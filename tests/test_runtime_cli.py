@@ -402,3 +402,12 @@ def test_app_run_errors_helpfully_without_a_script_file(
     monkeypatch.setitem(sys.modules, "__main__", types.ModuleType("__main__"))
     with pytest.raises(RuntimeError, match="notebook"):
         app.run()
+
+
+def test_version_flag_prints_version_and_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--version"])
+    assert excinfo.value.code == 0
+    output, _ = capsys.readouterr()
+    assert output.strip() == f"hflow {hflow.__version__}"
+    assert hflow.__version__ in output
