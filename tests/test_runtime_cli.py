@@ -402,3 +402,35 @@ def test_app_run_errors_helpfully_without_a_script_file(
     monkeypatch.setitem(sys.modules, "__main__", types.ModuleType("__main__"))
     with pytest.raises(RuntimeError, match="notebook"):
         app.run()
+
+
+def test_up_api_port_bakes_into_bundle_env(
+    compose_calls: list[list[str]],
+    healthy_client: None,
+    pipeline_file: Path,
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    exit_code = main(
+        [
+            "up",
+            "--pipeline",
+            f"{pipeline_file}:my_app",
+            "--data-root",
+            str(data_root),
+            "--api-port",
+            "9090",
+        ]
+    )
+    assert exit_code == 0
+    bundle_dir = data_root / "runtime"
+    assert (bundle_dir / "docker-compose.yaml").is_file()
+    env_values = dict(
+        line.split("=", 1)
+        for line in (bundle_dir / ".env").read_text().splitlines()
+        if line and not line.startswith("#")
+    )
+    assert env_values["API_PORT"] == "9090"
+    assert compose_calls == [
+        [str(bundle_dir / "docker-compose.yaml"), "up", "--detach"],
+    ]
