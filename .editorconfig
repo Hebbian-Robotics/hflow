@@ -1,0 +1,26 @@
+﻿# EditorConfig is awesome: https://EditorConfig.org
+
+# top-most EditorConfig file
+root = true
+
+# Unix-like end of line and UTF-8 charset for all files
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# Python files: 4-space indent, 100-char line length
+[*.py]
+indent_style = space
+indent_size = 4
+max_line_length = 100
+
+# YAML files: 2-space indent
+[*.{yml,yaml}]
+indent_style = space
+indent_size = 2
+
+# Markdown: preserve trailing spaces (some use them for line breaks)
+[*.md]
+trim_trailing_whitespace = false

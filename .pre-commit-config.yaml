@@ -1,0 +1,26 @@
+﻿
+# Pre-commit hooks for hflow
+
+# Install: uv run pre-commit install (or pipx run pre-commit install)
+
+# Run manually: uv run pre-commit run --all-files
+
+# Docs: https://pre-commit.com/
+
+
+
+repos:
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+
+    # Pin to the same ruff version as in uv.lock
+
+    rev: v0.16.2
+
+    hooks:
+
+      - id: ruff
+
+        args: [--fix]
+
+      - id: ruff-format
