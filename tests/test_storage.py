@@ -184,6 +184,14 @@ class TestBucketStorageRoot:
         with pytest.raises(FileNotFoundError):
             root.fetch("landing/missing.mcap")
 
+    def test_fetch_local_missing_has_oserror_filename(self, tmp_path: Path) -> None:
+        missing = tmp_path / "nope.mcap"
+        with pytest.raises(FileNotFoundError) as excinfo:
+            fetch_uri(missing)
+        assert excinfo.value.errno == 2
+        assert "No such file or directory" in str(excinfo.value)
+        assert str(missing) in str(excinfo.value)
+
     def test_publish_uploads_and_warms_mirror(self, tmp_path: Path) -> None:
         root, remote_dir = bucket_over_tmp(tmp_path)
         produced_file = tmp_path / "out.mcap"

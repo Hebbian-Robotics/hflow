@@ -90,6 +90,7 @@ def test_cli_doctor_missing_file_prints_one_line(capsys: pytest.CaptureFixture[s
     assert cli_main(["doctor", missing]) == 2
     captured = capsys.readouterr()
     assert "doctor:" in captured.err
+    assert "No such file or directory" in captured.err
     assert "Traceback" not in captured.err
 
 

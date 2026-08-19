@@ -32,6 +32,7 @@ rather than a consistency problem:
   episode uploaded by another.
 """
 
+import errno
 import fcntl
 import hashlib
 import os
@@ -630,5 +631,5 @@ def fetch_uri(uri: "str | Path") -> Path:
         return BucketStorageRoot(parent_url).fetch(name)
     local_file = Path(uri)
     if not local_file.is_file():
-        raise FileNotFoundError(local_file)
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(local_file))
     return local_file
