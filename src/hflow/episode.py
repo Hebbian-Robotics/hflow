@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from mcap.records import Schema
+from mcap.records import Attachment, Schema
 
 from hflow import video as video_module
 from hflow.ffmpeg import ffmpeg_path
@@ -309,6 +309,13 @@ class Episode:
     def metadata_records(self) -> dict[str, dict[str, str]]:
         """All MCAP Metadata records, keyed by record name."""
         return self._reader.metadata()
+
+    @cached_property
+    def attachments(self) -> list[Attachment]:
+        """All MCAP Attachment records (calibration files, URDFs, and other
+        episode-scoped files the canonical format preserves). Does not decode
+        message data."""
+        return list(self._reader.attachments())
 
     @cached_property
     def metadata(self) -> dict[str, str]:

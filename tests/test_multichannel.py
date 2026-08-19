@@ -16,6 +16,7 @@ from mcap.writer import Writer as StockWriter
 from hflow.doctor import diagnose
 from hflow.episode import Episode
 from hflow.format import METADATA_RECORD_EPISODE
+from hflow.mcap_writer import CanonicalMcapWriter
 from hflow.reader import open_reader
 from hflow.transform import write_canonical_episode
 
@@ -160,4 +161,21 @@ def test_transform_round_trips_both_channels(dual_channel_source: Path, tmp_path
         assert payloads_by_channel_id[channels_by_encoding["cdr"].id] == CDR_PAYLOADS
 
     report = diagnose(output)
-    assert report.conforming, report.summary()
+    assert report.conforming
+
+
+def test_episode_attachment_round_trip(tmp_path: Path) -> None:
+    mcap_path = tmp_path / "attachments.mcap"
+    attachment_name = "calibration.json"
+    attachment_data = b'{"camera_matrix": [1, 0, 0]}'
+
+    with CanonicalMcapWriter(mcap_path) as writer:
+        writer.add_attachment(attachment_name, "application/json", attachment_data)
+        writer.finish()
+
+    with Episode(mcap_path) as episode:
+        attachments = episode.attachments
+        assert len(attachments) == 1
+        assert attachments[0].name == attachment_name
+        assert attachments[0].media_type == "application/json"
+        assert attachments[0].data == attachment_data

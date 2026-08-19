@@ -187,6 +187,8 @@ def labels(ep: hflow.Episode) -> hflow.CheckResult:
 
 `ep.metadata` is a flat `dict[str, str]`: the episode semantics record (task, operator, success, embodiment, robot_software_version, plus whatever your rig recorded) merged with the version stamps (schema_version, pipeline_version, ffmpeg_version). Values are strings: `success` is `"true"`/`"false"`. `ep.metadata_records` exposes every MCAP Metadata record in the file, keyed by record name, when you need more than the merged view.
 
+`ep.attachments` is a list of the episode's MCAP Attachment records (calibration files, URDFs, and other episode-scoped files the canonical format preserves). Each attachment carries its `name`, `media_type`, and `data`; message data is not decoded.
+
 ## Dialect 5: the escape hatch
 
 The episode is standard MCAP; the accessors are conveniences, not a lock-in layer. If your script already speaks `mcap`, hand it the path:
