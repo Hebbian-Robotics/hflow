@@ -470,22 +470,38 @@ def _command_status(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _command_curate(arguments: argparse.Namespace) -> int:
+    if (arguments.sql is None) == (arguments.sql_file is None):
+        print("curate: pass exactly one of a SQL string or --sql-file", file=sys.stderr)
+        return 2
+    try:
+        sql = arguments.sql if arguments.sql is not None else arguments.sql_file.read_text()
+        report = curate(arguments.catalog, sql, output=arguments.output)
+    except (ValueError, FileNotFoundError) as error:
+        print(f"curate: {error}", file=sys.stderr)
+        return 2
+    print(report.summary())
+    return 0
+
+
+def _command_doctor(arguments: argparse.Namespace) -> int:
+    try:
+        doctor_report = diagnose(arguments.file)
+    except (ValueError, FileNotFoundError) as error:
+        print(f"doctor: {error}", file=sys.stderr)
+        return 2
+    print(doctor_report.summary())
+    return 0 if doctor_report.conforming else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = _build_parser().parse_args(argv)
     if arguments.command == "curate":
-        if (arguments.sql is None) == (arguments.sql_file is None):
-            print("curate: pass exactly one of a SQL string or --sql-file", file=sys.stderr)
-            return 2
-        sql = arguments.sql if arguments.sql is not None else arguments.sql_file.read_text()
-        report = curate(arguments.catalog, sql, output=arguments.output)
-        print(report.summary())
-        return 0
+        return _command_curate(arguments)
     if arguments.command == "stale":
         return _command_stale(arguments)
     if arguments.command == "doctor":
-        doctor_report = diagnose(arguments.file)
-        print(doctor_report.summary())
-        return 0 if doctor_report.conforming else 1
+        return _command_doctor(arguments)
     if arguments.command == "up":
         return _command_up(arguments)
     if arguments.command == "deploy":
