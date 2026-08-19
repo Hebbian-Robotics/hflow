@@ -110,14 +110,14 @@ uv run ty check
 To catch style issues before you commit, install pre-commit hooks (optional; CI will catch anything you miss):
 
 ```bash
-uv run pre-commit install
+uvx pre-commit install
 # or: pipx run pre-commit install
 ```
 
 Hooks will run automatically on `git commit`. To run them manually on all files:
 
 ```bash
-uv run pre-commit run --all-files
+uvx pre-commit run --all-files
 ```
 
 Hooks enforce the same style gates documented above: `ruff check --fix` and `ruff format`.
