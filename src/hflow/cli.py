@@ -299,11 +299,15 @@ def _command_stale(arguments: argparse.Namespace) -> int:
     else:
         pipeline_version = arguments.pipeline_version
 
-    stale = stale_episodes(
-        arguments.catalog,
-        pipeline_version=pipeline_version,
-        schema_version=schema_version,
-    )
+    try:
+        stale = stale_episodes(
+            arguments.catalog,
+            pipeline_version=pipeline_version,
+            schema_version=schema_version,
+        )
+    except (ValueError, FileNotFoundError) as error:
+        print(f"stale: {error}", file=sys.stderr)
+        return 2
     for episode in stale:
         print(episode.source_uri if episode.source_uri is not None else episode.uri)
     print(
