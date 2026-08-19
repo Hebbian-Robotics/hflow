@@ -100,7 +100,14 @@ def test_cli_curate_bad_catalog_prints_one_line(
     bad_catalog.mkdir()
     assert (
         cli_main(
-            ["curate", "SELECT 1", "--catalog", str(bad_catalog), "--output", str(tmp_path / "m.parquet")]
+            [
+                "curate",
+                "SELECT 1",
+                "--catalog",
+                str(bad_catalog),
+                "--output",
+                str(tmp_path / "m.parquet"),
+            ]
         )
         == 2
     )
