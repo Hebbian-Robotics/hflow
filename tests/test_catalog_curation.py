@@ -290,7 +290,6 @@ def test_cli_curate_dry_run_does_not_write_manifest(
     assert exit_code == 0
     assert not manifest.is_file()
     printed = capsys.readouterr().out
-    # Dry-run renders as a human message, not the literal None.
     assert "(not written; dry run)" in printed
     assert "None" not in printed
     assert "1 rows" in printed
