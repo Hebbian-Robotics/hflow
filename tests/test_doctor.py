@@ -89,7 +89,6 @@ def test_cli_doctor_missing_file_prints_one_line(capsys: pytest.CaptureFixture[s
     missing = "C:/definitely/not/here.mcap"
     assert cli_main(["doctor", missing]) == 2
     captured = capsys.readouterr()
-    # One-line message on stderr, no traceback.
     assert "doctor:" in captured.err
     assert "Traceback" not in captured.err
 
