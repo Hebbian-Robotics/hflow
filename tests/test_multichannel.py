@@ -129,8 +129,8 @@ def test_episode_exposes_publish_times(dual_channel_source: Path) -> None:
         publish_times = json_channel.publish_times
         assert isinstance(publish_times, np.ndarray)
         assert publish_times.shape == (len(json_channel),)
-        # publish_times are not guaranteed ascending, unlike log timestamps
-        assert not np.all(np.diff(publish_times) >= 0) or len(publish_times) <= 1
+        # Values match the message count and are non-negative nanos.
+        assert np.all(publish_times >= 0)
 
 
 def test_episode_unknown_keys_raise_helpfully(dual_channel_source: Path) -> None:
