@@ -9,6 +9,7 @@ represent both channels; only the topic-keyed convenience views refuse.
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 from mcap.reader import make_reader
 from mcap.writer import Writer as StockWriter
@@ -119,6 +120,17 @@ def test_episode_addresses_channels_by_id(dual_channel_source: Path) -> None:
         assert [message.data for message in cdr_channel.messages] == [
             bool(payload[-1]) for payload in CDR_PAYLOADS
         ]
+
+
+def test_episode_exposes_publish_times(dual_channel_source: Path) -> None:
+    with Episode(dual_channel_source) as episode:
+        by_encoding = {info.message_encoding: info for info in episode.channels.values()}
+        json_channel = episode.channel(by_encoding["json"].channel_id)
+        publish_times = json_channel.publish_times
+        assert isinstance(publish_times, np.ndarray)
+        assert publish_times.shape == (len(json_channel),)
+        # publish_times are not guaranteed ascending, unlike log timestamps
+        assert not np.all(np.diff(publish_times) >= 0) or len(publish_times) <= 1
 
 
 def test_episode_unknown_keys_raise_helpfully(dual_channel_source: Path) -> None:

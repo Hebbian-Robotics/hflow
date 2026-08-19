@@ -113,6 +113,15 @@ class ChannelData:
         return self._log_times
 
     @property
+    def publish_times(self) -> np.ndarray:
+        """Publish times in nanoseconds, shape (n,). Does not decode.
+
+        Unlike :attr:`timestamps`, publish times are not guaranteed ascending
+        (they reflect when the application handed each message to the channel).
+        """
+        return self._publish_times
+
+    @property
     def raw(self) -> list[bytes]:
         """Raw encoded message payloads. Does not decode."""
         return self._raw
