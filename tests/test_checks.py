@@ -11,6 +11,7 @@ from hflow.checks import (
     episode_duration,
     idle_fraction,
     joint_discontinuity,
+    required_topics,
     timestamp_regularity,
 )
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
@@ -160,3 +161,21 @@ def test_camera_frame_stats_sees_the_injected_black_segment(tmp_path: Path) -> N
     # No dropped frames were injected: the stored count matches the rate.
     assert result.measurements[f"{camera_topic}/frame_deficit_pct"] == pytest.approx(0.0)
     assert result.measurements[f"{camera_topic}/expected_frame_count"] == message_count
+
+
+def test_required_topics_marks_present_missing_and_unknown(jittery_episode: hflow.Episode) -> None:
+    present_topic = "/joint_states"
+    missing_topic = "/never_recorded"
+    result = required_topics(jittery_episode, topics=[present_topic, missing_topic])
+
+    assert result.measurements[f"{present_topic}/present"] is True
+    assert result.measurements[f"{present_topic}/message_count"] > 0
+    assert result.measurements[f"{missing_topic}/present"] is False
+    assert result.measurements[f"{missing_topic}/message_count"] == 0
+    assert result.measurements["missing_topic_count"] == 1
+
+
+def test_required_topics_all_present(jittery_episode: hflow.Episode) -> None:
+    result = required_topics(jittery_episode, topics=["/joint_states"])
+    assert result.measurements["missing_topic_count"] == 0
+    assert result.measurements["/joint_states/present"] is True

@@ -332,6 +332,40 @@ def episode_duration(episode: Episode, *, topics: Sequence[str] | None = None) -
     )
 
 
+def required_topics(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
+    """Presence and message volume of every topic the rig was supposed to record.
+
+    The cheapest corpus-level QC question is whether a recording captured all
+    of its expected streams -- a missing wrist camera or an absent
+    ``/joint_states`` should be one catalog query away. Per the evidence-not-
+    verdicts rule this records, for each requested topic:
+
+    - ``{topic}/present`` -- bool, whether any channel carries the topic
+    - ``{topic}/message_count`` -- int, total messages across its channels
+
+    plus a summary ``missing_topic_count``. Presence derives from
+    :attr:`Episode.channels`, so a topic mapped to multiple channels counts
+    once. Pass/fail policy is a curation query on the recorded measurements,
+    e.g.::
+
+        SELECT episode_id, value_text FROM measurements
+        WHERE key = 'missing_topic_count' AND value_text != '0'
+    """
+    required = list(topics)
+    present: dict[str, int] = {}
+    for info in episode.channels.values():
+        if info.topic in required:
+            present[info.topic] = present.get(info.topic, 0) + info.message_count
+    measurements: dict[str, MeasurementValue] = {
+        "missing_topic_count": len(required) - len(present),
+    }
+    for topic in required:
+        message_count = present.get(topic, 0)
+        measurements[f"{topic}/present"] = message_count > 0
+        measurements[f"{topic}/message_count"] = message_count
+    return CheckResult(measurements=measurements)
+
+
 def content_digest(episode: Episode) -> CheckResult:
     """A stable digest of the episode's message content, for duplicate hunts.
 
