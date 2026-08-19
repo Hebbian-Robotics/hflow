@@ -129,7 +129,6 @@ def test_episode_exposes_publish_times(dual_channel_source: Path) -> None:
         publish_times = json_channel.publish_times
         assert isinstance(publish_times, np.ndarray)
         assert publish_times.shape == (len(json_channel),)
-        # Values match the message count and are non-negative nanos.
         assert np.all(publish_times >= 0)
 
 
