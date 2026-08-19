@@ -1,0 +1,74 @@
+name: pr-limit
+
+# Caps concurrent open pull requests per outside contributor so the
+# good-first-issue pool is not blanket-claimed by one author. Maintainers
+# and collaborators are exempt. pull_request_target is safe here: the job
+# never checks out PR code.
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  enforce_open_pr_cap:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.user.type != 'Bot'
+    steps:
+      - name: Close pull requests over the per-author cap
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const MAX_OPEN_PRS_PER_AUTHOR = 1
+
+            const openedPullRequest = context.payload.pull_request
+            const author = openedPullRequest.user.login
+            const trustedAssociations = ['OWNER', 'MEMBER', 'COLLABORATOR']
+            if (trustedAssociations.includes(openedPullRequest.author_association)) {
+              core.info(`@${author} is ${openedPullRequest.author_association}; cap does not apply.`)
+              return
+            }
+
+            const openPullRequests = await github.paginate(github.rest.pulls.list, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            })
+            const otherOpenBySameAuthor = openPullRequests.filter(
+              (pullRequest) =>
+                pullRequest.user.login === author &&
+                pullRequest.number !== openedPullRequest.number,
+            )
+            if (otherOpenBySameAuthor.length < MAX_OPEN_PRS_PER_AUTHOR) {
+              core.info(`@${author} has ${otherOpenBySameAuthor.length} other open PR(s); within cap.`)
+              return
+            }
+
+            const openList = otherOpenBySameAuthor
+              .map((pullRequest) => `#${pullRequest.number}`)
+              .join(', ')
+            const message = [
+              `👋 Hi @${author} — thanks for the contribution! To keep starter issues available`,
+              `for other contributors and give every pull request a real review, we accept`,
+              `**${MAX_OPEN_PRS_PER_AUTHOR} open pull request per contributor at a time**.`,
+              '',
+              `You already have ${openList} open, so this one is being closed automatically.`,
+              `Once your open pull request is merged or closed, feel free to reopen this one —`,
+              `no work is lost.`,
+            ].join('\n')
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: openedPullRequest.number,
+              body: message,
+            })
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: openedPullRequest.number,
+              state: 'closed',
+            })
