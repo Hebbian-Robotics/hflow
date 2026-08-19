@@ -50,11 +50,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default="./data/catalog",
         help="catalog directory or object-store prefix (default: ./data/catalog)",
     )
-    curate_parser.add_argument(
+    curate_output_group = curate_parser.add_mutually_exclusive_group()
+    curate_output_group.add_argument(
         "--output",
         "-o",
         default="./data/manifest.parquet",
         help="manifest path or object-store URL (default: ./data/manifest.parquet)",
+    )
+    curate_output_group.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="run the query and report row count/coverage without writing a manifest",
     )
 
     stale_parser = subparsers.add_parser(
@@ -477,7 +483,8 @@ def main(argv: list[str] | None = None) -> int:
             print("curate: pass exactly one of a SQL string or --sql-file", file=sys.stderr)
             return 2
         sql = arguments.sql if arguments.sql is not None else arguments.sql_file.read_text()
-        report = curate(arguments.catalog, sql, output=arguments.output)
+        output = None if arguments.dry_run else arguments.output
+        report = curate(arguments.catalog, sql, output=output)
         print(report.summary())
         return 0
     if arguments.command == "stale":
