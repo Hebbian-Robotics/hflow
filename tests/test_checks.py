@@ -6,6 +6,7 @@ import pytest
 
 import hflow
 from hflow.checks import (
+    action_rate,
     camera_frame_stats,
     content_digest,
     episode_duration,
@@ -119,6 +120,14 @@ def test_episode_duration_matches_the_synthesized_span(jittery_episode: hflow.Ep
     assert duration_s == pytest.approx(4.0, abs=0.1)
     message_count_total = result.measurements["message_count_total"]
     assert isinstance(message_count_total, int) and message_count_total > 0
+
+
+def test_action_rate_matches_the_synthesized_rate(jittery_episode: hflow.Episode) -> None:
+    result = action_rate(jittery_episode, topics=["/joint_states"])
+    action_rate_hz = result.measurements["action_rate_hz"]
+    assert isinstance(action_rate_hz, float)
+    # the synthetic joint stream runs at 100 Hz by SyntheticEpisodeSpec default
+    assert action_rate_hz == pytest.approx(100.0, abs=0.5)
 
 
 def test_content_digest_identifies_duplicate_content(tmp_path: Path) -> None:

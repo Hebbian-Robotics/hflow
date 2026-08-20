@@ -159,6 +159,22 @@ FROM measurements WHERE key = 'content_digest'
 GROUP BY digest HAVING count(*) > 1
 ```
 
+### Cohort statistics
+
+Per-episode checks record evidence; cohort math (z-score, percentile) is a query over the catalog.
+
+```sql
+SELECT episode_id,
+       action_rate_hz,
+       (action_rate_hz - AVG(action_rate_hz) OVER ())
+         / STDDEV(action_rate_hz) OVER () AS action_rate_hz_z,
+       PERCENT_RANK() OVER (ORDER BY action_rate_hz) AS action_rate_hz_pct
+FROM episodes
+WHERE task = 'fold_napkin'
+```
+
+Cohort statistics are corpus-relative. The z-score depends on which rows the query runs over, including any WHERE clause applied before the window, so compute the window over the same filtered cohort you intend to cut. Also note that STDDEV over a single-row cohort is NULL, which is the correct answer: one episode has no cohort to compare against.
+
 ### Finding stale episodes to reprocess
 
 The corpus is assumed permanently mixed-version, so "reprocess everything" is

@@ -332,6 +332,39 @@ def episode_duration(episode: Episode, *, topics: Sequence[str] | None = None) -
     )
 
 
+def action_rate(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
+    """Mean message rate of the given action topics, in hertz.
+
+    Speed-vs-skill is a corpus-relative judgment, so it cannot be decided
+    inside a per-episode check; this check records the evidence and the cut
+    is a curation query, e.g.::
+
+        SELECT episode_id FROM episodes WHERE action_rate_hz_z > 1.645
+
+    (the window function producing action_rate_hz_z is documented in the
+    Cohort statistics section of docs/CATALOG.md).
+    """
+    start_candidates_ns: list[int] = []
+    end_candidates_ns: list[int] = []
+    message_count_total = 0
+    streams_with_messages = 0
+    for topic in topics:
+        stamps_ns = episode.channel(topic).timestamps
+        if len(stamps_ns) == 0:
+            continue
+        message_count_total += len(stamps_ns)
+        streams_with_messages += 1
+        start_candidates_ns.append(int(stamps_ns[0]))
+        end_candidates_ns.append(int(stamps_ns[-1]))
+    span_s = (
+        (max(end_candidates_ns) - min(start_candidates_ns)) / 1e9 if start_candidates_ns else 0.0
+    )
+    # n timestamps on a stream define n - 1 intervals
+    interval_count = message_count_total - streams_with_messages
+    action_rate_hz = interval_count / span_s if span_s > 0 else 0.0
+    return CheckResult(measurements={"action_rate_hz": action_rate_hz})
+
+
 def content_digest(episode: Episode) -> CheckResult:
     """A stable digest of the episode's message content, for duplicate hunts.
 
