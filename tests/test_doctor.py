@@ -84,6 +84,16 @@ def test_cli_doctor_exit_codes(
     assert cli_main(["doctor", str(bogus)]) == 1
     assert "NOT CONFORMING" in capsys.readouterr().out
 
+    assert cli_main(["doctor", str(canonical_episode), str(canonical_episode)]) == 0
+    both_conforming = capsys.readouterr().out
+    assert both_conforming.count(str(canonical_episode)) == 2
+    assert "NOT CONFORMING" not in both_conforming
+
+    assert cli_main(["doctor", str(canonical_episode), str(bogus)]) == 1
+    mixed = capsys.readouterr().out
+    assert str(canonical_episode) in mixed
+    assert str(bogus) in mixed
+
 
 def test_cli_doctor_missing_file_prints_one_line(capsys: pytest.CaptureFixture[str]) -> None:
     missing = "C:/definitely/not/here.mcap"

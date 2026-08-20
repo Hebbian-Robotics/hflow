@@ -127,8 +127,9 @@ A file claiming this convention must satisfy, in increasing strictness:
 4. **Video constraints**: every `foxglove.CompressedVideo` message is one Annex B access unit beginning with an AUD; every IDR access unit contains SPS and PPS; no B-frames; `format="h264"`.
 5. **Stamps**: `provenance/v1` present with `schema_version` and `pipeline_version`.
 
-`hflow doctor <file.mcap>` executes these checks and exits with status 0 for
-a conforming file or 1 when it reports violations.
+`hflow doctor <file.mcap> [more.mcap ...]` executes these checks against every
+file given, printing one report each, and exits with status 0 when all files
+conform or 1 when any reports violations.
 
 ## References
 
