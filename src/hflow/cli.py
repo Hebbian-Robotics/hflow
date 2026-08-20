@@ -86,6 +86,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CATALOG_DIR,
         help=f"catalog directory or object-store prefix (default: {DEFAULT_CATALOG_DIR})",
     )
+    stale_parser.add_argument(
+        "--exit-code",
+        action="store_true",
+        help="exit 1 when any stale episode is found",
+    )
     stale_group = stale_parser.add_mutually_exclusive_group(required=True)
     stale_group.add_argument(
         "--pipeline",
@@ -331,7 +336,7 @@ def _command_stale(arguments: argparse.Namespace) -> int:
         + (f" / schema_version {schema_version}" if schema_version is not None else ""),
         file=sys.stderr,
     )
-    return 0
+    return 1 if arguments.exit_code and stale else 0
 
 
 def _command_up(arguments: argparse.Namespace) -> int:

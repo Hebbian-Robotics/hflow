@@ -194,6 +194,14 @@ or on the command line, where stdout is exactly the pipeable source-URI list:
 hflow stale --catalog data/catalog --pipeline pipeline.py | xargs hflow ingest
 ```
 
+Pass `--exit-code` to make the command exit with status 1 when it finds any
+stale episodes, which lets CI gate on stale data without changing the default
+pipe-friendly behavior:
+
+```bash
+hflow stale --catalog data/catalog --pipeline pipeline.py --exit-code
+```
+
 `--pipeline` imports your pipeline file and compares against its current
 `pipeline_version` plus the current episode format version; pass
 `--pipeline-version <hash>` instead to compare against a known hash without

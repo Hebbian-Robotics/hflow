@@ -373,6 +373,36 @@ def test_cli_stale_prints_source_uris_for_ingest(
     assert "1 episode(s)" in captured.err
 
 
+@pytest.mark.parametrize(
+    ("pipeline_version", "expected_exit_code"),
+    [("somethingnewer", 1), (FAKE_STAMPS.pipeline_version, 0)],
+)
+def test_cli_stale_exit_code_gates_on_stale_episodes(
+    tmp_path: Path,
+    pipeline_version: str,
+    expected_exit_code: int,
+) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    catalog.append_episode(
+        canonical_path=_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[],
+        source_uri="episodes-in/run_0001.mcap",
+    )
+    exit_code = cli_main(
+        [
+            "stale",
+            "--catalog",
+            str(tmp_path / "catalog"),
+            "--pipeline-version",
+            pipeline_version,
+            "--exit-code",
+        ]
+    )
+    assert exit_code == expected_exit_code
+
+
 def test_cli_stale_reports_a_broken_pipeline_file_instead_of_crashing(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
