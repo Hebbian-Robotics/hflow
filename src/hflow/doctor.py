@@ -37,6 +37,8 @@ _MAX_FINDINGS_PER_CODE = 3
 
 
 class DiagnosticLevel(StrEnum):
+    """Severity of one ``Finding``: whether it breaks conformance or just deviates from defaults."""
+
     ERROR = "error"  # breaks the canonical convention (or the MCAP spec)
     WARNING = "warning"  # legal, but deviates from the defaults we write
 

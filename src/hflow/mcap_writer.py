@@ -204,6 +204,7 @@ class CanonicalMcapWriter:
         self._flush()
 
     def register_schema(self, name: str, encoding: str, data: bytes) -> int:
+        """Register a schema and return its id, for use as ``register_channel``'s ``schema_id``."""
         self._raise_if_finished("register a schema")
         schema_id = len(self._schemas_by_id) + 1
         schema = Schema(id=schema_id, data=data, encoding=encoding, name=name)
@@ -223,6 +224,14 @@ class CanonicalMcapWriter:
         group: str,
         metadata: dict[str, str] | None = None,
     ) -> int:
+        """Register a channel and return its id, for use as ``write_message``'s ``channel_id``.
+
+        ``group`` assigns the channel to a chunk stream (see the module
+        docstring's topic-group chunking rule): messages from channels in
+        different groups never share a chunk. ``schema_id`` must be either
+        ``0`` (the MCAP "no schema" sentinel) or an id returned by
+        ``register_schema``.
+        """
         self._raise_if_finished("register a channel")
         # schema_id 0 is the MCAP spec's "no schema" sentinel.
         if schema_id != 0 and schema_id not in self._schemas_by_id:
@@ -256,6 +265,12 @@ class CanonicalMcapWriter:
         publish_time: int | None = None,
         sequence: int = 0,
     ) -> None:
+        """Write one message to a registered channel.
+
+        ``channel_id`` must come from ``register_channel``. ``log_time`` is
+        nanoseconds and drives chunk time ranges; ``publish_time`` defaults
+        to ``log_time`` when omitted. Never call after ``finish()``.
+        """
         self._raise_if_finished("write a message")
         group_name = self._group_name_by_channel_id.get(channel_id)
         if group_name is None:
@@ -285,6 +300,7 @@ class CanonicalMcapWriter:
             self._finalize_group_chunk(group_name)
 
     def add_metadata(self, name: str, data: dict[str, str]) -> None:
+        """Write one named string-keyed metadata record (e.g. ``episode/v1``)."""
         self._raise_if_finished("add metadata")
         self._flush()
         offset = self._stream.tell()
@@ -304,6 +320,7 @@ class CanonicalMcapWriter:
         log_time: int = 0,
         create_time: int = 0,
     ) -> None:
+        """Write one binary attachment (e.g. provenance data) with a media type."""
         self._raise_if_finished("add an attachment")
         self._flush()
         offset = self._stream.tell()
@@ -330,6 +347,14 @@ class CanonicalMcapWriter:
         self._flush()
 
     def finish(self) -> None:
+        """Finalize every group's remaining chunk, write the summary and footer, and publish.
+
+        Must be called last -- every other public method raises once it has
+        run. Safe to call more than once (a no-op after the first call).
+        Path outputs publish atomically: nothing replaces the destination
+        until this succeeds. Called automatically by ``__exit__`` on a clean
+        ``with`` block exit; use ``abort()`` instead to discard a write.
+        """
         if self._finished:
             return
         try:
