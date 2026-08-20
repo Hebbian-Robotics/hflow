@@ -348,10 +348,13 @@ docker compose --file data/runtime/docker-compose.yaml logs airflow-dag-processo
 `ingest` prints the same hint (right after a fresh `up`, the DAG may still
 be parsing; retry in a few seconds).
 
-**Port 8080 is taken.** The port lives in the bundle's `.env` as `API_PORT`
-(re-renders don't change a preserved `.env`, so editing it sticks):
-`hflow down`, edit `API_PORT`, `hflow up` again. The API only ever binds
-to `127.0.0.1`, so two bundles on different ports coexist fine.
+**Port 8080 is taken.** Pick a different port up front with
+`hflow up --api-port 9090` (default: `8080`). For a bundle that already
+exists, the flag has no effect on a later `hflow up` -- an existing `.env`
+is never rewritten, so user edits survive re-renders -- so instead:
+`hflow down`, edit `API_PORT` in the bundle's `.env`, `hflow up` again. The
+API only ever binds to `127.0.0.1`, so two bundles on different ports
+coexist fine.
 
 **`up` failed partway.** Whatever started is deliberately left running: the
 state *is* the diagnosis. `hflow status` to look, `docker compose ... logs

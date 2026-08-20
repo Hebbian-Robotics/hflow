@@ -157,6 +157,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="user requirements file for the task venv (default: hflow only)",
     )
+    up_parser.add_argument(
+        "--api-port",
+        type=int,
+        default=8080,
+        help="host port the Airflow API binds to (default: 8080)",
+    )
 
     deploy_parser = subparsers.add_parser(
         "deploy",
@@ -354,6 +360,7 @@ def _command_up(arguments: argparse.Namespace) -> int:
         app_variable=app_variable,
         requirements_file=arguments.requirements,
         hflow_source=hflow_source,
+        api_port=arguments.api_port,
     )
     # A bucket data root has no local directory to host the bundle: ./runtime.
     default_bundle_dir = (

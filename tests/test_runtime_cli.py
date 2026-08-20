@@ -119,6 +119,32 @@ def test_up_renders_starts_and_prints(
     assert "rendering" not in output
 
 
+def test_up_honors_api_port(
+    compose_calls: list[list[str]],
+    healthy_client: None,
+    pipeline_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    data_root = tmp_path / "data"
+    exit_code = main(
+        [
+            "up",
+            "--pipeline",
+            str(pipeline_file),
+            "--data-root",
+            str(data_root),
+            "--api-port",
+            "9090",
+        ]
+    )
+    assert exit_code == 0
+    bundle_dir = data_root / "runtime"
+    assert "API_PORT=9090" in (bundle_dir / ".env").read_text().splitlines()
+    output, _errors = capsys.readouterr()
+    assert "http://127.0.0.1:9090" in output
+
+
 def test_start_runtime_emits_progress_events_in_phase_order(
     compose_calls: list[list[str]],
     healthy_client: None,
