@@ -1,5 +1,6 @@
 """Catalog appends and curation queries (issues #16/#17)."""
 
+import tempfile
 from pathlib import Path
 from typing import cast
 
@@ -549,6 +550,80 @@ def test_concurrent_append_of_the_identical_outcome_keeps_one_recorded_at(
             ).fetchall()
             timestamps.update(value for (value,) in rows)
         assert len(timestamps) == 1, f"mixed recorded_at across tables: {timestamps}"
+    finally:
+        connection.close()
+
+
+def test_measurements_latest_ranks_by_the_owning_episodes_recorded_at(tmp_path: Path) -> None:
+    """A dependent table's own recorded_at can go permanently stale: a repair
+    pass that wins the episodes race can crash before reaching measurements
+    (#51), and a later retry early-returns on exists(episodes) and never
+    revisits it. measurements_latest must still agree with episodes_latest
+    on which run is newest -- ranking (and reporting) off the episode's own
+    recorded_at, the one column create-if-absent guarantees a single writer
+    for, rather than this table's own, possibly-stale, column.
+    """
+    import time
+
+    import duckdb
+
+    canonical = _fake_canonical(tmp_path)
+    catalog = Catalog(tmp_path / "catalog")
+
+    older = catalog.append_episode(
+        canonical_path=canonical,
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[_check_row(version="v1", value=1.0)],
+    )
+    time.sleep(0.01)
+    newer = catalog.append_episode(
+        canonical_path=canonical,
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[_check_row(version="v2", value=2.0)],
+    )
+    assert older.written and newer.written
+    assert older.run_fingerprint != newer.run_fingerprint
+
+    # Simulate a repair pass that won `episodes` for the NEWER run but
+    # crashed before repairing `measurements`: that table's file is left
+    # with a stale recorded_at older than even the OLDER run's, despite
+    # `episodes` (the source of truth) correctly carrying the newest one.
+    stale_file = (
+        tmp_path
+        / "catalog"
+        / "measurements"
+        / f"{newer.episode_id}-{newer.run_fingerprint}.parquet"
+    )
+    connection = duckdb.connect()
+    try:
+        with tempfile.TemporaryDirectory(prefix="hflow-test-corrupt-") as staging_name:
+            staged = Path(staging_name) / "measurements.parquet"
+            connection.execute(
+                f"""
+                COPY (
+                    SELECT * REPLACE ('2000-01-01 00:00:00+00'::TIMESTAMPTZ AS recorded_at)
+                    FROM read_parquet('{stale_file}')
+                ) TO '{staged}' (FORMAT PARQUET)
+                """
+            )
+            staged.replace(stale_file)
+    finally:
+        connection.close()
+
+    connection = open_catalog_connection(tmp_path / "catalog")
+    try:
+        # episodes_latest ranks off its own always-authoritative recorded_at,
+        # so it is unaffected and still correctly calls the newer run latest.
+        assert connection.execute("SELECT run_fingerprint FROM episodes_latest").fetchone() == (
+            newer.run_fingerprint,
+        )
+        # measurements_latest must agree, despite its own corrupted column --
+        # before the fix, it picked the OLDER run's value (1.0) here.
+        assert connection.execute(
+            "SELECT value_double FROM measurements_latest WHERE key = 'example_metric'"
+        ).fetchone() == (2.0,)
     finally:
         connection.close()
 

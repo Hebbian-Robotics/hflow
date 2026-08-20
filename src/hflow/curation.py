@@ -11,7 +11,9 @@ Views registered on the connection:
 - ``episodes_raw``, ``check_runs``, ``measurements``, ``tags``,
   ``intervals`` -- the long tables, exactly as stored.
 - ``episodes_latest`` -- one row per episode_id (most recent append).
-- ``measurements_latest`` -- one row per (episode_id, key), most recent.
+- ``measurements_latest`` -- one row per (episode_id, key), most recent by
+  the OWNING episode's recorded_at (joined in), not the measurement row's
+  own -- the latter can go stale independently of the episode it belongs to.
 - ``episodes`` -- the wide view for everyday queries: latest episode rows,
   a ``status`` column (``'quarantined'``/``'ok'``), and one numeric column
   per measurement key (booleans as 0/1; text-valued measurements stay in the
@@ -178,10 +180,31 @@ def open_catalog_connection(catalog_root: "Path | str | StorageRoot") -> duckdb.
         """
         CREATE VIEW measurements_latest AS
         SELECT * EXCLUDE (row_rank) FROM (
-            SELECT *, row_number() OVER (
-                PARTITION BY episode_id, key
-                ORDER BY recorded_at DESC, run_fingerprint DESC
-            ) AS row_rank FROM measurements
+            SELECT
+                m.* EXCLUDE (recorded_at),
+                -- Rank (and report) by the EPISODE's recorded_at, not this
+                -- table's own: episodes/<file_stem>.parquet is the only file
+                -- create-if-absent guarantees a single writer for, so it is
+                -- the sole trustworthy recorded_at once episodes_latest has
+                -- already picked a winner. A repair pass that wins the
+                -- episodes race can still crash before reaching measurements
+                -- (see #51) -- a later retry then early-returns on
+                -- exists(episodes) and never revisits it, leaving this
+                -- table's own recorded_at stale forever. Ranking off it
+                -- directly could then pick a different run_fingerprint than
+                -- episodes_latest for the same episode_id, stitching rows
+                -- from two different runs together. The inner join also
+                -- means a run whose episodes file hasn't landed yet (crash
+                -- debris mid-append, not yet retried) is invisible here,
+                -- matching append_episode's own "episodes existing is what
+                -- proves an append complete" idiom.
+                e.recorded_at,
+                row_number() OVER (
+                    PARTITION BY m.episode_id, m.key
+                    ORDER BY e.recorded_at DESC, m.run_fingerprint DESC
+                ) AS row_rank
+            FROM measurements m
+            JOIN episodes_raw e USING (episode_id, run_fingerprint)
         ) WHERE row_rank = 1
         """
     )
