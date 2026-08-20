@@ -26,6 +26,14 @@ with per-task logs) instead of your terminal.
 No cloud account, no billing, no telemetry: everything below is containers on
 your machine, and the only recurring costs are disk and CPU.
 
+### Global flags
+
+The following options apply to the `hflow` command itself and must appear
+before the subcommand:
+
+- `--version` prints the installed HFlow version and exits.
+- `-v`, `--verbose` enables verbose logging.
+
 ## What `up` builds: anatomy of the bundle
 
 ```bash
@@ -313,7 +321,10 @@ Cloud Composer, or self-managed), skip the Compose runtime entirely:
 hflow deploy --pipeline pipeline.py --data-root-uri s3://my-bucket/robot-data
 ```
 
-This emits plain files under `./deploy/` and calls no platform API: the same
+This emits plain files under `./deploy/` (or the directory passed with
+`--output-dir`) and calls no platform API. Use `--requirements` to provide a
+user requirements file for the task venv; it has the same meaning here as for
+`hflow up`. The output contains the same
 five ingest DAGs the Compose runtime generates (one set of templates, rendered
 against your data root and your workers' venv interpreter, overridable with
 `--venv-python`; each file is named after its dag id so synced dags/ folders
