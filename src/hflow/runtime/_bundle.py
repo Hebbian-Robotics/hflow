@@ -507,13 +507,25 @@ def render_sub_dag_source(
         case Stage.SYNC | Stage.LABELS | Stage.MEDIA:
             template, gate_name = SUB_DAG_ERROR_GATE_TEMPLATE, "error_budget_gate"
     pipeline_stem = _pipeline_stem(master_dag_id)
+    # $data_root, $venv_python, and $pipeline_filename are substituted as
+    # repr() literals, never as bare text inside a pre-quoted template
+    # slot: a raw platform path (Windows venv interpreters use backslashes)
+    # or a data root containing a quote character would otherwise either
+    # break the generated file's Python syntax or -- worse -- close the
+    # surrounding string literal early and splice arbitrary text into the
+    # generated DAG's source (#44). repr() on a str always yields a
+    # self-escaping literal, so this holds for any input, not just the
+    # platform-path case that surfaced it.
+    data_root_literal = repr(data_root)
+    venv_python_literal = repr(venv_python)
+    pipeline_filename_literal = repr(pipeline_filename)
     # Substituted separately because Template.substitute never re-expands
     # variables inside substituted VALUES -- the filter's own $data_root must
     # be resolved before injection. Local roots only: probing a BUCKET
     # episode's channel list would download the whole file at plan time,
     # costing more than the skipped camera-less cycle saves.
     stage_plan_filter = (
-        MEDIA_PLAN_FILTER_TEMPLATE.substitute(data_root=data_root)
+        MEDIA_PLAN_FILTER_TEMPLATE.substitute(data_root=data_root_literal)
         if stage is Stage.MEDIA and not is_bucket_url(data_root)
         else ""
     )
@@ -526,10 +538,10 @@ def render_sub_dag_source(
         pipeline_tag=pipeline_stem,
         sub_display_name=f"{pipeline_stem} · {stage.value}",
         gate_name=gate_name,
-        pipeline_filename=pipeline_filename,
+        pipeline_filename=pipeline_filename_literal,
         app_variable=app_variable,
-        data_root=data_root,
-        venv_python=venv_python,
+        data_root=data_root_literal,
+        venv_python=venv_python_literal,
         stage_plan_filter=stage_plan_filter,
     )
 

@@ -435,7 +435,7 @@ latency-first run); `batch_count`: optional override.
     params={"uris": [], "mode": "batch", "batch_count": None},
 )
 def ingest_stage():
-    @task.external_python(python="$venv_python", expect_airflow=False, skip_on_exit_code=99)
+    @task.external_python(python=$venv_python, expect_airflow=False, skip_on_exit_code=99)
     def plan(uris, mode, batch_count):
         """Bin-pack uris into staggered batches; online is one immediate batch."""
         from hflow.batching import plan_batches
@@ -447,7 +447,7 @@ $stage_plan_filter        if mode == "online":
             # The online lane (Figure 4) is latency-first: one run per episode
             # as it lands -- no batching, no stagger, batch_count ignored.
             return [{"items": [str(uri) for uri in uris], "start_delay_s": 0.0}]
-        data_root = parse_storage_root("$data_root")
+        data_root = parse_storage_root($data_root)
         item_sizes = {str(uri): data_root.file_size(str(uri)) for uri in uris}
         resolved_batch_count = (
             int(batch_count) if batch_count is not None else min(4, len(item_sizes))
@@ -460,7 +460,7 @@ $stage_plan_filter        if mode == "online":
             for batch in planned
         ]
 
-    @task.external_python(python="$venv_python", expect_airflow=False)
+    @task.external_python(python=$venv_python, expect_airflow=False)
     def process_batch(batch):
         """Sleep the stagger delay, then run this sub-DAG's stage on every episode."""
         import importlib.util
@@ -473,13 +473,13 @@ $stage_plan_filter        if mode == "online":
 
         time.sleep(float(batch["start_delay_s"]))
 
-        pipeline_path = "/opt/user/" + "$pipeline_filename"
+        pipeline_path = "/opt/user/" + $pipeline_filename
         # Managed platforms cannot always mount user/ at /opt/user;
         # HFLOW_USER_DIR relocates it without re-rendering (DEPLOY.md names
         # the per-platform value).
         user_dir_override = os.environ.get("HFLOW_USER_DIR")
         if user_dir_override:
-            pipeline_path = user_dir_override.rstrip("/") + "/" + "$pipeline_filename"
+            pipeline_path = user_dir_override.rstrip("/") + "/" + $pipeline_filename
         spec = importlib.util.spec_from_file_location("hflow_user_pipeline", pipeline_path)
         if spec is None or spec.loader is None:
             raise RuntimeError("cannot load user pipeline at " + pipeline_path)
@@ -489,9 +489,10 @@ $stage_plan_filter        if mode == "online":
         # Episode URIs resolve under the runtime's data root; an app pointing
         # anywhere else would silently write elsewhere in the
         # task's filesystem, so refuse loudly instead.
-        if str(app.data_root) != "$data_root":
+        expected_data_root = $data_root
+        if str(app.data_root) != expected_data_root:
             raise RuntimeError(
-                "pipeline data_root must be $data_root inside the runtime; "
+                "pipeline data_root must be " + expected_data_root + " inside the runtime; "
                 f"it is {app.data_root}"
             )
 
@@ -529,7 +530,7 @@ $stage_plan_filter        if mode == "online":
 
 _SUB_DAG_QUARANTINE_GATE = '''\
 
-    @task.external_python(python="$venv_python", expect_airflow=False)
+    @task.external_python(python=$venv_python, expect_airflow=False)
     def quarantine_budget_gate(batch_counts):
         """Fail the run loudly on mass failure of either kind.
 
@@ -569,7 +570,7 @@ _SUB_DAG_QUARANTINE_GATE = '''\
 
 _SUB_DAG_ERROR_GATE = '''\
 
-    @task.external_python(python="$venv_python", expect_airflow=False)
+    @task.external_python(python=$venv_python, expect_airflow=False)
     def error_budget_gate(batch_counts):
         """Fail loudly when processing errors exceed the run budget.
 
@@ -639,7 +640,7 @@ MEDIA_PLAN_FILTER_TEMPLATE = Template(
         from hflow.reader import open_reader
 
         def has_camera(uri):
-            reader = open_reader(Path("$data_root") / str(uri))
+            reader = open_reader(Path($data_root) / str(uri))
             try:
                 return any(
                     info.schema_name in CAMERA_SCHEMA_NAMES

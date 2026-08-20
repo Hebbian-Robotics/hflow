@@ -376,14 +376,14 @@ def test_sub_dag_sources_compile_and_encode_contract(config: RuntimeConfig, tmp_
         assert "schedule=None" in dag_source
         assert 'params={"uris": [], "mode": "batch", "batch_count": None}' in dag_source
         # All three tasks run in the user venv via external python.
-        assert dag_source.count('@task.external_python(python="/opt/venvs/user/bin/python"') == 3
+        assert dag_source.count("@task.external_python(python='/opt/venvs/user/bin/python'") == 3
         # Imports live inside the (indented) function bodies -- the operator
         # extracts each body to a temp file, so module-level names never survive.
         assert "\n        from hflow.batching import plan_batches" in dag_source
         assert "\n        import importlib.util" in dag_source
         assert "\n        import math" in dag_source
         # The user pipeline is imported by file path and app resolved by name.
-        assert '"/opt/user/" + "my_pipeline.py"' in dag_source
+        assert "\"/opt/user/\" + 'my_pipeline.py'" in dag_source
         assert "spec_from_file_location" in dag_source
         assert 'getattr(pipeline_module, "app")' in dag_source
         # Each sub-DAG runs exactly its own Figure 4 stage.
@@ -404,8 +404,12 @@ def test_sub_dag_sources_compile_and_encode_contract(config: RuntimeConfig, tmp_
         assert "batch_counts >> gate" in dag_source
         # The process task authoritatively refuses an app
         # whose data_root is not the in-container mount point.
-        assert 'if str(app.data_root) != "/opt/airflow/data":' in dag_source
-        assert "pipeline data_root must be /opt/airflow/data inside the runtime" in dag_source
+        assert "expected_data_root = '/opt/airflow/data'" in dag_source
+        assert "if str(app.data_root) != expected_data_root:" in dag_source
+        assert (
+            '"pipeline data_root must be " + expected_data_root + " inside the runtime; "'
+            in dag_source
+        )
         # Checks decide quarantine: the quarantine budget lives ONLY in meta;
         # every other stage keeps the error-budget half.
         if stage is Stage.META:
@@ -588,8 +592,9 @@ class TestBucketModeBundle:
         paths, _ = _render(bucket_config, tmp_path / "bundle")
         for sub_dag_file in paths.sub_dag_files:
             dag_source = sub_dag_file.read_text()
-            assert f'parse_storage_root("{self.BUCKET_URL}")' in dag_source
-            assert f'if str(app.data_root) != "{self.BUCKET_URL}":' in dag_source
+            assert f"parse_storage_root({self.BUCKET_URL!r})" in dag_source
+            assert f"expected_data_root = {self.BUCKET_URL!r}" in dag_source
+            assert "if str(app.data_root) != expected_data_root:" in dag_source
         # The media plan filter probes episode channel lists, which would
         # download whole remote files at plan time: bucket bundles omit it.
         media_source = (paths.bundle_dir / "dags" / "ingest_media.py").read_text()
