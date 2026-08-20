@@ -62,6 +62,7 @@ contracts.
 - [Catalog tables and curation API](./CATALOG.md)
 - [Runtime commands and configuration](./RUNTIME.md)
 - [Native-video provider protocol](./PROVIDERS.md)
+- [Environment variables](./ENVIRONMENT.md)
 
 ## Explanation
 
