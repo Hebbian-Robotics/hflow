@@ -4,6 +4,11 @@ Thanks for helping make robotics data infrastructure easier to use. This
 project is pre-v1: focused bug reports, documentation fixes, compatibility
 work, and small changes with clear outcomes are especially useful.
 
+New to open-source contribution? GitHub's
+[contributing to a project quickstart](https://docs.github.com/en/get-started/exploring-projects-on-github/contributing-to-a-project)
+covers the fork, branch, and pull request flow this project uses. For
+questions at any point, ask in our [Discord](https://discord.gg/vacepQvjmg).
+
 By submitting a contribution, you agree that it may be distributed under the
 repository's [Apache-2.0 license](./LICENSE).
 

@@ -19,8 +19,11 @@ from mcap_ros2.decoder import DecoderFactory
 
 from hflow.ffmpeg import ffmpeg_path
 from hflow.testing import (
+    JOINT_SINE_MAX_FREQUENCY_HZ,
+    JOINT_SINE_MIN_FREQUENCY_HZ,
     SyntheticEpisodeSpec,
     VideoEpisodeSpec,
+    joint_sine_parameters,
     synthesize_episode,
     write_video_episode,
 )
@@ -60,6 +63,36 @@ def expected_joint_position(joint_index: int, phase_rad: float, time_s: float) -
     if time_s >= DEFAULT_SPEC.joint_jump_at_s:
         position_rad += DEFAULT_SPEC.joint_jump_rad
     return position_rad
+
+
+def test_joint_sine_parameters_are_deterministic_and_span_frequencies() -> None:
+    joint_count = 5
+    first_parameters = joint_sine_parameters(SyntheticEpisodeSpec(seed=42, joint_count=joint_count))
+    second_parameters = joint_sine_parameters(
+        SyntheticEpisodeSpec(seed=42, joint_count=joint_count, duration_s=1.0, cameras=())
+    )
+
+    assert first_parameters == second_parameters
+
+    frequencies_hz = [frequency_hz for frequency_hz, _phase_rad in first_parameters]
+    expected_frequency_step_hz = (JOINT_SINE_MAX_FREQUENCY_HZ - JOINT_SINE_MIN_FREQUENCY_HZ) / (
+        joint_count - 1
+    )
+    assert frequencies_hz[0] == JOINT_SINE_MIN_FREQUENCY_HZ
+    assert frequencies_hz[-1] == JOINT_SINE_MAX_FREQUENCY_HZ
+    assert [
+        frequencies_hz[index + 1] - frequencies_hz[index] for index in range(joint_count - 1)
+    ] == pytest.approx([expected_frequency_step_hz] * (joint_count - 1))
+    assert all(0.0 <= phase_rad < 2.0 * math.pi for _frequency_hz, phase_rad in first_parameters)
+
+
+def test_joint_sine_parameters_single_joint_uses_minimum_frequency() -> None:
+    parameters = joint_sine_parameters(SyntheticEpisodeSpec(seed=42, joint_count=1))
+
+    assert len(parameters) == 1
+    frequency_hz, phase_rad = parameters[0]
+    assert frequency_hz == JOINT_SINE_MIN_FREQUENCY_HZ
+    assert 0.0 <= phase_rad < 2.0 * math.pi
 
 
 def test_joint_states_round_trip(decoded_messages_by_topic: DecodedMessagesByTopic) -> None:

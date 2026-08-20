@@ -1,8 +1,9 @@
 name: welcome
 
-# Comments on the first issue and the first pull request a contributor opens.
-# Hand-rolled instead of actions/first-interaction, whose isFirstPullRequest()
-# does not filter by creator and therefore greets repeat contributors.
+# Comments once on a contributor's first interaction — their first issue or
+# pull request, whichever comes first, never both. Hand-rolled instead of
+# actions/first-interaction, whose isFirstPullRequest() does not filter by
+# creator and therefore greets repeat contributors.
 # pull_request_target is safe here: the job never checks out PR code.
 
 on:
@@ -37,13 +38,10 @@ jobs:
               state: 'all',
               per_page: 100,
             })
-            const sameTypeCount = authoredItems.filter(
-              (item) => Boolean(item.pull_request) === isPullRequest,
-            ).length
-
-            // The just-opened item is included in the listing, so 1 means first.
-            if (sameTypeCount > 1) {
-              core.info(`@${author} has ${sameTypeCount} ${isPullRequest ? 'PRs' : 'issues'}; not their first.`)
+            // The just-opened item is included in the listing, so 1 means this
+            // is the author's first interaction of any kind (issue or PR).
+            if (authoredItems.length > 1) {
+              core.info(`@${author} has ${authoredItems.length} issues/PRs; not their first interaction.`)
               return
             }
 
@@ -53,8 +51,11 @@ jobs:
               'A maintainer will review your pull request as soon as possible. In the meantime:',
               '',
               '- ⭐ Star the repo: https://github.com/Hebbian-Robotics/hflow',
+              '- 💬 Join our Discord: https://discord.gg/vacepQvjmg',
               '- 📖 Check [CONTRIBUTING.md](https://github.com/Hebbian-Robotics/hflow/blob/main/CONTRIBUTING.md) for the validation commands CI will run',
               '- 📣 Share the project with your network',
+              '',
+              '💡 Tip: one open pull request per contributor at a time. Issues with an assignee are taken; everything else is fair game.',
               '',
               'We are excited to have you here and appreciate your help making the project better! 🙌',
             ].join('\n')
@@ -67,6 +68,7 @@ jobs:
               'In the meantime, feel free to:',
               '',
               '- ⭐ Star the repo: https://github.com/Hebbian-Robotics/hflow',
+              '- 💬 Join our Discord: https://discord.gg/vacepQvjmg',
               '- 🛠️ Browse the [good first issues](https://github.com/Hebbian-Robotics/hflow/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) if you would like to contribute',
               '- 📣 Share the project with your network',
               '',

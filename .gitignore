@@ -12,3 +12,6 @@ __pycache__/
 # Default data root for pipelines and the quickstart example (user data,
 # never source).
 data/
+
+# Local maintainer tooling (agent skills, settings); not part of the public repo.
+.claude/

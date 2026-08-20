@@ -16,6 +16,7 @@ from hflow.runtime._deploy import DEFAULT_DEPLOY_VENV_PYTHON
 from hflow.steps import RUN_PROFILES
 
 DEFAULT_DATA_ROOT = Path("./data")
+DEFAULT_CATALOG_DIR = "./data/catalog"
 DEFAULT_BUNDLE_DIR = DEFAULT_DATA_ROOT / "runtime"
 DEFAULT_DEPLOY_OUTPUT_DIR = Path("./deploy")
 
@@ -47,8 +48,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     curate_parser.add_argument(
         "--catalog",
-        default="./data/catalog",
-        help="catalog directory or object-store prefix (default: ./data/catalog)",
+        default=DEFAULT_CATALOG_DIR,
+        help=f"catalog directory or object-store prefix (default: {DEFAULT_CATALOG_DIR})",
     )
     curate_parser.add_argument(
         "--output",
@@ -69,8 +70,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     stale_parser.add_argument(
         "--catalog",
-        default="./data/catalog",
-        help="catalog directory or object-store prefix (default: ./data/catalog)",
+        default=DEFAULT_CATALOG_DIR,
+        help=f"catalog directory or object-store prefix (default: {DEFAULT_CATALOG_DIR})",
     )
     stale_group = stale_parser.add_mutually_exclusive_group(required=True)
     stale_group.add_argument(
@@ -299,11 +300,15 @@ def _command_stale(arguments: argparse.Namespace) -> int:
     else:
         pipeline_version = arguments.pipeline_version
 
-    stale = stale_episodes(
-        arguments.catalog,
-        pipeline_version=pipeline_version,
-        schema_version=schema_version,
-    )
+    try:
+        stale = stale_episodes(
+            arguments.catalog,
+            pipeline_version=pipeline_version,
+            schema_version=schema_version,
+        )
+    except (ValueError, FileNotFoundError) as error:
+        print(f"stale: {error}", file=sys.stderr)
+        return 2
     for episode in stale:
         print(episode.source_uri if episode.source_uri is not None else episode.uri)
     print(
@@ -470,22 +475,38 @@ def _command_status(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _command_curate(arguments: argparse.Namespace) -> int:
+    if (arguments.sql is None) == (arguments.sql_file is None):
+        print("curate: pass exactly one of a SQL string or --sql-file", file=sys.stderr)
+        return 2
+    try:
+        sql = arguments.sql if arguments.sql is not None else arguments.sql_file.read_text()
+        report = curate(arguments.catalog, sql, output=arguments.output)
+    except (ValueError, FileNotFoundError) as error:
+        print(f"curate: {error}", file=sys.stderr)
+        return 2
+    print(report.summary())
+    return 0
+
+
+def _command_doctor(arguments: argparse.Namespace) -> int:
+    try:
+        doctor_report = diagnose(arguments.file)
+    except (ValueError, FileNotFoundError) as error:
+        print(f"doctor: {error}", file=sys.stderr)
+        return 2
+    print(doctor_report.summary())
+    return 0 if doctor_report.conforming else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = _build_parser().parse_args(argv)
     if arguments.command == "curate":
-        if (arguments.sql is None) == (arguments.sql_file is None):
-            print("curate: pass exactly one of a SQL string or --sql-file", file=sys.stderr)
-            return 2
-        sql = arguments.sql if arguments.sql is not None else arguments.sql_file.read_text()
-        report = curate(arguments.catalog, sql, output=arguments.output)
-        print(report.summary())
-        return 0
+        return _command_curate(arguments)
     if arguments.command == "stale":
         return _command_stale(arguments)
     if arguments.command == "doctor":
-        doctor_report = diagnose(arguments.file)
-        print(doctor_report.summary())
-        return 0 if doctor_report.conforming else 1
+        return _command_doctor(arguments)
     if arguments.command == "up":
         return _command_up(arguments)
     if arguments.command == "deploy":

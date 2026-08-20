@@ -83,3 +83,35 @@ def test_cli_doctor_exit_codes(
     bogus.write_bytes(b"nope")
     assert cli_main(["doctor", str(bogus)]) == 1
     assert "NOT CONFORMING" in capsys.readouterr().out
+
+
+def test_cli_doctor_missing_file_prints_one_line(capsys: pytest.CaptureFixture[str]) -> None:
+    missing = "C:/definitely/not/here.mcap"
+    assert cli_main(["doctor", missing]) == 2
+    captured = capsys.readouterr()
+    assert "doctor:" in captured.err
+    assert "No such file or directory" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_cli_curate_bad_catalog_prints_one_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bad_catalog = tmp_path / "not-a-catalog"
+    bad_catalog.mkdir()
+    assert (
+        cli_main(
+            [
+                "curate",
+                "SELECT 1",
+                "--catalog",
+                str(bad_catalog),
+                "--output",
+                str(tmp_path / "m.parquet"),
+            ]
+        )
+        == 2
+    )
+    captured = capsys.readouterr()
+    assert "curate:" in captured.err
+    assert "Traceback" not in captured.err
