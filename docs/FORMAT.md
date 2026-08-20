@@ -121,7 +121,7 @@ Stored-data identifiers (metadata record names, their keys, group names) are **n
 
 A file claiming this convention must satisfy, in increasing strictness:
 
-1. **It is valid MCAP**: readable by the stock [`mcap` package](https://mcap.dev/docs/python) with CRC validation on, with a complete summary section.
+1. **It is valid MCAP**: readable by the stock [`mcap` package](https://mcap.dev/docs/python/) with CRC validation on, with a complete summary section.
 2. **It opens in the standard viewers**: [Foxglove](https://foxglove.dev/) and [Rerun](https://rerun.io/). Opening in both is the acceptance test for every file the pipeline writes.
 3. **Chunk purity**: for every `ChunkIndex`, the channel IDs in `message_index_offsets` belong to exactly one group; each group's chunk sequence is time-ordered.
 4. **Video constraints**: every `foxglove.CompressedVideo` message is one Annex B access unit beginning with an AUD; every IDR access unit contains SPS and PPS; no B-frames; `format="h264"`.
@@ -133,6 +133,6 @@ a conforming file or 1 when it reports violations.
 ## References
 
 - Dyna Robotics, [Training Dyna-2 at million-hour scale, repeatably](https://www.dyna.co/research/dyna-2-infrastructure) (the primary source)
-- [MCAP specification](https://mcap.dev/spec) and [Python libraries](https://mcap.dev/docs/python)
+- [MCAP specification](https://mcap.dev/spec) and [Python libraries](https://mcap.dev/docs/python/)
 - [foxglove.CompressedVideo schema](https://docs.foxglove.dev/docs/sdk/schemas/compressed-video)
 - [Architecture](./ARCHITECTURE.md): the full design this format serves, with per-decision provenance

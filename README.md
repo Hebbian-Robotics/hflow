@@ -210,7 +210,7 @@ Primary source:
 
 Formats and tooling this project builds on:
 
-- [MCAP specification](https://mcap.dev/spec) and [Python libraries](https://mcap.dev/docs/python) (Foxglove)
+- [MCAP specification](https://mcap.dev/spec) and [Python libraries](https://mcap.dev/docs/python/) (Foxglove)
 - [foxglove.CompressedVideo schema](https://docs.foxglove.dev/docs/sdk/schemas/compressed-video): in-band H.264/H.265/VP9/AV1 video in MCAP
 - [Apache Airflow 3](https://airflow.apache.org/): ingestion DAG orchestration
 - [DuckDB](https://duckdb.org/): curation queries over the Parquet catalog
