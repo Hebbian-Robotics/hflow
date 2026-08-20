@@ -22,6 +22,18 @@ You need:
 - Docker with Compose v2 only when working on the Airflow runtime integration
 - [lychee](https://github.com/lycheeverse/lychee) when editing Markdown links
 
+## Platform Support
+
+**Linux & macOS**: Fully supported for native development.
+
+**Windows**: The hflow project has Unix-specific dependencies (`fcntl` for file locking) and does not currently support native Windows development.
+
+Windows users should use one of:
+- **WSL2 (Recommended)**: Follow the standard setup steps inside WSL2 with an Ubuntu distribution
+- **Docker Desktop**: Run development inside a container with a pre-configured Linux environment
+
+For WSL2, ensure virtualization is enabled in your BIOS before proceeding with the setup steps below.
+
 Clone the repository and create the locked development environment:
 
 ```bash
