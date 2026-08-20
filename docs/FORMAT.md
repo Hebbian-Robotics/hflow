@@ -124,12 +124,37 @@ A file claiming this convention must satisfy, in increasing strictness:
 1. **It is valid MCAP**: readable by the stock [`mcap` package](https://mcap.dev/docs/python/) with CRC validation on, with a complete summary section.
 2. **It opens in the standard viewers**: [Foxglove](https://foxglove.dev/) and [Rerun](https://rerun.io/). Opening in both is the acceptance test for every file the pipeline writes.
 3. **Chunk purity**: for every `ChunkIndex`, the channel IDs in `message_index_offsets` belong to exactly one group; each group's chunk sequence is time-ordered.
-4. **Video constraints**: every `foxglove.CompressedVideo` message is one Annex B access unit beginning with an AUD; every IDR access unit contains SPS and PPS; no B-frames; `format="h264"`.
+4. **Video constraints**: every `foxglove.CompressedVideo` message is one Annex B access unit beginning with an AUD; every IDR access unit contains SPS and PPS; `format="h264"`. **No B-frames** is also part of this convention (see [In-band video](#in-band-video) above), but `hflow doctor` does not currently detect B-frames -- it is not yet one of the checks below.
 5. **Stamps**: `provenance/v1` present with `schema_version` and `pipeline_version`.
 
-`hflow doctor <file.mcap> [more.mcap ...]` executes these checks against every
-file given, printing one report each, and exits with status 0 when all files
-conform or 1 when any reports violations.
+`hflow doctor <file.mcap> [more.mcap ...]` executes the checks below against
+every file given, printing one report each, and exits with status 0 when all
+files conform or 1 when any reports violations.
+
+### Doctor finding codes
+
+Every code `hflow doctor` can emit, with its level and meaning. `error` breaks
+the convention; `warning` is legal but deviates from the defaults this project
+writes.
+
+| Code | Level | Meaning |
+|---|---|---|
+| `unreadable` | error | The file does not parse as MCAP. |
+| `no-summary` | error | No summary section: the file is unindexed or truncated. |
+| `no-statistics` | error | The summary has no `Statistics` record. |
+| `no-chunk-indexes` | error | No `ChunkIndex` records: the file is unchunked or unindexed. |
+| `chunk-missing-message-indexes` | error | A chunk has no `MessageIndex` records. |
+| `chunk-mixes-video-and-state` | warning | A chunk's channels span both a video group and a non-video group; the default convention keeps them separate (a custom `topic_groups` assignment can do this legally). |
+| `missing-provenance` | error | No `provenance/v1` metadata record (version stamps). |
+| `provenance-missing-key` | error | `provenance/v1` is missing `schema_version` or `pipeline_version`. |
+| `missing-episode-record` | warning | No `episode/v1` metadata record (task/operator/success semantics live there). |
+| `topic-time-order` | error | A channel's `log_time` decreases between consecutive messages. |
+| `video-format` | error | A `foxglove.CompressedVideo` message's `format` is not `"h264"`. |
+| `video-not-aud-delimited` | error | A video payload does not parse as an AUD-delimited Annex B stream. |
+| `video-multiple-access-units` | error | A video message contains more than one Annex B access unit; the convention requires exactly one decodable frame per message. |
+| `video-keyframe-missing-parameter-sets` | error | A keyframe access unit has no SPS/PPS. |
+| `video-stream-starts-mid-gop` | error | A video stream's first message is not a keyframe, so it is not decodable from the start. |
+| `read-failed` | error | Reading messages failed, e.g. a corrupt chunk or bad CRC. |
 
 ## References
 
