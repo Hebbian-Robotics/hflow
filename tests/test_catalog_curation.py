@@ -473,6 +473,86 @@ def test_crash_repaired_append_keeps_one_recorded_at_across_tables(tmp_path: Pat
         connection.close()
 
 
+def test_concurrent_append_of_the_identical_outcome_keeps_one_recorded_at(
+    tmp_path: Path,
+) -> None:
+    """Two callers racing ``append_episode`` for the identical outcome (a
+    retried or duplicate-dispatched batch task, not a crash) must not split
+    one outcome's tables across two different recorded_at values.
+
+    Before the fix, a dependent table that lost its create-if-absent race
+    was unconditionally deleted and rewritten with the losing caller's OWN
+    recorded_at, independently per table -- so the caller that ultimately
+    won ``episodes`` (the durability marker) could end up with dependents
+    stamped by the OTHER caller, and different dependent tables could even
+    disagree with each other.
+    """
+    import threading
+
+    import duckdb
+
+    canonical = _fake_canonical(tmp_path)
+    catalog = Catalog(tmp_path / "catalog")
+    row = _check_row()
+
+    # A storage-boundary test double: gate the first two dependent-table
+    # writes on a barrier so both threads are guaranteed to reach
+    # append_episode's dependent-write loop at the same time, forcing the
+    # real interleaving a natural race only produces intermittently.
+    barrier = threading.Barrier(2)
+    released = 0
+    release_lock = threading.Lock()
+    real_location = catalog.location
+
+    class GatedLocation:
+        def __getattr__(self, name: str) -> object:
+            return getattr(real_location, name)
+
+        def store_file_if_absent(self, local_file: Path, relative: str) -> bool:
+            nonlocal released
+            with release_lock:
+                released += 1
+                should_wait = released <= 2
+            if should_wait:
+                barrier.wait(timeout=5)
+            return real_location.store_file_if_absent(local_file, relative)
+
+    catalog.location = cast("hflow.storage.StorageRoot", GatedLocation())
+
+    results: dict[str, hflow.catalog.AppendResult] = {}
+
+    def append_same_outcome(label: str) -> None:
+        results[label] = catalog.append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[row],
+        )
+
+    threads = [threading.Thread(target=append_same_outcome, args=(label,)) for label in "AB"]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert {result.written for result in results.values()} == {True, False}
+    stem = f"{results['A'].episode_id}-{results['A'].run_fingerprint}"
+
+    connection = duckdb.connect()
+    try:
+        timestamps = set()
+        for table_name in ("episodes", "check_runs", "measurements", "tags", "intervals"):
+            table_file = tmp_path / "catalog" / table_name / f"{stem}.parquet"
+            assert table_file.is_file(), f"{table_name} file missing after the race"
+            rows = connection.execute(
+                f"SELECT DISTINCT CAST(recorded_at AS VARCHAR) FROM read_parquet('{table_file}')"
+            ).fetchall()
+            timestamps.update(value for (value,) in rows)
+        assert len(timestamps) == 1, f"mixed recorded_at across tables: {timestamps}"
+    finally:
+        connection.close()
+
+
 def test_curate_accepts_file_url_output(tmp_path: Path) -> None:
     catalog = Catalog(tmp_path / "catalog")
     canonical = tmp_path / "e.canonical.mcap"
