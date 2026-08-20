@@ -226,6 +226,33 @@ def test_up_honors_bundle_dir_and_hflow_source(
     assert compose_calls[0][0] == str(bundle_dir / "docker-compose.yaml")
 
 
+def test_up_from_published_install_uses_matching_distribution(
+    compose_calls: list[list[str]],
+    healthy_client: None,
+    pipeline_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("hflow.runtime.infer_hflow_source", lambda: None)
+    bundle_dir = tmp_path / "published-bundle"
+    exit_code = main(
+        [
+            "up",
+            "--pipeline",
+            str(pipeline_file),
+            "--data-root",
+            str(tmp_path / "data"),
+            "--bundle-dir",
+            str(bundle_dir),
+        ]
+    )
+    assert exit_code == 0
+    compose_text = (bundle_dir / "docker-compose.yaml").read_text()
+    assert f"hflow_install_target='hflow=={hflow.__version__}'" in compose_text
+    assert ":/opt/hflow-src:ro" not in compose_text
+    assert compose_calls == [[str(bundle_dir / "docker-compose.yaml"), "up", "--detach"]]
+
+
 def test_down_invokes_compose_down(
     compose_calls: list[list[str]], pipeline_file: Path, tmp_path: Path
 ) -> None:

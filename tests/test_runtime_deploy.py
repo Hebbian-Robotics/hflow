@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import hflow
 from hflow.cli import main
 from hflow.runtime._deploy import (
     DEFAULT_DEPLOY_VENV_PYTHON,
@@ -149,7 +150,7 @@ def test_deploy_md_contents(config: DeployConfig, tmp_path: Path) -> None:
     assert "my_pipeline_ingest" in deploy_md
     # The external-python venv's package list (virtualenv preinstalled,
     # pendulum + lazy_object_proxy for the operator's datetime probes).
-    assert "virtualenv pendulum lazy_object_proxy hflow" in deploy_md
+    assert f"virtualenv pendulum lazy_object_proxy hflow=={hflow.__version__}" in deploy_md
     assert "user/requirements.txt" in deploy_md
     # Per-platform placement plus the env var the DAG expects.
     for platform_name in ("Astronomer", "MWAA", "Cloud Composer", "Self-managed"):
@@ -230,7 +231,7 @@ def test_deploy_config_supports_object_store_urls_and_installs_backend(tmp_path:
     paths = render_deploy_bundle(config, tmp_path / "deploy")
     assert config.data_root_uri == "s3://bucket/prefix"
     deploy_md = paths.deploy_md.read_text()
-    assert "hflow[bucket]" in deploy_md
+    assert f"'hflow[bucket]=={hflow.__version__}'" in deploy_md
     assert "HFLOW_MIRROR_DIR" in deploy_md
     for dag_file in paths.sub_dag_files:
         dag_source = dag_file.read_text()

@@ -28,11 +28,13 @@ spool-through-mirror boundary; workers therefore keep the processing core on
 local files without pretending bucket keys have ``pathlib.Path`` semantics.
 """
 
+import shlex
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
 from hflow.runtime._bundle import (
+    hflow_distribution_requirement,
     render_dag_sources,
     sub_dag_id_for_stage,
     warn_if_pipeline_data_root_differs,
@@ -54,7 +56,7 @@ DEFAULT_USER_DIR = "/opt/user"
 # What the external-python venv must contain besides the user's requirements
 # (references/airflow3-notes.md, "External-python": virtualenv preinstalled;
 # pendulum + lazy_object_proxy for the operator's datetime context probes).
-DEPLOY_VENV_BASE_PACKAGES = ("virtualenv", "pendulum", "lazy_object_proxy", "hflow")
+DEPLOY_VENV_BASE_PACKAGES = ("virtualenv", "pendulum", "lazy_object_proxy")
 
 
 def validate_data_root_uri(data_root_uri: str) -> str:
@@ -213,13 +215,11 @@ def _render_deploy_md(config: DeployConfig, *, dag_id: str, requirements_copied:
     sub_dag_list = ", ".join(f"`{sub_dag_id}.py`" for sub_dag_id in sub_dag_ids)
     profile_names = " | ".join(f'"{profile_name}"' for profile_name in RUN_PROFILES)
     pipeline_filename = Path(config.pipeline_file).name
-    # Quoted: zsh globs unquoted brackets and fails with "no matches found".
-    venv_packages = " ".join(
-        "'hflow[bucket]'"
-        if package_name == "hflow" and is_bucket_url(config.data_root_uri)
-        else package_name
-        for package_name in DEPLOY_VENV_BASE_PACKAGES
+    # shlex.quote protects the bucket extra's brackets from shells such as zsh.
+    hflow_requirement = hflow_distribution_requirement(
+        include_bucket_extra=is_bucket_url(config.data_root_uri)
     )
+    venv_packages = " ".join((*DEPLOY_VENV_BASE_PACKAGES, shlex.quote(hflow_requirement)))
     requirements_line = (
         f"{config.venv_python_path.removesuffix('/python')}/pip install -r user/requirements.txt"
         if requirements_copied

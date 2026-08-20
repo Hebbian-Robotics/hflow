@@ -1,0 +1,58 @@
+name: publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          python-version: "3.11"
+      - name: Verify the release tag matches the package version
+        run: |
+          package_version="$(uv version --short)"
+          if [ "${GITHUB_REF_NAME}" != "v${package_version}" ]; then
+            echo "Release tag ${GITHUB_REF_NAME} must equal v${package_version}." >&2
+            exit 1
+          fi
+      - name: Build distributions
+        run: uv build
+      - name: Smoke-test the wheel in a clean environment
+        run: |
+          uv venv --python 3.11 .release-venv
+          wheel_path="$(printf '%s\n' dist/*.whl)"
+          uv pip install --python .release-venv/bin/python "${wheel_path}"
+          .release-venv/bin/hflow --help
+          .release-venv/bin/python scripts/smoke_test_installed_wheel.py
+      - name: Upload distributions for publishing
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/hflow
+    permissions:
+      id-token: write
+    steps:
+      - name: Download built distributions
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Publish distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

@@ -172,9 +172,7 @@ services:
         if [ -f /opt/user/requirements.txt ]; then
           /opt/venvs/user/bin/pip install --no-cache-dir -r /opt/user/requirements.txt
         fi
-        if [ -d /opt/hflow-src ]; then
-          /opt/venvs/user/bin/pip install --no-cache-dir "$$hflow_install_target"
-        fi
+        /opt/venvs/user/bin/pip install --no-cache-dir "$$hflow_install_target"
         # Pre-warm the pinned ffmpeg into the volume-backed cache so the
         # download happens here, under the user's eyes at provision time,
         # instead of stalling the first task. Best-effort (|| true): air-gapped

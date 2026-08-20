@@ -127,9 +127,11 @@ See [storage and durability](./ARCHITECTURE.md#storage-and-durability) and
 
 ## Is HFlow published on PyPI?
 
-Not yet. The current pre-v1 package runs from a source checkout with the locked
-`uv` environment. Follow the [five-minute quickstart](../examples/README.md#five-minute-quickstart)
-for the exact command and expected result.
+Yes. Install the SDK with `uv add hflow`. The Hebbian Robotics project starts
+at version 0.2.0; earlier 0.1.x releases under the same PyPI name belonged to
+an unrelated, inactive project before the name was transferred. Follow the
+[five-minute quickstart](../examples/README.md#five-minute-quickstart) for the
+repository example and its expected result.
 
 ## Where should I start?
 

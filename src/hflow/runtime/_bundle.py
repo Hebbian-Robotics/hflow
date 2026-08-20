@@ -65,6 +65,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+from hflow import __version__
 from hflow.runtime._templates import (
     COMPOSE_TEMPLATE,
     DAG_BUNDLE_CONFIG_LIST_JSON,
@@ -151,8 +152,9 @@ class RuntimeConfig:
         way.
     :param requirements_file: The user's requirements for the task venv;
         ``None`` means only hflow and its dependencies.
-    :param hflow_source: Path to an hflow source checkout to install
-        into the user venv (required until the package is published).
+    :param hflow_source: Optional path to an hflow source checkout to install
+        into the user venv. When omitted, the runtime installs the exact
+        version of the currently running hflow distribution from PyPI.
     :param dag_id: Defaults to ``<pipeline_file stem>_ingest``.
     """
 
@@ -265,16 +267,26 @@ def _bucket_compose_credentials(bucket_url: str) -> tuple[str, str]:
     return "".join(environment_lines), mount_suffix
 
 
+def hflow_distribution_requirement(*, include_bucket_extra: bool) -> str:
+    """Return the exact hflow requirement matching the running SDK."""
+    distribution_name = "hflow[bucket]" if include_bucket_extra else "hflow"
+    return f"{distribution_name}=={__version__}"
+
+
 def _render_compose(data_root: StorageRoot, hflow_source: Path | None, project_name: str) -> str:
     airflow_hflow_source_mount = ""
     venv_init_hflow_source_mount = ""
+    include_bucket_extra = isinstance(data_root, BucketStorageRoot)
+    hflow_install_target = hflow_distribution_requirement(include_bucket_extra=include_bucket_extra)
     if hflow_source is not None:
         # Suffix lines appended after the last unconditional volume entry;
         # indentation differs (x-airflow-common vs the user-venv-init service).
         source_scalar = _compose_path_scalar(hflow_source)
         airflow_hflow_source_mount = f"\n    - '{source_scalar}:/opt/hflow-src:ro'"
         venv_init_hflow_source_mount = f"\n      - '{source_scalar}:/opt/hflow-src:ro'"
-    hflow_install_target = "/opt/hflow-src"
+        hflow_install_target = (
+            "/opt/hflow-src[bucket]" if include_bucket_extra else "/opt/hflow-src"
+        )
     match data_root:
         case LocalStorageRoot(path=host_data_root):
             data_volume_line = (
@@ -293,7 +305,6 @@ def _render_compose(data_root: StorageRoot, hflow_source: Path | None, project_n
             bucket_credentials_env, bucket_credentials_mount = _bucket_compose_credentials(
                 data_root.url
             )
-            hflow_install_target = "/opt/hflow-src[bucket]"
     return COMPOSE_TEMPLATE.substitute(
         project_name=project_name,
         data_volume_line=data_volume_line,
@@ -559,10 +570,10 @@ def render_dag_sources(
 def infer_hflow_source() -> Path | None:
     """The source checkout the imported ``hflow`` package lives in, if any.
 
-    Until the package is published, the user venv installs hflow from a
-    source tree; an editable/source install can supply its own checkout as the
+    An editable/source install can supply its own checkout as the development
     default. Returns ``None`` for a site-packages wheel install (no pyproject
-    above the package).
+    above the package), which makes the runtime install the same published
+    distribution version instead.
     """
     import hflow
 

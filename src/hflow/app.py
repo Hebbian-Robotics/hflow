@@ -737,11 +737,6 @@ class App:
                     break
 
         resolved_source = Path(hflow_source) if hflow_source is not None else infer_hflow_source()
-        if resolved_source is None:
-            raise RuntimeError(
-                "cannot infer an hflow source checkout to install into the user venv; "
-                "pass app.run(hflow_source='/path/to/hflow')"
-            )
         config = RuntimeConfig(
             pipeline_file=Path(pipeline_file),
             data_root=(

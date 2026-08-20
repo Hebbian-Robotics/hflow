@@ -134,8 +134,8 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "hflow source checkout to install into the user venv "
-            "(default: inferred from the imported hflow package)"
+            "development source checkout to install into the user venv "
+            "(default: inferred for editable installs; otherwise the current published version)"
         ),
     )
     up_parser.add_argument(
@@ -333,13 +333,6 @@ def _command_up(arguments: argparse.Namespace) -> int:
     hflow_source = (
         arguments.hflow_source if arguments.hflow_source is not None else infer_hflow_source()
     )
-    if hflow_source is None:
-        print(
-            "up: cannot infer an hflow source checkout to install into the user venv; "
-            "pass --hflow-source /path/to/hflow",
-            file=sys.stderr,
-        )
-        return 2
     from hflow.storage import is_bucket_url
 
     config = RuntimeConfig(

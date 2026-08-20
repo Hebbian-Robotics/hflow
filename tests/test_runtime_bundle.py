@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 import yaml
 
+import hflow
 from hflow.runtime import BundlePaths, RuntimeConfig, bundle_dag_ids, render_bundle
 from hflow.steps import RUN_PROFILES, Stage
 
@@ -162,13 +163,15 @@ def test_compose_hflow_source_mount_absent_when_unset(
     from dataclasses import replace
 
     paths, compose = _render(replace(config, hflow_source=None), tmp_path / "bundle")
-    # The venv-init script's guarded `if [ -d /opt/hflow-src ]` stays; only
-    # the volume mounts disappear.
     assert ":/opt/hflow-src:ro" not in paths.compose_file.read_text()
     assert compose["services"]["user-venv-init"]["volumes"] == [
         "user-venv:/opt/venvs",
         "./user:/opt/user:ro",
     ]
+    _, script = compose["services"]["user-venv-init"]["command"]
+    assert f"hflow_install_target='hflow=={hflow.__version__}'" in script
+    assert 'pip install --no-cache-dir "$$hflow_install_target"' in script
+    assert "if [ -d /opt/hflow-src ]" not in script
 
 
 def test_compose_depends_on_gates(config: RuntimeConfig, tmp_path: Path) -> None:
@@ -581,6 +584,18 @@ class TestBucketModeBundle:
         # The target joins the content hash so switching a bundle between
         # local and bucket roots rebuilds the venv exactly once.
         assert 'echo "install: $$hflow_install_target"' in script
+
+    def test_published_install_includes_bucket_extra(
+        self, bucket_config: RuntimeConfig, tmp_path: Path
+    ) -> None:
+        from dataclasses import replace
+
+        _, compose = _render(
+            replace(bucket_config, hflow_source=None), tmp_path / "published-bundle"
+        )
+        _, script = compose["services"]["user-venv-init"]["command"]
+        assert f"hflow_install_target='hflow[bucket]=={hflow.__version__}'" in script
+        assert ":/opt/hflow-src:ro" not in str(compose["x-airflow-common"]["volumes"])
 
     def test_dags_render_against_the_bucket_url(
         self, bucket_config: RuntimeConfig, tmp_path: Path
