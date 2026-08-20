@@ -1,4 +1,4 @@
-# The canonical episode format
+# Canonical MCAP episode format
 
 **Version 1**: a convention for training-ready robot episodes in standard [MCAP](https://mcap.dev/spec).
 
@@ -12,7 +12,7 @@ The single overriding rule: **a canonical episode is spec-conforming MCAP.** Eve
 
 - MCAP magic, `Header`, data section, `DataEnd`, summary section, `Footer`, closing magic, per the [MCAP spec](https://mcap.dev/spec).
 - `Header.profile` is the empty string `""` (the file mixes protobuf video channels with pass-through channels of arbitrary encoding, so no single profile applies).
-- `Header.library` is informational only (e.g. `hflow/0.0.0 episode-format/1`). No reader may key behavior off it (see [Identifier rules](#identifier-rules)).
+- `Header.library` is informational only (e.g. `hflow/0.2.0 episode-format/1`). No reader may key behavior off it (see [Identifier rules](#identifier-rules)).
 - Chunks are compressed with **zstd** by default (`"none"` is permitted). Each `Chunk` record carries `uncompressed_crc`; the `Footer` carries a summary CRC.
 - The summary section repeats all `Schema` and `Channel` records and contains `Statistics`, all `ChunkIndex` records, `AttachmentIndex`/`MetadataIndex` records, and `SummaryOffset` records. A canonical episode always has a complete summary; unindexed files are not canonical.
 
@@ -127,8 +127,9 @@ A file claiming this convention must satisfy, in increasing strictness:
 4. **Video constraints**: every `foxglove.CompressedVideo` message is one Annex B access unit beginning with an AUD; every IDR access unit contains SPS and PPS; no B-frames; `format="h264"`.
 5. **Stamps**: `provenance/v1` present with `schema_version` and `pipeline_version`.
 
-`hflow doctor <file.mcap>` executes these checks and exits with status 0 for
-a conforming file or 1 when it reports violations.
+`hflow doctor <file.mcap> [more.mcap ...]` executes these checks against every
+file given, printing one report each, and exits with status 0 when all files
+conform or 1 when any reports violations.
 
 ## References
 
@@ -136,3 +137,4 @@ a conforming file or 1 when it reports violations.
 - [MCAP specification](https://mcap.dev/spec) and [Python libraries](https://mcap.dev/docs/python/)
 - [foxglove.CompressedVideo schema](https://docs.foxglove.dev/docs/sdk/schemas/compressed-video)
 - [Architecture](./ARCHITECTURE.md): the full design this format serves, with per-decision provenance
+- [How HFlow fits the robotics data stack](./INTEGRATIONS.md)

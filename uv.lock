@@ -109,7 +109,7 @@ wheels = [
 
 [[package]]
 name = "hflow"
-version = "0.0.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "duckdb" },
@@ -151,7 +151,7 @@ requires-dist = [
     { name = "mcap-ros2-support", specifier = ">=0.5.7" },
     { name = "numpy", specifier = ">=2.4.6" },
     { name = "obstore", marker = "extra == 'bucket'", specifier = ">=0.10.0" },
-    { name = "openai", marker = "extra == 'openai'", specifier = ">=1.66.0" },
+    { name = "openai", marker = "extra == 'openai'", specifier = ">=3.0.0" },
     { name = "pyarrow", marker = "extra == 'arrow'", specifier = ">=25.0.1" },
     { name = "zstandard", specifier = ">=0.25.0" },
 ]

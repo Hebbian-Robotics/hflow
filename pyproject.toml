@@ -1,11 +1,24 @@
 [project]
 name = "hflow"
-version = "0.0.0"
-description = "Open-source pipeline for processing, quality-checking, enriching, and curating physical-AI episode data"
+version = "0.2.0"
+description = "Open source SDK for building Physical AI data pipelines"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-authors = [{ name = "Hebbian Robotics" }]
+authors = [
+    { name = "Hebbian Robotics" },
+    { name = "Kingston Kuan" },
+    { name = "Brandon Ong" },
+]
+keywords = [
+    "airflow",
+    "data-pipeline",
+    "data-quality",
+    "dataset-curation",
+    "mcap",
+    "physical-ai",
+    "robotics",
+]
 requires-python = ">=3.11"
 dependencies = [
     "duckdb>=1.5.5",
@@ -18,14 +31,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-arrow = [
-    "pyarrow>=25.0.1",
-]
+arrow = ["pyarrow>=25.0.1"]
 # Native object-store data roots (gs://, s3://, az://): obstore is the Rust
 # object_store crate as a single dependency-free wheel; local-path roots
 # never import it.
 bucket = ["obstore>=0.10.0"]
-openai = ["openai>=1.66.0"]
+openai = ["openai>=3.0.0"]
 
 [project.urls]
 Repository = "https://github.com/Hebbian-Robotics/hflow"

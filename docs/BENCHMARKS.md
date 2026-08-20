@@ -1,10 +1,25 @@
-# Benchmarks
+# HFlow MCAP storage and read benchmarks
 
-The efficiency report promised by the design tenets: what the simple version
-actually measures, at honest small scale, against the numbers Dyna published
-at million-hour scale in [Training Dyna-2 at million-hour scale, repeatably](https://www.dyna.co/research/dyna-2-infrastructure)
+These reproducible benchmarks measure the two performance decisions in HFlow's
+canonical MCAP writer: in-band video compression and topic-group chunking.
+They report what the current implementation achieves at honest small scale
+alongside the million-hour results Dyna published in
+[Training Dyna-2 at million-hour scale, repeatably](https://www.dyna.co/research/dyna-2-infrastructure)
 (Figure 3). Every number below comes from a real run of the scripts in
 [`benchmarks/`](../benchmarks); nothing is extrapolated.
+
+## Results at a glance
+
+| Workload | Measured result | Why it matters |
+| --- | --- | --- |
+| Six-camera real footage | **48-50.5% less video payload** than the source JPEG payloads | Quantifies the storage effect without relying on synthetic test patterns |
+| Four-camera synthetic training windows | **2.42x fewer chunk fetches** than per-topic chunking | Shows how grouping topics by read pattern reduces sample assembly work |
+| Six-camera real footage with 8 MB chunks | **2.81x fewer fetches and 3.21x fewer bytes fetched** than per-topic chunking | Demonstrates that chunk size and grouping policy must be tuned together |
+| Selective state scans | Naive schema grouping fetched **230 MB** for a 0.2 MB `/imu` stream | Shows why HFlow exposes per-topic group overrides instead of treating grouping as a fixed schema rule |
+
+These are measurements of specific workloads, not universal performance
+claims. The methodology, caveats, input recording, and reproduction commands
+are included below.
 
 **How to rerun** (each script prints these tables; `--quick` for a fast pass;
 `--input <recording.mcap>` measures a real recording; see the real-footage
@@ -201,8 +216,9 @@ Observations:
 
 Machine: the development box (local NVMe, Linux); ffmpeg: the pinned build
 recorded in each episode's `provenance/v1`; seeds and fixture parameters are
-constants at the top of each script; real-footage runs executed at commit
-`30dced7`. Rerunning reproduces the storage tables byte-for-byte
+constants at the top of each script. These results were included in the
+initial public repository snapshot (`6ab6ef9`). Rerunning reproduces the
+storage tables byte-for-byte
 (deterministic fixtures and encoder settings) and the read tables up to
 wall-clock noise. The real recording is fetched, never vendored; its sha256
 is pinned above.

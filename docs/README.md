@@ -1,7 +1,14 @@
-# Documentation
+# HFlow documentation
 
 HFlow turns landed physical-AI recordings into canonical, quality-checked,
 queryable datasets. Start with the path that matches what you are trying to do.
+
+```text
+MCAP recordings -> transform -> quality checks -> enrichments
+                                        |
+                                        v
+canonical MCAP + provenance + Parquet catalog -> curated manifest
+```
 
 The documentation follows the [Diátaxis](https://diataxis.fr/) model: tutorials
 teach through a complete experience, how-to guides solve a specific task,
@@ -17,6 +24,8 @@ and tradeoffs.
 - **Bring existing processing code:** use the [porting guide](./PORTING.md).
 - **Schedule a working pipeline:** continue with the [runtime guide](./RUNTIME.md).
 - **Find code you can run:** browse the [examples catalog](../examples/README.md).
+- **Understand where HFlow fits:** see the [robotics data stack](./INTEGRATIONS.md).
+- **Get a direct answer:** check the [frequently asked questions](./FAQ.md).
 
 ## Tutorials
 
@@ -61,6 +70,8 @@ These pages explain why the system has its current boundaries.
 - [Architecture and differences from Dyna](./ARCHITECTURE.md)
 - [Benchmark methodology and scale limits](./BENCHMARKS.md)
 - [Why steps use ordinary Python and small adapters](./PORTING.md#the-pattern)
+- [How HFlow fits with MCAP, Airflow, visualization tools, and training formats](./INTEGRATIONS.md)
+- [Frequently asked questions](./FAQ.md)
 
 ## Documentation contract
 

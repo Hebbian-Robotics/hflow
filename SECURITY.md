@@ -2,9 +2,14 @@
 
 ## Supported versions
 
-HFlow is pre-v1 and has no supported release series yet. Security fixes are
-made on the `main` branch. Once releases begin, this section will list the
-supported versions explicitly.
+HFlow is pre-v1. Security fixes are made on the `main` branch and released for
+the latest 0.2.x version when applicable.
+
+| Version | Supported |
+| --- | --- |
+| Latest 0.2.x | Yes |
+| Earlier 0.2.x | No; upgrade to the latest patch release |
+| 0.1.x | Not part of this project; these releases predate the PyPI name transfer |
 
 ## Report a vulnerability privately
 

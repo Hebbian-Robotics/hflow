@@ -1,4 +1,4 @@
-# Running the pipeline
+# Run HFlow pipelines with Airflow
 
 Your pipeline already works: `app.test("episode_0001.mcap")` runs every check
 in-process, in seconds, with no Docker and no scheduler. This page is the
@@ -60,17 +60,17 @@ Two details exist because their absence bites:
   own, and a venv built from your `--requirements` file inside a named
   volume. Every DAG task runs in *your* venv via `@task.external_python`, so
   your dependencies and Airflow's ~128 pins never meet. The venv is keyed to a
-  content hash of your requirements and the HFlow source: unchanged inputs
-  skip the rebuild entirely; a changed requirements file rebuilds exactly
-  once. Provisioning also pre-warms HFlow's pinned ffmpeg into the same
-  volume, so the download happens under your eyes at `up` time instead of
-  stalling the first task (best-effort: air-gapped provisioning still
-  succeeds, and the task-time fallback remains).
+  content hash of your requirements and the exact HFlow install target:
+  unchanged inputs skip the rebuild entirely; a changed requirement or HFlow
+  version rebuilds exactly once. Provisioning also pre-warms HFlow's pinned
+  ffmpeg into the same volume, so the download happens under your eyes at `up`
+  time instead of stalling the first task (best-effort: air-gapped
+  provisioning still succeeds, and the task-time fallback remains).
 
-Pre-v1 source-install note: the task venv installs hflow from a source
-checkout inferred from the imported package. Pass
-`--hflow-source /path/to/hflow` when the checkout cannot be inferred,
-such as when the CLI was launched from an installed wheel.
+When launched from an installed wheel, the task venv installs the exact same
+HFlow version from PyPI. An editable install instead infers its source checkout
+automatically so local changes reach the runtime. Pass
+`--hflow-source /path/to/hflow` only to override that development checkout.
 
 ## The loop
 
@@ -402,5 +402,7 @@ Two consequences to act on:
 - [Architecture](./ARCHITECTURE.md): why the runtime is provisioned, not
   imported; deployment modes; the failure taxonomy behind the gate
 - [Catalog and curation](./CATALOG.md): querying what the runs recorded
+- [How HFlow fits the robotics data stack](./INTEGRATIONS.md): the boundary
+  between HFlow, Airflow, object storage, and downstream tools
 - [`references/airflow3-notes.md`](../references/airflow3-notes.md): the
   cited Airflow 3.3.1 facts the bundle encodes

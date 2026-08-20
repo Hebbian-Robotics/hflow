@@ -1,4 +1,4 @@
-# Runnable examples
+# HFlow runnable examples
 
 Examples are executable documentation. Each one names its prerequisites, gives
 one command to run, and says what successful output looks like.

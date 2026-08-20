@@ -1,4 +1,4 @@
-# Native-video providers
+# Add native-video providers to HFlow
 
 How to add support for a VLM server that accepts video natively, as a separate package, without touching HFlow core.
 

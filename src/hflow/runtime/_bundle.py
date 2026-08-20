@@ -65,6 +65,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+from hflow import __version__
 from hflow.runtime._templates import (
     COMPOSE_TEMPLATE,
     DAG_BUNDLE_CONFIG_LIST_JSON,
@@ -151,8 +152,9 @@ class RuntimeConfig:
         way.
     :param requirements_file: The user's requirements for the task venv;
         ``None`` means only hflow and its dependencies.
-    :param hflow_source: Path to an hflow source checkout to install
-        into the user venv (required until the package is published).
+    :param hflow_source: Optional path to an hflow source checkout to install
+        into the user venv. When omitted, the runtime installs the exact
+        version of the currently running hflow distribution from PyPI.
     :param dag_id: Defaults to ``<pipeline_file stem>_ingest``.
     """
 
@@ -265,16 +267,26 @@ def _bucket_compose_credentials(bucket_url: str) -> tuple[str, str]:
     return "".join(environment_lines), mount_suffix
 
 
+def hflow_distribution_requirement(*, include_bucket_extra: bool) -> str:
+    """Return the exact hflow requirement matching the running SDK."""
+    distribution_name = "hflow[bucket]" if include_bucket_extra else "hflow"
+    return f"{distribution_name}=={__version__}"
+
+
 def _render_compose(data_root: StorageRoot, hflow_source: Path | None, project_name: str) -> str:
     airflow_hflow_source_mount = ""
     venv_init_hflow_source_mount = ""
+    include_bucket_extra = isinstance(data_root, BucketStorageRoot)
+    hflow_install_target = hflow_distribution_requirement(include_bucket_extra=include_bucket_extra)
     if hflow_source is not None:
         # Suffix lines appended after the last unconditional volume entry;
         # indentation differs (x-airflow-common vs the user-venv-init service).
         source_scalar = _compose_path_scalar(hflow_source)
         airflow_hflow_source_mount = f"\n    - '{source_scalar}:/opt/hflow-src:ro'"
         venv_init_hflow_source_mount = f"\n      - '{source_scalar}:/opt/hflow-src:ro'"
-    hflow_install_target = "/opt/hflow-src"
+        hflow_install_target = (
+            "/opt/hflow-src[bucket]" if include_bucket_extra else "/opt/hflow-src"
+        )
     match data_root:
         case LocalStorageRoot(path=host_data_root):
             data_volume_line = (
@@ -293,7 +305,6 @@ def _render_compose(data_root: StorageRoot, hflow_source: Path | None, project_n
             bucket_credentials_env, bucket_credentials_mount = _bucket_compose_credentials(
                 data_root.url
             )
-            hflow_install_target = "/opt/hflow-src[bucket]"
     return COMPOSE_TEMPLATE.substitute(
         project_name=project_name,
         data_volume_line=data_volume_line,
@@ -507,13 +518,25 @@ def render_sub_dag_source(
         case Stage.SYNC | Stage.LABELS | Stage.MEDIA:
             template, gate_name = SUB_DAG_ERROR_GATE_TEMPLATE, "error_budget_gate"
     pipeline_stem = _pipeline_stem(master_dag_id)
+    # $data_root, $venv_python, and $pipeline_filename are substituted as
+    # repr() literals, never as bare text inside a pre-quoted template
+    # slot: a raw platform path (Windows venv interpreters use backslashes)
+    # or a data root containing a quote character would otherwise either
+    # break the generated file's Python syntax or -- worse -- close the
+    # surrounding string literal early and splice arbitrary text into the
+    # generated DAG's source (#44). repr() on a str always yields a
+    # self-escaping literal, so this holds for any input, not just the
+    # platform-path case that surfaced it.
+    data_root_literal = repr(data_root)
+    venv_python_literal = repr(venv_python)
+    pipeline_filename_literal = repr(pipeline_filename)
     # Substituted separately because Template.substitute never re-expands
     # variables inside substituted VALUES -- the filter's own $data_root must
     # be resolved before injection. Local roots only: probing a BUCKET
     # episode's channel list would download the whole file at plan time,
     # costing more than the skipped camera-less cycle saves.
     stage_plan_filter = (
-        MEDIA_PLAN_FILTER_TEMPLATE.substitute(data_root=data_root)
+        MEDIA_PLAN_FILTER_TEMPLATE.substitute(data_root=data_root_literal)
         if stage is Stage.MEDIA and not is_bucket_url(data_root)
         else ""
     )
@@ -526,10 +549,10 @@ def render_sub_dag_source(
         pipeline_tag=pipeline_stem,
         sub_display_name=f"{pipeline_stem} · {stage.value}",
         gate_name=gate_name,
-        pipeline_filename=pipeline_filename,
+        pipeline_filename=pipeline_filename_literal,
         app_variable=app_variable,
-        data_root=data_root,
-        venv_python=venv_python,
+        data_root=data_root_literal,
+        venv_python=venv_python_literal,
         stage_plan_filter=stage_plan_filter,
     )
 
@@ -559,17 +582,26 @@ def render_dag_sources(
 def infer_hflow_source() -> Path | None:
     """The source checkout the imported ``hflow`` package lives in, if any.
 
-    Until the package is published, the user venv installs hflow from a
-    source tree; an editable/source install can supply its own checkout as the
-    default. Returns ``None`` for a site-packages wheel install (no pyproject
-    above the package).
+    An editable/source install can supply its own checkout as the development
+    default. Returns ``None`` for a site-packages wheel install, including a
+    virtual environment created inside an hflow checkout, which makes the
+    runtime install the same published distribution version instead.
     """
     import hflow
 
     package_dir = Path(hflow.__file__).resolve().parent
     for ancestor in package_dir.parents:
         pyproject = ancestor / "pyproject.toml"
-        if pyproject.is_file() and 'name = "hflow"' in pyproject.read_text():
+        source_package_directories = (ancestor / "src" / "hflow", ancestor / "hflow")
+        imported_from_checkout = any(
+            source_package_directory.resolve() == package_dir
+            for source_package_directory in source_package_directories
+        )
+        if (
+            imported_from_checkout
+            and pyproject.is_file()
+            and 'name = "hflow"' in pyproject.read_text()
+        ):
             return ancestor
     return None
 

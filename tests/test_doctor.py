@@ -1,5 +1,6 @@
 """The canonical episode format as an executable conformance check."""
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -83,6 +84,42 @@ def test_cli_doctor_exit_codes(
     bogus.write_bytes(b"nope")
     assert cli_main(["doctor", str(bogus)]) == 1
     assert "NOT CONFORMING" in capsys.readouterr().out
+
+    assert cli_main(["doctor", str(canonical_episode), str(canonical_episode)]) == 0
+    both_conforming = capsys.readouterr().out
+    assert both_conforming.count(str(canonical_episode)) == 2
+    assert "NOT CONFORMING" not in both_conforming
+
+    assert cli_main(["doctor", str(canonical_episode), str(bogus)]) == 1
+    mixed = capsys.readouterr().out
+    assert str(canonical_episode) in mixed
+    assert str(bogus) in mixed
+
+
+def test_cli_logs_library_warning_to_stderr(
+    canonical_episode: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logger = logging.getLogger("hflow.test")
+
+    def diagnose_with_warning(path: Path) -> object:
+        logger.warning("test library warning")
+        return diagnose(path)
+
+    monkeypatch.setattr("hflow.cli.diagnose", diagnose_with_warning)
+
+    root_logger = logging.getLogger()
+    handlers = root_logger.handlers.copy()
+    root_logger.handlers.clear()
+
+    try:
+        assert cli_main(["doctor", str(canonical_episode)]) == 0
+    finally:
+        root_logger.handlers[:] = handlers
+
+    captured = capsys.readouterr()
+    assert "WARNING hflow.test: test library warning" in captured.err
 
 
 def test_cli_doctor_missing_file_prints_one_line(capsys: pytest.CaptureFixture[str]) -> None:

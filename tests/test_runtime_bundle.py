@@ -9,7 +9,9 @@ from typing import Any
 import pytest
 import yaml
 
+import hflow
 from hflow.runtime import BundlePaths, RuntimeConfig, bundle_dag_ids, render_bundle
+from hflow.runtime._bundle import infer_hflow_source
 from hflow.steps import RUN_PROFILES, Stage
 
 AIRFLOW_SERVICE_NAMES = (
@@ -162,13 +164,50 @@ def test_compose_hflow_source_mount_absent_when_unset(
     from dataclasses import replace
 
     paths, compose = _render(replace(config, hflow_source=None), tmp_path / "bundle")
-    # The venv-init script's guarded `if [ -d /opt/hflow-src ]` stays; only
-    # the volume mounts disappear.
     assert ":/opt/hflow-src:ro" not in paths.compose_file.read_text()
     assert compose["services"]["user-venv-init"]["volumes"] == [
         "user-venv:/opt/venvs",
         "./user:/opt/user:ro",
     ]
+    _, script = compose["services"]["user-venv-init"]["command"]
+    assert f"hflow_install_target='hflow=={hflow.__version__}'" in script
+    assert 'pip install --no-cache-dir "$$hflow_install_target"' in script
+    assert "if [ -d /opt/hflow-src ]" not in script
+
+
+def test_infer_hflow_source_ignores_wheel_venv_inside_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout_directory = tmp_path / "hflow-checkout"
+    (checkout_directory / "src" / "hflow").mkdir(parents=True)
+    (checkout_directory / "pyproject.toml").write_text('[project]\nname = "hflow"\n')
+    wheel_package_file = (
+        checkout_directory
+        / ".release-venv"
+        / "lib"
+        / "python3.11"
+        / "site-packages"
+        / "hflow"
+        / "__init__.py"
+    )
+    wheel_package_file.parent.mkdir(parents=True)
+    wheel_package_file.touch()
+    monkeypatch.setattr(hflow, "__file__", str(wheel_package_file))
+
+    assert infer_hflow_source() is None
+
+
+def test_infer_hflow_source_recognizes_imported_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout_directory = tmp_path / "hflow-checkout"
+    source_package_file = checkout_directory / "src" / "hflow" / "__init__.py"
+    source_package_file.parent.mkdir(parents=True)
+    source_package_file.touch()
+    (checkout_directory / "pyproject.toml").write_text('[project]\nname = "hflow"\n')
+    monkeypatch.setattr(hflow, "__file__", str(source_package_file))
+
+    assert infer_hflow_source() == checkout_directory
 
 
 def test_compose_depends_on_gates(config: RuntimeConfig, tmp_path: Path) -> None:
@@ -376,14 +415,14 @@ def test_sub_dag_sources_compile_and_encode_contract(config: RuntimeConfig, tmp_
         assert "schedule=None" in dag_source
         assert 'params={"uris": [], "mode": "batch", "batch_count": None}' in dag_source
         # All three tasks run in the user venv via external python.
-        assert dag_source.count('@task.external_python(python="/opt/venvs/user/bin/python"') == 3
+        assert dag_source.count("@task.external_python(python='/opt/venvs/user/bin/python'") == 3
         # Imports live inside the (indented) function bodies -- the operator
         # extracts each body to a temp file, so module-level names never survive.
         assert "\n        from hflow.batching import plan_batches" in dag_source
         assert "\n        import importlib.util" in dag_source
         assert "\n        import math" in dag_source
         # The user pipeline is imported by file path and app resolved by name.
-        assert '"/opt/user/" + "my_pipeline.py"' in dag_source
+        assert "\"/opt/user/\" + 'my_pipeline.py'" in dag_source
         assert "spec_from_file_location" in dag_source
         assert 'getattr(pipeline_module, "app")' in dag_source
         # Each sub-DAG runs exactly its own Figure 4 stage.
@@ -404,8 +443,12 @@ def test_sub_dag_sources_compile_and_encode_contract(config: RuntimeConfig, tmp_
         assert "batch_counts >> gate" in dag_source
         # The process task authoritatively refuses an app
         # whose data_root is not the in-container mount point.
-        assert 'if str(app.data_root) != "/opt/airflow/data":' in dag_source
-        assert "pipeline data_root must be /opt/airflow/data inside the runtime" in dag_source
+        assert "expected_data_root = '/opt/airflow/data'" in dag_source
+        assert "if str(app.data_root) != expected_data_root:" in dag_source
+        assert (
+            '"pipeline data_root must be " + expected_data_root + " inside the runtime; "'
+            in dag_source
+        )
         # Checks decide quarantine: the quarantine budget lives ONLY in meta;
         # every other stage keeps the error-budget half.
         if stage is Stage.META:
@@ -582,14 +625,27 @@ class TestBucketModeBundle:
         # local and bucket roots rebuilds the venv exactly once.
         assert 'echo "install: $$hflow_install_target"' in script
 
+    def test_published_install_includes_bucket_extra(
+        self, bucket_config: RuntimeConfig, tmp_path: Path
+    ) -> None:
+        from dataclasses import replace
+
+        _, compose = _render(
+            replace(bucket_config, hflow_source=None), tmp_path / "published-bundle"
+        )
+        _, script = compose["services"]["user-venv-init"]["command"]
+        assert f"hflow_install_target='hflow[bucket]=={hflow.__version__}'" in script
+        assert ":/opt/hflow-src:ro" not in str(compose["x-airflow-common"]["volumes"])
+
     def test_dags_render_against_the_bucket_url(
         self, bucket_config: RuntimeConfig, tmp_path: Path
     ) -> None:
         paths, _ = _render(bucket_config, tmp_path / "bundle")
         for sub_dag_file in paths.sub_dag_files:
             dag_source = sub_dag_file.read_text()
-            assert f'parse_storage_root("{self.BUCKET_URL}")' in dag_source
-            assert f'if str(app.data_root) != "{self.BUCKET_URL}":' in dag_source
+            assert f"parse_storage_root({self.BUCKET_URL!r})" in dag_source
+            assert f"expected_data_root = {self.BUCKET_URL!r}" in dag_source
+            assert "if str(app.data_root) != expected_data_root:" in dag_source
         # The media plan filter probes episode channel lists, which would
         # download whole remote files at plan time: bucket bundles omit it.
         media_source = (paths.bundle_dir / "dags" / "ingest_media.py").read_text()

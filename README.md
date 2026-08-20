@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://hebbianrobotics.com">
-    <img src="docs/assets/hebbian-logo-on-black.svg" alt="Hebbian Robotics" width="128">
+    <img src="https://raw.githubusercontent.com/Hebbian-Robotics/hflow/main/docs/assets/hebbian-logo-on-black.svg" alt="Hebbian Robotics" width="128">
   </a>
   <br>
   <strong>Hebbian Robotics (YC S26)</strong>
@@ -8,13 +8,13 @@
 
 <h1 align="center">HFlow</h1>
 
-<p align="center"><strong>Open-source SDK for building Physical AI data pipelines</strong></p>
+<p align="center"><strong>Open source SDK for building Physical AI data pipelines</strong></p>
 
 <p align="center">
   <a href="https://www.ycombinator.com/companies/hebbian-robotics">
     <img src="https://img.shields.io/badge/Y%20Combinator%20-S26-F26522?style=flat-square&logo=ycombinator&logoColor=white" alt="Y Combinator S26">
   </a>
-  <a href="./LICENSE">
+  <a href="https://github.com/Hebbian-Robotics/hflow/blob/main/LICENSE">
     <img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square" alt="Apache 2.0 license">
   </a>
   <a href="https://discord.gg/vacepQvjmg">
@@ -22,7 +22,7 @@
   </a>
 </p>
 
-HFlow provides reusable infrastructure for physical-AI data pipelines. Add your
+HFlow provides reusable infrastructure for physical AI data pipelines. Add your
 existing Python transformations, quality checks, labels, and enrichments; HFlow
 handles the orchestration, storage, versioning, and curation around them.
 
@@ -48,9 +48,17 @@ cameras, teleoperated robots, autonomous policies, and other collection systems
 can all feed the pipeline once their data is represented as a supported MCAP
 episode.
 
-> **Status: pre-v1, with the core lifecycle working end to end.** HFlow is ready to try locally. See [what is implemented](./docs/ARCHITECTURE.md#what-is-different-from-dyna) and [open issues](https://github.com/Hebbian-Robotics/hflow/issues) for current details and remaining work.
+> **Status: pre-v1, with the core lifecycle working end to end.** HFlow is ready to try locally. See [what is implemented](https://github.com/Hebbian-Robotics/hflow/blob/main/docs/ARCHITECTURE.md#what-is-different-from-dyna) and [open issues](https://github.com/Hebbian-Robotics/hflow/issues) for current details and remaining work.
 
-**Help advance open robotics and Physical AI.** [Contributors are welcome](./CONTRIBUTING.md), and no robot hardware is required.
+**Help advance open robotics and Physical AI.** [Contributors are welcome](https://github.com/Hebbian-Robotics/hflow/blob/main/CONTRIBUTING.md), and no robot hardware is required.
+
+| | HFlow's boundary |
+| --- | --- |
+| **Input** | One multimodal episode per standard MCAP file |
+| **Processing** | Your Python transforms, checks, labels, and enrichments |
+| **Execution** | In-process for development; generated Airflow 3 DAGs for scheduled runs |
+| **Durable output** | Canonical MCAP episodes, provenance, artifacts, and a Parquet catalog |
+| **Curation** | DuckDB SQL that writes a version-pinned manifest |
 
 ## What you get
 
@@ -64,7 +72,7 @@ collection --> ingestion ---------------> curation ------> delivery
 ```
 
 <p align="center">
-  <img src="docs/assets/hflow-readme.gif" alt="HFlow pipeline demo" width="960">
+  <img src="https://raw.githubusercontent.com/Hebbian-Robotics/hflow/main/docs/assets/hflow-readme.gif" alt="HFlow pipeline demo" width="960">
 </p>
 
 - **Your processing code stays yours.** Transformations, quality checks, labels, and enrichments are plain Python functions in your own environment. Existing code plugs in through small adapters instead of being rewritten for a proprietary framework.
@@ -99,8 +107,17 @@ For reproducible bugs and scoped feature requests, use
 
 ## Install and try it
 
-HFlow is not published to PyPI yet. Run the pre-v1 package from a source
-checkout with [uv](https://docs.astral.sh/uv/):
+Install the SDK from PyPI with [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv add hflow
+```
+
+The Hebbian Robotics project starts at version 0.2.0. Earlier 0.1.x releases
+under the same PyPI name belonged to an unrelated, inactive project before
+the name was transferred.
+
+To run the repository's bundled quickstart:
 
 ```bash
 git clone https://github.com/Hebbian-Robotics/hflow.git
@@ -119,9 +136,9 @@ uv run python examples/quickstart.py path/to/episode.mcap
 ```
 
 Use `uv run hflow --help` to see the CLI. When you are ready to schedule the
-same pipeline, continue with the [runtime guide](./docs/RUNTIME.md). Developers
-and contributors should start with [CONTRIBUTING.md](./CONTRIBUTING.md). Browse
-the [examples catalog](./examples/README.md) for the egocentric-corpus and
+same pipeline, continue with the [runtime guide](https://github.com/Hebbian-Robotics/hflow/blob/main/docs/RUNTIME.md). Developers
+and contributors should start with [CONTRIBUTING.md](https://github.com/Hebbian-Robotics/hflow/blob/main/CONTRIBUTING.md). Browse
+the [examples catalog](https://github.com/Hebbian-Robotics/hflow/blob/main/examples/README.md) for the egocentric-corpus and
 OpenAI vision paths.
 
 ## What it looks like
@@ -182,7 +199,7 @@ WHERE task = 'fold_napkin'
 
 - **Training.** The pipeline ends at curated, quality-tagged, version-stamped episodes and a manifest. Many users filter data to deliver or sell it, not to train on it. (Converters to training formats such as [LeRobot](https://github.com/huggingface/lerobot) are planned as a separate, standalone package.)
 - **Maximum flexibility.** Robotics/physical-AI data is the narrative and the constraint budget: one canonical episode format, coarse-grained steps, and opinionated defaults are features.
-- **Million-hour throughput.** The [benchmark report](./docs/BENCHMARKS.md) documents honestly what the simple version achieves and where it falls over.
+- **Million-hour throughput.** The [benchmark report](https://github.com/Hebbian-Robotics/hflow/blob/main/docs/BENCHMARKS.md) documents honestly what the simple version achieves and where it falls over.
 
 ## Requirements
 
@@ -195,12 +212,14 @@ WHERE task = 'fold_napkin'
 
 ## Documentation
 
-- [Documentation home](./docs/README.md): start by task, then choose a tutorial, how-to guide, reference, or explanation
-- [Runnable examples](./examples/README.md): exact commands, prerequisites, expected output, and links to the relevant guides
-- [Architecture and differences from Dyna](./docs/ARCHITECTURE.md): the implemented, simplified, deferred, and out-of-scope matrix
-- [Call OpenAI vision from a step](./docs/how-to/call-openai-vision.md): a focused guide linked to a complete executable pipeline
-- [Contributing](./CONTRIBUTING.md): development setup, validation commands, test gates, and pull-request expectations
-- [Security policy](./SECURITY.md): supported versions and private vulnerability reporting
+- [Documentation home](https://github.com/Hebbian-Robotics/hflow/blob/main/docs/README.md): start by task, then choose a tutorial, how-to guide, reference, or explanation
+- [Frequently asked questions](https://github.com/Hebbian-Robotics/hflow/blob/main/docs/FAQ.md): formats, infrastructure, scale, project scope, and current release status
+- [How HFlow fits the robotics data stack](https://github.com/Hebbian-Robotics/hflow/blob/main/docs/INTEGRATIONS.md): MCAP, Airflow, Foxglove, Rerun, DuckDB, object storage, and training formats
+- [Runnable examples](https://github.com/Hebbian-Robotics/hflow/blob/main/examples/README.md): exact commands, prerequisites, expected output, and links to the relevant guides
+- [Architecture and differences from Dyna](https://github.com/Hebbian-Robotics/hflow/blob/main/docs/ARCHITECTURE.md): the implemented, simplified, deferred, and out-of-scope matrix
+- [Call OpenAI vision from a step](https://github.com/Hebbian-Robotics/hflow/blob/main/docs/how-to/call-openai-vision.md): a focused guide linked to a complete executable pipeline
+- [Contributing](https://github.com/Hebbian-Robotics/hflow/blob/main/CONTRIBUTING.md): development setup, validation commands, test gates, and pull-request expectations
+- [Security policy](https://github.com/Hebbian-Robotics/hflow/blob/main/SECURITY.md): supported versions and private vulnerability reporting
 
 ## References
 
@@ -221,4 +240,4 @@ Parts of the durability and measurement design draw on production experience fro
 
 ## License
 
-[Apache-2.0](./LICENSE)
+[Apache-2.0](https://github.com/Hebbian-Robotics/hflow/blob/main/LICENSE)

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import hflow
 from hflow.cli import main
 from hflow.runtime._deploy import (
     DEFAULT_DEPLOY_VENV_PYTHON,
@@ -91,15 +92,23 @@ def test_dag_sources_compile_and_carry_deploy_values(config: DeployConfig, tmp_p
         assert f'stages={{"{stage.value}"}}' in dag_source
         # The data root is parsed through the shared storage boundary for size
         # planning, while processing chooses a Path or full bucket URI.
-        assert f'data_root = parse_storage_root("{DATA_ROOT_PATH}")' in dag_source
+        # Substituted as a repr() literal (not bare text in a pre-quoted
+        # slot), so this holds for any data root content, not just this
+        # plain-path case -- see
+        # test_dag_sources_survive_paths_that_are_not_valid_python_literals.
+        assert f"data_root = parse_storage_root({DATA_ROOT_PATH!r})" in dag_source
         assert "episode_reference = (" in dag_source
-        assert f'if str(app.data_root) != "{DATA_ROOT_PATH}":' in dag_source
-        assert f"pipeline data_root must be {DATA_ROOT_PATH} inside the runtime" in dag_source
+        assert f"expected_data_root = {DATA_ROOT_PATH!r}" in dag_source
+        assert "if str(app.data_root) != expected_data_root:" in dag_source
+        assert (
+            '"pipeline data_root must be " + expected_data_root + " inside the runtime; "'
+            in dag_source
+        )
         assert "/opt/airflow/data" not in dag_source
         # All three tasks point at the (default) deploy venv interpreter.
-        assert dag_source.count(f'@task.external_python(python="{DEFAULT_DEPLOY_VENV_PYTHON}"') == 3
+        assert dag_source.count(f"@task.external_python(python={DEFAULT_DEPLOY_VENV_PYTHON!r}") == 3
         # The pipeline loads from user/, relocatable per platform via env var.
-        assert '"/opt/user/" + "my_pipeline.py"' in dag_source
+        assert "\"/opt/user/\" + 'my_pipeline.py'" in dag_source
         assert 'os.environ.get("HFLOW_USER_DIR")' in dag_source
 
 
@@ -112,10 +121,45 @@ def test_dag_sources_honor_custom_venv_python(config: DeployConfig, tmp_path: Pa
         dag_source = sub_dag_file.read_text()
         compile(dag_source, str(sub_dag_file), "exec")
         assert (
-            dag_source.count('@task.external_python(python="/home/airflow/venvs/tasks/bin/python"')
+            dag_source.count("@task.external_python(python='/home/airflow/venvs/tasks/bin/python'")
             == 3
         )
         assert DEFAULT_DEPLOY_VENV_PYTHON not in dag_source
+
+
+def test_dag_sources_survive_paths_that_are_not_valid_python_literals(
+    config: DeployConfig, tmp_path: Path
+) -> None:
+    """A Windows venv interpreter path or a data root containing a quote
+    character must not corrupt the generated DAG source (#44): every value
+    substituted into the templates is embedded as a repr() literal, which is
+    always self-escaping, rather than as bare text inside a pre-quoted slot.
+
+    Before the fix, the backslashes below produced a `SyntaxError` for every
+    sub-DAG (`\\U` reads as a truncated unicode escape) with nothing
+    surfacing the failure to whoever ran `hflow deploy`; a `data_root`
+    containing `"` closed the surrounding string literal early instead.
+    """
+    windows_venv_python = r"C:\Users\ci\venvs\user\Scripts\python.exe"
+    quote_bearing_data_root = '/data/root", os.system("unexpected"); x = ("'
+    paths = _render(
+        replace(
+            config,
+            venv_python_path=windows_venv_python,
+            data_root_uri=quote_bearing_data_root,
+        ),
+        tmp_path / "deploy",
+    )
+    for sub_dag_file in paths.sub_dag_files:
+        dag_source = sub_dag_file.read_text()
+        compile(dag_source, str(sub_dag_file), "exec")
+        assert dag_source.count(f"@task.external_python(python={windows_venv_python!r}") == 3
+        # The whole crafted value round-trips as one repr() literal -- if the
+        # embedded quote had broken out of the intended string instead, this
+        # exact substring would not appear (and `compile()` above would
+        # either have raised or accepted a different, corrupted program).
+        assert f"data_root = parse_storage_root({quote_bearing_data_root!r})" in dag_source
+        assert f"expected_data_root = {quote_bearing_data_root!r}" in dag_source
 
 
 def test_dag_id_default_rule_and_override(config: DeployConfig, tmp_path: Path) -> None:
@@ -149,7 +193,7 @@ def test_deploy_md_contents(config: DeployConfig, tmp_path: Path) -> None:
     assert "my_pipeline_ingest" in deploy_md
     # The external-python venv's package list (virtualenv preinstalled,
     # pendulum + lazy_object_proxy for the operator's datetime probes).
-    assert "virtualenv pendulum lazy_object_proxy hflow" in deploy_md
+    assert f"virtualenv pendulum lazy_object_proxy hflow=={hflow.__version__}" in deploy_md
     assert "user/requirements.txt" in deploy_md
     # Per-platform placement plus the env var the DAG expects.
     for platform_name in ("Astronomer", "MWAA", "Cloud Composer", "Self-managed"):
@@ -230,11 +274,11 @@ def test_deploy_config_supports_object_store_urls_and_installs_backend(tmp_path:
     paths = render_deploy_bundle(config, tmp_path / "deploy")
     assert config.data_root_uri == "s3://bucket/prefix"
     deploy_md = paths.deploy_md.read_text()
-    assert "hflow[bucket]" in deploy_md
+    assert f"'hflow[bucket]=={hflow.__version__}'" in deploy_md
     assert "HFLOW_MIRROR_DIR" in deploy_md
     for dag_file in paths.sub_dag_files:
         dag_source = dag_file.read_text()
-        assert 'parse_storage_root("s3://bucket/prefix")' in dag_source
+        assert "parse_storage_root('s3://bucket/prefix')" in dag_source
         assert "is_bucket_url(data_root)" in dag_source
 
 
@@ -326,7 +370,7 @@ def test_cli_deploy_honors_requirements_and_venv_python(tmp_path: Path) -> None:
     assert exit_code == 0
     assert (output_dir / "user" / "requirements.txt").read_text() == "scipy>=1\n"
     dag_source = (output_dir / "dags" / "demo_pipeline_meta.py").read_text()
-    assert dag_source.count('@task.external_python(python="/custom/venv/bin/python"') == 3
+    assert dag_source.count("@task.external_python(python='/custom/venv/bin/python'") == 3
 
 
 def test_cli_deploy_rejects_relative_data_root(

@@ -1,4 +1,4 @@
-# Porting your existing QC code
+# Add existing robotics quality checks to HFlow
 
 You already have a script that checks joint limits, or flags dark frames, or asks a VLM whether the gripper reached the towel. This page shows how to run it inside HFlow **without rewriting it**: your function stays untouched, and two or three of our lines extract the input it already expects and record what it returns.
 
@@ -236,5 +236,7 @@ both paths.
 - [Documentation home](./README.md): choose a tutorial, how-to guide, reference, or explanation
 - [Runnable examples](../examples/README.md): commands, prerequisites, and expected output
 - [OpenAI vision how-to](./how-to/call-openai-vision.md): a complete Responses API check
+- [How HFlow fits the robotics data stack](./INTEGRATIONS.md): which responsibilities stay in HFlow and which stay in surrounding tools
+- [Frequently asked questions](./FAQ.md): direct answers about formats, infrastructure, and project scope
 - [Architecture](./ARCHITECTURE.md): the full design, with per-decision provenance
 - [`examples/quickstart.py`](../examples/quickstart.py): the pattern on a synthetic episode, runnable today

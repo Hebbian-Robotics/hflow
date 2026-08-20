@@ -6,6 +6,7 @@ import pytest
 
 import hflow
 from hflow.checks import (
+    action_rate,
     camera_frame_stats,
     content_digest,
     episode_duration,
@@ -121,6 +122,14 @@ def test_episode_duration_matches_the_synthesized_span(jittery_episode: hflow.Ep
     assert isinstance(message_count_total, int) and message_count_total > 0
 
 
+def test_action_rate_matches_the_synthesized_rate(jittery_episode: hflow.Episode) -> None:
+    result = action_rate(jittery_episode, topics=["/joint_states"])
+    action_rate_hz = result.measurements["action_rate_hz"]
+    assert isinstance(action_rate_hz, float)
+    # the synthetic joint stream runs at 100 Hz by SyntheticEpisodeSpec default
+    assert action_rate_hz == pytest.approx(100.0, abs=0.5)
+
+
 def test_content_digest_identifies_duplicate_content(tmp_path: Path) -> None:
     spec = SyntheticEpisodeSpec(duration_s=2.0)
     first = synthesize_episode(tmp_path / "a.mcap", spec)
@@ -154,6 +163,10 @@ def test_camera_frame_stats_sees_the_injected_black_segment(tmp_path: Path) -> N
     assert isinstance(black_frame_pct, float)
     # 1 s of 4 s is black; decode boundaries make the exact count fuzzy.
     assert 10.0 < black_frame_pct < 50.0
+    # Non-bright fixture: overexposed_frame_pct should be 0.0 at default threshold.
+    overexposed_frame_pct = result.measurements[f"{camera_topic}/overexposed_frame_pct"]
+    assert isinstance(overexposed_frame_pct, float)
+    assert overexposed_frame_pct == 0.0
     message_count = result.measurements[f"{camera_topic}/message_count"]
     decoded_frame_count = result.measurements[f"{camera_topic}/decoded_frame_count"]
     assert message_count == decoded_frame_count

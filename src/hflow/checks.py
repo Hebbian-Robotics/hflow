@@ -195,6 +195,7 @@ def camera_frame_stats(
     black_pixel_threshold: int = 32,
     freeze_noise_db: float = -60.0,
     freeze_min_duration_s: float = 2.0,
+    bright_luma_threshold: float = 235.0,
 ) -> CheckResult:
     """Camera blackout, freeze, exposure, and frame-count evidence per camera.
 
@@ -207,8 +208,8 @@ def camera_frame_stats(
     ``freeze:<topic>`` intervals in log time. Requires a canonical episode
     (``Episode.video`` remuxes in-band H.264 only).
 
-    Evidence only, as always: blackout/exposure thresholds and any verdict
-    stay user-owned.
+    Evidence only, as always: blackout/exposure thresholds (including
+    ``bright_luma_threshold``) and any verdict stay user-owned.
     """
     selected_cameras = list(cameras) if cameras is not None else episode.cameras
     measurements: dict[str, MeasurementValue] = {}
@@ -234,9 +235,11 @@ def camera_frame_stats(
             black_pixel_threshold=black_pixel_threshold,
             freeze_noise_db=freeze_noise_db,
             freeze_min_duration_s=freeze_min_duration_s,
+            bright_luma_threshold=bright_luma_threshold,
         )
         measurements[f"{topic}/decoded_frame_count"] = stats.frame_count
         measurements[f"{topic}/black_frame_pct"] = stats.black_frame_pct
+        measurements[f"{topic}/overexposed_frame_pct"] = stats.overexposed_frame_pct
         measurements[f"{topic}/freeze_total_s"] = stats.freeze_total_s
         measurements[f"{topic}/luma_avg_mean"] = stats.luma_avg_mean
         measurements[f"{topic}/luma_avg_min"] = stats.luma_avg_min
@@ -330,6 +333,39 @@ def episode_duration(episode: Episode, *, topics: Sequence[str] | None = None) -
             "topic_count": len(selected),
         }
     )
+
+
+def action_rate(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
+    """Mean message rate of the given action topics, in hertz.
+
+    Speed-vs-skill is a corpus-relative judgment, so it cannot be decided
+    inside a per-episode check; this check records the evidence and the cut
+    is a curation query, e.g.::
+
+        SELECT episode_id FROM episodes WHERE action_rate_hz_z > 1.645
+
+    (the window function producing action_rate_hz_z is documented in the
+    Cohort statistics section of docs/CATALOG.md).
+    """
+    start_candidates_ns: list[int] = []
+    end_candidates_ns: list[int] = []
+    message_count_total = 0
+    streams_with_messages = 0
+    for topic in topics:
+        stamps_ns = episode.channel(topic).timestamps
+        if len(stamps_ns) == 0:
+            continue
+        message_count_total += len(stamps_ns)
+        streams_with_messages += 1
+        start_candidates_ns.append(int(stamps_ns[0]))
+        end_candidates_ns.append(int(stamps_ns[-1]))
+    span_s = (
+        (max(end_candidates_ns) - min(start_candidates_ns)) / 1e9 if start_candidates_ns else 0.0
+    )
+    # n timestamps on a stream define n - 1 intervals
+    interval_count = message_count_total - streams_with_messages
+    action_rate_hz = interval_count / span_s if span_s > 0 else 0.0
+    return CheckResult(measurements={"action_rate_hz": action_rate_hz})
 
 
 def content_digest(episode: Episode) -> CheckResult:

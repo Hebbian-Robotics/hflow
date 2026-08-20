@@ -443,8 +443,16 @@ class Catalog:
             # Build every table file locally first, then store dependents
             # before the episodes file (see above). store_file_if_absent is
             # atomic in both modes: rename-into-place locally, a conditional
-            # put (PutMode::Create) on a bucket -- so a racing worker
-            # appending the same outcome loses cleanly instead of duplicating.
+            # put (PutMode::Create) on a bucket.
+            #
+            # A dependent's create-if-absent can lose to either a genuinely
+            # stale file (a crashed earlier append -- its episodes file never
+            # landed, or we would have returned written=False above) or a
+            # LIVE concurrent racer appending the identical outcome right
+            # now: those two cases are indistinguishable from here (both
+            # look like "the dependent exists, episodes doesn't"), so a
+            # dependent that loses here is deliberately left alone instead
+            # of guessed at -- see the repair pass below.
             with tempfile.TemporaryDirectory(prefix="hflow-catalog-append-") as staging_name:
                 staging_dir = Path(staging_name)
                 for table_name in _TABLE_NAMES:
@@ -454,20 +462,34 @@ class Catalog:
                 for table_name in ("check_runs", "measurements", "tags", "intervals"):
                     staged_file = staging_dir / f"{table_name}.parquet"
                     dependent_key = f"{table_name}/{file_stem}.parquet"
-                    if not self.location.store_file_if_absent(staged_file, dependent_key):
-                        # A crashed earlier append left this dependent behind
-                        # (its episodes file never landed, or we would have
-                        # returned written=False above). Replace it so every
-                        # file of ONE append carries one recorded_at -- mixed
-                        # timestamps would let the per-key "latest" views
-                        # attribute another run's rows to this one. Safe to
-                        # delete: without its episodes file the run is
-                        # invisible (manifest-last).
-                        self.location.delete(dependent_key)
-                        self.location.store_file_if_absent(staged_file, dependent_key)
+                    self.location.store_file_if_absent(staged_file, dependent_key)
                 episodes_created = self.location.store_file_if_absent(
                     staging_dir / "episodes.parquet", f"episodes/{file_stem}.parquet"
                 )
+                if episodes_created:
+                    # store_file_if_absent on episodes is atomic, so at most
+                    # one caller ever observes True: we are now the unique,
+                    # durable owner of this file_stem, whether this is a
+                    # solo append, the winner of a race against a concurrent
+                    # duplicate, or a retry repairing a crashed earlier
+                    # attempt. Force every dependent to carry OUR
+                    # recorded_at -- unconditionally, since a losing
+                    # dependent write above (crash debris or a concurrent
+                    # racer that did not go on to win episodes) may hold a
+                    # different one. Every file of ONE append must carry one
+                    # recorded_at: the per-key "latest" views (curation.py)
+                    # each independently rank rows by (recorded_at,
+                    # run_fingerprint) per table, so a mismatch could let
+                    # them pick two different runs as "latest" for the same
+                    # episode and stitch together rows that never belonged
+                    # to the same outcome. ``publish`` is an unconditional
+                    # atomic replace (rename-into-place locally, a plain put
+                    # on a bucket) -- safe here because we already hold the
+                    # unique win on episodes.
+                    for table_name in ("check_runs", "measurements", "tags", "intervals"):
+                        staged_file = staging_dir / f"{table_name}.parquet"
+                        dependent_key = f"{table_name}/{file_stem}.parquet"
+                        self.location.publish(staged_file, dependent_key)
         finally:
             connection.close()
 

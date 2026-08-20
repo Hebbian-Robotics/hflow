@@ -1,4 +1,4 @@
-# Architecture
+# HFlow architecture for Physical AI data pipelines
 
 HFlow is an open-source reimplementation of the data-infrastructure architecture described in Dyna Robotics' ["Training Dyna-2 at million-hour scale, repeatably"](https://www.dyna.co/research/dyna-2-infrastructure) (Aug 2026), redesigned for single-tenant use at small scale. It applies the same infrastructure to multimodal physical-AI data from human egocentric collection, robot teleoperation, autonomous policy rollouts, and other sensor-rich sources.
 
