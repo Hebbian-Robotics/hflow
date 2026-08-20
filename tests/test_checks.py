@@ -163,6 +163,10 @@ def test_camera_frame_stats_sees_the_injected_black_segment(tmp_path: Path) -> N
     assert isinstance(black_frame_pct, float)
     # 1 s of 4 s is black; decode boundaries make the exact count fuzzy.
     assert 10.0 < black_frame_pct < 50.0
+    # Non-bright fixture: overexposed_frame_pct should be 0.0 at default threshold.
+    overexposed_frame_pct = result.measurements[f"{camera_topic}/overexposed_frame_pct"]
+    assert isinstance(overexposed_frame_pct, float)
+    assert overexposed_frame_pct == 0.0
     message_count = result.measurements[f"{camera_topic}/message_count"]
     decoded_frame_count = result.measurements[f"{camera_topic}/decoded_frame_count"]
     assert message_count == decoded_frame_count

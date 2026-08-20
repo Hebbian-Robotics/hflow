@@ -39,6 +39,8 @@ class FrameStats:
     duration_s: float
     black_frame_count: int
     black_frame_pct: float  # 0.0-100.0, denominator = frame_count
+    overexposed_frame_count: int
+    overexposed_frame_pct: float  # 0.0-100.0, denominator = frame_count
     freeze_intervals: list[tuple[float, float]]  # (start_s, end_s) pairs
     freeze_total_s: float
     luma_avg_mean: float
@@ -143,7 +145,9 @@ def _collect_freeze_intervals(
     return intervals
 
 
-def _stats_from_instrument_output(output_text: str) -> FrameStats:
+def _stats_from_instrument_output(
+    output_text: str, *, bright_luma_threshold: float = 235.0
+) -> FrameStats:
     """Pure aggregation of the instrument's stdout (testable on synthetic text)."""
     frames = _parse_metadata_print_frames(output_text)
     if not frames:
@@ -170,12 +174,16 @@ def _stats_from_instrument_output(output_text: str) -> FrameStats:
         _parse_finite_float(pblack_text, f"{_BLACKFRAME_PBLACK_KEY} of frame {frame_index}")
         black_frame_count += 1
 
+    overexposed_frame_count = sum(1 for v in luma_avg_values if v >= bright_luma_threshold)
+
     freeze_intervals = _collect_freeze_intervals(frames, duration_s)
     return FrameStats(
         frame_count=frame_count,
         duration_s=duration_s,
         black_frame_count=black_frame_count,
         black_frame_pct=100.0 * black_frame_count / frame_count,
+        overexposed_frame_count=overexposed_frame_count,
+        overexposed_frame_pct=100.0 * overexposed_frame_count / frame_count,
         freeze_intervals=freeze_intervals,
         freeze_total_s=sum(end_s - start_s for start_s, end_s in freeze_intervals),
         luma_avg_mean=statistics.fmean(luma_avg_values),
@@ -191,6 +199,7 @@ def frame_stats(
     black_pixel_threshold: int = 32,
     freeze_noise_db: float = -60.0,
     freeze_min_duration_s: float = 2.0,
+    bright_luma_threshold: float = 235.0,
 ) -> FrameStats:
     """Run the instrument over ``video`` and aggregate.
 
@@ -200,6 +209,9 @@ def frame_stats(
     - ``freezedetect=n={noise}dB:d={duration}`` yields freeze intervals; an
       unterminated freeze at EOF closes at the video duration.
     - ``signalstats`` yields per-frame YAVG, aggregated to mean/min/max.
+    - Frames with average luma at or above ``bright_luma_threshold`` are
+      counted as overexposed; ``overexposed_frame_pct`` uses the same
+      frame-count denominator as ``black_frame_pct``.
     """
     filter_graph = (
         f"blackframe=amount={black_frame_amount_pct}:threshold={black_pixel_threshold},"
@@ -222,4 +234,6 @@ def frame_stats(
     if completed.returncode != 0:
         stderr_tail = "\n".join(completed.stderr.strip().splitlines()[-5:])
         raise RuntimeError(f"ffmpeg instrument pass failed for {video}: {stderr_tail}")
-    return _stats_from_instrument_output(completed.stdout)
+    return _stats_from_instrument_output(
+        completed.stdout, bright_luma_threshold=bright_luma_threshold
+    )

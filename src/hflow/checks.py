@@ -195,6 +195,7 @@ def camera_frame_stats(
     black_pixel_threshold: int = 32,
     freeze_noise_db: float = -60.0,
     freeze_min_duration_s: float = 2.0,
+    bright_luma_threshold: float = 235.0,
 ) -> CheckResult:
     """Camera blackout, freeze, exposure, and frame-count evidence per camera.
 
@@ -207,8 +208,8 @@ def camera_frame_stats(
     ``freeze:<topic>`` intervals in log time. Requires a canonical episode
     (``Episode.video`` remuxes in-band H.264 only).
 
-    Evidence only, as always: blackout/exposure thresholds and any verdict
-    stay user-owned.
+    Evidence only, as always: blackout/exposure thresholds (including
+    ``bright_luma_threshold``) and any verdict stay user-owned.
     """
     selected_cameras = list(cameras) if cameras is not None else episode.cameras
     measurements: dict[str, MeasurementValue] = {}
@@ -234,9 +235,11 @@ def camera_frame_stats(
             black_pixel_threshold=black_pixel_threshold,
             freeze_noise_db=freeze_noise_db,
             freeze_min_duration_s=freeze_min_duration_s,
+            bright_luma_threshold=bright_luma_threshold,
         )
         measurements[f"{topic}/decoded_frame_count"] = stats.frame_count
         measurements[f"{topic}/black_frame_pct"] = stats.black_frame_pct
+        measurements[f"{topic}/overexposed_frame_pct"] = stats.overexposed_frame_pct
         measurements[f"{topic}/freeze_total_s"] = stats.freeze_total_s
         measurements[f"{topic}/luma_avg_mean"] = stats.luma_avg_mean
         measurements[f"{topic}/luma_avg_min"] = stats.luma_avg_min

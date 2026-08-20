@@ -304,6 +304,27 @@ def test_synthetic_output_aggregates_exactly() -> None:
     assert stats.luma_avg_max == pytest.approx(100.0)
     assert stats.freeze_intervals == []
     assert stats.freeze_total_s == 0.0
+    # Default threshold 235.0: none of 100, 10, 40 are >= 235
+    assert stats.overexposed_frame_count == 0
+    assert stats.overexposed_frame_pct == 0.0
+
+
+def test_synthetic_overexposed_aggregates_exactly() -> None:
+    # YAVG: 100 (normal), 240 (overexposed), 250 (overexposed) at default threshold 235.0
+    output = (
+        "frame:0    pts:0    pts_time:0\n"
+        "lavfi.signalstats.YAVG=100\n"
+        "frame:1    pts:512   pts_time:0.5\n"
+        "lavfi.signalstats.YAVG=240\n"
+        "frame:2    pts:1024  pts_time:1\n"
+        "lavfi.signalstats.YAVG=250\n"
+    )
+    stats = _stats_from_instrument_output(output)
+    assert stats.frame_count == 3
+    assert stats.overexposed_frame_count == 2
+    assert stats.overexposed_frame_pct == pytest.approx(66.666, abs=0.1)
+    assert stats.luma_avg_min == pytest.approx(100.0)
+    assert stats.luma_avg_max == pytest.approx(250.0)
 
 
 def test_synthetic_freeze_intervals_including_unterminated() -> None:
@@ -385,6 +406,39 @@ def black_tail_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.fixture(scope="module")
+def bright_tail_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """4s of testsrc2 followed by 2s of white, 10 fps, h264: 60 frames total."""
+    output = tmp_path_factory.mktemp("videos") / "bright_tail.mp4"
+    subprocess.run(
+        [
+            _system_ffmpeg(),
+            "-hide_banner",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=10:duration=4,format=yuv420p",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=white:size=160x120:rate=10:duration=2,format=yuv420p",
+            "-filter_complex",
+            "[0:v][1:v]concat=n=2:v=1:a=0[out]",
+            "-map",
+            "[out]",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            str(output),
+        ],
+        capture_output=True,
+        check=True,
+    )
+    return output
+
+
+@pytest.fixture(scope="module")
 def frozen_tail_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """2s of testsrc2 then the last frame held (cloned) for 3s, 10 fps."""
     output = tmp_path_factory.mktemp("videos") / "frozen_tail.mp4"
@@ -422,6 +476,23 @@ def test_frame_stats_black_segment(black_tail_video: Path) -> None:
     assert stats.luma_avg_min < 32.0
     assert stats.luma_avg_min <= stats.luma_avg_mean <= stats.luma_avg_max
     assert stats.luma_avg_max > 64.0
+    assert stats.freeze_intervals == []
+    # Default threshold 235.0: testsrc2 max YAVG is well below.
+    assert stats.overexposed_frame_count == 0
+    assert stats.overexposed_frame_pct == 0.0
+
+
+def test_frame_stats_bright_segment(bright_tail_video: Path) -> None:
+    # freeze_min_duration_s > the 2s white segment so no freeze fires here.
+    # Use a lower threshold to catch the white segment (limited-range white ~235).
+    stats = frame_stats(bright_tail_video, freeze_min_duration_s=3.0, bright_luma_threshold=200.0)
+    assert stats.frame_count == 60
+    assert stats.duration_s == pytest.approx(6.0, abs=0.3)
+    # 20 of 60 frames are white/overexposed; allow encoder edge effects.
+    assert 10.0 < stats.overexposed_frame_pct < 50.0
+    # Encoded limited-range white lands near YAVG=235.
+    assert stats.luma_avg_max > 200.0
+    assert stats.luma_avg_min <= stats.luma_avg_mean <= stats.luma_avg_max
     assert stats.freeze_intervals == []
 
 
