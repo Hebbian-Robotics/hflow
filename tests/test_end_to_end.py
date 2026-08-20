@@ -137,6 +137,17 @@ def test_canonical_episode_accessors(
         assert abs(frames[1].log_time_ns - frames[0].log_time_ns - 466_666_667) <= 1
 
 
+def test_channel_publish_times_are_reachable(
+    report_and_app: tuple[hflow.TestReport, hflow.App],
+) -> None:
+    report, _app = report_and_app
+    with hflow.Episode(report.canonical_path) as episode:
+        channel = episode.channel("/joint_states")
+        publish_times = channel.publish_times
+        assert isinstance(publish_times, np.ndarray)
+        assert publish_times.shape == (len(channel),)
+
+
 def test_arrow_export(report_and_app: tuple[hflow.TestReport, hflow.App]) -> None:
     report, _app = report_and_app
     with hflow.Episode(report.canonical_path) as episode:
