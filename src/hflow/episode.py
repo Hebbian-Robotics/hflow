@@ -21,7 +21,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from mcap.records import Attachment, Schema
@@ -35,6 +35,9 @@ from hflow.format import (
     METADATA_RECORD_PROVENANCE,
 )
 from hflow.reader import EpisodeReader, TopicInfo, open_reader
+
+if TYPE_CHECKING:
+    import pyarrow
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +207,7 @@ class ChannelData:
             )
         return array
 
-    def to_arrow(self) -> Any:
+    def to_arrow(self) -> "pyarrow.Table":
         """The channel as a ``pyarrow.Table``: ``log_time_ns`` plus one column
         per primitive field (numeric/string/bool scalars and numeric lists;
         nested fields are skipped). Requires the ``arrow`` extra."""
