@@ -386,6 +386,57 @@ def test_cli_stale_reports_a_broken_pipeline_file_instead_of_crashing(
     assert "boom at import time" in capsys.readouterr().err
 
 
+def test_cli_stale_exit_code_returns_one_when_episodes_are_behind(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    catalog.append_episode(
+        canonical_path=_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[],
+        source_uri="episodes-in/run_0001.mcap",
+    )
+    exit_code = cli_main(
+        [
+            "stale",
+            "--catalog",
+            str(tmp_path / "catalog"),
+            "--pipeline-version",
+            "somethingnewer",
+            "--exit-code",
+        ]
+    )
+    assert exit_code == 1
+    # The flag only changes the exit code; the pipeable URI list is unchanged.
+    assert capsys.readouterr().out.splitlines() == ["episodes-in/run_0001.mcap"]
+
+
+def test_cli_stale_exit_code_returns_zero_when_nothing_is_behind(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    catalog.append_episode(
+        canonical_path=_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[],
+        source_uri="episodes-in/run_0001.mcap",
+    )
+    exit_code = cli_main(
+        [
+            "stale",
+            "--catalog",
+            str(tmp_path / "catalog"),
+            "--pipeline-version",
+            FAKE_STAMPS.pipeline_version,
+            "--exit-code",
+        ]
+    )
+    assert exit_code == 0
+    assert capsys.readouterr().out == ""
+
+
 def test_append_accepts_non_json_measurement_scalars(tmp_path: Path) -> None:
     """numpy scalars are user data: they must fingerprint, not crash the append."""
     import numpy as np

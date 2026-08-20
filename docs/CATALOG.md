@@ -201,6 +201,17 @@ importing anything. Staleness follows the source recording, not the episode
 id: reprocessing mints a new content-addressed `episode_id`, and a source
 whose newest run already carries the current versions is not stale.
 
+Add `--exit-code` to make the command exit 1 when any stale episode is found,
+so a CI job or a pre-training checklist can fail on drift the way
+`hflow doctor` already does:
+
+```bash
+hflow stale --catalog data/catalog --pipeline pipeline.py --exit-code
+```
+
+Without the flag the command always exits 0, so existing pipes into
+`xargs hflow ingest` keep working.
+
 ### Coverage denominators
 
 Every `CurationReport` carries (and `summary()` always prints) which checks

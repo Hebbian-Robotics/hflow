@@ -98,6 +98,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--pipeline-version",
         help="compare against this pipeline_version hash directly (no pipeline import)",
     )
+    stale_parser.add_argument(
+        "--exit-code",
+        action="store_true",
+        help=(
+            "exit 1 when at least one stale episode is found (like "
+            "`git diff --exit-code`), so CI can gate on it; without this flag the "
+            "command always exits 0"
+        ),
+    )
 
     doctor_parser = subparsers.add_parser(
         "doctor",
@@ -331,6 +340,8 @@ def _command_stale(arguments: argparse.Namespace) -> int:
         + (f" / schema_version {schema_version}" if schema_version is not None else ""),
         file=sys.stderr,
     )
+    if arguments.exit_code and stale:
+        return 1
     return 0
 
 
