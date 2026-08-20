@@ -368,6 +368,38 @@ def action_rate(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
     return CheckResult(measurements={"action_rate_hz": action_rate_hz})
 
 
+def required_topics(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
+    """Presence and message volume of each requested topic.
+
+    The cheapest, most common corpus-level QC question: did this rig record
+    everything it was supposed to? Presence is derived from
+    :attr:`Episode.channels` (never :meth:`Episode.channel`, which raises
+    when a topic maps to more than one channel) and summed across every
+    channel matching the topic, so a duplicated topic never raises here. A
+    topic counts as present when at least one matching channel carries a
+    message -- an empty channel is schema without a recording.
+
+    Evidence only, no verdict: the pass/fail cut belongs in curation SQL,
+    e.g.::
+
+        SELECT episode_id FROM episodes WHERE missing_topic_count > 0
+    """
+    message_counts: dict[str, int] = dict.fromkeys(topics, 0)
+    for info in episode.channels.values():
+        if info.topic in message_counts:
+            message_counts[info.topic] += info.message_count
+    measurements: dict[str, MeasurementValue] = {}
+    missing_topic_count = 0
+    for topic in topics:
+        message_count = message_counts[topic]
+        measurements[f"{topic}/present"] = message_count > 0
+        measurements[f"{topic}/message_count"] = message_count
+        if message_count == 0:
+            missing_topic_count += 1
+    measurements["missing_topic_count"] = missing_topic_count
+    return CheckResult(measurements=measurements)
+
+
 def content_digest(episode: Episode) -> CheckResult:
     """A stable digest of the episode's message content, for duplicate hunts.
 

@@ -12,6 +12,7 @@ from hflow.checks import (
     episode_duration,
     idle_fraction,
     joint_discontinuity,
+    required_topics,
     timestamp_regularity,
 )
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
@@ -128,6 +129,29 @@ def test_action_rate_matches_the_synthesized_rate(jittery_episode: hflow.Episode
     assert isinstance(action_rate_hz, float)
     # the synthetic joint stream runs at 100 Hz by SyntheticEpisodeSpec default
     assert action_rate_hz == pytest.approx(100.0, abs=0.5)
+
+
+def test_required_topics_all_present(jittery_episode: hflow.Episode) -> None:
+    result = required_topics(
+        jittery_episode, topics=["/joint_states", "/wrist_cam/compressed"]
+    ).measurements
+    assert result["/joint_states/present"] is True
+    assert result["/wrist_cam/compressed/present"] is True
+    joint_states_count = result["/joint_states/message_count"]
+    wrist_cam_count = result["/wrist_cam/compressed/message_count"]
+    assert isinstance(joint_states_count, int) and joint_states_count > 0
+    assert isinstance(wrist_cam_count, int) and wrist_cam_count > 0
+    assert result["missing_topic_count"] == 0
+
+
+def test_required_topics_reports_a_missing_topic(jittery_episode: hflow.Episode) -> None:
+    result = required_topics(
+        jittery_episode, topics=["/joint_states", "/no_such_topic"]
+    ).measurements
+    assert result["/joint_states/present"] is True
+    assert result["/no_such_topic/present"] is False
+    assert result["/no_such_topic/message_count"] == 0
+    assert result["missing_topic_count"] == 1
 
 
 def test_content_digest_identifies_duplicate_content(tmp_path: Path) -> None:
