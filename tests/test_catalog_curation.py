@@ -274,6 +274,42 @@ def test_cli_curate_requires_exactly_one_sql_source(tmp_path: Path) -> None:
     assert cli_main(["curate", "--catalog", str(tmp_path)]) == 2
 
 
+def test_cli_curate_dry_run_prints_without_writing(
+    recorded_data_root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    exit_code = cli_main(
+        [
+            "curate",
+            "SELECT episode_id, task FROM episodes WHERE status != 'quarantined'",
+            "--catalog",
+            str(recorded_data_root / "catalog"),
+            "--dry-run",
+        ]
+    )
+    assert exit_code == 0
+    printed = capsys.readouterr().out
+    assert "1 rows" in printed
+    assert "coverage" in printed
+    assert "manifest: (not written; dry run)" in printed
+    assert "None" not in printed
+
+
+def test_cli_curate_rejects_dry_run_with_output(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        cli_main(
+            [
+                "curate",
+                "SELECT 1",
+                "--catalog",
+                str(tmp_path),
+                "--dry-run",
+                "--output",
+                str(tmp_path / "manifest.parquet"),
+            ]
+        )
+    assert exit_info.value.code == 2
+
+
 def test_stale_episodes_lists_only_episodes_behind_the_current_versions(tmp_path: Path) -> None:
     catalog = Catalog(tmp_path / "catalog")
     stale_stamps = FAKE_STAMPS

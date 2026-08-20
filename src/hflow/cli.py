@@ -64,11 +64,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CATALOG_DIR,
         help=f"catalog directory or object-store prefix (default: {DEFAULT_CATALOG_DIR})",
     )
-    curate_parser.add_argument(
+    curate_output_group = curate_parser.add_mutually_exclusive_group()
+    curate_output_group.add_argument(
         "--output",
         "-o",
         default="./data/manifest.parquet",
         help="manifest path or object-store URL (default: ./data/manifest.parquet)",
+    )
+    curate_output_group.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="run the query and print row count/coverage without writing a manifest",
     )
 
     stale_parser = subparsers.add_parser(
@@ -489,7 +495,8 @@ def _command_curate(arguments: argparse.Namespace) -> int:
         return 2
     try:
         sql = arguments.sql if arguments.sql is not None else arguments.sql_file.read_text()
-        report = curate(arguments.catalog, sql, output=arguments.output)
+        output = None if arguments.dry_run else arguments.output
+        report = curate(arguments.catalog, sql, output=output)
     except (ValueError, FileNotFoundError) as error:
         print(f"curate: {error}", file=sys.stderr)
         return 2
