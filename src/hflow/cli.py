@@ -7,6 +7,7 @@ lives only here.
 """
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -30,7 +31,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version",
         action="version",
-        version=f"hflow{__version__}",
+        version=f"hflow {__version__}",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -506,6 +513,13 @@ def _command_doctor(arguments: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = _build_parser().parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.INFO if arguments.verbose else logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+
     if arguments.command == "curate":
         return _command_curate(arguments)
     if arguments.command == "stale":

@@ -12,7 +12,6 @@ standard library.
 """
 
 import json
-import logging
 import re
 import shutil
 import subprocess
@@ -38,8 +37,6 @@ from hflow.reader import EpisodeReader, TopicInfo, open_reader
 
 if TYPE_CHECKING:
     import pyarrow
-
-logger = logging.getLogger(__name__)
 
 RawDecoder = Callable[[bytes], Any]
 

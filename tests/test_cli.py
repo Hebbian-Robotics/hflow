@@ -10,4 +10,4 @@ def test_cli_version(capsys: CaptureFixture) -> None:
         _build_parser().parse_args(["--version"])
 
     assert exception.value.code == 0
-    assert f"hflow{__version__}" in capsys.readouterr().out
+    assert f"hflow {__version__}" in capsys.readouterr().out
