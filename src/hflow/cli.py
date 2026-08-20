@@ -16,6 +16,7 @@ from hflow.runtime._deploy import DEFAULT_DEPLOY_VENV_PYTHON
 from hflow.steps import RUN_PROFILES
 
 DEFAULT_DATA_ROOT = Path("./data")
+DEFAULT_CATALOG_DIR = "./data/catalog"
 DEFAULT_BUNDLE_DIR = DEFAULT_DATA_ROOT / "runtime"
 DEFAULT_DEPLOY_OUTPUT_DIR = Path("./deploy")
 
@@ -47,8 +48,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     curate_parser.add_argument(
         "--catalog",
-        default="./data/catalog",
-        help="catalog directory or object-store prefix (default: ./data/catalog)",
+        default=DEFAULT_CATALOG_DIR,
+        help=f"catalog directory or object-store prefix (default: {DEFAULT_CATALOG_DIR})",
     )
     curate_parser.add_argument(
         "--output",
@@ -69,8 +70,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     stale_parser.add_argument(
         "--catalog",
-        default="./data/catalog",
-        help="catalog directory or object-store prefix (default: ./data/catalog)",
+        default=DEFAULT_CATALOG_DIR,
+        help=f"catalog directory or object-store prefix (default: {DEFAULT_CATALOG_DIR})",
     )
     stale_group = stale_parser.add_mutually_exclusive_group(required=True)
     stale_group.add_argument(
