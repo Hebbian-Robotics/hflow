@@ -847,6 +847,9 @@ def test_api_port_true_is_rejected_even_though_it_passes_the_range(
 
     True == 1, so the range test passes it, and the value is only ever str()-ed
     after that. Without this it reaches the rendered .env as API_PORT=True.
+    False is covered alongside the other wrong types below, where it is the
+    weaker case: it is 0, so the range check would reject it anyway, just with
+    the wrong reason.
     """
     from dataclasses import replace
 
@@ -856,15 +859,18 @@ def test_api_port_true_is_rejected_even_though_it_passes_the_range(
 
 @pytest.mark.parametrize(
     ("bad_port", "type_name"),
-    [("8080", "str"), (8080.0, "float"), (None, "NoneType"), (True, "bool")],
+    [("8080", "str"), (8080.0, "float"), (None, "NoneType"), (True, "bool"), (False, "bool")],
 )
 def test_api_port_of_the_wrong_type_is_rejected_at_construction(
     config: RuntimeConfig, bad_port: object, type_name: str
 ) -> None:
     """The field is annotated int, so anything else is refused where it is set.
 
-    A str used to render a working bundle by accident, since the value is only
-    str()-ed; a float rendered API_PORT=8080.0, which Compose will not take.
+    Two different prior behaviors end up here. A float passed the range check
+    and rendered API_PORT=8080.0, which Compose will not take. A str or None
+    failed the range check instead, but as a TypeError from the comparison,
+    which nothing catches: `_command_up` handles ValueError only, so it left
+    a traceback. Reporting the type first turns both into one ValueError.
     """
     from dataclasses import replace
 
