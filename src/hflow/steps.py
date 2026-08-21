@@ -202,7 +202,7 @@ def compute_check_version(
     that cannot be inspected safely.
     """
     if declared_version is not None and not declared_version:
-        raise ValueError("declared step version must not be empty")
+        raise ValueError(f"declared step version must not be empty for step {name!r}")
 
     implementation_identity = _callable_implementation_identity(
         function,

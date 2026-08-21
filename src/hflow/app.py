@@ -557,7 +557,7 @@ class App:
         ``hflow.to_grid`` or construct a ``DerivedSeries`` directly.
         """
         if not topic:
-            raise ValueError("derived channel topic must not be empty")
+            raise ValueError(f"derived channel topic must not be empty, got {topic!r}")
 
         def register(function: DerivedFunction) -> DerivedFunction:
             if any(registered.topic == topic for registered in self.derived):

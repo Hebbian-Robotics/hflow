@@ -343,14 +343,17 @@ def _validate_video_episode_spec(spec: VideoEpisodeSpec) -> None:
             f"got {spec.image_width}x{spec.image_height}"
         )
     if not spec.camera_name.strip():
-        raise ValueError("camera_name must not be empty")
+        raise ValueError(f"camera_name must not be empty, got {spec.camera_name!r}")
     _validate_video_fault_segment("black_segment", spec.black_segment, spec.duration_s)
     _validate_video_fault_segment("freeze_segment", spec.freeze_segment, spec.duration_s)
     if spec.black_segment is not None and spec.freeze_segment is not None:
         black_start_s, black_end_s = spec.black_segment
         freeze_start_s, freeze_end_s = spec.freeze_segment
         if max(black_start_s, freeze_start_s) < min(black_end_s, freeze_end_s):
-            raise ValueError("black_segment and freeze_segment must not overlap")
+            raise ValueError(
+                f"black_segment and freeze_segment must not overlap, "
+                f"got {spec.black_segment!r} and {spec.freeze_segment!r}"
+            )
 
 
 def _render_source_video_frames(
