@@ -213,9 +213,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_API_PORT,
         help=(
             "host port for the Airflow API, written into a new bundle's .env as "
-            f"API_PORT (default: {DEFAULT_API_PORT}). An existing .env is never "
-            "rewritten, so this only takes effect on a bundle that does not have "
-            "one yet"
+            f"API_PORT (default: {DEFAULT_API_PORT}, range 1-65535). An existing "
+            ".env is never rewritten, so this only takes effect on a bundle that "
+            "does not have one yet"
         ),
     )
     up_parser.add_argument(

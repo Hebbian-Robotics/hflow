@@ -828,7 +828,7 @@ def test_api_port_outside_the_tcp_range_is_rejected_at_construction(
     """
     from dataclasses import replace
 
-    with pytest.raises(ValueError, match=str(bad_port)):
+    with pytest.raises(ValueError, match=rf"api_port {bad_port} is not in 1-65535"):
         replace(config, api_port=bad_port)
 
 

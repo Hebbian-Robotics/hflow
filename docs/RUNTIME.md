@@ -405,7 +405,8 @@ docker compose --file data/runtime/docker-compose.yaml logs airflow-dag-processo
 be parsing; retry in a few seconds).
 
 **Port 8080 is taken.** For a bundle that does not exist yet, pass the port:
-`hflow up --api-port 9090`. For one already rendered, the `.env` on disk wins
+`hflow up --api-port 9090` (1 to 65535; anything outside that is refused before
+the bundle is rendered). For one already rendered, the `.env` on disk wins
 (re-renders never overwrite a preserved `.env`, so `--api-port` does nothing
 there and editing does stick): `hflow down`, edit `API_PORT`, `hflow up`
 again. The API binds to `127.0.0.1` by default (`API_BIND_HOST` in `.env`
