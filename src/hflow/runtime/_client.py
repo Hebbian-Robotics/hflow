@@ -170,7 +170,10 @@ class AirflowClient:
                 last_status = health.summary()
             if on_poll is not None:
                 on_poll(last_status)
-            time.sleep(poll_interval_s)
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                break
+            time.sleep(min(poll_interval_s, remaining_s))
         raise TimeoutError(
             f"Airflow at {self.base_url} not healthy after {timeout_s:.0f}s (last: {last_status})"
         )

@@ -14,7 +14,7 @@ import pytest
 import hflow
 from hflow.cli import _parse_pipeline_spec, main
 from hflow.runtime import AirflowHealth, RuntimeConfig, render_bundle
-from hflow.runtime._client import AirflowClient
+from hflow.runtime._client import AirflowClient, AirflowClientError
 
 HEALTHY = AirflowHealth(
     components={
@@ -374,6 +374,39 @@ def test_start_runtime_waits_for_all_five_dags(
         "demo_pipeline_labels",
         "demo_pipeline_media",
     ]
+
+
+def test_dag_registration_poll_does_not_sleep_past_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hflow.runtime._lifecycle import _wait_until_dag_registered
+
+    class InstantlyAdvancingClock:
+        def __init__(self) -> None:
+            self.current_time_s = 0.0
+
+        def monotonic(self) -> float:
+            return self.current_time_s
+
+        def sleep(self, duration_s: float) -> None:
+            self.current_time_s += duration_s
+
+    def unavailable_dag(_self: AirflowClient, dag_id: str) -> dict[str, object]:
+        raise AirflowClientError(f"{dag_id} unavailable", status=404)
+
+    clock = InstantlyAdvancingClock()
+    monkeypatch.setattr("hflow.runtime._lifecycle.time", clock)
+    monkeypatch.setattr(AirflowClient, "dag", unavailable_dag)
+    client = AirflowClient("http://127.0.0.1:8080", "airflow", "password")
+
+    with pytest.raises(TimeoutError, match="never registered"):
+        _wait_until_dag_registered(
+            client,
+            ["demo_pipeline_ingest"],
+            timeout_s=0.3,
+            poll_interval_s=10.0,
+        )
+    assert clock.current_time_s == pytest.approx(0.3)
 
 
 def test_status_reports_health_hints_and_services(

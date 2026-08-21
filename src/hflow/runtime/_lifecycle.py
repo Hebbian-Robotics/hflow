@@ -104,7 +104,10 @@ def _wait_until_dag_registered(
         pending_dag_ids = still_pending
         if not pending_dag_ids:
             return
-        time.sleep(poll_interval_s)
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            break
+        time.sleep(min(poll_interval_s, remaining_s))
     raise TimeoutError(
         f"Airflow is healthy but the ingest DAG(s) {pending_dag_ids!r} never registered "
         f"within {timeout_s:.0f}s (last: {last_error}) -- the DAG file likely "

@@ -209,4 +209,5 @@ def test_wait_until_healthy_times_out_with_last_status(stub_server: str) -> None
         pytest.raises(TimeoutError, match="scheduler=unhealthy"),
     ):
         monkeypatch.setattr("hflow.runtime._client.time", instantly_advancing_clock)
-        client.wait_until_healthy(timeout_s=0.3, poll_interval_s=0.1)
+        client.wait_until_healthy(timeout_s=0.3, poll_interval_s=10.0)
+    assert instantly_advancing_clock.current_time_s == pytest.approx(0.3)
