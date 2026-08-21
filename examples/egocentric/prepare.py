@@ -307,6 +307,12 @@ def _ensure_source_archive(manifest: CorpusManifest, data_root: Path) -> Path:
     download_root = data_root / "huggingface"
     archive_path = download_root / manifest.archive.path
     if not archive_path.is_file():
+        if shutil.which("hf") is None:
+            raise RuntimeError(
+                "the `hf` CLI is required to download this dataset but is not on PATH. "
+                "Install it with `uv tool install -U huggingface_hub`, then "
+                "`hf auth login`."
+            )
         command = [
             "hf",
             "download",

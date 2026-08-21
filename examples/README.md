@@ -53,9 +53,11 @@ Code: [`openai_vision/pipeline.py`](./openai_vision/pipeline.py)
 download, declared fault injection, local processing, Airflow scheduling,
 inspection with Foxglove and DuckDB, and SQL curation.
 
-**Prerequisites:** accepted Hugging Face dataset terms, `hf` authentication,
-network access, and about 2.5 GB of disk (a ~1 GB pinned download plus the
-generated corpus). Docker is needed only for the Airflow path.
+**Prerequisites:** accepted Hugging Face dataset terms, the `hf` CLI
+authenticated (`uv tool install -U huggingface_hub`, then
+`hf auth login`), network access, and about 2.5 GB of disk (a ~1 GB pinned
+download plus the generated corpus). Docker is needed only for the Airflow
+path.
 
 ```bash
 uv run python examples/egocentric/prepare.py

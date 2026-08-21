@@ -27,8 +27,9 @@ declared data you can edit (see [inject your own faults](#inject-your-own-faults
 
 ## Prerequisites
 
-- A Hugging Face account that has accepted the dataset's access terms, and an
-  authenticated `hf` CLI (`hf auth login`).
+- A Hugging Face account that has accepted the dataset's access terms, and the
+  `hf` CLI, authenticated: `uv tool install -U huggingface_hub` then
+  `hf auth login`.
 - Network access and disk: a ~1 GB download, about 2.5 GB total once the
   sources are extracted and the 96 episodes (~640 MB) are written.
 - Docker with Compose v2 (only for the [Airflow path](#run-it-under-airflow)).
