@@ -815,3 +815,26 @@ class TestBucketModeBundle:
         assert environment["AWS_ACCESS_KEY_ID"] == "${AWS_ACCESS_KEY_ID}"
         assert environment["AWS_SECRET_ACCESS_KEY"] == "${AWS_SECRET_ACCESS_KEY}"
         assert "AWS_SESSION_TOKEN" not in environment
+
+
+@pytest.mark.parametrize("bad_port", [70000, 65536, 0, -1])
+def test_api_port_outside_the_tcp_range_is_rejected_at_construction(
+    config: RuntimeConfig, bad_port: int
+) -> None:
+    """The invariant belongs to the field, so it holds for library callers too.
+
+    render_bundle is never reached: Compose would otherwise be the first thing
+    to complain, long after the bundle is on disk.
+    """
+    from dataclasses import replace
+
+    with pytest.raises(ValueError, match=str(bad_port)):
+        replace(config, api_port=bad_port)
+
+
+@pytest.mark.parametrize("good_port", [1, 8080, 65535])
+def test_api_port_inside_the_tcp_range_is_accepted(config: RuntimeConfig, good_port: int) -> None:
+    """Both ends of the range are legal, so the check cannot be exclusive."""
+    from dataclasses import replace
+
+    assert replace(config, api_port=good_port).api_port == good_port

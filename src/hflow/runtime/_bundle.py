@@ -92,6 +92,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_AIRFLOW_IMAGE = "apache/airflow:3.3.1"
 DEFAULT_POSTGRES_IMAGE = "postgres:16"
+# TCP port range, less port 0, which is "any free port" to bind(2) and not
+# something a published Compose port can be.
+MIN_PORT = 1
+MAX_PORT = 65535
 
 # Where a LOCAL host data root is mounted inside every runtime container; the
 # user's App must be constructed with exactly this data_root or its outputs
@@ -206,6 +210,14 @@ class RuntimeConfig:
     admin_password: str | None = None  # None: generated once into .env
     task_queue: str | None = None
     xcom_objectstorage_url: str | None = None
+
+    def __post_init__(self) -> None:
+        # A range invariant of the field, checked where the field is set, so a
+        # library caller building a RuntimeConfig directly gets the same answer
+        # as the command line. Compose reports an out-of-range port only once
+        # containers are starting, well past the point it is useful.
+        if not MIN_PORT <= self.api_port <= MAX_PORT:
+            raise ValueError(f"api_port {self.api_port!r} is not in {MIN_PORT}-{MAX_PORT}")
 
     def resolved_dag_id(self) -> str:
         if self.dag_id is not None:
