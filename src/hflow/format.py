@@ -41,11 +41,14 @@ EPISODE_KEY_ROBOT_SOFTWARE_VERSION = "robot_software_version"
 # download for camera-less episodes.
 FFMPEG_VERSION_NOT_USED = "not-used"
 
+# Log times, publish times, and every resampling grid are nanoseconds since
+# the epoch, so the conversion factor is shared rather than re-spelled.
+NANOSECONDS_PER_SECOND = 1_000_000_000
+
 # Version of the grid-resampling alignment policy (``hflow.resample``).
 # Multi-rate alignment is where format converters silently diverge
 # (docs/ARCHITECTURE.md, "Transform"), so the policy is explicit and
 # versioned: bump this when the grid or selection semantics change.
-NANOSECONDS_PER_SECOND = 1_000_000_000
 RESAMPLE_POLICY_VERSION = "1"
 
 # ``provenance/v1`` keys written when derived channels are present:
