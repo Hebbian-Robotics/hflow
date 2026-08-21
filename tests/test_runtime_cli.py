@@ -226,6 +226,82 @@ def test_up_honors_bundle_dir_and_hflow_source(
     assert compose_calls[0][0] == str(bundle_dir / "docker-compose.yaml")
 
 
+def test_up_api_port_reaches_the_rendered_env(
+    compose_calls: list[list[str]],
+    healthy_client: None,
+    pipeline_file: Path,
+    tmp_path: Path,
+) -> None:
+    """--api-port is the whole point: it has to land in the bundle's .env."""
+    bundle_dir = tmp_path / "runtime"
+    exit_code = main(
+        [
+            "up",
+            "--pipeline",
+            str(pipeline_file),
+            "--data-root",
+            str(tmp_path / "data"),
+            "--bundle-dir",
+            str(bundle_dir),
+            "--api-port",
+            "9090",
+        ]
+    )
+    assert exit_code == 0
+    assert "API_PORT=9090" in (bundle_dir / ".env").read_text()
+
+
+def test_up_without_api_port_keeps_8080(
+    compose_calls: list[list[str]],
+    healthy_client: None,
+    pipeline_file: Path,
+    tmp_path: Path,
+) -> None:
+    """The flag is additive: omitting it has to leave existing bundles where they were."""
+    bundle_dir = tmp_path / "runtime"
+    exit_code = main(
+        [
+            "up",
+            "--pipeline",
+            str(pipeline_file),
+            "--data-root",
+            str(tmp_path / "data"),
+            "--bundle-dir",
+            str(bundle_dir),
+        ]
+    )
+    assert exit_code == 0
+    assert "API_PORT=8080" in (bundle_dir / ".env").read_text()
+
+
+def test_up_api_port_does_not_rewrite_a_preserved_env(
+    compose_calls: list[list[str]],
+    healthy_client: None,
+    pipeline_file: Path,
+    tmp_path: Path,
+) -> None:
+    """A second up with a different port leaves the first .env alone.
+
+    Rendering is create-if-absent so an existing .env keeps its secrets and any
+    user edits, which means --api-port only reaches a bundle that has none yet.
+    docs/RUNTIME.md says so under "Port 8080 is taken"; this is what makes that
+    true rather than a claim.
+    """
+    bundle_dir = tmp_path / "runtime"
+    common = [
+        "up",
+        "--pipeline",
+        str(pipeline_file),
+        "--data-root",
+        str(tmp_path / "data"),
+        "--bundle-dir",
+        str(bundle_dir),
+    ]
+    assert main([*common, "--api-port", "9090"]) == 0
+    assert main([*common, "--api-port", "9091"]) == 0
+    assert "API_PORT=9090" in (bundle_dir / ".env").read_text()
+
+
 def test_up_from_published_install_uses_matching_distribution(
     compose_calls: list[list[str]],
     healthy_client: None,
