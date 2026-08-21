@@ -838,3 +838,35 @@ def test_api_port_inside_the_tcp_range_is_accepted(config: RuntimeConfig, good_p
     from dataclasses import replace
 
     assert replace(config, api_port=good_port).api_port == good_port
+
+
+def test_api_port_true_is_rejected_even_though_it_passes_the_range(
+    config: RuntimeConfig,
+) -> None:
+    """bool is the case the range check cannot catch.
+
+    True == 1, so the range test passes it, and the value is only ever str()-ed
+    after that. Without this it reaches the rendered .env as API_PORT=True.
+    """
+    from dataclasses import replace
+
+    with pytest.raises(ValueError, match="api_port must be an int, not bool: True"):
+        replace(config, api_port=True)
+
+
+@pytest.mark.parametrize(
+    ("bad_port", "type_name"),
+    [("8080", "str"), (8080.0, "float"), (None, "NoneType"), (True, "bool")],
+)
+def test_api_port_of_the_wrong_type_is_rejected_at_construction(
+    config: RuntimeConfig, bad_port: object, type_name: str
+) -> None:
+    """The field is annotated int, so anything else is refused where it is set.
+
+    A str used to render a working bundle by accident, since the value is only
+    str()-ed; a float rendered API_PORT=8080.0, which Compose will not take.
+    """
+    from dataclasses import replace
+
+    with pytest.raises(ValueError, match=f"api_port must be an int, not {type_name}"):
+        replace(config, api_port=bad_port)

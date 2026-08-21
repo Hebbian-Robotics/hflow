@@ -217,6 +217,16 @@ class RuntimeConfig:
         # library caller building a RuntimeConfig directly gets the same answer
         # as the command line. Compose reports an out-of-range port only once
         # containers are starting, well past the point it is useful.
+        #
+        # Type first, because the range test cannot do it. `isinstance` would
+        # not either: bool subclasses int, so True is 1 to a comparison and
+        # would pass the range on its way to rendering API_PORT=True. The
+        # value is only ever str()-ed from here on, so nothing downstream
+        # would object.
+        if type(self.api_port) is not int:
+            raise ValueError(
+                f"api_port must be an int, not {type(self.api_port).__name__}: {self.api_port!r}"
+            )
         if not MIN_PORT <= self.api_port <= MAX_PORT:
             raise ValueError(f"api_port {self.api_port!r} is not in {MIN_PORT}-{MAX_PORT}")
 
