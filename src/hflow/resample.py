@@ -26,10 +26,10 @@ from typing import TYPE_CHECKING, Literal, assert_never
 
 import numpy as np
 
+from hflow.format import NANOSECONDS_PER_SECOND
+
 if TYPE_CHECKING:
     from hflow.episode import ChannelData
-
-NANOSECONDS_PER_SECOND = 1_000_000_000
 
 ResamplePolicy = Literal["interpolate", "nearest"]
 

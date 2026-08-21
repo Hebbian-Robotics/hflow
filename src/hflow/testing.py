@@ -45,8 +45,7 @@ from pathlib import Path
 from mcap.writer import Writer
 
 from hflow.ffmpeg import ffmpeg_path
-
-NANOSECONDS_PER_SECOND = 1_000_000_000
+from hflow.format import NANOSECONDS_PER_SECOND
 
 JOINT_STATES_TOPIC = "/joint_states"
 JOINT_STATE_SCHEMA_NAME = "sensor_msgs/msg/JointState"

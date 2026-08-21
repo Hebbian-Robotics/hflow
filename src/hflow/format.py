@@ -45,6 +45,7 @@ FFMPEG_VERSION_NOT_USED = "not-used"
 # Multi-rate alignment is where format converters silently diverge
 # (docs/ARCHITECTURE.md, "Transform"), so the policy is explicit and
 # versioned: bump this when the grid or selection semantics change.
+NANOSECONDS_PER_SECOND = 1_000_000_000
 RESAMPLE_POLICY_VERSION = "1"
 
 # ``provenance/v1`` keys written when derived channels are present:
