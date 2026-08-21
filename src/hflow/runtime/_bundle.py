@@ -31,10 +31,12 @@ Bundle contents:
   file inside the volume is the checkpoint).
 
 The master DAG (Figure 4's top graph) runs entirely in Airflow's own
-environment: a ``@task.branch`` resolves the run profile against a dict
-literal baked from :data:`hflow.steps.RUN_PROFILES` at render time, then a
-``TriggerDagRunOperator`` per ENABLED stage fires the sub-DAG and waits for it
-(deferrable), chained sequentially ``sync >> meta >> labels >> media``.
+environment: a plain ``@task`` resolves the run profile against a dict
+literal baked from :data:`hflow.steps.RUN_PROFILES` at render time; each
+stage's ``TriggerDagRunOperator`` sits behind an ``enabled_<stage>`` gate
+task that raises ``AirflowSkipException`` when the profile disables it
+(deliberately NOT ``@task.branch`` -- see the master template's docstring),
+chained sequentially ``sync >> meta >> labels >> media``.
 
 Each sub-DAG (all task callables run via ``@task.external_python`` against
 the user venv; every import lives inside the function bodies -- the operator
@@ -57,15 +59,18 @@ extracts them to temp files):
 """
 
 import hashlib
+import json
 import logging
 import os
 import re
 import secrets
 import shutil
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 from hflow import __version__
+from hflow.app import ENDPOINT_ENVIRONMENT_VARIABLE_PREFIX
 from hflow.runtime._templates import (
     COMPOSE_TEMPLATE,
     DAG_BUNDLE_CONFIG_LIST_JSON,
@@ -74,7 +79,7 @@ from hflow.runtime._templates import (
     SUB_DAG_ERROR_GATE_TEMPLATE,
     SUB_DAG_QUARANTINE_GATE_TEMPLATE,
 )
-from hflow.steps import RUN_PROFILES, Stage
+from hflow.steps import RUN_PROFILES, IngestMode, Stage
 from hflow.storage import (
     BucketStorageRoot,
     LocalStorageRoot,
@@ -137,6 +142,19 @@ _BUCKET_CREDENTIAL_ENV_VARS: dict[str, tuple[str, ...]] = {
 # DAG against a configurable interpreter path instead (platforms differ).
 CONTAINER_VENV_PYTHON = "/opt/venvs/user/bin/python"
 
+# The machine-readable description both bundle renderers emit next to their
+# generated files: the artifact a provisioning service (or `load_bundle`)
+# reads instead of regexing generated code or parsing DEPLOY.md prose.
+BUNDLE_MANIFEST_FILE_NAME = "hflow-bundle.json"
+BUNDLE_MANIFEST_VERSION = 1
+
+
+class BundleKind(StrEnum):
+    """Which renderer produced a bundle (the manifest's ``kind`` field)."""
+
+    COMPOSE = "compose"
+    DEPLOY = "deploy"
+
 
 @dataclass(frozen=True)
 class RuntimeConfig:
@@ -155,7 +173,23 @@ class RuntimeConfig:
     :param hflow_source: Optional path to an hflow source checkout to install
         into the user venv. When omitted, the runtime installs the exact
         version of the currently running hflow distribution from PyPI.
-    :param dag_id: Defaults to ``<pipeline_file stem>_ingest``.
+    :param dag_id: Defaults to ``<pipeline_file stem>_ingest``. Namespacing
+        for shared schedulers rides on this: a ``<workspace>__<stem>_ingest``
+        master id prefixes every sub-DAG id and UI tag with the workspace.
+    :param api_bind_host: The host the api-server publishes on. The default
+        keeps the workspace loopback-only; a hosted data plane behind its own
+        gateway widens it deliberately.
+    :param task_queue: Optional Airflow queue name stamped onto every
+        generated stage task -- the routing seam for executors with more
+        than one worker pool (per-workspace workers on a shared scheduler).
+        LocalExecutor ignores it, so the Compose runtime behaves identically.
+    :param xcom_objectstorage_url: Optional override for the object-storage
+        XCom backend path (e.g. ``s3://tenant-bucket/xcom``). The default
+        ``file://`` store is single-host: fine for Compose, wrong for any
+        multi-machine executor -- payloads over the 4 KB threshold would land
+        on one worker's disk and be unreadable from the next task's host.
+        A bucket URL here requires the matching Airflow provider (e.g.
+        ``apache-airflow-providers-amazon``) in Airflow's own environment.
     """
 
     pipeline_file: Path
@@ -167,8 +201,11 @@ class RuntimeConfig:
     airflow_image: str = DEFAULT_AIRFLOW_IMAGE
     postgres_image: str = DEFAULT_POSTGRES_IMAGE
     api_port: int = 8080
+    api_bind_host: str = "127.0.0.1"
     admin_username: str = "airflow"
     admin_password: str | None = None  # None: generated once into .env
+    task_queue: str | None = None
+    xcom_objectstorage_url: str | None = None
 
     def resolved_dag_id(self) -> str:
         if self.dag_id is not None:
@@ -267,13 +304,39 @@ def _bucket_compose_credentials(bucket_url: str) -> tuple[str, str]:
     return "".join(environment_lines), mount_suffix
 
 
+def _endpoint_environment_passthrough_lines() -> str:
+    """Compose env lines forwarding ``HFLOW_ENDPOINT_*`` into every service.
+
+    Same contract as the bucket-credential passthrough: variable NAMES only,
+    resolved by compose from the shell that runs it -- values never land in
+    the bundle. This is what delivers ``App``'s endpoint-alias overrides
+    (app.py's ``HFLOW_ENDPOINT_<ALIAS>`` seam) to the task processes;
+    re-render after changing WHICH variables your shell exports. The charset
+    guard refuses names that could break the generated YAML.
+    """
+    environment_lines: list[str] = []
+    for variable_name in sorted(os.environ):
+        if (
+            variable_name.startswith(ENDPOINT_ENVIRONMENT_VARIABLE_PREFIX)
+            and os.environ[variable_name]
+            and re.fullmatch(r"[A-Z0-9_]+", variable_name)
+        ):
+            environment_lines.append(f"\n    {variable_name}: ${{{variable_name}}}")
+    return "".join(environment_lines)
+
+
 def hflow_distribution_requirement(*, include_bucket_extra: bool) -> str:
     """Return the exact hflow requirement matching the running SDK."""
     distribution_name = "hflow[bucket]" if include_bucket_extra else "hflow"
     return f"{distribution_name}=={__version__}"
 
 
-def _render_compose(data_root: StorageRoot, hflow_source: Path | None, project_name: str) -> str:
+def _render_compose(
+    data_root: StorageRoot,
+    hflow_source: Path | None,
+    project_name: str,
+    xcom_objectstorage_url: str | None = None,
+) -> str:
     airflow_hflow_source_mount = ""
     venv_init_hflow_source_mount = ""
     include_bucket_extra = isinstance(data_root, BucketStorageRoot)
@@ -305,11 +368,18 @@ def _render_compose(data_root: StorageRoot, hflow_source: Path | None, project_n
             bucket_credentials_env, bucket_credentials_mount = _bucket_compose_credentials(
                 data_root.url
             )
+    if xcom_objectstorage_url is not None:
+        # A multi-machine executor needs an XCom store every host reaches;
+        # the file:// defaults above are single-host by construction.
+        xcom_objectstorage_path = xcom_objectstorage_url
+    # Endpoint-alias overrides ride the same passthrough slot as bucket
+    # credentials, in BOTH modes -- names only, values from the launch shell.
+    environment_passthrough = bucket_credentials_env + _endpoint_environment_passthrough_lines()
     return COMPOSE_TEMPLATE.substitute(
         project_name=project_name,
         data_volume_line=data_volume_line,
         xcom_objectstorage_path=xcom_objectstorage_path,
-        bucket_credentials_env=bucket_credentials_env,
+        bucket_credentials_env=environment_passthrough,
         bucket_credentials_mount=bucket_credentials_mount,
         hflow_install_target=hflow_install_target,
         dag_bundle_config_list=DAG_BUNDLE_CONFIG_LIST_JSON,
@@ -323,9 +393,14 @@ def _generate_env_values(config: RuntimeConfig) -> dict[str, str]:
     return {
         "AIRFLOW_UID": str(os.getuid()),
         "API_PORT": str(config.api_port),
+        "API_BIND_HOST": config.api_bind_host,
         "AIRFLOW_IMAGE": config.airflow_image,
         "POSTGRES_IMAGE": config.postgres_image,
         "JWT_SECRET": generate_secret(),
+        # Generated like the admin password: no fixed database credential in
+        # a fresh bundle. Old bundles' preserved .env files lack the key and
+        # fall back to the compose default, so they keep working.
+        "POSTGRES_PASSWORD": generate_secret(),
         "AIRFLOW_ADMIN_USERNAME": config.admin_username,
         "AIRFLOW_ADMIN_PASSWORD": (
             config.admin_password if config.admin_password is not None else generate_secret()
@@ -441,6 +516,20 @@ def _validate_dag_identifiers(dag_id: str, app_variable: str | None = None) -> N
         raise ValueError(f"app_variable {app_variable!r} is not a Python identifier")
 
 
+def _task_queue_argument(task_queue: str | None) -> str:
+    """The ``, queue=...`` suffix injected into every stage task decorator.
+
+    Airflow queue names share the dag-id character policy here; the value is
+    additionally injected as a repr() literal so no input can splice code
+    into the generated DAG (#44's rule).
+    """
+    if task_queue is None:
+        return ""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", task_queue):
+        raise ValueError(f"task_queue {task_queue!r} may only contain [A-Za-z0-9_.-]")
+    return f", queue={task_queue!r}"
+
+
 def _run_profiles_literal() -> str:
     """:data:`hflow.steps.RUN_PROFILES` as a Python dict literal.
 
@@ -484,6 +573,9 @@ def render_master_dag_source(*, dag_id: str) -> str:
     return MASTER_DAG_TEMPLATE.substitute(
         dag_id=dag_id,
         run_profiles_literal=_run_profiles_literal(),
+        # Baked like the profiles: steps.IngestMode stays the one owner of
+        # the lane vocabulary, and the master runs without importing hflow.
+        ingest_modes_literal=repr(tuple(mode.value for mode in IngestMode)),
         profile_table_rows=_profile_table_markdown_rows(),
         pipeline_tag=pipeline_stem,
         master_display_name=f"{pipeline_stem} · ingest (master)",
@@ -502,12 +594,15 @@ def render_sub_dag_source(
     app_variable: str,
     data_root: str,
     venv_python: str,
+    task_queue: str | None = None,
 ) -> str:
     """One stage sub-DAG's Python source, shared by Compose and deploy rendering.
 
     ``data_root`` and ``venv_python`` are the two facts the deployment modes
     disagree on (Compose: :data:`CONTAINER_DATA_ROOT` /
     :data:`CONTAINER_VENV_PYTHON`; deploy: the user's URI and platform venv).
+    ``task_queue`` stamps every stage task with an Airflow queue for
+    multi-worker-pool executors; ``None`` keeps the executor's default.
     """
     sub_dag_id = sub_dag_id_for_stage(master_dag_id, stage)
     _validate_dag_identifiers(master_dag_id, app_variable)
@@ -530,6 +625,11 @@ def render_sub_dag_source(
     data_root_literal = repr(data_root)
     venv_python_literal = repr(venv_python)
     pipeline_filename_literal = repr(pipeline_filename)
+    # repr() is self-escaping in CODE positions only. The header docstring is
+    # prose inside a triple-quoted block, so a value containing a triple
+    # quote would close the docstring early and splice the remainder in as
+    # source; neutralize that one sequence for the prose slot.
+    venv_python_documentation_text = venv_python_literal.replace('"""', '\\"\\"\\"')
     # Substituted separately because Template.substitute never re-expands
     # variables inside substituted VALUES -- the filter's own $data_root must
     # be resolved before injection. Local roots only: probing a BUCKET
@@ -553,7 +653,9 @@ def render_sub_dag_source(
         app_variable=app_variable,
         data_root=data_root_literal,
         venv_python=venv_python_literal,
+        venv_python_doc=venv_python_documentation_text,
         stage_plan_filter=stage_plan_filter,
+        task_queue_argument=_task_queue_argument(task_queue),
     )
 
 
@@ -564,6 +666,7 @@ def render_dag_sources(
     app_variable: str,
     data_root: str,
     venv_python: str,
+    task_queue: str | None = None,
 ) -> dict[str, str]:
     """dag_id -> source for all five DAGs (master first, then Figure 4 order)."""
     sources = {master_dag_id: render_master_dag_source(dag_id=master_dag_id)}
@@ -575,6 +678,7 @@ def render_dag_sources(
             app_variable=app_variable,
             data_root=data_root,
             venv_python=venv_python,
+            task_queue=task_queue,
         )
     return sources
 
@@ -606,12 +710,73 @@ def infer_hflow_source() -> Path | None:
     return None
 
 
+def write_bundle_manifest(
+    output_directory: Path,
+    *,
+    kind: BundleKind,
+    dag_id: str,
+    data_root: str,
+    app_variable: str,
+    pipeline_filename: str,
+    requirements_included: bool,
+    task_queue: str | None,
+    venv_python: str,
+) -> Path:
+    """Emit ``hflow-bundle.json``: the bundle described as data, not prose.
+
+    The artifact a provisioning service reads (and a future control plane
+    accepts as an upload's description) instead of regexing generated DAG
+    source or parsing DEPLOY.md. ``load_bundle`` prefers it too.
+    """
+    manifest_payload = {
+        "manifest_version": BUNDLE_MANIFEST_VERSION,
+        "kind": kind.value,  # serialized as its string value (JSON boundary)
+        "hflow_version": __version__,
+        "dag_id": dag_id,
+        "sub_dag_ids": {stage.value: sub_dag_id_for_stage(dag_id, stage) for stage in Stage},
+        "data_root": data_root,
+        "app_variable": app_variable,
+        "pipeline_filename": pipeline_filename,
+        "requirements_included": requirements_included,
+        "task_queue": task_queue,
+        "venv_python": venv_python,
+    }
+    manifest_file = output_directory / BUNDLE_MANIFEST_FILE_NAME
+    manifest_file.write_text(json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n")
+    return manifest_file
+
+
+def _dag_id_from_bundle_manifest(bundle_directory: Path) -> str | None:
+    """The dag id per ``hflow-bundle.json``, or ``None`` when unusable.
+
+    Unusable covers absent, unparseable, and future-versioned manifests --
+    the caller falls back to the legacy read-it-from-generated-source path,
+    so bundles rendered by other versions keep loading.
+    """
+    manifest_file = bundle_directory / BUNDLE_MANIFEST_FILE_NAME
+    if not manifest_file.is_file():
+        return None
+    try:
+        manifest_payload = json.loads(manifest_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(manifest_payload, dict):
+        return None
+    if manifest_payload.get("manifest_version") != BUNDLE_MANIFEST_VERSION:
+        # A future (or mangled) manifest may have re-semantified its fields;
+        # the generated DAG source stays the trustworthy fallback.
+        return None
+    dag_id = manifest_payload.get("dag_id")
+    return dag_id if isinstance(dag_id, str) and dag_id else None
+
+
 def load_bundle(bundle_dir: Path | str) -> BundlePaths:
     """Reconstruct :class:`BundlePaths` for an already-rendered bundle.
 
     The CLI's ``down``/``ingest``/``status`` take only a bundle directory;
     everything else (port, credentials, dag id) is read back from the bundle's
-    own files -- the .env for secrets, the generated DAG for its id.
+    own files -- the .env for secrets, ``hflow-bundle.json`` for the dag id
+    (falling back to the generated DAG source for pre-manifest bundles).
     """
     bundle_directory = Path(bundle_dir)
     compose_file = bundle_directory / "docker-compose.yaml"
@@ -623,9 +788,12 @@ def load_bundle(bundle_dir: Path | str) -> BundlePaths:
                 f"no rendered bundle at {bundle_directory} (missing {required_file.name}); "
                 "run `hflow up` (or render_bundle) first"
             )
-    dag_id_match = _DAG_ID_PATTERN.search(dag_file.read_text())
-    if dag_id_match is None:
-        raise ValueError(f"{dag_file} has no dag_id=... -- not an hflow-generated DAG")
+    dag_id = _dag_id_from_bundle_manifest(bundle_directory)
+    if dag_id is None:
+        dag_id_match = _DAG_ID_PATTERN.search(dag_file.read_text())
+        if dag_id_match is None:
+            raise ValueError(f"{dag_file} has no dag_id=... -- not an hflow-generated DAG")
+        dag_id = dag_id_match.group(1)
     env_values = _parse_env_file(env_file)
     return BundlePaths(
         bundle_dir=bundle_directory,
@@ -639,7 +807,7 @@ def load_bundle(bundle_dir: Path | str) -> BundlePaths:
         api_base_url=f"http://127.0.0.1:{env_values.get('API_PORT', '8080')}",
         admin_username=env_values.get("AIRFLOW_ADMIN_USERNAME", "airflow"),
         admin_password=env_values.get("AIRFLOW_ADMIN_PASSWORD", ""),
-        dag_id=dag_id_match.group(1),
+        dag_id=dag_id,
     )
 
 
@@ -696,7 +864,12 @@ def render_bundle(config: RuntimeConfig, bundle_dir: Path | str) -> BundlePaths:
     )
     compose_file = bundle_directory / "docker-compose.yaml"
     compose_file.write_text(
-        _render_compose(resolved_data_root, hflow_source, _project_name(bundle_directory))
+        _render_compose(
+            resolved_data_root,
+            hflow_source,
+            _project_name(bundle_directory),
+            config.xcom_objectstorage_url,
+        )
     )
 
     # Five DAG files (Figure 4): the master keeps the historical ingest.py
@@ -709,6 +882,7 @@ def render_bundle(config: RuntimeConfig, bundle_dir: Path | str) -> BundlePaths:
         app_variable=config.app_variable,
         data_root=dag_data_root,
         venv_python=CONTAINER_VENV_PYTHON,
+        task_queue=config.task_queue,
     )
     dag_file = dags_dir / "ingest.py"
     dag_file.write_text(dag_sources[master_dag_id])
@@ -717,6 +891,18 @@ def render_bundle(config: RuntimeConfig, bundle_dir: Path | str) -> BundlePaths:
         sub_dag_file = dags_dir / f"ingest_{stage.value}.py"
         sub_dag_file.write_text(dag_sources[sub_dag_id_for_stage(master_dag_id, stage)])
         sub_dag_files.append(sub_dag_file)
+
+    write_bundle_manifest(
+        bundle_directory,
+        kind=BundleKind.COMPOSE,
+        dag_id=master_dag_id,
+        data_root=dag_data_root,
+        app_variable=config.app_variable,
+        pipeline_filename=pipeline_source.name,
+        requirements_included=config.requirements_file is not None,
+        task_queue=config.task_queue,
+        venv_python=CONTAINER_VENV_PYTHON,
+    )
 
     # Create-if-absent: an existing .env is never rewritten, so its secrets
     # (and any user edits) survive every re-render. It holds the JWT secret

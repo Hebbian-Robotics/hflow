@@ -58,8 +58,10 @@ app = hflow.App(
 ```
 
 The check declares `uses="vision"`. Preflight can then reject a missing alias
-before processing any episode. Inside the step, the endpoint remains an
-ordinary OpenAI SDK option:
+before processing any episode. At run start an exported
+`HFLOW_ENDPOINT_VISION` variable overrides (or supplies) the alias, so the
+same file can point at a different endpoint without editing it. Inside the
+step, the endpoint remains an ordinary OpenAI SDK option:
 
 ```python
 @app.check(uses="vision")

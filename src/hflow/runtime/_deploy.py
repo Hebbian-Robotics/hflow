@@ -34,12 +34,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from hflow.runtime._bundle import (
+    BundleKind,
     hflow_distribution_requirement,
     render_dag_sources,
     sub_dag_id_for_stage,
     warn_if_pipeline_data_root_differs,
+    write_bundle_manifest,
 )
 from hflow.runtime._templates import DAG_BUNDLE_CONFIG_LIST_JSON
+from hflow.stage_execution import USER_DIRECTORY_DEFAULT
 from hflow.steps import RUN_PROFILES, Stage
 from hflow.storage import is_bucket_url, parse_storage_root
 
@@ -47,11 +50,6 @@ from hflow.storage import is_bucket_url, parse_storage_root
 # Compose runtime's convention so a venv built from these instructions is
 # drop-in there too; every platform can override it (--venv-python).
 DEFAULT_DEPLOY_VENV_PYTHON = "/opt/venvs/user/bin/python"
-
-# Where the DAG looks for user/ when HFLOW_USER_DIR is unset -- the Compose
-# runtime's mount point, kept as the deploy default so self-managed
-# deployments that can mount anywhere need no environment variable at all.
-DEFAULT_USER_DIR = "/opt/user"
 
 # What the external-python venv must contain besides the user's requirements
 # (references/airflow3-notes.md, "External-python": virtualenv preinstalled;
@@ -98,6 +96,10 @@ class DeployConfig:
         (platforms differ; the DAG's ``@task.external_python`` points here).
     :param dag_id: Defaults to ``<pipeline_file stem>_ingest`` (the same rule
         as the Compose runtime's :class:`~hflow.runtime.RuntimeConfig`).
+    :param task_queue: Optional Airflow queue name stamped onto every stage
+        task -- routes this pipeline's tasks to a dedicated worker pool on
+        deployments running more than one (per-team or per-workspace
+        workers). ``None`` keeps the executor's default queue.
     """
 
     pipeline_file: Path
@@ -106,6 +108,7 @@ class DeployConfig:
     requirements_file: Path | None = None
     venv_python_path: str = DEFAULT_DEPLOY_VENV_PYTHON
     dag_id: str | None = None
+    task_queue: str | None = None
 
     def __post_init__(self) -> None:
         # Parse at the boundary: an invalid data root never becomes a config.
@@ -180,6 +183,7 @@ def render_deploy_bundle(config: DeployConfig, output_dir: Path | str) -> Deploy
         app_variable=config.app_variable,
         data_root=config.data_root_uri,
         venv_python=config.venv_python_path,
+        task_queue=config.task_queue,
     )
     dag_file = dags_dir / f"{dag_id}.py"
     dag_file.write_text(dag_sources[dag_id])
@@ -189,6 +193,18 @@ def render_deploy_bundle(config: DeployConfig, output_dir: Path | str) -> Deploy
         sub_dag_file = dags_dir / f"{sub_dag_id}.py"
         sub_dag_file.write_text(dag_sources[sub_dag_id])
         sub_dag_files.append(sub_dag_file)
+
+    write_bundle_manifest(
+        output_directory,
+        kind=BundleKind.DEPLOY,
+        dag_id=dag_id,
+        data_root=config.data_root_uri,
+        app_variable=config.app_variable,
+        pipeline_filename=pipeline_source.name,
+        requirements_included=requirements_copied,
+        task_queue=config.task_queue,
+        venv_python=config.venv_python_path,
+    )
 
     deploy_md = output_directory / "DEPLOY.md"
     deploy_md.write_text(
@@ -269,7 +285,7 @@ create it wherever the platform allows and re-render with
 ## 2. Place `dags/` and `user/`
 
 The DAG loads your pipeline from `$HFLOW_USER_DIR/{pipeline_filename}`
-(default `{DEFAULT_USER_DIR}`), so set `HFLOW_USER_DIR` on all Airflow
+(default `{USER_DIRECTORY_DEFAULT}`), so set `HFLOW_USER_DIR` on all Airflow
 components to wherever `user/` lands.
 
 ### Astronomer
@@ -310,19 +326,22 @@ components to wherever `user/` lands.
 AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST='{DAG_BUNDLE_CONFIG_LIST_JSON}'
 ```
 
-- Place `user/` at `{DEFAULT_USER_DIR}` on every worker (or anywhere, plus
+- Place `user/` at `{USER_DIRECTORY_DEFAULT}` on every worker (or anywhere, plus
   `HFLOW_USER_DIR`).
 
 ## 3. Environment the DAG expects
 
 | variable | value | why |
 | --- | --- | --- |
-| `HFLOW_USER_DIR` | absolute path of `user/` on the workers | where the tasks import `{pipeline_filename}` from (default `{DEFAULT_USER_DIR}`) |
+| `HFLOW_USER_DIR` | absolute path of `user/` on the workers | where the tasks import `{pipeline_filename}` from (default `{USER_DIRECTORY_DEFAULT}`) |
+| `HFLOW_ENDPOINT_<ALIAS>` | endpoint URL per alias the pipeline declares with `uses=` | optional: overrides (or supplies) endpoint aliases without editing the pipeline file -- set on every worker's task environment |
 
 Data root: episode URIs in the trigger conf resolve under
-`{config.data_root_uri}`, and your pipeline's App must be constructed with
-exactly `data_root="{config.data_root_uri}"` -- the DAG refuses to process
-episodes otherwise.
+`{config.data_root_uri}`. Construct your pipeline's App WITHOUT a
+`data_root` argument (recommended: the task exports `HFLOW_DATA_ROOT`
+before importing your pipeline, so the same file also runs unedited in the
+dev loop), or with exactly `data_root="{config.data_root_uri}"` -- the DAG
+refuses to process episodes under any other root.
 
 Object-store roots use the optional obstore backend in the task venv and the
 provider's standard worker credentials. Each worker spools inputs and outputs

@@ -89,27 +89,20 @@ def test_dag_sources_compile_and_carry_deploy_values(config: DeployConfig, tmp_p
         compile(dag_source, str(sub_dag_file), "exec")
 
         assert f'dag_id="my_pipeline_{stage.value}"' in dag_source
-        assert f'stages={{"{stage.value}"}}' in dag_source
-        # The data root is parsed through the shared storage boundary for size
-        # planning, while processing chooses a Path or full bucket URI.
-        # Substituted as a repr() literal (not bare text in a pre-quoted
-        # slot), so this holds for any data root content, not just this
-        # plain-path case -- see
+        assert f'"{stage.value}")' in dag_source
+        # The deploy data root reaches the library calls as a repr() literal
+        # (not bare text in a pre-quoted slot), so this holds for any data
+        # root content, not just this plain-path case -- see
         # test_dag_sources_survive_paths_that_are_not_valid_python_literals.
-        assert f"data_root = parse_storage_root({DATA_ROOT_PATH!r})" in dag_source
-        assert "episode_reference = (" in dag_source
+        assert f"data_root={DATA_ROOT_PATH!r}" in dag_source
         assert f"expected_data_root = {DATA_ROOT_PATH!r}" in dag_source
-        assert "if str(app.data_root) != expected_data_root:" in dag_source
-        assert (
-            '"pipeline data_root must be " + expected_data_root + " inside the runtime; "'
-            in dag_source
-        )
+        assert "require_application_data_root(app, expected_data_root)" in dag_source
         assert "/opt/airflow/data" not in dag_source
         # All three tasks point at the (default) deploy venv interpreter.
         assert dag_source.count(f"@task.external_python(python={DEFAULT_DEPLOY_VENV_PYTHON!r}") == 3
-        # The pipeline loads from user/, relocatable per platform via env var.
-        assert "\"/opt/user/\" + 'my_pipeline.py'" in dag_source
-        assert 'os.environ.get("HFLOW_USER_DIR")' in dag_source
+        # The pipeline loads from user/, relocatable per platform via env var
+        # (resolve_user_pipeline_path owns the HFLOW_USER_DIR lookup).
+        assert "resolve_user_pipeline_path('my_pipeline.py')" in dag_source
 
 
 def test_dag_sources_honor_custom_venv_python(config: DeployConfig, tmp_path: Path) -> None:
@@ -158,8 +151,21 @@ def test_dag_sources_survive_paths_that_are_not_valid_python_literals(
         # embedded quote had broken out of the intended string instead, this
         # exact substring would not appear (and `compile()` above would
         # either have raised or accepted a different, corrupted program).
-        assert f"data_root = parse_storage_root({quote_bearing_data_root!r})" in dag_source
+        assert f"data_root={quote_bearing_data_root!r}" in dag_source
         assert f"expected_data_root = {quote_bearing_data_root!r}" in dag_source
+
+    # The header DOCSTRING is a prose slot, not a code literal: a value
+    # containing a triple quote must not close it early and splice the rest
+    # of the header in as source.
+    docstring_breaking_venv_python = '/opt/"""; SPLICED = 1; _rest = """/python'
+    prose_paths = _render(
+        replace(config, venv_python_path=docstring_breaking_venv_python),
+        tmp_path / "deploy-docstring",
+    )
+    for sub_dag_file in prose_paths.sub_dag_files:
+        dag_source = sub_dag_file.read_text()
+        compile(dag_source, str(sub_dag_file), "exec")
+        assert "\nSPLICED = 1" not in dag_source
 
 
 def test_dag_id_default_rule_and_override(config: DeployConfig, tmp_path: Path) -> None:
@@ -278,8 +284,8 @@ def test_deploy_config_supports_object_store_urls_and_installs_backend(tmp_path:
     assert "HFLOW_MIRROR_DIR" in deploy_md
     for dag_file in paths.sub_dag_files:
         dag_source = dag_file.read_text()
-        assert "parse_storage_root('s3://bucket/prefix')" in dag_source
-        assert "is_bucket_url(data_root)" in dag_source
+        assert "data_root='s3://bucket/prefix'" in dag_source
+        assert "expected_data_root = 's3://bucket/prefix'" in dag_source
 
 
 def test_render_warns_on_mismatched_pipeline_data_root_literal(
@@ -302,6 +308,23 @@ def test_render_stays_silent_when_pipeline_matches_deploy_root(
     with caplog.at_level("WARNING", logger="hflow.runtime._bundle"):
         _render(config, tmp_path / "deploy")
     assert not caplog.records
+
+
+def test_deploy_bundle_manifest_describes_the_bundle(config: DeployConfig, tmp_path: Path) -> None:
+    """The deploy bundle carries the same machine-readable description the
+    Compose bundle does -- the upload/provisioning contract, kind 'deploy'."""
+    import json
+    from dataclasses import replace
+
+    paths = _render(replace(config, task_queue="workspace-a"), tmp_path / "deploy")
+    manifest_payload = json.loads((paths.output_dir / "hflow-bundle.json").read_text())
+    assert manifest_payload["kind"] == "deploy"
+    assert manifest_payload["dag_id"] == "my_pipeline_ingest"
+    assert manifest_payload["data_root"] == DATA_ROOT_PATH
+    assert manifest_payload["venv_python"] == DEFAULT_DEPLOY_VENV_PYTHON
+    assert manifest_payload["task_queue"] == "workspace-a"
+    for sub_dag_file in paths.sub_dag_files:
+        assert ", queue='workspace-a')" in sub_dag_file.read_text()
 
 
 def test_rerender_overwrites_generated_files(config: DeployConfig, tmp_path: Path) -> None:
@@ -340,7 +363,7 @@ def test_cli_deploy_renders_and_prints_pointers(
     assert exit_code == 0
     assert (output_dir / "dags" / "demo_pipeline_ingest.py").is_file()  # the master
     sub_dag_source = (output_dir / "dags" / "demo_pipeline_sync.py").read_text()
-    assert 'getattr(pipeline_module, "my_app")' in sub_dag_source
+    assert 'load_pipeline_application(pipeline_path, "my_app")' in sub_dag_source
     output = capsys.readouterr().out
     assert str(output_dir / "DEPLOY.md") in output
     assert "demo_pipeline_ingest" in output

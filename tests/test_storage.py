@@ -236,6 +236,44 @@ class TestBucketStorageRoot:
         root, _ = bucket_over_tmp(tmp_path)
         assert root.uri_for("episodes/e.mcap") == f"{root.url}/episodes/e.mcap"
 
+    def test_store_options_configure_the_store_and_survive_child(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Explicit store options reach obstore and propagate to child roots.
+
+        This is the credential-injection seam a control plane uses to scope
+        per-workspace credentials without mutating the process environment.
+        """
+        import hflow.storage as storage_module
+
+        real_obstore = storage_module._load_obstore()
+        received_options: list[dict[str, object]] = []
+        real_from_url = real_obstore.store.from_url
+
+        def capturing_from_url(url: str, **options: object) -> object:
+            received_options.append(dict(options))
+            return real_from_url(url, **options)
+
+        monkeypatch.setattr(real_obstore.store, "from_url", capturing_from_url)
+
+        remote_dir = tmp_path / "bucket"
+        remote_dir.mkdir()
+        root = BucketStorageRoot(
+            f"file://{remote_dir}",
+            mirror=tmp_path / "mirror",
+            store_options={"automatic_cleanup": True},
+        )
+        root.write_bytes("episodes/e.bin", b"payload")
+        assert root.read_bytes("episodes/e.bin") == b"payload"
+        assert received_options[-1]["automatic_cleanup"] is True
+        # file:// keeps its mkdir default unless the caller overrides it.
+        assert received_options[-1]["mkdir"] is True
+
+        catalog_child = root.child("catalog")
+        assert catalog_child.store_options == {"automatic_cleanup": True}
+        catalog_child.write_bytes("episodes/a.parquet", b"aa")
+        assert received_options[-1]["automatic_cleanup"] is True
+
 
 class TestFetchUri:
     def test_local_path_passes_through(self, tmp_path: Path) -> None:

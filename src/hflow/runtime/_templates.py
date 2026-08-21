@@ -43,8 +43,9 @@ class ComposeTemplate(Template):
 
 
 # The official Airflow 3.3.1 reference compose reduced to LocalExecutor:
-# postgres + airflow-init + apiserver/scheduler/dag-processor/triggerer,
-# no redis, no celery worker, no flower. Substitutions: %{data_volume_line}
+# postgres + airflow-init + user-venv-init +
+# apiserver/scheduler/dag-processor/triggerer, no redis, no celery worker,
+# no flower. Substitutions: %{data_volume_line}
 # (local mode: the host data root mounted at /opt/airflow/data; bucket mode:
 # the bundle-local ./xcom directory instead -- episodes never touch the host
 # filesystem), %{xcom_objectstorage_path} (under whichever of those mounts
@@ -72,7 +73,10 @@ x-airflow-common: &airflow-common
   user: "${AIRFLOW_UID}:0"
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    # ${POSTGRES_PASSWORD:-airflow}: generated per bundle into .env; the
+    # default keeps bundles rendered by older versions (whose preserved .env
+    # has no POSTGRES_PASSWORD) working against their existing DB volume.
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${POSTGRES_PASSWORD:-airflow}@postgres/airflow
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
     AIRFLOW__API_AUTH__JWT_SECRET: ${JWT_SECRET}
@@ -91,6 +95,7 @@ x-airflow-common: &airflow-common
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs%{data_volume_line}
+    # Mount target must match hflow.stage_execution.USER_DIRECTORY_DEFAULT.
     - ./user:/opt/user:ro
     - user-venv:/opt/venvs%{airflow_hflow_source_mount}%{bucket_credentials_mount}
   depends_on:
@@ -106,7 +111,7 @@ services:
     image: ${POSTGRES_IMAGE}
     environment:
       POSTGRES_USER: airflow
-      POSTGRES_PASSWORD: airflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-airflow}
       POSTGRES_DB: airflow
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
@@ -182,13 +187,17 @@ services:
         chown -R "${AIRFLOW_UID}:0" /opt/venvs
     volumes:
       - user-venv:/opt/venvs
+      # Mount target must match hflow.stage_execution.USER_DIRECTORY_DEFAULT.
       - ./user:/opt/user:ro%{venv_init_hflow_source_mount}
 
   airflow-apiserver:
     <<: *airflow-common
     command: api-server
     ports:
-      - "127.0.0.1:${API_PORT}:8080"
+      # ${API_BIND_HOST:-127.0.0.1}: loopback-only by default (a workspace
+      # exposes nothing); a hosted data plane fronted by its own gateway can
+      # widen the bind through .env without editing this file.
+      - "${API_BIND_HOST:-127.0.0.1}:${API_PORT}:8080"
     healthcheck:
       # /api/v2/monitor/health always answers HTTP 200 (the body carries the
       # per-component statuses); this checks the api-server answers at all,
@@ -265,9 +274,10 @@ would run media too).
 from airflow.providers.standard.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.sdk import dag, task
 
-# Baked from hflow.steps.RUN_PROFILES at render time -- re-render after
-# changing profiles; never edit this literal by hand.
+# Baked from hflow.steps.RUN_PROFILES and hflow.steps.IngestMode at render
+# time -- re-render after changing either; never edit these literals by hand.
 RUN_PROFILE_STAGES = $run_profiles_literal
+VALID_INGEST_MODES = $ingest_modes_literal
 
 # Declaration order is Figure 4's left-to-right execution order.
 STAGE_SUB_DAG_IDS = {
@@ -321,8 +331,10 @@ def master_ingest():
                 f"unknown run profile {profile!r}; valid profiles: "
                 f"{sorted(RUN_PROFILE_STAGES)}"
             )
-        if mode not in ("batch", "online"):
-            raise ValueError(f"unknown mode {mode!r}; valid modes: batch, online")
+        if mode not in VALID_INGEST_MODES:
+            raise ValueError(
+                f"unknown mode {mode!r}; valid modes: {', '.join(VALID_INGEST_MODES)}"
+            )
         return list(RUN_PROFILE_STAGES[profile])
 
     @task(trigger_rule="none_failed")
@@ -396,7 +408,7 @@ _SUB_DAG_HEADER = '''\
 One of Figure 4's four toggleable sub-DAGs, normally triggered by the master
 DAG "$master_dag_id" (direct triggering with the same conf also works).
 plan -> process_batch (dynamically mapped) -> $gate_name, all via
-@task.external_python against the user venv at $venv_python (user dependencies
+@task.external_python against the user venv at $venv_python_doc (user dependencies
 never meet Airflow's pins). Imports live inside the function bodies because
 the operator extracts each body to a temp file; only JSON-able data crosses
 task borders. Trigger conf: {"uris": [...], "mode": "batch"|"online",
@@ -433,164 +445,84 @@ latency-first run); `batch_count`: optional override.
     params={"uris": [], "mode": "batch", "batch_count": None},
 )
 def ingest_stage():
-    @task.external_python(python=$venv_python, expect_airflow=False, skip_on_exit_code=99)
+    @task.external_python(python=$venv_python, expect_airflow=False, skip_on_exit_code=99$task_queue_argument)
     def plan(uris, mode, batch_count):
-        """Bin-pack uris into staggered batches; online is one immediate batch."""
-        from hflow.batching import plan_batches
-        from hflow.storage import parse_storage_root
+        """Bin-pack uris into staggered batches; online is one immediate batch.
+
+        The lane semantics live in hflow.stage_execution (one owner for every
+        execution backend); this task only feeds it the trigger conf.
+        """
+        from hflow.stage_execution import plan_stage_batches
 
         if not uris:
             return []
-$stage_plan_filter        if mode == "online":
-            # The online lane (Figure 4) is latency-first: one run per episode
-            # as it lands -- no batching, no stagger, batch_count ignored.
-            return [{"items": [str(uri) for uri in uris], "start_delay_s": 0.0}]
-        data_root = parse_storage_root($data_root)
-        item_sizes = {str(uri): data_root.file_size(str(uri)) for uri in uris}
-        resolved_batch_count = (
-            int(batch_count) if batch_count is not None else min(4, len(item_sizes))
+$stage_plan_filter        return plan_stage_batches(
+            [str(uri) for uri in uris],
+            mode=mode,
+            batch_count=batch_count,
+            data_root=$data_root,
         )
-        planned = plan_batches(
-            item_sizes, batch_count=resolved_batch_count, stagger_interval_s=2.0
-        )
-        return [
-            {"items": list(batch.items), "start_delay_s": batch.start_delay_s}
-            for batch in planned
-        ]
 
-    @task.external_python(python=$venv_python, expect_airflow=False)
+    @task.external_python(python=$venv_python, expect_airflow=False$task_queue_argument)
     def process_batch(batch):
-        """Sleep the stagger delay, then run this sub-DAG's stage on every episode."""
-        import importlib.util
+        """Sleep the stagger delay, then run this sub-DAG's stage on every episode.
+
+        The pipeline-loading contract and the per-episode accounting loop live
+        in hflow.stage_execution; this task binds them to the rendered
+        data root and pipeline file.
+        """
         import os
         import time
-        import traceback
-        from pathlib import Path
 
-        from hflow.storage import is_bucket_url
+        from hflow.app import DATA_ROOT_ENVIRONMENT_VARIABLE
+        from hflow.stage_execution import (
+            load_pipeline_application,
+            process_stage_batch,
+            require_application_data_root,
+            resolve_user_pipeline_path,
+        )
 
         time.sleep(float(batch["start_delay_s"]))
 
-        pipeline_path = "/opt/user/" + $pipeline_filename
-        # Managed platforms cannot always mount user/ at /opt/user;
-        # HFLOW_USER_DIR relocates it without re-rendering (DEPLOY.md names
-        # the per-platform value).
-        user_dir_override = os.environ.get("HFLOW_USER_DIR")
-        if user_dir_override:
-            pipeline_path = user_dir_override.rstrip("/") + "/" + $pipeline_filename
-        spec = importlib.util.spec_from_file_location("hflow_user_pipeline", pipeline_path)
-        if spec is None or spec.loader is None:
-            raise RuntimeError("cannot load user pipeline at " + pipeline_path)
-        pipeline_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(pipeline_module)
-        app = getattr(pipeline_module, "$app_variable")
-        # Episode URIs resolve under the runtime's data root; an app pointing
-        # anywhere else would silently write elsewhere in the
-        # task's filesystem, so refuse loudly instead.
         expected_data_root = $data_root
-        if str(app.data_root) != expected_data_root:
-            raise RuntimeError(
-                "pipeline data_root must be " + expected_data_root + " inside the runtime; "
-                f"it is {app.data_root}"
-            )
-
-        data_root = str(app.data_root)
-        counts = {"processed": 0, "quarantined": 0, "errors": 0}
-        for uri in batch["items"]:
-            try:
-                episode_reference = (
-                    data_root.rstrip("/") + "/" + str(uri).lstrip("/")
-                    if is_bucket_url(data_root)
-                    else Path(data_root) / str(uri)
-                )
-                report = app.process(
-                    episode_reference, record=True, stages={"$stage_name"}
-                )
-            except Exception:
-                # Per-episode crashes are counted as errors, never batch-fatal;
-                # the gate applies the run budget to the error tally (and an
-                # all-errors run always fails), so mass failure stays loud.
-                traceback.print_exc()
-                counts["errors"] += 1
-                continue
-            if report.has_errors:
-                # app.process collects per-step diagnostics for the dev loop
-                # and catalog, so step failures are explicit report outcomes
-                # rather than escaping exceptions. They still count against
-                # the runtime's infrastructure-error budget.
-                counts["errors"] += 1
-            elif report.quarantined:
-                counts["quarantined"] += 1
-            else:
-                counts["processed"] += 1
-        return counts
+        # Environment-portable pipelines (App constructed without an explicit
+        # data_root) resolve their root from this variable; a pipeline that
+        # hardcodes a different literal is refused by the guard below.
+        os.environ[DATA_ROOT_ENVIRONMENT_VARIABLE] = expected_data_root
+        pipeline_path = resolve_user_pipeline_path($pipeline_filename)
+        app = load_pipeline_application(pipeline_path, "$app_variable")
+        require_application_data_root(app, expected_data_root)
+        return process_stage_batch(app, batch["items"], "$stage_name")
 '''
 
 _SUB_DAG_QUARANTINE_GATE = '''\
 
-    @task.external_python(python=$venv_python, expect_airflow=False)
+    @task.external_python(python=$venv_python, expect_airflow=False$task_queue_argument)
     def quarantine_budget_gate(batch_counts):
         """Fail the run loudly on mass failure of either kind.
 
         Checks decide quarantine, so the quarantine budget lives ONLY in this
-        meta sub-DAG. The same budget also applies to per-episode exceptions
-        and step errors collected in TestReport, and a run where nothing
-        processed at all always fails.
+        meta sub-DAG. The budget math is library-owned
+        (hflow.stage_execution), shared by every execution backend.
         """
-        import math
+        from hflow.stage_execution import summarize_quarantine_budget
 
-        total = sum(
-            counts["processed"] + counts["quarantined"] + counts["errors"]
-            for counts in batch_counts
-        )
-        quarantined = sum(counts["quarantined"] for counts in batch_counts)
-        errors = sum(counts["errors"] for counts in batch_counts)
-        budget = max(8, math.ceil(0.01 * total))
-        if quarantined > budget:
-            raise RuntimeError(
-                f"quarantined {quarantined} of {total} episodes, over the budget "
-                f"of {budget} -- quarantine is a tag, never a deletion; inspect "
-                "the catalog's quarantine tags"
-            )
-        if errors > budget or (errors and errors == total):
-            raise RuntimeError(
-                f"{errors} of {total} episodes had processing errors "
-                f"(budget {budget}) -- infrastructure, not data; see the "
-                "process_batch task logs"
-            )
-        return {
-            "total": total,
-            "quarantined": quarantined,
-            "errors": errors,
-            "budget": budget,
-        }
+        return summarize_quarantine_budget(batch_counts)
 '''
 
 _SUB_DAG_ERROR_GATE = '''\
 
-    @task.external_python(python=$venv_python, expect_airflow=False)
+    @task.external_python(python=$venv_python, expect_airflow=False$task_queue_argument)
     def error_budget_gate(batch_counts):
         """Fail loudly when processing errors exceed the run budget.
 
         Quarantine budgets live only in the meta sub-DAG (checks decide
-        quarantine); here quarantined episodes just count toward the total,
-        and a run where every episode errors always fails.
+        quarantine). The budget math is library-owned
+        (hflow.stage_execution), shared by every execution backend.
         """
-        import math
+        from hflow.stage_execution import summarize_error_budget
 
-        total = sum(
-            counts["processed"] + counts["quarantined"] + counts["errors"]
-            for counts in batch_counts
-        )
-        errors = sum(counts["errors"] for counts in batch_counts)
-        budget = max(8, math.ceil(0.01 * total))
-        if errors > budget or (errors and errors == total):
-            raise RuntimeError(
-                f"{errors} of {total} episodes had processing errors "
-                f"(budget {budget}) -- infrastructure, not data; see the "
-                "process_batch task logs"
-            )
-        return {"total": total, "errors": errors, "budget": budget}
+        return summarize_error_budget(batch_counts)
 '''
 
 _SUB_DAG_FOOTER = """\

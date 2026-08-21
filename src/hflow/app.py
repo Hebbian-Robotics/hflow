@@ -16,14 +16,17 @@ quality outcome.
 
 import hashlib
 import json
+import os
+import re
 import shutil
 import sys
 import tempfile
 import time
 import traceback
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -38,6 +41,11 @@ from hflow.catalog import (
 )
 from hflow.episode import Episode, _sanitize_topic
 from hflow.ffmpeg import contact_sheet
+from hflow.manifest import (
+    DerivedChannelManifest,
+    PipelineManifest,
+    StepManifest,
+)
 from hflow.resample import DerivedSeries
 from hflow.steps import (
     RUN_PROFILES,
@@ -69,10 +77,45 @@ from hflow.transform import (
     stamps_from_provenance,
     write_canonical_episode,
 )
+from hflow.workspace import RUNTIME_BUNDLE_DIRECTORY_NAME, Workspace
 
 # The contract a @app.transform override implements: (source, output, config)
 # -> the stamps it wrote. See :meth:`App.transform`.
 TransformFunction = Callable[[Path, Path, TransformConfig], EpisodeStamps]
+
+# The environment override for an App constructed without an explicit data
+# root: the runtime (or a control plane provisioning a hosted workspace)
+# exports it, and the same pipeline file runs unedited at every vantage --
+# dev laptop, container mount, or per-workspace bucket prefix.
+DATA_ROOT_ENVIRONMENT_VARIABLE = "HFLOW_DATA_ROOT"
+DEFAULT_DATA_ROOT = "./data"
+
+# Environment overrides for endpoint aliases (see App(endpoints=...)):
+# HFLOW_ENDPOINT_<ALIAS>, the alias uppercased with every non-alphanumeric
+# character replaced by "_". The deployment exports the variable; the
+# pipeline file stays environment-portable.
+ENDPOINT_ENVIRONMENT_VARIABLE_PREFIX = "HFLOW_ENDPOINT_"
+
+
+def endpoint_environment_variable_name(alias: str) -> str:
+    """The environment variable that overrides one endpoint alias."""
+    sanitized_alias = re.sub(r"[^A-Za-z0-9]", "_", alias).upper()
+    return f"{ENDPOINT_ENVIRONMENT_VARIABLE_PREFIX}{sanitized_alias}"
+
+
+def _resolve_data_root(data_root: "Path | str | StorageRoot | None") -> "Path | str | StorageRoot":
+    """Resolve the App's data root at the construction boundary.
+
+    An explicit argument always wins; ``None`` means "let the environment
+    decide": :data:`DATA_ROOT_ENVIRONMENT_VARIABLE` if set (how a runtime or
+    control plane injects the workspace's root), else ``./data`` (the
+    historical local default).
+    """
+    if data_root is not None:
+        return data_root
+    environment_data_root = os.environ.get(DATA_ROOT_ENVIRONMENT_VARIABLE)
+    return environment_data_root if environment_data_root else DEFAULT_DATA_ROOT
+
 
 # Figure 4's "Media" sub-DAG collapsed to its v1 built-in: one contact sheet
 # per camera topic, recorded exactly like an enrichment so its catalog rows
@@ -408,32 +451,51 @@ class App:
     :param name: Pipeline name (display and DAG identity).
     :param data_root: Local directory or supported object-store prefix where
         runs write outputs (test runs land under ``<data_root>/test-runs/``).
+        ``None`` (the default) resolves from the ``HFLOW_DATA_ROOT``
+        environment variable when set, else ``./data`` -- so one pipeline
+        file runs unedited on a laptop, inside the runtime containers, and
+        in a hosted workspace whose root the deployment injects.
     :param transform: Canonical-transform configuration.
     :param endpoints: Named endpoint aliases (e.g. ``{"judge": "http://..."}``)
         that checks declare with ``uses="judge"`` and resolve via
-        ``app.endpoints["judge"]`` in their own client code. (Named
-        ``endpoints``, not "providers": in the Airflow ecosystem "provider"
-        means a plugin package, and ``hflow.providers`` already means the
-        video-protocol extension point.)
+        ``app.endpoints["judge"]`` in their own client code. At run start,
+        an ``HFLOW_ENDPOINT_<ALIAS>`` environment variable overrides (or
+        supplies) an alias's value, so deployments inject their own endpoints
+        without editing pipeline code. The resolved ``app.endpoints`` mapping
+        is read-only and rebuilt at every run start -- supply or override
+        aliases through this parameter or the environment variable, never by
+        mutating the mapping. (Named ``endpoints``, not "providers": in the
+        Airflow ecosystem "provider" means a plugin package, and
+        ``hflow.providers`` already means the video-protocol extension
+        point.)
     """
 
     def __init__(
         self,
         name: str,
-        data_root: Path | str | StorageRoot = "./data",
+        data_root: Path | str | StorageRoot | None = None,
         *,
         transform: TransformConfig | None = None,
         endpoints: dict[str, str] | None = None,
     ) -> None:
         self.name = name
-        self.storage_root = parse_storage_root(data_root)
+        self.storage_root = parse_storage_root(_resolve_data_root(data_root))
+        self.workspace = Workspace(self.storage_root)
         self.data_root: Path | str = (
             self.storage_root.path
             if isinstance(self.storage_root, LocalStorageRoot)
             else self.storage_root.url
         )
         self.transform_config = transform if transform is not None else TransformConfig()
-        self.endpoints = dict(endpoints) if endpoints else {}
+        # The constructor literals stay pristine; ``endpoints`` is the
+        # RESOLVED mapping, rebuilt (literals overlaid with the current
+        # environment) at every run start so overrides set, changed, or
+        # unset between runs all take effect. Read-only on purpose: a direct
+        # mutation would be silently discarded by the next rebuild, so it
+        # refuses loudly instead -- supply aliases via App(endpoints=...) or
+        # HFLOW_ENDPOINT_<ALIAS>.
+        self._endpoint_literals: dict[str, str] = dict(endpoints) if endpoints else {}
+        self.endpoints: Mapping[str, str] = MappingProxyType(dict(self._endpoint_literals))
         self.checks: list[RegisteredCheck] = []
         self.enrichments: list[RegisteredEnrichment] = []
         self.derived: list[DerivedChannel] = []
@@ -459,6 +521,42 @@ class App:
         return compute_pipeline_version(
             self.transform_config,
             {channel.topic: channel.version for channel in self.derived},
+        )
+
+    def manifest(self) -> PipelineManifest:
+        """This pipeline's JSON-able description: step names, content-hash
+        versions, gate flags, endpoint aliases, and version stamps.
+
+        The metadata a pipeline crosses a control boundary as (`hflow
+        manifest` on the CLI): a service can display, diff, and validate
+        pipelines from it without holding the code. Producing it requires
+        importing the pipeline (versions hash the live functions), so
+        generate it in the pipeline author's own environment and treat the
+        result as the author's claims.
+        """
+        from hflow import __version__
+        from hflow.format import EPISODE_FORMAT_VERSION
+
+        return PipelineManifest(
+            pipeline_name=self.name,
+            hflow_version=__version__,
+            schema_version=EPISODE_FORMAT_VERSION,
+            pipeline_version=self.pipeline_version,
+            checks=tuple(
+                StepManifest.from_registered_check(registered) for registered in self.checks
+            ),
+            enrichments=tuple(
+                StepManifest.from_registered_enrichment(registered)
+                for registered in self.enrichments
+            ),
+            derived_channels=tuple(
+                DerivedChannelManifest(topic=channel.topic, version=channel.version)
+                for channel in self.derived
+            ),
+            endpoint_aliases=tuple(
+                sorted(set(self._endpoint_literals) | self._used_endpoint_aliases())
+            ),
+            has_transform_override=self.transform_override is not None,
         )
 
     def check(
@@ -630,18 +728,64 @@ class App:
             f"a key under the data root {self.storage_root}"
         )
 
+    def _used_endpoint_aliases(self) -> set[str]:
+        return {
+            registered.uses
+            for registered in [*self.checks, *self.enrichments]
+            if registered.uses is not None
+        }
+
+    def _resolve_endpoint_overrides(self) -> None:
+        """Rebuild ``endpoints``: literals overlaid with the environment.
+
+        The environment wins over a literal in the pipeline file, and an
+        alias supplied ONLY by the environment satisfies steps' ``uses=``
+        preflight -- this is how a deployment (or a control plane) injects
+        per-workspace endpoints without editing customer code. Runs at
+        preflight, after every registration, so ``app.endpoints[alias]``
+        inside a running step always sees the resolved value; rebuilding
+        from the pristine literals each time means an override set, changed,
+        or UNSET between runs in one process always takes effect.
+
+        The environment naming is lossy (non-alphanumerics collapse to
+        ``_``), so two aliases that map to one variable would be silently
+        co-overridden -- refused loudly here instead.
+        """
+        aliases = sorted(set(self._endpoint_literals) | self._used_endpoint_aliases())
+        aliases_by_variable: dict[str, list[str]] = {}
+        for alias in aliases:
+            aliases_by_variable.setdefault(endpoint_environment_variable_name(alias), []).append(
+                alias
+            )
+        colliding = {
+            variable: names for variable, names in aliases_by_variable.items() if len(names) > 1
+        }
+        if colliding:
+            raise ValueError(
+                "endpoint aliases are indistinguishable under HFLOW_ENDPOINT_* naming: "
+                + "; ".join(
+                    f"{variable} would override all of {names}"
+                    for variable, names in sorted(colliding.items())
+                )
+                + " -- rename an alias so each maps to a distinct environment variable"
+            )
+        resolved = dict(self._endpoint_literals)
+        for alias in aliases:
+            environment_override = os.environ.get(endpoint_environment_variable_name(alias))
+            if environment_override:
+                resolved[alias] = environment_override
+        self.endpoints = MappingProxyType(resolved)
+
     def _preflight(self) -> None:
+        self._resolve_endpoint_overrides()
         missing = sorted(
-            {
-                registered.uses
-                for registered in [*self.checks, *self.enrichments]
-                if registered.uses is not None and registered.uses not in self.endpoints
-            }
+            {alias for alias in self._used_endpoint_aliases() if alias not in self.endpoints}
         )
         if missing:
             raise ValueError(
                 f"steps declare endpoint aliases {missing} but App(endpoints=...) "
-                f"defines only {sorted(self.endpoints)}"
+                f"defines only {sorted(self.endpoints)} -- pass the alias there, or export "
+                + ", ".join(endpoint_environment_variable_name(alias) for alias in missing)
             )
 
     def _ordered_checks(self) -> list[RegisteredCheck]:
@@ -682,7 +826,7 @@ class App:
             output_dir=(
                 output_dir
                 if output_dir is not None
-                else self.storage_root.child("test-runs").child(
+                else self.workspace.test_runs_root.child(
                     _source_artifact_directory_name(episode, self.storage_root)
                 )
             ),
@@ -751,9 +895,9 @@ class App:
         # A bucket data root has no local directory to host the bundle, so it
         # defaults to ./runtime in the working directory instead.
         default_bundle_dir = (
-            self.storage_root.path / "runtime"
+            self.storage_root.path / RUNTIME_BUNDLE_DIRECTORY_NAME
             if isinstance(self.storage_root, LocalStorageRoot)
-            else Path("runtime")
+            else Path(RUNTIME_BUNDLE_DIRECTORY_NAME)
         )
         resolved_bundle_dir = Path(bundle_dir) if bundle_dir is not None else default_bundle_dir
         # Narrate the long provisioning stages to stderr (stdout stays the
@@ -809,7 +953,7 @@ class App:
         run_storage_root = (
             parse_storage_root(output_dir)
             if output_dir is not None
-            else self.storage_root.child("episodes").child(
+            else self.workspace.episodes_root.child(
                 _source_artifact_directory_name(episode, self.storage_root)
             )
         )
@@ -972,7 +1116,7 @@ class App:
             # recorded run without meta never masks the state.
             if Stage.META not in enabled_stages:
                 cataloged_quarantine = latest_quarantine(
-                    self.storage_root.child("catalog"), content_episode_id(canonical_path)
+                    self.workspace.catalog_root, content_episode_id(canonical_path)
                 )
                 if cataloged_quarantine is not None and cataloged_quarantine.quarantined:
                     report.quarantine_tags.extend(cataloged_quarantine.tags)
@@ -1094,7 +1238,7 @@ class App:
                         tags=list(enrichment_result.tags) if enrichment_result is not None else [],
                     )
                 )
-            report.catalog_entry = Catalog(self.storage_root.child("catalog")).append_episode(
+            report.catalog_entry = Catalog(self.workspace.catalog_root).append_episode(
                 canonical_path=canonical_path,
                 uri=canonical_uri,
                 stamps=stamps,

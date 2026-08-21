@@ -1,8 +1,11 @@
+import json
+from pathlib import Path
+
 import pytest
 from pytest import CaptureFixture
 
 from hflow import __version__
-from hflow.cli import _build_parser
+from hflow.cli import _build_parser, main
 
 
 def test_cli_version(capsys: CaptureFixture) -> None:
@@ -11,3 +14,51 @@ def test_cli_version(capsys: CaptureFixture) -> None:
 
     assert exception.value.code == 0
     assert f"hflow {__version__}" in capsys.readouterr().out
+
+
+def test_cli_manifest_prints_the_pipeline_manifest_json(
+    tmp_path: Path, capsys: CaptureFixture
+) -> None:
+    pipeline_file = tmp_path / "kitchen.py"
+    pipeline_file.write_text(
+        "import hflow\n\n"
+        "my_app = hflow.App('kitchen', data_root='./data')\n\n"
+        "@my_app.check(critical=True)\n"
+        "def blackout(ep: hflow.Episode) -> hflow.CheckResult:\n"
+        "    return hflow.CheckResult()\n"
+    )
+    exit_code = main(["manifest", "--pipeline", f"{pipeline_file}:my_app"])
+    assert exit_code == 0
+    manifest_payload = json.loads(capsys.readouterr().out)
+    assert manifest_payload["pipeline_name"] == "kitchen"
+    assert manifest_payload["hflow_version"] == __version__
+    (check_entry,) = manifest_payload["checks"]
+    assert check_entry["name"] == "blackout"
+    assert check_entry["critical"] is True
+
+
+def test_cli_defaults_follow_the_environment_data_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A shell configured with HFLOW_DATA_ROOT must not have curate/stale/up
+    silently address a hardcoded ./data beside the workspace the App uses."""
+    monkeypatch.setenv("HFLOW_DATA_ROOT", str(tmp_path / "workspace"))
+    parser = _build_parser()
+    stale_arguments = parser.parse_args(["stale", "--pipeline-version", "abc"])
+    assert stale_arguments.catalog == f"{tmp_path / 'workspace'}/catalog"
+    up_arguments = parser.parse_args(["up", "--pipeline", "p.py"])
+    assert up_arguments.data_root == str(tmp_path / "workspace")
+
+    monkeypatch.delenv("HFLOW_DATA_ROOT")
+    default_arguments = _build_parser().parse_args(["stale", "--pipeline-version", "abc"])
+    assert default_arguments.catalog == "./data/catalog"
+
+
+def test_cli_manifest_reports_a_broken_pipeline_instead_of_crashing(
+    tmp_path: Path, capsys: CaptureFixture
+) -> None:
+    pipeline_file = tmp_path / "broken.py"
+    pipeline_file.write_text("raise RuntimeError('boom at import')\n")
+    exit_code = main(["manifest", "--pipeline", str(pipeline_file)])
+    assert exit_code == 2
+    assert "boom at import" in capsys.readouterr().err

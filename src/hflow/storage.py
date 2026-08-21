@@ -380,9 +380,22 @@ class BucketStorageRoot:
         slashes are stripped so joins never double them).
     :param mirror: The local mirror directory; defaults to a stable per-URL
         cache directory (see :func:`_default_mirror_directory`).
+    :param store_options: Explicit per-root store configuration forwarded to
+        ``obstore.store.from_url`` (credentials, region, endpoint overrides).
+        ``None`` keeps today's behavior: the provider's ambient environment.
+        This is the injection seam for scoped per-workspace credentials -- a
+        control plane can hold several roots with distinct credentials in one
+        process instead of mutating ``os.environ``. Values may be secrets, so
+        they are never written to disk or included in ``repr``.
     """
 
-    def __init__(self, url: str, *, mirror: Path | None = None) -> None:
+    def __init__(
+        self,
+        url: str,
+        *,
+        mirror: Path | None = None,
+        store_options: dict[str, Any] | None = None,
+    ) -> None:
         normalized_url = url.rstrip("/")
         _scheme, separator, remainder = normalized_url.partition("://")
         if not separator or not remainder:
@@ -391,6 +404,7 @@ class BucketStorageRoot:
             )
         self.url = normalized_url
         self.mirror = mirror if mirror is not None else _default_mirror_directory(normalized_url)
+        self.store_options: dict[str, Any] = dict(store_options) if store_options else {}
         self._store: Any | None = None
 
     def __str__(self) -> str:
@@ -412,7 +426,9 @@ class BucketStorageRoot:
     def child(self, name: str) -> "BucketStorageRoot":
         validated_name = _validated_relative_key(name)
         return BucketStorageRoot(
-            f"{self.url}/{validated_name}", mirror=self.mirror / validated_name
+            f"{self.url}/{validated_name}",
+            mirror=self.mirror / validated_name,
+            store_options=self.store_options or None,
         )
 
     def uri_for(self, relative: str) -> str:
@@ -423,7 +439,13 @@ class BucketStorageRoot:
             obstore = _load_obstore()
             # obstore's LocalStore test backend requires its root directory to
             # exist; real bucket prefixes are virtual and need no equivalent.
-            store_options = {"mkdir": True} if self.url.startswith("file://") else {}
+            store_options: dict[str, Any] = (
+                {"mkdir": True} if self.url.startswith("file://") else {}
+            )
+            # Explicit per-root configuration wins over the defaults above;
+            # anything NOT configured here still resolves from the provider's
+            # ambient environment inside obstore.
+            store_options.update(self.store_options)
             self._store = obstore.store.from_url(self.url, **store_options)
         return self._store
 

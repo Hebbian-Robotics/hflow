@@ -94,6 +94,11 @@ same engine can be scaled as multiple isolated workspaces (for example, one
 per team or customer) behind an external control plane. That is the intended
 path to a future hosted version, but the hosted control plane is not
 implemented in this repository and is not a pre-v1 release commitment.
+[docs/HOSTING.md](https://github.com/Hebbian-Robotics/hflow/blob/main/docs/HOSTING.md)
+documents the data-plane contract that makes such a control plane an
+addition rather than a rearchitecture: the workspace unit, the seams a
+service drives (manifests, remote runtime addressing, credential injection),
+the trust model, and the current limits.
 
 ## Community and hosted interest
 
@@ -240,4 +245,6 @@ Parts of the durability and measurement design draw on production experience fro
 
 ## License
 
-[Apache-2.0](https://github.com/Hebbian-Robotics/hflow/blob/main/LICENSE)
+[Apache-2.0](https://github.com/Hebbian-Robotics/hflow/blob/main/LICENSE).
+The license covers the code, not the names: see the
+[trademark policy](https://github.com/Hebbian-Robotics/hflow/blob/main/TRADEMARKS.md).

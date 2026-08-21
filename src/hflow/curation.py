@@ -26,6 +26,8 @@ must not look like a statistic over all of it.
 """
 
 import tempfile
+from collections.abc import Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -95,6 +97,27 @@ class CurationReport:
 
 
 @dataclass(frozen=True)
+class _BucketManifestDestination:
+    """A manifest headed for an object store, staged locally first."""
+
+    parent_url: str
+    object_name: str
+    staging_dir: Path
+
+
+@dataclass(frozen=True)
+class _LocalManifestDestination:
+    """A manifest headed for a local path, staged in a private sibling dir."""
+
+    final_path: Path
+    staging_dir: Path
+
+
+# None: curate() ran report-only, nothing written.
+_ManifestDestination = _BucketManifestDestination | _LocalManifestDestination | None
+
+
+@dataclass(frozen=True)
 class StaleEpisode:
     """One episode whose latest cataloged run predates the current versions."""
 
@@ -139,16 +162,64 @@ def _local_query_root(location: StorageRoot) -> Path:
             return location.sync_into_mirror(tuple(_TABLE_DIRECTORIES.values()))
 
 
-def open_catalog_connection(catalog_root: "Path | str | StorageRoot") -> duckdb.DuckDBPyConnection:
+def _apply_connection_constraints(
+    connection: duckdb.DuckDBPyConnection, allowed_directories: Sequence[Path]
+) -> None:
+    """Confine one connection to ``allowed_directories``, then lock it.
+
+    DuckDB's file functions can otherwise read or write any path the process
+    reaches, auto-install extensions, and open network resources -- fine when
+    the user owns the machine, unacceptable when the SQL is tenant-supplied
+    (a hosted, self-serve curation surface). ``allowed_directories`` is a
+    read AND write allowlist, so callers must pass only directories the SQL
+    may also write into -- never the catalog root itself. Locking the
+    configuration last means the SQL cannot lift the restriction.
+    """
+    if allowed_directories:
+        quoted_directories = ", ".join(
+            _quote_sql_string(str(Path(directory).resolve())) for directory in allowed_directories
+        )
+        connection.execute(f"SET allowed_directories = [{quoted_directories}]")
+    connection.execute("SET enable_external_access = false")
+    connection.execute("SET autoinstall_known_extensions = false")
+    connection.execute("SET autoload_known_extensions = false")
+    connection.execute("SET lock_configuration = true")
+
+
+def open_catalog_connection(
+    catalog_root: "Path | str | StorageRoot", *, constrained: bool = False
+) -> duckdb.DuckDBPyConnection:
     """A DuckDB connection with all catalog views registered.
 
     Public on purpose: ``curate()`` is a convenience, not a gate -- take the
     connection and explore. ``catalog_root`` may be a local directory or a
     bucket prefix (``gs://.../catalog``).
+
+    ``constrained=True`` is the service posture for running SQL that is not
+    the operator's own (a hosted curation endpoint): the catalog is
+    materialized into the connection once at open (so the SQL touches data,
+    never the catalog's files -- DuckDB's directory allowlist permits writes
+    too, and the append-only catalog must not be writable by tenant SQL),
+    extension auto-install/auto-load is off, all other file access is
+    refused, and the configuration is locked. The default stays unrestricted
+    for local exploration.
     """
     location = parse_storage_root(catalog_root)
     _verify_catalog_format(location)
     root = _local_query_root(location)
+    return _open_connection_over_root(root, constrained=constrained, writable_directories=())
+
+
+def _open_connection_over_root(
+    root: Path, *, constrained: bool, writable_directories: Sequence[Path]
+) -> duckdb.DuckDBPyConnection:
+    """Register the catalog views over one local query root.
+
+    Constrained connections materialize the long tables in memory BEFORE the
+    constraints land, so the locked allowlist holds only
+    ``writable_directories`` (``curate``'s private manifest staging) -- the
+    catalog's own files stay unreachable for reads and, crucially, writes.
+    """
     connection = duckdb.connect()
 
     for view_name in _LONG_TABLE_NAMES:
@@ -156,14 +227,26 @@ def open_catalog_connection(catalog_root: "Path | str | StorageRoot") -> duckdb.
         table_directory = root / directory_name
         if any(table_directory.glob("*.parquet")):
             pattern = _quote_sql_string(str(table_directory / "*.parquet"))
-            connection.execute(
-                f"CREATE VIEW {view_name} AS "
-                f"SELECT * FROM read_parquet({pattern}, union_by_name=true)"
-            )
+            if constrained:
+                # A real table, not a view: reads happen here, once, while
+                # file access is still allowed; tenant SQL later queries the
+                # in-memory copy and never touches the catalog's files.
+                connection.execute(
+                    f"CREATE TABLE {view_name} AS "
+                    f"SELECT * FROM read_parquet({pattern}, union_by_name=true)"
+                )
+            else:
+                connection.execute(
+                    f"CREATE VIEW {view_name} AS "
+                    f"SELECT * FROM read_parquet({pattern}, union_by_name=true)"
+                )
         else:
             # An empty catalog table: an empty relation with the real schema
             # keeps every downstream view and query definable.
             connection.execute(f"CREATE TABLE {view_name} ({TABLE_COLUMN_DDL[directory_name]})")
+
+    if constrained:
+        _apply_connection_constraints(connection, list(writable_directories))
 
     connection.execute(
         """
@@ -188,10 +271,11 @@ def open_catalog_connection(catalog_root: "Path | str | StorageRoot") -> duckdb.
                 -- the sole trustworthy recorded_at once episodes_latest has
                 -- already picked a winner. A repair pass that wins the
                 -- episodes race can still crash before reaching measurements
-                -- (see #51) -- a later retry then early-returns on
-                -- exists(episodes) and never revisits it, leaving this
-                -- table's own recorded_at stale forever. Ranking off it
-                -- directly could then pick a different run_fingerprint than
+                -- (see #51); replayed appends now reconcile stale dependents
+                -- (catalog._reconcile_replayed_append), but until a replay
+                -- happens -- and on mirrors synced before it -- this table's
+                -- own recorded_at can disagree. Ranking off it directly
+                -- could then pick a different run_fingerprint than
                 -- episodes_latest for the same episode_id, stitching rows
                 -- from two different runs together. The inner join also
                 -- means a run whose episodes file hasn't landed yet (crash
@@ -255,6 +339,19 @@ def open_catalog_connection(catalog_root: "Path | str | StorageRoot") -> duckdb.
             """
         )
     return connection
+
+
+def _stage_manifest_and_count(
+    connection: duckdb.DuckDBPyConnection, sql: str, staged_manifest: Path
+) -> int:
+    """COPY the query's result to the staged manifest; return its row count."""
+    connection.execute(
+        f"COPY ({sql}) TO {_quote_sql_string(str(staged_manifest))} (FORMAT PARQUET)"
+    )
+    (row_count,) = connection.execute(
+        f"SELECT count(*) FROM read_parquet({_quote_sql_string(str(staged_manifest))})"
+    ).fetchone() or (0,)
+    return int(row_count)
 
 
 def _collect_coverage(connection: duckdb.DuckDBPyConnection) -> tuple[int, list[CheckCoverage]]:
@@ -343,6 +440,7 @@ def curate(
     sql: str,
     *,
     output: Path | str | None = None,
+    constrained: bool = False,
 ) -> CurationReport:
     """Run ``sql`` over the catalog views; write the result as a manifest.
 
@@ -353,6 +451,11 @@ def curate(
     or a bucket URL (``gs://.../manifest.parquet`` uploads the manifest).
     With ``output=None`` the query still runs (row count + coverage
     reporting) but nothing is written.
+
+    ``constrained=True`` runs the SQL on a locked-down connection (see
+    :func:`open_catalog_connection`) whose only file access is the
+    manifest's own private staging directory -- the posture a hosted service
+    uses for tenant-supplied SQL.
     """
     # file:// output URLs mean a local file, matching parse_storage_root's
     # convention for roots -- without this, the Path() branch below would
@@ -363,40 +466,73 @@ def curate(
             raise ValueError(f"manifest output URL {output!r} must be absolute (file:///abs/path)")
         output = Path(file_url_path)
 
-    connection = open_catalog_connection(catalog_root)
-    try:
-        total_episodes, coverage = _collect_coverage(connection)
+    location = parse_storage_root(catalog_root)
+    _verify_catalog_format(location)
+    query_root = _local_query_root(location)
 
-        manifest_path: Path | str | None = None
+    with ExitStack() as cleanup:
+        # Resolve the manifest destination BEFORE opening the connection: a
+        # constrained connection's directory allowlist is locked at open
+        # time, so the staging directory must already be known. One variant
+        # per destination shape, so a half-resolved state (a bucket target
+        # with no staging directory) is unrepresentable.
+        destination: _ManifestDestination = None
         if isinstance(output, str) and is_bucket_url(output):
             manifest_parent_url, _, manifest_name = output.rpartition("/")
             if not manifest_name:
                 raise ValueError(f"manifest output URL {output!r} names no object")
-            with tempfile.TemporaryDirectory(prefix="hflow-manifest-") as staging_name:
-                staged_manifest = Path(staging_name) / manifest_name
-                connection.execute(
-                    f"COPY ({sql}) TO {_quote_sql_string(str(staged_manifest))} (FORMAT PARQUET)"
-                )
-                (row_count,) = connection.execute(
-                    f"SELECT count(*) FROM read_parquet({_quote_sql_string(str(staged_manifest))})"
-                ).fetchone() or (0,)
-                manifest_path = BucketStorageRoot(manifest_parent_url).publish(
-                    staged_manifest, manifest_name
-                )
+            destination = _BucketManifestDestination(
+                parent_url=manifest_parent_url,
+                object_name=manifest_name,
+                staging_dir=Path(
+                    cleanup.enter_context(tempfile.TemporaryDirectory(prefix="hflow-manifest-"))
+                ),
+            )
         elif output is not None:
             local_manifest = Path(output)
             local_manifest.parent.mkdir(parents=True, exist_ok=True)
-            temporary_path = local_manifest.with_name(local_manifest.name + ".tmp")
-            connection.execute(
-                f"COPY ({sql}) TO {_quote_sql_string(str(temporary_path))} (FORMAT PARQUET)"
+            # A PRIVATE staging subdirectory, never the output's parent: the
+            # constrained allowlist is recursive and covers reads too, so
+            # allowlisting the parent would hand tenant SQL everything beside
+            # the manifest (a bare filename would expose the whole working
+            # directory). Same filesystem, so the final replace stays atomic.
+            destination = _LocalManifestDestination(
+                final_path=local_manifest,
+                staging_dir=Path(
+                    cleanup.enter_context(
+                        tempfile.TemporaryDirectory(
+                            prefix=".hflow-manifest-", dir=local_manifest.parent
+                        )
+                    )
+                ),
             )
-            (row_count,) = connection.execute(
-                f"SELECT count(*) FROM read_parquet({_quote_sql_string(str(temporary_path))})"
-            ).fetchone() or (0,)
-            temporary_path.replace(local_manifest)
-            manifest_path = local_manifest
-        else:
-            (row_count,) = connection.execute(f"SELECT count(*) FROM ({sql})").fetchone() or (0,)
+        writable_directories = () if destination is None else (destination.staging_dir,)
+
+        connection = _open_connection_over_root(
+            query_root, constrained=constrained, writable_directories=writable_directories
+        )
+        cleanup.callback(connection.close)
+
+        total_episodes, coverage = _collect_coverage(connection)
+
+        manifest_path: Path | str | None
+        match destination:
+            case _BucketManifestDestination(
+                parent_url=parent_url, object_name=object_name, staging_dir=staging_dir
+            ):
+                staged_manifest = staging_dir / object_name
+                row_count = _stage_manifest_and_count(connection, sql, staged_manifest)
+                manifest_path = BucketStorageRoot(parent_url).publish(staged_manifest, object_name)
+            case _LocalManifestDestination(final_path=final_path, staging_dir=staging_dir):
+                staged_manifest = staging_dir / final_path.name
+                row_count = _stage_manifest_and_count(connection, sql, staged_manifest)
+                staged_manifest.replace(final_path)
+                manifest_path = final_path
+            case None:
+                (row_count,) = connection.execute(f"SELECT count(*) FROM ({sql})").fetchone() or (
+                    0,
+                )
+                manifest_path = None
 
         return CurationReport(
             manifest_path=manifest_path,
@@ -404,5 +540,3 @@ def curate(
             total_episodes=total_episodes,
             coverage=coverage,
         )
-    finally:
-        connection.close()

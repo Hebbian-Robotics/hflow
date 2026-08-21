@@ -84,8 +84,10 @@ def test_compose_common_environment(config: RuntimeConfig, tmp_path: Path) -> No
     _, compose = _render(config, tmp_path / "bundle")
     scheduler_env = compose["services"]["airflow-scheduler"]["environment"]
     assert scheduler_env["AIRFLOW__CORE__EXECUTOR"] == "LocalExecutor"
+    # The database password is generated per bundle; the compose default
+    # keeps pre-manifest bundles (whose preserved .env lacks the key) working.
     assert scheduler_env["AIRFLOW__DATABASE__SQL_ALCHEMY_CONN"] == (
-        "postgresql+psycopg2://airflow:airflow@postgres/airflow"
+        "postgresql+psycopg2://airflow:${POSTGRES_PASSWORD:-airflow}@postgres/airflow"
     )
     assert scheduler_env["AIRFLOW__CORE__EXECUTION_API_SERVER_URL"] == (
         "http://airflow-apiserver:8080/execution/"
@@ -128,7 +130,8 @@ def test_compose_apiserver_port_and_healthcheck(config: RuntimeConfig, tmp_path:
     _, compose = _render(config, tmp_path / "bundle")
     apiserver = compose["services"]["airflow-apiserver"]
     assert apiserver["command"] == "api-server"
-    assert apiserver["ports"] == ["127.0.0.1:${API_PORT}:8080"]
+    # Loopback by default; API_BIND_HOST in .env widens it deliberately.
+    assert apiserver["ports"] == ["${API_BIND_HOST:-127.0.0.1}:${API_PORT}:8080"]
     assert apiserver["healthcheck"]["test"] == [
         "CMD",
         "curl",
@@ -417,48 +420,156 @@ def test_sub_dag_sources_compile_and_encode_contract(config: RuntimeConfig, tmp_
         # All three tasks run in the user venv via external python.
         assert dag_source.count("@task.external_python(python='/opt/venvs/user/bin/python'") == 3
         # Imports live inside the (indented) function bodies -- the operator
-        # extracts each body to a temp file, so module-level names never survive.
-        assert "\n        from hflow.batching import plan_batches" in dag_source
-        assert "\n        import importlib.util" in dag_source
-        assert "\n        import math" in dag_source
-        # The user pipeline is imported by file path and app resolved by name.
-        assert "\"/opt/user/\" + 'my_pipeline.py'" in dag_source
-        assert "spec_from_file_location" in dag_source
-        assert 'getattr(pipeline_module, "app")' in dag_source
+        # extracts each body to a temp file, so module-level names never
+        # survive. The tasks are thin callers into hflow.stage_execution (one
+        # owner of the run semantics; see tests/test_stage_execution.py for
+        # the semantics themselves).
+        assert "\n        from hflow.stage_execution import plan_stage_batches" in dag_source
+        assert "\n        from hflow.stage_execution import (" in dag_source
+        assert "load_pipeline_application" in dag_source
+        assert "resolve_user_pipeline_path('my_pipeline.py')" in dag_source
+        assert 'load_pipeline_application(pipeline_path, "app")' in dag_source
         # Each sub-DAG runs exactly its own Figure 4 stage.
-        assert f'stages={{"{stage.value}"}}' in dag_source
-        # The online lane: one immediate batch, no stagger, batch_count ignored.
-        assert 'if mode == "online":' in dag_source
-        assert '"start_delay_s": 0.0' in dag_source
-        # The stagger, mapped batches, and error budget are generated as one contract.
+        assert f'process_stage_batch(app, batch["items"], "{stage.value}")' in dag_source
+        # The stagger, mapped batches, and budget gate are one contract.
         assert 'time.sleep(float(batch["start_delay_s"]))' in dag_source
-        assert "if report.has_errors:" in dag_source
-        assert 'counts["errors"] += 1' in dag_source
         assert "process_batch.expand(batch=batches)" in dag_source
-        assert "max(8, math.ceil(0.01 * total))" in dag_source
         # The gate materializes the mapped results (lazy XCom proxies cannot
         # cross the external-python pickle boundary; list-typed task_ids keeps
         # a single-batch run from being flattened) and keeps the edge explicit.
         assert "{{ ti.xcom_pull(task_ids=['process_batch']) | list }}" in dag_source
         assert "batch_counts >> gate" in dag_source
-        # The process task authoritatively refuses an app
-        # whose data_root is not the in-container mount point.
+        # The process task exports the environment-resolved data root, then
+        # authoritatively refuses an app whose data_root points elsewhere.
         assert "expected_data_root = '/opt/airflow/data'" in dag_source
-        assert "if str(app.data_root) != expected_data_root:" in dag_source
-        assert (
-            '"pipeline data_root must be " + expected_data_root + " inside the runtime; "'
-            in dag_source
-        )
+        assert "os.environ[DATA_ROOT_ENVIRONMENT_VARIABLE] = expected_data_root" in dag_source
+        assert "require_application_data_root(app, expected_data_root)" in dag_source
         # Checks decide quarantine: the quarantine budget lives ONLY in meta;
         # every other stage keeps the error-budget half.
         if stage is Stage.META:
             assert "def quarantine_budget_gate(" in dag_source
-            assert "quarantined > budget" in dag_source
+            assert "summarize_quarantine_budget" in dag_source
+            assert "summarize_error_budget" not in dag_source
         else:
             assert "def error_budget_gate(" in dag_source
-            assert "quarantined > budget" not in dag_source
-        assert "errors > budget" in dag_source
-        assert "errors == total" in dag_source
+            assert "summarize_error_budget" in dag_source
+            assert "summarize_quarantine_budget" not in dag_source
+
+
+def test_bundle_manifest_describes_the_bundle_and_load_bundle_prefers_it(
+    config: RuntimeConfig, tmp_path: Path
+) -> None:
+    """hflow-bundle.json is the machine-readable bundle description a
+    provisioning service (and load_bundle) reads instead of regexing
+    generated code; pre-manifest bundles still load via the legacy path."""
+    from dataclasses import replace
+
+    from hflow.runtime import load_bundle
+
+    paths, _ = _render(replace(config, task_queue="workspace-a"), tmp_path / "bundle")
+    manifest_file = paths.bundle_dir / "hflow-bundle.json"
+    manifest_payload = json.loads(manifest_file.read_text())
+    assert manifest_payload["manifest_version"] == 1
+    assert manifest_payload["kind"] == "compose"
+    assert manifest_payload["hflow_version"] == hflow.__version__
+    assert manifest_payload["dag_id"] == "my_pipeline_ingest"
+    assert manifest_payload["sub_dag_ids"] == {
+        "sync": "my_pipeline_sync",
+        "meta": "my_pipeline_meta",
+        "labels": "my_pipeline_labels",
+        "media": "my_pipeline_media",
+    }
+    assert manifest_payload["data_root"] == "/opt/airflow/data"
+    assert manifest_payload["app_variable"] == "app"
+    assert manifest_payload["pipeline_filename"] == "my_pipeline.py"
+    assert manifest_payload["requirements_included"] is True
+    assert manifest_payload["task_queue"] == "workspace-a"
+
+    # The manifest is authoritative for the dag id when present...
+    manifest_payload["dag_id"] = "renamed_by_manifest"
+    manifest_file.write_text(json.dumps(manifest_payload))
+    assert load_bundle(paths.bundle_dir).dag_id == "renamed_by_manifest"
+    # ...a FUTURE-versioned manifest may have re-semantified its fields, so
+    # it falls back to the generated source rather than being misread...
+    manifest_payload["manifest_version"] = 999
+    manifest_file.write_text(json.dumps(manifest_payload))
+    assert load_bundle(paths.bundle_dir).dag_id == "my_pipeline_ingest"
+    # ...an unusable manifest falls back to the generated source (legacy)...
+    manifest_file.write_text("{ not json")
+    assert load_bundle(paths.bundle_dir).dag_id == "my_pipeline_ingest"
+    # ...and a pre-manifest bundle (no file at all) still loads.
+    manifest_file.unlink()
+    assert load_bundle(paths.bundle_dir).dag_id == "my_pipeline_ingest"
+
+
+def test_task_queue_routes_every_stage_task(config: RuntimeConfig, tmp_path: Path) -> None:
+    """The worker-pool routing seam: task_queue stamps all stage tasks, and
+    the default keeps generated DAGs queue-free (executor default)."""
+    from dataclasses import replace
+
+    default_paths, _ = _render(config, tmp_path / "default-bundle")
+    for sub_dag_file in default_paths.sub_dag_files:
+        assert "queue=" not in sub_dag_file.read_text()
+
+    queued_paths, _ = _render(replace(config, task_queue="workspace-a"), tmp_path / "bundle")
+    for sub_dag_file in queued_paths.sub_dag_files:
+        dag_source = sub_dag_file.read_text()
+        compile(dag_source, str(sub_dag_file), "exec")
+        assert dag_source.count(", queue='workspace-a')") == 3
+
+    with pytest.raises(ValueError, match="task_queue"):
+        render_bundle(replace(config, task_queue="bad queue'name"), tmp_path / "refused-bundle")
+
+
+def test_xcom_objectstorage_url_override(config: RuntimeConfig, tmp_path: Path) -> None:
+    """Multi-machine executors need an XCom store every host reaches; the
+    override replaces the single-host file:// default."""
+    from dataclasses import replace
+
+    _, compose = _render(
+        replace(config, xcom_objectstorage_url="s3://tenant-bucket/xcom"),
+        tmp_path / "bundle",
+    )
+    scheduler_env = compose["services"]["airflow-scheduler"]["environment"]
+    assert scheduler_env["AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_PATH"] == (
+        "s3://tenant-bucket/xcom"
+    )
+
+
+def test_endpoint_environment_variables_pass_through_by_name(
+    config: RuntimeConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exported HFLOW_ENDPOINT_* variables at render time are wired into the
+    containers' environment as name-only ${VAR} references (same contract as
+    bucket credentials: values never land in the bundle), so App's endpoint
+    overlay works inside the runtime's task processes."""
+    monkeypatch.setenv("HFLOW_ENDPOINT_JUDGE", "http://judge:8000/v1")
+    _, compose = _render(config, tmp_path / "bundle")
+    scheduler_env = compose["services"]["airflow-scheduler"]["environment"]
+    assert scheduler_env["HFLOW_ENDPOINT_JUDGE"] == "${HFLOW_ENDPOINT_JUDGE}"
+    assert "http://judge:8000/v1" not in (tmp_path / "bundle" / "docker-compose.yaml").read_text()
+
+    monkeypatch.delenv("HFLOW_ENDPOINT_JUDGE")
+    _, rerendered_compose = _render(config, tmp_path / "bundle-without")
+    assert (
+        "HFLOW_ENDPOINT_JUDGE"
+        not in (rerendered_compose["services"]["airflow-scheduler"]["environment"])
+    )
+
+
+def test_env_file_carries_generated_postgres_password_and_bind_host(
+    config: RuntimeConfig, tmp_path: Path
+) -> None:
+    paths, _ = _render(config, tmp_path / "bundle")
+    env_values = dict(
+        line.split("=", 1)
+        for line in paths.env_file.read_text().splitlines()
+        if line and not line.startswith("#")
+    )
+    assert env_values["API_BIND_HOST"] == "127.0.0.1"
+    # A generated secret, never the historical fixed default.
+    assert env_values["POSTGRES_PASSWORD"] != "airflow"
+    assert len(env_values["POSTGRES_PASSWORD"]) >= 16
 
 
 def test_dag_sources_carry_airflow_ui_polish(config: RuntimeConfig, tmp_path: Path) -> None:
@@ -643,9 +754,9 @@ class TestBucketModeBundle:
         paths, _ = _render(bucket_config, tmp_path / "bundle")
         for sub_dag_file in paths.sub_dag_files:
             dag_source = sub_dag_file.read_text()
-            assert f"parse_storage_root({self.BUCKET_URL!r})" in dag_source
+            assert f"data_root={self.BUCKET_URL!r}" in dag_source
             assert f"expected_data_root = {self.BUCKET_URL!r}" in dag_source
-            assert "if str(app.data_root) != expected_data_root:" in dag_source
+            assert "require_application_data_root(app, expected_data_root)" in dag_source
         # The media plan filter probes episode channel lists, which would
         # download whole remote files at plan time: bucket bundles omit it.
         media_source = (paths.bundle_dir / "dags" / "ingest_media.py").read_text()

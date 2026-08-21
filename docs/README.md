@@ -68,6 +68,7 @@ contracts.
 These pages explain why the system has its current boundaries.
 
 - [Architecture and differences from Dyna](./ARCHITECTURE.md)
+- [Hosting HFlow: the data-plane contract for operating workspaces for others](./HOSTING.md)
 - [Benchmark methodology and scale limits](./BENCHMARKS.md)
 - [Why steps use ordinary Python and small adapters](./PORTING.md#the-pattern)
 - [How HFlow fits with MCAP, Airflow, visualization tools, and training formats](./INTEGRATIONS.md)

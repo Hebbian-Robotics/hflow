@@ -15,3 +15,4 @@ data/
 
 # Local maintainer tooling (agent skills, settings); not part of the public repo.
 .claude/
+.agents/

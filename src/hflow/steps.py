@@ -49,6 +49,19 @@ class Stage(StrEnum):
     MEDIA = "media"  # "Media": derived media artifacts (contact sheets)
 
 
+class IngestMode(StrEnum):
+    """The trigger conf's ``mode`` vocabulary, shared with the DAGs.
+
+    Like :class:`Stage`, these strings cross the conf boundary: the master
+    DAG validates against a copy baked at render time, and
+    ``hflow.stage_execution`` parses the value at the library boundary. One
+    owner -- here -- so the runner and the DAGs can never disagree.
+    """
+
+    BATCH = "batch"  # bin-packed near-equal-byte shards with staggered starts
+    ONLINE = "online"  # latency-first: one immediate batch, no stagger
+
+
 # Run profiles: the same graph with different sub-DAGs enabled (Figure 4).
 RUN_PROFILES: dict[str, frozenset[Stage]] = {
     "full": frozenset(Stage),

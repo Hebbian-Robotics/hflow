@@ -31,6 +31,33 @@ class AirflowClientError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class PasswordCredentials:
+    """Airflow's FAB username/password flow: exchanged for a JWT on demand.
+
+    The Compose runtime's shape -- the bundle's generated admin credentials
+    live in its ``.env`` and expire tokens are refreshed transparently.
+    """
+
+    username: str
+    password: str
+
+
+@dataclass(frozen=True)
+class BearerToken:
+    """A pre-issued bearer token, used as-is on every request.
+
+    The hosted shape: a control plane (or a managed Airflow's token
+    endpoint) mints the token and hands it to the client; this class never
+    refreshes it, so a 401 surfaces to the caller instead of looping.
+    """
+
+    token: str
+
+
+AirflowAuth = PasswordCredentials | BearerToken
+
+
+@dataclass(frozen=True)
 class AirflowHealth:
     """Parsed ``/api/v2/monitor/health`` body."""
 
@@ -49,19 +76,32 @@ class AirflowHealth:
 
 
 class AirflowClient:
-    """Minimal typed client for the deployment endpoints the SDK needs."""
+    """Minimal typed client for the deployment endpoints the SDK needs.
+
+    Authenticate one of two ways: the historical positional
+    ``(base_url, username, password)`` form, or ``auth=`` with an
+    :data:`AirflowAuth` variant -- :class:`PasswordCredentials` for the
+    Compose runtime's FAB flow, :class:`BearerToken` for a token minted
+    elsewhere (a hosted control plane, a managed platform's token endpoint).
+    """
 
     def __init__(
         self,
         base_url: str,
-        username: str,
-        password: str,
+        username: str | None = None,
+        password: str | None = None,
         *,
+        auth: AirflowAuth | None = None,
         request_timeout_s: float = 30.0,
     ) -> None:
+        if auth is not None and (username is not None or password is not None):
+            raise ValueError("pass either username/password or auth=, not both")
+        if auth is None:
+            if username is None or password is None:
+                raise ValueError("AirflowClient needs credentials: username and password, or auth=")
+            auth = PasswordCredentials(username=username, password=password)
         self.base_url = base_url.rstrip("/")
-        self._username = username
-        self._password = password
+        self._auth = auth
         self._request_timeout_s = request_timeout_s
         self._token: str | None = None
 
@@ -109,15 +149,19 @@ class AirflowClient:
         return parsed
 
     def _fetch_token(self) -> str:
-        response = self._http_json(
-            "POST",
-            f"{self.base_url}/auth/token",
-            {"username": self._username, "password": self._password},
-        )
-        token = response.get("access_token")
-        if not isinstance(token, str) or not token:
-            raise AirflowClientError(f"/auth/token returned no access_token: {response!r}")
-        return token
+        match self._auth:
+            case PasswordCredentials(username=username, password=password):
+                response = self._http_json(
+                    "POST",
+                    f"{self.base_url}/auth/token",
+                    {"username": username, "password": password},
+                )
+                token = response.get("access_token")
+                if not isinstance(token, str) or not token:
+                    raise AirflowClientError(f"/auth/token returned no access_token: {response!r}")
+                return token
+            case BearerToken(token=token):
+                return token
 
     def _authenticated(
         self, method: str, path: str, payload: dict[str, Any] | None = None
@@ -130,6 +174,18 @@ class AirflowClient:
         except AirflowClientError as error:
             if error.status != 401:
                 raise
+            if isinstance(self._auth, BearerToken):
+                # A pre-issued token cannot be refreshed here; retrying with
+                # the same bytes would just 401 again. Keep the server's own
+                # explanation in the message -- it is what the CLI prints.
+                body_excerpt = " ".join(error.body.split())[:200]
+                raise AirflowClientError(
+                    f"{method} {url} rejected the pre-issued bearer token (HTTP 401): "
+                    "the token is expired or invalid -- obtain a fresh one"
+                    + (f" (server said: {body_excerpt})" if body_excerpt else ""),
+                    status=401,
+                    body=error.body,
+                ) from error
             # Expired token: refresh exactly once and retry.
             self._token = self._fetch_token()
             return self._http_json(method, url, payload, bearer_token=self._token)
@@ -208,9 +264,17 @@ class AirflowClient:
     def dag_run(self, dag_id: str, dag_run_id: str) -> dict[str, Any]:
         return self._authenticated("GET", f"/api/v2/dags/{dag_id}/dagRuns/{dag_run_id}")
 
-    def dag_runs(self, dag_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
-        """The DAG's runs (up to ``limit``), as the API returns them."""
-        response = self._authenticated("GET", f"/api/v2/dags/{dag_id}/dagRuns?limit={limit}")
+    def dag_runs(
+        self, dag_id: str, *, limit: int = 100, order_by: str | None = None
+    ) -> list[dict[str, Any]]:
+        """The DAG's runs (up to ``limit``), as the API returns them.
+
+        Airflow's default ordering is id ASCENDING, so with more runs than
+        ``limit`` the server truncates to the OLDEST -- pass
+        ``order_by="-id"`` for the newest first.
+        """
+        query = f"limit={limit}" + (f"&order_by={order_by}" if order_by else "")
+        response = self._authenticated("GET", f"/api/v2/dags/{dag_id}/dagRuns?{query}")
         runs = response.get("dag_runs")
         return runs if isinstance(runs, list) else []
 

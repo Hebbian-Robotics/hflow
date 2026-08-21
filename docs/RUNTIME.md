@@ -51,11 +51,12 @@ runtime:
 
 | file | what it is |
 |---|---|
-| `docker-compose.yaml` | The official Airflow 3.3.1 reference compose reduced to LocalExecutor: `postgres`, `airflow-init`, `user-venv-init`, `airflow-apiserver`, `airflow-scheduler`, `airflow-dag-processor`, `airflow-triggerer`. No Redis, no Celery worker. The API binds to `127.0.0.1` only. Overwritten on every re-render. |
-| `.env` | Generated secrets (JWT secret, admin password), the API port, image tags, your UID. **Create-if-absent**: written once at `0600`, never overwritten by a re-render; your secrets and edits survive, and what's on disk wins over config. |
+| `docker-compose.yaml` | The official Airflow 3.3.1 reference compose reduced to LocalExecutor: `postgres`, `airflow-init`, `user-venv-init`, `airflow-apiserver`, `airflow-scheduler`, `airflow-dag-processor`, `airflow-triggerer`. No Redis, no Celery worker. The API binds to `127.0.0.1` only (widen deliberately via `API_BIND_HOST` in `.env`). Overwritten on every re-render. |
+| `.env` | Generated secrets (JWT secret, admin password, Postgres password), the API port and bind host, image tags, your UID. **Create-if-absent**: written once at `0600`, never overwritten by a re-render; your secrets and edits survive, and what's on disk wins over config. |
 | `dags/` | The five generated DAG files (below): the master `ingest.py` (`dag_id` defaults to `<pipeline stem>_ingest`) plus the four stage sub-DAGs `ingest_sync.py` / `ingest_meta.py` / `ingest_labels.py` / `ingest_media.py` (`<stem>_sync` etc.). |
 | `user/` | A copy of your pipeline file and requirements, mounted read-only into the containers. Refreshed on every re-render; re-run `up` after editing your pipeline. |
 | `logs/` | Airflow task logs, readable from the host. |
+| `hflow-bundle.json` | The bundle described as data: manifest version, kind (`compose`/`deploy`), hflow version, master and sub-DAG ids, data root, pipeline filename, app variable, whether requirements were included, task queue, and the task venv's interpreter path. What tooling (and `load_bundle`) reads instead of parsing generated code; `hflow deploy` emits the same file. |
 
 Two details exist because their absence bites:
 
@@ -152,10 +153,12 @@ See [the catalog guide](./CATALOG.md) for the views and the query patterns.
 > (per-episode, latency-first) and batch (per-shard, staggered).
 
 **The master (`<stem>_ingest`)** runs entirely in Airflow's own environment:
-no user venv, no hflow import. A `resolve_profile` branch task validates
+no user venv, no hflow import. A `resolve_profile` task validates
 the conf's `profile` against the profile vocabulary (baked in from
 `hflow.steps.RUN_PROFILES` at render time, so the runner and the DAGs can
-never disagree), then one `TriggerDagRunOperator` per **enabled** stage fires
+never disagree); each stage's trigger then sits behind an `enabled_<stage>`
+gate task that skips when the profile disables its stage, and one
+`TriggerDagRunOperator` per **enabled** stage fires
 its sub-DAG and waits for it (deferrable; the triggerer service carries the
 wait), chained strictly `sync → meta → labels → media`. Disabled stages show
 as skipped tasks in the UI; a failed sub-DAG stops the chain and fails the
@@ -205,11 +208,21 @@ task running in your venv, and each runs exactly its own stage via
    gate does not undo any work; it makes mass failure visible instead of
    letting a run that quarantined half its input report green.
 
-## The one rule: `data_root="/opt/airflow/data"`
+## The one rule: the App's data root is the runtime's data root
 
 Your `--data-root` directory is mounted at `/opt/airflow/data` inside every
-container, and that is where episode URIs resolve and outputs land. Your
-pipeline's App must therefore be constructed with exactly that path:
+container, and that is where episode URIs resolve and outputs land. The
+recommended shape is to construct the App **without** a `data_root` argument:
+
+```python
+app = hflow.App("my-pipeline")  # resolves HFLOW_DATA_ROOT, else ./data
+```
+
+The generated process task exports `HFLOW_DATA_ROOT=/opt/airflow/data` before
+importing your pipeline, so the same file runs unedited in the dev loop
+(where the root falls back to `./data`, or whatever you export) and inside
+the runtime. An explicit `data_root=` literal still works, but then it must
+be exactly the runtime's root:
 
 ```python
 app = hflow.App("my-pipeline", data_root="/opt/airflow/data")
@@ -224,10 +237,16 @@ imported App's `data_root` differs. The mounted directory is shared both
 ways: the catalog and canonical episodes the containers write are ordinary
 files on your host.
 
-(Yes, this means the dev-loop and runtime data roots differ. Point the App at
-`/opt/airflow/data` and pass `output_dir=` to `app.test()` while iterating, or
-flip the literal when you graduate; the run-time check catches a forgotten
-flip loudly either way.)
+Endpoint aliases resolve the same way: for a pipeline that declares
+`endpoints={"judge": ...}` and `uses="judge"`, exporting
+`HFLOW_ENDPOINT_<ALIAS>` (alias uppercased, non-alphanumerics as `_`, e.g.
+`HFLOW_ENDPOINT_JUDGE`) before `hflow up` makes the renderer forward that
+variable into every container, overriding -- or supplying -- the alias
+without editing the pipeline file. Point the same check at your local Ollama
+in the dev loop and at the team's vLLM box in the runtime, one file, zero
+edits. Forwarding is by name only (values never land in the bundle) and is
+captured at render time, so re-run `up` after changing which variables your
+shell exports.
 
 ## Bucket data roots: `--data-root gs://bucket/prefix`
 
@@ -270,6 +289,32 @@ Canonical episodes, contact sheets, sync-completion markers, and catalog
 appends all publish back to the bucket; `hflow curate --catalog
 gs://my-bucket/robot-data/catalog` then works from any machine with read
 access.
+
+## Remote runtimes: `--airflow-url`
+
+`ingest` and `status` can address a runtime that is not on this machine --
+a team Airflow, or a hosted workspace whose operator handed you a URL, a DAG
+id, and a credential ([docs/HOSTING.md](./HOSTING.md)). No bundle directory
+is involved:
+
+```bash
+export HFLOW_AIRFLOW_TOKEN=...   # or HFLOW_AIRFLOW_USERNAME + HFLOW_AIRFLOW_PASSWORD
+hflow ingest episodes-in/run_0001.mcap \
+  --airflow-url https://workspace.example.com --dag-id kitchen_ingest
+hflow status --airflow-url https://workspace.example.com --dag-id kitchen_ingest
+```
+
+- The URL and DAG id also resolve from `HFLOW_AIRFLOW_URL` and
+  `HFLOW_AIRFLOW_DAG_ID`, so a shell profile (or a control plane's injected
+  environment) can set the workspace once and the plain commands just work.
+- Credentials come from the environment only, never flags -- command lines
+  leak into process listings and shell history. A pre-issued bearer token
+  (`HFLOW_AIRFLOW_TOKEN`) wins over username/password.
+- An explicit `--bundle-dir` keeps a command local even when
+  `HFLOW_AIRFLOW_URL` is exported; an explicit `--airflow-url` wins the other
+  way.
+- Remote `status` reports health, DAG registration, and recent run states
+  over the REST API alone (the local `docker compose ps` half does not apply).
 
 ## `status`: diagnostics
 
@@ -363,8 +408,8 @@ be parsing; retry in a few seconds).
 `hflow up --api-port 9090`. For one already rendered, the `.env` on disk wins
 (re-renders never overwrite a preserved `.env`, so `--api-port` does nothing
 there and editing does stick): `hflow down`, edit `API_PORT`, `hflow up`
-again. The API only ever binds to `127.0.0.1`, so two bundles on different
-ports coexist fine.
+again. The API binds to `127.0.0.1` by default (`API_BIND_HOST` in `.env`
+widens it deliberately), so two bundles on different ports coexist fine.
 
 **`up` failed partway.** Whatever started is deliberately left running: the
 state *is* the diagnosis. `hflow status` to look, `docker compose ... logs

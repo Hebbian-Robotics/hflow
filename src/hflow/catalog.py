@@ -88,6 +88,18 @@ TABLE_COLUMN_DDL: dict[str, str] = {
 
 _TABLE_NAMES = tuple(TABLE_COLUMN_DDL)
 
+# Every table except episodes: written before it, force-aligned to its
+# recorded_at afterwards (see append_episode's repair passes). Derived so a
+# table added to TABLE_COLUMN_DDL automatically joins every dependent pass.
+_DEPENDENT_TABLE_NAMES = tuple(name for name in TABLE_COLUMN_DDL if name != "episodes")
+
+# Appends this process already verified (or repaired) as recorded_at-aligned,
+# keyed by (location, file_stem). Once aligned a stem can never go stale
+# again -- the episodes file is immutable and every post-commit dependent
+# write carries its recorded_at -- so replays skip straight back to the
+# single existence check instead of re-reading five files every time.
+_reconciled_append_stems: set[tuple[str, str]] = set()
+
 _FORMAT_MARKER_NAME = "format_version"
 
 
@@ -261,6 +273,79 @@ def _run_fingerprint(
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
 
+def _insert_dependent_rows(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    episode_id: str,
+    run_fingerprint: str,
+    check_rows: Sequence[CheckRunRow],
+    recorded_at: datetime,
+) -> None:
+    """Insert one append's dependent-table rows (everything except episodes).
+
+    Shared by the initial append and the replay repair pass, so both write
+    rows identical in every fingerprinted column -- between an append attempt
+    and its repair only ``recorded_at`` (forced to the committed value) and
+    ``duration_s`` (attempt wall clock, deliberately outside the run
+    fingerprint) can differ.
+    """
+    for row in check_rows:
+        connection.execute(
+            "INSERT INTO check_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                episode_id,
+                run_fingerprint,
+                row.check_name,
+                row.check_version,
+                row.critical,
+                row.status.value,  # stored as its string value (DB boundary)
+                row.duration_s,
+                row.error,
+                recorded_at,
+            ],
+        )
+        for key, value in row.measurements.items():
+            value_double = (
+                float(value)
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+                else None
+            )
+            value_text = value if isinstance(value, str) else None
+            value_bool = value if isinstance(value, bool) else None
+            connection.execute(
+                "INSERT INTO measurements VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    episode_id,
+                    run_fingerprint,
+                    row.check_name,
+                    row.check_version,
+                    key,
+                    value_double,
+                    value_text,
+                    value_bool,
+                    recorded_at,
+                ],
+            )
+        for tag in row.tags:
+            connection.execute(
+                "INSERT INTO tags VALUES (?, ?, ?, ?, ?)",
+                [episode_id, run_fingerprint, row.check_name, tag, recorded_at],
+            )
+        for interval in row.intervals:
+            connection.execute(
+                "INSERT INTO intervals VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    episode_id,
+                    run_fingerprint,
+                    row.check_name,
+                    interval.label,
+                    interval.start_ns,
+                    interval.end_ns,
+                    recorded_at,
+                ],
+            )
+
+
 class Catalog:
     """Append access to one catalog root (typically ``<data_root>/catalog``).
 
@@ -346,7 +431,17 @@ class Catalog:
 
         # Create-if-absent: the episodes file is written last (manifest-last,
         # in miniature), so its existence proves the whole append completed.
+        # A replay is also the retry lane for #51's residual crash window (a
+        # winner that died between creating episodes and force-aligning the
+        # dependents), so it reconciles dependent recorded_at before
+        # returning instead of trusting the previous attempt blindly.
         if self.location.exists(f"episodes/{file_stem}.parquet"):
+            self._reconcile_replayed_append(
+                file_stem=file_stem,
+                episode_id=episode_id,
+                run_fingerprint=run_fingerprint,
+                check_rows=check_rows,
+            )
             return AppendResult(
                 episode_id=episode_id, run_fingerprint=run_fingerprint, written=False
             )
@@ -384,61 +479,13 @@ class Catalog:
                     recorded_at,
                 ],
             )
-            for row in check_rows:
-                connection.execute(
-                    "INSERT INTO check_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [
-                        episode_id,
-                        run_fingerprint,
-                        row.check_name,
-                        row.check_version,
-                        row.critical,
-                        row.status.value,  # stored as its string value (DB boundary)
-                        row.duration_s,
-                        row.error,
-                        recorded_at,
-                    ],
-                )
-                for key, value in row.measurements.items():
-                    value_double = (
-                        float(value)
-                        if isinstance(value, (int, float)) and not isinstance(value, bool)
-                        else None
-                    )
-                    value_text = value if isinstance(value, str) else None
-                    value_bool = value if isinstance(value, bool) else None
-                    connection.execute(
-                        "INSERT INTO measurements VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        [
-                            episode_id,
-                            run_fingerprint,
-                            row.check_name,
-                            row.check_version,
-                            key,
-                            value_double,
-                            value_text,
-                            value_bool,
-                            recorded_at,
-                        ],
-                    )
-                for tag in row.tags:
-                    connection.execute(
-                        "INSERT INTO tags VALUES (?, ?, ?, ?, ?)",
-                        [episode_id, run_fingerprint, row.check_name, tag, recorded_at],
-                    )
-                for interval in row.intervals:
-                    connection.execute(
-                        "INSERT INTO intervals VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        [
-                            episode_id,
-                            run_fingerprint,
-                            row.check_name,
-                            interval.label,
-                            interval.start_ns,
-                            interval.end_ns,
-                            recorded_at,
-                        ],
-                    )
+            _insert_dependent_rows(
+                connection,
+                episode_id=episode_id,
+                run_fingerprint=run_fingerprint,
+                check_rows=check_rows,
+                recorded_at=recorded_at,
+            )
 
             # Build every table file locally first, then store dependents
             # before the episodes file (see above). store_file_if_absent is
@@ -459,7 +506,7 @@ class Catalog:
                     staged_file = staging_dir / f"{table_name}.parquet"
                     escaped = str(staged_file).replace("'", "''")
                     connection.execute(f"COPY {table_name} TO '{escaped}' (FORMAT PARQUET)")
-                for table_name in ("check_runs", "measurements", "tags", "intervals"):
+                for table_name in _DEPENDENT_TABLE_NAMES:
                     staged_file = staging_dir / f"{table_name}.parquet"
                     dependent_key = f"{table_name}/{file_stem}.parquet"
                     self.location.store_file_if_absent(staged_file, dependent_key)
@@ -486,13 +533,122 @@ class Catalog:
                     # atomic replace (rename-into-place locally, a plain put
                     # on a bucket) -- safe here because we already hold the
                     # unique win on episodes.
-                    for table_name in ("check_runs", "measurements", "tags", "intervals"):
+                    for table_name in _DEPENDENT_TABLE_NAMES:
                         staged_file = staging_dir / f"{table_name}.parquet"
                         dependent_key = f"{table_name}/{file_stem}.parquet"
                         self.location.publish(staged_file, dependent_key)
+                    # The winner just aligned everything itself; later replays
+                    # in this process can skip the verification pass.
+                    _reconciled_append_stems.add((str(self.location), file_stem))
         finally:
             connection.close()
 
         return AppendResult(
             episode_id=episode_id, run_fingerprint=run_fingerprint, written=episodes_created
         )
+
+    def _reconcile_replayed_append(
+        self,
+        *,
+        file_stem: str,
+        episode_id: str,
+        run_fingerprint: str,
+        check_rows: Sequence[CheckRunRow],
+    ) -> None:
+        """Heal dependents a crashed repair pass left behind (#51's residual).
+
+        The episodes file's ``recorded_at`` is the one trustworthy timestamp
+        of a completed append: its create-if-absent is the atomic commit. A
+        winner that crashed between creating it and force-aligning the
+        dependents leaves dependent tables carrying a different (stale)
+        ``recorded_at``; replays used to early-return without ever revisiting
+        them, so the per-table "latest" rankings could stitch rows from two
+        different runs together. A replay holds content identical in every
+        fingerprinted column by construction -- the run fingerprint hashes
+        the check outcomes (``duration_s``, attempt wall clock, is
+        deliberately excluded and may differ) -- so it can safely rebuild any
+        disagreeing dependent with the committed timestamp. ``publish`` is an
+        atomic replace, and every repairer writes the same identity content
+        with the same committed ``recorded_at``, so concurrent replays
+        converge instead of fighting.
+
+        Verified stems are memoized per process: the steady-state replay
+        (the idempotent-dedupe hot path) pays this pass's five file reads at
+        most once, then returns to the single existence check.
+        """
+        memo_key = (str(self.location), file_stem)
+        if memo_key in _reconciled_append_stems:
+            return
+        episodes_file = self.location.fetch(f"episodes/{file_stem}.parquet")
+        connection = duckdb.connect()
+        try:
+            # The committed timestamp stays inside DuckDB throughout:
+            # materializing a TIMESTAMPTZ into Python would require pytz,
+            # which is not a dependency.
+            episodes_pattern = str(episodes_file).replace("'", "''")
+            connection.execute(
+                "CREATE TABLE committed_timestamp AS "
+                f"SELECT recorded_at FROM read_parquet('{episodes_pattern}') LIMIT 1"
+            )
+            (committed_count,) = connection.execute(
+                "SELECT count(*) FROM committed_timestamp"
+            ).fetchone() or (0,)
+            if committed_count == 0:
+                # append_episode always inserts exactly one episodes row and
+                # publishes atomically, so a zero-row episodes file is not a
+                # state this system produces -- refuse loudly rather than
+                # silently skipping reconciliation against a corrupt marker.
+                raise ValueError(
+                    f"catalog file episodes/{file_stem}.parquet exists but holds no rows -- "
+                    "the append commit marker is corrupt, so dependent tables cannot be "
+                    "reconciled; delete the empty file to let the next append rebuild "
+                    "this episode's tables"
+                )
+
+            stale_table_names: list[str] = []
+            for table_name in _DEPENDENT_TABLE_NAMES:
+                dependent_key = f"{table_name}/{file_stem}.parquet"
+                try:
+                    dependent_file = self.location.fetch(dependent_key)
+                except FileNotFoundError:
+                    # Dependents are stored before episodes, so this should
+                    # not happen; if it somehow did, rebuilding it is the
+                    # correct healing move either way.
+                    stale_table_names.append(table_name)
+                    continue
+                dependent_pattern = str(dependent_file).replace("'", "''")
+                (mismatched_row_count,) = connection.execute(
+                    f"SELECT count(*) FROM read_parquet('{dependent_pattern}') "
+                    "WHERE recorded_at IS DISTINCT FROM "
+                    "(SELECT recorded_at FROM committed_timestamp)"
+                ).fetchone() or (0,)
+                if mismatched_row_count:
+                    stale_table_names.append(table_name)
+            if not stale_table_names:
+                _reconciled_append_stems.add(memo_key)
+                return
+
+            for table_name in _DEPENDENT_TABLE_NAMES:
+                connection.execute(f"CREATE TABLE {table_name} ({TABLE_COLUMN_DDL[table_name]})")
+            _insert_dependent_rows(
+                connection,
+                episode_id=episode_id,
+                run_fingerprint=run_fingerprint,
+                check_rows=check_rows,
+                # A placeholder only: the COPY below REPLACEs recorded_at
+                # with the committed timestamp, entirely inside DuckDB.
+                recorded_at=datetime.now(UTC),
+            )
+            with tempfile.TemporaryDirectory(prefix="hflow-catalog-repair-") as staging_name:
+                staging_dir = Path(staging_name)
+                for table_name in stale_table_names:
+                    staged_file = staging_dir / f"{table_name}.parquet"
+                    escaped = str(staged_file).replace("'", "''")
+                    connection.execute(
+                        f"COPY (SELECT * REPLACE ((SELECT recorded_at FROM committed_timestamp) "
+                        f"AS recorded_at) FROM {table_name}) TO '{escaped}' (FORMAT PARQUET)"
+                    )
+                    self.location.publish(staged_file, f"{table_name}/{file_stem}.parquet")
+            _reconciled_append_stems.add(memo_key)
+        finally:
+            connection.close()

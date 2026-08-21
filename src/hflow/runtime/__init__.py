@@ -16,9 +16,12 @@ from hflow.runtime._bundle import (
     sub_dag_id_for_stage,
 )
 from hflow.runtime._client import (
+    AirflowAuth,
     AirflowClient,
     AirflowClientError,
     AirflowHealth,
+    BearerToken,
+    PasswordCredentials,
 )
 from hflow.runtime._compose import (
     ComposeError,
@@ -33,6 +36,12 @@ from hflow.runtime._deploy import (
     render_deploy_bundle,
     validate_data_root_uri,
 )
+from hflow.runtime._endpoint import (
+    RemoteRuntimeEndpoint,
+    client_for_endpoint,
+    describe_remote_status,
+    resolve_remote_endpoint,
+)
 from hflow.runtime._lifecycle import (
     client_for_bundle,
     describe_runtime_status,
@@ -42,25 +51,32 @@ from hflow.runtime._lifecycle import (
 
 __all__ = [
     "DEFAULT_AIRFLOW_IMAGE",
+    "AirflowAuth",
     "AirflowClient",
     "AirflowClientError",
     "AirflowHealth",
+    "BearerToken",
     "BundlePaths",
     "ComposeError",
     "DeployConfig",
     "DeployPaths",
+    "PasswordCredentials",
+    "RemoteRuntimeEndpoint",
     "RuntimeConfig",
     "bundle_dag_ids",
     "client_for_bundle",
+    "client_for_endpoint",
     "compose_down",
     "compose_logs",
     "compose_ps",
     "compose_up_detached",
+    "describe_remote_status",
     "describe_runtime_status",
     "infer_hflow_source",
     "load_bundle",
     "render_bundle",
     "render_deploy_bundle",
+    "resolve_remote_endpoint",
     "start_runtime",
     "started_summary",
     "sub_dag_id_for_stage",

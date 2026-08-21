@@ -1,6 +1,7 @@
 """AirflowClient against a stub HTTP server (no Docker, no Airflow)."""
 
 import json
+import socket
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -8,7 +9,15 @@ from typing import Any, ClassVar
 
 import pytest
 
-from hflow.runtime import AirflowClient, AirflowClientError
+from hflow.runtime import (
+    AirflowClient,
+    AirflowClientError,
+    BearerToken,
+    PasswordCredentials,
+    RemoteRuntimeEndpoint,
+    describe_remote_status,
+    resolve_remote_endpoint,
+)
 
 
 class _StubAirflowHandler(BaseHTTPRequestHandler):
@@ -72,6 +81,22 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
                 return
             existing_run_id = self.path.rsplit("/", 1)[-1]
             self._respond(200, {"dag_run_id": existing_run_id, "state": "running"})
+            return
+        if "/dagRuns" in self.path:  # the run LIST (with or without ?limit=)
+            if not self._bearer_ok(authorization):
+                self._respond(401, {"detail": "expired"})
+                return
+            self._respond(200, {"dag_runs": [{"dag_run_id": "manual__1", "state": "success"}]})
+            return
+        if self.path.startswith("/api/v2/dags/"):
+            if not self._bearer_ok(authorization):
+                self._respond(401, {"detail": "expired"})
+                return
+            requested_dag_id = self.path.rsplit("/", 1)[-1]
+            if requested_dag_id == "missing_dag":
+                self._respond(404, {"detail": "DAG not found"})
+                return
+            self._respond(200, {"dag_id": requested_dag_id})
             return
         if self.path == "/api/v2/monitor/health":
             status = "healthy" if type(self).healthy else "unhealthy"
@@ -188,6 +213,146 @@ def test_health_parses_body_not_status(stub_server: str) -> None:
     unhealthy = client.health()  # still HTTP 200: the body is the signal
     assert not unhealthy.healthy
     assert "scheduler=unhealthy" in unhealthy.summary()
+
+
+def test_bearer_token_auth_never_calls_the_token_endpoint(stub_server: str) -> None:
+    """A pre-issued token (control-plane-minted) is used as-is: no username,
+    no password, and no POST /auth/token."""
+    _StubAirflowHandler.issued_tokens.append("pre-issued-token")
+    client = AirflowClient(stub_server, auth=BearerToken("pre-issued-token"))
+    result = client.trigger_dag_run("pipeline_ingest")
+    assert result["state"] == "queued"
+    token_endpoint_requests = [
+        entry for entry in _StubAirflowHandler.requests_seen if entry[1] == "/auth/token"
+    ]
+    assert token_endpoint_requests == []
+
+
+def test_rejected_bearer_token_fails_without_a_refresh_loop(stub_server: str) -> None:
+    client = AirflowClient(stub_server, auth=BearerToken("never-issued"))
+    with pytest.raises(AirflowClientError, match="expired or invalid"):
+        client.trigger_dag_run("pipeline_ingest")
+    # Exactly one request went out: retrying the same token bytes is useless.
+    trigger_requests = [
+        entry for entry in _StubAirflowHandler.requests_seen if entry[1].endswith("/dagRuns")
+    ]
+    assert len(trigger_requests) == 1
+
+
+def test_client_requires_exactly_one_credential_form() -> None:
+    with pytest.raises(ValueError, match="not both"):
+        AirflowClient("http://x", "user", "password", auth=BearerToken("token"))
+    with pytest.raises(ValueError, match="needs credentials"):
+        AirflowClient("http://x")
+
+
+class TestResolveRemoteEndpoint:
+    def test_no_url_anywhere_means_local(self) -> None:
+        assert resolve_remote_endpoint(environ={}) is None
+
+    def test_flags_win_and_token_beats_password(self) -> None:
+        endpoint = resolve_remote_endpoint(
+            airflow_url="https://workspace.example.com",
+            dag_id="kitchen_ingest",
+            environ={
+                "HFLOW_AIRFLOW_URL": "https://ignored.example.com",
+                "HFLOW_AIRFLOW_TOKEN": "minted-token",
+                "HFLOW_AIRFLOW_USERNAME": "also-ignored",
+                "HFLOW_AIRFLOW_PASSWORD": "also-ignored",
+            },
+        )
+        assert endpoint == RemoteRuntimeEndpoint(
+            base_url="https://workspace.example.com",
+            dag_id="kitchen_ingest",
+            auth=BearerToken("minted-token"),
+        )
+
+    def test_environment_only_resolution_with_password_credentials(self) -> None:
+        endpoint = resolve_remote_endpoint(
+            environ={
+                "HFLOW_AIRFLOW_URL": "https://workspace.example.com",
+                "HFLOW_AIRFLOW_DAG_ID": "kitchen_ingest",
+                "HFLOW_AIRFLOW_USERNAME": "svc",
+                "HFLOW_AIRFLOW_PASSWORD": "secret",
+            }
+        )
+        assert endpoint is not None
+        assert endpoint.auth == PasswordCredentials(username="svc", password="secret")
+
+    def test_missing_dag_id_and_missing_credentials_name_the_fix(self) -> None:
+        with pytest.raises(ValueError, match="HFLOW_AIRFLOW_DAG_ID"):
+            resolve_remote_endpoint(
+                airflow_url="https://workspace.example.com",
+                environ={"HFLOW_AIRFLOW_TOKEN": "minted-token"},
+            )
+        with pytest.raises(ValueError, match="HFLOW_AIRFLOW_TOKEN"):
+            resolve_remote_endpoint(
+                airflow_url="https://workspace.example.com",
+                dag_id="kitchen_ingest",
+                environ={},
+            )
+
+    def test_scheme_less_url_is_refused_at_the_boundary(self) -> None:
+        # urllib would otherwise crash with a raw ValueError deep inside the
+        # first request; the resolution boundary names the fix instead.
+        with pytest.raises(ValueError, match="http:// or https://"):
+            resolve_remote_endpoint(
+                airflow_url="workspace.example.com:8080",
+                dag_id="kitchen_ingest",
+                environ={"HFLOW_AIRFLOW_TOKEN": "minted-token"},
+            )
+
+
+def test_describe_remote_status_reports_health_dag_and_recent_runs(stub_server: str) -> None:
+    _StubAirflowHandler.issued_tokens.append("pre-issued-token")
+    endpoint = RemoteRuntimeEndpoint(
+        base_url=stub_server,
+        dag_id="pipeline_ingest",
+        auth=BearerToken("pre-issued-token"),
+    )
+    status_text = describe_remote_status(endpoint)
+    assert "healthy" in status_text
+    assert "pipeline_ingest" in status_text
+    assert "manual__1 [success]" in status_text
+    # The server truncates the run list to `limit` in id-ASCENDING order by
+    # default, which would show a busy DAG's OLDEST history; the request must
+    # ask for the newest runs explicitly.
+    run_list_requests = [
+        entry
+        for entry in _StubAirflowHandler.requests_seen
+        if "/dagRuns?" in entry[1] and entry[0] == "GET"
+    ]
+    assert run_list_requests, "no dag-run list request was made"
+    assert "order_by=-id" in run_list_requests[-1][1]
+
+
+def test_describe_remote_status_reports_an_unreachable_endpoint() -> None:
+    """The primary operator-facing failure: the workspace is down or the URL
+    is wrong. Status must report it, never raise."""
+    with socket.socket() as port_probe:  # find a port with no listener
+        port_probe.bind(("127.0.0.1", 0))
+        unused_port = port_probe.getsockname()[1]
+    endpoint = RemoteRuntimeEndpoint(
+        base_url=f"http://127.0.0.1:{unused_port}",
+        dag_id="pipeline_ingest",
+        auth=BearerToken("irrelevant"),
+    )
+    status_text = describe_remote_status(endpoint)
+    assert "unreachable" in status_text
+
+
+def test_describe_remote_status_reports_an_unavailable_dag(stub_server: str) -> None:
+    """A healthy endpoint whose DAG id is wrong (or not yet registered) must
+    be reported as such, with the health still shown."""
+    _StubAirflowHandler.issued_tokens.append("pre-issued-token")
+    endpoint = RemoteRuntimeEndpoint(
+        base_url=stub_server,
+        dag_id="missing_dag",
+        auth=BearerToken("pre-issued-token"),
+    )
+    status_text = describe_remote_status(endpoint)
+    assert "healthy" in status_text
+    assert "unavailable" in status_text
 
 
 def test_wait_until_healthy_times_out_with_last_status(stub_server: str) -> None:

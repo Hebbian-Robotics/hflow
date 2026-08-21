@@ -28,6 +28,12 @@ from hflow.curation import (
 from hflow.doctor import DiagnosticLevel, DoctorReport, Finding, diagnose
 from hflow.episode import ChannelData, Episode, ExtractedFrame
 from hflow.format import GopPreset
+from hflow.manifest import (
+    DerivedChannelManifest,
+    PipelineManifest,
+    StepKind,
+    StepManifest,
+)
 from hflow.mcap_writer import CanonicalMcapWriter
 from hflow.reader import (
     EpisodeReader,
@@ -42,6 +48,7 @@ from hflow.steps import (
     CheckResult,
     DerivedChannel,
     EnrichmentResult,
+    IngestMode,
     Interval,
     MeasurementValue,
     RegisteredCheck,
@@ -58,6 +65,7 @@ from hflow.storage import (
     parse_storage_root,
 )
 from hflow.transform import EpisodeStamps, TransformConfig, write_canonical_episode
+from hflow.workspace import Workspace, WorkspaceIdentity
 
 try:
     __version__ = version("hflow")
@@ -79,6 +87,7 @@ __all__ = [
     "CheckStatus",
     "CurationReport",
     "DerivedChannel",
+    "DerivedChannelManifest",
     "DerivedSeries",
     "DiagnosticLevel",
     "DoctorReport",
@@ -90,10 +99,12 @@ __all__ = [
     "ExtractedFrame",
     "Finding",
     "GopPreset",
+    "IngestMode",
     "Interval",
     "LocalStorageRoot",
     "MeasurementValue",
     "MessageBatch",
+    "PipelineManifest",
     "PlannedBatch",
     "PythonMcapEpisodeReader",
     "RegisteredCheck",
@@ -101,10 +112,14 @@ __all__ = [
     "ResamplePolicy",
     "Stage",
     "StaleEpisode",
+    "StepKind",
+    "StepManifest",
     "StorageRoot",
     "TestReport",
     "TopicInfo",
     "TransformConfig",
+    "Workspace",
+    "WorkspaceIdentity",
     "__version__",
     "checks",
     "curate",

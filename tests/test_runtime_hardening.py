@@ -84,12 +84,13 @@ def test_hostile_dag_identifiers_are_rejected(tmp_path: Path) -> None:
 def test_generated_gate_budgets_errors_too(tmp_path: Path) -> None:
     paths = render_bundle(_config(tmp_path), tmp_path / "bundle")
     # The gates live in the stage sub-DAGs (the master only triggers them);
-    # every one of them must budget per-episode crashes.
+    # every one of them must call a library budget (whose error-budgeting
+    # behavior tests/test_stage_execution.py verifies directly).
     for sub_dag_file in paths.sub_dag_files:
         dag_source = sub_dag_file.read_text()
         compile(dag_source, str(sub_dag_file), "exec")
-        assert "errors > budget" in dag_source
-        assert "errors == total" in dag_source
+        assert "from hflow.stage_execution import summarize_" in dag_source
+        assert "_budget(batch_counts)" in dag_source
 
 
 def test_ingest_rejects_absolute_and_escaping_uris(tmp_path: Path) -> None:

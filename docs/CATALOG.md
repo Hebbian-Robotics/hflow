@@ -56,6 +56,14 @@ Three durability rules govern writes:
   `check_version` changes, so re-running adds *new-version* rows next to the
   old ones. The corpus is assumed permanently mixed-version; curation picks.
 
+One timestamp per append: every file of one `(episode_id, run_fingerprint)`
+carries the episodes file's `recorded_at` (its create-if-absent is the
+atomic commit). The winner force-aligns the dependent tables after
+committing, and a replayed append re-checks and heals any dependent a
+crashed earlier attempt left with a stale timestamp -- so concurrent
+duplicate appends and retried tasks converge instead of stitching two runs'
+rows together.
+
 ## Querying
 
 ```python
@@ -97,6 +105,14 @@ Workers process local files in an etag-validated mirror (override its base with
 catalog rows, and manifests publish to the bucket. Catalog table files are
 append-only and content-named, so a mirror only downloads rows it does not yet
 have.
+
+Running SQL you did not write? Pass `constrained=True` to `curate()` or
+`open_catalog_connection()`: the DuckDB connection's file access is limited
+to the catalog (plus the manifest's own destination), extension
+auto-install/auto-load is off, and the configuration is locked -- the
+posture a service uses for tenant-supplied SQL
+([docs/HOSTING.md](./HOSTING.md#trust-model)). The default stays
+unrestricted for your own exploration.
 
 ### The view surface
 

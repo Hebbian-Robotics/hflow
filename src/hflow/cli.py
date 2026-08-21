@@ -1,29 +1,55 @@
 """Command-line entry point.
 
-Subcommands: ``curate``, ``stale``, ``doctor``, the Compose runtime family
-``up``/``down``/``ingest``/``status``, and ``deploy`` for bring-your-own
-Airflow. Everything the CLI does is a thin call into the library: no behavior
-lives only here.
+Subcommands: ``curate``, ``stale``, ``doctor``, ``manifest``, the Compose
+runtime family ``up``/``down``/``ingest``/``status``, and ``deploy`` for
+bring-your-own Airflow. Everything the CLI does is a thin call into the
+library: no behavior lives only here.
+
+``ingest`` and ``status`` address either a LOCAL rendered bundle (the
+default: ``--bundle-dir`` or its auto-discovery) or a REMOTE runtime by URL
+(``--airflow-url`` / ``HFLOW_AIRFLOW_URL`` plus ``HFLOW_AIRFLOW_DAG_ID`` and
+environment credentials) -- the same commands drive a hosted workspace.
 """
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from hflow import __version__
+from hflow.app import DATA_ROOT_ENVIRONMENT_VARIABLE, DEFAULT_DATA_ROOT
 from hflow.curation import curate, stale_episodes
 from hflow.doctor import diagnose
 from hflow.runtime._deploy import DEFAULT_DEPLOY_VENV_PYTHON
 from hflow.steps import RUN_PROFILES
+from hflow.storage import is_bucket_url
+from hflow.workspace import CATALOG_DIRECTORY_NAME, RUNTIME_BUNDLE_DIRECTORY_NAME
 
-DEFAULT_DATA_ROOT = Path("./data")
-DEFAULT_CATALOG_DIR = "./data/catalog"
-DEFAULT_BUNDLE_DIR = DEFAULT_DATA_ROOT / "runtime"
+if TYPE_CHECKING:
+    from hflow.app import App
+    from hflow.runtime import RemoteRuntimeEndpoint
+
 DEFAULT_DEPLOY_OUTPUT_DIR = Path("./deploy")
 # Mirrors RuntimeConfig.api_port; kept here so the parser can state it without
 # importing the runtime package, which `up` defers until it actually runs.
 DEFAULT_API_PORT = 8080
+
+
+def _environment_data_root() -> str:
+    """The data root the App itself would resolve: ``HFLOW_DATA_ROOT`` wins.
+
+    CLI defaults derive from the same variable so a shell configured for one
+    workspace addresses that workspace's catalog and runtime consistently --
+    never a hardcoded ``./data`` beside it.
+    """
+    return os.environ.get(DATA_ROOT_ENVIRONMENT_VARIABLE) or DEFAULT_DATA_ROOT
+
+
+def _default_catalog_location() -> str:
+    # A string join, not Path: bucket URLs (gs://...) must survive.
+    return f"{_environment_data_root().rstrip('/')}/{CATALOG_DIRECTORY_NAME}"
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -64,14 +90,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     curate_parser.add_argument(
         "--catalog",
-        default=DEFAULT_CATALOG_DIR,
-        help=f"catalog directory or object-store prefix (default: {DEFAULT_CATALOG_DIR})",
+        default=_default_catalog_location(),
+        help=(
+            "catalog directory or object-store prefix "
+            f"(default: $HFLOW_DATA_ROOT/catalog, else {DEFAULT_DATA_ROOT}/catalog)"
+        ),
     )
     curate_parser.add_argument(
         "--output",
         "-o",
-        default="./data/manifest.parquet",
-        help="manifest path or object-store URL (default: ./data/manifest.parquet)",
+        default=f"{_environment_data_root().rstrip('/')}/manifest.parquet",
+        help=(
+            "manifest path or object-store URL "
+            f"(default: $HFLOW_DATA_ROOT/manifest.parquet, else "
+            f"{DEFAULT_DATA_ROOT}/manifest.parquet)"
+        ),
     )
 
     stale_parser = subparsers.add_parser(
@@ -86,8 +119,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     stale_parser.add_argument(
         "--catalog",
-        default=DEFAULT_CATALOG_DIR,
-        help=f"catalog directory or object-store prefix (default: {DEFAULT_CATALOG_DIR})",
+        default=_default_catalog_location(),
+        help=(
+            "catalog directory or object-store prefix "
+            f"(default: $HFLOW_DATA_ROOT/catalog, else {DEFAULT_DATA_ROOT}/catalog)"
+        ),
     )
     stale_group = stale_parser.add_mutually_exclusive_group(required=True)
     stale_group.add_argument(
@@ -124,6 +160,23 @@ def _build_parser() -> argparse.ArgumentParser:
         "file", nargs="+", help="the local paths or object-store URLs to check"
     )
 
+    manifest_parser = subparsers.add_parser(
+        "manifest",
+        help="print the pipeline's manifest (steps, versions, endpoints) as JSON",
+        description=(
+            "Import the pipeline file and print its manifest -- step names, "
+            "content-hash versions, gate flags, endpoint aliases, and version "
+            "stamps -- as JSON on stdout. This is the metadata a pipeline "
+            "crosses a control boundary as. Importing EXECUTES the pipeline "
+            "file, so run this in the pipeline's own environment."
+        ),
+    )
+    manifest_parser.add_argument(
+        "--pipeline",
+        required=True,
+        help="pipeline file, optionally with the App variable name: path/to/pipeline.py[:app]",
+    )
+
     up_parser = subparsers.add_parser(
         "up",
         help="render the Compose bundle and start the local Airflow runtime",
@@ -141,11 +194,11 @@ def _build_parser() -> argparse.ArgumentParser:
     up_parser.add_argument(
         "--data-root",
         type=str,
-        default=str(DEFAULT_DATA_ROOT),
+        default=_environment_data_root(),
         help=(
             "host directory mounted at /opt/airflow/data, or a bucket URL "
             "(gs://, s3://, az://) the runtime talks to natively "
-            f"(default: {DEFAULT_DATA_ROOT})"
+            f"(default: $HFLOW_DATA_ROOT, else {DEFAULT_DATA_ROOT})"
         ),
     )
     up_parser.add_argument(
@@ -229,7 +282,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--bundle-dir",
         type=Path,
         default=None,
-        help=f"the rendered bundle to stop (default: {DEFAULT_BUNDLE_DIR}, else ./runtime)",
+        help=(
+            "the rendered bundle to stop (default: $HFLOW_DATA_ROOT/runtime, "
+            f"else {DEFAULT_DATA_ROOT}/runtime; ./runtime for bucket data roots)"
+        ),
     )
     down_parser.add_argument(
         "--volumes",
@@ -250,8 +306,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--bundle-dir",
         type=Path,
         default=None,
-        help=f"the rendered bundle to talk to (default: {DEFAULT_BUNDLE_DIR}, else ./runtime)",
+        help=(
+            "the rendered bundle to talk to (default: $HFLOW_DATA_ROOT/runtime, "
+            f"else {DEFAULT_DATA_ROOT}/runtime; ./runtime for bucket data roots)"
+        ),
     )
+    _add_remote_endpoint_arguments(ingest_parser)
     ingest_parser.add_argument(
         "--profile",
         choices=sorted(RUN_PROFILES),
@@ -275,25 +335,67 @@ def _build_parser() -> argparse.ArgumentParser:
         "--bundle-dir",
         type=Path,
         default=None,
-        help=f"the rendered bundle to inspect (default: {DEFAULT_BUNDLE_DIR}, else ./runtime)",
+        help=(
+            "the rendered bundle to inspect (default: $HFLOW_DATA_ROOT/runtime, "
+            f"else {DEFAULT_DATA_ROOT}/runtime; ./runtime for bucket data roots)"
+        ),
     )
+    _add_remote_endpoint_arguments(status_parser)
     return parser
+
+
+def _add_remote_endpoint_arguments(command_parser: argparse.ArgumentParser) -> None:
+    """The remote-runtime addressing flags ``ingest`` and ``status`` share."""
+    command_parser.add_argument(
+        "--airflow-url",
+        default=None,
+        help=(
+            "Airflow API base URL of a remote runtime, e.g. a hosted workspace "
+            "(or export HFLOW_AIRFLOW_URL); credentials come from the environment "
+            "only: HFLOW_AIRFLOW_TOKEN, or HFLOW_AIRFLOW_USERNAME and "
+            "HFLOW_AIRFLOW_PASSWORD"
+        ),
+    )
+    command_parser.add_argument(
+        "--dag-id",
+        default=None,
+        help="master ingest DAG id on the remote runtime (or export HFLOW_AIRFLOW_DAG_ID)",
+    )
+
+
+def _remote_endpoint_for_command(arguments: argparse.Namespace) -> "RemoteRuntimeEndpoint | None":
+    """The remote endpoint this command addresses, or ``None`` for local.
+
+    An explicit ``--bundle-dir`` keeps the command local even when
+    ``HFLOW_AIRFLOW_URL`` is exported; an explicit ``--airflow-url`` wins the
+    other way. Raises ``ValueError`` when a remote resolution is incomplete.
+    """
+    from hflow.runtime import resolve_remote_endpoint
+
+    if arguments.airflow_url is None and arguments.bundle_dir is not None:
+        return None
+    return resolve_remote_endpoint(airflow_url=arguments.airflow_url, dag_id=arguments.dag_id)
 
 
 def _resolve_bundle_dir(bundle_dir_argument: Path | None) -> Path:
     """The bundle a command addresses when ``--bundle-dir`` was not given.
 
-    Local-mode runtimes render at ``<data-root>/runtime`` (default
-    ``./data/runtime``); bucket-mode runtimes have no local data root and
-    render at ``./runtime``. Try each in that order, falling back to the
-    local default so ``load_bundle``'s error names the primary location.
+    Local-mode runtimes render at ``<data-root>/runtime`` -- resolved from
+    ``HFLOW_DATA_ROOT`` when set (matching where ``up`` rendered), else the
+    ``./data/runtime`` default; bucket-mode runtimes have no local data root
+    and render at ``./runtime``. Try each in that order, falling back to the
+    primary candidate so ``load_bundle``'s error names it.
     """
     if bundle_dir_argument is not None:
         return bundle_dir_argument
-    for candidate in (DEFAULT_BUNDLE_DIR, Path("runtime")):
+    environment_data_root = _environment_data_root()
+    candidates = [Path(RUNTIME_BUNDLE_DIRECTORY_NAME)]
+    if not is_bucket_url(environment_data_root):
+        candidates.insert(0, Path(environment_data_root) / RUNTIME_BUNDLE_DIRECTORY_NAME)
+    for candidate in candidates:
         if (candidate / "docker-compose.yaml").is_file():
             return candidate
-    return DEFAULT_BUNDLE_DIR
+    return candidates[0]
 
 
 def _parse_pipeline_spec(pipeline_spec: str) -> tuple[Path, str]:
@@ -304,33 +406,51 @@ def _parse_pipeline_spec(pipeline_spec: str) -> tuple[Path, str]:
     return Path(pipeline_spec), "app"
 
 
+def _import_pipeline_app(pipeline_spec: str) -> "App":
+    """Import ``path/to/pipeline.py[:app]`` and return its App, loudly.
+
+    The pipeline file is arbitrary user code: any exception it raises is a
+    boundary failure of the calling command (reported as a ``ValueError``
+    naming the file), never a crash.
+    """
+    import importlib.util
+
+    from hflow.app import App
+
+    pipeline_file, app_variable = _parse_pipeline_spec(pipeline_spec)
+    spec = importlib.util.spec_from_file_location("hflow_user_pipeline", pipeline_file)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"cannot import pipeline file {pipeline_file}")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as error:
+        raise ValueError(f"importing {pipeline_file} failed: {error}") from error
+    app = getattr(module, app_variable, None)
+    if not isinstance(app, App):
+        raise ValueError(f"{pipeline_file} has no hflow.App named {app_variable!r}")
+    return app
+
+
+def _command_manifest(arguments: argparse.Namespace) -> int:
+    try:
+        app = _import_pipeline_app(arguments.pipeline)
+    except ValueError as error:
+        print(f"manifest: {error}", file=sys.stderr)
+        return 2
+    sys.stdout.write(app.manifest().to_json())
+    return 0
+
+
 def _command_stale(arguments: argparse.Namespace) -> int:
     schema_version: str | None = None
     if arguments.pipeline is not None:
-        import importlib.util
-
-        from hflow.app import App
         from hflow.format import EPISODE_FORMAT_VERSION
 
-        pipeline_file, app_variable = _parse_pipeline_spec(arguments.pipeline)
-        spec = importlib.util.spec_from_file_location("hflow_user_pipeline", pipeline_file)
-        if spec is None or spec.loader is None:
-            print(f"stale: cannot import pipeline file {pipeline_file}", file=sys.stderr)
-            return 2
-        module = importlib.util.module_from_spec(spec)
         try:
-            # The pipeline file is arbitrary user code: any exception it
-            # raises is a boundary failure of this command, not a crash.
-            spec.loader.exec_module(module)
-        except Exception as error:
-            print(f"stale: importing {pipeline_file} failed: {error}", file=sys.stderr)
-            return 2
-        app = getattr(module, app_variable, None)
-        if not isinstance(app, App):
-            print(
-                f"stale: {pipeline_file} has no hflow.App named {app_variable!r}",
-                file=sys.stderr,
-            )
+            app = _import_pipeline_app(arguments.pipeline)
+        except ValueError as error:
+            print(f"stale: {error}", file=sys.stderr)
             return 2
         pipeline_version = app.pipeline_version
         # A pipeline defines the whole current target, format version included.
@@ -371,8 +491,6 @@ def _command_up(arguments: argparse.Namespace) -> int:
     hflow_source = (
         arguments.hflow_source if arguments.hflow_source is not None else infer_hflow_source()
     )
-    from hflow.storage import is_bucket_url
-
     config = RuntimeConfig(
         pipeline_file=pipeline_file,
         data_root=arguments.data_root,
@@ -383,9 +501,9 @@ def _command_up(arguments: argparse.Namespace) -> int:
     )
     # A bucket data root has no local directory to host the bundle: ./runtime.
     default_bundle_dir = (
-        Path("runtime")
+        Path(RUNTIME_BUNDLE_DIRECTORY_NAME)
         if is_bucket_url(arguments.data_root)
-        else Path(arguments.data_root) / "runtime"
+        else Path(arguments.data_root) / RUNTIME_BUNDLE_DIRECTORY_NAME
     )
     bundle_dir = arguments.bundle_dir if arguments.bundle_dir is not None else default_bundle_dir
     from hflow.runtime import ComposeError
@@ -450,7 +568,11 @@ def _command_deploy(arguments: argparse.Namespace) -> int:
 def _command_down(arguments: argparse.Namespace) -> int:
     from hflow.runtime import compose_down, load_bundle
 
-    paths = load_bundle(_resolve_bundle_dir(arguments.bundle_dir))
+    try:
+        paths = load_bundle(_resolve_bundle_dir(arguments.bundle_dir))
+    except (ValueError, FileNotFoundError) as error:
+        print(f"down: {error}", file=sys.stderr)
+        return 2
     compose_down(paths.compose_file, remove_volumes=arguments.volumes)
     print(
         f"runtime at {paths.bundle_dir} stopped{' (volumes removed)' if arguments.volumes else ''}"
@@ -461,10 +583,15 @@ def _command_down(arguments: argparse.Namespace) -> int:
 def _command_ingest(arguments: argparse.Namespace) -> int:
     from posixpath import normpath
 
-    from hflow.runtime import AirflowClientError, client_for_bundle, load_bundle
+    from hflow.runtime import (
+        AirflowClientError,
+        client_for_bundle,
+        client_for_endpoint,
+        load_bundle,
+    )
 
-    # URIs resolve against /opt/airflow/data INSIDE the container; absolute
-    # host paths and ../ escapes cannot work there, so fail before triggering.
+    # URIs resolve against the runtime's data root; absolute host paths and
+    # ../ escapes cannot work there, so fail before triggering.
     for uri in arguments.uris:
         if uri.startswith("/") or normpath(uri).startswith(".."):
             print(
@@ -475,10 +602,27 @@ def _command_ingest(arguments: argparse.Namespace) -> int:
             )
             return 2
 
-    paths = load_bundle(_resolve_bundle_dir(arguments.bundle_dir))
     try:
-        dag_run = client_for_bundle(paths).ingest(
-            paths.dag_id,
+        endpoint = _remote_endpoint_for_command(arguments)
+    except ValueError as error:
+        print(f"ingest: {error}", file=sys.stderr)
+        return 2
+    if endpoint is not None:
+        client = client_for_endpoint(endpoint)
+        dag_id = endpoint.dag_id
+        watch_location = endpoint.base_url
+    else:
+        try:
+            paths = load_bundle(_resolve_bundle_dir(arguments.bundle_dir))
+        except (ValueError, FileNotFoundError) as error:
+            print(f"ingest: {error}", file=sys.stderr)
+            return 2
+        client = client_for_bundle(paths)
+        dag_id = paths.dag_id
+        watch_location = paths.api_base_url
+    try:
+        dag_run = client.ingest(
+            dag_id,
             list(arguments.uris),
             profile=arguments.profile,
             online=arguments.online,
@@ -486,25 +630,45 @@ def _command_ingest(arguments: argparse.Namespace) -> int:
     except AirflowClientError as error:
         print(f"ingest: {error}", file=sys.stderr)
         if error.status == 404:
-            print(
-                "hint: the ingest DAG may still be parsing -- retry in a few "
-                "seconds, or check `docker compose logs airflow-dag-processor`",
-                file=sys.stderr,
-            )
+            if endpoint is None:
+                print(
+                    "hint: the ingest DAG may still be parsing -- retry in a few "
+                    "seconds, or check `docker compose logs airflow-dag-processor`",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"hint: no DAG {dag_id!r} at {endpoint.base_url} -- verify --dag-id / "
+                    "HFLOW_AIRFLOW_DAG_ID, or retry in a few seconds if the pipeline "
+                    "was just deployed",
+                    file=sys.stderr,
+                )
         return 1
     run_id = dag_run.get("dag_run_id", "<unknown>")
     lane = "online" if arguments.online else "batch"
     print(
-        f"triggered {paths.dag_id} run {run_id} over {len(arguments.uris)} episode(s) "
-        f"(profile {arguments.profile}, {lane} lane); watch it at {paths.api_base_url}"
+        f"triggered {dag_id} run {run_id} over {len(arguments.uris)} episode(s) "
+        f"(profile {arguments.profile}, {lane} lane); watch it at {watch_location}"
     )
     return 0
 
 
 def _command_status(arguments: argparse.Namespace) -> int:
-    from hflow.runtime import describe_runtime_status, load_bundle
+    from hflow.runtime import describe_remote_status, describe_runtime_status, load_bundle
 
-    paths = load_bundle(_resolve_bundle_dir(arguments.bundle_dir))
+    try:
+        endpoint = _remote_endpoint_for_command(arguments)
+    except ValueError as error:
+        print(f"status: {error}", file=sys.stderr)
+        return 2
+    if endpoint is not None:
+        print(describe_remote_status(endpoint))
+        return 0
+    try:
+        paths = load_bundle(_resolve_bundle_dir(arguments.bundle_dir))
+    except (ValueError, FileNotFoundError) as error:
+        print(f"status: {error}", file=sys.stderr)
+        return 2
     print(describe_runtime_status(paths))
     return 0
 
@@ -552,6 +716,8 @@ def main(argv: list[str] | None = None) -> int:
         return _command_stale(arguments)
     if arguments.command == "doctor":
         return _command_doctor(arguments)
+    if arguments.command == "manifest":
+        return _command_manifest(arguments)
     if arguments.command == "up":
         return _command_up(arguments)
     if arguments.command == "deploy":

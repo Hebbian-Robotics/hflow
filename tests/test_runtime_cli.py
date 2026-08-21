@@ -14,7 +14,7 @@ import pytest
 import hflow
 from hflow.cli import _parse_pipeline_spec, main
 from hflow.runtime import AirflowHealth, RuntimeConfig, render_bundle
-from hflow.runtime._client import AirflowClient, AirflowClientError
+from hflow.runtime._client import AirflowClient, AirflowClientError, PasswordCredentials
 
 HEALTHY = AirflowHealth(
     components={
@@ -103,7 +103,7 @@ def test_up_renders_starts_and_prints(
     # The master DAG triggers the sub-DAGs; the sub-DAGs load the user's app.
     assert "TriggerDagRunOperator" in (bundle_dir / "dags" / "ingest.py").read_text()
     dag_source = (bundle_dir / "dags" / "ingest_sync.py").read_text()
-    assert 'getattr(pipeline_module, "my_app")' in dag_source
+    assert 'load_pipeline_application(pipeline_path, "my_app")' in dag_source
     assert compose_calls == [
         [str(bundle_dir / "docker-compose.yaml"), "up", "--detach"],
     ]
@@ -363,7 +363,9 @@ def test_ingest_uses_env_credentials_and_dag_id(
         online: bool = False,
         dag_run_id: str | None = None,
     ) -> dict[str, str]:
-        captured["credentials"] = (self._username, self._password)
+        client_auth = self._auth
+        assert isinstance(client_auth, PasswordCredentials)
+        captured["credentials"] = (client_auth.username, client_auth.password)
         captured["dag_id"] = dag_id
         captured["uris"] = uris
         captured["profile"] = profile
@@ -382,6 +384,131 @@ def test_ingest_uses_env_credentials_and_dag_id(
     output = capsys.readouterr().out
     assert "manual__test" in output
     assert "profile full, batch lane" in output
+
+
+def test_ingest_targets_a_remote_endpoint_without_any_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The hosted addressing path: --airflow-url + --dag-id + an environment
+    credential drive a remote workspace with no local bundle directory at
+    all. Credentials never travel via argv."""
+    from hflow.runtime import BearerToken
+
+    captured: dict[str, object] = {}
+
+    def fake_ingest(
+        self: AirflowClient,
+        dag_id: str,
+        uris: list[str],
+        *,
+        profile: str = "full",
+        online: bool = False,
+        dag_run_id: str | None = None,
+    ) -> dict[str, str]:
+        captured["base_url"] = self.base_url
+        captured["auth"] = self._auth
+        captured["dag_id"] = dag_id
+        captured["uris"] = uris
+        return {"dag_run_id": "manual__remote"}
+
+    monkeypatch.setattr(AirflowClient, "ingest", fake_ingest)
+    monkeypatch.setenv("HFLOW_AIRFLOW_TOKEN", "minted-token")
+    exit_code = main(
+        [
+            "ingest",
+            "episodes-in/a.mcap",
+            "--airflow-url",
+            "https://workspace.example.com",
+            "--dag-id",
+            "kitchen_ingest",
+        ]
+    )
+    assert exit_code == 0
+    assert captured["base_url"] == "https://workspace.example.com"
+    assert captured["auth"] == BearerToken("minted-token")
+    assert captured["dag_id"] == "kitchen_ingest"
+    assert captured["uris"] == ["episodes-in/a.mcap"]
+    output = capsys.readouterr().out
+    assert "manual__remote" in output
+    assert "watch it at https://workspace.example.com" in output
+
+
+def test_ingest_remote_without_credentials_names_the_environment_fix(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    for variable in ("HFLOW_AIRFLOW_TOKEN", "HFLOW_AIRFLOW_USERNAME", "HFLOW_AIRFLOW_PASSWORD"):
+        monkeypatch.delenv(variable, raising=False)
+    exit_code = main(
+        [
+            "ingest",
+            "a.mcap",
+            "--airflow-url",
+            "https://workspace.example.com",
+            "--dag-id",
+            "kitchen_ingest",
+        ]
+    )
+    assert exit_code == 2
+    assert "HFLOW_AIRFLOW_TOKEN" in capsys.readouterr().err
+
+
+def test_explicit_bundle_dir_stays_local_even_with_remote_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    pipeline_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An exported HFLOW_AIRFLOW_URL must not hijack a command whose user
+    explicitly addressed a local bundle."""
+    bundle_dir = _rendered_bundle(tmp_path, pipeline_file)
+    monkeypatch.setenv("HFLOW_AIRFLOW_URL", "https://workspace.example.com")
+    captured: dict[str, object] = {}
+
+    def fake_ingest(
+        self: AirflowClient,
+        dag_id: str,
+        uris: list[str],
+        *,
+        profile: str = "full",
+        online: bool = False,
+        dag_run_id: str | None = None,
+    ) -> dict[str, str]:
+        captured["base_url"] = self.base_url
+        return {"dag_run_id": "manual__local"}
+
+    monkeypatch.setattr(AirflowClient, "ingest", fake_ingest)
+    assert main(["ingest", "a.mcap", "--bundle-dir", str(bundle_dir)]) == 0
+    assert str(captured["base_url"]).startswith("http://127.0.0.1")
+    assert "manual__local" in capsys.readouterr().out
+
+
+def test_status_remote_reports_health_and_runs_without_a_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Remote status needs no local bundle: environment addressing drives the
+    REST-only path, and the output carries the endpoint, health, and runs."""
+    healthy = AirflowHealth(
+        components={"metadatabase": "healthy", "scheduler": "healthy", "dag_processor": "healthy"}
+    )
+    monkeypatch.setattr(AirflowClient, "health", lambda self: healthy)
+    monkeypatch.setattr(AirflowClient, "dag", lambda self, dag_id: {"dag_id": dag_id})
+    monkeypatch.setattr(
+        AirflowClient,
+        "dag_runs",
+        lambda self, dag_id, **_kwargs: [{"dag_run_id": "manual__1", "state": "success"}],
+    )
+    monkeypatch.setenv("HFLOW_AIRFLOW_URL", "https://workspace.example.com")
+    monkeypatch.setenv("HFLOW_AIRFLOW_DAG_ID", "kitchen_ingest")
+    monkeypatch.setenv("HFLOW_AIRFLOW_TOKEN", "minted-token")
+    assert main(["status"]) == 0
+    output = capsys.readouterr().out
+    assert "endpoint: https://workspace.example.com" in output
+    assert "kitchen_ingest" in output
+    assert "healthy" in output
+    assert "manual__1 [success]" in output
 
 
 def test_ingest_plumbs_profile_and_online_into_conf(
@@ -527,7 +654,10 @@ def test_app_run_resolves_main_module_and_variable(
     assert paths.bundle_dir == tmp_path / "data" / "runtime"
     # The app variable lands in the sub-DAGs (the master never loads the app).
     for sub_dag_file in paths.sub_dag_files:
-        assert 'getattr(pipeline_module, "my_pipeline_app")' in sub_dag_file.read_text()
+        assert (
+            'load_pipeline_application(pipeline_path, "my_pipeline_app")'
+            in sub_dag_file.read_text()
+        )
     assert compose_calls == [[str(paths.compose_file), "up", "--detach"]]
 
 

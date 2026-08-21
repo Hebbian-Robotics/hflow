@@ -227,7 +227,7 @@ The pinned ffmpeg build is treated as a measuring instrument: a static build is 
 
 ## Tenancy
 
-The open-source deployment is **single-tenant everything**: one workspace, no user management, no RBAC, which is the norm across comparable OSS infrastructure (Airbyte, Dagster, Prefect, Temporal, Langfuse). A future hosted offering would be a multi-tenant *control plane* over per-customer or customer-run data planes (the Dagster+/Prefect hybrid pattern): raw sensor data never transits the vendor, and the OSS single-tenant engine is the hosted data-plane unit. The design consequence taken now, because it cannot be cheaply retrofitted: only metadata, states, and pointers cross the control boundary, never episode bytes.
+The open-source deployment is **single-tenant everything**: one workspace, no user management, no RBAC, which is the norm across comparable OSS infrastructure (Airbyte, Dagster, Prefect, Temporal, Langfuse). A future hosted offering would be a multi-tenant *control plane* over per-customer or customer-run data planes (the Dagster+/Prefect hybrid pattern): raw sensor data never transits the vendor, and the OSS single-tenant engine is the hosted data-plane unit. The design consequence taken now, because it cannot be cheaply retrofitted: only metadata, states, and pointers cross the control boundary, never episode bytes. [HOSTING.md](./HOSTING.md) names that boundary concretely -- the workspace unit and its identity, the manifest artifacts a service exchanges, remote runtime addressing, the environment injection contract, the trust model, and the current limits.
 
 ## The scale path
 

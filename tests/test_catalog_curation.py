@@ -437,6 +437,88 @@ def test_cli_stale_exit_code_returns_zero_when_nothing_is_behind(
     assert capsys.readouterr().out == ""
 
 
+def test_constrained_connection_confines_sql_to_the_catalog(tmp_path: Path) -> None:
+    """The service posture for tenant-supplied SQL: catalog views stay
+    queryable, but file access outside the catalog and configuration changes
+    are refused -- arbitrary SQL must not become arbitrary file access on a
+    shared host.
+    """
+    catalog = Catalog(tmp_path / "catalog")
+    catalog.append_episode(
+        canonical_path=_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={"task": "fold_napkin"},
+        check_rows=[_check_row()],
+    )
+
+    connection = open_catalog_connection(tmp_path / "catalog", constrained=True)
+    try:
+        assert connection.execute("SELECT count(*) FROM episodes").fetchone() == (1,)
+        assert connection.execute("SELECT example_metric FROM episodes").fetchone() == (1.0,)
+        with pytest.raises(duckdb.Error, match=r"allowed_directories|[Pp]ermission"):
+            connection.execute("SELECT * FROM read_csv('/etc/hosts')")
+        with pytest.raises(duckdb.Error, match=r"lock|configuration"):
+            connection.execute("SET enable_external_access = true")
+        # The catalog itself must stay unwritable: DuckDB's directory
+        # allowlist permits writes, so the catalog root is never on it --
+        # tenant SQL cannot forge rows or clobber committed files.
+        forged_row_file = tmp_path / "catalog" / "episodes" / "forged.parquet"
+        with pytest.raises(duckdb.Error, match=r"allowed_directories|[Pp]ermission"):
+            connection.execute(f"COPY (SELECT 1 AS x) TO '{forged_row_file}' (FORMAT PARQUET)")
+        assert not forged_row_file.exists()
+        # ...and it cannot READ the catalog's raw files either; the data
+        # arrives through the materialized tables alone.
+        episodes_glob = tmp_path / "catalog" / "episodes" / "*.parquet"
+        with pytest.raises(duckdb.Error, match=r"allowed_directories|[Pp]ermission"):
+            connection.execute(f"SELECT * FROM read_parquet('{episodes_glob}')")
+    finally:
+        connection.close()
+
+
+def test_constrained_curate_writes_the_manifest_but_refuses_outside_reads(
+    tmp_path: Path,
+) -> None:
+    catalog_dir = tmp_path / "catalog"
+    catalog = Catalog(catalog_dir)
+    catalog.append_episode(
+        canonical_path=_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[_check_row()],
+    )
+    manifest_path = tmp_path / "out" / "manifest.parquet"
+
+    report = curate(
+        catalog_dir,
+        "SELECT episode_id, uri FROM episodes",
+        output=manifest_path,
+        constrained=True,
+    )
+    assert report.row_count == 1
+    assert manifest_path.is_file()
+
+    with pytest.raises(duckdb.Error, match=r"allowed_directories|[Pp]ermission"):
+        curate(
+            catalog_dir,
+            "SELECT * FROM read_csv('/etc/hosts')",
+            output=tmp_path / "out" / "evil.parquet",
+            constrained=True,
+        )
+
+    # The output's parent directory is NOT on the allowlist (only a private
+    # staging subdirectory is), so tenant SQL cannot read what happens to
+    # live beside its own manifest.
+    sibling_secret = tmp_path / "out" / "sibling-secret.csv"
+    sibling_secret.write_text("secret\n")
+    with pytest.raises(duckdb.Error, match=r"allowed_directories|[Pp]ermission"):
+        curate(
+            catalog_dir,
+            f"SELECT * FROM read_csv('{sibling_secret}')",
+            output=tmp_path / "out" / "second.parquet",
+            constrained=True,
+        )
+
+
 def test_append_accepts_non_json_measurement_scalars(tmp_path: Path) -> None:
     """numpy scalars are user data: they must fingerprint, not crash the append."""
     import numpy as np
@@ -529,6 +611,107 @@ def test_crash_repaired_append_keeps_one_recorded_at_across_tables(tmp_path: Pat
         assert len(timestamps) == 1, f"mixed recorded_at across tables: {timestamps}"
     finally:
         connection.close()
+
+
+def test_replaying_an_append_heals_dependents_left_stale_by_a_crashed_repair(
+    tmp_path: Path,
+) -> None:
+    """#51's residual window: a winner that created the episodes file but
+    crashed before force-aligning the dependents leaves them carrying a stale
+    recorded_at. A later replay of the same outcome (the normal retry lane)
+    must reconcile every dependent to the episodes file's recorded_at instead
+    of early-returning past the damage forever.
+    """
+    import duckdb
+
+    canonical = _fake_canonical(tmp_path)
+    catalog = Catalog(tmp_path / "catalog")
+    row = _check_row()
+
+    def append_same_outcome() -> "hflow.catalog.AppendResult":
+        return catalog.append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[row],
+        )
+
+    first = append_same_outcome()
+    stem = f"{first.episode_id}-{first.run_fingerprint}"
+
+    # Simulate the crash debris: two dependents still carry an earlier
+    # attempt's recorded_at (one hour older), exactly what a repair pass that
+    # died mid-publish leaves behind.
+    connection = duckdb.connect()
+    try:
+        for table_name in ("check_runs", "tags"):
+            table_file = tmp_path / "catalog" / table_name / f"{stem}.parquet"
+            stale_copy = tmp_path / f"stale-{table_name}.parquet"
+            connection.execute(
+                f"COPY (SELECT * REPLACE (recorded_at - INTERVAL 1 HOUR AS recorded_at) "
+                f"FROM read_parquet('{table_file}')) TO '{stale_copy}' (FORMAT PARQUET)"
+            )
+            table_file.write_bytes(stale_copy.read_bytes())
+    finally:
+        connection.close()
+
+    # The replay happens in a fresh worker process in reality; the crashed
+    # repairer's process-local memo of "already aligned" does not carry over.
+    hflow.catalog._reconciled_append_stems.clear()
+
+    replay = append_same_outcome()
+    assert replay.written is False
+    assert replay.run_fingerprint == first.run_fingerprint
+
+    connection = duckdb.connect()
+    try:
+        timestamps = set()
+        for table_name in ("episodes", "check_runs", "measurements", "tags", "intervals"):
+            table_file = tmp_path / "catalog" / table_name / f"{stem}.parquet"
+            rows = connection.execute(
+                f"SELECT DISTINCT CAST(recorded_at AS VARCHAR) FROM read_parquet('{table_file}')"
+            ).fetchall()
+            timestamps.update(value for (value,) in rows)
+        assert len(timestamps) == 1, f"replay left mixed recorded_at across tables: {timestamps}"
+    finally:
+        connection.close()
+
+
+def test_replaying_an_append_refuses_a_corrupt_empty_commit_marker(tmp_path: Path) -> None:
+    """append_episode always inserts exactly one episodes row, so a zero-row
+    episodes file is corruption -- a replay must refuse loudly instead of
+    silently skipping reconciliation against it."""
+    import duckdb
+
+    canonical = _fake_canonical(tmp_path)
+    catalog = Catalog(tmp_path / "catalog")
+    row = _check_row()
+
+    def append_same_outcome() -> "hflow.catalog.AppendResult":
+        return catalog.append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[row],
+        )
+
+    first = append_same_outcome()
+    stem = f"{first.episode_id}-{first.run_fingerprint}"
+    episodes_file = tmp_path / "catalog" / "episodes" / f"{stem}.parquet"
+    connection = duckdb.connect()
+    try:
+        empty_copy = tmp_path / "empty-episodes.parquet"
+        connection.execute(
+            f"COPY (SELECT * FROM read_parquet('{episodes_file}') WHERE false) "
+            f"TO '{empty_copy}' (FORMAT PARQUET)"
+        )
+        episodes_file.write_bytes(empty_copy.read_bytes())
+    finally:
+        connection.close()
+    hflow.catalog._reconciled_append_stems.clear()  # a replay is a fresh process
+
+    with pytest.raises(ValueError, match="holds no rows"):
+        append_same_outcome()
 
 
 def test_concurrent_append_of_the_identical_outcome_keeps_one_recorded_at(
