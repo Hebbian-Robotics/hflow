@@ -92,8 +92,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_AIRFLOW_IMAGE = "apache/airflow:3.3.1"
 DEFAULT_POSTGRES_IMAGE = "postgres:16"
-# TCP port range, less port 0, which is "any free port" to bind(2) and not
-# something a published Compose port can be.
+# TCP port range. 0 is excluded on purpose: it means "any free port" to bind(2),
+# but this value is also interpolated into api_base_url, which the health wait
+# dials and started_summary prints, and http://127.0.0.1:0 is not dialable.
 MIN_PORT = 1
 MAX_PORT = 65535
 
