@@ -362,7 +362,10 @@ def test_step_version_still_refuses_a_partial_bound_to_an_opaque_value() -> None
     class OpaqueClient:
         pass
 
-    bound = functools.partial(hflow.checks.action_rate, topics=OpaqueClient())
+    def scored_by_client(episode: hflow.Episode, *, client: object) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"ok": client is not None})
+
+    bound = functools.partial(scored_by_client, client=OpaqueClient())
     with pytest.raises(ValueError, match="cannot derive a stable version identity"):
         compute_check_version("opaque", bound, False, frozenset(), None)
 
