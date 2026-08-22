@@ -1,7 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { CheckIcon, ChevronDownIcon, CopyIcon } from "../icons";
-
-type CopyState = "idle" | "copied" | "failed";
+import { useCopyToClipboard } from "../useCopyToClipboard";
 
 /**
  * The compiled-query readout: the server returns the exact SELECT it ran for
@@ -15,28 +14,11 @@ export function SqlFooter({
   emptyMessage?: string;
 }) {
   const [isExpanded, setIsExpanded] = useState(false);
-  const [copyState, setCopyState] = useState<CopyState>("idle");
-  const resetTimerRef = useRef<number | null>(null);
+  const { copyState, copyText } = useCopyToClipboard();
 
-  useEffect(() => {
-    return () => {
-      if (resetTimerRef.current !== null) window.clearTimeout(resetTimerRef.current);
-    };
-  }, []);
-
-  async function copySql() {
-    if (!sql) return;
-    let nextState: CopyState;
-    try {
-      await navigator.clipboard.writeText(sql);
-      nextState = "copied";
-    } catch {
-      nextState = "failed";
-    }
-    setCopyState(nextState);
-    if (resetTimerRef.current !== null) window.clearTimeout(resetTimerRef.current);
-    resetTimerRef.current = window.setTimeout(() => setCopyState("idle"), 1600);
-  }
+  const copySql = () => {
+    if (sql) void copyText(sql);
+  };
 
   const copyLabel =
     copyState === "copied" ? "Copied" : copyState === "failed" ? "Copy failed" : "Copy";

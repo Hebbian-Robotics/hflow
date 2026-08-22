@@ -6,7 +6,6 @@ import {
   fetchRuntimeStatus,
   fetchWorkspaceConfig,
   INGEST_MODES,
-  type IngestMode,
   RUN_PROFILE_NAMES,
   type RuntimeHealth,
   type RuntimeRun,
@@ -14,6 +13,7 @@ import {
   STAGE_ORDER,
   type StageRecentRuns,
   triggerIngest,
+  type WorkspaceConfig,
 } from "../api";
 import { EmptyPanel, ErrorPanel, LoadingPanel } from "../components/QueryStates";
 import { formatDurationBetween, formatTimestamp } from "../format";
@@ -240,9 +240,14 @@ function StageRunsStrip({
   stages: StageRecentRuns[];
   airflowWebUrl: string | null;
 }) {
-  // Render in the canonical stage order; unknown extras (forward compat) go last.
+  // Render in the canonical stage order; unknown extras (forward compat) go
+  // last — indexOf answers -1 for them, which would sort them FIRST.
+  const stageRank = (stage: string): number => {
+    const knownIndex = STAGE_ORDER.indexOf(stage);
+    return knownIndex === -1 ? STAGE_ORDER.length : knownIndex;
+  };
   const orderedStages = [...stages].sort(
-    (left, right) => STAGE_ORDER.indexOf(left.stage) - STAGE_ORDER.indexOf(right.stage),
+    (left, right) => stageRank(left.stage) - stageRank(right.stage),
   );
   return (
     <section className="section">
@@ -302,12 +307,20 @@ function StageRunsStrip({
   );
 }
 
-function TriggerIngestForm() {
+function TriggerIngestForm({ config }: { config: WorkspaceConfig | undefined }) {
   const queryClient = useQueryClient();
   const [urisText, setUrisText] = useState("");
-  const [profile, setProfile] = useState<string>("full");
-  const [mode, setMode] = useState<IngestMode>("batch");
+  const [profileChoice, setProfileChoice] = useState<string | null>(null);
+  const [modeChoice, setModeChoice] = useState<string | null>(null);
   const [batchCountText, setBatchCountText] = useState("");
+
+  // The selects offer the LIVE vocabularies /api/v1/config serves (hflow.steps
+  // stays the one owner); the constants are only the fallback for servers that
+  // predate those config fields. Until the user picks, the first option holds.
+  const profileNames = config?.run_profiles ?? RUN_PROFILE_NAMES;
+  const ingestModes = config?.ingest_modes ?? INGEST_MODES;
+  const profile = profileChoice ?? profileNames[0] ?? "full";
+  const mode = modeChoice ?? ingestModes[0] ?? "batch";
 
   const ingestMutation = useMutation({
     mutationFn: triggerIngest,
@@ -353,9 +366,9 @@ function TriggerIngestForm() {
             <select
               className="input"
               value={profile}
-              onChange={(event) => setProfile(event.target.value)}
+              onChange={(event) => setProfileChoice(event.target.value)}
             >
-              {RUN_PROFILE_NAMES.map((profileName) => (
+              {profileNames.map((profileName) => (
                 <option key={profileName} value={profileName}>
                   {profileName}
                 </option>
@@ -367,9 +380,9 @@ function TriggerIngestForm() {
             <select
               className="input"
               value={mode}
-              onChange={(event) => setMode(event.target.value === "online" ? "online" : "batch")}
+              onChange={(event) => setModeChoice(event.target.value)}
             >
-              {INGEST_MODES.map((modeName) => (
+              {ingestModes.map((modeName) => (
                 <option key={modeName} value={modeName}>
                   {modeName}
                 </option>
@@ -494,7 +507,7 @@ export function RunsPage() {
         <>
           <StatusTiles status={runtimeStatus} />
 
-          {readOnly ? null : <TriggerIngestForm />}
+          {readOnly ? null : <TriggerIngestForm config={configQuery.data} />}
 
           <section className="section">
             <h2 className="section-title">Master runs</h2>

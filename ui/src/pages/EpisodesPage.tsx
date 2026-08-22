@@ -8,7 +8,7 @@ import {
   useReactTable,
 } from "@tanstack/react-table";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import {
   DEFAULT_ORDER_BY,
   type EpisodeColumnStats,
@@ -210,6 +210,15 @@ export function EpisodesPage() {
   const episodesData = episodesQuery.data;
   const rows = useMemo(() => episodesData?.rows ?? [], [episodesData]);
 
+  // Detail-route navigation carries the list URL's search string, so the
+  // detail page's back link can restore the exact filters/sort/page. A landing
+  // ?token= is deliberately NOT carried into more history entries.
+  const listSearch = useMemo(() => {
+    const carried = new URLSearchParams(searchParams);
+    carried.delete("token");
+    return carried.toString();
+  }, [searchParams]);
+
   // Columns come from the server's DESCRIBE of the wide view, so the table
   // renders whatever the catalog holds without a hardcoded schema.
   const tableColumns = useMemo<ColumnDef<EpisodeRow, unknown>[]>(() => {
@@ -221,9 +230,25 @@ export function EpisodesPage() {
           {column.name}
         </span>
       ),
-      cell: (cellContext) => <ValueCell columnName={column.name} value={cellContext.getValue()} />,
+      cell: (cellContext) => {
+        const cellValue = cellContext.getValue();
+        // The id cell is a REAL link (middle-click, copy address, screen-reader
+        // announcement); the row's click/key handlers stay as conveniences.
+        if (column.name === "episode_id" && typeof cellValue === "string") {
+          return (
+            <Link
+              className="episode-id-link cell-mono"
+              to={{ pathname: `/episodes/${encodeURIComponent(cellValue)}`, search: listSearch }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              {cellValue}
+            </Link>
+          );
+        }
+        return <ValueCell columnName={column.name} value={cellValue} />;
+      },
     }));
-  }, [episodesData]);
+  }, [episodesData, listSearch]);
 
   const table = useReactTable({
     data: rows,
@@ -261,7 +286,7 @@ export function EpisodesPage() {
   const openEpisode = (row: EpisodeRow) => {
     const episodeId = row.episode_id;
     if (typeof episodeId !== "string") return;
-    navigate(`/episodes/${encodeURIComponent(episodeId)}`);
+    navigate({ pathname: `/episodes/${encodeURIComponent(episodeId)}`, search: listSearch });
   };
 
   const hasActiveFilters =
@@ -273,7 +298,13 @@ export function EpisodesPage() {
     query.search !== "";
 
   const clearFilters = () => {
-    setSearchParams(new URLSearchParams(), { replace: true });
+    // Only the FILTER params — sort and rows-per-page are not filters, so a
+    // "Clear filters" click must leave them alone (offset resets via updateFilters).
+    updateFilters((params) => {
+      for (const filterKey of ["task", "operator", "embodiment", "status", "success", "search"]) {
+        params.delete(filterKey);
+      }
+    });
   };
 
   const pageSizeChoices = PAGE_SIZE_CHOICES.includes(query.limit)
@@ -428,13 +459,20 @@ export function EpisodesPage() {
                 </thead>
                 <tbody>
                   {table.getRowModel().rows.map((tableRow) => (
+                    // biome-ignore lint/a11y/useSemanticElements: a table row cannot become an <a>; the id cell carries the real <Link>, and role="link" tells assistive tech the focusable row itself activates too.
                     <tr
                       key={tableRow.id}
                       className="episode-row"
                       tabIndex={0}
+                      role="link"
+                      aria-label={`Open episode ${String(tableRow.original.episode_id ?? "")}`}
                       onClick={() => openEpisode(tableRow.original)}
                       onKeyDown={(event) => {
-                        if (event.key === "Enter") openEpisode(tableRow.original);
+                        // The episode_id link handles its own keys when focused.
+                        if (event.target !== event.currentTarget) return;
+                        if (event.key !== "Enter" && event.key !== " ") return;
+                        event.preventDefault(); // Space activates; it must not scroll.
+                        openEpisode(tableRow.original);
                       }}
                     >
                       {tableRow.getVisibleCells().map((cell) => (

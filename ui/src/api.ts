@@ -30,6 +30,11 @@ export interface WorkspaceConfig {
   data_root: string;
   workspace_id: string | null;
   capabilities: WorkspaceCapabilities;
+  /** Live run-profile names from hflow.steps.RUN_PROFILES — served so the
+   * frontend never hardcodes them. Absent only on servers that predate M2. */
+  run_profiles?: string[];
+  /** Live ingest modes from hflow.steps.IngestMode; same contract as run_profiles. */
+  ingest_modes?: string[];
 }
 
 export interface EpisodeColumn {
@@ -85,7 +90,9 @@ export interface EpisodeInterval {
   start_ns: number;
   end_ns: number;
   check_name: string;
-  check_version: string;
+  /** Joined from check_runs (LEFT JOIN — the intervals table carries no
+   * version), so it is null when no matching check_runs row exists. */
+  check_version: string | null;
 }
 
 export interface EpisodeTagRecord {
@@ -135,9 +142,13 @@ export const MAX_PAGE_SIZE = 500;
 export const DEFAULT_ORDER_BY = "recorded_at";
 
 // --- session token -----------------------------------------------------------
-// `hflow ui` prints a tokened URL; the server also sets a cookie on first use.
-// We keep the token from the landing URL so API calls work even before the
-// cookie exists (e.g. behind the Vite dev proxy) and across client-side routes.
+// `hflow ui` prints a tokened URL; the server sets an HttpOnly session cookie
+// on that first navigation (newer servers redirect it to strip the token from
+// the address bar). We keep any token we saw in the landing URL so API calls
+// still work where the cookie never got set (e.g. behind the Vite dev proxy):
+// XHR always sends it as `Authorization: Bearer`, and media/download URLs fall
+// back to a `?token=` query param ONLY when the cookie is known not to work —
+// never by default, so the credential stays out of access logs and history.
 
 const SESSION_TOKEN_STORAGE_KEY = "hflow-ui-session-token";
 
@@ -161,9 +172,53 @@ function readSessionToken(): string | null {
 
 const sessionToken = readSessionToken();
 
-/** Append the session token to a same-origin API URL (media, canonical download). */
+// The session cookie is HttpOnly, so the only way to learn whether it
+// authenticates this browser is to ask the server once and cache the answer.
+const COOKIE_AUTH_STORAGE_KEY = "hflow-ui-cookie-auth";
+
+type CookieAuthAnswer = "yes" | "no" | null;
+
+function readCachedCookieAuthAnswer(): CookieAuthAnswer {
+  try {
+    const cachedAnswer = sessionStorage.getItem(COOKIE_AUTH_STORAGE_KEY);
+    return cachedAnswer === "yes" || cachedAnswer === "no" ? cachedAnswer : null;
+  } catch {
+    return null;
+  }
+}
+
+let cookieAuthAnswer: CookieAuthAnswer = readCachedCookieAuthAnswer();
+
+/**
+ * Probe (once per session, before first render) whether the server's session
+ * cookie authenticates this browser: one credential-free GET /api/v1/config.
+ * 2xx means the cookie (or a token-less server) covers <img>/<a> URLs; a
+ * failure status means media URLs need the ?token= fallback.
+ */
+export async function detectCookieAuth(): Promise<void> {
+  if (!sessionToken || cookieAuthAnswer !== null) return;
+  let probeResponse: Response;
+  try {
+    probeResponse = await fetch("/api/v1/config", { headers: { Accept: "application/json" } });
+  } catch {
+    return; // Server unreachable — stay undecided and probe again next load.
+  }
+  cookieAuthAnswer = probeResponse.ok ? "yes" : "no";
+  try {
+    sessionStorage.setItem(COOKIE_AUTH_STORAGE_KEY, cookieAuthAnswer);
+  } catch {
+    // Storage unavailable: the in-memory answer still covers this page.
+  }
+}
+
+/**
+ * Prepare a same-origin URL the browser fetches outside XHR (<img src>,
+ * <a download>): the session cookie authenticates those by default, so the
+ * token rides the query string only as the fallback for sessions where the
+ * cookie is known not to work (detectCookieAuth answered "no").
+ */
 export function withSessionToken(url: string): string {
-  if (!sessionToken) return url;
+  if (!sessionToken || cookieAuthAnswer !== "no") return url;
   const separator = url.includes("?") ? "&" : "?";
   return `${url}${separator}token=${encodeURIComponent(sessionToken)}`;
 }
@@ -177,14 +232,17 @@ async function requestJson<ResponseBody>(
   method: HttpMethod,
   requestBody?: unknown,
 ): Promise<ResponseBody> {
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (requestBody !== undefined) headers["Content-Type"] = "application/json";
+  // XHR authenticates with the Bearer header (the session cookie also rides
+  // along); the token never travels in the query string, where it would land
+  // in access logs — and newer servers refuse query tokens on XHR anyway.
+  if (sessionToken) headers.Authorization = `Bearer ${sessionToken}`;
   let response: Response;
   try {
-    response = await fetch(withSessionToken(path), {
+    response = await fetch(path, {
       method,
-      headers:
-        requestBody === undefined
-          ? { Accept: "application/json" }
-          : { Accept: "application/json", "Content-Type": "application/json" },
+      headers,
       body: requestBody === undefined ? undefined : JSON.stringify(requestBody),
     });
   } catch (networkError) {
@@ -454,9 +512,9 @@ export interface RuntimeRun {
   conf: Record<string, unknown>;
 }
 
-export type StageName = "sync" | "meta" | "labels" | "media";
-
-export const STAGE_ORDER: readonly StageName[] = ["sync", "meta", "labels", "media"];
+/** Canonical hflow.steps.Stage order, for display sorting only — the server
+ * may emit stage names this build does not know (forward compat). */
+export const STAGE_ORDER: readonly string[] = ["sync", "meta", "labels", "media"];
 
 export interface StageRun {
   dag_run_id: string;
@@ -466,7 +524,8 @@ export interface StageRun {
 }
 
 export interface StageRecentRuns {
-  stage: StageName;
+  /** A hflow.steps.Stage value; unknown names can appear under version skew. */
+  stage: string;
   dag_id: string;
   recent: StageRun[];
 }
@@ -477,17 +536,19 @@ export interface RuntimeRunsResponse {
   stages: StageRecentRuns[] | null;
 }
 
-/** Mirrors hflow.steps.RUN_PROFILES — the server validates against the live set. */
-export const RUN_PROFILE_NAMES = ["full", "metadata_backfill", "relabel"] as const;
+/** Offline fallback for config.run_profiles when the server predates that
+ * field — the live vocabulary is served by /api/v1/config (hflow.steps.RUN_PROFILES
+ * stays the one owner) and the server validates against it either way. */
+export const RUN_PROFILE_NAMES: readonly string[] = ["full", "metadata_backfill", "relabel"];
 
-export type IngestMode = "batch" | "online";
-
-export const INGEST_MODES: readonly IngestMode[] = ["batch", "online"];
+/** Offline fallback for config.ingest_modes; same contract as RUN_PROFILE_NAMES. */
+export const INGEST_MODES: readonly string[] = ["batch", "online"];
 
 export interface IngestRequest {
   uris: string[];
   profile: string;
-  mode: IngestMode;
+  /** A hflow.steps.IngestMode value; the server validates against the live set. */
+  mode: string;
   batch_count?: number;
 }
 
@@ -553,8 +614,20 @@ export interface StaleSummary {
   count: number;
 }
 
+/** One ingest-stage lane as the server groups it: the REAL stage semantics
+ * from hflow.steps/App.process, in stage-graph order. */
+export interface PipelineStageLane {
+  stage: string;
+  /** True for lanes whose work is engine builtins (sync, media) rather than
+   * user-registered steps. */
+  engine_owned: boolean;
+  steps: PipelineStepManifest[];
+}
+
 export interface PipelineResponse {
   manifest: PipelineManifest;
+  /** Manifest steps grouped into stage lanes — the one owner of the grouping. */
+  stages: PipelineStageLane[];
   observed: ObservedVersion[];
   stale: StaleSummary | null;
 }

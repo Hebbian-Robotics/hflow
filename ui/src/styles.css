@@ -564,6 +564,20 @@ body {
   outline-offset: -2px;
 }
 
+/* The id cell is a real link (middle-click, copy address); it inherits the
+   mono cell look and only reveals link affordances on hover/focus. */
+.episode-id-link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.episode-id-link:hover,
+.episode-id-link:focus-visible {
+  color: var(--accent-ink);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .cell-null {
   color: var(--ink-faint);
 }

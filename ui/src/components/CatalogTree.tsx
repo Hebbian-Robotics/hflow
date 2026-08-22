@@ -10,6 +10,16 @@ import { EmptyPanel, ErrorPanel, LoadingPanel } from "./QueryStates";
 
 const SUMMARY_PROFILE_KEYS = ["min", "max", "approx_unique", "null_percentage"] as const;
 
+const PLAIN_SQL_IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** What click-to-insert puts in the editor: quoted unless the name is a plain
+ * identifier — the wide episodes view pivots measurement keys into columns,
+ * and those keys are arbitrary strings (e.g. "artifact/wrist_cam"), which
+ * DuckDB would otherwise parse as a division of two unknown columns. */
+function insertableSqlIdentifier(name: string): string {
+  return PLAIN_SQL_IDENTIFIER_PATTERN.test(name) ? name : `"${name.replaceAll('"', '""')}"`;
+}
+
 function TableSummarySection({
   tableName,
   onDeselect,
@@ -159,7 +169,7 @@ export function CatalogTree({
                     <button
                       type="button"
                       className="btn btn-ghost btn-tiny insert-btn"
-                      onClick={() => onInsertText(table.name)}
+                      onClick={() => onInsertText(insertableSqlIdentifier(table.name))}
                       title={`Insert "${table.name}" into the editor`}
                       aria-label={`Insert ${table.name} into the editor`}
                     >
@@ -173,7 +183,7 @@ export function CatalogTree({
                           <button
                             type="button"
                             className="catalog-column"
-                            onClick={() => onInsertText(column.name)}
+                            onClick={() => onInsertText(insertableSqlIdentifier(column.name))}
                             title={`${column.type} — insert "${column.name}" into the editor`}
                           >
                             <span className="catalog-column-name">{column.name}</span>

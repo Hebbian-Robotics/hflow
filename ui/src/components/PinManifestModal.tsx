@@ -21,6 +21,7 @@ export function PinManifestModal({
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const nameInputRef = useRef<HTMLInputElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
 
   const pinMutation = useMutation({
     mutationFn: pinManifest,
@@ -29,13 +30,49 @@ export function PinManifestModal({
     },
   });
 
+  // Focus returns to whatever opened the dialog (the Pin-manifest button)
+  // when it unmounts, instead of being dropped on <body>. MUST be declared
+  // before the autofocus effect below, which moves focus into the dialog.
+  useEffect(() => {
+    const openerElement =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    return () => openerElement?.focus();
+  }, []);
+
   useEffect(() => {
     nameInputRef.current?.focus();
   }, []);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape") {
+        onClose();
+        return;
+      }
+      // The overlay is only visual, so aria-modal needs a real focus trap:
+      // Tab cycles within the dialog rather than walking into the obscured
+      // studio behind it (where CodeMirror would swallow keystrokes).
+      if (event.key !== "Tab") return;
+      const dialogElement = dialogRef.current;
+      if (!dialogElement) return;
+      const focusableElements = dialogElement.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input, textarea, select, summary, [tabindex]:not([tabindex="-1"])',
+      );
+      const firstFocusable = focusableElements[0];
+      const lastFocusable = focusableElements[focusableElements.length - 1];
+      if (!firstFocusable || !lastFocusable) return;
+      const activeElement = document.activeElement;
+      const focusIsInsideDialog =
+        activeElement instanceof Node && dialogElement.contains(activeElement);
+      if (event.shiftKey) {
+        if (!focusIsInsideDialog || activeElement === firstFocusable) {
+          event.preventDefault();
+          lastFocusable.focus();
+        }
+      } else if (!focusIsInsideDialog || activeElement === lastFocusable) {
+        event.preventDefault();
+        firstFocusable.focus();
+      }
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
@@ -48,7 +85,13 @@ export function PinManifestModal({
 
   return (
     <div className="modal-overlay">
-      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="pin-modal-title">
+      <div
+        ref={dialogRef}
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="pin-modal-title"
+      >
         <header className="modal-header">
           <h2 id="pin-modal-title" className="modal-title">
             {pinnedEntry ? "Manifest pinned" : "Pin manifest"}

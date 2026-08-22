@@ -1,14 +1,20 @@
 import { useQuery } from "@tanstack/react-query";
 import { Fragment, useEffect } from "react";
-import { ApiError, fetchPipeline, type PipelineManifest, type PipelineStepManifest } from "../api";
+import {
+  ApiError,
+  fetchPipeline,
+  type PipelineManifest,
+  type PipelineStageLane,
+  type PipelineStepManifest,
+} from "../api";
 import { EmptyPanel, ErrorPanel, LoadingPanel } from "../components/QueryStates";
 import { VersionChip } from "../components/VersionChip";
 import { formatTimestamp } from "../format";
 import { ChevronDownIcon } from "../icons";
 
-// Stage lanes mirror hflow.steps.Stage: sync runs the canonical transform and
-// derived channels, meta runs checks + catalog registration, labels runs
-// enrichments, media renders derived media (the engine's contact sheets).
+// The lane set, order, and step grouping come from the server's `stages`
+// payload (hflow.steps.Stage is the one owner of stage semantics); only the
+// display copy below and the engine-work annotation cards live client-side.
 
 interface LaneCard {
   name: string;
@@ -41,52 +47,68 @@ function engineCard(name: string, kind: string): LaneCard {
   return { name, kind, version: null, critical: false, uses: null, isEngineOwned: true };
 }
 
-function buildStageLanes(manifest: PipelineManifest): StageLane[] {
-  const transformCard: LaneCard = {
-    name: "canonical transform",
-    kind: manifest.has_transform_override ? "transform override" : "engine transform",
-    version: null,
-    // The transform is the critical path: a failure quarantines the episode.
-    critical: true,
-    uses: null,
-    isEngineOwned: !manifest.has_transform_override,
-  };
-  const derivedCards = manifest.derived_channels.map(
-    (channel): LaneCard => ({
-      name: channel.topic,
-      kind: "derived channel",
-      version: channel.version,
-      critical: false,
+/** Human titles/descriptions for the canonical stages; a stage the server
+ * sends that this build does not know still renders, under its own name. */
+const STAGE_DISPLAY_COPY: Record<string, { title: string; description: string }> = {
+  sync: {
+    title: "Transform & sync",
+    description: "canonical transform + derived channels (critical path)",
+  },
+  meta: { title: "Metadata", description: "checks + catalog registration" },
+  labels: { title: "Labels & artifacts", description: "enrichments (non-critical)" },
+  media: { title: "Media", description: "derived media artifacts" },
+};
+
+/** Engine work the manifest's step lists do not carry, annotated per stage:
+ * the transform + derived channels (sync), catalog registration (meta), and
+ * the engine's contact sheets (media). */
+function engineWorkCards(stage: string, manifest: PipelineManifest): LaneCard[] {
+  if (stage === "sync") {
+    const transformCard: LaneCard = {
+      name: "canonical transform",
+      kind: manifest.has_transform_override ? "transform override" : "engine transform",
+      version: null,
+      // The transform is the critical path: a failure quarantines the episode.
+      critical: true,
       uses: null,
-      isEngineOwned: false,
-    }),
-  );
-  return [
-    {
-      stage: "sync",
-      title: "Transform & sync",
-      description: "canonical transform + derived channels (critical path)",
-      cards: [transformCard, ...derivedCards],
-    },
-    {
-      stage: "meta",
-      title: "Metadata",
-      description: "checks + catalog registration",
-      cards: [...manifest.checks.map(cardFromStep), engineCard("catalog registration", "engine")],
-    },
-    {
-      stage: "labels",
-      title: "Labels & artifacts",
-      description: "enrichments (non-critical)",
-      cards: manifest.enrichments.map(cardFromStep),
-    },
-    {
-      stage: "media",
-      title: "Media",
-      description: "derived media artifacts",
-      cards: [engineCard("media/contact_sheet", "engine")],
-    },
-  ];
+      isEngineOwned: !manifest.has_transform_override,
+    };
+    const derivedCards = manifest.derived_channels.map(
+      (channel): LaneCard => ({
+        name: channel.topic,
+        kind: "derived channel",
+        version: channel.version,
+        critical: false,
+        uses: null,
+        isEngineOwned: false,
+      }),
+    );
+    return [transformCard, ...derivedCards];
+  }
+  if (stage === "meta") return [engineCard("catalog registration", "engine")];
+  if (stage === "media") return [engineCard("media/contact_sheet", "engine")];
+  return [];
+}
+
+function buildStageLanes(stages: PipelineStageLane[], manifest: PipelineManifest): StageLane[] {
+  return stages.map((serverLane) => {
+    const displayCopy = STAGE_DISPLAY_COPY[serverLane.stage] ?? {
+      title: serverLane.stage,
+      description: serverLane.engine_owned ? "engine-owned stage" : "pipeline steps",
+    };
+    const engineCards = engineWorkCards(serverLane.stage, manifest);
+    return {
+      stage: serverLane.stage,
+      title: displayCopy.title,
+      description: displayCopy.description,
+      // Engine work leads in sync (the transform runs first); elsewhere the
+      // user-registered steps lead and the engine annotation trails.
+      cards:
+        serverLane.stage === "sync"
+          ? [...engineCards, ...serverLane.steps.map(cardFromStep)]
+          : [...serverLane.steps.map(cardFromStep), ...engineCards],
+    };
+  });
 }
 
 function StepCardView({ card }: { card: LaneCard }) {
@@ -162,8 +184,8 @@ export function PipelinePage() {
     );
   }
 
-  const { manifest, observed, stale } = pipelineQuery.data;
-  const stageLanes = buildStageLanes(manifest);
+  const { manifest, stages, observed, stale } = pipelineQuery.data;
+  const stageLanes = buildStageLanes(stages, manifest);
 
   return (
     <div className="pipeline-page">

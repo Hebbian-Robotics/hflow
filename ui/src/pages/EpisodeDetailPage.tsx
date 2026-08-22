@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Fragment, type ReactNode, useEffect, useMemo, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useLocation, useParams } from "react-router-dom";
 import {
   type EpisodeCheckRun,
   type EpisodeDossier,
@@ -251,7 +251,10 @@ function IntervalsSection({ intervals }: { intervals: EpisodeInterval[] }) {
                   {nanosecondsToRelativeSeconds(interval.end_ns, interval.start_ns)}
                 </td>
                 <td className="cell-mono cell-dim">
-                  {interval.check_name}@{interval.check_version}
+                  {/* check_version comes from a LEFT JOIN and can be null. */}
+                  {interval.check_version
+                    ? `${interval.check_name}@${interval.check_version}`
+                    : interval.check_name}
                 </td>
               </tr>
             ))}
@@ -393,6 +396,9 @@ function DossierView({ dossier }: { dossier: EpisodeDossier }) {
 
 export function EpisodeDetailPage() {
   const { episodeId } = useParams<{ episodeId: string }>();
+  // Row navigation carried the Episodes URL's search string onto this route,
+  // so the back link can restore the exact filters/sort/page.
+  const location = useLocation();
   const dossierQuery = useQuery({
     queryKey: ["episode", episodeId],
     queryFn: () => fetchEpisodeDossier(episodeId ?? ""),
@@ -408,7 +414,7 @@ export function EpisodeDetailPage() {
 
   return (
     <div className="episode-page">
-      <Link to="/" className="back-link">
+      <Link to={{ pathname: "/", search: location.search }} className="back-link">
         <ArrowLeftIcon />
         <span>Episodes</span>
       </Link>
