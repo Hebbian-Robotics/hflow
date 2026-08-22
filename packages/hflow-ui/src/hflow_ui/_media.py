@@ -73,8 +73,16 @@ def is_uri_servable(uri: str, *, data_root: str) -> bool:
     return True
 
 
-def served_file_response(resolved_file: Path) -> FileResponse:
+def served_file_response(
+    resolved_file: Path, *, attachment_filename: str | None = None
+) -> FileResponse:
     """Bytes with a guessed content type; Starlette's FileResponse handles
-    Range requests where it can, and a plain GET always works."""
+    Range requests where it can, and a plain GET always works. Passing
+    ``attachment_filename`` marks the response Content-Disposition:
+    attachment under that name (manifest downloads)."""
     guessed_type, _ = mimetypes.guess_type(resolved_file.name)
-    return FileResponse(resolved_file, media_type=guessed_type or "application/octet-stream")
+    return FileResponse(
+        resolved_file,
+        media_type=guessed_type or "application/octet-stream",
+        filename=attachment_filename,
+    )

@@ -1,10 +1,12 @@
 """The FastAPI app (pure, testable) and the ``hflow ui`` server entry point.
 
-``create_app`` builds the whole read-only API plus SPA serving from one
+``create_app`` builds the whole API plus SPA serving from one
 :class:`UiSettings` -- no sockets, no side effects. ``serve`` adds the launch
 behavior: pick a free port, print the tokened URL, open the browser, run
-uvicorn. Nothing in this package ever mutates the workspace, and the server
-never mints workspace identity.
+uvicorn. The only workspace files this package ever writes are the curation
+studio's: immutable pinned manifests under ``<data_root>/manifests/`` and
+the ``<data_root>/ui/state.json`` sidecar (both refused when
+``settings.read_only``); the server never mints workspace identity.
 """
 
 import importlib.resources
@@ -24,7 +26,7 @@ import hflow
 from hflow.format import CATALOG_FORMAT_VERSION
 from hflow.storage import LocalStorageRoot
 from hflow.workspace import Workspace
-from hflow_ui import _catalog, _media
+from hflow_ui import _catalog, _curation, _media
 from hflow_ui._auth import SessionTokenMiddleware
 from hflow_ui._settings import UiSettings
 
@@ -94,7 +96,7 @@ def create_app(settings: UiSettings) -> FastAPI:
         return JSONResponse(
             {
                 "mode": "local",
-                "read_only": True,
+                "read_only": settings.read_only,
                 "hflow_version": hflow.__version__,
                 "hflow_ui_version": hflow_ui_version,
                 "data_root": settings.data_root,
@@ -196,6 +198,10 @@ def create_app(settings: UiSettings) -> FastAPI:
                 status_code=404, detail=f"no episode {episode_id!r} in this catalog"
             )
         return _served_file_response_or_refuse(canonical_uri, settings.data_root)
+
+    # M1 curation studio routes -- included BEFORE the SPA catch-all below so
+    # they win route matching.
+    application.include_router(_curation.create_curation_router(settings))
 
     @application.get("/{requested_path:path}", include_in_schema=False)
     def serve_spa(requested_path: str) -> Response:

@@ -22,6 +22,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time
+from decimal import Decimal
 from urllib.parse import quote
 
 import duckdb
@@ -55,20 +56,35 @@ def _recorded_at_as_iso_text(qualified_column: str = "recorded_at") -> str:
 
 
 def json_safe_value(value: object) -> object:
-    """One catalog cell as a JSON-legal value.
+    """One DuckDB cell as a JSON-legal value.
 
     Datetimes become ISO-8601 strings (a safety net -- timestamp columns are
     already rendered to TEXT in SQL) and NaN/inf doubles become null: both
-    are illegal in JSON and would otherwise poison the whole payload.
+    are illegal in JSON and would otherwise poison the whole payload. The
+    remaining branches exist for the curation studio, where arbitrary user
+    SELECTs can materialize types JSON cannot carry (DECIMAL literals,
+    BLOBs, INTERVALs, nested LISTs/STRUCTs): containers are converted
+    element-wise and anything else is rendered as text -- a legal query must
+    never 500 over its result types.
     """
+    if value is None or isinstance(value, bool | int | str):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
     if isinstance(value, datetime | date | time):
         return value.isoformat()
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    return value
+    if isinstance(value, Decimal):
+        return json_safe_value(float(value))
+    if isinstance(value, list | tuple):
+        return [json_safe_value(element) for element in value]
+    if isinstance(value, dict):
+        return {str(key): json_safe_value(element) for key, element in value.items()}
+    if isinstance(value, bytes | bytearray):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
-def _fetched_json_safe_rows(executed_query: duckdb.DuckDBPyConnection) -> list[dict[str, object]]:
+def fetched_json_safe_rows(executed_query: duckdb.DuckDBPyConnection) -> list[dict[str, object]]:
     column_names = [str(column[0]) for column in executed_query.description or []]
     return [
         {name: json_safe_value(cell) for name, cell in zip(column_names, row, strict=True)}
@@ -98,7 +114,7 @@ class EpisodePage:
     sql: str
 
 
-def _quoted_identifier(column_name: str) -> str:
+def quoted_identifier(column_name: str) -> str:
     return '"' + column_name.replace('"', '""') + '"'
 
 
@@ -118,7 +134,7 @@ def _compiled_conditions(filters: EpisodeListFilters) -> tuple[list[str], list[s
     for column_name, values in exact_match_columns:
         if values:
             placeholders = ", ".join("?" for _ in values)
-            conditions.append(f"{_quoted_identifier(column_name)} IN ({placeholders})")
+            conditions.append(f"{quoted_identifier(column_name)} IN ({placeholders})")
             parameters.extend(values)
     if filters.status is not None:
         conditions.append('"status" = ?')
@@ -131,7 +147,7 @@ def _compiled_conditions(filters: EpisodeListFilters) -> tuple[list[str], list[s
     if filters.search:
         like_pattern = "%" + _escaped_like_fragment(filters.search) + "%"
         disjuncts = " OR ".join(
-            f"{_quoted_identifier(name)} ILIKE ? ESCAPE '\\'" for name in _SEARCHED_COLUMN_NAMES
+            f"{quoted_identifier(name)} ILIKE ? ESCAPE '\\'" for name in _SEARCHED_COLUMN_NAMES
         )
         conditions.append("(" + disjuncts + ")")
         parameters.extend([like_pattern] * len(_SEARCHED_COLUMN_NAMES))
@@ -185,13 +201,13 @@ def query_episode_page(
     direction = "DESC" if descending else "ASC"
     query_tail = (
         f"FROM episodes{where_sql} "
-        f"ORDER BY {_quoted_identifier(order_by)} {direction} LIMIT {limit} OFFSET {offset}"
+        f"ORDER BY {quoted_identifier(order_by)} {direction} LIMIT {limit} OFFSET {offset}"
     )
     # The executed form renders recorded_at to ISO text in SQL (see the module
     # note); the displayed form stays the logical query a user would write.
     executed_sql = f"SELECT * REPLACE ({_recorded_at_as_iso_text()}) {query_tail}"
     display_sql = f"SELECT * {query_tail}"
-    rows = _fetched_json_safe_rows(connection.execute(executed_sql, parameters))
+    rows = fetched_json_safe_rows(connection.execute(executed_sql, parameters))
     count_row = connection.execute(
         f"SELECT count(*) FROM episodes{where_sql}", parameters
     ).fetchone()
@@ -210,7 +226,7 @@ def query_episode_facets(
     """Facet value counts over the wide episodes view; NULL buckets skipped."""
     facets: dict[str, list[dict[str, object]]] = {}
     for facet_column_name in _FACET_COLUMN_NAMES:
-        quoted_column = _quoted_identifier(facet_column_name)
+        quoted_column = quoted_identifier(facet_column_name)
         value_counts = connection.execute(
             f"SELECT {quoted_column} AS value, count(*) AS value_count FROM episodes "
             f"WHERE {quoted_column} IS NOT NULL "
@@ -246,7 +262,7 @@ def query_episode_dossier(
     connection: duckdb.DuckDBPyConnection, episode_id: str, *, data_root: str
 ) -> dict[str, object] | None:
     """Everything the episode page shows, or ``None`` when the id is unknown."""
-    episode_rows = _fetched_json_safe_rows(
+    episode_rows = fetched_json_safe_rows(
         connection.execute(
             f"SELECT * REPLACE ({_recorded_at_as_iso_text()}) "
             "FROM episodes_latest WHERE episode_id = ?",
@@ -266,7 +282,7 @@ def query_episode_dossier(
         "quarantine_tags": quarantine_tags,
     }
 
-    measurements = _fetched_json_safe_rows(
+    measurements = fetched_json_safe_rows(
         connection.execute(
             "SELECT key, value_double, value_text, value_bool, check_name, check_version, "
             f"{_recorded_at_as_iso_text()} "
@@ -274,7 +290,7 @@ def query_episode_dossier(
             [episode_id],
         )
     )
-    check_runs = _fetched_json_safe_rows(
+    check_runs = fetched_json_safe_rows(
         connection.execute(
             "SELECT check_name, check_version, critical, status, duration_s, error, "
             f"{_recorded_at_as_iso_text()}, run_fingerprint "
@@ -285,7 +301,7 @@ def query_episode_dossier(
     # Intervals and tags are the episode's LATEST run only -- the current
     # evidence. check_version rides in from that run's check_runs row because
     # the intervals table does not carry one itself.
-    intervals = _fetched_json_safe_rows(
+    intervals = fetched_json_safe_rows(
         connection.execute(
             """
             SELECT i.label, i.start_ns, i.end_ns, i.check_name, r.check_version
@@ -301,7 +317,7 @@ def query_episode_dossier(
             [episode_id],
         )
     )
-    tags = _fetched_json_safe_rows(
+    tags = fetched_json_safe_rows(
         connection.execute(
             f"SELECT t.tag, t.check_name, {_recorded_at_as_iso_text('t.recorded_at')} "
             "FROM tags AS t "
@@ -311,7 +327,7 @@ def query_episode_dossier(
             [episode_id],
         )
     )
-    history = _fetched_json_safe_rows(
+    history = fetched_json_safe_rows(
         connection.execute(
             f"SELECT * REPLACE ({_recorded_at_as_iso_text()}) "
             "FROM episodes_raw WHERE episode_id = ? "

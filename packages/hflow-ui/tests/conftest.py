@@ -37,6 +37,36 @@ def api(populated_workspace: PopulatedWorkspace, unbuilt_assets_dir: Path) -> Te
 
 
 @pytest.fixture(scope="session")
+def read_only_api(populated_workspace: PopulatedWorkspace, unbuilt_assets_dir: Path) -> TestClient:
+    """A client whose server runs read-only: every write endpoint must 403.
+
+    Session-scoped over the shared workspace on purpose -- a read-only server
+    refuses before touching anything, so it cannot dirty the fixture.
+    """
+    settings = UiSettings(
+        data_root=str(populated_workspace.data_root),
+        token=None,
+        assets_dir=unbuilt_assets_dir,
+        read_only=True,
+    )
+    return TestClient(create_app(settings))
+
+
+@pytest.fixture()
+def writable_workspace(tmp_path_factory: pytest.TempPathFactory) -> PopulatedWorkspace:
+    """A per-test workspace for tests that WRITE (pins, saved queries)."""
+    return build_populated_workspace(tmp_path_factory)
+
+
+@pytest.fixture()
+def writable_api(writable_workspace: PopulatedWorkspace, unbuilt_assets_dir: Path) -> TestClient:
+    settings = UiSettings(
+        data_root=str(writable_workspace.data_root), token=None, assets_dir=unbuilt_assets_dir
+    )
+    return TestClient(create_app(settings))
+
+
+@pytest.fixture(scope="session")
 def empty_workspace_api(
     tmp_path_factory: pytest.TempPathFactory, unbuilt_assets_dir: Path
 ) -> TestClient:

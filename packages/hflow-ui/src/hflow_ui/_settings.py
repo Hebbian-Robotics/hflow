@@ -30,3 +30,7 @@ class UiSettings:
     token: str | None = None
     assets_dir: Path | None = None
     open_browser: bool = True
+    # M1: when true, every mutating endpoint (manifest pinning, saved-query
+    # writes) answers 403 and /api/v1/config reports it; the CLI flag that
+    # sets this (--read-only) lands in M2, so the field stays defaulted here.
+    read_only: bool = False

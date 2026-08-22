@@ -15,16 +15,20 @@ def test_health_reports_ok(api: TestClient) -> None:
     assert response.json() == {"ok": True}
 
 
-def test_config_reports_local_read_only_mode(
+def test_config_reports_local_mode_and_capabilities(
     api: TestClient, populated_workspace: PopulatedWorkspace
 ) -> None:
     payload = api.get("/api/v1/config").json()
     assert payload["mode"] == "local"
-    assert payload["read_only"] is True
+    assert payload["read_only"] is False  # M1: the default server accepts writes
     assert isinstance(payload["hflow_version"], str) and payload["hflow_version"]
     assert payload["hflow_ui_version"] == "0.1.0"
     assert payload["data_root"] == str(populated_workspace.data_root)
     assert payload["capabilities"] == {"catalog": True, "media": True, "runtime": False}
+
+
+def test_config_reports_the_read_only_setting(read_only_api: TestClient) -> None:
+    assert read_only_api.get("/api/v1/config").json()["read_only"] is True
 
 
 def test_config_never_mints_workspace_identity(
