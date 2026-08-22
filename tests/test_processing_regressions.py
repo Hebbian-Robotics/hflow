@@ -219,6 +219,40 @@ def test_check_with_optional_extra_parameter_registers() -> None:
     assert {check.name for check in app.checks} == {"optional_topic"}
 
 
+def test_check_without_episode_parameter_fails_at_registration() -> None:
+    app = hflow.App("signature-zeroarg", data_root=Path("/tmp"))
+
+    def no_episode() -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"n": 1})
+
+    with pytest.raises(ValueError, match="cannot accept the episode"):
+        app.check()(cast(hflow.steps.CheckFunction, no_episode))
+
+    assert app.checks == []
+
+
+def test_check_with_only_kwargs_fails_at_registration() -> None:
+    app = hflow.App("signature-kwargs-only", data_root=Path("/tmp"))
+
+    def kwargs_only(**kwargs: object) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"n": len(kwargs)})
+
+    with pytest.raises(ValueError, match="cannot accept the episode"):
+        app.check()(cast(hflow.steps.CheckFunction, kwargs_only))
+
+    assert app.checks == []
+
+
+def test_check_with_varargs_registers() -> None:
+    app = hflow.App("signature-varargs", data_root=Path("/tmp"))
+
+    @app.check()
+    def varargs_check(*args: object) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"n": len(args)})
+
+    assert {check.name for check in app.checks} == {"varargs_check"}
+
+
 _STEP_VERSION_GLOBAL_THRESHOLD = 0.1
 
 

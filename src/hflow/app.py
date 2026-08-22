@@ -299,23 +299,32 @@ class EnrichmentRunReport:
         return CheckStatus.MEASURED
 
 
-def _unsatisfiable_check_parameters(function: Callable[..., object]) -> list[str]:
-    """Names of required parameters a registered check could never receive.
+def _unsatisfiable_check_parameters(
+    function: Callable[..., object],
+) -> tuple[list[str], bool]:
+    """Required parameters a registered check could never receive.
 
     At run time a check is called with exactly one argument: the canonical
     episode (``registered.function(canonical_episode)``). A check is only
-    satisfiable if every remaining parameter is optional (has a default) or
-    is a ``*args``/``**kwargs`` sink. Parameters whose defaults the runtime
-    call cannot supply (required positional-or-keyword beyond the episode,
-    required keyword-only) would make every episode fail with a
-    ``TypeError`` that the App records as an infrastructure error at ingest
-    time. Returning their names lets registration reject them up front.
+    satisfiable if it can accept that episode positionally and every other
+    parameter is optional (has a default) or is a ``*args``/``**kwargs``
+    sink. Parameters the runtime call cannot supply (required
+    positional-or-keyword beyond the episode, required keyword-only) would
+    make every episode fail with a ``TypeError`` that the App records as an
+    infrastructure error at ingest time.
+
+    Returns ``(surplus, accepts_episode)``: the names of required parameters
+    beyond the episode, and whether the signature has any slot that can
+    receive the episode positionally (a plain parameter, or ``*args``, which
+    absorbs it). ``**kwargs`` alone is not a slot: it cannot absorb a
+    positional argument.
     """
     try:
         parameters = inspect.signature(function).parameters.values()
     except (TypeError, ValueError):
-        return []
+        return [], True
     seen_episode = False
+    sees_varargs = False
     unsatisfiable: list[str] = []
     for parameter in parameters:
         if parameter.kind in (
@@ -328,12 +337,14 @@ def _unsatisfiable_check_parameters(function: Callable[..., object]) -> list[str
                 seen_episode = True
                 continue
             unsatisfiable.append(parameter.name)
+        elif parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+            sees_varargs = True
         elif (
             parameter.kind is inspect.Parameter.KEYWORD_ONLY
             and parameter.default is inspect.Parameter.empty
         ):
             unsatisfiable.append(parameter.name)
-    return unsatisfiable
+    return unsatisfiable, seen_episode or sees_varargs
 
 
 def _execute_enrichment(
@@ -618,7 +629,7 @@ class App:
                 raise ValueError("pass name=... when registering a callable without __name__")
             if check_name in self._registered_step_names():
                 raise ValueError(f"a step named {check_name!r} is already registered")
-            unsatisfiable = _unsatisfiable_check_parameters(function)
+            unsatisfiable, accepts_episode = _unsatisfiable_check_parameters(function)
             if unsatisfiable:
                 unsatisfiable_list = ", ".join(sorted(unsatisfiable))
                 raise ValueError(
@@ -629,6 +640,15 @@ class App:
                     f"    def {check_name}_check(ep: hflow.Episode) -> hflow.CheckResult:\n"
                     f"        return {getattr(function, '__name__', check_name)}(ep, {unsatisfiable_list.split(', ')[0]}=...)\n"
                 )
+            if not accepts_episode:
+                raise ValueError(
+                    f"check {check_name!r} cannot accept the episode: it must take "
+                    "the canonical episode as its first positional parameter, e.g.\n\n"
+                    f"    @app.check()\n"
+                    f"    def {check_name}_check(ep: hflow.Episode) -> hflow.CheckResult:\n"
+                    "        ...\n"
+                )
+
             requires_set = frozenset(requires) if requires is not None else frozenset()
             self.checks.append(
                 RegisteredCheck(
