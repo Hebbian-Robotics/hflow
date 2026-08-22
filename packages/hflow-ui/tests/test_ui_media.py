@@ -156,3 +156,49 @@ def test_canonical_outside_the_data_root_is_403(
 
 def test_canonical_of_an_unknown_episode_is_404(api: TestClient) -> None:
     assert api.get("/api/v1/episodes/not-an-id/canonical").status_code == 404
+
+
+def test_media_recorded_from_a_container_vantage_is_served(tmp_path: Path) -> None:
+    """The Compose runtime catalogs its own mount path for the same bytes.
+
+    A run executed in the bundle records
+    ``/opt/airflow/data/episodes/<run>/media/x.jpg``; those very bytes are at
+    ``<data root>/episodes/<run>/media/x.jpg`` on this host, so the episode
+    page must show the camera views rather than refusing its own workspace.
+    """
+    from hflow_ui._media import MediaResolutionError, resolve_served_file
+
+    data_root = tmp_path / "workspace"
+    host_media_file = data_root / "episodes" / "run-0001-abcdef" / "media" / "wrist_cam.jpg"
+    host_media_file.parent.mkdir(parents=True)
+    host_media_file.write_bytes(b"\xff\xd8\xff\xe0 jpeg bytes")
+
+    container_uri = "/opt/airflow/data/episodes/run-0001-abcdef/media/wrist_cam.jpg"
+    assert resolve_served_file(container_uri, data_root=str(data_root)) == host_media_file.resolve()
+
+    # Re-anchoring never widens what may be served: a traversal in the
+    # recorded tail still lands outside the root and is refused.
+    with pytest.raises(MediaResolutionError):
+        resolve_served_file(
+            "/opt/airflow/data/episodes/../../../etc/passwd", data_root=str(data_root)
+        )
+    # A foreign path with no workspace layout component stays refused.
+    foreign_file = tmp_path / "elsewhere" / "secret.jpg"
+    foreign_file.parent.mkdir(parents=True)
+    foreign_file.write_bytes(b"nope")
+    with pytest.raises(MediaResolutionError) as refusal:
+        resolve_served_file(str(foreign_file), data_root=str(data_root))
+    assert refusal.value.status_code == 403
+
+
+def test_container_vantage_rebasing_requires_the_file_to_exist_here(tmp_path: Path) -> None:
+    """A vantage-shaped URI with no counterpart here is still a 404."""
+    from hflow_ui._media import MediaResolutionError, resolve_served_file
+
+    data_root = tmp_path / "workspace"
+    (data_root / "episodes").mkdir(parents=True)
+    with pytest.raises(MediaResolutionError) as refusal:
+        resolve_served_file(
+            "/opt/airflow/data/episodes/never-synced/media/x.jpg", data_root=str(data_root)
+        )
+    assert refusal.value.status_code == 404

@@ -13,6 +13,18 @@ from pathlib import Path
 from starlette.responses import FileResponse
 
 from hflow.storage import LocalStorageRoot, is_bucket_url, parse_storage_root
+from hflow.workspace import (
+    CATALOG_DIRECTORY_NAME,
+    EPISODES_DIRECTORY_NAME,
+    TEST_RUNS_DIRECTORY_NAME,
+)
+
+# The layout directories a workspace's own files live under, owned by
+# hflow.workspace. Used to recognise a path recorded from another vantage of
+# this workspace (a container mount) and re-anchor it here.
+_WORKSPACE_LAYOUT_DIRECTORY_NAMES = frozenset(
+    {EPISODES_DIRECTORY_NAME, CATALOG_DIRECTORY_NAME, TEST_RUNS_DIRECTORY_NAME}
+)
 
 # Media types inert enough to render inline in the browser: raster images and
 # common audio/video containers. Deliberately excludes text/html,
@@ -73,30 +85,67 @@ def _resolved_local_data_root(data_root: str) -> Path:
     return workspace_root.path.resolve()
 
 
+def _strictly_resolved(candidate: Path) -> Path | None:
+    """The real file behind a path, or ``None`` when it cannot be reached."""
+    try:
+        return candidate.resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def _rebased_onto_this_workspace(recorded_path: Path, resolved_data_root: Path) -> Path | None:
+    """The same workspace-relative file, as THIS host addresses it.
+
+    One workspace is reachable from several vantages: the Compose runtime
+    mounts the data root inside its containers, so a run executed there
+    catalogs ``/opt/airflow/data/episodes/<run>/media/x.jpg`` while the very
+    same bytes sit at ``<data root>/episodes/<run>/media/x.jpg`` here. A path
+    recorded from another vantage is not foreign data -- it is this
+    workspace, named differently -- so it is re-anchored at the first
+    workspace layout directory in it and re-checked exactly like any other
+    candidate. Containment is still enforced afterwards, so this only ever
+    resolves to files already inside the data root; it never widens what may
+    be served.
+    """
+    for index, component in enumerate(recorded_path.parts):
+        if component in _WORKSPACE_LAYOUT_DIRECTORY_NAMES:
+            return resolved_data_root.joinpath(*recorded_path.parts[index:])
+    return None
+
+
 def resolve_served_file(uri: str, *, data_root: str) -> Path:
     """The real file a catalog URI may be served from, or a typed refusal.
 
     Resolution is strict (symlinks followed, missing components refused), and
     the result must be contained in the resolved data root -- a symlink that
-    points out of the workspace is refused exactly like a foreign path.
+    points out of the workspace is refused exactly like a foreign path. A URI
+    recorded from another vantage of this same workspace (see
+    :func:`_rebased_onto_this_workspace`) is retried against this host's data
+    root under the identical containment rule.
     """
     if is_bucket_url(uri):
         raise MediaResolutionError(
             501, "this file lives in an object store; bucket media serving is not implemented in M0"
         )
     resolved_data_root = _resolved_local_data_root(data_root)
-    try:
-        resolved_file = Path(uri.removeprefix("file://")).resolve(strict=True)
-    except FileNotFoundError:
-        raise MediaResolutionError(
-            404, "the cataloged file does not exist on this machine"
-        ) from None
-    except OSError:
-        raise MediaResolutionError(404, "the cataloged file is unreachable") from None
-    if not resolved_file.is_relative_to(resolved_data_root):
-        raise MediaResolutionError(
-            403, "the cataloged URI resolves outside the workspace data root"
-        )
+    recorded_path = Path(uri.removeprefix("file://"))
+
+    resolved_file = _strictly_resolved(recorded_path)
+    escapes_workspace = resolved_file is not None and not resolved_file.is_relative_to(
+        resolved_data_root
+    )
+    if resolved_file is None or escapes_workspace:
+        rebased_path = _rebased_onto_this_workspace(recorded_path, resolved_data_root)
+        rebased_file = None if rebased_path is None else _strictly_resolved(rebased_path)
+        if rebased_file is not None and rebased_file.is_relative_to(resolved_data_root):
+            resolved_file = rebased_file
+        elif escapes_workspace:
+            raise MediaResolutionError(
+                403, "the cataloged URI resolves outside the workspace data root"
+            )
+        else:
+            raise MediaResolutionError(404, "the cataloged file does not exist on this machine")
+
     if not resolved_file.is_file():
         raise MediaResolutionError(404, "the cataloged URI does not name a regular file")
     return resolved_file

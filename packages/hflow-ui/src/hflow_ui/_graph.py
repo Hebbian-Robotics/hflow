@@ -290,6 +290,10 @@ def _task_instance_json(instance: dict[str, Any]) -> dict[str, object]:
         "state": _optional_string(instance.get("state")),
         "start_date": _optional_string(instance.get("start_date")),
         "end_date": _optional_string(instance.get("end_date")),
+        # When the scheduler queued the task, so a replay can distinguish
+        # "waiting for a worker" from "running". Airflow has spelled this
+        # field both ways across versions and may omit it; absent is fine.
+        "queued_at": _optional_string(instance.get("queued_when") or instance.get("queued_at")),
         "try_number": int(try_number) if isinstance(try_number, int) else None,
         # -1 is Airflow's "not a mapped instance"; an absent value means the
         # same thing.
