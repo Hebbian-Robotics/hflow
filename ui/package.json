@@ -6,7 +6,7 @@
   "description": "Read-only workspace UI for hflow catalogs (M0). Served by the hflow-ui FastAPI package.",
   "license": "Apache-2.0",
   "engines": {
-    "node": ">=20.19"
+    "node": "^20.19.0 || >=22.12.0"
   },
   "scripts": {
     "dev": "vite",
@@ -24,17 +24,17 @@
     "@codemirror/view": "^6.43.9",
     "@lezer/highlight": "^1.2.3",
     "@tanstack/react-query": "^5.62.0",
-    "@tanstack/react-table": "^8.20.6",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "react-router-dom": "^6.30.0"
+    "@tanstack/react-table": "^9.1.2",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-router-dom": "^7.18.2"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.2.0",
-    "@types/react": "^18.3.12",
-    "@types/react-dom": "^18.3.1",
-    "@vitejs/plugin-react": "^4.7.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^6.1.0",
     "typescript": "^5.9.2",
-    "vite": "^7.1.4"
+    "vite": "^8.2.2"
   }
 }

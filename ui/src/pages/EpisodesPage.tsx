@@ -2,10 +2,11 @@ import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import {
   type ColumnDef,
   flexRender,
-  getCoreRowModel,
+  rowSortingFeature,
   type SortingState,
+  tableFeatures,
   type Updater,
-  useReactTable,
+  useTable,
 } from "@tanstack/react-table";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
@@ -34,6 +35,13 @@ const PAGE_SIZE_CHOICES = [25, 50, 100, 250, 500];
 // Header-popover clicks only map to columns with an existing structured filter
 // param; other columns render their stats without a click-to-filter affordance.
 const STATS_FILTERABLE_COLUMNS = new Set(["task", "operator", "embodiment", "status"]);
+
+// v9 registers table features explicitly so unregistered ones tree-shake
+// away. Sorting is the only one this table needs, and even that is
+// `manualSorting`: the header click sends order_by/order to the server, which
+// compiles and runs the ORDER BY (the thin-client rule). Filtering and
+// pagination are likewise the server's, so their features stay unregistered.
+const episodesTableFeatures = tableFeatures({ rowSortingFeature });
 
 export function EpisodesPage() {
   const navigate = useNavigate();
@@ -221,7 +229,9 @@ export function EpisodesPage() {
 
   // Columns come from the server's DESCRIBE of the wide view, so the table
   // renders whatever the catalog holds without a hardcoded schema.
-  const tableColumns = useMemo<ColumnDef<EpisodeRow, unknown>[]>(() => {
+  const tableColumns = useMemo<
+    ColumnDef<typeof episodesTableFeatures, EpisodeRow, unknown>[]
+  >(() => {
     return (episodesData?.columns ?? []).map((column) => ({
       id: column.name,
       accessorFn: (row: EpisodeRow) => row[column.name],
@@ -250,12 +260,14 @@ export function EpisodesPage() {
     }));
   }, [episodesData, listSearch]);
 
-  const table = useReactTable({
+  const table = useTable({
+    features: episodesTableFeatures,
     data: rows,
     columns: tableColumns,
-    getCoreRowModel: getCoreRowModel(),
     manualSorting: true,
-    manualPagination: true,
+    // No manualPagination: without rowPaginationFeature registered the table
+    // never slices rows itself, so the server's LIMIT/OFFSET is the only
+    // pagination there is.
     enableMultiSort: false,
     enableSortingRemoval: false,
     state: { sorting },
@@ -475,7 +487,7 @@ export function EpisodesPage() {
                         openEpisode(tableRow.original);
                       }}
                     >
-                      {tableRow.getVisibleCells().map((cell) => (
+                      {tableRow.getAllCells().map((cell) => (
                         <td key={cell.id}>
                           {flexRender(cell.column.columnDef.cell, cell.getContext())}
                         </td>
