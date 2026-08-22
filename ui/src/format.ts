@@ -91,6 +91,18 @@ export function formatDurationCompact(seconds: number | null): string {
   return `${wholeHours}h ${String(wholeMinutes % 60).padStart(2, "0")}m`;
 }
 
+/**
+ * A clock offset for the run replay: the same vocabulary as
+ * formatDurationCompact, except that zero reads "0s" rather than "0.0s" (an
+ * axis whose first tick is the run's own start should not claim precision it
+ * is not measuring) and a negative offset keeps its sign.
+ */
+export function formatOffsetCompact(seconds: number): string {
+  if (!Number.isFinite(seconds)) return "—";
+  if (seconds === 0) return "0s";
+  return seconds < 0 ? `-${formatDurationCompact(-seconds)}` : formatDurationCompact(seconds);
+}
+
 /** Content-derived React key for a raw catalog row (no array indexes). */
 export function historyRowKey(row: EpisodeRow): string {
   return ["recorded_at", "run_fingerprint", "pipeline_version", "uri"]

@@ -795,8 +795,10 @@ export function PipelinePage() {
             {stale.count} episode{stale.count === 1 ? " is" : "s are"} stale
           </strong>{" "}
           against pipeline version <code className="cell-mono">{stale.pipeline_version}</code> —
-          last processed by an older pipeline. Re-run ingest (profile <code>metadata_backfill</code>{" "}
-          or <code>relabel</code>) to refresh them.
+          last processed by an older pipeline. The pipeline version is stamped by the canonical
+          transform, so refreshing them means a re-run that includes the <code>sync</code> stage:
+          the default <code>full</code> profile. (<code>metadata_backfill</code> and{" "}
+          <code>relabel</code> re-run later stages only, and leave this version untouched.)
         </div>
       ) : null}
 

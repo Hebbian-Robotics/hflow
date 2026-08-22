@@ -3117,6 +3117,562 @@ tr.is-selected-run td {
   background: var(--accent-soft);
 }
 
+/* ---- runs: replay timeline --------------------------------------------------- */
+
+/* A Gantt of every task instance on one shared axis, with a draggable playhead
+   that repaints the DAGs around it. Two columns everywhere — a label gutter and
+   a track — so the ruler, every row and the playhead overlay line up exactly
+   without a single hand-measured offset. */
+
+.replay {
+  --replay-gutter: 210px;
+  --replay-gap: 10px;
+  --replay-row-height: 22px;
+  --replay-batch-row-height: 19px;
+
+  margin: 10px 0 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.replay.is-scrubbing {
+  cursor: ew-resize;
+  user-select: none;
+}
+
+.replay-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.replay-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+}
+
+.replay-transport {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.btn.is-playing {
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+.replay-speed {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 4px;
+}
+
+.replay-speed-label {
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.replay-speed .input {
+  padding: 1px 4px;
+  font-size: 11.5px;
+}
+
+.replay-reduced-note {
+  margin-left: 2px;
+  font-size: 10.5px;
+  color: var(--ink-faint);
+  cursor: help;
+}
+
+.replay-readout {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.replay-readout-offset {
+  font-size: 12.5px;
+  font-weight: 650;
+  color: var(--accent-ink);
+}
+
+.replay-readout-absolute {
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+
+/* Live is a state, so it reads as a state: pinned means the dot is lit. */
+.replay-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--ink-muted);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.replay-live:hover {
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+.replay-live.is-live {
+  border-color: color-mix(in srgb, var(--ok) 45%, var(--border-strong));
+  background: var(--ok-soft);
+  color: var(--ok);
+  cursor: default;
+}
+
+.replay-live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ink-faint);
+}
+
+.replay-live.is-live .replay-live-dot {
+  background: var(--ok);
+  animation: replay-live-pulse 1800ms ease-in-out infinite;
+}
+
+@keyframes replay-live-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.replay-note,
+.replay-empty {
+  margin: 0;
+  padding: 8px 12px;
+  font-size: 11.5px;
+  color: var(--ink-muted);
+}
+
+.replay-chart {
+  position: relative;
+}
+
+.replay-scroll {
+  max-height: 46vh;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 8px 12px 10px;
+}
+
+.replay-lanes {
+  position: relative;
+}
+
+.replay-ruler,
+.replay-row {
+  display: grid;
+  grid-template-columns: var(--replay-gutter) minmax(0, 1fr);
+  column-gap: var(--replay-gap);
+  align-items: center;
+}
+
+.replay-ruler {
+  height: 18px;
+  margin-bottom: 4px;
+}
+
+.replay-ruler-gutter {
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.replay-ruler-track {
+  position: relative;
+  height: 100%;
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+.replay-tick {
+  position: absolute;
+  top: 2px;
+  transform: translateX(-50%);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.replay-tick:first-child {
+  transform: none;
+}
+
+.replay-group {
+  padding-top: 6px;
+}
+
+.replay-group-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  padding: 3px 0 3px;
+  border-top: 1px solid var(--border);
+}
+
+.replay-group-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+}
+
+.replay-group-dag {
+  font-size: 10.5px;
+  color: var(--ink-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.replay-group-note {
+  margin: 2px 0 4px;
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+
+.replay-row {
+  height: var(--replay-row-height);
+}
+
+.replay-row.is-batch {
+  height: var(--replay-batch-row-height);
+}
+
+.replay-row-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  height: 100%;
+  padding-left: 2px;
+  border-radius: 4px;
+}
+
+.replay-row-name {
+  padding: 0 2px;
+  border: none;
+  border-radius: 3px;
+  background: none;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.replay-row-name:hover {
+  color: var(--accent-ink);
+}
+
+.replay-row.is-selected .replay-row-name {
+  color: var(--accent-ink);
+  font-weight: 650;
+}
+
+.replay-row-name.is-batch {
+  margin-left: 12px;
+  color: var(--ink-muted);
+  font-size: 10.5px;
+}
+
+.replay-row-duration {
+  margin-left: auto;
+  flex: none;
+  padding-right: 2px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The two caveats that belong ON the row rather than in the note below it. */
+.replay-tag {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 650;
+  line-height: 1.6;
+  cursor: help;
+}
+
+.replay-tag.is-waits {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+
+.replay-tag.is-retry {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.replay-fanout-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+  flex: none;
+  padding: 0 3px;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--ink-muted);
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.replay-fanout-toggle:hover {
+  color: var(--accent-ink);
+  background: var(--accent-soft);
+}
+
+.replay-fanout-toggle .chevron {
+  transform: rotate(-90deg);
+  transition: transform 120ms ease;
+}
+
+.replay-fanout-toggle .chevron.is-open {
+  transform: none;
+}
+
+.replay-row-track {
+  position: relative;
+  height: 100%;
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+.replay-row.is-selected .replay-row-label,
+.replay-row.is-selected .replay-row-track {
+  background: var(--accent-soft);
+}
+
+.replay-bar {
+  position: absolute;
+  top: 50%;
+  height: 11px;
+  min-width: 3px;
+  margin-top: -5.5px;
+  border-radius: 3px;
+  background: var(--ink-faint);
+}
+
+.replay-row.is-batch .replay-bar {
+  height: 8px;
+  margin-top: -4px;
+}
+
+.replay-bar.is-ok {
+  background: var(--ok);
+}
+
+.replay-bar.is-err {
+  background: var(--err);
+}
+
+.replay-bar.is-warn {
+  background: var(--warn);
+}
+
+.replay-bar.is-accent {
+  background: var(--accent);
+}
+
+/* Queued is a WAIT, not work: thinner, hatched, and in the neutral ink so it
+   can never be mistaken for a state colour. */
+.replay-bar.is-queued {
+  height: 7px;
+  margin-top: -3.5px;
+  border-radius: 3px 0 0 3px;
+  background-color: var(--surface-sunken);
+  background-image: repeating-linear-gradient(
+    135deg,
+    var(--border-strong) 0 2px,
+    transparent 2px 5px
+  );
+}
+
+/* A fan-out summary packs every batch into one lane, so the queued waits move
+   to their own strip above the run band: overlaid, the last batch's long wait
+   would paint over the batches that were already running. */
+.replay-row-track.is-summary .replay-bar {
+  height: 9px;
+  margin-top: -3px;
+}
+
+.replay-row-track.is-summary .replay-bar.is-queued {
+  top: 2px;
+  height: 4px;
+  margin-top: 0;
+}
+
+/* No end recorded yet: the bar runs to the axis edge and fades out rather than
+   drawing a finish the payload never reported. */
+.replay-bar.is-open {
+  border-radius: 3px 0 0 3px;
+  -webkit-mask-image: linear-gradient(90deg, #000 86%, rgba(0, 0, 0, 0.3));
+  mask-image: linear-gradient(90deg, #000 86%, rgba(0, 0, 0, 0.3));
+}
+
+.replay-untimed {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  transform: translateY(-50%);
+  padding: 0 6px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 3px;
+  font-size: 9.5px;
+  color: var(--ink-faint);
+  cursor: help;
+}
+
+.replay-overlay {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: calc(var(--replay-gutter) + var(--replay-gap));
+  pointer-events: none;
+}
+
+.replay-gridline {
+  position: absolute;
+  top: 16px;
+  bottom: 0;
+  width: 1px;
+  background: var(--border);
+  opacity: 0.7;
+}
+
+.replay-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-left: 2px solid var(--accent);
+  margin-left: -1px;
+}
+
+.replay-grip {
+  position: absolute;
+  top: 0;
+  left: -7px;
+  width: 13px;
+  height: 13px;
+  border-radius: 3px;
+  background: var(--accent);
+  cursor: ew-resize;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.replay-grip::after {
+  content: "";
+  position: absolute;
+  top: 12px;
+  left: 3.5px;
+  border-left: 3px solid transparent;
+  border-right: 3px solid transparent;
+  border-top: 4px solid var(--accent);
+}
+
+.replay-limits {
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+
+.replay-limits-summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px 6px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.replay-limits-summary::-webkit-details-marker {
+  display: none;
+}
+
+.replay-limits-summary:hover {
+  color: var(--accent-ink);
+}
+
+.replay-limits-list {
+  margin: 0;
+  padding: 0 14px 10px 34px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-width: 74em;
+  color: var(--ink-muted);
+}
+
+.replay-limits-list strong {
+  color: var(--ink);
+  font-weight: 650;
+}
+
+.replay-limits-list code {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+
+.replay-hint {
+  border-top: 1px solid var(--border);
+}
+
+/* While the playhead is parked, every graph on the page is a reconstruction —
+   the accent frame says so without recolouring anything. */
+.graph-layout.is-replaying .dag-figure {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+
+.detail-replay-at {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--accent-ink);
+}
+
 /* ---- episode: timeline strip ------------------------------------------------ */
 
 .timeline {
@@ -3359,6 +3915,10 @@ tr.is-selected-run td {
   .measure-key {
     width: 150px;
   }
+
+  .replay {
+    --replay-gutter: 168px;
+  }
 }
 
 @media (max-width: 960px) {
@@ -3420,13 +3980,28 @@ tr.is-selected-run td {
     border-right: none;
     border-bottom: 1px solid var(--border);
   }
+
+  .replay {
+    --replay-gutter: 126px;
+  }
+
+  .replay-readout-absolute {
+    display: none;
+  }
 }
 
 /* ---- reduced motion ------------------------------------------------------ */
 
-/* The only motion in the UI: spinner rotation and hover transitions. */
+/* The only motion in the UI: spinner rotation, the live dot, and hover
+   transitions. Replay playback asks matchMedia the same question and simply
+   does not run (its Play control says so), so nothing here animates a
+   playhead across the screen. */
 @media (prefers-reduced-motion: reduce) {
   .spinner {
+    animation: none;
+  }
+
+  .replay-live.is-live .replay-live-dot {
     animation: none;
   }
 

@@ -763,6 +763,10 @@ export interface RunTaskInstance {
   state: string | null;
   start_date: string | null;
   end_date: string | null;
+  /** When the scheduler queued the task, so the replay can tell "waiting for a
+   * worker" from "running". Airflow may omit it, and servers that predate the
+   * field leave the key absent entirely — always treat it as optional. */
+  queued_at: string | null;
   try_number: number | null;
   map_index: number;
   duration_s: number | null;

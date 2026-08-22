@@ -28,12 +28,38 @@ import { DagGraph, type DagGraphNode } from "../components/DagGraph";
 import { DetailBlock, DetailRow, DetailsPanel } from "../components/DetailsPanel";
 import { EmptyPanel, ErrorPanel, LoadingPanel } from "../components/QueryStates";
 import { RunStateChip } from "../components/RunStateChip";
-import { formatDurationBetween, formatDurationCompact, formatTimestamp } from "../format";
+import { RunTimeline } from "../components/RunTimeline";
+import {
+  formatDurationBetween,
+  formatDurationCompact,
+  formatOffsetCompact,
+  formatTimestamp,
+} from "../format";
 import { ChevronDownIcon, ExternalLinkIcon, PlayIcon, RefreshIcon } from "../icons";
 import { runStateTone } from "../runState";
+import {
+  buildRunReplay,
+  formatInstant,
+  formatOffsetLabel,
+  isRunUnfinished,
+  MASTER_SCOPE,
+  NOT_STARTED_STATE,
+  type RunNodeSelection,
+  replayedFanOutSummary,
+  replayedRunState,
+  replayTaskInstances,
+} from "../runTimeline";
+import { useNowTick } from "../useNowTick";
+import { usePrefersReducedMotion } from "../usePrefersReducedMotion";
 
 const RUNS_PAGE_LIMIT = 25;
 const AUTO_REFRESH_INTERVAL_MS = 10_000;
+
+// How often the replay's "now" edge advances while a run is unfinished. The
+// axis only has to keep up with the reader's eye, and a reader who asked for
+// reduced motion gets the slow clock rather than a creeping edge.
+const LIVE_TICK_INTERVAL_MS = 1_000;
+const LIVE_TICK_INTERVAL_REDUCED_MOTION_MS = 5_000;
 
 // The runs monitor renders exactly what the server proxied from Airflow —
 // the browser never sees Airflow credentials, only these JSON summaries.
@@ -192,7 +218,17 @@ function instanceGroupsByTaskId(
   return groups;
 }
 
-function liveNodes(topology: DagTopology, groups: Map<string, TaskInstanceGroup>): DagGraphNode[] {
+/**
+ * Nodes for one DAG. `unstartedState` is what a task with nothing to paint
+ * reads as: live that means Airflow has no instance for it at all, but at a
+ * replay instant it means the instance exists and had not started yet — two
+ * different truths that must not share one word.
+ */
+function liveNodes(
+  topology: DagTopology,
+  groups: Map<string, TaskInstanceGroup>,
+  unstartedState: string,
+): DagGraphNode[] {
   return topology.tasks.map((task) => {
     const group = groups.get(task.task_id);
     return {
@@ -201,16 +237,10 @@ function liveNodes(topology: DagTopology, groups: Map<string, TaskInstanceGroup>
       summary: task.summary,
       mapped: task.mapped,
       deferred: task.deferred,
-      state: group?.state ?? "no instance",
+      state: group?.state ?? unstartedState,
       badge: group?.badge ?? (task.mapped ? "×0" : null),
     };
   });
-}
-
-interface RunNodeSelection {
-  /** "master", or a stage name. */
-  scope: string;
-  taskId: string;
 }
 
 function TaskInstanceDetails({
@@ -220,6 +250,10 @@ function TaskInstanceDetails({
   dagId,
   dagRunId,
   airflowWebUrl,
+  replayAtMs,
+  replayEndMs,
+  replayOffsetMinutes,
+  replayStartMs,
 }: {
   selection: RunNodeSelection;
   group: TaskInstanceGroup | undefined;
@@ -227,19 +261,49 @@ function TaskInstanceDetails({
   dagId: string;
   dagRunId: string | null;
   airflowWebUrl: string | null;
+  /** The replay instant the panel reports state at; null = the live payload. */
+  replayAtMs: number | null;
+  replayEndMs: number;
+  replayOffsetMinutes: number;
+  replayStartMs: number;
 }) {
   const taskUrl = airflowTaskUrl(airflowWebUrl, dagId, dagRunId, selection.taskId);
-  const mappedInstances = (group?.instances ?? []).filter((instance) => instance.map_index >= 0);
-  const single = group?.instances.length === 1 ? group.instances[0] : undefined;
+  const rawInstances = group?.instances ?? [];
+  // The panel keeps the facts (timestamps, tries, real durations) whatever the
+  // playhead says; only the STATE is restated at the replay instant.
+  const replayedGroup =
+    replayAtMs === null || group === undefined
+      ? undefined
+      : summarizeInstances(replayTaskInstances(rawInstances, replayAtMs, replayEndMs), null);
+  // A replayed null state means "had not started", which is a real answer —
+  // it must not fall through to the run's final state. The fallback word
+  // matches the graph node's for the same instant.
+  const unstartedState = replayAtMs === null ? "no instance" : NOT_STARTED_STATE;
+  const shownState =
+    replayedGroup !== undefined
+      ? (replayedGroup.state ?? unstartedState)
+      : (group?.state ?? unstartedState);
+  const mappedInstances = (
+    replayAtMs === null ? rawInstances : replayTaskInstances(rawInstances, replayAtMs, replayEndMs)
+  ).filter((instance) => instance.map_index >= 0);
+  const single = rawInstances.length === 1 ? rawInstances[0] : undefined;
   return (
     <DetailsPanel
       title={selection.taskId}
-      kicker={selection.scope === "master" ? "master task" : `${selection.scope} task`}
+      kicker={selection.scope === MASTER_SCOPE ? "master task" : `${selection.scope} task`}
     >
       <p className="details-prose">{summary}</p>
       <DetailRow label="state">
-        <RunStateChip state={group?.state ?? "no instance"} />
+        <RunStateChip state={shownState} />
       </DetailRow>
+      {replayAtMs === null ? null : (
+        <DetailRow label="at">
+          <span className="detail-replay-at">
+            +{formatOffsetCompact((replayAtMs - replayStartMs) / 1000)} ·{" "}
+            {formatInstant(replayAtMs, replayOffsetMinutes)}
+          </span>
+        </DetailRow>
+      )}
       {single ? (
         <>
           <DetailRow label="started">
@@ -253,7 +317,11 @@ function TaskInstanceDetails({
         </>
       ) : null}
       {mappedInstances.length > 0 ? (
-        <DetailBlock label={`mapped instances · ${mappedInstances.length}`}>
+        <DetailBlock
+          label={`mapped instances · ${mappedInstances.length}${
+            replayAtMs === null ? "" : " · at the playhead"
+          }`}
+        >
           <ul className="instance-list">
             {mappedInstances.map((instance) => (
               <li key={instance.map_index} className="instance-row">
@@ -263,13 +331,23 @@ function TaskInstanceDetails({
                   {formatDurationCompact(instance.duration_s)}
                 </span>
                 {instance.try_number !== null && instance.try_number > 1 ? (
-                  <span className="chip chip-warn">try {instance.try_number}</span>
+                  <span
+                    className="chip chip-warn"
+                    title="Only this last attempt is in the payload; earlier ones are not."
+                  >
+                    try {instance.try_number}
+                  </span>
                 ) : null}
               </li>
             ))}
           </ul>
         </DetailBlock>
       ) : null}
+      {replayAtMs === null ? null : (
+        <p className="details-hint">
+          States are reconstructed at the playhead; the timings above are the run's own.
+        </p>
+      )}
       {taskUrl ? (
         <a className="btn btn-tiny" href={taskUrl} target="_blank" rel="noreferrer">
           <ExternalLinkIcon />
@@ -313,17 +391,41 @@ function StageRunGraph({
   selection,
   onSelect,
   airflowWebUrl,
+  replayAtMs,
+  replayEndMs,
 }: {
   stage: RunGraphStage;
   topology: DagTopology | undefined;
   selection: RunNodeSelection | null;
   onSelect: (selection: RunNodeSelection) => void;
   airflowWebUrl: string | null;
+  /** Non-null while the playhead is parked: paint this instant, not the live state. */
+  replayAtMs: number | null;
+  replayEndMs: number;
 }) {
-  const groups = useMemo(
-    () => instanceGroupsByTaskId(stage.tasks, stage.mapped_summary),
-    [stage.tasks, stage.mapped_summary],
+  // Replaying re-states the instances at the playhead and recounts the
+  // fan-out from them; the server's summary is the run's final split, which
+  // would contradict the bars mid-scrub.
+  const tasks = useMemo(
+    () =>
+      replayAtMs === null ? stage.tasks : replayTaskInstances(stage.tasks, replayAtMs, replayEndMs),
+    [stage.tasks, replayAtMs, replayEndMs],
   );
+  const mappedSummary = useMemo(
+    () =>
+      replayAtMs === null
+        ? stage.mapped_summary
+        : replayedFanOutSummary(stage.mapped_summary, tasks),
+    [stage.mapped_summary, tasks, replayAtMs],
+  );
+  const groups = useMemo(
+    () => instanceGroupsByTaskId(tasks, mappedSummary),
+    [tasks, mappedSummary],
+  );
+  const stageState =
+    replayAtMs === null
+      ? stage.state
+      : replayedRunState(stage.tasks, stage.state, replayAtMs, replayEndMs);
   const runUrl = stage.dag_run_id
     ? airflowRunUrl(airflowWebUrl, stage.dag_id, stage.dag_run_id)
     : null;
@@ -331,11 +433,11 @@ function StageRunGraph({
     <div className="stage-lane-card is-expanded">
       <div className="stage-run-head">
         <span className="lane-stage">{stage.stage}</span>
-        <RunStateChip state={stage.state ?? "not run"} />
+        <RunStateChip state={stageState ?? "not run"} />
         <code className="cell-mono stage-run-dag" title={stage.dag_id}>
           {stage.dag_id}
         </code>
-        {stage.mapped_summary ? <FanOutSummary summary={stage.mapped_summary} /> : null}
+        {mappedSummary ? <FanOutSummary summary={mappedSummary} /> : null}
         <span className="toolbar-spacer" />
         {stage.match === "heuristic" ? (
           <span
@@ -362,7 +464,11 @@ function StageRunGraph({
         </p>
       ) : (
         <DagGraph
-          nodes={liveNodes(topology, groups)}
+          nodes={liveNodes(
+            topology,
+            groups,
+            replayAtMs === null ? "no instance" : NOT_STARTED_STATE,
+          )}
           edges={topology.edges.map(([from, to]) => ({ from, to }))}
           label={`${stage.stage} sub-DAG for this run`}
           selectedNodeId={selection?.scope === stage.stage ? selection.taskId : null}
@@ -377,26 +483,57 @@ function RunGraphSection({
   runGraph,
   graph,
   airflowWebUrl,
+  isAutoRefreshOn,
 }: {
   runGraph: RunGraphResponse;
   graph: PipelineGraphResponse;
   airflowWebUrl: string | null;
+  isAutoRefreshOn: boolean;
 }) {
   const [selection, setSelection] = useState<RunNodeSelection | null>(null);
-  const masterGroups = useMemo(
+  // null = pinned to the axis end, which for an unfinished run is live; any
+  // number is a parked playhead, and parking is what detaches from live.
+  const [playheadChoice, setPlayheadChoice] = useState<number | null>(null);
+
+  const prefersReducedMotion = usePrefersReducedMotion();
+  const unfinished = isRunUnfinished(runGraph);
+  const nowMs = useNowTick(
+    unfinished
+      ? prefersReducedMotion
+        ? LIVE_TICK_INTERVAL_REDUCED_MOTION_MS
+        : LIVE_TICK_INTERVAL_MS
+      : null,
+  );
+  const replay = useMemo(() => buildRunReplay(runGraph, graph, nowMs), [runGraph, graph, nowMs]);
+  const playheadMs = playheadChoice ?? replay.endMs;
+  // Only a parked playhead repaints the graphs; pinned to the end, the page
+  // shows the payload exactly as the server sent it.
+  const replayAtMs = playheadChoice === null ? null : playheadMs;
+
+  const masterTasks = useMemo(
+    () =>
+      replayAtMs === null
+        ? runGraph.master.tasks
+        : replayTaskInstances(runGraph.master.tasks, replayAtMs, replay.endMs),
+    [runGraph.master.tasks, replayAtMs, replay.endMs],
+  );
+  const masterGroups = useMemo(() => instanceGroupsByTaskId(masterTasks, null), [masterTasks]);
+  // The details panel reads the RAW instances: its timestamps and tries are
+  // facts about the run, not about the instant being replayed.
+  const rawMasterGroups = useMemo(
     () => instanceGroupsByTaskId(runGraph.master.tasks, null),
     [runGraph.master.tasks],
   );
 
   const selectedStage =
-    selection && selection.scope !== "master"
+    selection && selection.scope !== MASTER_SCOPE
       ? runGraph.stages.find((stage) => stage.stage === selection.scope)
       : undefined;
   const selectedGroup =
     selection === null
       ? undefined
-      : selection.scope === "master"
-        ? masterGroups.get(selection.taskId)
+      : selection.scope === MASTER_SCOPE
+        ? rawMasterGroups.get(selection.taskId)
         : selectedStage
           ? instanceGroupsByTaskId(selectedStage.tasks, selectedStage.mapped_summary).get(
               selection.taskId,
@@ -405,30 +542,59 @@ function RunGraphSection({
   const selectedTopology =
     selection === null
       ? undefined
-      : selection.scope === "master"
+      : selection.scope === MASTER_SCOPE
         ? graph.master
         : graph.stages.find((stage) => stage.stage === selection.scope)?.dag;
   const selectedSummary =
     selectedTopology?.tasks.find((task) => task.task_id === selection?.taskId)?.summary ??
     "This task is not part of the topology this server describes.";
 
+  const masterState =
+    replayAtMs === null
+      ? runGraph.master.state
+      : replayedRunState(runGraph.master.tasks, runGraph.master.state, replayAtMs, replay.endMs);
+
   return (
     <section className="section">
       <h2 className="section-title">Run graph</h2>
       <div className="run-graph-head">
-        <RunStateChip state={runGraph.master.state} />
+        <RunStateChip state={masterState} />
         <code className="cell-mono run-graph-id" title={runGraph.master.dag_run_id}>
           {runGraph.master.dag_run_id}
         </code>
+        {replayAtMs === null ? null : (
+          <span
+            className="chip chip-accent"
+            title={`The graphs are painted as of ${formatInstant(
+              replayAtMs,
+              replay.offsetMinutes,
+            )} ${formatOffsetLabel(replay.offsetMinutes)}, not at the live state.`}
+          >
+            replay +{formatOffsetCompact((replayAtMs - replay.startMs) / 1000)}
+          </span>
+        )}
       </div>
-      <div className="graph-layout">
+      <div className={replayAtMs === null ? "graph-layout" : "graph-layout is-replaying"}>
         <div className="graph-column">
           <DagGraph
-            nodes={liveNodes(graph.master, masterGroups)}
+            nodes={liveNodes(
+              graph.master,
+              masterGroups,
+              replayAtMs === null ? "no instance" : NOT_STARTED_STATE,
+            )}
             edges={graph.master.edges.map(([from, to]) => ({ from, to }))}
             label="Master DAG for this run"
-            selectedNodeId={selection?.scope === "master" ? selection.taskId : null}
-            onSelectNode={(taskId) => setSelection({ scope: "master", taskId })}
+            selectedNodeId={selection?.scope === MASTER_SCOPE ? selection.taskId : null}
+            onSelectNode={(taskId) => setSelection({ scope: MASTER_SCOPE, taskId })}
+          />
+          <RunTimeline
+            replay={replay}
+            playheadMs={playheadMs}
+            onPlayheadChange={setPlayheadChoice}
+            isPinnedToEnd={playheadChoice === null}
+            selection={selection}
+            onSelect={setSelection}
+            isAutoRefreshOn={isAutoRefreshOn}
           />
           <div className="stage-lane-list">
             {runGraph.stages.map((stage) => (
@@ -439,6 +605,8 @@ function RunGraphSection({
                 selection={selection}
                 onSelect={setSelection}
                 airflowWebUrl={airflowWebUrl}
+                replayAtMs={replayAtMs}
+                replayEndMs={replay.endMs}
               />
             ))}
           </div>
@@ -447,9 +615,9 @@ function RunGraphSection({
           {selection === null ? (
             <DetailsPanel title="No task selected" kicker="details">
               <p className="details-hint">
-                Select a node in the master DAG or a stage sub-DAG to see its state, timings and
-                tries. Stacked nodes are mapped fan-outs: their badge is the batch split, and the
-                panel lists every instance.
+                Select a node in the master DAG, a row in the replay, or a node in a stage sub-DAG
+                to see its state, timings and tries. Stacked nodes are mapped fan-outs: their badge
+                is the batch split, and the panel lists every instance.
               </p>
             </DetailsPanel>
           ) : (
@@ -458,14 +626,20 @@ function RunGraphSection({
               group={selectedGroup}
               summary={selectedSummary}
               dagId={
-                selection.scope === "master" ? graph.master.dag_id : (selectedStage?.dag_id ?? "")
+                selection.scope === MASTER_SCOPE
+                  ? graph.master.dag_id
+                  : (selectedStage?.dag_id ?? "")
               }
               dagRunId={
-                selection.scope === "master"
+                selection.scope === MASTER_SCOPE
                   ? runGraph.master.dag_run_id
                   : (selectedStage?.dag_run_id ?? null)
               }
               airflowWebUrl={airflowWebUrl}
+              replayAtMs={replayAtMs}
+              replayEndMs={replay.endMs}
+              replayStartMs={replay.startMs}
+              replayOffsetMinutes={replay.offsetMinutes}
             />
           )}
         </div>
@@ -914,6 +1088,7 @@ export function RunsPage() {
               runGraph={runGraphQuery.data}
               graph={topologyQuery.data}
               airflowWebUrl={runtimeStatus.airflow_web_url}
+              isAutoRefreshOn={isAutoRefreshOn}
             />
           ) : runGraphQuery.isError || topologyQuery.isError ? (
             <section className="section">
