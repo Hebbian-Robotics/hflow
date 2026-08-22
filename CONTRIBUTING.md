@@ -76,12 +76,13 @@ uv run --python 3.11 --locked --all-extras pytest -q
 uv run --python 3.14 --locked --all-extras pytest -q
 ```
 
-Two integration tests are intentionally opt-in because they need network or
-Docker access:
+Three integration test suites are intentionally opt-in because they need
+network access, Docker, or a writable object-store prefix:
 
 ```bash
 HFLOW_NETWORK_TESTS=1 uv run pytest tests/test_ffmpeg.py -q
 HFLOW_DOCKER_TESTS=1 uv run pytest tests/test_runtime_integration.py -q
+HFLOW_TEST_BUCKET_URL=gs://your-bucket/tmp-prefix uv run pytest tests/test_storage.py -q
 ```
 
 Run the Docker test when changing the runtime bundle, DAG templates, REST
