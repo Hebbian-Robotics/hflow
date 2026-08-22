@@ -1,23 +1,22 @@
 """The pipeline page API: the startup-imported App described over the catalog.
 
 ``--pipeline path/to/pipeline.py[:app]`` names a Python file this server
-imports -- EXECUTES -- exactly once at startup (the same spec-import idiom as
-the core CLI's pipeline commands; producing a manifest requires the live
-functions, because step versions are content hashes of them). The operator
-opts into running their own pipeline code by passing the flag; an import
-failure never crashes the server -- the error string is remembered, the
-config capability reports false, and /api/v1/pipeline answers 409 with the
-stored reason.
+imports -- EXECUTES -- exactly once at startup via the shared
+:func:`hflow.import_pipeline_application` seam (the one owner of the "address
+a pipeline by file" contract, used by the CLI too; producing a manifest
+requires the live functions, because step versions are content hashes of
+them). The operator opts into running their own pipeline code by passing the
+flag; an import failure never crashes the server -- the error string is
+remembered, the config capability reports false, and /api/v1/pipeline answers
+409 with the stored reason.
 """
 
-import importlib.util
 from dataclasses import dataclass
-from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
-from hflow import App
+from hflow import App, import_pipeline_application
 from hflow.curation import stale_episodes
 from hflow.format import EPISODE_FORMAT_VERSION
 from hflow.manifest import PipelineManifest
@@ -25,10 +24,6 @@ from hflow.steps import Stage
 from hflow.workspace import Workspace
 from hflow_ui import _catalog
 from hflow_ui._settings import UiSettings
-
-# The module name the imported pipeline file executes under (never registered
-# in sys.modules, so repeated launches cannot collide).
-_PIPELINE_MODULE_NAME = "hflow_ui_user_pipeline"
 
 
 @dataclass(frozen=True)
@@ -41,38 +36,6 @@ class PipelineState:
     @property
     def available(self) -> bool:
         return self.application is not None
-
-
-def _parse_pipeline_spec(pipeline_spec: str) -> tuple[Path, str]:
-    """Split ``path/to/pipeline.py[:app_variable]`` (default variable ``app``);
-    the same rule as the core CLI's spec parsing."""
-    path_part, separator, variable_part = pipeline_spec.rpartition(":")
-    if separator and path_part and variable_part.isidentifier():
-        return Path(path_part), variable_part
-    return Path(pipeline_spec), "app"
-
-
-def import_pipeline_application(pipeline_spec: str) -> App:
-    """Import ``path/to/pipeline.py[:app]`` and return its App, loudly.
-
-    EXECUTES the file (the CLI's spec-import idiom, copied rather than
-    imported from its private module). The file is arbitrary user code: any
-    exception it raises becomes a ``ValueError`` naming the file, never a
-    crash.
-    """
-    pipeline_file, app_variable = _parse_pipeline_spec(pipeline_spec)
-    spec = importlib.util.spec_from_file_location(_PIPELINE_MODULE_NAME, pipeline_file)
-    if spec is None or spec.loader is None:
-        raise ValueError(f"cannot import pipeline file {pipeline_file}")
-    module = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(module)
-    except Exception as error:
-        raise ValueError(f"importing {pipeline_file} failed: {error}") from error
-    application = getattr(module, app_variable, None)
-    if not isinstance(application, App):
-        raise ValueError(f"{pipeline_file} has no hflow.App named {app_variable!r}")
-    return application
 
 
 def load_pipeline_state(pipeline_spec: str | None) -> PipelineState:

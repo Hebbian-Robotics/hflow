@@ -9,7 +9,9 @@ the ``<data_root>/ui/state.json`` sidecar (both refused when
 ``settings.read_only``); the server never mints workspace identity.
 """
 
+import copy
 import importlib.resources
+import logging
 import os
 import socket
 import threading
@@ -21,6 +23,10 @@ import duckdb
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.requests import Request
+from uvicorn.config import LOGGING_CONFIG
+from uvicorn.logging import AccessFormatter
 
 import hflow
 from hflow.format import CATALOG_FORMAT_VERSION
@@ -34,6 +40,31 @@ from hflow_ui._settings import UiSettings
 ASSETS_ENVIRONMENT_VARIABLE = "HFLOW_UI_ASSETS"
 
 _PORT_RETRY_ATTEMPTS = 10
+
+# A blanket cap on request-body size: comfortably above the curation studio's
+# own per-field limits (a 100k SQL body plus JSON overhead), but a hard stop
+# on an unbounded POST -- the sidecar is the one file the UI writes outside
+# manifests/, so nothing it persists should be able to grow without limit.
+_MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024
+
+
+class RequestBodySizeLimitMiddleware(BaseHTTPMiddleware):
+    """Refuses any request whose declared body exceeds the size cap (413)."""
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                declared_length = int(content_length)
+            except ValueError:
+                declared_length = None
+            if declared_length is not None and declared_length > _MAX_REQUEST_BODY_BYTES:
+                return JSONResponse(
+                    {"detail": "request body too large"},
+                    status_code=413,
+                )
+        return await call_next(request)
+
 
 _FRONTEND_PLACEHOLDER_PAGE = """<!doctype html>
 <html>
@@ -65,8 +96,11 @@ def create_app(settings: UiSettings) -> FastAPI:
         openapi_url="/api/openapi.json",
         redoc_url=None,
     )
+    # Body-size cap is outermost (added last): reject an oversized POST before
+    # auth or routing touches it.
     if settings.token is not None:
         application.add_middleware(SessionTokenMiddleware, session_token=settings.token)
+    application.add_middleware(RequestBodySizeLimitMiddleware)
 
     # --pipeline is imported -- EXECUTED -- exactly once, here at app
     # construction; the outcome (the live App, or the remembered failure) is
@@ -317,6 +351,35 @@ def _contained_asset_response(assets_directory: Path, requested_path: str) -> Fi
     return FileResponse(resolved_candidate)
 
 
+class _QueryStringStrippingAccessFormatter(AccessFormatter):
+    """uvicorn access formatter that logs the path WITHOUT its query string.
+
+    The login ``?token=`` (and any other query param) would otherwise land in
+    the access line for every request -- a 256-bit credential written to
+    stdout, which ``serve`` itself anticipates being piped to a supervisor's
+    log. Dropping the query string keeps the useful method/path/status line.
+    """
+
+    def formatMessage(self, record: logging.LogRecord) -> str:
+        # uvicorn's access record carries (client_addr, method, full_path,
+        # http_version, status_code); full_path includes the query string.
+        if isinstance(record.args, tuple) and len(record.args) == 5:
+            client_addr, method, full_path, http_version, status_code = record.args
+            path_without_query = str(full_path).split("?", 1)[0]
+            record.args = (client_addr, method, path_without_query, http_version, status_code)
+        return super().formatMessage(record)
+
+
+def _access_log_config() -> dict[str, object]:
+    """uvicorn's default logging config with the query-string-dropping access
+    formatter swapped in."""
+    log_config = copy.deepcopy(LOGGING_CONFIG)
+    log_config["formatters"]["access"]["()"] = (
+        f"{__name__}.{_QueryStringStrippingAccessFormatter.__name__}"
+    )
+    return log_config
+
+
 def serve(settings: UiSettings) -> None:
     """Run the workspace UI: free port, printed (tokened) URL, browser, uvicorn."""
     application = create_app(settings)
@@ -339,7 +402,13 @@ def serve(settings: UiSettings) -> None:
         browser_timer = threading.Timer(1.0, webbrowser.open, args=[login_url])
         browser_timer.daemon = True
         browser_timer.start()
-    uvicorn.run(application, host=settings.host, port=chosen_port, log_level="info")
+    uvicorn.run(
+        application,
+        host=settings.host,
+        port=chosen_port,
+        log_level="info",
+        log_config=_access_log_config(),
+    )
 
 
 def _first_free_port(host: str, preferred_port: int) -> int:

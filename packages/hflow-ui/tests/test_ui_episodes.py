@@ -35,6 +35,34 @@ def test_timestamps_are_iso_8601_strings(api: TestClient) -> None:
         assert datetime.fromisoformat(row["recorded_at"]).tzinfo is not None
 
 
+def test_timestamps_use_a_full_colon_utc_offset(api: TestClient) -> None:
+    # DuckDB's strftime %z renders the offset as "+00" (which JS Date.parse
+    # rejects and the frontend's offset regex misses); every timestamp must
+    # carry the full "+00:00" the rest of the stack assumes.
+    for row in _episode_rows(api)["rows"]:
+        assert row["recorded_at"].endswith("+00:00"), row["recorded_at"]
+        assert not row["recorded_at"].endswith("+00")  # sanity: not the bare form
+
+
+def test_pagination_over_a_tied_sort_key_never_overlaps_or_drops(api: TestClient) -> None:
+    # pipeline_version is identical across all four episodes, so without a
+    # deterministic tiebreaker successive pages could overlap or drop rows.
+    total = _episode_rows(api, order_by="pipeline_version")["total"]
+    assert total == 4
+    seen_ids: list[str] = []
+    for offset in range(0, total, 2):
+        page = _episode_rows(api, order_by="pipeline_version", order="asc", limit=2, offset=offset)
+        seen_ids.extend(row["episode_id"] for row in page["rows"])
+    # Every episode appears exactly once across the walked pages.
+    assert len(seen_ids) == total
+    assert len(set(seen_ids)) == total
+    # And the walk is repeatable: the same offsets return the same rows.
+    repeat_first_page = _episode_rows(
+        api, order_by="pipeline_version", order="asc", limit=2, offset=0
+    )
+    assert [row["episode_id"] for row in repeat_first_page["rows"]] == seen_ids[:2]
+
+
 def test_non_finite_doubles_become_null(
     api: TestClient, populated_workspace: PopulatedWorkspace
 ) -> None:

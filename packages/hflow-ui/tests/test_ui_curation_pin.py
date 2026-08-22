@@ -1,6 +1,7 @@
 """POST /api/v1/curation/pin and /api/v1/manifests: immutable pinned cuts."""
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import duckdb
@@ -82,16 +83,58 @@ def test_a_filename_collision_is_refused_never_overwritten(
     assert [file.name for file in manifest_files] == [entry["manifest_path"].split("/")[-1]]
 
 
-def test_pin_requires_a_sluggable_name(writable_api: TestClient) -> None:
+def test_pin_requires_a_nonempty_name(writable_api: TestClient) -> None:
     assert (
         writable_api.post("/api/v1/curation/pin", json={"sql": OK_CUT_SQL, "name": ""}).status_code
         == 422
     )
-    symbols_only = writable_api.post(
-        "/api/v1/curation/pin", json={"sql": OK_CUT_SQL, "name": "!!!"}
-    )
-    assert symbols_only.status_code == 400
-    assert "letter or digit" in symbols_only.json()["detail"]
+
+
+def test_pin_names_without_ascii_alphanumerics_fall_back_to_a_slug(
+    writable_api: TestClient,
+) -> None:
+    # Symbols-only and non-Latin-script names are valid: the full Unicode name
+    # is stored, and the on-disk filename uses the fallback slug (the
+    # timestamp suffix keeps it unique) rather than being refused.
+    symbols_only = _pin(writable_api, "!!!")
+    assert symbols_only["name"] == "!!!"
+    assert symbols_only["manifest_path"].startswith("manifests/manifest-")
+
+    non_latin = _pin(writable_api, "数据集")
+    assert non_latin["name"] == "数据集"
+    assert non_latin["manifest_path"].startswith("manifests/manifest-")
+
+
+def test_concurrent_pins_all_land_in_the_registry(
+    writable_api: TestClient, writable_workspace: PopulatedWorkspace
+) -> None:
+    # FastAPI runs these sync endpoints on a threadpool; without a lock around
+    # the sidecar read-modify-write, overlapping pins would drop each other's
+    # acknowledged registry entry and strand parquet files. Fire several at
+    # once and assert every acknowledged pin is registered.
+    names = [f"cut-{index}" for index in range(6)]
+    with ThreadPoolExecutor(max_workers=len(names)) as pool:
+        responses = list(
+            pool.map(
+                lambda name: writable_api.post(
+                    "/api/v1/curation/pin", json={"sql": OK_CUT_SQL, "name": name}
+                ),
+                names,
+            )
+        )
+    acknowledged_ids = set()
+    for response in responses:
+        assert response.status_code == 200, response.text
+        acknowledged_ids.add(response.json()["id"])
+    assert len(acknowledged_ids) == len(names)
+    registered_ids = {
+        manifest["id"] for manifest in writable_api.get("/api/v1/manifests").json()["manifests"]
+    }
+    # No acknowledged pin was silently dropped.
+    assert acknowledged_ids <= registered_ids
+    # And no parquet is stranded (every file on disk has a registry entry).
+    manifest_files = list((writable_workspace.data_root / "manifests").glob("*.parquet"))
+    assert len(manifest_files) == len(names)
 
 
 def test_pin_with_bad_sql_is_400_and_registers_nothing(

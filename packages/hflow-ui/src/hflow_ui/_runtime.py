@@ -18,11 +18,12 @@ Two rules hold at this boundary:
   other endpoints refuse with a clear 4xx/502 detail.
 """
 
-import json
+import logging
 import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from posixpath import normpath
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
@@ -47,9 +48,6 @@ from hflow_ui._settings import UiSettings
 # contract); restated here rather than imported from that private module.
 AIRFLOW_URL_ENVIRONMENT_VARIABLE = "HFLOW_AIRFLOW_URL"
 
-# Mirrors hflow.runtime._bundle's manifest filename (same restatement rule).
-BUNDLE_MANIFEST_FILE_NAME = "hflow-bundle.json"
-
 # How long one resolution (bundle files read, client built) is reused before
 # the next request re-probes -- long enough to spare a busy Runs page the
 # filesystem walk, short enough that `hflow up` shows up within seconds.
@@ -59,6 +57,38 @@ RESOLUTION_CACHE_TTL_S = 5.0
 _HEALTH_COMPONENT_NAMES = ("metadatabase", "scheduler", "triggerer", "dag_processor")
 
 _RECENT_STAGE_RUN_LIMIT = 5
+
+_LOGGER = logging.getLogger("hflow_ui.runtime")
+
+
+def _client_error_reason(error: AirflowClientError) -> str:
+    """A stable machine-readable classification of an Airflow call failure."""
+    if error.status in (401, 403):
+        return "unauthorized"
+    if error.status is not None:
+        return "http_error"
+    return "unreachable"
+
+
+def _client_error_detail(error: AirflowClientError, *, source: str) -> str:
+    """A browser-safe detail for an Airflow call failure.
+
+    A local bundle's api-server address is one the operator already has, so
+    its verbatim message (which embeds that URL) is fine. A REMOTE runtime's
+    base URL is deliberately withheld on the success path, and the verbatim
+    message embeds that URL plus an excerpt of the upstream response body --
+    so a remote failure returns only a generic detail with a stable reason
+    code, and the full error is logged server-side for the operator.
+    """
+    if source == "bundle":
+        return str(error)
+    reason = _client_error_reason(error)
+    _LOGGER.warning("remote Airflow call failed (reason=%s): %s", reason, error)
+    if error.status is not None:
+        return (
+            f"the remote ingest runtime returned an error (reason: {reason}, status {error.status})"
+        )
+    return f"the remote ingest runtime is not reachable (reason: {reason})"
 
 
 @dataclass(frozen=True)
@@ -133,37 +163,15 @@ def local_bundle_web_url(data_root: str) -> str | None:
         return None
 
 
-def _bundle_stage_dag_ids(
-    bundle_directory: Path, master_dag_id: str
-) -> tuple[tuple[str, str], ...]:
+def _stage_dag_ids(master_dag_id: str) -> tuple[tuple[str, str], ...]:
     """(stage name, sub-DAG id) pairs in stage-graph order.
 
-    Preferred source: the bundle's own ``hflow-bundle.json`` manifest, which
-    records ``sub_dag_ids`` as data. Pre-manifest bundles (or mangled
-    manifests) fall back to the same public derivation the renderer used
-    (:func:`hflow.runtime.sub_dag_id_for_stage` over the master id).
+    The sub-DAG ids derive from the master's id the same way the renderer
+    minted them (:func:`hflow.runtime.sub_dag_id_for_stage`), so there is one
+    owner of that mapping and no second bundle-manifest parser to drift from
+    the library's version-guarded :func:`hflow.runtime.load_bundle`.
     """
-    recorded_ids: dict[str, str] = {}
-    manifest_file = bundle_directory / BUNDLE_MANIFEST_FILE_NAME
-    try:
-        manifest_payload = json.loads(manifest_file.read_text())
-    except (OSError, json.JSONDecodeError):
-        manifest_payload = None
-    if isinstance(manifest_payload, dict):
-        raw_sub_dag_ids = manifest_payload.get("sub_dag_ids")
-        if isinstance(raw_sub_dag_ids, dict):
-            recorded_ids = {
-                str(stage_name): sub_dag_id
-                for stage_name, sub_dag_id in raw_sub_dag_ids.items()
-                if isinstance(sub_dag_id, str) and sub_dag_id
-            }
-    return tuple(
-        (
-            stage.value,
-            recorded_ids.get(stage.value) or sub_dag_id_for_stage(master_dag_id, stage),
-        )
-        for stage in Stage
-    )
+    return tuple((stage.value, sub_dag_id_for_stage(master_dag_id, stage)) for stage in Stage)
 
 
 def resolve_runtime(data_root: str) -> RuntimeResolution:
@@ -185,7 +193,7 @@ def resolve_runtime(data_root: str) -> RuntimeResolution:
             dag_id=bundle_paths.dag_id,
             source="bundle",
             airflow_web_url=bundle_paths.api_base_url,
-            stage_dag_ids=_bundle_stage_dag_ids(bundle_directory, bundle_paths.dag_id),
+            stage_dag_ids=_stage_dag_ids(bundle_paths.dag_id),
         )
     try:
         endpoint = resolve_remote_endpoint()
@@ -304,7 +312,7 @@ def create_runtime_router(settings: UiSettings) -> APIRouter:
             # still an available:false ANSWER, with the addressing facts.
             return JSONResponse(
                 _unavailable_status_payload(
-                    str(error),
+                    _client_error_detail(error, source=resolution.source),
                     source=resolution.source,
                     airflow_web_url=resolution.airflow_web_url,
                     dag_id=resolution.dag_id,
@@ -343,7 +351,9 @@ def create_runtime_router(settings: UiSettings) -> APIRouter:
             # newest-first is the only ordering that shows recent activity.
             master_runs = runtime.client.dag_runs(runtime.dag_id, limit=limit, order_by="-id")
         except AirflowClientError as error:
-            raise HTTPException(status_code=502, detail=str(error)) from error
+            raise HTTPException(
+                status_code=502, detail=_client_error_detail(error, source=runtime.source)
+            ) from error
         stages: list[dict[str, object]] | None = None
         if runtime.stage_dag_ids is not None:
             stages = []
@@ -371,6 +381,17 @@ def create_runtime_router(settings: UiSettings) -> APIRouter:
         uris = [uri.strip() for uri in request.uris]
         if any(not uri for uri in uris):
             raise HTTPException(status_code=400, detail="every uri must be a non-empty string")
+        # URIs resolve against the runtime's data root; absolute host paths and
+        # ../ escapes cannot work there, so refuse them before triggering --
+        # the same guard `hflow ingest` enforces (src/hflow/cli.py).
+        for uri in uris:
+            if uri.startswith("/") or normpath(uri).startswith(".."):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{uri!r} is not relative to the data root -- URIs are resolved "
+                    "against the runtime's configured data root (e.g. "
+                    "`episodes-in/run_0001.mcap`)",
+                )
         if request.profile not in RUN_PROFILES:
             raise HTTPException(
                 status_code=400,
@@ -387,25 +408,20 @@ def create_runtime_router(settings: UiSettings) -> APIRouter:
             ) from error
         runtime = resolved_or_refuse()
         try:
-            if request.batch_count is None:
-                trigger_response = runtime.client.ingest(
-                    runtime.dag_id, uris, profile=request.profile, online=mode is IngestMode.ONLINE
-                )
-            else:
-                # AirflowClient.ingest has no batch_count seam; compose the
-                # same conf shape the master DAG's params declare (uris/
-                # profile/mode/batch_count) over the public trigger method.
-                trigger_response = runtime.client.trigger_dag_run(
-                    runtime.dag_id,
-                    conf={
-                        "uris": uris,
-                        "profile": request.profile,
-                        "mode": mode.value,
-                        "batch_count": request.batch_count,
-                    },
-                )
+            # AirflowClient.ingest owns the trigger conf's shape (uris/profile/
+            # mode/batch_count) for every caller -- CLI, UI, control plane --
+            # so the UI never rebuilds the dict itself.
+            trigger_response = runtime.client.ingest(
+                runtime.dag_id,
+                uris,
+                profile=request.profile,
+                online=mode is IngestMode.ONLINE,
+                batch_count=request.batch_count,
+            )
         except AirflowClientError as error:
-            raise HTTPException(status_code=502, detail=str(error)) from error
+            raise HTTPException(
+                status_code=502, detail=_client_error_detail(error, source=runtime.source)
+            ) from error
         return JSONResponse(
             {
                 "dag_run_id": trigger_response.get("dag_run_id"),

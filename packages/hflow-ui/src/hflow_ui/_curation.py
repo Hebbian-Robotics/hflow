@@ -19,6 +19,7 @@ The registry describing them lives in the sidecar (see ``_sidecar``).
 """
 
 import re
+import threading
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -49,36 +50,57 @@ CATALOG_TABLE_NAMES = (
 
 _TIMESTAMPTZ_TYPE = "TIMESTAMP WITH TIME ZONE"
 
+# Upper bounds on everything that can be persisted into the sidecar (which is
+# fully re-read and re-serialized on every list request): a name, a
+# description, one SQL body, and the number of stored entries. Generous for
+# real use, but they make the one file the UI writes outside manifests/
+# bounded instead of unbounded.
+_MAX_NAME_LENGTH = 200
+_MAX_DESCRIPTION_LENGTH = 2000
+_MAX_SQL_LENGTH = 100_000
+_MAX_SAVED_QUERIES = 1000
+_MAX_PINNED_MANIFESTS = 1000
+
 
 class PreviewRequest(BaseModel):
-    sql: str
+    sql: str = Field(max_length=_MAX_SQL_LENGTH)
     limit: int = Field(default=100, ge=1, le=1000)
     stats: bool = False
 
 
 class ReportRequest(BaseModel):
-    sql: str
+    sql: str = Field(max_length=_MAX_SQL_LENGTH)
 
 
 class PinRequest(BaseModel):
-    sql: str
-    name: str = Field(min_length=1)
-    description: str = ""
+    sql: str = Field(max_length=_MAX_SQL_LENGTH)
+    name: str = Field(min_length=1, max_length=_MAX_NAME_LENGTH)
+    description: str = Field(default="", max_length=_MAX_DESCRIPTION_LENGTH)
 
 
 class SavedQueryCreateRequest(BaseModel):
-    name: str = Field(min_length=1)
-    sql: str
+    name: str = Field(min_length=1, max_length=_MAX_NAME_LENGTH)
+    sql: str = Field(max_length=_MAX_SQL_LENGTH)
 
 
 class SavedQueryUpdateRequest(BaseModel):
-    name: str | None = None
-    sql: str | None = None
+    name: str | None = Field(default=None, max_length=_MAX_NAME_LENGTH)
+    sql: str | None = Field(default=None, max_length=_MAX_SQL_LENGTH)
+
+
+# Fallback filename slug when a name has no ASCII alphanumerics (a name in a
+# non-Latin script, or symbols only). The full Unicode name is still stored on
+# the registry entry; only the on-disk filename uses the slug, and the
+# timestamp suffix keeps every filename unique regardless.
+_FALLBACK_MANIFEST_SLUG = "manifest"
 
 
 def slugified_manifest_name(raw_name: str) -> str:
-    """The user-given name as a filename slug: lowercase, [a-z0-9-], dashes collapsed."""
-    return re.sub(r"[^a-z0-9]+", "-", raw_name.lower()).strip("-")
+    """The user-given name as a filename slug: lowercase, [a-z0-9-], dashes
+    collapsed. Names with no ASCII alphanumerics (e.g. ``数据集``, ``!!!``)
+    slug to the fallback rather than being refused."""
+    slug = re.sub(r"[^a-z0-9]+", "-", raw_name.lower()).strip("-")
+    return slug or _FALLBACK_MANIFEST_SLUG
 
 
 def _utc_now_iso() -> str:
@@ -103,6 +125,29 @@ def _bad_sql_refusal(error: duckdb.Error) -> HTTPException:
     # DuckDB's parser/binder message IS the useful diagnostic; bad SQL is the
     # caller's mistake, never a server fault (so 400, never 500).
     return HTTPException(status_code=400, detail=str(error))
+
+
+def _reject_non_single_select(user_sql: str) -> None:
+    """Refuse anything that is not exactly one SELECT statement.
+
+    ``execute()`` with no bind parameters runs EVERY statement in the string
+    and returns only the LAST result, so a smuggled second statement
+    (``SELECT ...); CREATE TABLE ...; SELECT ... FROM (SELECT ...``) would run
+    silently -- preview 500s on the resulting shape and report answers over
+    the wrong statement. ``extract_statements`` parses the text WITHOUT
+    executing it; require exactly one statement whose type is SELECT.
+    """
+    parser_connection = duckdb.connect()
+    try:
+        statements = parser_connection.extract_statements(user_sql)
+    except duckdb.Error as error:
+        raise _bad_sql_refusal(error) from error
+    finally:
+        parser_connection.close()
+    if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
+        raise HTTPException(
+            status_code=400, detail="sql must be exactly one read-only SELECT statement"
+        )
 
 
 def _sidecar_refusal(error: _sidecar.SidecarError) -> HTTPException:
@@ -172,8 +217,15 @@ def run_preview(
     )
     count_row = connection.execute(f"SELECT count(*) FROM ({user_sql})").fetchone()
     row_count = int(count_row[0]) if count_row is not None else 0
+    # SUMMARIZE over the SAME timestamp-replaced projection the rows use: the
+    # constrained connection cannot SET TimeZone (locked at open), so a bare
+    # SUMMARIZE would stringify TIMESTAMPTZ min/max/quartiles in the host's
+    # timezone -- inconsistent with (and a different calendar day from) the
+    # UTC ISO text the preview rows already carry.
     column_stats = (
-        _catalog.fetched_json_safe_rows(connection.execute(f"SUMMARIZE SELECT * FROM ({user_sql})"))
+        _catalog.fetched_json_safe_rows(
+            connection.execute(f"SUMMARIZE {select_head} FROM ({user_sql})")
+        )
         if include_stats
         else None
     )
@@ -215,6 +267,12 @@ def _coverage_entries(report: CurationReport) -> tuple[_sidecar.CoverageEntry, .
 def create_curation_router(settings: UiSettings) -> APIRouter:
     """Every M1 curation-studio route, closed over one launch's settings."""
     router = APIRouter(prefix="/api/v1")
+    # FastAPI runs these sync endpoints on a threadpool, so two overlapping
+    # writes (double-submit, two tabs) would both read the same base sidecar
+    # and the later store would silently drop the earlier's entry. One
+    # process-wide lock serializes the whole load->modify->store of every
+    # mutating route -- sufficient for the single-server design.
+    sidecar_write_lock = threading.Lock()
 
     def refuse_when_read_only() -> None:
         if settings.read_only:
@@ -245,6 +303,7 @@ def create_curation_router(settings: UiSettings) -> APIRouter:
     @router.post("/curation/preview")
     def run_curation_preview(request: PreviewRequest) -> JSONResponse:
         user_sql = _stripped_sql_or_refuse(request.sql)
+        _reject_non_single_select(user_sql)
         connection = _open_constrained_connection_or_refuse(settings.data_root)
         try:
             payload = run_preview(
@@ -259,6 +318,7 @@ def create_curation_router(settings: UiSettings) -> APIRouter:
     @router.post("/curation/report")
     def run_curation_report(request: ReportRequest) -> JSONResponse:
         user_sql = _stripped_sql_or_refuse(request.sql)
+        _reject_non_single_select(user_sql)
         report = _curated_or_refused(settings.data_root, user_sql, output=None)
         return JSONResponse(
             {
@@ -272,39 +332,47 @@ def create_curation_router(settings: UiSettings) -> APIRouter:
     def pin_manifest(request: PinRequest) -> JSONResponse:
         refuse_when_read_only()
         user_sql = _stripped_sql_or_refuse(request.sql)
+        _reject_non_single_select(user_sql)
         manifest_slug = slugified_manifest_name(request.name)
-        if not manifest_slug:
-            raise HTTPException(
-                status_code=400, detail="name must contain at least one letter or digit"
+        with sidecar_write_lock:
+            # Load (and thereby validate) the sidecar BEFORE writing the
+            # manifest, so a corrupt registry never strands an unregistered
+            # manifest file. The whole load->curate->store runs under the lock
+            # so a concurrent write cannot drop this pin's acknowledged entry.
+            state = loaded_sidecar_state()
+            if len(state.manifests) >= _MAX_PINNED_MANIFESTS:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"this workspace already has {_MAX_PINNED_MANIFESTS} pinned "
+                    "manifests (the registry cap); remove some before pinning more",
+                )
+            manifests_directory = local_data_root_or_refuse() / MANIFESTS_DIRECTORY_NAME
+            manifest_file = manifests_directory / (
+                f"{manifest_slug}-{_manifest_timestamp()}.parquet"
             )
-        # Load (and thereby validate) the sidecar BEFORE writing the manifest,
-        # so a corrupt registry never strands an unregistered manifest file.
-        state = loaded_sidecar_state()
-        manifests_directory = local_data_root_or_refuse() / MANIFESTS_DIRECTORY_NAME
-        manifest_file = manifests_directory / (f"{manifest_slug}-{_manifest_timestamp()}.parquet")
-        if manifest_file.exists():
-            raise HTTPException(
-                status_code=409,
-                detail=f"manifest file {manifest_file.name} already exists; "
-                "pinned manifests are immutable and never overwritten -- retry the pin",
+            if manifest_file.exists():
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"manifest file {manifest_file.name} already exists; "
+                    "pinned manifests are immutable and never overwritten -- retry the pin",
+                )
+            report = _curated_or_refused(settings.data_root, user_sql, output=manifest_file)
+            entry = _sidecar.PinnedManifest(
+                manifest_id=uuid.uuid4().hex,
+                name=request.name,
+                description=request.description,
+                sql=user_sql,
+                manifest_path=f"{MANIFESTS_DIRECTORY_NAME}/{manifest_file.name}",
+                row_count=report.row_count,
+                total_episodes=report.total_episodes,
+                coverage=_coverage_entries(report),
+                created_at=_utc_now_iso(),
             )
-        report = _curated_or_refused(settings.data_root, user_sql, output=manifest_file)
-        entry = _sidecar.PinnedManifest(
-            manifest_id=uuid.uuid4().hex,
-            name=request.name,
-            description=request.description,
-            sql=user_sql,
-            manifest_path=f"{MANIFESTS_DIRECTORY_NAME}/{manifest_file.name}",
-            row_count=report.row_count,
-            total_episodes=report.total_episodes,
-            coverage=_coverage_entries(report),
-            created_at=_utc_now_iso(),
-        )
-        stored_sidecar_state(
-            _sidecar.SidecarState(
-                saved_queries=state.saved_queries, manifests=(*state.manifests, entry)
+            stored_sidecar_state(
+                _sidecar.SidecarState(
+                    saved_queries=state.saved_queries, manifests=(*state.manifests, entry)
+                )
             )
-        )
         return JSONResponse(entry.to_json_dict())
 
     @router.get("/manifests")
@@ -354,59 +422,68 @@ def create_curation_router(settings: UiSettings) -> APIRouter:
             sql=_stripped_sql_or_refuse(request.sql),
             updated_at=_utc_now_iso(),
         )
-        state = loaded_sidecar_state()
-        stored_sidecar_state(
-            _sidecar.SidecarState(
-                saved_queries=(*state.saved_queries, entry), manifests=state.manifests
+        with sidecar_write_lock:
+            state = loaded_sidecar_state()
+            if len(state.saved_queries) >= _MAX_SAVED_QUERIES:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"this workspace already has {_MAX_SAVED_QUERIES} saved queries "
+                    "(the sidecar cap); remove some before saving more",
+                )
+            stored_sidecar_state(
+                _sidecar.SidecarState(
+                    saved_queries=(*state.saved_queries, entry), manifests=state.manifests
+                )
             )
-        )
         return JSONResponse(entry.to_json_dict())
 
     @router.put("/queries/{query_id}")
     def update_saved_query(query_id: str, request: SavedQueryUpdateRequest) -> JSONResponse:
         refuse_when_read_only()
-        state = loaded_sidecar_state()
-        existing = next(
-            (entry for entry in state.saved_queries if entry.query_id == query_id), None
-        )
-        if existing is None:
-            raise HTTPException(status_code=404, detail=f"no saved query with id {query_id!r}")
-        updated_name = existing.name
-        if request.name is not None:
-            updated_name = request.name.strip()
-            if not updated_name:
-                raise HTTPException(status_code=400, detail="name must be non-empty")
-        updated_sql = (
-            _stripped_sql_or_refuse(request.sql) if request.sql is not None else existing.sql
-        )
-        updated_entry = _sidecar.SavedQuery(
-            query_id=query_id, name=updated_name, sql=updated_sql, updated_at=_utc_now_iso()
-        )
-        stored_sidecar_state(
-            _sidecar.SidecarState(
-                saved_queries=tuple(
-                    updated_entry if entry.query_id == query_id else entry
-                    for entry in state.saved_queries
-                ),
-                manifests=state.manifests,
+        with sidecar_write_lock:
+            state = loaded_sidecar_state()
+            existing = next(
+                (entry for entry in state.saved_queries if entry.query_id == query_id), None
             )
-        )
+            if existing is None:
+                raise HTTPException(status_code=404, detail=f"no saved query with id {query_id!r}")
+            updated_name = existing.name
+            if request.name is not None:
+                updated_name = request.name.strip()
+                if not updated_name:
+                    raise HTTPException(status_code=400, detail="name must be non-empty")
+            updated_sql = (
+                _stripped_sql_or_refuse(request.sql) if request.sql is not None else existing.sql
+            )
+            updated_entry = _sidecar.SavedQuery(
+                query_id=query_id, name=updated_name, sql=updated_sql, updated_at=_utc_now_iso()
+            )
+            stored_sidecar_state(
+                _sidecar.SidecarState(
+                    saved_queries=tuple(
+                        updated_entry if entry.query_id == query_id else entry
+                        for entry in state.saved_queries
+                    ),
+                    manifests=state.manifests,
+                )
+            )
         return JSONResponse(updated_entry.to_json_dict())
 
     @router.delete("/queries/{query_id}", status_code=204)
     def delete_saved_query(query_id: str) -> Response:
         refuse_when_read_only()
-        state = loaded_sidecar_state()
-        if all(entry.query_id != query_id for entry in state.saved_queries):
-            raise HTTPException(status_code=404, detail=f"no saved query with id {query_id!r}")
-        stored_sidecar_state(
-            _sidecar.SidecarState(
-                saved_queries=tuple(
-                    entry for entry in state.saved_queries if entry.query_id != query_id
-                ),
-                manifests=state.manifests,
+        with sidecar_write_lock:
+            state = loaded_sidecar_state()
+            if all(entry.query_id != query_id for entry in state.saved_queries):
+                raise HTTPException(status_code=404, detail=f"no saved query with id {query_id!r}")
+            stored_sidecar_state(
+                _sidecar.SidecarState(
+                    saved_queries=tuple(
+                        entry for entry in state.saved_queries if entry.query_id != query_id
+                    ),
+                    manifests=state.manifests,
+                )
             )
-        )
         return Response(status_code=204)
 
     @router.get("/catalog/tables")

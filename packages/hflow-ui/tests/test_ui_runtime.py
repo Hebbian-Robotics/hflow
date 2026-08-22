@@ -155,6 +155,34 @@ def test_status_addresses_the_remote_environment(
     assert payload["airflow_web_url"] is None
 
 
+def test_status_remote_failure_does_not_leak_the_base_url(
+    runtime_free_cwd: Path,
+    tmp_path: Path,
+    unbuilt_assets_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HFLOW_AIRFLOW_URL", "https://airflow.internal.corp:8443")
+    monkeypatch.setenv("HFLOW_AIRFLOW_DAG_ID", "kitchen_ingest")
+    monkeypatch.setenv("HFLOW_AIRFLOW_TOKEN", "minted-token")
+
+    def unreachable_health(self: AirflowClient) -> AirflowHealth:
+        raise AirflowClientError(
+            "GET https://airflow.internal.corp:8443/api/v2/monitor/health "
+            "unreachable: [Errno 111] Connection refused"
+        )
+
+    monkeypatch.setattr(AirflowClient, "health", unreachable_health)
+    data_root = tmp_path / "bare-root"
+    data_root.mkdir()
+    payload = _client_over(data_root, unbuilt_assets_dir).get("/api/v1/runtime/status").json()
+    assert payload["available"] is False
+    # The remote base URL the success path withholds must not leak on failure.
+    assert "airflow.internal.corp" not in payload["detail"]
+    assert payload["airflow_web_url"] is None
+    # A stable machine-readable reason still rides along.
+    assert "unreachable" in payload["detail"]
+
+
 def test_status_remote_incomplete_environment_names_the_missing_variable(
     runtime_free_cwd: Path,
     tmp_path: Path,
@@ -296,6 +324,24 @@ def test_ingest_validates_profile_and_mode_before_touching_any_runtime(
     assert no_uris.status_code == 422  # pydantic: the list itself must be non-empty
 
 
+def test_ingest_rejects_absolute_and_escaping_uris_before_any_runtime(
+    runtime_free_cwd: Path, tmp_path: Path, unbuilt_assets_dir: Path
+) -> None:
+    # URIs resolve against the runtime's data root; absolute paths and ../
+    # escapes cannot work there, so they are refused with a 400 before the
+    # runtime is even resolved -- the same guard `hflow ingest` enforces.
+    data_root = tmp_path / "bare-root"
+    data_root.mkdir()
+    client = _client_over(data_root, unbuilt_assets_dir)
+    for hostile_uri in ("/etc/passwd", "../../etc/shadow", "sub/../../escape.mcap"):
+        response = client.post(
+            "/api/v1/runtime/ingest",
+            json={"uris": [hostile_uri], "profile": "full", "mode": "batch"},
+        )
+        assert response.status_code == 400, hostile_uri
+        assert "not relative to the data root" in response.json()["detail"]
+
+
 def test_ingest_without_a_runtime_is_a_clear_409(
     runtime_free_cwd: Path, tmp_path: Path, unbuilt_assets_dir: Path
 ) -> None:
@@ -320,12 +366,14 @@ def test_ingest_triggers_the_master_dag(
         *,
         profile: str = "full",
         online: bool = False,
+        batch_count: int | None = None,
         dag_run_id: str | None = None,
     ) -> dict[str, str]:
         captured["dag_id"] = dag_id
         captured["uris"] = uris
         captured["profile"] = profile
         captured["online"] = online
+        captured["batch_count"] = batch_count
         return {"dag_run_id": "manual__ui", "state": "queued"}
 
     monkeypatch.setattr(AirflowClient, "ingest", fake_ingest)
@@ -340,6 +388,7 @@ def test_ingest_triggers_the_master_dag(
         "uris": ["a.mcap", "sub/b.mcap"],
         "profile": "relabel",
         "online": True,
+        "batch_count": None,
     }
 
 
@@ -384,6 +433,7 @@ def test_ingest_maps_airflow_errors_to_502(
         *,
         profile: str = "full",
         online: bool = False,
+        batch_count: int | None = None,
         dag_run_id: str | None = None,
     ) -> dict[str, str]:
         raise AirflowClientError("POST /dagRuns failed with HTTP 503: scheduler down")

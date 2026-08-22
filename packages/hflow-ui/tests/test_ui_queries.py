@@ -67,6 +67,25 @@ def test_update_to_a_blank_name_or_sql_is_refused(writable_api: TestClient) -> N
     )
 
 
+def test_create_refuses_oversized_name_and_sql(writable_api: TestClient) -> None:
+    over_long_name = writable_api.post(
+        "/api/v1/queries", json={"name": "n" * 201, "sql": "SELECT 1"}
+    )
+    assert over_long_name.status_code == 422
+    over_long_sql = writable_api.post(
+        "/api/v1/queries", json={"name": "ok", "sql": "SELECT 1 -- " + "A" * 100_001}
+    )
+    assert over_long_sql.status_code == 422
+
+
+def test_oversized_request_body_is_refused_at_the_boundary(writable_api: TestClient) -> None:
+    # A body far larger than any per-field cap is refused (413) before it is
+    # parsed or persisted.
+    huge_body = {"name": "ok", "sql": "SELECT 1 -- " + "A" * (5 * 1024 * 1024)}
+    response = writable_api.post("/api/v1/queries", json=huge_body)
+    assert response.status_code == 413
+
+
 def test_query_writes_are_403_when_read_only(read_only_api: TestClient) -> None:
     assert read_only_api.get("/api/v1/queries").status_code == 200  # reading stays open
     refusals = [

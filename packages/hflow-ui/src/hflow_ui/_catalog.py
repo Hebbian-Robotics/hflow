@@ -19,7 +19,6 @@ Two boundary rules hold everywhere here:
 
 import json
 import math
-from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -27,17 +26,20 @@ from urllib.parse import quote
 
 import duckdb
 
+from hflow.app import ARTIFACT_MEASUREMENT_KEY_PREFIX, MEDIA_CONTACT_SHEET_STEP_NAME
 from hflow.curation import open_catalog_connection
 from hflow.workspace import Workspace
 from hflow_ui._media import is_uri_servable
 
-CONTACT_SHEET_CHECK_NAME = "media/contact_sheet"
-ARTIFACT_KEY_PREFIX = "artifact/"
-
 _FACET_COLUMN_NAMES = ("task", "operator", "embodiment", "status", "pipeline_version")
 _SEARCHED_COLUMN_NAMES = ("episode_id", "task", "operator")
 
-_ISO_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%f%z"
+# %z renders the locked-UTC offset as "+00" on DuckDB 1.5.5, which JS
+# Date.parse rejects and the frontend's offset-stripping regex misses; the
+# connection is pinned to UTC, so render the wall time and append the offset
+# literally -- matching _curation._timestamp_replace_clause's "+00:00".
+_ISO_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%f"
+_ISO_UTC_OFFSET_SUFFIX = "+00:00"
 
 
 class UnknownOrderColumnError(ValueError):
@@ -57,7 +59,10 @@ def utc_iso_text(timestamp_expression: str, alias: str) -> str:
     ``timestamp_expression`` and ``alias`` are code-owned constants, never
     user input.
     """
-    return f"strftime({timestamp_expression}, '{_ISO_TIMESTAMP_FORMAT}') AS {alias}"
+    return (
+        f"strftime({timestamp_expression}, '{_ISO_TIMESTAMP_FORMAT}') "
+        f"|| '{_ISO_UTC_OFFSET_SUFFIX}' AS {alias}"
+    )
 
 
 def _recorded_at_as_iso_text(qualified_column: str = "recorded_at") -> str:
@@ -132,8 +137,40 @@ def _escaped_like_fragment(raw_value: str) -> str:
     return raw_value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _compiled_conditions(filters: EpisodeListFilters) -> tuple[list[str], list[str]]:
-    conditions: list[str] = []
+def _quoted_sql_literal(value: str) -> str:
+    """One string value as a single-quoted SQL literal (internal quotes doubled)."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+@dataclass(frozen=True)
+class _CompiledFilters:
+    """The WHERE conditions in two parallel forms plus the bind values.
+
+    ``executed_conditions`` carry ``?`` placeholders bound by ``parameters``;
+    ``display_conditions`` inline the same values as quoted literals. Building
+    the display form here (rather than by splitting rendered SQL on '?') means
+    an order_by identifier that itself contains '?' can never be miscounted as
+    a placeholder.
+    """
+
+    executed_conditions: list[str]
+    display_conditions: list[str]
+    parameters: list[str]
+
+    def executed_where(self) -> str:
+        return (
+            (" WHERE " + " AND ".join(self.executed_conditions)) if self.executed_conditions else ""
+        )
+
+    def display_where(self) -> str:
+        return (
+            (" WHERE " + " AND ".join(self.display_conditions)) if self.display_conditions else ""
+        )
+
+
+def _compiled_conditions(filters: EpisodeListFilters) -> _CompiledFilters:
+    executed_conditions: list[str] = []
+    display_conditions: list[str] = []
     parameters: list[str] = []
     exact_match_columns = (
         ("task", filters.tasks),
@@ -142,42 +179,40 @@ def _compiled_conditions(filters: EpisodeListFilters) -> tuple[list[str], list[s
     )
     for column_name, values in exact_match_columns:
         if values:
+            quoted_column = quoted_identifier(column_name)
             placeholders = ", ".join("?" for _ in values)
-            conditions.append(f"{quoted_identifier(column_name)} IN ({placeholders})")
+            executed_conditions.append(f"{quoted_column} IN ({placeholders})")
+            inlined = ", ".join(_quoted_sql_literal(value) for value in values)
+            display_conditions.append(f"{quoted_column} IN ({inlined})")
             parameters.extend(values)
     if filters.status is not None:
-        conditions.append('"status" = ?')
+        executed_conditions.append('"status" = ?')
+        display_conditions.append(f'"status" = {_quoted_sql_literal(filters.status)}')
         parameters.append(filters.status)
     if filters.success is not None:
         # Stored success is a stringified boolean whose casing varies by the
         # recording producer; the filter accepts "true"/"false" regardless.
-        conditions.append('lower("success") = ?')
+        executed_conditions.append('lower("success") = ?')
+        display_conditions.append(f'lower("success") = {_quoted_sql_literal(filters.success)}')
         parameters.append(filters.success)
     if filters.search:
         like_pattern = "%" + _escaped_like_fragment(filters.search) + "%"
-        disjuncts = " OR ".join(
+        pattern_literal = _quoted_sql_literal(like_pattern)
+        executed_disjuncts = " OR ".join(
             f"{quoted_identifier(name)} ILIKE ? ESCAPE '\\'" for name in _SEARCHED_COLUMN_NAMES
         )
-        conditions.append("(" + disjuncts + ")")
+        display_disjuncts = " OR ".join(
+            f"{quoted_identifier(name)} ILIKE {pattern_literal} ESCAPE '\\'"
+            for name in _SEARCHED_COLUMN_NAMES
+        )
+        executed_conditions.append("(" + executed_disjuncts + ")")
+        display_conditions.append("(" + display_disjuncts + ")")
         parameters.extend([like_pattern] * len(_SEARCHED_COLUMN_NAMES))
-    return conditions, parameters
-
-
-def _rendered_display_sql(parameterized_sql: str, parameters: Sequence[str]) -> str:
-    """The compiled SQL with values inlined as quoted literals.
-
-    Execution always uses the parameterized form; this rendering exists so
-    the UI can show -- and the user can paste into ``hflow curate`` -- a
-    runnable query. Values are single-quoted with internal quotes doubled,
-    the same idiom as ``hflow.curation``.
-    """
-    pieces = parameterized_sql.split("?")
-    if len(pieces) != len(parameters) + 1:
-        raise ValueError("placeholder count does not match parameter count")
-    rendered = pieces[0]
-    for parameter_value, following_piece in zip(parameters, pieces[1:], strict=True):
-        rendered += "'" + str(parameter_value).replace("'", "''") + "'" + following_piece
-    return rendered
+    return _CompiledFilters(
+        executed_conditions=executed_conditions,
+        display_conditions=display_conditions,
+        parameters=parameters,
+    )
 
 
 def described_episode_columns(connection: duckdb.DuckDBPyConnection) -> list[dict[str, str]]:
@@ -205,28 +240,29 @@ def query_episode_page(
             f"unknown order_by column {order_by!r}; order by one of the episodes view's "
             "columns (the 'columns' field of this endpoint lists them)"
         )
-    conditions, parameters = _compiled_conditions(filters)
-    where_sql = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+    compiled = _compiled_conditions(filters)
     direction = "DESC" if descending else "ASC"
-    query_tail = (
-        f"FROM episodes{where_sql} "
-        f"ORDER BY {quoted_identifier(order_by)} {direction} LIMIT {limit} OFFSET {offset}"
+    # episode_id is unique in the wide view, so it is a deterministic
+    # tiebreaker: without it, ordering by any column with duplicate values
+    # (task, status, ...) leaves ties unstable across DuckDB's per-query
+    # parallel sort, so successive OFFSET pages could overlap or drop rows.
+    order_clause = f'ORDER BY {quoted_identifier(order_by)} {direction}, "episode_id" ASC'
+    executed_tail = (
+        f"FROM episodes{compiled.executed_where()} {order_clause} LIMIT {limit} OFFSET {offset}"
+    )
+    display_tail = (
+        f"FROM episodes{compiled.display_where()} {order_clause} LIMIT {limit} OFFSET {offset}"
     )
     # The executed form renders recorded_at to ISO text in SQL (see the module
     # note); the displayed form stays the logical query a user would write.
-    executed_sql = f"SELECT * REPLACE ({_recorded_at_as_iso_text()}) {query_tail}"
-    display_sql = f"SELECT * {query_tail}"
-    rows = fetched_json_safe_rows(connection.execute(executed_sql, parameters))
+    executed_sql = f"SELECT * REPLACE ({_recorded_at_as_iso_text()}) {executed_tail}"
+    display_sql = f"SELECT * {display_tail}"
+    rows = fetched_json_safe_rows(connection.execute(executed_sql, compiled.parameters))
     count_row = connection.execute(
-        f"SELECT count(*) FROM episodes{where_sql}", parameters
+        f"SELECT count(*) FROM episodes{compiled.executed_where()}", compiled.parameters
     ).fetchone()
     total = int(count_row[0]) if count_row is not None else 0
-    return EpisodePage(
-        rows=rows,
-        total=total,
-        columns=columns,
-        sql=_rendered_display_sql(display_sql, parameters),
-    )
+    return EpisodePage(rows=rows, total=total, columns=columns, sql=display_sql)
 
 
 def query_episode_facets(
@@ -283,10 +319,6 @@ def _stat_kind(duckdb_type: str) -> str | None:
     return None
 
 
-def _quoted_string_literal(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
-
-
 @dataclass(frozen=True)
 class _NumericColumnPlan:
     """One numeric column that earned a histogram, with its bucket geometry."""
@@ -321,8 +353,9 @@ def query_episode_stats(
     UNION ALL query computing every surviving column's histogram buckets or
     top values against a shared filtered CTE.
     """
-    conditions, parameters = _compiled_conditions(filters)
-    where_sql = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+    compiled = _compiled_conditions(filters)
+    parameters = compiled.parameters
+    where_sql = compiled.executed_where()
     candidate_columns = [
         (column["name"], kind)
         for column in described_episode_columns(connection)
@@ -363,7 +396,15 @@ def query_episode_stats(
             minimum, maximum = float(minimum), float(maximum)
             # NaN/inf values poison min/max (NaN sorts above everything in
             # DuckDB), so a non-finite bound marks the whole column degenerate.
-            if not (math.isfinite(minimum) and math.isfinite(maximum)) or minimum >= maximum:
+            # The span (max - min) can itself overflow to inf even when both
+            # bounds are finite (e.g. -1.7e308 and 1.7e308); an inf bucket
+            # width would be interpolated as the bare token "inf" into the
+            # histogram SQL, so require a finite span too.
+            if (
+                not (math.isfinite(minimum) and math.isfinite(maximum))
+                or not math.isfinite(maximum - minimum)
+                or minimum >= maximum
+            ):
                 continue
             plans.append(_NumericColumnPlan(name=column_name, minimum=minimum, maximum=maximum))
         else:
@@ -382,7 +423,7 @@ def query_episode_stats(
     union_branches: list[str] = []
     for plan in plans:
         quoted_column = quoted_identifier(plan.name)
-        name_literal = _quoted_string_literal(plan.name)
+        name_literal = _quoted_sql_literal(plan.name)
         if isinstance(plan, _NumericColumnPlan):
             # Bounds are data-derived finite floats (never user input), so
             # their repr()s are safe SQL literals.
@@ -464,7 +505,11 @@ def find_media_uri(
     row = connection.execute(
         "SELECT value_text FROM measurements_latest "
         "WHERE episode_id = ? AND check_name = ? AND key = ? AND value_text IS NOT NULL",
-        [episode_id, CONTACT_SHEET_CHECK_NAME, ARTIFACT_KEY_PREFIX + artifact_name],
+        [
+            episode_id,
+            MEDIA_CONTACT_SHEET_STEP_NAME,
+            ARTIFACT_MEASUREMENT_KEY_PREFIX + artifact_name,
+        ],
     ).fetchone()
     return str(row[0]) if row is not None and row[0] is not None else None
 
@@ -559,12 +604,12 @@ def query_episode_dossier(
         "SELECT key, value_text FROM measurements_latest "
         "WHERE episode_id = ? AND check_name = ? AND key LIKE ? AND value_text IS NOT NULL "
         "ORDER BY key",
-        [episode_id, CONTACT_SHEET_CHECK_NAME, ARTIFACT_KEY_PREFIX + "%"],
+        [episode_id, MEDIA_CONTACT_SHEET_STEP_NAME, ARTIFACT_MEASUREMENT_KEY_PREFIX + "%"],
     ).fetchall()
     quoted_episode_id = quote(episode_id, safe="")
     media: list[dict[str, object]] = []
     for key, artifact_uri in media_rows:
-        artifact_name = str(key).removeprefix(ARTIFACT_KEY_PREFIX)
+        artifact_name = str(key).removeprefix(ARTIFACT_MEASUREMENT_KEY_PREFIX)
         served_url = (
             f"/api/v1/episodes/{quoted_episode_id}/media/{quote(artifact_name, safe='/')}"
             if is_uri_servable(str(artifact_uri), data_root=data_root)

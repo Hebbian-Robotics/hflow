@@ -39,6 +39,8 @@ def test_ok_episode_status_and_identity(
     assert episode["operator"] == "alice"
     assert episode["embodiment"] == "arm-1"
     assert datetime.fromisoformat(episode["recorded_at"]).tzinfo is not None
+    # Full "+00:00" offset, not DuckDB's bare "+00" (see _catalog).
+    assert episode["recorded_at"].endswith("+00:00")
 
 
 def test_quarantined_episode_carries_parsed_tags(
