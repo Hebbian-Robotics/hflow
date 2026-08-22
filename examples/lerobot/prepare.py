@@ -18,6 +18,7 @@ Output:
 """
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -32,13 +33,12 @@ from hflow.mcap_writer import CanonicalMcapWriter
 
 DEFAULT_REPO = "lerobot/pusht"
 DEFAULT_REVISION = "main"
-DEFAULT_OUTPUT_DIR = "./data/lerobot_pusht"
+DEFAULT_OUTPUT_DIR = Path("./data/lerobot_pusht")
 DEFAULT_CAMERA_KEY = "observation.image"
 
 CONVERTER_VERSION = "lerobot-converter-v1"
 
 # LeRobot pusht constants
-PUSHT_FPS = 10.0
 PUSHT_GOP_SECONDS = 1.0
 
 # Timestamp handling
@@ -68,19 +68,11 @@ class SourceVideo:
 
 
 @dataclass(frozen=True)
-class PlannedFault:
-    episode_number: int
-    fault: str
-    fault_segment_s: tuple[float, float]
-
-
-@dataclass(frozen=True)
 class EpisodePlan:
     total_episodes: int
     duration_s: float
     first_source_start_s: float
     source_stride_s: float
-    faults: tuple[PlannedFault, ...]
 
 
 @dataclass(frozen=True)
@@ -90,18 +82,16 @@ class PlannedEpisode:
     source_start_s: float
     duration_s: float
     task: str
-    fault: str
-    fault_segment_s: tuple[float, float] | None
 
 
 @dataclass(frozen=True)
 class CorpusManifest:
     schema_version: int
-    dataset: dict
-    archive: dict
-    sources: list[dict]
-    episode_plan: dict
-    episodes: list[dict]
+    dataset: DatasetSource
+    archive: SourceArchive
+    sources: list[SourceVideo]
+    episode_plan: EpisodePlan
+    episodes: list[PlannedEpisode]
 
 
 def _require_object(value: object, context: str) -> dict[str, object]:
@@ -134,30 +124,31 @@ def _require_integer(value: object, context: str) -> int:
     return value
 
 
-def _parse_fault_segment(value: object, context: str) -> tuple[float, float]:
-    array = _require_array(value, context)
-    if len(array) != 2:
-        raise ValueError(f"{context} must contain [start_s, end_s]")
-    return (
-        _require_number(array[0], f"{context}[0]"),
-        _require_number(array[1], f"{context}[1]"),
-    )
-
-
 def _require_ffmpeg() -> None:
     """Ensure ffmpeg is available on PATH."""
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg not found in PATH")
 
 
+def _get_ffmpeg_version() -> str:
+    """Get the first line of ffmpeg -version output."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.splitlines()[0].strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, IndexError):
+        return "unknown"
+
+
 def _expand_episode_plan(
     sources: list[SourceVideo],
     episode_plan: EpisodePlan,
-) -> list[dict]:
-    planned_faults_by_episode_number = {
-        planned_fault.episode_number: planned_fault for planned_fault in episode_plan.faults
-    }
-    episodes: list[dict] = []
+) -> list[PlannedEpisode]:
+    episodes: list[PlannedEpisode] = []
     for episode_number in range(1, episode_plan.total_episodes + 1):
         zero_based_episode_index = episode_number - 1
         source_video = sources[zero_based_episode_index % len(sources)]
@@ -172,24 +163,19 @@ def _expand_episode_plan(
                 f"{source_video.duration_s:g}s"
             )
 
-        planned_fault = planned_faults_by_episode_number.get(episode_number)
         episodes.append(
-            {
-                "episode_id": f"pusht_episode_{episode_number:04d}",
-                "source_member": source_video.member,
-                "source_start_s": source_start_s,
-                "duration_s": episode_plan.duration_s,
-                "task": source_video.task,
-                "fault": planned_fault.fault if planned_fault is not None else "none",
-                "fault_segment_s": (
-                    planned_fault.fault_segment_s if planned_fault is not None else None
-                ),
-            }
+            PlannedEpisode(
+                episode_id=f"pusht_episode_{episode_number:04d}",
+                source_member=source_video.member,
+                source_start_s=source_start_s,
+                duration_s=episode_plan.duration_s,
+                task=source_video.task,
+            )
         )
     return episodes
 
 
-def _load_manifest(manifest_path: Path) -> dict:
+def _load_manifest(manifest_path: Path) -> CorpusManifest:
     root = _require_object(json.loads(manifest_path.read_text()), "manifest")
     schema_version_value = root.get("schema_version")
     if schema_version_value != 1:
@@ -199,7 +185,6 @@ def _load_manifest(manifest_path: Path) -> dict:
     archive_object = _require_object(root.get("archive"), "archive")
     source_objects = _require_array(root.get("sources"), "sources")
     episode_plan_object = _require_object(root.get("episode_plan"), "episode_plan")
-    fault_objects = _require_array(episode_plan_object.get("faults"), "episode_plan.faults")
 
     dataset = DatasetSource(
         repo_id=_require_string(dataset_object.get("repo_id"), "dataset.repo_id"),
@@ -223,28 +208,6 @@ def _load_manifest(manifest_path: Path) -> dict:
         for source_object in [_require_object(source_value, f"sources[{source_index}]")]
     ]
 
-    planned_faults: list[PlannedFault] = []
-    for fault_index, fault_value in enumerate(fault_objects):
-        fault_object = _require_object(fault_value, f"episode_plan.faults[{fault_index}]")
-        fault = _require_string(
-            fault_object.get("fault"), f"episode_plan.faults[{fault_index}].fault"
-        )
-        if fault == "none":
-            raise ValueError(f"episode_plan.faults[{fault_index}].fault cannot be none")
-        planned_faults.append(
-            PlannedFault(
-                episode_number=_require_integer(
-                    fault_object.get("episode_number"),
-                    f"episode_plan.faults[{fault_index}].episode_number",
-                ),
-                fault=fault,
-                fault_segment_s=_parse_fault_segment(
-                    fault_object.get("fault_segment_s"),
-                    f"episode_plan.faults[{fault_index}].fault_segment_s",
-                ),
-            )
-        )
-
     episode_plan = EpisodePlan(
         total_episodes=_require_integer(
             episode_plan_object.get("total_episodes"), "episode_plan.total_episodes"
@@ -259,7 +222,6 @@ def _load_manifest(manifest_path: Path) -> dict:
         source_stride_s=_require_number(
             episode_plan_object.get("source_stride_s"), "episode_plan.source_stride_s"
         ),
-        faults=tuple(planned_faults),
     )
 
     source_members = {source.member for source in sources}
@@ -273,35 +235,17 @@ def _load_manifest(manifest_path: Path) -> dict:
         raise ValueError("episode_plan.duration_s must be positive")
     if episode_plan.first_source_start_s < 0 or episode_plan.source_stride_s < 0:
         raise ValueError("episode plan source timings cannot be negative")
-    fault_episode_numbers = [fault.episode_number for fault in episode_plan.faults]
-    if len(fault_episode_numbers) != len(set(fault_episode_numbers)):
-        raise ValueError("episode_plan.faults contains duplicate episode numbers")
-    for planned_fault in episode_plan.faults:
-        fault_start_s, fault_end_s = planned_fault.fault_segment_s
-        if not 1 <= planned_fault.episode_number <= episode_plan.total_episodes:
-            raise ValueError(
-                f"fault episode_number {planned_fault.episode_number} is outside the episode plan"
-            )
-        if fault_start_s < 0 or fault_start_s >= fault_end_s:
-            raise ValueError(
-                f"fault segment for episode {planned_fault.episode_number} must have "
-                "0 <= start < end"
-            )
-        if fault_end_s > episode_plan.duration_s:
-            raise ValueError(
-                f"fault segment for episode {planned_fault.episode_number} ends after the episode"
-            )
 
     episodes = _expand_episode_plan(sources, episode_plan)
 
-    return {
-        "schema_version": 1,
-        "dataset": dataset,
-        "archive": archive,
-        "sources": sources,
-        "episode_plan": episode_plan,
-        "episodes": episodes,
-    }
+    return CorpusManifest(
+        schema_version=1,
+        dataset=dataset,
+        archive=archive,
+        sources=sources,
+        episode_plan=episode_plan,
+        episodes=episodes,
+    )
 
 
 def _sha256_file(file_path: Path) -> str:
@@ -320,15 +264,15 @@ def _verify_sha256(file_path: Path, expected_sha256: str) -> None:
         )
 
 
-def _ensure_source_archive(manifest: dict, data_root: Path) -> Path:
+def _ensure_source_archive(manifest: CorpusManifest, data_root: Path) -> Path:
     """Download all source files from Hugging Face to local directory."""
     _require_ffmpeg()
     download_root = data_root / "huggingface"
     download_root.mkdir(parents=True, exist_ok=True)
 
-    base_url = f"https://huggingface.co/datasets/{manifest['dataset'].repo_id}/resolve/{manifest['dataset'].revision}"
+    base_url = f"https://huggingface.co/datasets/{manifest.dataset.repo_id}/resolve/{manifest.dataset.revision}"
 
-    for source_video in manifest["sources"]:
+    for source_video in manifest.sources:
         file_path = download_root / source_video.member
         file_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -353,34 +297,23 @@ def _ensure_source_archive(manifest: dict, data_root: Path) -> Path:
 
 
 def _extract_source_videos(
-    manifest: dict,
+    manifest: CorpusManifest,
     download_root: Path,
-    data_root: Path,
 ) -> dict[str, Path]:
-    """Return paths to source files (already downloaded, no extraction needed)."""
-    source_root = data_root / "source"
-    source_root.mkdir(parents=True, exist_ok=True)
+    """Return paths to source files (already downloaded, no extraction needed).
+    Points downstream code at the original download directory to avoid copying.
+    """
     source_paths: dict[str, Path] = {}
 
-    for source_video in manifest["sources"]:
+    for source_video in manifest.sources:
         src_path = download_root / source_video.member
-        # Preserve directory structure to avoid filename conflicts
-        dst_path = source_root / source_video.member
-        dst_path.parent.mkdir(parents=True, exist_ok=True)
-
-        if dst_path.is_file():
-            if source_video.sha256:
-                _verify_sha256(dst_path, source_video.sha256)
-            source_paths[source_video.member] = dst_path
-            continue
 
         if not src_path.is_file():
             raise RuntimeError(f"source file not found: {src_path}")
 
-        shutil.copy2(src_path, dst_path)
         if source_video.sha256:
-            _verify_sha256(dst_path, source_video.sha256)
-        source_paths[source_video.member] = dst_path
+            _verify_sha256(src_path, source_video.sha256)
+        source_paths[source_video.member] = src_path
 
     return source_paths
 
@@ -433,14 +366,8 @@ def _split_h264_by_aud(h264_data: bytes) -> list[bytes]:
     unit_end_offsets = [*unit_start_offsets[1:], len(h264_data)]
 
     access_units: list[bytes] = []
-    nal_walk_index = 0
     for unit_start, unit_end in zip(unit_start_offsets, unit_end_offsets, strict=True):
         access_units.append(h264_data[unit_start:unit_end])
-        while (
-            nal_walk_index < len(nal_offsets_and_types)
-            and nal_offsets_and_types[nal_walk_index][0] < unit_end
-        ):
-            nal_walk_index += 1
     return access_units
 
 
@@ -456,7 +383,7 @@ def _encode_cdr_float32_array(arr: list[float]) -> bytes:
     return encapsulation + payload
 
 
-def _transcode_mp4_to_h264(mp4_path: Path, gop_seconds: float = PUSHT_GOP_SECONDS) -> list[bytes]:
+def _transcode_mp4_to_h264(mp4_path: Path, gop_seconds: float, fps: float) -> list[bytes]:
     """Transcode MP4 to H.264 Annex B stream using ffmpeg directly.
 
     Uses exact x264 parameters from src/hflow/video.py:
@@ -464,33 +391,6 @@ def _transcode_mp4_to_h264(mp4_path: Path, gop_seconds: float = PUSHT_GOP_SECOND
     -x264-params keyint=<gop_frames>:min-keyint=<gop_frames>:scenecut=0:bframes=0:repeat-headers=1:aud=1
     """
     _require_ffmpeg()
-
-    # Get video duration and fps using ffprobe
-    probe_cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "stream=r_frame_rate,duration",
-        "-of",
-        "csv=p=0",
-        str(mp4_path),
-    ]
-    probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
-    if probe_result.returncode != 0:
-        raise RuntimeError(f"ffprobe failed: {probe_result.stderr}")
-    parts = probe_result.stdout.strip().split(",")
-    if len(parts) != 2:
-        raise RuntimeError(f"unexpected ffprobe output: {probe_result.stdout}")
-    fps_fraction = parts[0]
-    _ = float(parts[1]) if parts[1] != "N/A" else 0.0
-    if "/" in fps_fraction:
-        num, den = map(int, fps_fraction.split("/"))
-        fps = num / den
-    else:
-        fps = float(fps_fraction)
 
     gop_frames = max(1, round(gop_seconds * fps))
     x264_params = (
@@ -526,40 +426,254 @@ def _transcode_mp4_to_h264(mp4_path: Path, gop_seconds: float = PUSHT_GOP_SECOND
     return _split_h264_by_aud(result.stdout)
 
 
-def convert_episode(
-    args: argparse.Namespace,
-    manifest: dict,
+def _get_video_pts_times(mp4_path: Path) -> list[float]:
+    """Get per-frame PTS times from MP4 using ffprobe.
+    Returns list of PTS times in seconds for each frame.
+    """
+    _require_ffmpeg()
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "packet=pts_time",
+        "-of",
+        "csv=p=0",
+        str(mp4_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe failed: {result.stderr}")
+    pts_times = []
+    for line in result.stdout.strip().splitlines():
+        if line.strip():
+            with contextlib.suppress(ValueError):
+                pts_times.append(float(line.strip()))
+    return pts_times
+
+
+def _slice_video(
+    video_path: Path,
+    from_ts: float,
+    to_ts: float,
+) -> Path:
+    """Slice video to a temp file (MP4 muxer requires seekable output)."""
+    _require_ffmpeg()
+    fd, sliced_video_path_str = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd)
+    sliced_video_path = Path(sliced_video_path_str)
+    try:
+        slice_cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            str(from_ts),
+            "-to",
+            str(to_ts),
+            "-i",
+            str(video_path),
+            "-c",
+            "copy",
+            "-f",
+            "mp4",
+            str(sliced_video_path),
+        ]
+        slice_result = subprocess.run(slice_cmd, capture_output=True)
+        if slice_result.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg slice failed: {slice_result.stderr.decode('utf-8', errors='replace')}"
+            )
+        return sliced_video_path
+    except Exception:
+        sliced_video_path.unlink(missing_ok=True)
+        raise
+
+
+def lerobot_to_mcap(
+    dataset_repo: str = "lerobot/pusht",
+    revision: str = "main",
+    output_dir: Path = Path("./data/lerobot_pusht"),
+    episode_index: int | None = None,
+    camera_key: str = "observation.image",
+) -> list[Path]:
+    """Convert LeRobot pusht dataset episodes to canonical MCAP.
+
+    Args:
+        dataset_repo: Hugging Face dataset repository (default: lerobot/pusht)
+        revision: Dataset revision (default: main)
+        output_dir: Output directory for prepared episodes
+        episode_index: Episode index to convert, or None for all episodes
+        camera_key: Camera key in dataset (default: observation.image)
+
+    Returns:
+        List of output MCAP file paths.
+    """
+    _require_ffmpeg()
+
+    # Build manifest inline (no external manifest.json needed for pusht)
+    dataset = DatasetSource(
+        repo_id=dataset_repo,
+        revision=revision,
+        license="CC-BY-4.0",
+    )
+    archive = SourceArchive(
+        path="pusht_dataset",
+        sha256="",
+    )
+    sources = [
+        SourceVideo(
+            member="data/chunk-000/file-000.parquet",
+            sha256="",
+            duration_s=2060.0,
+            task="push_t",
+        ),
+        SourceVideo(
+            member="videos/observation.image/chunk-000/file-000.mp4",
+            sha256="",
+            duration_s=2060.0,
+            task="push_t",
+        ),
+        SourceVideo(
+            member="meta/episodes/chunk-000/file-000.parquet",
+            sha256="",
+            duration_s=2060.0,
+            task="push_t",
+        ),
+    ]
+    episode_plan = EpisodePlan(
+        total_episodes=206,
+        duration_s=10.0,
+        first_source_start_s=0.0,
+        source_stride_s=10.0,
+    )
+
+    manifest = CorpusManifest(
+        schema_version=1,
+        dataset=dataset,
+        archive=archive,
+        sources=sources,
+        episode_plan=episode_plan,
+        episodes=_expand_episode_plan(
+            sources,
+            EpisodePlan(
+                total_episodes=206,
+                duration_s=10.0,
+                first_source_start_s=0.0,
+                source_stride_s=10.0,
+            ),
+        ),
+    )
+
+    # Download/verify source files
+    download_root = _ensure_source_archive(manifest, output_dir)
+    source_paths = _extract_source_videos(manifest, download_root)
+
+    # Determine which episodes to process
+    if episode_index is not None:
+        episode_indices = [episode_index]
+    else:
+        episode_indices = list(range(manifest.episode_plan.total_episodes))
+
+    output_paths: list[Path] = []
+
+    for ep_idx in episode_indices:
+        output_path = _convert_single_episode(
+            manifest=manifest,
+            source_paths=dict(source_paths),
+            output_dir=output_dir,
+            episode_index=ep_idx,
+            camera_key=camera_key,
+        )
+        output_paths.append(output_path)
+
+    return output_paths
+
+
+def _convert_single_episode(
+    manifest: CorpusManifest,
     source_paths: dict[str, Path],
-    data_root: Path,
+    output_dir: Path,
+    episode_index: int,
+    camera_key: str,
 ) -> Path:
     """Convert a single episode to canonical MCAP. Returns output path."""
     import duckdb
 
-    episode = manifest["episodes"][args.episode_index]
-    episode_id = episode["episode_id"]
+    episode = manifest.episodes[episode_index]
 
-    # Find the parquet file for this episode
-    parquet_files = list(data_root.glob("**/*.parquet"))
-    if not parquet_files:
-        raise RuntimeError(f"no parquet files found in {data_root}")
+    # Select the specific parquet files by their manifest role
+    # Find the data parquet (not meta/episodes)
+    data_parquet = None
+    episodes_parquet = None
+    video_mp4 = None
 
-    # Query the episode data from parquet
+    for source_video in manifest.sources:
+        if source_video.member.endswith(".parquet") and not source_video.member.startswith("meta/"):
+            data_parquet = source_video.member
+        elif source_video.member.startswith("meta/episodes/") and source_video.member.endswith(
+            ".parquet"
+        ):
+            episodes_parquet = source_video.member
+        elif source_video.member.endswith(".mp4"):
+            video_mp4 = source_video.member
+
+    if not data_parquet or not video_mp4:
+        raise RuntimeError("Required source files not found in manifest")
+
+    data_parquet_path = source_paths.get(data_parquet)
+    episodes_parquet_path = source_paths.get(episodes_parquet) if episodes_parquet else None
+    video_path = source_paths.get(video_mp4)
+
+    if not data_parquet_path or not data_parquet_path.is_file():
+        raise RuntimeError(f"data parquet not found: {data_parquet_path}")
+    if not video_path or not video_path.is_file():
+        raise RuntimeError(f"video not found: {video_path}")
+
+    # Probe video for actual frame rate
+    _require_ffmpeg()
+    probe_cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=r_frame_rate",
+        "-of",
+        "csv=p=0",
+        str(video_path),
+    ]
+    probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+    if probe_result.returncode != 0:
+        raise RuntimeError(f"ffprobe failed: {probe_result.stderr}")
+    fps_fraction = probe_result.stdout.strip()
+    if "/" in fps_fraction:
+        num, den = map(int, fps_fraction.split("/"))
+        fps = num / den
+    else:
+        fps = float(fps_fraction)
+
+    # Query the episode data from parquet (select specific file by manifest role)
+    data_parquet_escaped = str(data_parquet_path).replace("'", "''")
     conn = duckdb.connect()
     try:
-        # Register all parquet files (create view once)
-        for pf in parquet_files:
-            conn.execute(f"CREATE VIEW IF NOT EXISTS data AS SELECT * FROM read_parquet('{pf}')")
+        conn.execute(f"CREATE VIEW data AS SELECT * FROM read_parquet('{data_parquet_escaped}')")
 
         # Get episode data
         episode_data = conn.execute(
-            f"SELECT * FROM data WHERE episode_index = {args.episode_index} ORDER BY frame_index"
+            f"SELECT * FROM data WHERE episode_index = {episode_index} ORDER BY frame_index"
         ).fetchall()
 
         # Get column names
         columns = [desc[0] for desc in conn.description]
 
         if not episode_data:
-            raise ValueError(f"no data found for episode_index {args.episode_index}")
+            raise ValueError(f"no data found for episode_index {episode_index}")
     finally:
         conn.close()
 
@@ -572,95 +686,59 @@ def convert_episode(
     actions = [row[action_idx] for row in episode_data]
     timestamps = [row[timestamp_idx] for row in episode_data]
 
-    # Get video path and slice/transcode
-    video_key = args.camera_key  # observation.image (keep dot for Hugging Face path)
-    video_member = f"videos/{video_key}/chunk-000/file-000.mp4"
-    video_path = source_paths.get(video_member)
-    if video_path is None:
-        # Try to find the video file
-        video_files = list(data_root.glob(f"**/{video_key}/*.mp4"))
-        if not video_files:
-            raise RuntimeError(f"video for {video_key} not found")
-        video_path = video_files[0]
-
-    # Slice video for this episode using from_timestamp/to_timestamp from episodes parquet
-    # First, get the episode timestamps from the episodes parquet
-    episodes_parquet = list(data_root.glob("**/meta/episodes/**/*.parquet"))
-    if not episodes_parquet:
-        episodes_parquet = list(data_root.glob("**/meta*.parquet"))
-
-    if episodes_parquet:
+    # Get episode timestamps from episodes parquet for video slicing
+    from_ts = 0.0
+    to_ts = 0.0
+    if episodes_parquet_path and episodes_parquet_path.is_file():
+        episodes_parquet_escaped = str(episodes_parquet_path).replace("'", "''")
         conn = duckdb.connect()
         try:
             conn.execute(
-                f"CREATE VIEW episodes AS SELECT * FROM read_parquet('{episodes_parquet[0]}')"
+                f"CREATE VIEW episodes AS SELECT * FROM read_parquet('{episodes_parquet_escaped}')"
             )
             ep_row = conn.execute(
-                f'SELECT "videos/observation.image/from_timestamp", "videos/observation.image/to_timestamp" FROM episodes WHERE episode_index = {args.episode_index}'
+                f'SELECT "videos/observation.image/from_timestamp", "videos/observation.image/to_timestamp" FROM episodes WHERE episode_index = {episode_index}'
             ).fetchone()
             if ep_row:
                 from_ts, to_ts = ep_row
-                # Slice the video to a temp file (MP4 muxer requires seekable output)
-                # Use mkstemp to get a path without creating the file
-                fd, sliced_video_path_str = tempfile.mkstemp(suffix=".mp4")
-                os.close(fd)
-                sliced_video_path = Path(sliced_video_path_str)
-                try:
-                    slice_cmd = [
-                        "ffmpeg",
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-y",
-                        "-ss",
-                        str(from_ts),
-                        "-to",
-                        str(to_ts),
-                        "-i",
-                        str(video_path),
-                        "-c",
-                        "copy",
-                        "-f",
-                        "mp4",
-                        str(sliced_video_path),
-                    ]
-                    slice_result = subprocess.run(slice_cmd, capture_output=True)
-                    if slice_result.returncode != 0:
-                        raise RuntimeError(
-                            f"ffmpeg slice failed: {slice_result.stderr.decode('utf-8', errors='replace')}"
-                        )
-                    access_units = _transcode_mp4_to_h264(sliced_video_path, PUSHT_GOP_SECONDS)
-                finally:
-                    sliced_video_path.unlink(missing_ok=True)
-            else:
-                # No episode timestamps, transcode full video
-                access_units = _transcode_mp4_to_h264(video_path, PUSHT_GOP_SECONDS)
         finally:
             conn.close()
-    else:
-        # No episodes parquet, transcode full video
-        access_units = _transcode_mp4_to_h264(video_path, PUSHT_GOP_SECONDS)
 
-    # Cross-check: |parquet_timestamp - mp4_pts| > 50ms
-    # For each frame, compute expected time (index / fps) and compare with parquet timestamp
+    # Slice video if we have timestamps
+    if from_ts > 0.0 or to_ts > 0.0:
+        sliced_video_path = _slice_video(video_path, from_ts, to_ts)
+        try:
+            access_units = _transcode_mp4_to_h264(sliced_video_path, PUSHT_GOP_SECONDS, fps)
+            pts_times = _get_video_pts_times(sliced_video_path)
+        finally:
+            sliced_video_path.unlink(missing_ok=True)
+    else:
+        access_units = _transcode_mp4_to_h264(video_path, PUSHT_GOP_SECONDS, fps)
+        pts_times = _get_video_pts_times(video_path)
+
+    # Cross-check: |parquet_timestamp - video_pts| > 50ms
     frame_count = len(states)
     if len(access_units) != frame_count:
         raise ValueError(
             f"frame count mismatch: {frame_count} parquet frames vs {len(access_units)} video access units"
         )
 
+    if len(pts_times) != frame_count:
+        raise ValueError(
+            f"PTS count mismatch: {frame_count} frames vs {len(pts_times)} video PTS entries"
+        )
+
     for i in range(frame_count):
         parquet_ts = timestamps[i]
-        # Expected time for frame i: i / fps (since PTS starts at 0 for first frame)
-        expected_time = i / PUSHT_FPS
-        if abs(parquet_ts - expected_time) > 0.050:  # 50ms threshold
+        video_pts = pts_times[i] if i < len(pts_times) else (i / fps)
+        if abs(parquet_ts - video_pts) > 0.050:  # 50ms threshold
             raise ValueError(
                 f"timestamp disagreement at frame {i}: parquet={parquet_ts:.6f}s, "
-                f"expected={expected_time:.6f}s, diff={abs(parquet_ts - expected_time) * 1000:.1f}ms > 50ms"
+                f"video_pts={video_pts:.6f}s, diff={abs(parquet_ts - video_pts) * 1000:.1f}ms > 50ms"
             )
 
     # Write MCAP
-    output_path = args.output_dir / "landing" / f"{episode_id}.mcap"
+    output_path = output_dir / "landing" / f"pusht_episode_{episode_index + 1:04d}.mcap"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Build foxglove.CompressedVideo schema
@@ -670,12 +748,12 @@ def convert_episode(
     schema_data = build_file_descriptor_set(CompressedVideo).SerializeToString()
 
     # Custom CDR schema for state/action: float32[2] position (ROS 2 message definition)
-    # Use valid ROS 2 package name (lowercase, no dots) and proper message definition
     STATE_SCHEMA_NAME = "lerobot_msgs/msg/State"
     ACTION_SCHEMA_NAME = "lerobot_msgs/msg/Action"
-    # ROS 2 message definition: package declaration + message fields
     STATE_SCHEMA_TEXT = """float32[2] position"""
+    ACTION_SCHEMA_TEXT = """float32[2] action"""
     state_schema_data = STATE_SCHEMA_TEXT.encode("utf-8")
+    action_schema_data = ACTION_SCHEMA_TEXT.encode("utf-8")
 
     with CanonicalMcapWriter(output_path) as writer:
         # Register schemas
@@ -683,7 +761,7 @@ def convert_episode(
             "foxglove.CompressedVideo", "protobuf", schema_data
         )
         state_schema_id = writer.register_schema(STATE_SCHEMA_NAME, "ros2msg", state_schema_data)
-        action_schema_id = writer.register_schema(ACTION_SCHEMA_NAME, "ros2msg", state_schema_data)
+        action_schema_id = writer.register_schema(ACTION_SCHEMA_NAME, "ros2msg", action_schema_data)
 
         # Register channels
         video_channel_id = writer.register_channel(
@@ -707,11 +785,10 @@ def convert_episode(
 
         # Write messages
         for i in range(frame_count):
-            log_time_ns = EPISODE_START_TIME_NS + round(i * NANOSECONDS_PER_SECOND / PUSHT_FPS)
+            log_time_ns = EPISODE_START_TIME_NS + round(i * NANOSECONDS_PER_SECOND / fps)
 
             # Video frame
             if i < len(access_units):
-                # Build CompressedVideo protobuf message
                 video_msg = CompressedVideo()
                 video_msg.timestamp.seconds = log_time_ns // 1_000_000_000
                 video_msg.timestamp.nanos = log_time_ns % 1_000_000_000
@@ -733,16 +810,17 @@ def convert_episode(
             writer.write_message(action_channel_id, log_time_ns, action_data)
 
         # Add episode metadata
+        ffmpeg_version = _get_ffmpeg_version()
         writer.add_metadata(
             "episode/v1",
             {
-                "task": episode["task"],
+                "task": episode.task,
                 "operator": "lerobot_converter",
                 "success": "true",
                 "embodiment": "pusht",
-                "source_dataset": manifest["dataset"].repo_id,
-                "source_revision": manifest["dataset"].revision,
-                "source_episode_index": str(args.episode_index),
+                "source_dataset": manifest.dataset.repo_id,
+                "source_revision": manifest.dataset.revision,
+                "source_episode_index": str(episode_index),
                 "converter_version": CONVERTER_VERSION,
             },
         )
@@ -751,10 +829,10 @@ def convert_episode(
             {
                 "schema_version": "1",
                 "pipeline_version": CONVERTER_VERSION,
-                "ffmpeg_version": "unknown",
+                "ffmpeg_version": ffmpeg_version,
                 "gop_preset": "vla",
                 "gop_seconds": str(PUSHT_GOP_SECONDS),
-                "source_uri": f"hf://datasets/{manifest['dataset'].repo_id}@{manifest['dataset'].revision}",
+                "source_uri": f"hf://datasets/{manifest.dataset.repo_id}@{manifest.dataset.revision}",
             },
         )
 
@@ -766,47 +844,41 @@ def main() -> None:
     """Main entry point."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--repo", default=DEFAULT_REPO, help="Hugging Face dataset repo (default: lerobot/pusht)"
+        "--repo", default=DEFAULT_REPO, help=f"Hugging Face dataset repo (default: {DEFAULT_REPO})"
     )
     parser.add_argument(
-        "--revision", default=DEFAULT_REVISION, help="Dataset revision (default: main)"
+        "--revision",
+        default=DEFAULT_REVISION,
+        help=f"Dataset revision (default: {DEFAULT_REVISION})",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path(DEFAULT_OUTPUT_DIR),
-        help="Output directory for prepared episodes (default: ./data/lerobot_pusht)",
+        default=DEFAULT_OUTPUT_DIR,
+        help=f"Output directory for prepared episodes (default: {DEFAULT_OUTPUT_DIR})",
     )
     parser.add_argument(
         "--camera-key",
         default=DEFAULT_CAMERA_KEY,
-        help="Camera key in dataset (default: observation.image)",
+        help=f"Camera key in dataset (default: {DEFAULT_CAMERA_KEY})",
     )
     parser.add_argument(
         "--episode-index",
         type=int,
-        default=0,
-        help="Episode index to convert (default: 0)",
+        default=None,
+        help="Episode index to convert, or None for all episodes (default: None)",
     )
     args = parser.parse_args()
 
-    # Pre-flight check: ffmpeg must be available before any hflow imports that might shell out
-    _require_ffmpeg()
+    output_paths = lerobot_to_mcap(
+        dataset_repo=args.repo,
+        revision=args.revision,
+        output_dir=args.output_dir,
+        episode_index=args.episode_index,
+        camera_key=args.camera_key,
+    )
 
-    # Load the dataset manifest
-    manifest_path = Path(__file__).with_name("manifest.json")
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"manifest.json not found at {manifest_path}")
-    manifest = _load_manifest(manifest_path)
-
-    # Download/verify source files and extract videos
-    download_root = _ensure_source_archive(manifest, args.output_dir)
-    source_paths = _extract_source_videos(manifest, download_root, args.output_dir)
-
-    # Load parquet data for the requested episode
-
-    data_root = args.output_dir / "source"
-    convert_episode(args, manifest, source_paths, data_root)
+    print(f"Converted {len(output_paths)} episode(s)")
 
 
 if __name__ == "__main__":
