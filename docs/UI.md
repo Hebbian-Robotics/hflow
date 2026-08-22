@@ -34,11 +34,11 @@ into every task venv, and they should never carry frontend assets.
   much of the corpus) before you pin. **Pin manifest** freezes a query's
   result as an immutable Parquet manifest under `<data_root>/manifests/`,
   recorded with its SQL, row count, and coverage in the Manifests registry.
-- **Runs** -- the local Airflow runtime's health, recent ingest runs with
-  their trigger configuration, per-stage activity, and a trigger form
-  (`hflow ingest`'s wire shape, as a form). Appears when a rendered bundle or
-  a remote runtime (`HFLOW_AIRFLOW_URL` and friends) is reachable; hidden
-  otherwise.
+- **Runs** -- the ingest runtime's health, recent runs with their trigger
+  configuration, per-stage activity, and a trigger form (`hflow ingest`'s
+  wire shape, as a form). It addresses a rendered local bundle or a remote
+  runtime (`HFLOW_AIRFLOW_URL` and friends); when neither is reachable the
+  page says which it looked for and why it failed, rather than disappearing.
 - **Pipeline** -- the registered steps by stage with content-hash versions,
   critical flags, and endpoint aliases, plus the versions actually observed
   in the catalog. Requires `--pipeline path/to/pipeline.py[:app]`, which
@@ -82,5 +82,7 @@ queries and the manifest registry) and your pinned manifests -- nothing else.
 - [Catalog tables and curation API](./CATALOG.md) -- the views and SQL idioms
   the Episodes and Curate screens are built on
 - [Runtime guide](./RUNTIME.md) -- the Airflow runtime the Runs screen fronts
-- [Hosting HFlow](./HOSTING.md) -- the same UI's place in an operated,
-  multi-workspace deployment
+- [Hosting HFlow](./HOSTING.md) -- the data-plane contract for operating
+  workspaces for other people, whose seams (bucket data roots, scoped
+  credentials, constrained SQL, remote runtime addressing) are the ones this
+  UI reads through

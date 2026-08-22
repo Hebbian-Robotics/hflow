@@ -53,6 +53,24 @@ jobs:
         run: pnpm check
       - name: Build
         run: pnpm build
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: "3.11"
+      - name: Verify the hflow-ui wheel would carry the built frontend
+        working-directory: .
+        # The UI is only usable if the built assets reach the package; without
+        # this the wheel builds happily and serves the "frontend not built"
+        # placeholder instead.
+        run: |
+          rm -rf packages/hflow-ui/src/hflow_ui/static
+          mkdir -p packages/hflow-ui/src/hflow_ui/static
+          cp -r ui/dist/. packages/hflow-ui/src/hflow_ui/static/
+          uv build --package hflow-ui
+          wheel_path="$(printf '%s\n' dist/hflow_ui-*.whl)"
+          if ! unzip -l "${wheel_path}" | grep -q 'hflow_ui/static/index.html'; then
+            echo "${wheel_path} has no hflow_ui/static/index.html -- the frontend build did not reach the package." >&2
+            exit 1
+          fi
 
   links:
     runs-on: ubuntu-latest
