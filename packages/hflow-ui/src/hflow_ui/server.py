@@ -24,9 +24,10 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 import hflow
 from hflow.format import CATALOG_FORMAT_VERSION
+from hflow.steps import RUN_PROFILES, IngestMode
 from hflow.storage import LocalStorageRoot
 from hflow.workspace import Workspace
-from hflow_ui import _catalog, _curation, _media
+from hflow_ui import _catalog, _curation, _media, _pipeline, _runtime
 from hflow_ui._auth import SessionTokenMiddleware
 from hflow_ui._settings import UiSettings
 
@@ -67,6 +68,11 @@ def create_app(settings: UiSettings) -> FastAPI:
     if settings.token is not None:
         application.add_middleware(SessionTokenMiddleware, session_token=settings.token)
 
+    # --pipeline is imported -- EXECUTED -- exactly once, here at app
+    # construction; the outcome (the live App, or the remembered failure) is
+    # what /api/v1/pipeline and the config capability report for this launch.
+    pipeline_state = _pipeline.load_pipeline_state(settings.pipeline)
+
     def open_connection_or_refuse() -> duckdb.DuckDBPyConnection:
         # A FRESH connection per request: the wide episodes view binds its
         # measurement columns at open time (hflow.curation), so a held
@@ -104,8 +110,18 @@ def create_app(settings: UiSettings) -> FastAPI:
                 "capabilities": {
                     "catalog": _catalog_marker_readable(workspace),
                     "media": isinstance(workspace.storage_root, LocalStorageRoot),
-                    "runtime": False,  # M0: no runs monitor
+                    # Addressed (bundle dir or HFLOW_AIRFLOW_URL), not
+                    # necessarily reachable -- /runtime/status owns liveness.
+                    "runtime": _runtime.runtime_configured(settings.data_root),
+                    "pipeline": pipeline_state.available,
                 },
+                # Deep-link base for the Runs page, honestly derived from the
+                # addressed bundle's own records; null when none is addressed.
+                "airflow_web_url": _runtime.local_bundle_web_url(settings.data_root),
+                # The trigger form's vocabularies, served so the frontend
+                # never hardcodes them (hflow.steps stays the one owner).
+                "run_profiles": list(RUN_PROFILES),
+                "ingest_modes": [mode.value for mode in IngestMode],
             }
         )
 
@@ -157,6 +173,32 @@ def create_app(settings: UiSettings) -> FastAPI:
             connection.close()
         return JSONResponse(facets)
 
+    # Registered before the {episode_id} route below so the literal path
+    # segment "stats" can never be read as an episode id.
+    @application.get("/api/v1/episodes/stats")
+    def read_episode_stats(
+        task: Annotated[list[str] | None, Query()] = None,
+        operator: Annotated[list[str] | None, Query()] = None,
+        embodiment: Annotated[list[str] | None, Query()] = None,
+        status: Annotated[Literal["ok", "quarantined"] | None, Query()] = None,
+        success: Annotated[Literal["true", "false"] | None, Query()] = None,
+        search: Annotated[str | None, Query()] = None,
+    ) -> JSONResponse:
+        filters = _catalog.EpisodeListFilters(
+            tasks=tuple(task or ()),
+            operators=tuple(operator or ()),
+            embodiments=tuple(embodiment or ()),
+            status=status,
+            success=success,
+            search=search,
+        )
+        connection = open_connection_or_refuse()
+        try:
+            stats = _catalog.query_episode_stats(connection, filters)
+        finally:
+            connection.close()
+        return JSONResponse(stats)
+
     @application.get("/api/v1/episodes/{episode_id}")
     def read_episode(episode_id: str) -> JSONResponse:
         connection = open_connection_or_refuse()
@@ -199,9 +241,11 @@ def create_app(settings: UiSettings) -> FastAPI:
             )
         return _served_file_response_or_refuse(canonical_uri, settings.data_root)
 
-    # M1 curation studio routes -- included BEFORE the SPA catch-all below so
-    # they win route matching.
+    # M1 curation studio + M2 runs monitor and pipeline routes -- included
+    # BEFORE the SPA catch-all below so they win route matching.
     application.include_router(_curation.create_curation_router(settings))
+    application.include_router(_runtime.create_runtime_router(settings))
+    application.include_router(_pipeline.create_pipeline_router(settings, pipeline_state))
 
     @application.get("/{requested_path:path}", include_in_schema=False)
     def serve_spa(requested_path: str) -> Response:

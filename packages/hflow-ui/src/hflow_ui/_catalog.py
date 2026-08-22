@@ -51,8 +51,17 @@ def open_workspace_connection(data_root: str) -> duckdb.DuckDBPyConnection:
     return connection
 
 
+def utc_iso_text(timestamp_expression: str, alias: str) -> str:
+    """SQL rendering a (UTC-pinned) timestamp expression as ISO-8601 text.
+
+    ``timestamp_expression`` and ``alias`` are code-owned constants, never
+    user input.
+    """
+    return f"strftime({timestamp_expression}, '{_ISO_TIMESTAMP_FORMAT}') AS {alias}"
+
+
 def _recorded_at_as_iso_text(qualified_column: str = "recorded_at") -> str:
-    return f"strftime({qualified_column}, '{_ISO_TIMESTAMP_FORMAT}') AS recorded_at"
+    return utc_iso_text(qualified_column, "recorded_at")
 
 
 def json_safe_value(value: object) -> object:
@@ -236,6 +245,216 @@ def query_episode_facets(
             {"value": str(value), "count": int(count)} for value, count in value_counts
         ]
     return facets
+
+
+# /api/v1/episodes/stats shape knobs: ~12 histogram buckets per numeric
+# column, top 8 values per categorical column (the remainder is other_count),
+# and "low-cardinality" capped so id-like columns never masquerade as facets.
+HISTOGRAM_BUCKET_COUNT = 12
+TOP_VALUE_LIMIT = 8
+LOW_CARDINALITY_LIMIT = 32
+
+_NUMERIC_STAT_TYPES = frozenset(
+    {
+        "TINYINT",
+        "SMALLINT",
+        "INTEGER",
+        "BIGINT",
+        "HUGEINT",
+        "UTINYINT",
+        "USMALLINT",
+        "UINTEGER",
+        "UBIGINT",
+        "FLOAT",
+        "DOUBLE",
+    }
+)
+_CATEGORICAL_STAT_TYPES = frozenset({"VARCHAR", "BOOLEAN"})
+
+
+def _stat_kind(duckdb_type: str) -> str | None:
+    """ "numeric"/"categorical" for distributable column types, else ``None``
+    (timestamps, JSON blobs, and nested types have no mini-distribution)."""
+    normalized_type = duckdb_type.upper()
+    if normalized_type in _NUMERIC_STAT_TYPES or normalized_type.startswith("DECIMAL"):
+        return "numeric"
+    if normalized_type in _CATEGORICAL_STAT_TYPES:
+        return "categorical"
+    return None
+
+
+def _quoted_string_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+@dataclass(frozen=True)
+class _NumericColumnPlan:
+    """One numeric column that earned a histogram, with its bucket geometry."""
+
+    name: str
+    minimum: float
+    maximum: float
+
+    @property
+    def bucket_width(self) -> float:
+        return (self.maximum - self.minimum) / HISTOGRAM_BUCKET_COUNT
+
+
+@dataclass(frozen=True)
+class _CategoricalColumnPlan:
+    """One low-cardinality column that earned a top-values breakdown."""
+
+    name: str
+    non_null_count: int
+
+
+def query_episode_stats(
+    connection: duckdb.DuckDBPyConnection, filters: EpisodeListFilters
+) -> dict[str, object]:
+    """Per-column mini-distributions over the CURRENT filter set.
+
+    Reuses the episode list's filter compilation (one source of truth), so
+    the sparkbars always describe exactly the rows the table shows. Two
+    scans total: one aggregate pass classifying every candidate column
+    (skipping degenerate ones -- all NULL, a single value, NaN/inf-poisoned
+    numerics, id-like all-unique or over-the-cap categoricals), then one
+    UNION ALL query computing every surviving column's histogram buckets or
+    top values against a shared filtered CTE.
+    """
+    conditions, parameters = _compiled_conditions(filters)
+    where_sql = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+    candidate_columns = [
+        (column["name"], kind)
+        for column in described_episode_columns(connection)
+        if (kind := _stat_kind(column["type"])) is not None
+    ]
+    if not candidate_columns:
+        return {"columns": []}
+
+    aggregate_expressions: list[str] = []
+    for column_name, kind in candidate_columns:
+        quoted_column = quoted_identifier(column_name)
+        if kind == "numeric":
+            aggregate_expressions.extend(
+                (
+                    f"count({quoted_column})",
+                    f"min(CAST({quoted_column} AS DOUBLE))",
+                    f"max(CAST({quoted_column} AS DOUBLE))",
+                )
+            )
+        else:
+            aggregate_expressions.extend(
+                (f"count({quoted_column})", f"count(DISTINCT {quoted_column})")
+            )
+    aggregate_row = connection.execute(
+        f"SELECT {', '.join(aggregate_expressions)} FROM episodes{where_sql}", parameters
+    ).fetchone()
+    if aggregate_row is None:
+        return {"columns": []}
+
+    plans: list[_NumericColumnPlan | _CategoricalColumnPlan] = []
+    value_index = 0
+    for column_name, kind in candidate_columns:
+        if kind == "numeric":
+            non_null_count, minimum, maximum = aggregate_row[value_index : value_index + 3]
+            value_index += 3
+            if int(non_null_count or 0) == 0 or minimum is None or maximum is None:
+                continue
+            minimum, maximum = float(minimum), float(maximum)
+            # NaN/inf values poison min/max (NaN sorts above everything in
+            # DuckDB), so a non-finite bound marks the whole column degenerate.
+            if not (math.isfinite(minimum) and math.isfinite(maximum)) or minimum >= maximum:
+                continue
+            plans.append(_NumericColumnPlan(name=column_name, minimum=minimum, maximum=maximum))
+        else:
+            non_null_count, distinct_count = aggregate_row[value_index : value_index + 2]
+            value_index += 2
+            non_null_count, distinct_count = int(non_null_count or 0), int(distinct_count or 0)
+            if distinct_count < 2 or distinct_count > LOW_CARDINALITY_LIMIT:
+                continue
+            if distinct_count == non_null_count and distinct_count > 2:
+                # Every value unique: an identifier, not a distribution.
+                continue
+            plans.append(_CategoricalColumnPlan(name=column_name, non_null_count=non_null_count))
+    if not plans:
+        return {"columns": []}
+
+    union_branches: list[str] = []
+    for plan in plans:
+        quoted_column = quoted_identifier(plan.name)
+        name_literal = _quoted_string_literal(plan.name)
+        if isinstance(plan, _NumericColumnPlan):
+            # Bounds are data-derived finite floats (never user input), so
+            # their repr()s are safe SQL literals.
+            union_branches.append(
+                f"SELECT {name_literal} AS column_name, "
+                f"least(CAST(floor((CAST({quoted_column} AS DOUBLE) - {plan.minimum!r}) "
+                f"/ {plan.bucket_width!r}) AS BIGINT), {HISTOGRAM_BUCKET_COUNT - 1}) "
+                "AS bucket_index, "
+                "CAST(NULL AS VARCHAR) AS value, count(*) AS bucket_count "
+                f"FROM filtered WHERE {quoted_column} IS NOT NULL GROUP BY 2"
+            )
+        else:
+            union_branches.append(
+                "SELECT * FROM ("
+                f"SELECT {name_literal} AS column_name, CAST(NULL AS BIGINT) AS bucket_index, "
+                f"CAST({quoted_column} AS VARCHAR) AS value, count(*) AS bucket_count "
+                f"FROM filtered WHERE {quoted_column} IS NOT NULL "
+                f"GROUP BY 3 ORDER BY bucket_count DESC, value ASC LIMIT {TOP_VALUE_LIMIT})"
+            )
+    # One query for every column: the shared CTE binds the filter parameters
+    # exactly once and each branch aggregates the same filtered rows.
+    distribution_rows = connection.execute(
+        f"WITH filtered AS (SELECT * FROM episodes{where_sql})\n"
+        + "\nUNION ALL\n".join(union_branches),
+        parameters,
+    ).fetchall()
+
+    bucket_counts_by_column: dict[str, dict[int, int]] = {}
+    value_counts_by_column: dict[str, list[tuple[str, int]]] = {}
+    for column_name, bucket_index, value, count in distribution_rows:
+        if bucket_index is not None:
+            bucket_counts_by_column.setdefault(str(column_name), {})[int(bucket_index)] = int(count)
+        else:
+            value_counts_by_column.setdefault(str(column_name), []).append((str(value), int(count)))
+
+    stat_columns: list[dict[str, object]] = []
+    for plan in plans:
+        if isinstance(plan, _NumericColumnPlan):
+            bucket_counts = bucket_counts_by_column.get(plan.name, {})
+            stat_columns.append(
+                {
+                    "name": plan.name,
+                    "kind": "numeric",
+                    "buckets": [
+                        {
+                            "lo": plan.minimum + index * plan.bucket_width,
+                            "hi": (
+                                plan.maximum
+                                if index == HISTOGRAM_BUCKET_COUNT - 1
+                                else plan.minimum + (index + 1) * plan.bucket_width
+                            ),
+                            "count": bucket_counts.get(index, 0),
+                        }
+                        for index in range(HISTOGRAM_BUCKET_COUNT)
+                    ],
+                }
+            )
+        else:
+            # UNION ALL guarantees no cross-branch order; re-rank here.
+            top_values = sorted(
+                value_counts_by_column.get(plan.name, ()),
+                key=lambda entry: (-entry[1], entry[0]),
+            )
+            stat_columns.append(
+                {
+                    "name": plan.name,
+                    "kind": "categorical",
+                    "values": [{"value": value, "count": count} for value, count in top_values],
+                    "other_count": plan.non_null_count - sum(count for _value, count in top_values),
+                }
+            )
+    return {"columns": stat_columns}
 
 
 def find_media_uri(

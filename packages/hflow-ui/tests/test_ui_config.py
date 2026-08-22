@@ -2,11 +2,22 @@
 
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from hflow_ui import UiSettings, create_app
 from ui_test_fixtures import PopulatedWorkspace
 
+from hflow.runtime import RuntimeConfig, render_bundle
 from hflow.workspace import Workspace
+
+
+@pytest.fixture()
+def no_ambient_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """No ./runtime fallback in cwd and no remote environment exported."""
+    working_directory = tmp_path / "config-cwd"
+    working_directory.mkdir()
+    monkeypatch.chdir(working_directory)
+    monkeypatch.delenv("HFLOW_AIRFLOW_URL", raising=False)
 
 
 def test_health_reports_ok(api: TestClient) -> None:
@@ -16,7 +27,7 @@ def test_health_reports_ok(api: TestClient) -> None:
 
 
 def test_config_reports_local_mode_and_capabilities(
-    api: TestClient, populated_workspace: PopulatedWorkspace
+    api: TestClient, populated_workspace: PopulatedWorkspace, no_ambient_runtime: None
 ) -> None:
     payload = api.get("/api/v1/config").json()
     assert payload["mode"] == "local"
@@ -24,7 +35,48 @@ def test_config_reports_local_mode_and_capabilities(
     assert isinstance(payload["hflow_version"], str) and payload["hflow_version"]
     assert payload["hflow_ui_version"] == "0.1.0"
     assert payload["data_root"] == str(populated_workspace.data_root)
-    assert payload["capabilities"] == {"catalog": True, "media": True, "runtime": False}
+    assert payload["capabilities"] == {
+        "catalog": True,
+        "media": True,
+        "runtime": False,  # no bundle rendered and no HFLOW_AIRFLOW_URL exported
+        "pipeline": False,  # no --pipeline configured
+    }
+    assert payload["airflow_web_url"] is None
+    # The trigger form's vocabularies come from the server, never hardcoded.
+    assert "full" in payload["run_profiles"]
+    assert payload["ingest_modes"] == ["batch", "online"]
+
+
+def test_config_runtime_capability_from_a_rendered_bundle(
+    tmp_path: Path, unbuilt_assets_dir: Path, no_ambient_runtime: None
+) -> None:
+    data_root = tmp_path / "data"
+    pipeline_file = tmp_path / "demo_pipeline.py"
+    pipeline_file.write_text("import hflow\n\napp = hflow.App('demo', data_root='/tmp/x')\n")
+    render_bundle(
+        RuntimeConfig(pipeline_file=pipeline_file, data_root=data_root), data_root / "runtime"
+    )
+    settings = UiSettings(data_root=str(data_root), token=None, assets_dir=unbuilt_assets_dir)
+    payload = TestClient(create_app(settings)).get("/api/v1/config").json()
+    # Configured, not necessarily reachable: nothing is running here.
+    assert payload["capabilities"]["runtime"] is True
+    # The deep-link base is what the bundle itself records (.env API_PORT).
+    assert payload["airflow_web_url"] == "http://127.0.0.1:8080"
+
+
+def test_config_runtime_capability_from_the_remote_environment(
+    tmp_path: Path,
+    unbuilt_assets_dir: Path,
+    no_ambient_runtime: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HFLOW_AIRFLOW_URL", "https://workspace.example.com")
+    data_root = tmp_path / "bare-root"
+    data_root.mkdir()
+    settings = UiSettings(data_root=str(data_root), token=None, assets_dir=unbuilt_assets_dir)
+    payload = TestClient(create_app(settings)).get("/api/v1/config").json()
+    assert payload["capabilities"]["runtime"] is True
+    assert payload["airflow_web_url"] is None  # only a local bundle records one
 
 
 def test_config_reports_the_read_only_setting(read_only_api: TestClient) -> None:
