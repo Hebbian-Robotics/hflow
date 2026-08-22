@@ -79,6 +79,18 @@ export function formatDurationBetween(startIso: string | null, endIso: string | 
   return `${wholeHours}h ${String(wholeMinutes % 60).padStart(2, "0")}m`;
 }
 
+/** Tight duration readout for graph badges: "0.4s", "3.2s", "2m 04s", "1h 12m". */
+export function formatDurationCompact(seconds: number | null): string {
+  if (seconds === null || !Number.isFinite(seconds) || seconds < 0) return "—";
+  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
+  const wholeMinutes = Math.floor(seconds / 60);
+  if (wholeMinutes < 60) {
+    return `${wholeMinutes}m ${String(Math.round(seconds % 60)).padStart(2, "0")}s`;
+  }
+  const wholeHours = Math.floor(wholeMinutes / 60);
+  return `${wholeHours}h ${String(wholeMinutes % 60).padStart(2, "0")}m`;
+}
+
 /** Content-derived React key for a raw catalog row (no array indexes). */
 export function historyRowKey(row: EpisodeRow): string {
   return ["recorded_at", "run_fingerprint", "pipeline_version", "uri"]

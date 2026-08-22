@@ -1,135 +1,739 @@
 import { useQuery } from "@tanstack/react-query";
-import { Fragment, useEffect } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ApiError,
+  type DagTopology,
   fetchPipeline,
-  type PipelineManifest,
-  type PipelineStageLane,
-  type PipelineStepManifest,
+  fetchPipelineGraph,
+  type PipelineEngineStep,
+  type PipelineGraphResponse,
+  type PipelineGraphStage,
+  type PipelineResponse,
+  type PipelineUserStep,
+  type QuarantineGate,
 } from "../api";
+import { DagGraph, type DagGraphEdge, type DagGraphNode } from "../components/DagGraph";
+import { DetailBlock, DetailRow, DetailsPanel } from "../components/DetailsPanel";
 import { EmptyPanel, ErrorPanel, LoadingPanel } from "../components/QueryStates";
 import { VersionChip } from "../components/VersionChip";
 import { formatTimestamp } from "../format";
 import { ChevronDownIcon } from "../icons";
 
-// The lane set, order, and step grouping come from the server's `stages`
-// payload (hflow.steps.Stage is the one owner of stage semantics); only the
-// display copy below and the engine-work annotation cards live client-side.
+// Two nested layers meet on this page and the UI must not conflate them:
+//   1. ORCHESTRATION — a real DAG with real edges (the master chain, and each
+//      stage's plan -> process_batch -> budget gate sub-DAG).
+//   2. USER STEPS — registered checks/enrichments that run INSIDE one
+//      process_batch task with NO edges between them, ordered only by the
+//      engine's two-tier cheap-first policy. Drawing arrows between them would
+//      be a lie, so this page draws groups and says so in words.
+// The one real cross-step edge is the quarantine gate, and it IS drawn.
 
-interface LaneCard {
+type PipelineSelection =
+  | { kind: "master-task"; taskId: string }
+  | { kind: "stage-task"; stage: string; taskId: string }
+  | { kind: "user-step"; stage: string; name: string }
+  | { kind: "engine-step"; stage: string; name: string }
+  | { kind: "quarantine" };
+
+function topologyNodes(topology: DagTopology): DagGraphNode[] {
+  return topology.tasks.map((task) => ({
+    id: task.task_id,
+    label: task.task_id,
+    summary: task.summary,
+    mapped: task.mapped,
+    deferred: task.deferred,
+  }));
+}
+
+function topologyEdges(topology: DagTopology): DagGraphEdge[] {
+  return topology.edges.map(([from, to]) => ({ from, to }));
+}
+
+/** The quarantine gate as connectors: from the stage that runs the critical
+ * checks into the gate task of every stage its verdict can skip. */
+function quarantineEdges(
+  graph: PipelineGraphResponse,
+  gate: QuarantineGate | null,
+): DagGraphEdge[] {
+  if (!gate) return [];
+  const sourceStage = graph.stages.find((stage) => stage.stage === gate.from_stage);
+  if (!sourceStage) return [];
+  return gate.to_stages.flatMap((stageName) => {
+    const target = graph.stages.find((stage) => stage.stage === stageName);
+    if (!target) return [];
+    return [
+      {
+        from: sourceStage.trigger_task_id,
+        to: target.gate_task_id,
+        kind: "gate" as const,
+        label: "quarantine gate",
+      },
+    ];
+  });
+}
+
+function stageOfMasterTask(
+  graph: PipelineGraphResponse,
+  taskId: string,
+): PipelineGraphStage | undefined {
+  return graph.stages.find(
+    (stage) => stage.gate_task_id === taskId || stage.trigger_task_id === taskId,
+  );
+}
+
+function StepCard({
+  name,
+  kind,
+  version,
+  critical,
+  uses,
+  isEngineOwned,
+  isSelected,
+  onSelect,
+}: {
   name: string;
   kind: string;
   version: string | null;
   critical: boolean;
   uses: string | null;
   isEngineOwned: boolean;
-}
-
-interface StageLane {
-  stage: string;
-  title: string;
-  description: string;
-  cards: LaneCard[];
-}
-
-function cardFromStep(step: PipelineStepManifest): LaneCard {
-  return {
-    name: step.name,
-    kind: step.kind,
-    version: step.version,
-    critical: step.critical,
-    uses: step.uses,
-    isEngineOwned: false,
-  };
-}
-
-function engineCard(name: string, kind: string): LaneCard {
-  return { name, kind, version: null, critical: false, uses: null, isEngineOwned: true };
-}
-
-/** Human titles/descriptions for the canonical stages; a stage the server
- * sends that this build does not know still renders, under its own name. */
-const STAGE_DISPLAY_COPY: Record<string, { title: string; description: string }> = {
-  sync: {
-    title: "Transform & sync",
-    description: "canonical transform + derived channels (critical path)",
-  },
-  meta: { title: "Metadata", description: "checks + catalog registration" },
-  labels: { title: "Labels & artifacts", description: "enrichments (non-critical)" },
-  media: { title: "Media", description: "derived media artifacts" },
-};
-
-/** Engine work the manifest's step lists do not carry, annotated per stage:
- * the transform + derived channels (sync), catalog registration (meta), and
- * the engine's contact sheets (media). */
-function engineWorkCards(stage: string, manifest: PipelineManifest): LaneCard[] {
-  if (stage === "sync") {
-    const transformCard: LaneCard = {
-      name: "canonical transform",
-      kind: manifest.has_transform_override ? "transform override" : "engine transform",
-      version: null,
-      // The transform is the critical path: a failure quarantines the episode.
-      critical: true,
-      uses: null,
-      isEngineOwned: !manifest.has_transform_override,
-    };
-    const derivedCards = manifest.derived_channels.map(
-      (channel): LaneCard => ({
-        name: channel.topic,
-        kind: "derived channel",
-        version: channel.version,
-        critical: false,
-        uses: null,
-        isEngineOwned: false,
-      }),
-    );
-    return [transformCard, ...derivedCards];
-  }
-  if (stage === "meta") return [engineCard("catalog registration", "engine")];
-  if (stage === "media") return [engineCard("media/contact_sheet", "engine")];
-  return [];
-}
-
-function buildStageLanes(stages: PipelineStageLane[], manifest: PipelineManifest): StageLane[] {
-  return stages.map((serverLane) => {
-    const displayCopy = STAGE_DISPLAY_COPY[serverLane.stage] ?? {
-      title: serverLane.stage,
-      description: serverLane.engine_owned ? "engine-owned stage" : "pipeline steps",
-    };
-    const engineCards = engineWorkCards(serverLane.stage, manifest);
-    return {
-      stage: serverLane.stage,
-      title: displayCopy.title,
-      description: displayCopy.description,
-      // Engine work leads in sync (the transform runs first); elsewhere the
-      // user-registered steps lead and the engine annotation trails.
-      cards:
-        serverLane.stage === "sync"
-          ? [...engineCards, ...serverLane.steps.map(cardFromStep)]
-          : [...serverLane.steps.map(cardFromStep), ...engineCards],
-    };
-  });
-}
-
-function StepCardView({ card }: { card: LaneCard }) {
+  isSelected: boolean;
+  onSelect: () => void;
+}) {
+  const classes = [
+    "step-card",
+    "step-card-button",
+    isEngineOwned ? "step-card-engine" : "",
+    isSelected ? "is-selected" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
   return (
-    <div className={card.isEngineOwned ? "step-card step-card-engine" : "step-card"}>
-      <div className="step-card-top">
-        <span className="step-card-name" title={card.name}>
-          {card.name}
+    <button type="button" className={classes} onClick={onSelect} aria-current={isSelected}>
+      <span className="step-card-top">
+        <span className="step-card-name" title={name}>
+          {name}
         </span>
-        {card.critical ? <span className="chip chip-err">critical</span> : null}
-      </div>
-      <div className="step-card-meta">
-        <span className="step-card-kind">{card.kind}</span>
-        {card.version ? <VersionChip version={card.version} /> : null}
-        {card.uses ? (
-          <span className="chip chip-accent" title={`declares endpoint alias ${card.uses}`}>
-            {card.uses}
+        {critical ? <span className="chip chip-err">critical</span> : null}
+      </span>
+      <span className="step-card-meta">
+        <span className="step-card-kind">{kind}</span>
+        {/* The card itself is the button, so the version shows as plain text
+            here; the copyable VersionChip lives in the details panel. */}
+        {version ? <span className="step-card-version">{version.slice(0, 10)}</span> : null}
+        {uses ? (
+          <span className="chip chip-accent" title={`declares endpoint alias ${uses}`}>
+            {uses}
           </span>
         ) : null}
+      </span>
+    </button>
+  );
+}
+
+function TierGroup({
+  tier,
+  steps,
+  stage,
+  selection,
+  onSelect,
+}: {
+  tier: 1 | 2;
+  steps: PipelineUserStep[];
+  stage: string;
+  selection: PipelineSelection | null;
+  onSelect: (selection: PipelineSelection) => void;
+}) {
+  if (steps.length === 0) return null;
+  return (
+    <div className="tier-group">
+      <div className="tier-head">
+        <span className="tier-badge">tier {tier}</span>
+        <span className="tier-caption">
+          {tier === 1
+            ? "no requires, no endpoint alias — the engine runs these first"
+            : "declares requires or an endpoint alias — runs after tier 1"}
+        </span>
+      </div>
+      <p className="tier-note">
+        {steps.length === 1
+          ? "This step has no ordering relative to the others in this stage"
+          : `These ${steps.length} steps have no ordering between them`}
+        : they all run inside the same <code>process_batch</code> task, and only the tier boundary
+        is a real ordering.
+      </p>
+      <div className="step-card-row">
+        {steps.map((step) => (
+          <StepCard
+            key={step.name}
+            name={step.name}
+            kind={step.kind}
+            version={step.version}
+            critical={step.critical}
+            uses={step.uses}
+            isEngineOwned={false}
+            isSelected={
+              selection?.kind === "user-step" &&
+              selection.stage === stage &&
+              selection.name === step.name
+            }
+            onSelect={() => onSelect({ kind: "user-step", stage, name: step.name })}
+          />
+        ))}
       </div>
     </div>
+  );
+}
+
+function EngineStepRow({
+  steps,
+  stage,
+  selection,
+  onSelect,
+}: {
+  steps: PipelineEngineStep[];
+  stage: string;
+  selection: PipelineSelection | null;
+  onSelect: (selection: PipelineSelection) => void;
+}) {
+  if (steps.length === 0) return null;
+  return (
+    <div className="tier-group">
+      <div className="tier-head">
+        <span className="tier-badge is-engine">engine</span>
+        <span className="tier-caption">work the engine always does in this stage</span>
+      </div>
+      <div className="step-card-row">
+        {steps.map((step) => (
+          <StepCard
+            key={step.name}
+            name={step.name}
+            kind="engine"
+            version={null}
+            critical={false}
+            uses={null}
+            isEngineOwned={true}
+            isSelected={
+              selection?.kind === "engine-step" &&
+              selection.stage === stage &&
+              selection.name === step.name
+            }
+            onSelect={() => onSelect({ kind: "engine-step", stage, name: step.name })}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function StageLane({
+  stage,
+  graph,
+  isExpanded,
+  onToggle,
+  selection,
+  onSelect,
+  derivedChannels,
+}: {
+  stage: PipelineGraphStage;
+  graph: PipelineGraphResponse;
+  isExpanded: boolean;
+  onToggle: () => void;
+  selection: PipelineSelection | null;
+  onSelect: (selection: PipelineSelection) => void;
+  derivedChannels: { topic: string; version: string }[];
+}) {
+  const gate = graph.quarantine_gate;
+  const isQuarantineGated = gate ? gate.to_stages.includes(stage.stage) : false;
+  const isQuarantineSource = gate ? gate.from_stage === stage.stage : false;
+  const tierOneSteps = stage.user_steps.filter((step) => step.tier === 1);
+  const tierTwoSteps = stage.user_steps.filter((step) => step.tier === 2);
+  const subDagNodes = topologyNodes(stage.dag).map((node) =>
+    node.mapped
+      ? { ...node, badge: "×N", summary: `${node.summary} — one mapped instance per planned batch` }
+      : node,
+  );
+
+  return (
+    <div className={isExpanded ? "stage-lane-card is-expanded" : "stage-lane-card"}>
+      <button
+        type="button"
+        className="stage-lane-head"
+        onClick={onToggle}
+        aria-expanded={isExpanded}
+      >
+        <ChevronDownIcon className={isExpanded ? "chevron is-open" : "chevron"} />
+        <span className="lane-stage">{stage.stage}</span>
+        <span className="lane-title">{stage.title}</span>
+        <span className="lane-description">{stage.description}</span>
+        <span className="toolbar-spacer" />
+        {isQuarantineSource ? <span className="chip chip-warn">sets quarantine</span> : null}
+        {isQuarantineGated ? <span className="chip chip-warn">quarantine-gated</span> : null}
+        <span className="lane-step-count">
+          {graph.steps_known
+            ? `${stage.user_steps.length} step${stage.user_steps.length === 1 ? "" : "s"}`
+            : "steps unknown"}
+        </span>
+      </button>
+      {isExpanded ? (
+        <div className="stage-lane-body">
+          <div className="stage-lane-meta">
+            <span className="stage-meta-item">
+              <span className="meta-label">sub-dag</span>
+              <code className="cell-mono">{stage.dag.dag_id}</code>
+            </span>
+            <span className="stage-meta-item">
+              <span className="meta-label">enabled by profiles</span>
+              <span className="profile-chips">
+                {stage.enabling_profiles.length === 0 ? (
+                  <span className="empty-note">none</span>
+                ) : (
+                  stage.enabling_profiles.map((profile) => (
+                    <span key={profile} className="chip chip-muted">
+                      {profile}
+                    </span>
+                  ))
+                )}
+              </span>
+            </span>
+          </div>
+          <DagGraph
+            nodes={subDagNodes}
+            edges={topologyEdges(stage.dag)}
+            label={`${stage.stage} sub-DAG`}
+            selectedNodeId={
+              selection?.kind === "stage-task" && selection.stage === stage.stage
+                ? selection.taskId
+                : null
+            }
+            onSelectNode={(taskId) => onSelect({ kind: "stage-task", stage: stage.stage, taskId })}
+          />
+          <div className="inside-panel">
+            <div className="inside-panel-head">
+              <span className="inside-panel-title">
+                inside <code>process_batch</code>
+              </span>
+              <span className="inside-panel-note">
+                one mapped task instance per batch runs everything below, per episode
+              </span>
+            </div>
+            {!graph.steps_known ? (
+              <p className="empty-note">
+                No <code>--pipeline</code> configured, so the registered steps in this stage are
+                unknown. The orchestration above is the same either way.
+              </p>
+            ) : stage.user_steps.length === 0 && stage.engine_steps.length === 0 ? (
+              <p className="empty-note">Nothing registered in this stage.</p>
+            ) : (
+              <>
+                <EngineStepRow
+                  steps={stage.engine_steps}
+                  stage={stage.stage}
+                  selection={selection}
+                  onSelect={onSelect}
+                />
+                {derivedChannels.length > 0 ? (
+                  <div className="tier-group">
+                    <div className="tier-head">
+                      <span className="tier-badge is-engine">derived channels</span>
+                      <span className="tier-caption">written by the canonical transform</span>
+                    </div>
+                    <div className="step-card-row">
+                      {derivedChannels.map((channel) => (
+                        <span key={channel.topic} className="step-card step-card-engine">
+                          <span className="step-card-top">
+                            <span className="step-card-name" title={channel.topic}>
+                              {channel.topic}
+                            </span>
+                          </span>
+                          <span className="step-card-meta">
+                            <span className="step-card-kind">derived channel</span>
+                            <VersionChip version={channel.version} />
+                          </span>
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+                <TierGroup
+                  tier={1}
+                  steps={tierOneSteps}
+                  stage={stage.stage}
+                  selection={selection}
+                  onSelect={onSelect}
+                />
+                {tierOneSteps.length > 0 && tierTwoSteps.length > 0 ? (
+                  <div className="tier-divider">
+                    <span className="tier-divider-line" aria-hidden="true" />
+                    <span className="tier-divider-label">then</span>
+                    <span className="tier-divider-line" aria-hidden="true" />
+                  </div>
+                ) : null}
+                <TierGroup
+                  tier={2}
+                  steps={tierTwoSteps}
+                  stage={stage.stage}
+                  selection={selection}
+                  onSelect={onSelect}
+                />
+              </>
+            )}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function SelectionDetails({
+  graph,
+  selection,
+  onExpandStage,
+}: {
+  graph: PipelineGraphResponse;
+  selection: PipelineSelection | null;
+  onExpandStage: (stage: string) => void;
+}) {
+  if (selection === null) {
+    return (
+      <DetailsPanel title="How to read this graph" kicker="legend">
+        <ul className="legend-list">
+          <li>
+            <span className="legend-swatch is-plain" aria-hidden="true" />
+            <span>A task in the generated DAG. Solid connectors are real dependencies.</span>
+          </li>
+          <li>
+            <span className="legend-swatch is-mapped" aria-hidden="true" />
+            <span>
+              A stacked card is dynamically mapped: <strong>×N</strong> instances, one per planned
+              batch.
+            </span>
+          </li>
+          <li>
+            <span className="legend-chip">waits</span>
+            <span>
+              A deferred task. It released its worker slot and is waiting — not stalled, not
+              running.
+            </span>
+          </li>
+          <li>
+            <span className="legend-swatch is-gate" aria-hidden="true" />
+            <span>
+              A dashed connector is a conditional gate, not a task dependency: the quarantine
+              verdict.
+            </span>
+          </li>
+        </ul>
+        <p className="details-hint">
+          Select any node or step to see what it does. The steps inside <code>process_batch</code>{" "}
+          have no edges between them — that is the model, not a missing feature.
+        </p>
+      </DetailsPanel>
+    );
+  }
+
+  if (selection.kind === "quarantine") {
+    const gate = graph.quarantine_gate;
+    if (!gate) return <DetailsPanel title="Quarantine gate">{null}</DetailsPanel>;
+    return (
+      <DetailsPanel title="Quarantine gate" kicker="conditional edge">
+        <p className="details-prose">{gate.explanation}</p>
+        <DetailRow label="decided in">{gate.from_stage}</DetailRow>
+        <DetailRow label="skips">{gate.to_stages.join(", ")}</DetailRow>
+        <DetailBlock label="critical checks">
+          {gate.critical_step_names.length === 0 ? (
+            <p className="empty-note">No critical checks are registered, so nothing quarantines.</p>
+          ) : (
+            <ul className="detail-list">
+              {gate.critical_step_names.map((name) => (
+                <li key={name} className="cell-mono">
+                  {name}
+                </li>
+              ))}
+            </ul>
+          )}
+        </DetailBlock>
+      </DetailsPanel>
+    );
+  }
+
+  if (selection.kind === "master-task") {
+    const task = graph.master.tasks.find((entry) => entry.task_id === selection.taskId);
+    const stage = stageOfMasterTask(graph, selection.taskId);
+    return (
+      <DetailsPanel title={selection.taskId} kicker="master dag task">
+        <p className="details-prose">{task?.summary ?? "Unknown task."}</p>
+        <DetailRow label="dag">
+          <code className="cell-mono">{graph.master.dag_id}</code>
+        </DetailRow>
+        {task?.deferred ? (
+          <DetailRow label="waiting">
+            defers its worker slot while the sub-DAG runs (Airflow calls this deferred)
+          </DetailRow>
+        ) : null}
+        {stage ? (
+          <>
+            <DetailRow label="stage">{stage.stage}</DetailRow>
+            <DetailRow label="enabled by">
+              {stage.enabling_profiles.length > 0 ? stage.enabling_profiles.join(", ") : "—"}
+            </DetailRow>
+            <DetailBlock label="sub-dag">
+              <code className="cell-mono">{stage.dag.dag_id}</code>
+              <button
+                type="button"
+                className="btn btn-tiny"
+                onClick={() => onExpandStage(stage.stage)}
+              >
+                Expand {stage.stage}
+              </button>
+            </DetailBlock>
+          </>
+        ) : null}
+      </DetailsPanel>
+    );
+  }
+
+  if (selection.kind === "stage-task") {
+    const stage = graph.stages.find((entry) => entry.stage === selection.stage);
+    const task = stage?.dag.tasks.find((entry) => entry.task_id === selection.taskId);
+    return (
+      <DetailsPanel title={selection.taskId} kicker={`${selection.stage} sub-dag task`}>
+        <p className="details-prose">{task?.summary ?? "Unknown task."}</p>
+        <DetailRow label="dag">
+          <code className="cell-mono">{stage?.dag.dag_id ?? "—"}</code>
+        </DetailRow>
+        {task?.mapped ? (
+          <DetailRow label="fan-out">
+            dynamically mapped — one instance per planned batch, each running every step below
+          </DetailRow>
+        ) : null}
+        {stage ? (
+          <DetailRow label="triggered by">
+            <code className="cell-mono">{stage.trigger_task_id}</code>
+          </DetailRow>
+        ) : null}
+      </DetailsPanel>
+    );
+  }
+
+  if (selection.kind === "engine-step") {
+    const stage = graph.stages.find((entry) => entry.stage === selection.stage);
+    const step = stage?.engine_steps.find((entry) => entry.name === selection.name);
+    return (
+      <DetailsPanel title={selection.name} kicker="engine step">
+        <p className="details-prose">{step?.summary ?? "Engine-owned work."}</p>
+        <DetailRow label="stage">{selection.stage}</DetailRow>
+        <DetailRow label="registered">no — the engine always runs it</DetailRow>
+      </DetailsPanel>
+    );
+  }
+
+  const stage = graph.stages.find((entry) => entry.stage === selection.stage);
+  const step = stage?.user_steps.find((entry) => entry.name === selection.name);
+  if (!step) return <DetailsPanel title={selection.name}>{null}</DetailsPanel>;
+  return (
+    <DetailsPanel title={step.name} kicker={`${step.kind} · ${selection.stage}`}>
+      <DetailRow label="version">
+        <VersionChip version={step.version} />
+      </DetailRow>
+      <DetailRow label="critical">
+        {step.critical ? (
+          <span className="chip chip-err">yes — a failure quarantines the episode</span>
+        ) : (
+          "no"
+        )}
+      </DetailRow>
+      <DetailRow label="endpoint">{step.uses ?? "—"}</DetailRow>
+      <DetailBlock label="requires">
+        {step.requires.length === 0 ? (
+          <p className="empty-note">nothing — it reads the canonical episode only</p>
+        ) : (
+          <ul className="detail-list">
+            {step.requires.map((requirement) => (
+              <li key={requirement} className="cell-mono">
+                {requirement}
+              </li>
+            ))}
+          </ul>
+        )}
+      </DetailBlock>
+      <p className="details-hint">
+        Tier {step.tier}
+        {step.tier === 2
+          ? " — it declares requires or an endpoint alias, so the engine runs it after the cheap steps."
+          : " — no requires and no endpoint, so the engine runs it first."}{" "}
+        Within a tier there is no ordering.
+      </p>
+    </DetailsPanel>
+  );
+}
+
+function PipelineGraphView({
+  graph,
+  pipeline,
+}: {
+  graph: PipelineGraphResponse;
+  pipeline: PipelineResponse | undefined;
+}) {
+  const [selection, setSelection] = useState<PipelineSelection | null>(null);
+  const [expandedStagesOverride, setExpandedStagesOverride] = useState<ReadonlySet<string> | null>(
+    null,
+  );
+
+  // Open the first stage that actually has registered steps, so the nested
+  // layer is visible without hunting; the user's own toggles take over after.
+  const defaultExpandedStages = useMemo(() => {
+    const firstWithSteps = graph.stages.find((stage) => stage.user_steps.length > 0);
+    const chosen = firstWithSteps ?? graph.stages[0];
+    return new Set<string>(chosen ? [chosen.stage] : []);
+  }, [graph]);
+  const expandedStages = expandedStagesOverride ?? defaultExpandedStages;
+
+  const toggleStage = (stageName: string) => {
+    setExpandedStagesOverride(() => {
+      const next = new Set(expandedStages);
+      if (next.has(stageName)) next.delete(stageName);
+      else next.add(stageName);
+      return next;
+    });
+  };
+  const expandStage = (stageName: string) => {
+    setExpandedStagesOverride(() => new Set(expandedStages).add(stageName));
+  };
+
+  const masterNodes = topologyNodes(graph.master);
+  const masterEdges = [
+    ...topologyEdges(graph.master),
+    ...quarantineEdges(graph, graph.quarantine_gate),
+  ];
+  const expandedTriggerIds = graph.stages
+    .filter((stage) => expandedStages.has(stage.stage))
+    .map((stage) => stage.trigger_task_id);
+
+  const derivedChannelsByStage = (stageName: string) =>
+    stageName === "sync" ? (pipeline?.manifest.derived_channels ?? []) : [];
+
+  return (
+    <>
+      {!graph.dag_ids_known ? (
+        <div className="notice-banner" role="status">
+          <strong>No runtime addressed.</strong> The task graph below is what a bundle for this
+          pipeline renders; the DAG ids are display-only until <code>hflow up</code> (or an{" "}
+          <code>HFLOW_AIRFLOW_*</code> environment) gives the UI a real bundle.
+        </div>
+      ) : null}
+      {!graph.steps_known ? (
+        <div className="notice-banner" role="status">
+          <strong>No pipeline configured.</strong> Orchestration is exact, but the steps inside{" "}
+          <code>process_batch</code> are unknown. Restart with{" "}
+          <code>hflow ui --pipeline path/to/pipeline.py</code> to see them.
+        </div>
+      ) : null}
+
+      <div className="graph-layout">
+        <div className="graph-column">
+          <section className="section">
+            <h2 className="section-title">
+              Orchestration · <code className="cell-mono">{graph.master.dag_id}</code>
+            </h2>
+            <p className="section-note">
+              The master DAG validates the conf, then walks the stage chain: each stage is gated on
+              the run profile and triggered as its own sub-DAG, which the master waits for.
+            </p>
+            <DagGraph
+              nodes={masterNodes}
+              edges={masterEdges}
+              label="Master ingest DAG"
+              selectedNodeId={selection?.kind === "master-task" ? selection.taskId : null}
+              expandedNodeIds={expandedTriggerIds}
+              onSelectNode={(taskId) => {
+                setSelection({ kind: "master-task", taskId });
+                const stage = stageOfMasterTask(graph, taskId);
+                if (stage) expandStage(stage.stage);
+              }}
+            />
+            {graph.quarantine_gate ? (
+              <button
+                type="button"
+                className={
+                  selection?.kind === "quarantine" ? "gate-callout is-selected" : "gate-callout"
+                }
+                onClick={() => setSelection({ kind: "quarantine" })}
+              >
+                <span className="gate-callout-title">quarantine gate</span>
+                <span className="gate-callout-text">{graph.quarantine_gate.explanation}</span>
+              </button>
+            ) : null}
+          </section>
+
+          <section className="section">
+            <h2 className="section-title">Stages</h2>
+            <p className="section-note">
+              Expand a stage for its sub-DAG and the steps that run inside its{" "}
+              <code>process_batch</code>.
+            </p>
+            <div className="stage-lane-list">
+              {graph.stages.map((stage) => (
+                <StageLane
+                  key={stage.stage}
+                  stage={stage}
+                  graph={graph}
+                  isExpanded={expandedStages.has(stage.stage)}
+                  onToggle={() => toggleStage(stage.stage)}
+                  selection={selection}
+                  onSelect={setSelection}
+                  derivedChannels={derivedChannelsByStage(stage.stage)}
+                />
+              ))}
+            </div>
+          </section>
+        </div>
+        <div className="details-column">
+          <SelectionDetails graph={graph} selection={selection} onExpandStage={expandStage} />
+        </div>
+      </div>
+    </>
+  );
+}
+
+function ObservedVersionsSection({ pipeline }: { pipeline: PipelineResponse }) {
+  return (
+    <section className="section">
+      <h2 className="section-title">Observed versions</h2>
+      {pipeline.observed.length === 0 ? (
+        <p className="empty-note">
+          No check runs recorded in this catalog yet — observed step versions appear after an
+          ingest.
+        </p>
+      ) : (
+        <div className="table-overflow">
+          <table className="evidence-table">
+            <thead>
+              <tr>
+                <th>check</th>
+                <th>version</th>
+                <th>first seen</th>
+                <th>last seen</th>
+                <th>runs</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pipeline.observed.map((entry) => (
+                <tr key={`${entry.check_name}@${entry.check_version}`}>
+                  <td className="cell-mono">{entry.check_name}</td>
+                  <td>
+                    <VersionChip version={entry.check_version} />
+                  </td>
+                  <td className="cell-mono">{formatTimestamp(entry.first_seen)}</td>
+                  <td className="cell-mono">{formatTimestamp(entry.last_seen)}</td>
+                  <td className="cell-num">{entry.run_count}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -141,6 +745,13 @@ export function PipelinePage() {
     };
   }, []);
 
+  const graphQuery = useQuery({
+    queryKey: ["pipeline-graph"],
+    queryFn: fetchPipelineGraph,
+    retry: (failureCount, error) =>
+      !(error instanceof ApiError && (error.status === 404 || error.status === 409)) &&
+      failureCount < 1,
+  });
   const pipelineQuery = useQuery({
     queryKey: ["pipeline"],
     queryFn: fetchPipeline,
@@ -149,66 +760,34 @@ export function PipelinePage() {
       !(error instanceof ApiError && error.status === 409) && failureCount < 1,
   });
 
-  if (pipelineQuery.isPending) {
-    return (
-      <div className="pipeline-page">
-        <LoadingPanel label="Loading the pipeline manifest…" />
-      </div>
-    );
-  }
-
-  if (pipelineQuery.isError) {
-    const queryError = pipelineQuery.error;
-    if (queryError instanceof ApiError && queryError.status === 409) {
-      return (
-        <div className="pipeline-page">
-          <EmptyPanel title="No pipeline to show." hint={queryError.detail}>
-            <p className="state-detail">
-              Start the server with <code>hflow ui --pipeline path/to/pipeline.py</code> (append{" "}
-              <code>:app</code> if the App object is not named <code>app</code>) to see its stage
-              graph here. The file is imported once at startup, in your own environment.
-            </p>
-          </EmptyPanel>
-        </div>
-      );
-    }
-    return (
-      <div className="pipeline-page">
-        <ErrorPanel
-          error={queryError}
-          onRetry={() => {
-            void pipelineQuery.refetch();
-          }}
-        />
-      </div>
-    );
-  }
-
-  const { manifest, stages, observed, stale } = pipelineQuery.data;
-  const stageLanes = buildStageLanes(stages, manifest);
+  const manifest = pipelineQuery.data?.manifest;
+  const stale = pipelineQuery.data?.stale;
+  const pipelineTitle = manifest?.pipeline_name ?? graphQuery.data?.master.dag_id ?? "Pipeline";
 
   return (
     <div className="pipeline-page">
       <div className="page-title-row">
-        <h1 className="page-title">{manifest.pipeline_name}</h1>
-        <VersionChip version={manifest.pipeline_version} />
+        <h1 className="page-title">{pipelineTitle}</h1>
+        {manifest ? <VersionChip version={manifest.pipeline_version} /> : null}
       </div>
-      <div className="meta-grid pipeline-meta">
-        <div className="meta-item">
-          <div className="meta-label">hflow version</div>
-          <p className="meta-value">{manifest.hflow_version}</p>
+      {manifest ? (
+        <div className="meta-grid pipeline-meta">
+          <div className="meta-item">
+            <div className="meta-label">hflow version</div>
+            <p className="meta-value">{manifest.hflow_version}</p>
+          </div>
+          <div className="meta-item">
+            <div className="meta-label">schema version</div>
+            <p className="meta-value">{manifest.schema_version}</p>
+          </div>
+          <div className="meta-item">
+            <div className="meta-label">endpoint aliases</div>
+            <p className="meta-value">
+              {manifest.endpoint_aliases.length > 0 ? manifest.endpoint_aliases.join(", ") : "—"}
+            </p>
+          </div>
         </div>
-        <div className="meta-item">
-          <div className="meta-label">schema version</div>
-          <p className="meta-value">{manifest.schema_version}</p>
-        </div>
-        <div className="meta-item">
-          <div className="meta-label">endpoint aliases</div>
-          <p className="meta-value">
-            {manifest.endpoint_aliases.length > 0 ? manifest.endpoint_aliases.join(", ") : "—"}
-          </p>
-        </div>
-      </div>
+      ) : null}
 
       {stale && stale.count > 0 ? (
         <div className="stale-banner" role="status">
@@ -221,73 +800,42 @@ export function PipelinePage() {
         </div>
       ) : null}
 
-      <section className="section">
-        <h2 className="section-title">Stage graph</h2>
-        <div className="pipeline-lanes">
-          {stageLanes.map((lane, laneIndex) => (
-            <Fragment key={lane.stage}>
-              {laneIndex > 0 ? (
-                <div className="lane-arrow" aria-hidden="true">
-                  <ChevronDownIcon className="lane-arrow-icon" />
-                </div>
-              ) : null}
-              <div className="pipeline-lane">
-                <div className="lane-header">
-                  <span className="lane-stage">{lane.stage}</span>
-                  <span className="lane-title">{lane.title}</span>
-                </div>
-                <p className="lane-description">{lane.description}</p>
-                {lane.cards.length === 0 ? (
-                  <p className="empty-note">nothing registered</p>
-                ) : (
-                  <div className="lane-cards">
-                    {lane.cards.map((card) => (
-                      <StepCardView key={card.name} card={card} />
-                    ))}
-                  </div>
-                )}
-              </div>
-            </Fragment>
-          ))}
-        </div>
-      </section>
-
-      <section className="section">
-        <h2 className="section-title">Observed versions</h2>
-        {observed.length === 0 ? (
-          <p className="empty-note">
-            No check runs recorded in this catalog yet — observed step versions appear after an
-            ingest.
-          </p>
+      {graphQuery.isPending ? (
+        <LoadingPanel label="Loading the pipeline graph…" />
+      ) : graphQuery.isError ? (
+        graphQuery.error instanceof ApiError && graphQuery.error.status === 404 ? (
+          <EmptyPanel
+            title="This server does not serve the pipeline graph."
+            hint="Upgrade hflow-ui to see the ingest DAG and its stage sub-DAGs here."
+          />
         ) : (
-          <div className="table-overflow">
-            <table className="evidence-table">
-              <thead>
-                <tr>
-                  <th>check</th>
-                  <th>version</th>
-                  <th>first seen</th>
-                  <th>last seen</th>
-                  <th>runs</th>
-                </tr>
-              </thead>
-              <tbody>
-                {observed.map((entry) => (
-                  <tr key={`${entry.check_name}@${entry.check_version}`}>
-                    <td className="cell-mono">{entry.check_name}</td>
-                    <td>
-                      <VersionChip version={entry.check_version} />
-                    </td>
-                    <td className="cell-mono">{formatTimestamp(entry.first_seen)}</td>
-                    <td className="cell-mono">{formatTimestamp(entry.last_seen)}</td>
-                    <td className="cell-num">{entry.run_count}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </section>
+          <ErrorPanel
+            error={graphQuery.error}
+            onRetry={() => {
+              void graphQuery.refetch();
+            }}
+          />
+        )
+      ) : (
+        <PipelineGraphView graph={graphQuery.data} pipeline={pipelineQuery.data} />
+      )}
+
+      {pipelineQuery.data ? <ObservedVersionsSection pipeline={pipelineQuery.data} /> : null}
+      {pipelineQuery.isError &&
+      pipelineQuery.error instanceof ApiError &&
+      pipelineQuery.error.status === 409 ? (
+        <section className="section">
+          <h2 className="section-title">Registered steps</h2>
+          <EmptyPanel title="No pipeline manifest." hint={pipelineQuery.error.detail}>
+            <p className="state-detail">
+              Start the server with <code>hflow ui --pipeline path/to/pipeline.py</code> (append{" "}
+              <code>:app</code> if the App object is not named <code>app</code>) to see registered
+              steps, versions and staleness here. The file is imported once at startup, in your own
+              environment.
+            </p>
+          </EmptyPanel>
+        </section>
+      ) : null}
     </div>
   );
 }

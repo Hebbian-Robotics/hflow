@@ -681,6 +681,158 @@ export function fetchEpisodeStats(filter: EpisodesFilter): Promise<EpisodesStats
   return fetchJson<EpisodesStatsResponse>(`/api/v1/episodes/stats${suffix}`);
 }
 
+// --- Visualization wave: DAG topology, live run graph, episode timeline ----------
+
+/** One task of a generated DAG (mirrors hflow.runtime.DagTaskNode). */
+export interface DagTaskNode {
+  task_id: string;
+  summary: string;
+  /** Dynamically mapped: one instance per planned batch — draw it as a fan-out. */
+  mapped: boolean;
+  /** Defers instead of holding a worker slot — say "waiting", never "stalled". */
+  deferred: boolean;
+}
+
+export interface DagTopology {
+  dag_id: string;
+  tasks: DagTaskNode[];
+  /** [upstream, downstream] task-id pairs, declaration order. */
+  edges: [string, string][];
+}
+
+/** Engine work inside one stage that the manifest's step lists do not carry. */
+export interface PipelineEngineStep {
+  name: string;
+  summary: string;
+}
+
+/**
+ * One registered step, as the graph endpoint serves it. `tier` mirrors
+ * App._ordered_checks: tier 2 iff the step declares requires or uses, so it
+ * runs after the cheap ones. Steps within a tier have NO ordering.
+ */
+export interface PipelineUserStep {
+  name: string;
+  kind: string;
+  version: string;
+  critical: boolean;
+  uses: string | null;
+  requires: string[];
+  tier: 1 | 2;
+}
+
+export interface PipelineGraphStage {
+  /** A hflow.steps.Stage value; unknown names can appear under version skew. */
+  stage: string;
+  title: string;
+  description: string;
+  gate_task_id: string;
+  trigger_task_id: string;
+  enabling_profiles: string[];
+  dag: DagTopology;
+  engine_steps: PipelineEngineStep[];
+  user_steps: PipelineUserStep[];
+}
+
+/** The one real cross-step edge: meta's critical checks gate later enrichment. */
+export interface QuarantineGate {
+  from_stage: string;
+  to_stages: string[];
+  critical_step_names: string[];
+  explanation: string;
+}
+
+export interface PipelineGraphResponse {
+  /** False when no runtime is addressed: the master id is display-only. */
+  dag_ids_known: boolean;
+  /** False without --pipeline: the steps inside process_batch are unknown. */
+  steps_known: boolean;
+  master: DagTopology;
+  stages: PipelineGraphStage[];
+  /** Null exactly when steps_known is false. */
+  quarantine_gate: QuarantineGate | null;
+}
+
+export function fetchPipelineGraph(): Promise<PipelineGraphResponse> {
+  return fetchJson<PipelineGraphResponse>("/api/v1/pipeline/graph");
+}
+
+/** One Airflow task instance; map_index -1 means the task is not mapped. */
+export interface RunTaskInstance {
+  task_id: string;
+  state: string | null;
+  start_date: string | null;
+  end_date: string | null;
+  try_number: number | null;
+  map_index: number;
+  duration_s: number | null;
+}
+
+export interface RunGraphMaster {
+  dag_run_id: string;
+  state: string | null;
+  tasks: RunTaskInstance[];
+}
+
+export interface MappedFanOutSummary {
+  task_id: string;
+  total: number;
+  by_state: Record<string, number>;
+}
+
+export interface RunGraphStage {
+  stage: string;
+  dag_id: string;
+  /** Null when this stage never ran for this master run. */
+  dag_run_id: string | null;
+  state: string | null;
+  /** "heuristic": matched by start time, not by a stored parent-run link. */
+  match: "heuristic" | null;
+  tasks: RunTaskInstance[];
+  mapped_summary: MappedFanOutSummary | null;
+}
+
+export interface RunGraphResponse {
+  master: RunGraphMaster;
+  stages: RunGraphStage[];
+}
+
+export function fetchRunGraph(dagRunId: string): Promise<RunGraphResponse> {
+  return fetchJson<RunGraphResponse>(`/api/v1/runtime/runs/${encodeURIComponent(dagRunId)}/graph`);
+}
+
+/** One recorded interval, with seconds relative to the episode span. */
+export interface TimelineInterval {
+  label: string;
+  start_ns: number;
+  end_ns: number;
+  start_s: number;
+  end_s: number;
+  check_name: string;
+  /** Label prefix ("gap", "joint_discontinuity", …) — the colour grouping. */
+  kind: string;
+}
+
+/** A numeric measurement, ready to draw as a bar. */
+export interface TimelineMeasurement {
+  key: string;
+  value: number;
+  unit: string | null;
+}
+
+export interface EpisodeTimeline {
+  start_ns: number | null;
+  end_ns: number | null;
+  /** Null when nothing in the episode gives a span — the UI must say so. */
+  duration_s: number | null;
+  intervals: TimelineInterval[];
+  measurements: TimelineMeasurement[];
+}
+
+export function fetchEpisodeTimeline(episodeId: string): Promise<EpisodeTimeline> {
+  return fetchJson<EpisodeTimeline>(`/api/v1/episodes/${encodeURIComponent(episodeId)}/timeline`);
+}
+
 /** Human-readable message for any error a query can surface. */
 export function describeApiError(error: unknown): string {
   if (error instanceof ApiError) {

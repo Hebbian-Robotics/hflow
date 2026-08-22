@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Fragment, type ReactNode, useEffect, useMemo, useState } from "react";
 import { Link, useLocation, useParams } from "react-router-dom";
 import {
+  ApiError,
   type EpisodeCheckRun,
   type EpisodeDossier,
   type EpisodeInterval,
@@ -9,9 +10,12 @@ import {
   type EpisodeMediaItem,
   type EpisodeRow,
   type EpisodeTagRecord,
+  type EpisodeTimeline,
   fetchEpisodeDossier,
+  fetchEpisodeTimeline,
   withSessionToken,
 } from "../api";
+import { MeasurementBars, TimelineStrip } from "../components/EpisodeTimeline";
 import { EmptyPanel, ErrorPanel, LoadingPanel } from "../components/QueryStates";
 import { StatusChip } from "../components/StatusChip";
 import { ValueCell } from "../components/ValueCell";
@@ -81,6 +85,64 @@ function MediaSection({ media }: { media: EpisodeMediaItem[] }) {
       </div>
     </SectionShell>
   );
+}
+
+/** The visual half of the evidence: where things happened in the recording,
+ * and how big the numbers are. Both come from /episodes/{id}/timeline, which
+ * derives the span server-side. */
+function TimelineSections({ timeline }: { timeline: EpisodeTimeline }) {
+  return (
+    <>
+      <SectionShell title="Timeline">
+        <TimelineStrip timeline={timeline} />
+      </SectionShell>
+      <SectionShell title="Measurements at a glance">
+        <MeasurementBars measurements={timeline.measurements} />
+      </SectionShell>
+    </>
+  );
+}
+
+function VisualEvidence({ episodeId }: { episodeId: string }) {
+  const timelineQuery = useQuery({
+    queryKey: ["episode-timeline", episodeId],
+    queryFn: () => fetchEpisodeTimeline(episodeId),
+    // A 404 here means the server predates the timeline endpoint, not a bad
+    // episode id (the dossier above already resolved it) — retrying is pointless.
+    retry: (failureCount, error) =>
+      !(error instanceof ApiError && error.status === 404) && failureCount < 1,
+  });
+
+  if (timelineQuery.isPending) {
+    return (
+      <SectionShell title="Timeline">
+        <LoadingPanel label="Loading the episode timeline…" />
+      </SectionShell>
+    );
+  }
+  if (timelineQuery.isError) {
+    if (timelineQuery.error instanceof ApiError && timelineQuery.error.status === 404) {
+      return (
+        <SectionShell title="Timeline">
+          <p className="empty-note">
+            This server does not serve episode timelines yet — upgrade hflow-ui to see interval
+            bands and measurement bars here.
+          </p>
+        </SectionShell>
+      );
+    }
+    return (
+      <SectionShell title="Timeline">
+        <ErrorPanel
+          error={timelineQuery.error}
+          onRetry={() => {
+            void timelineQuery.refetch();
+          }}
+        />
+      </SectionShell>
+    );
+  }
+  return <TimelineSections timeline={timelineQuery.data} />;
 }
 
 function CheckRunsSection({ checkRuns }: { checkRuns: EpisodeCheckRun[] }) {
@@ -379,6 +441,8 @@ function DossierView({ dossier }: { dossier: EpisodeDossier }) {
       </header>
 
       <MediaSection media={dossier.media} />
+
+      <VisualEvidence episodeId={episodeIdText} />
 
       <CheckRunsSection checkRuns={dossier.check_runs} />
       <MeasurementsSection measurements={dossier.measurements} />

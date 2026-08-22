@@ -1,12 +1,21 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import {
+  ApiError,
+  type DagTopology,
   describeApiError,
+  fetchPipelineGraph,
+  fetchRunGraph,
   fetchRuntimeRuns,
   fetchRuntimeStatus,
   fetchWorkspaceConfig,
   INGEST_MODES,
+  type MappedFanOutSummary,
+  type PipelineGraphResponse,
   RUN_PROFILE_NAMES,
+  type RunGraphResponse,
+  type RunGraphStage,
+  type RunTaskInstance,
   type RuntimeHealth,
   type RuntimeRun,
   type RuntimeStatus,
@@ -15,37 +24,19 @@ import {
   triggerIngest,
   type WorkspaceConfig,
 } from "../api";
+import { DagGraph, type DagGraphNode } from "../components/DagGraph";
+import { DetailBlock, DetailRow, DetailsPanel } from "../components/DetailsPanel";
 import { EmptyPanel, ErrorPanel, LoadingPanel } from "../components/QueryStates";
-import { formatDurationBetween, formatTimestamp } from "../format";
+import { RunStateChip } from "../components/RunStateChip";
+import { formatDurationBetween, formatDurationCompact, formatTimestamp } from "../format";
 import { ChevronDownIcon, ExternalLinkIcon, PlayIcon, RefreshIcon } from "../icons";
+import { runStateTone } from "../runState";
 
 const RUNS_PAGE_LIMIT = 25;
 const AUTO_REFRESH_INTERVAL_MS = 10_000;
 
 // The runs monitor renders exactly what the server proxied from Airflow —
 // the browser never sees Airflow credentials, only these JSON summaries.
-
-function runStateChipClass(state: string): string {
-  switch (state.toLowerCase()) {
-    case "success":
-      return "chip chip-ok";
-    case "failed":
-    case "error":
-      return "chip chip-err";
-    case "running":
-      return "chip chip-accent";
-    case "up_for_retry":
-    case "up_for_reschedule":
-    case "restarting":
-      return "chip chip-warn";
-    default:
-      return "chip chip-muted";
-  }
-}
-
-function RunStateChip({ state }: { state: string }) {
-  return <span className={runStateChipClass(state)}>{state}</span>;
-}
 
 type HealthTone = "ok" | "err" | "warn" | "muted";
 
@@ -123,14 +114,380 @@ function airflowRunUrl(
   return `${base}/dags/${encodeURIComponent(dagId)}/runs/${encodeURIComponent(dagRunId)}`;
 }
 
+function airflowTaskUrl(
+  webUrlBase: string | null,
+  dagId: string | null,
+  dagRunId: string | null,
+  taskId: string,
+): string | null {
+  if (!dagRunId) return null;
+  const runUrl = airflowRunUrl(webUrlBase, dagId, dagRunId);
+  return runUrl ? `${runUrl}/tasks/${encodeURIComponent(taskId)}` : null;
+}
+
+// ---- run graph ----------------------------------------------------------------
+
+/** One node's live picture: the instances Airflow reported for that task id. */
+interface TaskInstanceGroup {
+  instances: RunTaskInstance[];
+  /** The state to paint the node with; the badge carries the exact counts. */
+  state: string | null;
+  badge: string | null;
+}
+
+function summarizeInstances(
+  instances: RunTaskInstance[],
+  mappedSummary: MappedFanOutSummary | null,
+): TaskInstanceGroup {
+  if (instances.length === 0) return { instances, state: null, badge: null };
+  const isMapped = instances.some((instance) => instance.map_index >= 0);
+  if (!isMapped) {
+    const single = instances[0] as RunTaskInstance;
+    return {
+      instances,
+      state: single.state,
+      badge: single.duration_s === null ? null : formatDurationCompact(single.duration_s),
+    };
+  }
+  const byState = new Map<string, number>();
+  for (const instance of instances) {
+    const stateName = instance.state ?? "no state";
+    byState.set(stateName, (byState.get(stateName) ?? 0) + 1);
+  }
+  const total = mappedSummary?.total ?? instances.length;
+  const succeeded = mappedSummary?.by_state.success ?? byState.get("success") ?? 0;
+  // The painted state names the most urgent thing happening in the fan-out;
+  // the badge below it always shows the real split, so nothing is hidden.
+  const dominantState =
+    (byState.has("running") && "running") ||
+    (byState.has("failed") && "failed") ||
+    (byState.has("upstream_failed") && "upstream_failed") ||
+    (byState.has("deferred") && "deferred") ||
+    (succeeded === total && "success") ||
+    instances[0]?.state ||
+    null;
+  return { instances, state: dominantState, badge: `${succeeded}/${total} ok` };
+}
+
+function instanceGroupsByTaskId(
+  tasks: RunTaskInstance[],
+  mappedSummary: MappedFanOutSummary | null,
+): Map<string, TaskInstanceGroup> {
+  const byTaskId = new Map<string, RunTaskInstance[]>();
+  for (const instance of tasks) {
+    const bucket = byTaskId.get(instance.task_id);
+    if (bucket) bucket.push(instance);
+    else byTaskId.set(instance.task_id, [instance]);
+  }
+  const groups = new Map<string, TaskInstanceGroup>();
+  for (const [taskId, instances] of byTaskId) {
+    groups.set(
+      taskId,
+      summarizeInstances(
+        instances,
+        mappedSummary && mappedSummary.task_id === taskId ? mappedSummary : null,
+      ),
+    );
+  }
+  return groups;
+}
+
+function liveNodes(topology: DagTopology, groups: Map<string, TaskInstanceGroup>): DagGraphNode[] {
+  return topology.tasks.map((task) => {
+    const group = groups.get(task.task_id);
+    return {
+      id: task.task_id,
+      label: task.task_id,
+      summary: task.summary,
+      mapped: task.mapped,
+      deferred: task.deferred,
+      state: group?.state ?? "no instance",
+      badge: group?.badge ?? (task.mapped ? "×0" : null),
+    };
+  });
+}
+
+interface RunNodeSelection {
+  /** "master", or a stage name. */
+  scope: string;
+  taskId: string;
+}
+
+function TaskInstanceDetails({
+  selection,
+  group,
+  summary,
+  dagId,
+  dagRunId,
+  airflowWebUrl,
+}: {
+  selection: RunNodeSelection;
+  group: TaskInstanceGroup | undefined;
+  summary: string;
+  dagId: string;
+  dagRunId: string | null;
+  airflowWebUrl: string | null;
+}) {
+  const taskUrl = airflowTaskUrl(airflowWebUrl, dagId, dagRunId, selection.taskId);
+  const mappedInstances = (group?.instances ?? []).filter((instance) => instance.map_index >= 0);
+  const single = group?.instances.length === 1 ? group.instances[0] : undefined;
+  return (
+    <DetailsPanel
+      title={selection.taskId}
+      kicker={selection.scope === "master" ? "master task" : `${selection.scope} task`}
+    >
+      <p className="details-prose">{summary}</p>
+      <DetailRow label="state">
+        <RunStateChip state={group?.state ?? "no instance"} />
+      </DetailRow>
+      {single ? (
+        <>
+          <DetailRow label="started">
+            {single.start_date ? formatTimestamp(single.start_date) : "—"}
+          </DetailRow>
+          <DetailRow label="ended">
+            {single.end_date ? formatTimestamp(single.end_date) : "—"}
+          </DetailRow>
+          <DetailRow label="duration">{formatDurationCompact(single.duration_s)}</DetailRow>
+          <DetailRow label="tries">{single.try_number ?? "—"}</DetailRow>
+        </>
+      ) : null}
+      {mappedInstances.length > 0 ? (
+        <DetailBlock label={`mapped instances · ${mappedInstances.length}`}>
+          <ul className="instance-list">
+            {mappedInstances.map((instance) => (
+              <li key={instance.map_index} className="instance-row">
+                <span className="instance-index">[{instance.map_index}]</span>
+                <RunStateChip state={instance.state} />
+                <span className="instance-duration">
+                  {formatDurationCompact(instance.duration_s)}
+                </span>
+                {instance.try_number !== null && instance.try_number > 1 ? (
+                  <span className="chip chip-warn">try {instance.try_number}</span>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        </DetailBlock>
+      ) : null}
+      {taskUrl ? (
+        <a className="btn btn-tiny" href={taskUrl} target="_blank" rel="noreferrer">
+          <ExternalLinkIcon />
+          <span>Open in Airflow</span>
+        </a>
+      ) : null}
+    </DetailsPanel>
+  );
+}
+
+/** The batch fan-out at a glance: one proportional bar in the state palette,
+ * with the counts spelled out beside it so the split never rests on colour. */
+function FanOutSummary({ summary }: { summary: MappedFanOutSummary }) {
+  const succeeded = summary.by_state.success ?? 0;
+  const otherStates = Object.entries(summary.by_state)
+    .filter(([stateName]) => stateName !== "success")
+    .sort((left, right) => right[1] - left[1]);
+  return (
+    <span className="fanout">
+      <span className="fanout-bar" aria-hidden="true">
+        {Object.entries(summary.by_state).map(([stateName, count]) => (
+          <span
+            key={stateName}
+            className={`fanout-seg is-${runStateTone(stateName)}`}
+            style={{ flexGrow: count }}
+            title={`${count} ${stateName}`}
+          />
+        ))}
+      </span>
+      <span className="fanout-readout">
+        {succeeded} of {summary.total} batches succeeded
+        {otherStates.map(([stateName, count]) => ` · ${count} ${stateName}`).join("")}
+      </span>
+    </span>
+  );
+}
+
+function StageRunGraph({
+  stage,
+  topology,
+  selection,
+  onSelect,
+  airflowWebUrl,
+}: {
+  stage: RunGraphStage;
+  topology: DagTopology | undefined;
+  selection: RunNodeSelection | null;
+  onSelect: (selection: RunNodeSelection) => void;
+  airflowWebUrl: string | null;
+}) {
+  const groups = useMemo(
+    () => instanceGroupsByTaskId(stage.tasks, stage.mapped_summary),
+    [stage.tasks, stage.mapped_summary],
+  );
+  const runUrl = stage.dag_run_id
+    ? airflowRunUrl(airflowWebUrl, stage.dag_id, stage.dag_run_id)
+    : null;
+  return (
+    <div className="stage-lane-card is-expanded">
+      <div className="stage-run-head">
+        <span className="lane-stage">{stage.stage}</span>
+        <RunStateChip state={stage.state ?? "not run"} />
+        <code className="cell-mono stage-run-dag" title={stage.dag_id}>
+          {stage.dag_id}
+        </code>
+        {stage.mapped_summary ? <FanOutSummary summary={stage.mapped_summary} /> : null}
+        <span className="toolbar-spacer" />
+        {stage.match === "heuristic" ? (
+          <span
+            className="chip chip-muted"
+            title="Matched to this master run by start time — Airflow stores no parent-run link for triggered sub-DAGs."
+          >
+            matched by time
+          </span>
+        ) : null}
+        {runUrl ? (
+          <a className="btn btn-ghost btn-tiny" href={runUrl} target="_blank" rel="noreferrer">
+            <ExternalLinkIcon />
+          </a>
+        ) : null}
+      </div>
+      {stage.dag_run_id === null ? (
+        <p className="empty-note stage-run-empty">
+          This stage did not run for this master run (the run profile skipped it, or the chain
+          stopped before it).
+        </p>
+      ) : !topology ? (
+        <p className="empty-note stage-run-empty">
+          No topology for this stage — the server does not describe it.
+        </p>
+      ) : (
+        <DagGraph
+          nodes={liveNodes(topology, groups)}
+          edges={topology.edges.map(([from, to]) => ({ from, to }))}
+          label={`${stage.stage} sub-DAG for this run`}
+          selectedNodeId={selection?.scope === stage.stage ? selection.taskId : null}
+          onSelectNode={(taskId) => onSelect({ scope: stage.stage, taskId })}
+        />
+      )}
+    </div>
+  );
+}
+
+function RunGraphSection({
+  runGraph,
+  graph,
+  airflowWebUrl,
+}: {
+  runGraph: RunGraphResponse;
+  graph: PipelineGraphResponse;
+  airflowWebUrl: string | null;
+}) {
+  const [selection, setSelection] = useState<RunNodeSelection | null>(null);
+  const masterGroups = useMemo(
+    () => instanceGroupsByTaskId(runGraph.master.tasks, null),
+    [runGraph.master.tasks],
+  );
+
+  const selectedStage =
+    selection && selection.scope !== "master"
+      ? runGraph.stages.find((stage) => stage.stage === selection.scope)
+      : undefined;
+  const selectedGroup =
+    selection === null
+      ? undefined
+      : selection.scope === "master"
+        ? masterGroups.get(selection.taskId)
+        : selectedStage
+          ? instanceGroupsByTaskId(selectedStage.tasks, selectedStage.mapped_summary).get(
+              selection.taskId,
+            )
+          : undefined;
+  const selectedTopology =
+    selection === null
+      ? undefined
+      : selection.scope === "master"
+        ? graph.master
+        : graph.stages.find((stage) => stage.stage === selection.scope)?.dag;
+  const selectedSummary =
+    selectedTopology?.tasks.find((task) => task.task_id === selection?.taskId)?.summary ??
+    "This task is not part of the topology this server describes.";
+
+  return (
+    <section className="section">
+      <h2 className="section-title">Run graph</h2>
+      <div className="run-graph-head">
+        <RunStateChip state={runGraph.master.state} />
+        <code className="cell-mono run-graph-id" title={runGraph.master.dag_run_id}>
+          {runGraph.master.dag_run_id}
+        </code>
+      </div>
+      <div className="graph-layout">
+        <div className="graph-column">
+          <DagGraph
+            nodes={liveNodes(graph.master, masterGroups)}
+            edges={graph.master.edges.map(([from, to]) => ({ from, to }))}
+            label="Master DAG for this run"
+            selectedNodeId={selection?.scope === "master" ? selection.taskId : null}
+            onSelectNode={(taskId) => setSelection({ scope: "master", taskId })}
+          />
+          <div className="stage-lane-list">
+            {runGraph.stages.map((stage) => (
+              <StageRunGraph
+                key={stage.stage}
+                stage={stage}
+                topology={graph.stages.find((entry) => entry.stage === stage.stage)?.dag}
+                selection={selection}
+                onSelect={setSelection}
+                airflowWebUrl={airflowWebUrl}
+              />
+            ))}
+          </div>
+        </div>
+        <div className="details-column">
+          {selection === null ? (
+            <DetailsPanel title="No task selected" kicker="details">
+              <p className="details-hint">
+                Select a node in the master DAG or a stage sub-DAG to see its state, timings and
+                tries. Stacked nodes are mapped fan-outs: their badge is the batch split, and the
+                panel lists every instance.
+              </p>
+            </DetailsPanel>
+          ) : (
+            <TaskInstanceDetails
+              selection={selection}
+              group={selectedGroup}
+              summary={selectedSummary}
+              dagId={
+                selection.scope === "master" ? graph.master.dag_id : (selectedStage?.dag_id ?? "")
+              }
+              dagRunId={
+                selection.scope === "master"
+                  ? runGraph.master.dag_run_id
+                  : (selectedStage?.dag_run_id ?? null)
+              }
+              airflowWebUrl={airflowWebUrl}
+            />
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+// ---- tables -------------------------------------------------------------------
+
 function MasterRunsTable({
   runs,
   airflowWebUrl,
   dagId,
+  selectedRunId,
+  onSelectRun,
 }: {
   runs: RuntimeRun[];
   airflowWebUrl: string | null;
   dagId: string | null;
+  selectedRunId: string | null;
+  onSelectRun: (dagRunId: string) => void;
 }) {
   const [expandedRunIds, setExpandedRunIds] = useState<ReadonlySet<string>>(new Set());
   const hasAirflowLinks = airflowWebUrl !== null && dagId !== null;
@@ -171,10 +528,11 @@ function MasterRunsTable({
         <tbody>
           {runs.map((run) => {
             const isExpanded = expandedRunIds.has(run.dag_run_id);
+            const isSelected = run.dag_run_id === selectedRunId;
             const runUrl = airflowRunUrl(airflowWebUrl, dagId, run.dag_run_id);
             return (
               <Fragment key={run.dag_run_id}>
-                <tr>
+                <tr className={isSelected ? "is-selected-run" : undefined}>
                   <td>
                     <button
                       type="button"
@@ -189,8 +547,18 @@ function MasterRunsTable({
                   <td>
                     <RunStateChip state={run.state} />
                   </td>
-                  <td className="cell-mono" title={run.dag_run_id}>
-                    {run.dag_run_id}
+                  <td>
+                    <button
+                      type="button"
+                      className={isSelected ? "run-id-button is-selected" : "run-id-button"}
+                      onClick={() => onSelectRun(run.dag_run_id)}
+                      title={
+                        isSelected ? "Shown in the run graph above" : "Show this run in the graph"
+                      }
+                      aria-current={isSelected}
+                    >
+                      {run.dag_run_id}
+                    </button>
                   </td>
                   <td className="cell-mono">
                     {run.start_date ? formatTimestamp(run.start_date) : "—"}
@@ -426,6 +794,7 @@ function TriggerIngestForm({ config }: { config: WorkspaceConfig | undefined }) 
 
 export function RunsPage() {
   const [isAutoRefreshOn, setIsAutoRefreshOn] = useState(false);
+  const [selectedRunIdChoice, setSelectedRunIdChoice] = useState<string | null>(null);
 
   useEffect(() => {
     document.title = "Runs · HFlow";
@@ -452,14 +821,42 @@ export function RunsPage() {
     refetchInterval: isAutoRefreshOn ? AUTO_REFRESH_INTERVAL_MS : false,
   });
 
+  // Without an explicit pick, the graph follows the newest run.
+  const selectedRunId = selectedRunIdChoice ?? runsQuery.data?.runs[0]?.dag_run_id ?? null;
+
+  // The topology is the same payload the Pipeline page draws (shared cache);
+  // the run graph only adds live state over it.
+  const topologyQuery = useQuery({
+    queryKey: ["pipeline-graph"],
+    queryFn: fetchPipelineGraph,
+    enabled: runtimeStatus?.available === true,
+    retry: (failureCount, error) =>
+      !(error instanceof ApiError && (error.status === 404 || error.status === 409)) &&
+      failureCount < 1,
+  });
+
+  const runGraphQuery = useQuery({
+    queryKey: ["run-graph", selectedRunId],
+    queryFn: () => fetchRunGraph(selectedRunId ?? ""),
+    enabled: selectedRunId !== null && runtimeStatus?.available === true,
+    refetchInterval: isAutoRefreshOn ? AUTO_REFRESH_INTERVAL_MS : false,
+    retry: (failureCount, error) =>
+      !(error instanceof ApiError && (error.status === 404 || error.status === 409)) &&
+      failureCount < 1,
+  });
+
   const refreshNow = () => {
     void statusQuery.refetch();
-    if (runtimeStatus?.available) void runsQuery.refetch();
+    if (runtimeStatus?.available) {
+      void runsQuery.refetch();
+      void runGraphQuery.refetch();
+    }
   };
 
   const isRefreshing =
     (statusQuery.isFetching && !statusQuery.isPending) ||
-    (runsQuery.isFetching && !runsQuery.isPending);
+    (runsQuery.isFetching && !runsQuery.isPending) ||
+    (runGraphQuery.isFetching && !runGraphQuery.isPending);
 
   return (
     <div className="runs-page">
@@ -507,6 +904,27 @@ export function RunsPage() {
         <>
           <StatusTiles status={runtimeStatus} />
 
+          {runGraphQuery.isPending && selectedRunId !== null ? (
+            <LoadingPanel label="Loading the run graph…" />
+          ) : runGraphQuery.data && topologyQuery.data ? (
+            <RunGraphSection
+              // Keyed by run: picking another run starts with a clean
+              // selection instead of pointing at the previous run's task.
+              key={runGraphQuery.data.master.dag_run_id}
+              runGraph={runGraphQuery.data}
+              graph={topologyQuery.data}
+              airflowWebUrl={runtimeStatus.airflow_web_url}
+            />
+          ) : runGraphQuery.isError || topologyQuery.isError ? (
+            <section className="section">
+              <h2 className="section-title">Run graph</h2>
+              <p className="empty-note">
+                {describeApiError(runGraphQuery.error ?? topologyQuery.error)} — the runs table
+                below still works.
+              </p>
+            </section>
+          ) : null}
+
           {readOnly ? null : <TriggerIngestForm config={configQuery.data} />}
 
           <section className="section">
@@ -525,6 +943,8 @@ export function RunsPage() {
                 runs={runsQuery.data.runs}
                 airflowWebUrl={runtimeStatus.airflow_web_url}
                 dagId={runtimeStatus.dag_id}
+                selectedRunId={selectedRunId}
+                onSelectRun={setSelectedRunIdChoice}
               />
             )}
           </section>

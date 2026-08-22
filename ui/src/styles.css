@@ -27,6 +27,18 @@
 
   --focus-ring: #0c6d77;
 
+  /* Categorical slots for interval kinds, in fixed order — never cycled, never
+     reused for status. Validated (OKLCH lightness band, chroma floor, CVD and
+     normal-vision separation, contrast vs this mode's surface); a fourth kind
+     folds into --viz-other rather than getting a generated hue, and the legend
+     always names every kind so identity never rests on colour alone.
+     --viz-ink is the label colour that stays legible on all four fills. */
+  --viz-1: #036bb9;
+  --viz-2: #a73189;
+  --viz-3: #856302;
+  --viz-other: #5b6672;
+  --viz-ink: #ffffff;
+
   --font-ui: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-mono:
     ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, "Liberation Mono", monospace;
@@ -55,6 +67,14 @@
     --err-soft: rgba(229, 114, 107, 0.15);
 
     --focus-ring: #56c1cb;
+
+    /* Dark is selected, not flipped: its own steps, re-validated against the
+       dark surface, with a dark label ink because the fills are lighter here. */
+    --viz-1: #1795fa;
+    --viz-2: #d75eb4;
+    --viz-3: #b88a06;
+    --viz-other: #8a949e;
+    --viz-ink: #12161a;
   }
 }
 
@@ -788,14 +808,16 @@ body {
   flex-direction: column;
   gap: 3px;
   flex: none;
-  max-width: 360px;
+  max-width: 520px;
   color: inherit;
   text-decoration: none;
 }
 
+/* Contact sheets are evidence, not decoration: big enough to read at a glance,
+   still one click from the full-size image. */
 .media-item img {
   display: block;
-  height: 120px;
+  height: 220px;
   max-width: 100%;
   object-fit: contain;
   border: 1px solid var(--border-strong);
@@ -2256,7 +2278,1088 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* ---- dag graph ------------------------------------------------------------ */
+
+/* Hand-rolled renderer: an SVG connector layer under real <button> nodes, so
+   nodes focus, Enter selects, and text keeps browser typography. */
+
+.dag-figure {
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.dag-scroll {
+  overflow-x: auto;
+  border-radius: 8px 8px 0 0;
+}
+
+.dag-canvas {
+  position: relative;
+}
+
+.dag-edge-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.dag-edge {
+  fill: none;
+  stroke: var(--border-strong);
+  stroke-width: 1.5;
+  pointer-events: stroke;
+}
+
+.dag-edge.is-gate {
+  stroke: var(--warn);
+  stroke-dasharray: 5 4;
+}
+
+.dag-arrow {
+  fill: var(--border-strong);
+}
+
+.dag-arrow.is-gate {
+  fill: var(--warn);
+}
+
+.dag-edge-label {
+  font-family: var(--font-ui);
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  fill: var(--ink-faint);
+  /* Halo so a label stays readable where it crosses a connector. */
+  paint-order: stroke;
+  stroke: var(--surface);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
+.dag-edge-label.is-gate {
+  fill: var(--warn);
+}
+
+.dag-node-slot {
+  position: absolute;
+}
+
+/* A mapped task is one instance per planned batch: the card is stacked. */
+.dag-node-stack {
+  position: absolute;
+  inset: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--surface-sunken);
+}
+
+.dag-node-stack.is-back {
+  transform: translate(8px, 8px);
+  opacity: 0.5;
+}
+
+.dag-node-stack.is-mid {
+  transform: translate(4px, 4px);
+  opacity: 0.75;
+}
+
+.dag-node {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  width: 100%;
+  height: 100%;
+  padding: 6px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.dag-node:hover {
+  border-color: var(--accent);
+}
+
+.dag-node.is-selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.dag-node.is-expanded {
+  border-left-width: 3px;
+  border-left-color: var(--accent);
+}
+
+.dag-node.is-ok {
+  border-color: color-mix(in srgb, var(--ok) 45%, var(--border-strong));
+  background: color-mix(in srgb, var(--ok) 9%, var(--surface));
+}
+
+.dag-node.is-err {
+  border-color: color-mix(in srgb, var(--err) 50%, var(--border-strong));
+  background: color-mix(in srgb, var(--err) 10%, var(--surface));
+}
+
+.dag-node.is-warn {
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--border-strong));
+  background: color-mix(in srgb, var(--warn) 10%, var(--surface));
+}
+
+.dag-node.is-accent {
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--border-strong));
+  background: color-mix(in srgb, var(--accent) 9%, var(--surface));
+}
+
+/* Long task ids wrap to a second line instead of being truncated — the id is
+   the thing the API, the logs and the details panel all speak. */
+.dag-node-id {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.25;
+  max-height: 29px;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.dag-node-meta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.dag-node-state {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dag-node-state.is-ok {
+  color: var(--ok);
+}
+
+.dag-node-state.is-err {
+  color: var(--err);
+}
+
+.dag-node-state.is-warn {
+  color: var(--warn);
+}
+
+.dag-node-state.is-accent {
+  color: var(--accent-ink);
+}
+
+.dag-node-state.is-muted {
+  color: var(--ink-faint);
+}
+
+/* Deferred means "released its worker slot and is waiting" — never stalled. */
+.dag-node-waits {
+  flex: none;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  font-size: 9.5px;
+  font-weight: 650;
+  line-height: 1.7;
+}
+
+.dag-node-badge {
+  margin-left: auto;
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.dag-hint {
+  margin: 0;
+  padding: 5px 10px 6px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+
+/* ---- graph + details two-pane ---------------------------------------------- */
+
+.graph-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 292px;
+  gap: 14px;
+  align-items: start;
+  margin-top: 10px;
+}
+
+.graph-column {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.graph-column .section:first-child {
+  margin-top: 0;
+}
+
+.details-column {
+  position: sticky;
+  top: 10px;
+  min-width: 0;
+}
+
+.details-panel {
+  padding: 10px 12px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.details-panel-head {
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.details-kicker {
+  display: block;
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.details-title {
+  margin: 1px 0 0;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-weight: 650;
+  word-break: break-all;
+}
+
+.details-panel-body {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  align-items: flex-start;
+}
+
+.details-prose {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+
+.details-hint {
+  margin: 2px 0 0;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+
+.details-hint code,
+.details-prose code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.detail-row {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  width: 100%;
+  min-width: 0;
+}
+
+.detail-label {
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+/* Row labels share one gutter so the values line up; block labels run full
+   width above their content. */
+.detail-row .detail-label {
+  flex: none;
+  width: 78px;
+}
+
+.detail-value {
+  min-width: 0;
+  font-size: 12px;
+  word-break: break-word;
+}
+
+.detail-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  min-width: 0;
+}
+
+.detail-block-body {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.detail-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 11.5px;
+}
+
+.legend-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  font-size: 11.5px;
+  color: var(--ink-muted);
+}
+
+.legend-list li {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+}
+
+.legend-swatch {
+  flex: none;
+  width: 24px;
+  height: 15px;
+  margin-top: 1px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--bg);
+}
+
+.legend-swatch.is-mapped {
+  box-shadow:
+    3px 3px 0 -1px var(--surface-sunken),
+    3px 3px 0 0 var(--border-strong);
+}
+
+.legend-swatch.is-gate {
+  height: 0;
+  margin-top: 8px;
+  border: none;
+  border-top: 2px dashed var(--warn);
+  border-radius: 0;
+}
+
+.legend-chip {
+  flex: none;
+  margin-top: 1px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  font-size: 9.5px;
+  font-weight: 650;
+  line-height: 1.7;
+}
+
+.instance-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  max-height: 230px;
+  overflow-y: auto;
+}
+
+.instance-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+}
+
+.instance-index {
+  flex: none;
+  width: 30px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-faint);
+}
+
+.instance-duration {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- pipeline: notices, stage lanes, nested steps --------------------------- */
+
+.notice-banner {
+  margin-top: 12px;
+  padding: 9px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink-muted);
+  font-size: 12.5px;
+}
+
+.notice-banner strong {
+  color: var(--ink);
+}
+
+.notice-banner code,
+.section-note code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.section-note {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+
+.section-title code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.gate-callout {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: flex-start;
+  width: 100%;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px dashed color-mix(in srgb, var(--warn) 45%, var(--border));
+  border-radius: 8px;
+  background: var(--warn-soft);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.gate-callout.is-selected {
+  border-style: solid;
+  box-shadow: 0 0 0 2px var(--warn-soft);
+}
+
+.gate-callout-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--warn);
+}
+
+.gate-callout-text {
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+
+.stage-lane-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.stage-lane-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.stage-lane-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 8px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.stage-lane-head:hover {
+  background: var(--accent-soft);
+}
+
+.stage-lane-card.is-expanded .stage-lane-head {
+  border-radius: 8px 8px 0 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.stage-lane-head .lane-description {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lane-step-count {
+  flex: none;
+  font-size: 11px;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.stage-lane-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px;
+}
+
+.stage-lane-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 22px;
+}
+
+.stage-meta-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.profile-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.inside-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  background: var(--surface-sunken);
+}
+
+.inside-panel-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.inside-panel-title {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.inside-panel-title code,
+.inside-panel-note code,
+.tier-note code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.inside-panel-note {
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+
+.tier-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tier-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.tier-badge {
+  padding: 0 7px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  line-height: 1.8;
+}
+
+.tier-badge.is-engine {
+  border: 1px dashed var(--border-strong);
+  background: var(--surface);
+  color: var(--ink-muted);
+}
+
+.tier-caption {
+  font-size: 11.5px;
+  color: var(--ink-muted);
+}
+
+.tier-note {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+
+.tier-divider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tier-divider-line {
+  flex: 1;
+  height: 1px;
+  background: var(--border-strong);
+}
+
+.tier-divider-label {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.step-card-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.step-card-row .step-card {
+  width: 236px;
+  max-width: 100%;
+}
+
+.step-card-button {
+  display: flex;
+  flex-direction: column;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.step-card-button:hover {
+  border-color: var(--accent);
+}
+
+.step-card-button.is-selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.step-card-version {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-faint);
+}
+
+/* ---- runs: live graph ------------------------------------------------------- */
+
+.run-graph-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.run-graph-id {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stage-run-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border);
+  min-width: 0;
+}
+
+.stage-run-dag {
+  color: var(--ink-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fanout {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+/* Proportional split of the batch fan-out, in the status palette; the counts
+   beside it carry the same information without colour. */
+.fanout-bar {
+  display: flex;
+  gap: 2px;
+  width: 116px;
+  height: 8px;
+}
+
+.fanout-seg {
+  min-width: 3px;
+  border-radius: 2px;
+  background: var(--ink-faint);
+}
+
+.fanout-seg.is-ok {
+  background: var(--ok);
+}
+
+.fanout-seg.is-err {
+  background: var(--err);
+}
+
+.fanout-seg.is-warn {
+  background: var(--warn);
+}
+
+.fanout-seg.is-accent {
+  background: var(--accent);
+}
+
+.fanout-readout {
+  flex: none;
+  font-size: 11.5px;
+  color: var(--ink-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.stage-run-empty {
+  padding: 10px;
+}
+
+.stage-lane-card > .dag-figure {
+  margin: 10px;
+  width: calc(100% - 20px);
+}
+
+.run-id-button {
+  max-width: 340px;
+  padding: 1px 5px;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: inherit;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.run-id-button:hover {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+
+.run-id-button.is-selected {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  font-weight: 650;
+}
+
+tr.is-selected-run td {
+  background: var(--accent-soft);
+}
+
+/* ---- episode: timeline strip ------------------------------------------------ */
+
+.timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.timeline-plot {
+  position: relative;
+}
+
+.timeline-gridline {
+  position: absolute;
+  top: -4px;
+  bottom: -6px;
+  width: 1px;
+  background: var(--border);
+}
+
+.timeline-band {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 4px;
+  overflow: hidden;
+  /* 2px surface ring so touching or stacked bands never merge visually. */
+  box-shadow: 0 0 0 2px var(--surface);
+  background: var(--viz-other);
+}
+
+.timeline-band.is-slot-1 {
+  background: var(--viz-1);
+}
+
+.timeline-band.is-slot-2 {
+  background: var(--viz-2);
+}
+
+.timeline-band.is-slot-3 {
+  background: var(--viz-3);
+}
+
+.timeline-band-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--viz-ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.timeline-axis {
+  position: relative;
+  height: 14px;
+  margin-top: 2px;
+}
+
+.timeline-tick {
+  position: absolute;
+  transform: translateX(-50%);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.timeline-tick:first-child {
+  transform: none;
+}
+
+.timeline-tick:last-child {
+  transform: translateX(-100%);
+}
+
+.timeline-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+}
+
+.timeline-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--ink-muted);
+}
+
+.timeline-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  background: var(--viz-other);
+}
+
+.timeline-swatch.is-slot-1 {
+  background: var(--viz-1);
+}
+
+.timeline-swatch.is-slot-2 {
+  background: var(--viz-2);
+}
+
+.timeline-swatch.is-slot-3 {
+  background: var(--viz-3);
+}
+
+.timeline-legend-name {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.timeline-legend-count {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.timeline-legend-note {
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+
+/* ---- episode: measurement bars ---------------------------------------------- */
+
+.measure-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.measure-group-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 4px;
+  flex-wrap: wrap;
+}
+
+.measure-group-unit {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+}
+
+.measure-group-note {
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+
+.measure-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.measure-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.measure-key {
+  flex: none;
+  width: 210px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.measure-track {
+  flex: 1;
+  min-width: 60px;
+  max-width: 460px;
+  height: 9px;
+  border-radius: 0 3px 3px 0;
+  background: var(--surface-sunken);
+}
+
+.measure-fill {
+  display: block;
+  height: 100%;
+  border-radius: 0 3px 3px 0;
+  background: var(--accent);
+}
+
+/* A negative value is drawn as magnitude, outlined so the sign is not lost. */
+.measure-fill.is-negative {
+  background: repeating-linear-gradient(135deg, var(--accent-soft) 0 4px, transparent 4px 8px);
+  border: 1px solid var(--accent);
+}
+
+.measure-value {
+  flex: none;
+  width: 120px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.measure-unit {
+  color: var(--ink-faint);
+}
+
 /* ---- responsive ---------------------------------------------------------- */
+
+/* The details pane is a column beside the graph until there is no room for
+   both; then it stacks above the graph, still always present. */
+@media (max-width: 1180px) {
+  .graph-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .details-column {
+    position: static;
+    order: -1;
+  }
+
+  .measure-key {
+    width: 150px;
+  }
+}
 
 @media (max-width: 960px) {
   .episodes-body {
