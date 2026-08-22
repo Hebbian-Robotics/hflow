@@ -33,8 +33,10 @@ Implementation notes:
   wall-clock reads.
 """
 
+import errno
 import json
 import math
+import os
 import random
 import struct
 import subprocess
@@ -511,7 +513,7 @@ def write_video_episode(
     _validate_video_episode_spec(resolved_spec)
     source_video_path = Path(source_video)
     if not source_video_path.is_file():
-        raise FileNotFoundError(source_video_path)
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(source_video_path))
     output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 

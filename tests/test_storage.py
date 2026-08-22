@@ -10,6 +10,7 @@ A live object-store integration test runs only when
 ``HFLOW_TEST_BUCKET_URL`` is set (e.g. ``gs://bucket/tmp-prefix``).
 """
 
+import errno
 import os
 from pathlib import Path
 
@@ -108,6 +109,16 @@ class TestLocalStorageRoot:
         assert root.fetch("landing/e.mcap") == tmp_path / "landing" / "e.mcap"
         with pytest.raises(FileNotFoundError):
             root.fetch("landing/missing.mcap")
+
+    def test_fetch_missing_has_oserror_filename(self, tmp_path: Path) -> None:
+        root = LocalStorageRoot(tmp_path)
+        missing = tmp_path / "landing" / "missing.mcap"
+        with pytest.raises(FileNotFoundError) as excinfo:
+            root.fetch("landing/missing.mcap")
+        assert excinfo.value.errno == errno.ENOENT
+        assert excinfo.value.filename == str(missing)
+        assert "No such file or directory" in str(excinfo.value)
+        assert str(missing) in str(excinfo.value)
 
     def test_publish_copies_only_when_needed(self, tmp_path: Path) -> None:
         root = LocalStorageRoot(tmp_path / "root")

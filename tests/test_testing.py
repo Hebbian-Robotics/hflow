@@ -5,6 +5,7 @@ these tests referee the hand-encoded CDR, the ros2msg schema texts, and the
 deterministic content formulas.
 """
 
+import errno
 import hashlib
 import json
 import math
@@ -269,3 +270,13 @@ def test_video_episode_adapter_round_trip_and_faults(tmp_path: Path) -> None:
     assert decoded_frame_jpegs[1] != decoded_frame_jpegs[2]
     assert decoded_frame_jpegs[3] == decoded_frame_jpegs[4]
     assert metadata_records["episode/v1"]["source_dataset"] == "test-video"
+
+
+def test_video_episode_missing_source_names_the_path_with_errno(tmp_path: Path) -> None:
+    missing_source = tmp_path / "absent.mp4"
+    with pytest.raises(FileNotFoundError) as excinfo:
+        write_video_episode(missing_source, tmp_path / "adapted.mcap")
+    assert excinfo.value.errno == errno.ENOENT
+    assert excinfo.value.filename == str(missing_source)
+    assert "No such file or directory" in str(excinfo.value)
+    assert str(missing_source) in str(excinfo.value)

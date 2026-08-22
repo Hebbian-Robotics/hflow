@@ -341,7 +341,7 @@ class LocalStorageRoot:
         """The local file at ``relative`` (it already lives here)."""
         local_file = self.path / _validated_relative_key(relative)
         if not local_file.is_file():
-            raise FileNotFoundError(local_file)
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(local_file))
         return local_file
 
     def uri_for(self, relative: str) -> str:
