@@ -354,8 +354,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--data-root",
         default=_environment_data_root(),
         help=(
-            "workspace data root to browse "
-            f"(default: $HFLOW_DATA_ROOT, else {DEFAULT_DATA_ROOT})"
+            f"workspace data root to browse (default: $HFLOW_DATA_ROOT, else {DEFAULT_DATA_ROOT})"
         ),
     )
     ui_parser.add_argument(

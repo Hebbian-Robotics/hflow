@@ -38,6 +38,22 @@ jobs:
       - name: Tests
         run: uv run pytest -q
 
+  ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Enable pnpm via corepack (Node is preinstalled on the runner)
+        run: corepack enable && corepack prepare pnpm@11.10.0 --activate
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Lint, format, and typecheck
+        run: pnpm check
+      - name: Build
+        run: pnpm build
+
   links:
     runs-on: ubuntu-latest
     steps:
