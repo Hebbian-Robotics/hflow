@@ -5,9 +5,9 @@ vision tokens (one image instead of N). One of the two VLM-adjacent helpers
 we ship -- there is deliberately no bundled VLM client.
 
 Implementation: a single ffmpeg invocation over the frame files
-(``concat`` + ``scale`` + ``tile``). Timestamp burn-in uses ``drawtext``
-when a usable font is found (``fc-match`` or common font paths); if none is
-available the sheet is still produced without burn-in and
+(``concat`` + ``scale`` + ``tile``). Timestamp burn-in uses ``drawtext`` when
+both the filter and a usable font are available (``fc-match`` or common font
+paths); otherwise the sheet is still produced without burn-in and
 ``ContactSheet.timestamps_burned`` is False -- callers can pass timestamps in
 the prompt instead. If more frames are given than ``max_tiles``, frames are
 sampled evenly and the drop is reported on the result, never silent.
@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -62,6 +63,22 @@ def _find_usable_font_file() -> Path | None:
         if common_path.is_file():
             return common_path
     return None
+
+
+@cache
+def _ffmpeg_supports_drawtext(ffmpeg_binary: Path) -> bool:
+    completed = subprocess.run(
+        [str(ffmpeg_binary), "-hide_banner", "-filters"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return False
+    return any(
+        len(columns := line.split()) > 1 and columns[1] == "drawtext"
+        for line in completed.stdout.splitlines()
+    )
 
 
 def _evenly_sampled_indices(total_count: int, max_count: int) -> list[int]:
@@ -132,9 +149,12 @@ def contact_sheet(
     selected_frames = [frames[index] for index in _evenly_sampled_indices(len(frames), max_tiles)]
     rows = math.ceil(len(selected_frames) / columns)
 
+    ffmpeg_binary = ffmpeg_path()
     font_file = _find_usable_font_file()
+    timestamps_burned = font_file is not None and _ffmpeg_supports_drawtext(ffmpeg_binary)
     filter_chain: list[str] = [f"scale={tile_width}:-1"]
-    if font_file is not None:
+    if timestamps_burned:
+        assert font_file is not None
         filter_chain.extend(_drawtext_filters(selected_frames, font_file, tile_width))
     filter_chain.append(f"tile={columns}x{rows}")
 
@@ -143,7 +163,7 @@ def contact_sheet(
         concat_list_path = Path(staging_dir_name) / "frames.txt"
         _write_concat_list(selected_frames, concat_list_path)
         command = [
-            str(ffmpeg_path()),
+            str(ffmpeg_binary),
             "-hide_banner",
             "-nostats",
             "-y",
@@ -171,6 +191,6 @@ def contact_sheet(
         columns=columns,
         rows=rows,
         tile_log_times_ns=[frame.log_time_ns for frame in selected_frames],
-        timestamps_burned=font_file is not None,
+        timestamps_burned=timestamps_burned,
         frames_sampled_from=len(frames),
     )

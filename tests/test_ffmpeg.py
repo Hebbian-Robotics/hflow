@@ -582,7 +582,10 @@ def test_contact_sheet_grid_geometry(
     width, height = _probe_dimensions(output)
     assert width == 4 * 320
     assert height == 3 * 240  # 320x240 sources scaled to width 320 keep height 240
-    assert sheet.timestamps_burned == (_find_usable_font_file() is not None)
+    assert sheet.timestamps_burned == (
+        _find_usable_font_file() is not None
+        and _contact_sheet._ffmpeg_supports_drawtext(ffmpeg_path())
+    )
 
 
 def test_contact_sheet_max_tiles_sampling(
@@ -599,6 +602,30 @@ def test_contact_sheet_max_tiles_sampling(
     assert sheet.rows == 2  # ceil(6 / 4); tile pads the two empty cells
     width, _height = _probe_dimensions(output)
     assert width == 4 * 160
+
+
+def test_contact_sheet_without_drawtext_still_produces_sheet(
+    ten_extracted_frames: list[ExtractedFrame],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        _contact_sheet,
+        "_find_usable_font_file",
+        lambda: Path("/a/usable/font.ttf"),
+    )
+    monkeypatch.setattr(
+        _contact_sheet,
+        "_ffmpeg_supports_drawtext",
+        lambda _ffmpeg_binary: False,
+    )
+
+    output = tmp_path / "sheet-without-drawtext.jpg"
+    sheet = contact_sheet(ten_extracted_frames[:2], output, columns=2)
+
+    assert output.is_file()
+    assert _probe_dimensions(output) == (640, 240)
+    assert sheet.timestamps_burned is False
 
 
 def test_contact_sheet_accepts_apostrophes_in_external_paths(
