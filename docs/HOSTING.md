@@ -154,6 +154,13 @@ deployment against facts:
   store.
 - **No tenant-facing log or metrics API.** Observability is Airflow's own
   UI and task logs on the workspace.
+- **The workspace UI (`hflow ui`) authenticates nobody.** It is a local
+  developer tool bound to `127.0.0.1`, deliberately without a login; it is
+  not a tenant-facing surface, and serving it to anyone but the workspace's
+  own operator means putting an authenticating proxy in front of it. Signing
+  people in and scoping them to a workspace is the control plane's job --
+  per-user identity and revocable sessions, which no shared launch secret
+  could stand in for.
 - **Task processes share the runtime's environment**, including the
   workspace's storage credentials, and the venv build runs as root at
   provision time -- isolation between principals must come from your
@@ -161,11 +168,18 @@ deployment against facts:
 - **A workspace's Airflow stack idles at several GB of RAM** across five
   long-running services (the compose file defines seven; two are one-shot
   init containers).
-- **Engine upgrades re-version steps.** Step versions content-hash captured
-  globals, including referenced modules with their versions, so a step that
-  touches `hflow.*` gets a new version on every hflow release: `hflow
-  stale` will list its episodes, and curation pins keep working because the
-  corpus is designed to be permanently mixed-version.
+- **Engine upgrades re-version a corpus only when processing changed.** An
+  hflow release no longer moves any identity by itself: `pipeline_version`
+  folds in `hflow.behavior.TRANSFORM_BEHAVIOR_VERSION` (bumped deliberately,
+  only when the transform would write different bytes) instead of the release
+  number, the canonical file's header carries no release number, and step
+  versions record the modules they reference by name rather than by version.
+  A byte-identical input therefore keeps its `episode_id` across upgrades, so
+  content-addressed dedupe holds. The flip side is a real one: an engine
+  change that alters processing without a behavior bump is invisible to
+  `hflow stale`, so operators upgrading across a behavior bump should expect
+  exactly one corpus-wide re-version and plan reprocessing then. The corpus is
+  designed to be permanently mixed-version, so curation pins keep working.
 - **ffmpeg licensing**: the pinned build is BtbN's **GPL** variant (it
   carries the H.264 encoder the canonical transform needs). GPL source
   obligations attach to **redistribution** -- shipping worker images or

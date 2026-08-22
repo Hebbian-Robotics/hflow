@@ -152,68 +152,98 @@ class AppendResult:
     written: bool  # False when this exact run was already recorded
 
 
-@dataclass(frozen=True)
-class LatestQuarantine:
-    """The quarantine facts of an episode's most recent cataloged run."""
+class QuarantineHistory:
+    """Which episodes the catalog last recorded as quarantined, read once.
 
-    quarantined: bool
-    tags: list[str]
+    The labels and media stages gate on this per episode, and the ``episodes``
+    table is append-only with one parquet file per append -- so asking it one
+    episode at a time costs one scan of a file set that grows with the corpus,
+    per episode, plus one bucket-mirror sync each. Reading every quarantined
+    episode in a single pass makes a whole stage batch pay that once.
 
+    Scope is deliberately the batch, not the process: the snapshot is taken
+    when the first lookup arrives, which is what the gate wants. The meta
+    stage that decides quarantine has already finished by the time labels or
+    media reads it, and the rows a stage appends for its own episodes as it
+    runs cannot change another episode's answer.
 
-def latest_quarantine(
-    catalog_root: "Path | str | StorageRoot", episode_id: str
-) -> LatestQuarantine | None:
-    """The latest recorded quarantine facts for ``episode_id``, or ``None``
-    when the catalog (or the episode) is unknown.
-
-    "Latest" follows the ``episodes_latest`` view semantics: most recent
-    ``recorded_at``, ties broken by ``run_fingerprint``. Bucket catalogs sync
-    the episodes table into their mirror first (only files the mirror lacks
-    download; table files are append-only and content-named).
+    Only quarantined episodes are held. A clean episode and an unknown one
+    lead the gate to the same decision -- proceed -- so carrying the rest of
+    the corpus in memory would be paying to learn nothing.
     """
-    location = parse_storage_root(catalog_root)
-    match location:
-        case LocalStorageRoot(path=local_root):
-            episodes_dir = local_root / "episodes"
-        case BucketStorageRoot():
-            location.sync_into_mirror(("episodes",))
-            episodes_dir = location.mirror / "episodes"
-    if not episodes_dir.is_dir() or not any(episodes_dir.glob("*.parquet")):
-        return None
-    glob_pattern = str(episodes_dir / "*.parquet").replace("'", "''")
-    connection = duckdb.connect()
-    try:
-        row = connection.execute(
-            f"""
-            SELECT quarantined, quarantine_tags_json
-            FROM read_parquet('{glob_pattern}', union_by_name=true)
-            WHERE episode_id = ?
-            ORDER BY recorded_at DESC, run_fingerprint DESC
-            LIMIT 1
-            """,
-            [episode_id],
-        ).fetchone()
-    finally:
-        connection.close()
-    if row is None:
-        return None
-    quarantined, tags_json = row
-    return LatestQuarantine(
-        quarantined=bool(quarantined),
-        tags=[str(tag) for tag in json.loads(tags_json)] if tags_json else [],
-    )
+
+    def __init__(self, catalog_root: "Path | str | StorageRoot") -> None:
+        location = parse_storage_root(catalog_root)
+        match location:
+            case LocalStorageRoot(path=local_root):
+                self._episodes_dir = local_root / "episodes"
+            case BucketStorageRoot():
+                location.sync_into_mirror(("episodes",))
+                self._episodes_dir = location.mirror / "episodes"
+        self._tags_by_episode: dict[str, list[str]] | None = None
+
+    def quarantine_tags(self, episode_id: str) -> list[str] | None:
+        """The tags of the quarantine on ``episode_id``'s latest recorded run,
+        or ``None`` when that run left it clean -- or when the catalog has
+        never seen it, which the gate treats identically.
+
+        "Latest" follows the ``episodes_latest`` view semantics: most recent
+        ``recorded_at``, ties broken by ``run_fingerprint``.
+        """
+        if self._tags_by_episode is None:
+            self._tags_by_episode = self._read_quarantined_episodes()
+        return self._tags_by_episode.get(episode_id)
+
+    def _read_quarantined_episodes(self) -> dict[str, list[str]]:
+        if not self._episodes_dir.is_dir() or not any(self._episodes_dir.glob("*.parquet")):
+            return {}
+        glob_pattern = str(self._episodes_dir / "*.parquet").replace("'", "''")
+        connection = duckdb.connect()
+        try:
+            # QUALIFY picks each episode's newest row first; the outer WHERE
+            # then keeps only the ones that row calls quarantined. Filtering
+            # before the window would instead find the newest QUARANTINED row,
+            # resurrecting a quarantine that a later clean run had cleared.
+            rows = connection.execute(
+                f"""
+                SELECT episode_id, quarantine_tags_json FROM (
+                    SELECT episode_id, quarantined, quarantine_tags_json
+                    FROM read_parquet('{glob_pattern}', union_by_name=true)
+                    QUALIFY ROW_NUMBER() OVER (
+                        PARTITION BY episode_id
+                        ORDER BY recorded_at DESC, run_fingerprint DESC
+                    ) = 1
+                )
+                WHERE quarantined
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+        return {
+            str(episode_id): [str(tag) for tag in json.loads(tags_json)] if tags_json else []
+            for episode_id, tags_json in rows
+        }
+
+    def close(self) -> None:
+        """Drop the snapshot, so a reused history re-reads the table."""
+        self._tags_by_episode = None
+
+    def __enter__(self) -> "QuarantineHistory":
+        return self
+
+    def __exit__(self, *_exception: object) -> None:
+        self.close()
 
 
-def latest_quarantine_state(
+def latest_quarantine_tags(
     catalog_root: "Path | str | StorageRoot", episode_id: str
-) -> bool | None:
-    """Whether ``episode_id``'s most recent cataloged run left it quarantined.
-
-    ``None`` when the catalog or the episode is unknown -- no catalog means
-    no known quarantine, and callers proceed.
+) -> list[str] | None:
+    """One episode's carried-forward quarantine tags (see
+    :meth:`QuarantineHistory.quarantine_tags`). Reuse a
+    :class:`QuarantineHistory` when asking about more than one episode.
     """
-    latest = latest_quarantine(catalog_root, episode_id)
-    return None if latest is None else latest.quarantined
+    with QuarantineHistory(catalog_root) as history:
+        return history.quarantine_tags(episode_id)
 
 
 def content_episode_id(canonical_path: Path) -> str:
