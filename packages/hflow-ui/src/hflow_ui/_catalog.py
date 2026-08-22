@@ -522,6 +522,34 @@ def find_canonical_uri(connection: duckdb.DuckDBPyConnection, episode_id: str) -
     return str(row[0]) if row is not None and row[0] is not None else None
 
 
+def query_latest_run_intervals(
+    connection: duckdb.DuckDBPyConnection, episode_id: str
+) -> list[dict[str, object]]:
+    """One episode's intervals from its LATEST run -- the current evidence.
+
+    ``check_version`` rides in from that run's ``check_runs`` row because the
+    intervals table does not carry one itself. One owner for this join: the
+    dossier and the timeline must never disagree about which run's intervals
+    an episode "has".
+    """
+    return fetched_json_safe_rows(
+        connection.execute(
+            """
+            SELECT i.label, i.start_ns, i.end_ns, i.check_name, r.check_version
+            FROM intervals AS i
+            JOIN episodes_latest AS e
+              ON i.episode_id = e.episode_id AND i.run_fingerprint = e.run_fingerprint
+            LEFT JOIN check_runs AS r
+              ON r.episode_id = i.episode_id AND r.run_fingerprint = i.run_fingerprint
+                 AND r.check_name = i.check_name
+            WHERE i.episode_id = ?
+            ORDER BY i.start_ns, i.label
+            """,
+            [episode_id],
+        )
+    )
+
+
 def query_episode_dossier(
     connection: duckdb.DuckDBPyConnection, episode_id: str, *, data_root: str
 ) -> dict[str, object] | None:
@@ -563,24 +591,8 @@ def query_episode_dossier(
         )
     )
     # Intervals and tags are the episode's LATEST run only -- the current
-    # evidence. check_version rides in from that run's check_runs row because
-    # the intervals table does not carry one itself.
-    intervals = fetched_json_safe_rows(
-        connection.execute(
-            """
-            SELECT i.label, i.start_ns, i.end_ns, i.check_name, r.check_version
-            FROM intervals AS i
-            JOIN episodes_latest AS e
-              ON i.episode_id = e.episode_id AND i.run_fingerprint = e.run_fingerprint
-            LEFT JOIN check_runs AS r
-              ON r.episode_id = i.episode_id AND r.run_fingerprint = i.run_fingerprint
-                 AND r.check_name = i.check_name
-            WHERE i.episode_id = ?
-            ORDER BY i.start_ns, i.label
-            """,
-            [episode_id],
-        )
-    )
+    # evidence.
+    intervals = query_latest_run_intervals(connection, episode_id)
     tags = fetched_json_safe_rows(
         connection.execute(
             f"SELECT t.tag, t.check_name, {_recorded_at_as_iso_text('t.recorded_at')} "
@@ -632,4 +644,198 @@ def query_episode_dossier(
         "history": history,
         "media": media,
         "canonical_url": canonical_url,
+    }
+
+
+NANOSECONDS_PER_SECOND = 1_000_000_000
+
+# Timeline span derivation. Interval times are nanoseconds of LOG time, so an
+# episode with intervals carries its own axis; an episode without them can
+# still have a length if some check measured one. A measurement key naming a
+# duration supplies that length: the token after the key's last '_' picks the
+# unit, and a duration key with no recognized unit suffix (``episode_duration``)
+# is read as SECONDS -- the convention every hflow example follows.
+_DURATION_KEY_TOKEN = "duration"
+_NANOSECONDS_PER_DURATION_UNIT: dict[str, float] = {
+    "ns": 1.0,
+    "us": 1e3,
+    "ms": 1e6,
+    "s": 1e9,
+    "sec": 1e9,
+    "secs": 1e9,
+    "second": 1e9,
+    "seconds": 1e9,
+    "min": 6e10,
+    "mins": 6e10,
+    "minute": 6e10,
+    "minutes": 6e10,
+}
+_DEFAULT_DURATION_UNIT_NANOSECONDS = 1e9
+
+# Units the measurement bars label themselves with, by the same key suffix.
+# Absent from this table means "no unit known" -- the bar shows the bare
+# number rather than inventing a dimension.
+_UNIT_BY_KEY_SUFFIX: dict[str, str] = {
+    "ns": "ns",
+    "us": "us",
+    "ms": "ms",
+    "s": "s",
+    "sec": "s",
+    "secs": "s",
+    "second": "s",
+    "seconds": "s",
+    "min": "min",
+    "mins": "min",
+    "minutes": "min",
+    "hz": "Hz",
+    "pct": "%",
+    "percent": "%",
+    "ratio": "ratio",
+    "count": "count",
+    "bytes": "bytes",
+    "mb": "MB",
+    "gb": "GB",
+    "m": "m",
+    "mm": "mm",
+    "cm": "cm",
+    "km": "km",
+    "deg": "deg",
+    "rad": "rad",
+    "kg": "kg",
+    "n": "N",
+}
+
+
+def _measurement_key_suffix(key: str) -> str:
+    """The unit-bearing tail of a measurement key (``max_gap_ms`` -> ``ms``)."""
+    return key.rsplit("_", 1)[-1].lower() if "_" in key else ""
+
+
+def _duration_nanoseconds(key: str, value: float) -> float | None:
+    """A duration-naming measurement converted to nanoseconds, if it is one."""
+    if _DURATION_KEY_TOKEN not in key.lower() or not math.isfinite(value) or value <= 0:
+        return None
+    unit_scale = _NANOSECONDS_PER_DURATION_UNIT.get(
+        _measurement_key_suffix(key), _DEFAULT_DURATION_UNIT_NANOSECONDS
+    )
+    return value * unit_scale
+
+
+def _interval_kind(label: object, check_name: object) -> str:
+    """The colour group for one interval label.
+
+    Labels are conventionally ``<kind>:<topic>`` (``gap:/imu``,
+    ``joint_discontinuity:/joint_states``), so the prefix is the group. A
+    label with no prefix groups by itself; an empty label falls back to the
+    check that produced it, which is the only honest grouping left.
+    """
+    text = str(label).strip() if isinstance(label, str) else ""
+    if not text:
+        return str(check_name) if isinstance(check_name, str) and check_name else "interval"
+    prefix = text.split(":", 1)[0].strip()
+    return prefix or text
+
+
+def _nanoseconds_or_none(value: object) -> int | None:
+    """One interval bound as an int, or None when the row does not carry one."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _relative_seconds(time_ns: object, span_start_ns: int | None) -> float | None:
+    absolute_ns = _nanoseconds_or_none(time_ns)
+    if span_start_ns is None or absolute_ns is None:
+        return None
+    return (absolute_ns - span_start_ns) / NANOSECONDS_PER_SECOND
+
+
+def query_episode_timeline(
+    connection: duckdb.DuckDBPyConnection, episode_id: str
+) -> dict[str, object] | None:
+    """One episode's time axis, computed server-side (``None`` when unknown).
+
+    The span comes from the latest run's intervals, extended by any duration
+    measurement that claims a longer episode; an episode with no intervals but
+    a duration measurement gets a zero-based axis; an episode with neither
+    gets nulls, and the UI says the span is unknown rather than drawing a
+    fabricated axis.
+    """
+    if (
+        connection.execute(
+            "SELECT 1 FROM episodes_latest WHERE episode_id = ?", [episode_id]
+        ).fetchone()
+        is None
+    ):
+        return None
+
+    interval_rows = query_latest_run_intervals(connection, episode_id)
+    measurement_rows = connection.execute(
+        "SELECT key, value_double FROM measurements_latest "
+        "WHERE episode_id = ? AND value_double IS NOT NULL ORDER BY key",
+        [episode_id],
+    ).fetchall()
+    numeric_measurements = [
+        (str(key), float(value))
+        for key, value in measurement_rows
+        # NaN/inf poison a bar chart exactly as they poison JSON: drop them.
+        if isinstance(value, int | float) and math.isfinite(float(value))
+    ]
+
+    interval_starts = [
+        row_start_ns
+        for row in interval_rows
+        if (row_start_ns := _nanoseconds_or_none(row.get("start_ns"))) is not None
+    ]
+    interval_ends = [
+        row_end_ns
+        for row in interval_rows
+        if (row_end_ns := _nanoseconds_or_none(row.get("end_ns"))) is not None
+    ]
+    # Several duration-ish measurements: the largest wins, because the span
+    # must contain every interval AND every claimed duration.
+    claimed_durations_ns = [
+        duration_ns
+        for key, value in numeric_measurements
+        if (duration_ns := _duration_nanoseconds(key, value)) is not None
+    ]
+    longest_claimed_duration_ns = max(claimed_durations_ns) if claimed_durations_ns else None
+
+    start_ns: int | None = None
+    end_ns: int | None = None
+    if interval_starts:
+        start_ns = min(interval_starts)
+        end_ns = max([*interval_ends, start_ns])
+        if longest_claimed_duration_ns is not None:
+            end_ns = max(end_ns, start_ns + int(longest_claimed_duration_ns))
+    elif longest_claimed_duration_ns is not None:
+        start_ns, end_ns = 0, int(longest_claimed_duration_ns)
+
+    duration_s = (
+        (end_ns - start_ns) / NANOSECONDS_PER_SECOND
+        if start_ns is not None and end_ns is not None
+        else None
+    )
+    return {
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+        "duration_s": duration_s,
+        "intervals": [
+            {
+                "label": row.get("label"),
+                "start_ns": row.get("start_ns"),
+                "end_ns": row.get("end_ns"),
+                "start_s": _relative_seconds(row.get("start_ns"), start_ns),
+                "end_s": _relative_seconds(row.get("end_ns"), start_ns),
+                "check_name": row.get("check_name"),
+                "kind": _interval_kind(row.get("label"), row.get("check_name")),
+            }
+            for row in interval_rows
+        ],
+        "measurements": [
+            {
+                "key": key,
+                "value": value,
+                "unit": _UNIT_BY_KEY_SUFFIX.get(_measurement_key_suffix(key)),
+            }
+            for key, value in numeric_measurements
+        ],
     }

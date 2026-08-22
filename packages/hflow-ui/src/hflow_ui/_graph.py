@@ -1,0 +1,536 @@
+"""The visualization API: the ingest DAG's shape, and one run's live state.
+
+Two nested layers meet on these endpoints, and neither may be drawn as the
+other:
+
+- **Orchestration** -- a real DAG with real edges, served straight from
+  :func:`hflow.runtime.ingest_dag_topology` (the library's description of the
+  DAGs ``hflow up`` renders, pinned to the templates by the core suite). The
+  master resolves the run profile, then walks the stage chain gating and
+  triggering each sub-DAG; every sub-DAG plans batches, fans ``process_batch``
+  out over them, and closes on a budget gate.
+- **User steps** -- the registered checks and enrichments of a ``--pipeline``
+  App, which have NO dependency edges on each other. They all run INSIDE one
+  ``process_batch`` task of the stage that owns their kind, ordered only by
+  the engine's two-tier cheap-first policy (:meth:`hflow.App._ordered_checks`:
+  a step declaring ``requires`` or ``uses`` runs in the second tier). Drawing
+  arrows between them would be a lie; the payload states the tiers instead.
+
+The one real cross-step edge is the quarantine gate, and it is served as its
+own object rather than as an edge in either graph.
+
+Both endpoints degrade instead of failing: the pipeline graph answers with
+``dag_ids_known``/``steps_known`` flags when no runtime or no pipeline is
+addressed, and the run graph refuses with the runs monitor's 409/502 idiom.
+"""
+
+import re
+from collections import Counter
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from math import isfinite
+from typing import Any
+
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import JSONResponse
+
+from hflow.app import MEDIA_CONTACT_SHEET_STEP_NAME
+from hflow.manifest import PipelineManifest, StepManifest
+from hflow.runtime import (
+    AirflowClient,
+    AirflowClientError,
+    DagTaskNode,
+    DagTopology,
+    IngestTopology,
+    StageTopology,
+    ingest_dag_topology,
+)
+from hflow.steps import Stage
+from hflow_ui._pipeline import PipelineState
+from hflow_ui._runtime import ResolvedRuntime, RuntimeResolver, client_error_detail
+
+# The display copy for the four stages. Restated here (rather than imported
+# from hflow.runtime._bundle's STAGE_TITLES/STAGE_DESCRIPTIONS, which are
+# private and worded for Airflow's own UI) so the browser never hardcodes it:
+# the thin-client rule applies to prose too.
+_STAGE_TITLES: dict[Stage, str] = {
+    Stage.SYNC: "Transform & sync",
+    Stage.META: "Metadata",
+    Stage.LABELS: "Labels & artifacts",
+    Stage.MEDIA: "Media",
+}
+_STAGE_DESCRIPTIONS: dict[Stage, str] = {
+    Stage.SYNC: "canonical transform + derived channels (critical path)",
+    Stage.META: "checks + catalog registration",
+    Stage.LABELS: "enrichments (non-critical)",
+    Stage.MEDIA: "derived media artifacts",
+}
+
+# The master id shown when no runtime is addressed: the DAGs do not exist
+# yet, so the graph is drawn under a display-only name (the pipeline's own
+# name when one is imported, else this) and ``dag_ids_known`` is false.
+DISPLAY_ONLY_MASTER_DAG_ID = "ingest"
+
+_DAG_ID_UNSAFE_CHARACTERS = re.compile(r"[^A-Za-z0-9_.-]+")
+
+# How many of a stage sub-DAG's runs the run-graph heuristic looks at.
+_STAGE_RUN_SEARCH_LIMIT = 25
+
+# Airflow reports a task instance that has not been scheduled yet with a null
+# state; the mapped fan-out summary needs a key for those.
+_UNSET_TASK_STATE = "no_status"
+
+
+def _dag_task_node_json(node: DagTaskNode) -> dict[str, object]:
+    return {
+        "task_id": node.task_id,
+        "summary": node.summary,
+        "mapped": node.mapped,
+        "deferred": node.deferred,
+    }
+
+
+def _dag_topology_json(topology: DagTopology) -> dict[str, object]:
+    return {
+        "dag_id": topology.dag_id,
+        "tasks": [_dag_task_node_json(node) for node in topology.tasks],
+        "edges": [[upstream, downstream] for upstream, downstream in topology.edges],
+    }
+
+
+def _display_master_dag_id(pipeline_name: str | None) -> str:
+    """A stand-in master id for a workspace with no rendered bundle.
+
+    Never presented as real: the response's ``dag_ids_known`` is false, and
+    the sub-DAG ids derived from it are display-only too. The real id is
+    ``<pipeline file stem>_ingest``, which only a rendered bundle knows.
+    """
+    if pipeline_name is None:
+        return DISPLAY_ONLY_MASTER_DAG_ID
+    sanitized = _DAG_ID_UNSAFE_CHARACTERS.sub("-", pipeline_name).strip("-")
+    return sanitized or DISPLAY_ONLY_MASTER_DAG_ID
+
+
+def _step_tier(step: StepManifest) -> int:
+    """Which cheap-first tier this step runs in (1 first, 2 second).
+
+    Mirrors :meth:`hflow.App._ordered_checks` and ``_ordered_enrichments``
+    EXACTLY: both sort on ``bool(requires) or uses is not None``, so tier 2 is
+    precisely the steps declaring a required channel or an endpoint alias.
+    Within a tier there is no ordering at all -- registration order is what
+    the stable sort preserves, not a dependency.
+    """
+    return 2 if (bool(step.requires) or step.uses is not None) else 1
+
+
+def _user_steps_json(stage: Stage, manifest: PipelineManifest | None) -> list[dict[str, object]]:
+    """The registered steps running inside this stage's ``process_batch``.
+
+    Stage ownership is the engine's (``hflow.steps``/``App.process``):
+    registered checks run in meta, user enrichments in labels; sync and media
+    carry no user-registered steps. Ordered exactly as the engine runs them
+    (tier 1 first, registration order within a tier).
+    """
+    if manifest is None:
+        return []
+    if stage is Stage.META:
+        registered_steps: tuple[StepManifest, ...] = manifest.checks
+    elif stage is Stage.LABELS:
+        registered_steps = manifest.enrichments
+    else:
+        return []
+    return [
+        {
+            "name": step.name,
+            "kind": step.kind.value,
+            "version": step.version,
+            "critical": step.critical,
+            "uses": step.uses,
+            "requires": list(step.requires),
+            "tier": _step_tier(step),
+        }
+        # Stable sort on the tier alone: the same call App._ordered_checks
+        # makes, so the payload's order IS the execution order.
+        for step in sorted(registered_steps, key=_step_tier)
+    ]
+
+
+def _engine_steps_json(stage: Stage, manifest: PipelineManifest | None) -> list[dict[str, str]]:
+    """The engine's own work inside this stage's ``process_batch``.
+
+    Not registrations -- these are what ``App.process`` does around the user's
+    steps, and no manifest lists them: the canonical transform (sync), the
+    catalog append (meta), and the contact-sheet renderer (media).
+    """
+    if stage is Stage.SYNC:
+        overridden = manifest is not None and manifest.has_transform_override
+        derived_channel_count = len(manifest.derived_channels) if manifest is not None else 0
+        summary = (
+            "rewrite the source recording into a canonical MCAP and publish it"
+            if not overridden
+            else "rewrite the source recording with this pipeline's transform override "
+            "and publish it"
+        )
+        if derived_channel_count:
+            summary += (
+                f"; computes {derived_channel_count} registered derived "
+                f"channel{'s' if derived_channel_count != 1 else ''} over the source"
+            )
+        return [{"name": "canonical transform", "summary": summary}]
+    if stage is Stage.META:
+        return [
+            {
+                "name": "catalog registration",
+                "summary": "append this run's episode row and every step's evidence "
+                "(check runs, measurements, intervals, tags) to the catalog",
+            }
+        ]
+    if stage is Stage.MEDIA:
+        return [
+            {
+                "name": MEDIA_CONTACT_SHEET_STEP_NAME,
+                "summary": "render one contact sheet per camera and record it as a "
+                "catalog artifact; absent when the episode has no cameras",
+            }
+        ]
+    return []
+
+
+# What a failed critical check actually does in App.process: the episode is
+# tagged (never deleted), the meta stage skips its REMAINING checks, and every
+# enrichment in labels and media is recorded as skipped.
+_QUARANTINE_GATE_EXPLANATION = (
+    "a False verdict from a critical check quarantines the episode: meta skips its "
+    "remaining checks, and every enrichment in the labels and media stages is recorded "
+    "as skipped. Quarantine is a tag, never a deletion."
+)
+_NO_CRITICAL_CHECKS_EXPLANATION = (
+    "this pipeline registers no critical checks, so no check can quarantine an episode. "
+    "A critical check's False verdict would make meta skip its remaining checks and every "
+    "enrichment in the labels and media stages."
+)
+
+
+def _quarantine_gate_json(manifest: PipelineManifest | None) -> dict[str, object] | None:
+    """The one real edge between user steps, or null when no pipeline is known."""
+    if manifest is None:
+        return None
+    critical_step_names = [step.name for step in manifest.checks if step.critical]
+    return {
+        "from_stage": Stage.META.value,
+        "to_stages": [Stage.LABELS.value, Stage.MEDIA.value],
+        "critical_step_names": critical_step_names,
+        "explanation": (
+            _QUARANTINE_GATE_EXPLANATION if critical_step_names else _NO_CRITICAL_CHECKS_EXPLANATION
+        ),
+    }
+
+
+def _stage_graph_json(
+    stage_topology: StageTopology, manifest: PipelineManifest | None
+) -> dict[str, object]:
+    stage = stage_topology.stage
+    return {
+        "stage": stage.value,
+        "title": _STAGE_TITLES[stage],
+        "description": _STAGE_DESCRIPTIONS[stage],
+        "gate_task_id": stage_topology.gate_task_id,
+        "trigger_task_id": stage_topology.trigger_task_id,
+        "enabling_profiles": list(stage_topology.enabling_profiles),
+        "dag": _dag_topology_json(stage_topology.dag),
+        "engine_steps": _engine_steps_json(stage, manifest),
+        "user_steps": _user_steps_json(stage, manifest),
+    }
+
+
+def _parsed_timestamp(value: object) -> datetime | None:
+    """One Airflow ISO-8601 timestamp as an aware datetime, or None.
+
+    Airflow renders UTC as a trailing ``Z``; it is normalized here rather than
+    left to ``fromisoformat``'s version-dependent tolerance, and a naive value
+    is read as UTC so a comparison against another timestamp never raises.
+    Anything unparseable is None -- a timestamp this build cannot read must
+    not fail the request.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _duration_seconds(instance: dict[str, Any]) -> float | None:
+    """One task instance's wall duration, computed here rather than trusted.
+
+    Airflow's own ``duration`` field is the fallback for an instance whose
+    timestamps this build cannot parse.
+    """
+    started_at = _parsed_timestamp(instance.get("start_date"))
+    ended_at = _parsed_timestamp(instance.get("end_date"))
+    if started_at is not None and ended_at is not None:
+        return (ended_at - started_at).total_seconds()
+    reported_duration = instance.get("duration")
+    if isinstance(reported_duration, int | float) and not isinstance(reported_duration, bool):
+        return float(reported_duration) if isfinite(float(reported_duration)) else None
+    return None
+
+
+def _optional_string(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _task_instance_json(instance: dict[str, Any]) -> dict[str, object]:
+    """One Airflow task instance reduced to what the graph draws."""
+    try_number = instance.get("try_number")
+    map_index = instance.get("map_index")
+    return {
+        "task_id": _optional_string(instance.get("task_id")),
+        "state": _optional_string(instance.get("state")),
+        "start_date": _optional_string(instance.get("start_date")),
+        "end_date": _optional_string(instance.get("end_date")),
+        "try_number": int(try_number) if isinstance(try_number, int) else None,
+        # -1 is Airflow's "not a mapped instance"; an absent value means the
+        # same thing.
+        "map_index": int(map_index) if isinstance(map_index, int) else -1,
+        "duration_s": _duration_seconds(instance),
+    }
+
+
+def _sorted_task_instances(
+    instances: list[dict[str, Any]], topology: DagTopology
+) -> list[dict[str, object]]:
+    """Task instances in TOPOLOGY order (then by map index), not API order."""
+    topology_positions = {node.task_id: index for index, node in enumerate(topology.tasks)}
+    unknown_task_position = len(topology_positions)
+    task_json = [_task_instance_json(instance) for instance in instances]
+    return sorted(
+        task_json,
+        key=lambda task: (
+            topology_positions.get(str(task["task_id"]), unknown_task_position),
+            str(task["task_id"]),
+            # map_index is always an int here (_task_instance_json defaults it).
+            task["map_index"] if isinstance(task["map_index"], int) else -1,
+        ),
+    )
+
+
+def _mapped_summary(
+    tasks: list[dict[str, object]], stage_topology: StageTopology
+) -> dict[str, object] | None:
+    """The fan-out's counts: how many mapped instances are in which state.
+
+    The mapped task id comes from the topology (the node flagged ``mapped``),
+    so this never restates a task name the library owns.
+    """
+    mapped_task_ids = [node.task_id for node in stage_topology.dag.tasks if node.mapped]
+    if not mapped_task_ids:
+        return None
+    mapped_task_id = mapped_task_ids[0]
+    mapped_instances = [task for task in tasks if task["task_id"] == mapped_task_id]
+    if not mapped_instances:
+        return None
+    state_counts = Counter(
+        str(task["state"]) if isinstance(task["state"], str) else _UNSET_TASK_STATE
+        for task in mapped_instances
+    )
+    return {
+        "task_id": mapped_task_id,
+        # Before the fan-out expands, Airflow reports ONE instance with
+        # map_index -1; it is counted, because "1 unexpanded instance" is the
+        # truth at that moment.
+        "total": len(mapped_instances),
+        "by_state": dict(sorted(state_counts.items())),
+    }
+
+
+@dataclass(frozen=True)
+class _MatchedStageRun:
+    """The stage run a master run most plausibly triggered, and how it matched."""
+
+    run: dict[str, Any]
+    match: str
+
+
+def _matched_stage_run(
+    stage_runs: list[dict[str, Any]], master_started_at: datetime | None
+) -> _MatchedStageRun | None:
+    """The newest run of one stage sub-DAG that started at/after the master's.
+
+    HONEST LIMITATION, restated in the payload as ``"match": "heuristic"``:
+    the master's ``TriggerDagRunOperator`` lets Airflow mint the sub-DAG's run
+    id and forwards a conf that carries no back-reference, so the API offers
+    nothing that ties a stage run to the master run that triggered it. Two
+    master runs overlapping in time can therefore be attributed the same
+    stage run. A master run that has not started yet (no ``start_date``)
+    matches nothing rather than guessing.
+    """
+    if master_started_at is None:
+        return None
+    best_run: dict[str, Any] | None = None
+    best_started_at: datetime | None = None
+    for run in stage_runs:
+        started_at = _parsed_timestamp(run.get("start_date"))
+        if started_at is None or started_at < master_started_at:
+            continue
+        if best_started_at is None or started_at > best_started_at:
+            best_run, best_started_at = run, started_at
+    if best_run is None:
+        return None
+    return _MatchedStageRun(run=best_run, match="heuristic")
+
+
+def _empty_stage_graph(stage_topology: StageTopology) -> dict[str, object]:
+    return {
+        "stage": stage_topology.stage.value,
+        "dag_id": stage_topology.dag.dag_id,
+        "dag_run_id": None,
+        "state": None,
+        "match": None,
+        "tasks": [],
+        "mapped_summary": None,
+    }
+
+
+def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver) -> APIRouter:
+    """The visualization routes, closed over one launch's pipeline and runtime.
+
+    Read-only throughout, so unlike the other routers these need no settings:
+    the pipeline comes from the one startup import and the runtime from the
+    shared resolver.
+    """
+    router = APIRouter(prefix="/api/v1")
+
+    def refuse_when_no_runtime() -> ResolvedRuntime:
+        resolution = resolver.resolve()
+        if not isinstance(resolution, ResolvedRuntime):
+            raise HTTPException(status_code=409, detail=resolution.detail)
+        return resolution
+
+    def refuse_airflow_failure(
+        error: AirflowClientError, runtime: ResolvedRuntime
+    ) -> HTTPException:
+        return HTTPException(
+            status_code=502, detail=client_error_detail(error, source=runtime.source)
+        )
+
+    def stage_task_instances(
+        client: AirflowClient, dag_id: str, dag_run_id: str
+    ) -> list[dict[str, Any]]:
+        try:
+            return client.task_instances(dag_id, dag_run_id)
+        except AirflowClientError:
+            # A stage sub-DAG that vanished (or a run Airflow expired) leaves
+            # that lane without task detail; the master's own state -- the
+            # page's point -- is already in hand, so this is a thinner
+            # drawing, not a failed request.
+            return []
+
+    @router.get("/pipeline/graph")
+    def read_pipeline_graph() -> JSONResponse:
+        """The merged picture: the DAG topology plus the pipeline's user steps.
+
+        Three degraded states, each explicit rather than an error: no runtime
+        addressed (``dag_ids_known: false``, display-only ids), no
+        ``--pipeline`` (``steps_known: false``, no user steps and no
+        quarantine gate), and both at once -- the common first-run case.
+        """
+        resolution = resolver.resolve()
+        dag_ids_known = isinstance(resolution, ResolvedRuntime)
+        application = pipeline_state.application
+        master_dag_id = (
+            resolution.dag_id
+            if isinstance(resolution, ResolvedRuntime)
+            else _display_master_dag_id(application.name if application is not None else None)
+        )
+        manifest = application.manifest() if application is not None else None
+        topology: IngestTopology = ingest_dag_topology(master_dag_id)
+        return JSONResponse(
+            {
+                "dag_ids_known": dag_ids_known,
+                "steps_known": manifest is not None,
+                "master": _dag_topology_json(topology.master),
+                "stages": [
+                    _stage_graph_json(stage_topology, manifest)
+                    for stage_topology in topology.stages
+                ],
+                "quarantine_gate": _quarantine_gate_json(manifest),
+            }
+        )
+
+    @router.get("/runtime/runs/{dag_run_id}/graph")
+    def read_run_graph(dag_run_id: str) -> JSONResponse:
+        """One master run's live state over the same topology.
+
+        The master run is addressed directly; each stage's sub-DAG run is
+        resolved by the documented heuristic in :func:`_matched_stage_run`.
+        """
+        runtime = refuse_when_no_runtime()
+        topology = ingest_dag_topology(runtime.dag_id)
+        try:
+            master_run = runtime.client.dag_run(runtime.dag_id, dag_run_id)
+        except AirflowClientError as error:
+            if error.status == 404:
+                # A definitively unknown run is a missing resource, not an
+                # upstream failure -- and the detail names only ids the
+                # caller already sent.
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"no run {dag_run_id!r} of dag {runtime.dag_id!r}",
+                ) from error
+            raise refuse_airflow_failure(error, runtime) from error
+        try:
+            master_instances = runtime.client.task_instances(runtime.dag_id, dag_run_id)
+        except AirflowClientError as error:
+            raise refuse_airflow_failure(error, runtime) from error
+        master_started_at = _parsed_timestamp(master_run.get("start_date"))
+
+        stages: list[dict[str, object]] = []
+        for stage_topology in topology.stages:
+            stage_dag_id = stage_topology.dag.dag_id
+            try:
+                stage_runs = runtime.client.dag_runs(
+                    stage_dag_id, limit=_STAGE_RUN_SEARCH_LIMIT, order_by="-id"
+                )
+            except AirflowClientError:
+                # An unregistered stage sub-DAG (a partial profile, or a
+                # bundle mid-render) is a stage that never ran here.
+                stage_runs = []
+            matched = _matched_stage_run(stage_runs, master_started_at)
+            if matched is None:
+                stages.append(_empty_stage_graph(stage_topology))
+                continue
+            stage_run_id = _optional_string(matched.run.get("dag_run_id"))
+            stage_tasks = (
+                _sorted_task_instances(
+                    stage_task_instances(runtime.client, stage_dag_id, stage_run_id),
+                    stage_topology.dag,
+                )
+                if stage_run_id is not None
+                else []
+            )
+            stages.append(
+                {
+                    "stage": stage_topology.stage.value,
+                    "dag_id": stage_dag_id,
+                    "dag_run_id": stage_run_id,
+                    "state": _optional_string(matched.run.get("state")),
+                    "match": matched.match,
+                    "tasks": stage_tasks,
+                    "mapped_summary": _mapped_summary(stage_tasks, stage_topology),
+                }
+            )
+
+        return JSONResponse(
+            {
+                "master": {
+                    "dag_run_id": _optional_string(master_run.get("dag_run_id")) or dag_run_id,
+                    "state": _optional_string(master_run.get("state")),
+                    "tasks": _sorted_task_instances(master_instances, topology.master),
+                },
+                "stages": stages,
+            }
+        )
+
+    return router

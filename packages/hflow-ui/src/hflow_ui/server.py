@@ -33,7 +33,7 @@ from hflow.format import CATALOG_FORMAT_VERSION
 from hflow.steps import RUN_PROFILES, IngestMode
 from hflow.storage import LocalStorageRoot
 from hflow.workspace import Workspace
-from hflow_ui import _catalog, _curation, _media, _pipeline, _runtime
+from hflow_ui import _catalog, _curation, _graph, _media, _pipeline, _runtime
 from hflow_ui._auth import SessionTokenMiddleware
 from hflow_ui._settings import UiSettings
 
@@ -106,6 +106,9 @@ def create_app(settings: UiSettings) -> FastAPI:
     # construction; the outcome (the live App, or the remembered failure) is
     # what /api/v1/pipeline and the config capability report for this launch.
     pipeline_state = _pipeline.load_pipeline_state(settings.pipeline)
+    # One runtime resolver per launch, shared by the runs monitor and the
+    # graph routes so both read the same briefly-cached addressing.
+    runtime_resolver = _runtime.RuntimeResolver(settings.data_root)
 
     def open_connection_or_refuse() -> duckdb.DuckDBPyConnection:
         # A FRESH connection per request: the wide episodes view binds its
@@ -248,6 +251,19 @@ def create_app(settings: UiSettings) -> FastAPI:
             )
         return JSONResponse(dossier)
 
+    @application.get("/api/v1/episodes/{episode_id}/timeline")
+    def read_episode_timeline(episode_id: str) -> JSONResponse:
+        connection = open_connection_or_refuse()
+        try:
+            timeline = _catalog.query_episode_timeline(connection, episode_id)
+        finally:
+            connection.close()
+        if timeline is None:
+            raise HTTPException(
+                status_code=404, detail=f"no episode {episode_id!r} in this catalog"
+            )
+        return JSONResponse(timeline)
+
     @application.get("/api/v1/episodes/{episode_id}/media/{artifact_name:path}")
     def read_episode_media(episode_id: str, artifact_name: str) -> FileResponse:
         connection = open_connection_or_refuse()
@@ -275,11 +291,13 @@ def create_app(settings: UiSettings) -> FastAPI:
             )
         return _served_file_response_or_refuse(canonical_uri, settings.data_root)
 
-    # M1 curation studio + M2 runs monitor and pipeline routes -- included
-    # BEFORE the SPA catch-all below so they win route matching.
+    # M1 curation studio, M2 runs monitor and pipeline routes, and the
+    # visualization routes -- included BEFORE the SPA catch-all below so they
+    # win route matching.
     application.include_router(_curation.create_curation_router(settings))
-    application.include_router(_runtime.create_runtime_router(settings))
+    application.include_router(_runtime.create_runtime_router(settings, runtime_resolver))
     application.include_router(_pipeline.create_pipeline_router(settings, pipeline_state))
+    application.include_router(_graph.create_graph_router(pipeline_state, runtime_resolver))
 
     @application.get("/{requested_path:path}", include_in_schema=False)
     def serve_spa(requested_path: str) -> Response:

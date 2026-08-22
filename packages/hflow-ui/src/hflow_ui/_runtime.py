@@ -70,8 +70,8 @@ def _client_error_reason(error: AirflowClientError) -> str:
     return "unreachable"
 
 
-def _client_error_detail(error: AirflowClientError, *, source: str) -> str:
-    """A browser-safe detail for an Airflow call failure.
+def client_error_detail(error: AirflowClientError, *, source: str) -> str:
+    """A browser-safe detail for an Airflow call failure (shared with _graph).
 
     A local bundle's api-server address is one the operator already has, so
     its verbatim message (which embeds that URL) is fine. A REMOTE runtime's
@@ -280,10 +280,13 @@ def _stage_run_summary(run: dict[str, Any]) -> dict[str, object]:
     }
 
 
-def create_runtime_router(settings: UiSettings) -> APIRouter:
-    """Every M2 runs-monitor route, closed over one launch's settings."""
+def create_runtime_router(settings: UiSettings, resolver: RuntimeResolver) -> APIRouter:
+    """Every M2 runs-monitor route, closed over one launch's settings.
+
+    The resolver is passed in (rather than built here) so the run-graph routes
+    in ``_graph`` share one addressing cache with this router.
+    """
     router = APIRouter(prefix="/api/v1")
-    resolver = RuntimeResolver(settings.data_root)
 
     def resolved_or_refuse() -> ResolvedRuntime:
         resolution = resolver.resolve()
@@ -312,7 +315,7 @@ def create_runtime_router(settings: UiSettings) -> APIRouter:
             # still an available:false ANSWER, with the addressing facts.
             return JSONResponse(
                 _unavailable_status_payload(
-                    _client_error_detail(error, source=resolution.source),
+                    client_error_detail(error, source=resolution.source),
                     source=resolution.source,
                     airflow_web_url=resolution.airflow_web_url,
                     dag_id=resolution.dag_id,
@@ -352,7 +355,7 @@ def create_runtime_router(settings: UiSettings) -> APIRouter:
             master_runs = runtime.client.dag_runs(runtime.dag_id, limit=limit, order_by="-id")
         except AirflowClientError as error:
             raise HTTPException(
-                status_code=502, detail=_client_error_detail(error, source=runtime.source)
+                status_code=502, detail=client_error_detail(error, source=runtime.source)
             ) from error
         stages: list[dict[str, object]] | None = None
         if runtime.stage_dag_ids is not None:
@@ -420,7 +423,7 @@ def create_runtime_router(settings: UiSettings) -> APIRouter:
             )
         except AirflowClientError as error:
             raise HTTPException(
-                status_code=502, detail=_client_error_detail(error, source=runtime.source)
+                status_code=502, detail=client_error_detail(error, source=runtime.source)
             ) from error
         return JSONResponse(
             {
