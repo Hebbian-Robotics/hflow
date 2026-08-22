@@ -253,6 +253,29 @@ def test_check_with_varargs_registers() -> None:
     assert {check.name for check in app.checks} == {"varargs_check"}
 
 
+def test_check_whose_episode_parameter_has_a_default_registers_and_runs() -> None:
+    """A default on the episode parameter does not stop it receiving the episode.
+
+    The check is called as ``function(canonical_episode)``, so the default is
+    never used and the signature is satisfiable. An earlier form of the
+    accepts-the-episode test skipped every defaulted positional parameter
+    before claiming the episode's slot, which rejected this at registration
+    even though it had always worked.
+    """
+    app = hflow.App("signature-defaulted-episode", data_root=Path("/tmp"))
+
+    @app.check()
+    def defaulted_episode(episode: hflow.Episode | None = None) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"episode_arrived": episode is not None})
+
+    assert {check.name for check in app.checks} == {"defaulted_episode"}
+    # Registration is the regression, but assert it is callable the way the
+    # runtime calls it, so the test fails if the call convention ever changes.
+    assert app.checks[0].function(cast(hflow.Episode, object())).measurements == {
+        "episode_arrived": True
+    }
+
+
 _STEP_VERSION_GLOBAL_THRESHOLD = 0.1
 
 

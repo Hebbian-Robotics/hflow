@@ -318,6 +318,11 @@ def _unsatisfiable_check_parameters(
     receive the episode positionally (a plain parameter, or ``*args``, which
     absorbs it). ``**kwargs`` alone is not a slot: it cannot absorb a
     positional argument.
+
+    A default on the first positional parameter does not stop it being the
+    episode's slot. ``def check(episode=None)`` is called as
+    ``check(canonical_episode)`` and the default is simply never used, so it
+    is satisfiable and must keep registering.
     """
     try:
         parameters = inspect.signature(function).parameters.values()
@@ -331,10 +336,12 @@ def _unsatisfiable_check_parameters(
             inspect.Parameter.POSITIONAL_ONLY,
             inspect.Parameter.POSITIONAL_OR_KEYWORD,
         ):
-            if parameter.default is not inspect.Parameter.empty:
-                continue
             if not seen_episode:
+                # The first positional slot takes the episode whether or not
+                # it has a default, so claim it before testing for one.
                 seen_episode = True
+                continue
+            if parameter.default is not inspect.Parameter.empty:
                 continue
             unsatisfiable.append(parameter.name)
         elif parameter.kind is inspect.Parameter.VAR_POSITIONAL:
