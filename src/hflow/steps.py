@@ -321,11 +321,14 @@ def _stable_version_identity_value(value: object) -> VersionIdentityValue:
     if isinstance(value, Path):
         return {"path": str(value)}
     if isinstance(value, ModuleType):
-        module_version = getattr(value, "__version__", None)
-        return {
-            "module": value.__name__,
-            "version": module_version if isinstance(module_version, str) else None,
-        }
+        # The module's IDENTITY, never its ``__version__``: a version number
+        # is a poor proxy for "does this library compute differently", and
+        # folding it in re-versioned every step that merely referenced
+        # ``hflow`` or ``numpy`` on any release of those packages -- including
+        # releases that changed nothing a step can observe. What a step
+        # actually does still lives in its own source and captured values,
+        # which this hash covers directly.
+        return {"module": value.__name__}
     if isinstance(value, type):
         return {"type": f"{value.__module__}.{value.__qualname__}"}
     if isinstance(value, CodeType):

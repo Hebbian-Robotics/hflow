@@ -392,8 +392,13 @@ def test_default_library_identifier_names_project_and_format() -> None:
         pass
     stream.seek(0)
     header = make_reader(stream).get_header()
-    assert header.library.startswith("hflow/")
+    assert header.library.startswith("hflow ")
     assert "episode-format/1" in header.library
+    # The header is inside the bytes content_episode_id hashes, so it must
+    # carry no release number: see tests/test_identity_stability.py.
+    import hflow
+
+    assert hflow.__version__ not in header.library
 
     explicit_stream = BytesIO()
     with CanonicalMcapWriter(explicit_stream, library="custom-writer/9"):
