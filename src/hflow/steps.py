@@ -8,6 +8,7 @@ on a check registered with ``critical=True``, a False verdict quarantines the
 episode (a tag, never a deletion) and skips its downstream steps.
 """
 
+import functools
 import hashlib
 import inspect
 import json
@@ -248,6 +249,12 @@ def _callable_implementation_identity(
     *,
     allow_opaque: bool = False,
 ) -> VersionIdentityValue:
+    if isinstance(function, functools.partial):
+        return {
+            "partial_func": _callable_implementation_identity(function.func),
+            "partial_args": _stable_version_identity_value(function.args),
+            "partial_keywords": _stable_version_identity_value(function.keywords),
+        }
     source_target: object = function
     if not inspect.isfunction(function) and not inspect.ismethod(function):
         source_target = type(function).__call__
@@ -288,7 +295,10 @@ def _callable_behavior_configuration(
     function: Callable[..., object],
 ) -> VersionIdentityValue:
     configuration: dict[str, VersionIdentityValue] = {}
-    if inspect.isfunction(function) or inspect.ismethod(function):
+    if isinstance(function, functools.partial):
+        configuration["partial_args"] = _stable_version_identity_value(function.args)
+        configuration["partial_keywords"] = _stable_version_identity_value(function.keywords)
+    elif inspect.isfunction(function) or inspect.ismethod(function):
         closure_variables = inspect.getclosurevars(function)
         configuration["nonlocals"] = _stable_version_identity_value(closure_variables.nonlocals)
         configuration["globals"] = _stable_version_identity_value(closure_variables.globals)

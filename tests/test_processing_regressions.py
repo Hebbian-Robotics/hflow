@@ -1,5 +1,6 @@
 """Processing, publication, and user-step boundary regressions."""
 
+import functools
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -274,6 +275,32 @@ def test_check_whose_episode_parameter_has_a_default_registers_and_runs() -> Non
     assert app.checks[0].function(cast(hflow.Episode, object())).measurements == {
         "episode_arrived": True
     }
+
+
+def test_step_version_accepts_functools_partial_with_bound_args() -> None:
+    bound = functools.partial(hflow.checks.action_rate, topics=["/joint_states"])
+    version = compute_check_version("bound", bound, False, frozenset(), None)
+
+    assert version
+
+
+def test_step_version_differs_when_partial_bindings_change() -> None:
+    topics_a = functools.partial(hflow.checks.action_rate, topics=["/joint_states"])
+    topics_b = functools.partial(hflow.checks.action_rate, topics=["/other_stream"])
+    version_a = compute_check_version("a", topics_a, False, frozenset(), None)
+    version_b = compute_check_version("b", topics_b, False, frozenset(), None)
+
+    assert version_a != version_b
+
+
+def test_check_registration_accepts_functools_partial() -> None:
+    app = hflow.App("partial-registration", data_root=Path("/tmp"))
+    bound = functools.partial(hflow.checks.action_rate, topics=["/joint_states"])
+
+    app.check(name="bound")(bound)
+
+    assert {check.name for check in app.checks} == {"bound"}
+    assert app.checks[0].version
 
 
 _STEP_VERSION_GLOBAL_THRESHOLD = 0.1
