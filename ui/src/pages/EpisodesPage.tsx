@@ -11,20 +11,29 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   DEFAULT_ORDER_BY,
+  type EpisodeColumnStats,
   type EpisodeRow,
   type EpisodeStatus,
+  type EpisodesFilter,
   fetchEpisodeFacets,
+  fetchEpisodeStats,
   fetchEpisodesPage,
   parseEpisodesQuery,
 } from "../api";
 import { FacetSidebar, type MultiValueFacetName } from "../components/FacetSidebar";
+import { HeaderDistribution } from "../components/HeaderDistribution";
 import { EmptyPanel, ErrorPanel, LoadingPanel } from "../components/QueryStates";
 import { SqlFooter } from "../components/SqlFooter";
 import { ValueCell } from "../components/ValueCell";
 import { ChevronDownIcon, SearchIcon } from "../icons";
 
 const SEARCH_DEBOUNCE_MS = 300;
+const STATS_DEBOUNCE_MS = 250;
 const PAGE_SIZE_CHOICES = [25, 50, 100, 250, 500];
+
+// Header-popover clicks only map to columns with an existing structured filter
+// param; other columns render their stats without a click-to-filter affordance.
+const STATS_FILTERABLE_COLUMNS = new Set(["task", "operator", "embodiment", "status"]);
 
 export function EpisodesPage() {
   const navigate = useNavigate();
@@ -37,6 +46,45 @@ export function EpisodesPage() {
     placeholderData: keepPreviousData,
   });
   const facetsQuery = useQuery({ queryKey: ["episode-facets"], queryFn: fetchEpisodeFacets });
+
+  // Column mini-distributions, computed server-side under the ACTIVE filters.
+  // Debounced and independent of the table query — the table never waits on stats.
+  const statsFilter = useMemo<EpisodesFilter>(
+    () => ({
+      task: query.task,
+      operator: query.operator,
+      embodiment: query.embodiment,
+      status: query.status,
+      success: query.success,
+      search: query.search,
+    }),
+    [query],
+  );
+  const statsFilterKey = useMemo(() => JSON.stringify(statsFilter), [statsFilter]);
+  const [debouncedStats, setDebouncedStats] = useState<{ key: string; filter: EpisodesFilter }>({
+    key: statsFilterKey,
+    filter: statsFilter,
+  });
+  useEffect(() => {
+    if (statsFilterKey === debouncedStats.key) return;
+    const debounceHandle = window.setTimeout(
+      () => setDebouncedStats({ key: statsFilterKey, filter: statsFilter }),
+      STATS_DEBOUNCE_MS,
+    );
+    return () => window.clearTimeout(debounceHandle);
+  }, [statsFilterKey, statsFilter, debouncedStats.key]);
+  const statsQuery = useQuery({
+    queryKey: ["episode-stats", debouncedStats.key],
+    queryFn: () => fetchEpisodeStats(debouncedStats.filter),
+    placeholderData: keepPreviousData,
+  });
+  const statsByColumn = useMemo(() => {
+    const byColumn = new Map<string, EpisodeColumnStats>();
+    for (const columnStats of statsQuery.data?.columns ?? []) {
+      byColumn.set(columnStats.name, columnStats);
+    }
+    return byColumn;
+  }, [statsQuery.data]);
 
   // Any filter or sort change restarts pagination at the first page.
   const updateFilters = useCallback(
@@ -100,6 +148,40 @@ export function EpisodesPage() {
       else params.delete("success");
     });
   };
+
+  // A popover value click applies the same structured params the sidebar uses.
+  const applyStatsValueFilter = useCallback(
+    (columnName: string, value: string) => {
+      if (columnName === "status") {
+        if (value === "ok" || value === "quarantined") {
+          selectStatus(query.status === value ? null : value);
+        }
+        return;
+      }
+      if (columnName === "task" || columnName === "operator" || columnName === "embodiment") {
+        toggleFacetValue(columnName, value);
+      }
+    },
+    [query.status, selectStatus, toggleFacetValue],
+  );
+
+  const activeStatsValues = useCallback(
+    (columnName: string): readonly string[] => {
+      switch (columnName) {
+        case "task":
+          return query.task;
+        case "operator":
+          return query.operator;
+        case "embodiment":
+          return query.embodiment;
+        case "status":
+          return query.status ? [query.status] : [];
+        default:
+          return [];
+      }
+    },
+    [query],
+  );
 
   // Sorting maps 1:1 onto the API's order_by/order params; the server default
   // (recorded_at desc) is mirrored so the header indicator is honest.
@@ -296,6 +378,10 @@ export function EpisodesPage() {
                     <tr key={headerGroup.id}>
                       {headerGroup.headers.map((header) => {
                         const sortDirection = header.column.getIsSorted();
+                        const columnStats = statsByColumn.get(header.column.id);
+                        const isStatsFilterable =
+                          columnStats?.kind === "categorical" &&
+                          STATS_FILTERABLE_COLUMNS.has(header.column.id);
                         return (
                           <th
                             key={header.id}
@@ -307,20 +393,33 @@ export function EpisodesPage() {
                                   : undefined
                             }
                           >
-                            <button
-                              type="button"
-                              className="th-sort"
-                              onClick={header.column.getToggleSortingHandler()}
-                            >
-                              {flexRender(header.column.columnDef.header, header.getContext())}
-                              {sortDirection ? (
-                                <ChevronDownIcon
-                                  className={
-                                    sortDirection === "asc" ? "sort-arrow is-asc" : "sort-arrow"
+                            <div className="th-inner">
+                              <button
+                                type="button"
+                                className="th-sort"
+                                onClick={header.column.getToggleSortingHandler()}
+                              >
+                                {flexRender(header.column.columnDef.header, header.getContext())}
+                                {sortDirection ? (
+                                  <ChevronDownIcon
+                                    className={
+                                      sortDirection === "asc" ? "sort-arrow is-asc" : "sort-arrow"
+                                    }
+                                  />
+                                ) : null}
+                              </button>
+                              {columnStats ? (
+                                <HeaderDistribution
+                                  stats={columnStats}
+                                  onSelectValue={
+                                    isStatsFilterable
+                                      ? (value) => applyStatsValueFilter(header.column.id, value)
+                                      : null
                                   }
+                                  activeValues={activeStatsValues(header.column.id)}
                                 />
                               ) : null}
-                            </button>
+                            </div>
                           </th>
                         );
                       })}

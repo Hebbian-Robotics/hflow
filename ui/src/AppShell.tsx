@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, Outlet, useLocation } from "react-router-dom";
 import { fetchWorkspaceConfig } from "./api";
-import { BrandMarkIcon, CurateIcon, EpisodesIcon } from "./icons";
+import { BrandMarkIcon, CurateIcon, EpisodesIcon, PipelineIcon, RunsIcon } from "./icons";
 
 // Small workspace readout at the bottom of the rail: where the data lives and
 // which versions are serving it. Quiet on purpose.
@@ -26,6 +26,8 @@ function WorkspaceSummary() {
 export function AppShell() {
   const location = useLocation();
   const isEpisodesActive = location.pathname === "/" || location.pathname.startsWith("/episodes");
+  const isRunsActive = location.pathname.startsWith("/runs");
+  const isPipelineActive = location.pathname.startsWith("/pipeline");
   const isCurateActive = location.pathname.startsWith("/curate");
   return (
     <div className="app-shell">
@@ -41,6 +43,22 @@ export function AppShell() {
         >
           <EpisodesIcon />
           <span>Episodes</span>
+        </Link>
+        <Link
+          to="/runs"
+          className={isRunsActive ? "nav-item is-active" : "nav-item"}
+          aria-current={isRunsActive ? "page" : undefined}
+        >
+          <RunsIcon />
+          <span>Runs</span>
+        </Link>
+        <Link
+          to="/pipeline"
+          className={isPipelineActive ? "nav-item is-active" : "nav-item"}
+          aria-current={isPipelineActive ? "page" : undefined}
+        >
+          <PipelineIcon />
+          <span>Pipeline</span>
         </Link>
         <Link
           to="/curate"

@@ -63,6 +63,22 @@ export function shortFingerprint(fingerprint: string): string {
   return fingerprint.length > 10 ? fingerprint.slice(0, 10) : fingerprint;
 }
 
+/** Wall-clock span between two ISO timestamps, for run timing readouts. */
+export function formatDurationBetween(startIso: string | null, endIso: string | null): string {
+  if (!startIso || !endIso) return "—";
+  const elapsedMs = Date.parse(endIso) - Date.parse(startIso);
+  if (!Number.isFinite(elapsedMs) || elapsedMs < 0) return "—";
+  const totalSeconds = elapsedMs / 1000;
+  if (totalSeconds < 60) return `${totalSeconds.toFixed(1)} s`;
+  const wholeMinutes = Math.floor(totalSeconds / 60);
+  const remainderSeconds = Math.round(totalSeconds % 60);
+  if (wholeMinutes < 60) {
+    return `${wholeMinutes}m ${String(remainderSeconds).padStart(2, "0")}s`;
+  }
+  const wholeHours = Math.floor(wholeMinutes / 60);
+  return `${wholeHours}h ${String(wholeMinutes % 60).padStart(2, "0")}m`;
+}
+
 /** Content-derived React key for a raw catalog row (no array indexes). */
 export function historyRowKey(row: EpisodeRow): string {
   return ["recorded_at", "run_fingerprint", "pipeline_version", "uri"]

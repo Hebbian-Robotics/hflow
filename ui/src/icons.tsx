@@ -332,6 +332,119 @@ export function TrashIcon({ className }: IconProps) {
   );
 }
 
+export function RunsIcon({ className }: IconProps) {
+  return (
+    <svg
+      className={className}
+      width="15"
+      height="15"
+      viewBox="0 0 16 16"
+      fill="none"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path
+        d="M13.6 8A5.6 5.6 0 1 1 8 2.4c2.2 0 4.1 1.3 5 3.1"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+      />
+      <path d="M13.8 2.6v3h-3" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+      <path d="M6.8 5.9v4.2L10.2 8 6.8 5.9z" fill="currentColor" />
+    </svg>
+  );
+}
+
+export function PipelineIcon({ className }: IconProps) {
+  return (
+    <svg
+      className={className}
+      width="15"
+      height="15"
+      viewBox="0 0 16 16"
+      fill="none"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <circle cx="3" cy="8" r="1.8" stroke="currentColor" strokeWidth="1.4" />
+      <circle cx="13" cy="4" r="1.6" stroke="currentColor" strokeWidth="1.4" />
+      <circle cx="13" cy="12" r="1.6" stroke="currentColor" strokeWidth="1.4" />
+      <path d="M4.7 7.3l6.8-2.7M4.7 8.7l6.8 2.7" stroke="currentColor" strokeWidth="1.4" />
+    </svg>
+  );
+}
+
+export function RefreshIcon({ className }: IconProps) {
+  return (
+    <svg
+      className={className}
+      width="13"
+      height="13"
+      viewBox="0 0 16 16"
+      fill="none"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path
+        d="M13.3 8A5.3 5.3 0 1 1 8 2.7c2 0 3.8 1.1 4.7 2.8"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+      />
+      <path d="M13 2.4v3.2H9.8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+export function ExternalLinkIcon({ className }: IconProps) {
+  return (
+    <svg
+      className={className}
+      width="12"
+      height="12"
+      viewBox="0 0 16 16"
+      fill="none"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path
+        d="M7 3H4a1.5 1.5 0 0 0-1.5 1.5V12A1.5 1.5 0 0 0 4 13.5h7.5A1.5 1.5 0 0 0 13 12V9"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+      />
+      <path
+        d="M9.5 2.5H13.5V6.5M13.2 2.8L7.8 8.2"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+export function DistributionIcon({ className }: IconProps) {
+  return (
+    <svg
+      className={className}
+      width="11"
+      height="11"
+      viewBox="0 0 16 16"
+      fill="none"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path
+        d="M2.5 13.5V10M6.2 13.5V5.5M9.8 13.5V2.5M13.5 13.5V8"
+        stroke="currentColor"
+        strokeWidth="1.9"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
 export function ArrowLeftIcon({ className }: IconProps) {
   return (
     <svg

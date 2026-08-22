@@ -1,6 +1,6 @@
 // Typed client for the hflow-ui JSON API (/api/v1).
-// Interfaces mirror the M0 + M1 contract shapes exactly; this module is the
-// only place that talks to the network.
+// Interfaces mirror the M0 + M1 + M2 contract shapes exactly; this module is
+// the only place that talks to the network.
 
 export class ApiError extends Error {
   readonly status: number;
@@ -18,6 +18,8 @@ export interface WorkspaceCapabilities {
   catalog: boolean;
   media: boolean;
   runtime: boolean;
+  /** M2: true when the server imported a --pipeline app at startup. Absent on M0/M1 servers. */
+  pipeline?: boolean;
 }
 
 export interface WorkspaceConfig {
@@ -110,13 +112,17 @@ export interface EpisodeDossier {
   canonical_url: string | null;
 }
 
-export interface EpisodesQuery {
+/** The structured filter params /episodes and /episodes/stats share. */
+export interface EpisodesFilter {
   task: string[];
   operator: string[];
   embodiment: string[];
   status: EpisodeStatus | null;
   success: "true" | "false" | null;
   search: string;
+}
+
+export interface EpisodesQuery extends EpisodesFilter {
   orderBy: string | null;
   order: "asc" | "desc";
   limit: number;
@@ -207,14 +213,21 @@ async function fetchJson<ResponseBody>(path: string): Promise<ResponseBody> {
   return requestJson<ResponseBody>(path, "GET");
 }
 
-function buildEpisodesSearchParams(query: EpisodesQuery): URLSearchParams {
+/** Only the filter params (no sort/pagination) — shared with /episodes/stats,
+ * whose distributions must reflect the same filtered set regardless of paging. */
+function buildEpisodesFilterParams(filter: EpisodesFilter): URLSearchParams {
   const params = new URLSearchParams();
-  for (const value of query.task) params.append("task", value);
-  for (const value of query.operator) params.append("operator", value);
-  for (const value of query.embodiment) params.append("embodiment", value);
-  if (query.status) params.set("status", query.status);
-  if (query.success) params.set("success", query.success);
-  if (query.search) params.set("search", query.search);
+  for (const value of filter.task) params.append("task", value);
+  for (const value of filter.operator) params.append("operator", value);
+  for (const value of filter.embodiment) params.append("embodiment", value);
+  if (filter.status) params.set("status", filter.status);
+  if (filter.success) params.set("success", filter.success);
+  if (filter.search) params.set("search", filter.search);
+  return params;
+}
+
+function buildEpisodesSearchParams(query: EpisodesQuery): URLSearchParams {
+  const params = buildEpisodesFilterParams(query);
   if (query.orderBy) params.set("order_by", query.orderBy);
   params.set("order", query.order);
   params.set("limit", String(query.limit));
@@ -407,6 +420,192 @@ export function fetchCatalogTableSummary(tableName: string): Promise<CatalogTabl
   return fetchJson<CatalogTableSummary>(
     `/api/v1/catalog/tables/${encodeURIComponent(tableName)}/summary`,
   );
+}
+
+// --- M2: runs monitor -------------------------------------------------------------
+
+/** Per-component health from Airflow's monitor endpoint; null = component absent
+ * (triggerer/dag_processor may legitimately be missing in minimal deployments). */
+export interface RuntimeHealth {
+  metadatabase: string | null;
+  scheduler: string | null;
+  triggerer: string | null;
+  dag_processor: string | null;
+}
+
+export interface RuntimeStatus {
+  available: boolean;
+  /** Why the runtime is unavailable (only meaningful when available is false). */
+  detail: string | null;
+  source: "bundle" | "remote" | null;
+  /** Deep-link base for the Airflow web UI, when the server knows one. */
+  airflow_web_url: string | null;
+  dag_id: string | null;
+  registered: boolean | null;
+  health: RuntimeHealth | null;
+}
+
+export interface RuntimeRun {
+  dag_run_id: string;
+  state: string;
+  logical_date: string | null;
+  start_date: string | null;
+  end_date: string | null;
+  conf: Record<string, unknown>;
+}
+
+export type StageName = "sync" | "meta" | "labels" | "media";
+
+export const STAGE_ORDER: readonly StageName[] = ["sync", "meta", "labels", "media"];
+
+export interface StageRun {
+  dag_run_id: string;
+  state: string;
+  start_date: string | null;
+  end_date: string | null;
+}
+
+export interface StageRecentRuns {
+  stage: StageName;
+  dag_id: string;
+  recent: StageRun[];
+}
+
+export interface RuntimeRunsResponse {
+  runs: RuntimeRun[];
+  /** Recent-per-stage runs (bundle only); NOT correlated with specific master runs. */
+  stages: StageRecentRuns[] | null;
+}
+
+/** Mirrors hflow.steps.RUN_PROFILES — the server validates against the live set. */
+export const RUN_PROFILE_NAMES = ["full", "metadata_backfill", "relabel"] as const;
+
+export type IngestMode = "batch" | "online";
+
+export const INGEST_MODES: readonly IngestMode[] = ["batch", "online"];
+
+export interface IngestRequest {
+  uris: string[];
+  profile: string;
+  mode: IngestMode;
+  batch_count?: number;
+}
+
+export interface IngestResponse {
+  dag_run_id: string;
+  state: string;
+}
+
+export function fetchRuntimeStatus(): Promise<RuntimeStatus> {
+  return fetchJson<RuntimeStatus>("/api/v1/runtime/status");
+}
+
+export function fetchRuntimeRuns(limit: number): Promise<RuntimeRunsResponse> {
+  return fetchJson<RuntimeRunsResponse>(`/api/v1/runtime/runs?limit=${limit}`);
+}
+
+export function triggerIngest(request: IngestRequest): Promise<IngestResponse> {
+  return requestJson<IngestResponse>("/api/v1/runtime/ingest", "POST", request);
+}
+
+// --- M2: pipeline page --------------------------------------------------------------
+
+/** One registered step out of App.manifest() (hflow.manifest.StepManifest). */
+export interface PipelineStepManifest {
+  name: string;
+  kind: string;
+  /** Content hash of the live function — long; display truncated with copy. */
+  version: string;
+  critical: boolean;
+  requires: string[];
+  /** Endpoint alias the step declares, or null. */
+  uses: string | null;
+}
+
+export interface DerivedChannelManifest {
+  topic: string;
+  version: string;
+}
+
+export interface PipelineManifest {
+  manifest_version: number;
+  pipeline_name: string;
+  hflow_version: string;
+  schema_version: string;
+  pipeline_version: string;
+  checks: PipelineStepManifest[];
+  enrichments: PipelineStepManifest[];
+  derived_channels: DerivedChannelManifest[];
+  endpoint_aliases: string[];
+  has_transform_override: boolean;
+}
+
+export interface ObservedVersion {
+  check_name: string;
+  check_version: string;
+  first_seen: string;
+  last_seen: string;
+  run_count: number;
+}
+
+export interface StaleSummary {
+  pipeline_version: string;
+  count: number;
+}
+
+export interface PipelineResponse {
+  manifest: PipelineManifest;
+  observed: ObservedVersion[];
+  stale: StaleSummary | null;
+}
+
+/** 409 (ApiError with the server's detail) when no --pipeline is configured. */
+export function fetchPipeline(): Promise<PipelineResponse> {
+  return fetchJson<PipelineResponse>("/api/v1/pipeline");
+}
+
+// --- M2: episode column distributions --------------------------------------------------
+
+export interface StatsBucket {
+  lo: number;
+  hi: number;
+  count: number;
+}
+
+export interface StatsValue {
+  value: string;
+  count: number;
+}
+
+export interface NumericColumnStats {
+  name: string;
+  kind: "numeric";
+  /** Bucket bounds carry the range; top-level min/max are optional extras. */
+  min?: number | null;
+  max?: number | null;
+  buckets: StatsBucket[];
+}
+
+export interface CategoricalColumnStats {
+  name: string;
+  kind: "categorical";
+  /** Top values with counts (server-capped). */
+  values: StatsValue[];
+  /** Rows beyond the cap, rolled up; 0 or absent when the cap covered everything. */
+  other_count?: number | null;
+}
+
+export type EpisodeColumnStats = NumericColumnStats | CategoricalColumnStats;
+
+export interface EpisodesStatsResponse {
+  columns: EpisodeColumnStats[];
+}
+
+/** Distributions over the SAME filtered set as /episodes (sort/paging excluded). */
+export function fetchEpisodeStats(filter: EpisodesFilter): Promise<EpisodesStatsResponse> {
+  const params = buildEpisodesFilterParams(filter);
+  const suffix = params.size > 0 ? `?${params}` : "";
+  return fetchJson<EpisodesStatsResponse>(`/api/v1/episodes/stats${suffix}`);
 }
 
 /** Human-readable message for any error a query can surface. */

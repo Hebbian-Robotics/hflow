@@ -7,6 +7,8 @@ import { EmptyPanel } from "./components/QueryStates";
 import { CuratePage } from "./pages/CuratePage";
 import { EpisodeDetailPage } from "./pages/EpisodeDetailPage";
 import { EpisodesPage } from "./pages/EpisodesPage";
+import { PipelinePage } from "./pages/PipelinePage";
+import { RunsPage } from "./pages/RunsPage";
 import "./styles.css";
 
 const queryClient = new QueryClient({
@@ -26,6 +28,8 @@ const router = createBrowserRouter([
     children: [
       { index: true, element: <EpisodesPage /> },
       { path: "episodes/:episodeId", element: <EpisodeDetailPage /> },
+      { path: "runs", element: <RunsPage /> },
+      { path: "pipeline", element: <PipelinePage /> },
       { path: "curate", element: <CuratePage /> },
       {
         path: "*",
