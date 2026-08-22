@@ -13,6 +13,7 @@ from hflow.app import (
     CheckStatus,
     EnrichmentRunReport,
     TestReport,
+    import_pipeline_application,
 )
 from hflow.batching import PlannedBatch, plan_batches, plan_batches_from_files
 from hflow.catalog import AppendResult, Catalog, CheckRunRow
@@ -125,6 +126,7 @@ __all__ = [
     "diagnose",
     "fetch_uri",
     "ffmpeg",
+    "import_pipeline_application",
     "is_bucket_url",
     "open_catalog_connection",
     "open_reader",

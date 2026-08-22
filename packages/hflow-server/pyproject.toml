@@ -1,0 +1,32 @@
+[project]
+name = "hflow-server"
+version = "0.1.0"
+description = "Local web UI for HFlow: browse episodes, quality evidence, and the catalog"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Hebbian Robotics" }]
+requires-python = ">=3.11"
+dependencies = [
+    # The floor is a real one, not a formality: this package imports
+    # hflow.workspace, hflow.import_pipeline_application,
+    # hflow.runtime.ingest_dag_topology and hflow.app's artifact-key constant
+    # at module scope, and none of them exist in hflow 0.2.0. Without the
+    # floor, `pip install hflow-server` beside an older hflow resolves happily and
+    # then dies with ImportError on `import hflow_server`. [tool.uv.sources] below
+    # only steers resolution inside this repo -- it is stripped from the built
+    # wheel's metadata -- and uv ignores this specifier for the workspace
+    # member, so in-repo development is unaffected by the number.
+    "hflow>=0.3.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
+]
+
+[project.urls]
+Repository = "https://github.com/Hebbian-Robotics/hflow"
+
+[tool.uv.sources]
+hflow = { workspace = true }
+
+[build-system]
+requires = ["uv_build>=0.11.33,<0.12"]
+build-backend = "uv_build"
