@@ -1,6 +1,6 @@
 // Typed client for the hflow-ui JSON API (/api/v1).
-// Interfaces mirror the M0 contract shapes exactly; this module is the only
-// place that talks to the network.
+// Interfaces mirror the M0 + M1 contract shapes exactly; this module is the
+// only place that talks to the network.
 
 export class ApiError extends Error {
   readonly status: number;
@@ -164,10 +164,23 @@ export function withSessionToken(url: string): string {
 
 // --- fetch helpers ------------------------------------------------------------
 
-async function fetchJson<ResponseBody>(path: string): Promise<ResponseBody> {
+type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
+
+async function requestJson<ResponseBody>(
+  path: string,
+  method: HttpMethod,
+  requestBody?: unknown,
+): Promise<ResponseBody> {
   let response: Response;
   try {
-    response = await fetch(withSessionToken(path), { headers: { Accept: "application/json" } });
+    response = await fetch(withSessionToken(path), {
+      method,
+      headers:
+        requestBody === undefined
+          ? { Accept: "application/json" }
+          : { Accept: "application/json", "Content-Type": "application/json" },
+      body: requestBody === undefined ? undefined : JSON.stringify(requestBody),
+    });
   } catch (networkError) {
     const reason = networkError instanceof Error ? networkError.message : "network error";
     throw new ApiError(0, reason);
@@ -185,7 +198,13 @@ async function fetchJson<ResponseBody>(path: string): Promise<ResponseBody> {
     }
     throw new ApiError(response.status, detail);
   }
+  // DELETE endpoints answer 204 with no body.
+  if (response.status === 204) return undefined as unknown as ResponseBody;
   return (await response.json()) as ResponseBody;
+}
+
+async function fetchJson<ResponseBody>(path: string): Promise<ResponseBody> {
+  return requestJson<ResponseBody>(path, "GET");
 }
 
 function buildEpisodesSearchParams(query: EpisodesQuery): URLSearchParams {
@@ -248,6 +267,146 @@ export function fetchEpisodeFacets(): Promise<EpisodeFacets> {
 
 export function fetchEpisodeDossier(episodeId: string): Promise<EpisodeDossier> {
   return fetchJson<EpisodeDossier>(`/api/v1/episodes/${encodeURIComponent(episodeId)}`);
+}
+
+// --- M1: curation studio --------------------------------------------------------
+
+/** {name, type} column descriptor, as returned by the server's DESCRIBE. */
+export type ColumnDescriptor = EpisodeColumn;
+
+/** One generic result row; the server guarantees JSON-safe values. */
+export type ResultRow = Record<string, unknown>;
+
+/**
+ * One row of a DuckDB `SUMMARIZE` result (column_name, column_type, min, max,
+ * approx_unique, null_percentage, …). The exact key set varies with the DuckDB
+ * version, so it stays an open record and the UI renders whatever arrives.
+ */
+export type SummarizeRow = Record<string, unknown>;
+
+export interface CurationPreviewRequest {
+  sql: string;
+  /** Server default 100, max 1000. */
+  limit?: number;
+  /** When true the server also runs SUMMARIZE over the result. */
+  stats?: boolean;
+}
+
+export interface CurationPreviewResult {
+  columns: ColumnDescriptor[];
+  rows: ResultRow[];
+  /** Full count over the user's SELECT, independent of the preview limit. */
+  row_count: number;
+  truncated: boolean;
+  column_stats: SummarizeRow[] | null;
+  /** The wrapped SELECT the server actually ran. */
+  sql: string;
+}
+
+export interface CoverageEntry {
+  check_name: string;
+  episodes_ran: number;
+  total_episodes: number;
+  fraction: number;
+}
+
+export interface CurationReport {
+  row_count: number;
+  total_episodes: number;
+  coverage: CoverageEntry[];
+}
+
+export interface PinManifestRequest {
+  sql: string;
+  name: string;
+  description?: string;
+}
+
+export interface ManifestRegistryEntry {
+  id: string;
+  name: string;
+  description: string | null;
+  sql: string;
+  /** Data-root-relative path of the pinned Parquet file. */
+  manifest_path: string;
+  row_count: number;
+  total_episodes: number;
+  coverage: CoverageEntry[];
+  created_at: string;
+}
+
+export interface SavedQuery {
+  id: string;
+  name: string;
+  sql: string;
+  updated_at: string;
+}
+
+export interface CatalogTable {
+  name: string;
+  kind: "view" | "table";
+  columns: ColumnDescriptor[];
+}
+
+export interface CatalogTableSummary {
+  row_count: number;
+  columns: SummarizeRow[];
+}
+
+export function runCurationPreview(
+  request: CurationPreviewRequest,
+): Promise<CurationPreviewResult> {
+  return requestJson<CurationPreviewResult>("/api/v1/curation/preview", "POST", request);
+}
+
+export function runCurationReport(sql: string): Promise<CurationReport> {
+  return requestJson<CurationReport>("/api/v1/curation/report", "POST", { sql });
+}
+
+export function pinManifest(request: PinManifestRequest): Promise<ManifestRegistryEntry> {
+  return requestJson<ManifestRegistryEntry>("/api/v1/curation/pin", "POST", request);
+}
+
+export function fetchManifests(): Promise<ManifestRegistryEntry[]> {
+  return fetchJson<{ manifests: ManifestRegistryEntry[] }>("/api/v1/manifests").then(
+    (body) => body.manifests,
+  );
+}
+
+/** Same-origin Parquet download path; wrap with withSessionToken() for hrefs. */
+export function manifestDownloadPath(manifestId: string): string {
+  return `/api/v1/manifests/${encodeURIComponent(manifestId)}/download`;
+}
+
+export function fetchSavedQueries(): Promise<SavedQuery[]> {
+  return fetchJson<{ queries: SavedQuery[] }>("/api/v1/queries").then((body) => body.queries);
+}
+
+export function createSavedQuery(input: { name: string; sql: string }): Promise<SavedQuery> {
+  return requestJson<SavedQuery>("/api/v1/queries", "POST", input);
+}
+
+export function updateSavedQuery(
+  queryId: string,
+  changes: { name?: string; sql?: string },
+): Promise<SavedQuery> {
+  return requestJson<SavedQuery>(`/api/v1/queries/${encodeURIComponent(queryId)}`, "PUT", changes);
+}
+
+export function deleteSavedQuery(queryId: string): Promise<void> {
+  return requestJson<void>(`/api/v1/queries/${encodeURIComponent(queryId)}`, "DELETE");
+}
+
+export function fetchCatalogTables(): Promise<CatalogTable[]> {
+  return fetchJson<{ tables: CatalogTable[] }>("/api/v1/catalog/tables").then(
+    (body) => body.tables,
+  );
+}
+
+export function fetchCatalogTableSummary(tableName: string): Promise<CatalogTableSummary> {
+  return fetchJson<CatalogTableSummary>(
+    `/api/v1/catalog/tables/${encodeURIComponent(tableName)}/summary`,
+  );
 }
 
 /** Human-readable message for any error a query can surface. */

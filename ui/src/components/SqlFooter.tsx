@@ -7,7 +7,13 @@ type CopyState = "idle" | "copied" | "failed";
  * The compiled-query readout: the server returns the exact SELECT it ran for
  * the current filters, and this strip keeps it visible, expandable, copyable.
  */
-export function SqlFooter({ sql }: { sql: string | undefined }) {
+export function SqlFooter({
+  sql,
+  emptyMessage = "compiled query appears here once episodes load",
+}: {
+  sql: string | undefined;
+  emptyMessage?: string;
+}) {
   const [isExpanded, setIsExpanded] = useState(false);
   const [copyState, setCopyState] = useState<CopyState>("idle");
   const resetTimerRef = useRef<number | null>(null);
@@ -59,9 +65,7 @@ export function SqlFooter({ sql }: { sql: string | undefined }) {
           </code>
         )
       ) : (
-        <code className="sql-preview sql-empty">
-          compiled query appears here once episodes load
-        </code>
+        <code className="sql-preview sql-empty">{emptyMessage}</code>
       )}
       <button
         type="button"

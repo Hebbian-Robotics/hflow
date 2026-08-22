@@ -41,6 +41,24 @@ export function measurementDisplayValue(measurement: EpisodeMeasurement): string
   return "—";
 }
 
+/** 0.518 -> "51.8%"; integral percentages drop the decimal. */
+export function formatFractionAsPercent(fraction: number): string {
+  const percent = fraction * 100;
+  const text = Number.isInteger(percent) ? String(percent) : percent.toFixed(1);
+  return `${text}%`;
+}
+
+/** Display text for one value out of a SUMMARIZE row (open, JSON-safe record). */
+export function summarizeValueText(value: unknown): string {
+  if (value === null || value === undefined) return "—";
+  if (typeof value === "number") return formatNumber(value);
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "string") {
+    return looksLikeIsoTimestamp(value) ? formatTimestamp(value) : value;
+  }
+  return JSON.stringify(value);
+}
+
 export function shortFingerprint(fingerprint: string): string {
   return fingerprint.length > 10 ? fingerprint.slice(0, 10) : fingerprint;
 }

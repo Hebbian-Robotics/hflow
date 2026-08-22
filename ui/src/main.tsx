@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import { createBrowserRouter, RouterProvider } from "react-router-dom";
 import { AppShell } from "./AppShell";
 import { EmptyPanel } from "./components/QueryStates";
+import { CuratePage } from "./pages/CuratePage";
 import { EpisodeDetailPage } from "./pages/EpisodeDetailPage";
 import { EpisodesPage } from "./pages/EpisodesPage";
 import "./styles.css";
@@ -25,6 +26,7 @@ const router = createBrowserRouter([
     children: [
       { index: true, element: <EpisodesPage /> },
       { path: "episodes/:episodeId", element: <EpisodeDetailPage /> },
+      { path: "curate", element: <CuratePage /> },
       {
         path: "*",
         element: (

@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, Outlet, useLocation } from "react-router-dom";
 import { fetchWorkspaceConfig } from "./api";
-import { BrandMarkIcon, EpisodesIcon } from "./icons";
+import { BrandMarkIcon, CurateIcon, EpisodesIcon } from "./icons";
 
 // Small workspace readout at the bottom of the rail: where the data lives and
 // which versions are serving it. Quiet on purpose.
@@ -26,6 +26,7 @@ function WorkspaceSummary() {
 export function AppShell() {
   const location = useLocation();
   const isEpisodesActive = location.pathname === "/" || location.pathname.startsWith("/episodes");
+  const isCurateActive = location.pathname.startsWith("/curate");
   return (
     <div className="app-shell">
       <nav className="nav-rail" aria-label="Primary">
@@ -40,6 +41,14 @@ export function AppShell() {
         >
           <EpisodesIcon />
           <span>Episodes</span>
+        </Link>
+        <Link
+          to="/curate"
+          className={isCurateActive ? "nav-item is-active" : "nav-item"}
+          aria-current={isCurateActive ? "page" : undefined}
+        >
+          <CurateIcon />
+          <span>Curate</span>
         </Link>
         <div className="rail-foot">
           <WorkspaceSummary />
