@@ -204,18 +204,6 @@ def latest_quarantine(
     )
 
 
-def latest_quarantine_state(
-    catalog_root: "Path | str | StorageRoot", episode_id: str
-) -> bool | None:
-    """Whether ``episode_id``'s most recent cataloged run left it quarantined.
-
-    ``None`` when the catalog or the episode is unknown -- no catalog means
-    no known quarantine, and callers proceed.
-    """
-    latest = latest_quarantine(catalog_root, episode_id)
-    return None if latest is None else latest.quarantined
-
-
 def content_episode_id(canonical_path: Path) -> str:
     """Content-address an episode: sha256 of the canonical file, 16 hex chars."""
     digest = hashlib.sha256()
