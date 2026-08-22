@@ -20,7 +20,6 @@ Output:
 import argparse
 import contextlib
 import hashlib
-import json
 import os
 import shutil
 import struct
@@ -94,36 +93,6 @@ class CorpusManifest:
     episodes: list[PlannedEpisode]
 
 
-def _require_object(value: object, context: str) -> dict[str, object]:
-    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
-        raise ValueError(f"{context} must be a JSON object with string keys")
-    return value
-
-
-def _require_array(value: object, context: str) -> list[object]:
-    if not isinstance(value, list):
-        raise ValueError(f"{context} must be a JSON array")
-    return value
-
-
-def _require_string(value: object, context: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{context} must be a non-empty string")
-    return value
-
-
-def _require_number(value: object, context: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise ValueError(f"{context} must be a number")
-    return float(value)
-
-
-def _require_integer(value: object, context: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{context} must be an integer")
-    return value
-
-
 def _require_ffmpeg() -> None:
     """Ensure ffmpeg is available on PATH."""
     if not shutil.which("ffmpeg"):
@@ -173,79 +142,6 @@ def _expand_episode_plan(
             )
         )
     return episodes
-
-
-def _load_manifest(manifest_path: Path) -> CorpusManifest:
-    root = _require_object(json.loads(manifest_path.read_text()), "manifest")
-    schema_version_value = root.get("schema_version")
-    if schema_version_value != 1:
-        raise ValueError(f"unsupported manifest schema_version {schema_version_value!r}")
-
-    dataset_object = _require_object(root.get("dataset"), "dataset")
-    archive_object = _require_object(root.get("archive"), "archive")
-    source_objects = _require_array(root.get("sources"), "sources")
-    episode_plan_object = _require_object(root.get("episode_plan"), "episode_plan")
-
-    dataset = DatasetSource(
-        repo_id=_require_string(dataset_object.get("repo_id"), "dataset.repo_id"),
-        revision=_require_string(dataset_object.get("revision"), "dataset.revision"),
-        license=_require_string(dataset_object.get("license"), "dataset.license"),
-    )
-    archive = SourceArchive(
-        path=_require_string(archive_object.get("path"), "archive.path"),
-        sha256=str(archive_object.get("sha256", "") or ""),
-    )
-    sources = [
-        SourceVideo(
-            member=_require_string(source_object.get("member"), f"sources[{source_index}].member"),
-            sha256=str(source_object.get("sha256", "") or ""),
-            duration_s=_require_number(
-                source_object.get("duration_s"), f"sources[{source_index}].duration_s"
-            ),
-            task=_require_string(source_object.get("task"), f"sources[{source_index}].task"),
-        )
-        for source_index, source_value in enumerate(source_objects)
-        for source_object in [_require_object(source_value, f"sources[{source_index}]")]
-    ]
-
-    episode_plan = EpisodePlan(
-        total_episodes=_require_integer(
-            episode_plan_object.get("total_episodes"), "episode_plan.total_episodes"
-        ),
-        duration_s=_require_number(
-            episode_plan_object.get("duration_s"), "episode_plan.duration_s"
-        ),
-        first_source_start_s=_require_number(
-            episode_plan_object.get("first_source_start_s"),
-            "episode_plan.first_source_start_s",
-        ),
-        source_stride_s=_require_number(
-            episode_plan_object.get("source_stride_s"), "episode_plan.source_stride_s"
-        ),
-    )
-
-    source_members = {source.member for source in sources}
-    if not sources:
-        raise ValueError("sources must contain at least one video")
-    if len(source_members) != len(sources):
-        raise ValueError("sources contains duplicate member names")
-    if episode_plan.total_episodes < 1:
-        raise ValueError("episode_plan.total_episodes must be at least one")
-    if episode_plan.duration_s <= 0:
-        raise ValueError("episode_plan.duration_s must be positive")
-    if episode_plan.first_source_start_s < 0 or episode_plan.source_stride_s < 0:
-        raise ValueError("episode plan source timings cannot be negative")
-
-    episodes = _expand_episode_plan(sources, episode_plan)
-
-    return CorpusManifest(
-        schema_version=1,
-        dataset=dataset,
-        archive=archive,
-        sources=sources,
-        episode_plan=episode_plan,
-        episodes=episodes,
-    )
 
 
 def _sha256_file(file_path: Path) -> str:
@@ -730,7 +626,7 @@ def _convert_single_episode(
 
     for i in range(frame_count):
         parquet_ts = timestamps[i]
-        video_pts = pts_times[i] if i < len(pts_times) else (i / fps)
+        video_pts = pts_times[i]
         if abs(parquet_ts - video_pts) > 0.050:  # 50ms threshold
             raise ValueError(
                 f"timestamp disagreement at frame {i}: parquet={parquet_ts:.6f}s, "

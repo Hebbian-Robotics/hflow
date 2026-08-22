@@ -52,6 +52,7 @@ Use these when you already know the outcome you need.
 - [Load a large manifest with memory mapping](./how-to/load-manifest-mmap.md)
 - [Inspect episodes in Foxglove](./how-to/inspect-episodes-in-foxglove.md)
 - [Add a native-video provider](./PROVIDERS.md)
+- [Develop from Windows with WSL2](./how-to/wsl2.md)
 
 ## Reference
 
