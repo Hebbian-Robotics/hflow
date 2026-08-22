@@ -171,4 +171,4 @@ commands run natively inside WSL.
 
 Add to `docs/README.md` under **How-to guides**:
 
-- [Run HFlow on Windows with WSL2](./how-to/wsl2.md)
+- [Run HFlow on Windows with WSL2](./wsl2.md)
