@@ -63,9 +63,13 @@ def cleared_binary_caches() -> Iterator[None]:
     _clear_all_binary_caches()
 
 
-def test_env_override_wins(monkeypatch: pytest.MonkeyPatch, cleared_binary_caches: None) -> None:
-    monkeypatch.setenv(FFMPEG_ENV_VAR, "/usr/bin/ffmpeg")
-    assert ffmpeg_path() == Path("/usr/bin/ffmpeg")
+def test_env_override_wins(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cleared_binary_caches: None
+) -> None:
+    override_ffmpeg = tmp_path / "ffmpeg"
+    override_ffmpeg.touch()
+    monkeypatch.setenv(FFMPEG_ENV_VAR, str(override_ffmpeg))
+    assert ffmpeg_path() == override_ffmpeg
 
 
 def test_env_override_to_missing_file_raises(
