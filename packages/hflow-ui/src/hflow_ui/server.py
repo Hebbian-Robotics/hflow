@@ -22,15 +22,14 @@ from typing import Annotated
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
-from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
-from starlette.requests import Request
+from starlette.datastructures import Headers
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from uvicorn.config import LOGGING_CONFIG
 from uvicorn.logging import AccessFormatter
 
 import hflow
 from hflow.format import CATALOG_FORMAT_VERSION
 from hflow.steps import RUN_PROFILES, IngestMode
-from hflow.storage import LocalStorageRoot
 from hflow.workspace import Workspace
 from hflow_ui import _catalog, _connections, _curation, _graph, _media, _pipeline, _runtime
 from hflow_ui._auth import SessionTokenMiddleware
@@ -48,7 +47,7 @@ from hflow_ui._contract import (
     WorkspaceCapabilities,
     WorkspaceConfigResponse,
 )
-from hflow_ui._settings import UiSettings
+from hflow_ui._settings import MAX_PORT, UiSettings, local_data_root_or_none
 
 ASSETS_ENVIRONMENT_VARIABLE = "HFLOW_UI_ASSETS"
 
@@ -61,22 +60,88 @@ _PORT_RETRY_ATTEMPTS = 10
 _MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024
 
 
-class RequestBodySizeLimitMiddleware(BaseHTTPMiddleware):
-    """Refuses any request whose declared body exceeds the size cap (413)."""
+def _declared_request_body_bytes(scope: Scope) -> int | None:
+    """The request's Content-Length, or None when it declares none (or lies)."""
+    declared = Headers(scope=scope).get("content-length")
+    if declared is None:
+        return None
+    try:
+        return int(declared)
+    except ValueError:
+        return None
 
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        content_length = request.headers.get("content-length")
-        if content_length is not None:
-            try:
-                declared_length = int(content_length)
-            except ValueError:
-                declared_length = None
-            if declared_length is not None and declared_length > _MAX_REQUEST_BODY_BYTES:
-                return JSONResponse(
-                    {"detail": "request body too large"},
-                    status_code=413,
-                )
-        return await call_next(request)
+
+class RequestBodySizeLimitMiddleware:
+    """Refuses any request body over the size cap with a 413.
+
+    Pure ASGI, and it counts the bytes rather than trusting a header: a
+    declared ``Content-Length`` is only a claim, and a chunked request makes
+    none at all, so a header-only check let exactly the thing this middleware
+    exists to stop -- an unbounded POST buffered whole before any validation
+    runs -- through by simply omitting the header. A declared length over the
+    cap is still refused up front, without reading a byte.
+
+    The body is read HERE and replayed downstream rather than counted inside
+    a wrapped receive channel: an oversized-body error raised from inside the
+    channel gets rewritten by whatever was reading it (FastAPI's body reader
+    turns any exception but its own into a generic 400, and an intervening
+    ``BaseHTTPMiddleware`` collapses even that into an exception group), which
+    would leave the cap enforced but unsayable. What is buffered is bounded by
+    the cap itself -- the first chunk that crosses it ends the request -- and
+    every route on this API reads its whole body anyway, so nothing that would
+    otherwise have streamed is being held here.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+        declared_body_bytes = _declared_request_body_bytes(scope)
+        if declared_body_bytes is not None and declared_body_bytes > _MAX_REQUEST_BODY_BYTES:
+            await _refuse_oversized_body(scope, receive, send)
+            return
+        body_messages = await _capped_body_messages(receive)
+        if body_messages is None:
+            await _refuse_oversized_body(scope, receive, send)
+            return
+        await self._app(scope, _replaying_receive(body_messages, receive), send)
+
+
+async def _capped_body_messages(receive: Receive) -> list[Message] | None:
+    """One request's body messages, or ``None`` once they exceed the cap."""
+    body_messages: list[Message] = []
+    received_body_bytes = 0
+    while True:
+        message = await receive()
+        body_messages.append(message)
+        if message["type"] != "http.request":
+            # http.disconnect: no body is coming, and none ever will.
+            return body_messages
+        received_body_bytes += len(message.get("body", b""))
+        if received_body_bytes > _MAX_REQUEST_BODY_BYTES:
+            return None
+        if not message.get("more_body", False):
+            return body_messages
+
+
+def _replaying_receive(body_messages: list[Message], receive: Receive) -> Receive:
+    """A receive channel handing back the read body, then the real channel."""
+    unread_messages = iter(body_messages)
+
+    async def replaying_receive() -> Message:
+        unread = next(unread_messages, None)
+        # Past the buffered body the real channel takes over, so a downstream
+        # reader still sees the eventual http.disconnect.
+        return unread if unread is not None else await receive()
+
+    return replaying_receive
+
+
+async def _refuse_oversized_body(scope: Scope, receive: Receive, send: Send) -> None:
+    await JSONResponse({"detail": "request body too large"}, status_code=413)(scope, receive, send)
 
 
 _FRONTEND_PLACEHOLDER_PAGE = """<!doctype html>
@@ -85,8 +150,8 @@ _FRONTEND_PLACEHOLDER_PAGE = """<!doctype html>
   <body>
     <h1>HFlow workspace UI</h1>
     <p>The frontend bundle is not built into this installation, but the JSON
-    API is live under <code>/api/v1</code> (interactive docs at
-    <code>/api/docs</code>).</p>
+    API is live under <code>/api/v1</code> (its OpenAPI schema is at
+    <code>/api/openapi.json</code>).</p>
     <p>To develop the frontend, run <code>pnpm install &amp;&amp; pnpm dev</code>
     inside the repository's <code>ui/</code> directory; to serve a local build,
     run <code>pnpm build</code> there and point the <code>HFLOW_UI_ASSETS</code>
@@ -134,7 +199,14 @@ def create_app(settings: UiSettings) -> FastAPI:
     application = FastAPI(
         title="HFlow workspace UI",
         version=hflow_ui_version,
-        docs_url="/api/docs",
+        # No Swagger or ReDoc HTML page. Both of FastAPI's built-in pages load
+        # their JS and CSS from cdn.jsdelivr.net, which would break the offline
+        # promise this UI makes (docs/UI.md, "Trust posture": no CDN, no
+        # outbound requests) and would run third-party script same-origin with
+        # an authenticated workspace session. The generated schema is served as
+        # JSON instead -- that IS the contract, and any local OpenAPI viewer or
+        # client generator reads it. test_ui_offline_posture.py pins this.
+        docs_url=None,
         openapi_url="/api/openapi.json",
         redoc_url=None,
     )
@@ -165,6 +237,7 @@ def create_app(settings: UiSettings) -> FastAPI:
             # A corrupt identity marker must not stop the UI from booting: the
             # id is informational here, and this surface never mints one.
             identity = None
+        workspace_is_local = local_data_root_or_none(settings.data_root) is not None
         return WorkspaceConfigResponse(
             mode="local",
             read_only=settings.read_only,
@@ -174,12 +247,16 @@ def create_app(settings: UiSettings) -> FastAPI:
             workspace_id=identity.workspace_id if identity is not None else None,
             capabilities=WorkspaceCapabilities(
                 catalog=_catalog_marker_readable(workspace),
-                media=isinstance(workspace.storage_root, LocalStorageRoot),
+                # Media bytes and the studio's writes both need the workspace
+                # reachable as local paths; they are separate flags because
+                # bucket support will arrive for them separately.
+                media=workspace_is_local,
+                curation=workspace_is_local,
                 # Addressed (bundle dir or HFLOW_AIRFLOW_URL), not necessarily
                 # reachable -- /runtime/status owns liveness, and it is also
                 # the one endpoint that serves the Airflow deep-link base.
-                runtime=_runtime.runtime_configured(settings.data_root),
-                pipeline=pipeline_state.available,
+                runtime=_runtime.runtime_addressed(runtime_resolver.resolve()),
+                pipeline=isinstance(pipeline_state, _pipeline.PipelineLoaded),
             ),
             # The trigger form's vocabularies, served so the frontend never
             # hardcodes them (hflow.steps stays the one owner).
@@ -298,7 +375,7 @@ def _served_file_response_or_refuse(uri: str, data_root: str) -> FileResponse:
     try:
         resolved_file = _media.resolve_served_file(uri, data_root=data_root)
     except _media.MediaResolutionError as error:
-        raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+        raise _media.media_refusal(error) from error
     return _media.served_file_response(resolved_file)
 
 
@@ -409,15 +486,19 @@ def serve(settings: UiSettings) -> None:
 
 
 def _first_free_port(host: str, preferred_port: int) -> int:
-    """The preferred port, or the first free one in the handful above it."""
-    for candidate_port in range(preferred_port, preferred_port + _PORT_RETRY_ATTEMPTS):
+    """The preferred port, or the first free one in the handful above it.
+
+    ``preferred_port`` is already in ``MIN_PORT..MAX_PORT`` (``UiSettings``
+    parses it there), and the retry window is clipped to MAX_PORT so walking
+    off the top of the range refuses with the same sentence as an occupied
+    range rather than with bind(2)'s OverflowError.
+    """
+    last_candidate_port = min(preferred_port + _PORT_RETRY_ATTEMPTS - 1, MAX_PORT)
+    for candidate_port in range(preferred_port, last_candidate_port + 1):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_socket:
             try:
                 probe_socket.bind((host, candidate_port))
             except OSError:
                 continue
         return candidate_port
-    raise RuntimeError(
-        f"no free port between {preferred_port} and "
-        f"{preferred_port + _PORT_RETRY_ATTEMPTS - 1} on {host}"
-    )
+    raise RuntimeError(f"no free port between {preferred_port} and {last_candidate_port} on {host}")

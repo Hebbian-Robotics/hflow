@@ -30,8 +30,8 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from hflow.storage import LocalStorageRoot, parse_storage_root
 from hflow_ui._contract import CheckCoverageEntry, PinnedManifestEntry, SavedQueryEntry
+from hflow_ui._settings import local_data_root_or_none
 
 STATE_VERSION = 1
 SIDECAR_DIRECTORY_NAME = "ui"
@@ -57,14 +57,14 @@ class SidecarState:
 
 def local_data_root(data_root: str) -> Path:
     """The data root as a local directory; sidecar and manifest writes need one."""
-    parsed_root = parse_storage_root(data_root)
-    if not isinstance(parsed_root, LocalStorageRoot):
+    local_root = local_data_root_or_none(data_root)
+    if local_root is None:
         raise SidecarError(
             501,
             "saved queries and pinned manifests need a local data root; "
             "bucket-backed workspaces are not supported by the curation studio yet",
         )
-    return parsed_root.path
+    return local_root
 
 
 def sidecar_state_file(data_root: str) -> Path:
@@ -122,8 +122,13 @@ def _parsed_state(raw_payload: str, state_file: Path) -> SidecarState:
         raise _refused(state_file, "expected a JSON object")
     found_version = parsed.get("state_version")
     if found_version != STATE_VERSION:
+        # 409, not 500: the same mapping _connections gives a catalog written
+        # in a format version this build cannot read -- the state is there and
+        # intact, this build just cannot speak to it, which is a conflict with
+        # the workspace rather than a fault of this server. A file that is
+        # corrupt (rather than merely newer) keeps the 500 _refused gives it.
         raise SidecarError(
-            500,
+            409,
             f"UI state file {state_file} has state_version {found_version!r}; "
             f"this build reads version {STATE_VERSION!r}",
         )

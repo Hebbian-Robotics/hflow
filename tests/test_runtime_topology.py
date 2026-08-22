@@ -23,7 +23,7 @@ from hflow.runtime._topology import (
     RESOLVE_PROFILE_TASK_ID,
     budget_gate_task_id,
 )
-from hflow.steps import RUN_PROFILES, Stage
+from hflow.steps import Stage
 
 MASTER_DAG_ID = "kitchen_ingest"
 
@@ -49,11 +49,12 @@ def test_master_task_ids_appear_in_the_rendered_master_dag(rendered_bundle: Path
     topology = ingest_dag_topology(MASTER_DAG_ID)
 
     assert f"def {RESOLVE_PROFILE_TASK_ID}(" in source
+    # The gate and trigger ids are built from f-strings in the template, so the
+    # rendered source carries one shape covering every stage; what varies per
+    # stage is the id the description derives from it.
+    assert 'task_id=f"enabled_{stage_name}"' in source
+    assert 'task_id=f"trigger_{stage_name}"' in source
     for stage_topology in topology.stages:
-        # The gate and trigger ids are built from f-strings in the template,
-        # so assert on the shape the template produces rather than a literal.
-        assert 'task_id=f"enabled_{stage_name}"' in source
-        assert 'task_id=f"trigger_{stage_name}"' in source
         assert stage_topology.gate_task_id == f"enabled_{stage_topology.stage.value}"
         assert stage_topology.trigger_task_id == f"trigger_{stage_topology.stage.value}"
 
@@ -101,12 +102,14 @@ def test_process_batch_is_the_only_mapped_task() -> None:
         assert mapped == [PROCESS_BATCH_TASK_ID]
 
 
-def test_enabling_profiles_come_from_the_run_profile_vocabulary() -> None:
-    for stage_topology in ingest_dag_topology(MASTER_DAG_ID).stages:
-        expected = sorted(
-            name for name, stages in RUN_PROFILES.items() if stage_topology.stage in stages
-        )
-        assert list(stage_topology.enabling_profiles) == expected
-    # A profile that disables a stage is what the master's gate skips on.
-    metadata_backfill = ingest_dag_topology(MASTER_DAG_ID).stage(Stage.LABELS)
-    assert "metadata_backfill" not in metadata_backfill.enabling_profiles
+def test_enabling_profiles_name_which_profiles_run_each_stage() -> None:
+    """The profile table as the UI reads it, stated rather than recomputed.
+
+    A profile missing from a stage's tuple is exactly what the master's gate
+    skips on -- metadata_backfill runs meta and nothing else.
+    """
+    topology = ingest_dag_topology(MASTER_DAG_ID)
+    assert topology.stage(Stage.SYNC).enabling_profiles == ("full",)
+    assert topology.stage(Stage.META).enabling_profiles == ("full", "metadata_backfill")
+    assert topology.stage(Stage.LABELS).enabling_profiles == ("full", "relabel")
+    assert topology.stage(Stage.MEDIA).enabling_profiles == ("full",)

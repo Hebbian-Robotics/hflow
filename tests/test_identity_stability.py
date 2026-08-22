@@ -11,6 +11,8 @@ sources minted new episode identities instead of deduping.
 These tests fail if any of those couplings comes back.
 """
 
+from collections.abc import Callable
+
 import numpy
 
 import hflow
@@ -22,23 +24,23 @@ from hflow.transform import TransformConfig, compute_pipeline_version
 FAKE_RELEASE = "9.9.9"
 
 
-def _step_version(function: object) -> str:
+def _step_version(function: Callable[..., object]) -> str:
     return compute_check_version(
         name="probe",
-        function=function,  # ty: ignore[invalid-argument-type]
+        function=function,
         critical=False,
         requires=frozenset(),
         uses=None,
     )
 
 
-def _with_faked_release(compute: object) -> tuple[str, str]:
+def _with_faked_release(compute: Callable[[], str]) -> tuple[str, str]:
     """Return (value now, value under a faked hflow release)."""
-    before = compute()  # ty: ignore[call-non-callable]
+    before = compute()
     original = hflow.__version__
     hflow.__version__ = FAKE_RELEASE
     try:
-        after = compute()  # ty: ignore[call-non-callable]
+        after = compute()
     finally:
         hflow.__version__ = original
     return before, after

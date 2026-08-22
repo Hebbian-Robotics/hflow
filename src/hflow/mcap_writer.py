@@ -66,7 +66,7 @@ MCAP0_MAGIC = struct.pack("<8B", 137, 77, 67, 65, 80, 48, 13, 10)
 
 
 def _default_library_identifier() -> str:
-    """Project name + package version + episode format version.
+    """Project name + episode format version + transform behavior version.
 
     Informational only (MCAP Header ``library`` field): stored-data
     identifiers stay neutral per ``hflow.format``.

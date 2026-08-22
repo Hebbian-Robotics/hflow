@@ -85,6 +85,21 @@ def timeline_workspace(tmp_path_factory: pytest.TempPathFactory) -> dict[str, st
             )
         ],
     )
+    duration_named_percentage = appended(
+        "duration_named_percentage",
+        [
+            CheckRunRow(
+                check_name="duty_cycle_check",
+                check_version="v1",
+                critical=False,
+                status=hflow.CheckStatus.MEASURED,
+                duration_s=0.01,
+                # Says "duration", measures a percentage: the suffix names a
+                # dimension that is not a time.
+                measurements={"duty_cycle_duration_pct": 45.0},
+            )
+        ],
+    )
     no_span = appended(
         "no_span",
         [
@@ -102,6 +117,7 @@ def timeline_workspace(tmp_path_factory: pytest.TempPathFactory) -> dict[str, st
         "data_root": str(data_root),
         "intervals_and_duration": intervals_and_duration,
         "duration_only": duration_only,
+        "duration_named_percentage": duration_named_percentage,
         "no_span": no_span,
     }
 
@@ -176,6 +192,26 @@ def test_timeline_from_a_duration_measurement_alone_is_zero_based(
     assert payload["start_ns"] == 0
     assert payload["end_ns"] == 30 * NANOSECONDS_PER_SECOND
     assert payload["duration_s"] == pytest.approx(30.0)
+
+
+def test_a_duration_key_measuring_a_percentage_does_not_become_the_axis(
+    timeline_api: TestClient, timeline_workspace: dict[str, str]
+) -> None:
+    """The bar's unit and the axis must read the same key the same way.
+
+    ``duty_cycle_duration_pct`` is labelled "45 %"; reading its suffix as a
+    time as well would claim a 45-second episode -- a fabricated axis 1e9
+    times the number's own dimension.
+    """
+    payload = timeline_api.get(
+        f"/api/v1/episodes/{timeline_workspace['duration_named_percentage']}/timeline"
+    ).json()
+    assert payload["measurements"] == [
+        {"key": "duty_cycle_duration_pct", "value": 45.0, "unit": "%"}
+    ]
+    assert payload["start_ns"] is None
+    assert payload["end_ns"] is None
+    assert payload["duration_s"] is None
 
 
 def test_timeline_without_any_span_returns_nulls_not_a_guess(

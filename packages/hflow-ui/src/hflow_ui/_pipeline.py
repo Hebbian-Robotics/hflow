@@ -18,7 +18,7 @@ from fastapi import APIRouter, HTTPException
 from hflow import App, import_pipeline_application
 from hflow.curation import stale_episodes
 from hflow.format import EPISODE_FORMAT_VERSION
-from hflow.manifest import PipelineManifest
+from hflow.manifest import PipelineManifest, StepManifest
 from hflow.steps import Stage
 from hflow.workspace import Workspace
 from hflow_ui import _catalog, _connections
@@ -28,60 +28,110 @@ from hflow_ui._contract import (
     PipelineStageLane,
     PipelineStepManifest,
     StaleSummary,
+    StepTier,
 )
 from hflow_ui._settings import UiSettings
 
 
 @dataclass(frozen=True)
-class PipelineState:
-    """The one startup import's outcome: the live App, or why there is none."""
+class PipelineLoaded:
+    """The one startup import produced a live App."""
 
-    application: App | None
-    unavailable_detail: str | None
+    application: App
 
-    @property
-    def available(self) -> bool:
-        return self.application is not None
+
+@dataclass(frozen=True)
+class PipelineUnavailable:
+    """No App for this launch, and exactly why."""
+
+    detail: str
+
+
+# Two states, never both and never neither -- the same sum ``_runtime`` uses
+# for its resolution, so the two capabilities behind the same 409 refusal are
+# modelled the same way and the refusal's detail cannot be null.
+PipelineState = PipelineLoaded | PipelineUnavailable
 
 
 def load_pipeline_state(pipeline_spec: str | None) -> PipelineState:
     """Run the one startup import and remember its outcome, whatever it is."""
     if pipeline_spec is None:
-        return PipelineState(
-            application=None,
-            unavailable_detail=(
+        return PipelineUnavailable(
+            detail=(
                 "no --pipeline configured: relaunch `hflow ui` with "
                 "--pipeline path/to/pipeline.py[:app] to serve the pipeline page"
-            ),
+            )
         )
     try:
-        application = import_pipeline_application(pipeline_spec)
+        return PipelineLoaded(application=import_pipeline_application(pipeline_spec))
     except ValueError as error:
-        return PipelineState(application=None, unavailable_detail=str(error))
-    return PipelineState(application=application, unavailable_detail=None)
+        return PipelineUnavailable(detail=str(error))
 
 
-def _stage_lanes(manifest: PipelineManifest) -> list[PipelineStageLane]:
-    """Manifest steps grouped into the ingest stage lanes, in stage-graph order.
+def registered_step_tier(step: StepManifest) -> StepTier:
+    """Which cheap-first tier this step runs in (1 first, 2 second).
 
-    The REAL stage semantics from ``hflow.steps``/``App.process``: registered
-    checks run in the META stage ("checks + catalog registration"), user
+    Mirrors :meth:`hflow.App._ordered_checks` and ``_ordered_enrichments``
+    EXACTLY: both sort on ``bool(requires) or uses is not None``, so tier 2 is
+    precisely the steps declaring a required channel or an endpoint alias.
+    Within a tier there is no ordering at all -- registration order is what
+    the stable sort preserves, not a dependency.
+
+    The rule ideally belongs in the SDK -- a ``tier`` on
+    ``hflow.manifest.StepManifest`` that ``App`` sorts on and ``hflow
+    manifest`` renders, so the CLI could answer "in what order do my steps
+    run?" too. Until it lives there, this is this package's ONE copy: both
+    endpoints project from :func:`registered_steps_by_stage` rather than
+    restating the expression a second time.
+    """
+    return 2 if (bool(step.requires) or step.uses is not None) else 1
+
+
+def _in_execution_order(
+    steps: tuple[StepManifest, ...],
+) -> tuple[tuple[StepManifest, StepTier], ...]:
+    # Stable sort on the tier alone: the same sort App._ordered_checks makes,
+    # so the served order IS the execution order.
+    return tuple(
+        (step, registered_step_tier(step)) for step in sorted(steps, key=registered_step_tier)
+    )
+
+
+def registered_steps_by_stage(
+    manifest: PipelineManifest,
+) -> dict[Stage, tuple[tuple[StepManifest, StepTier], ...]]:
+    """Which registered steps run in which stage, in the order they run.
+
+    The ONE owner of that mapping for this package: the pipeline page's lanes
+    and the graph's per-stage user steps are the same steps in the same order,
+    differing only in whether the payload carries the tier -- so the two pages
+    can never show one pipeline as two.
+
+    Stage ownership is the engine's (``hflow.steps``/``App.process``):
+    registered checks run in META ("checks + catalog registration"), user
     enrichments in LABELS ("Labels & artifacts"), while SYNC (the canonical
     transform plus derived channels) and MEDIA (the engine's contact-sheet
     step) are engine-owned lanes carrying no user-registered steps.
     """
-    steps_by_stage: dict[Stage, list[PipelineStepManifest]] = {stage: [] for stage in Stage}
-    steps_by_stage[Stage.META] = [
-        PipelineStepManifest.from_step_manifest(step) for step in manifest.checks
-    ]
-    steps_by_stage[Stage.LABELS] = [
-        PipelineStepManifest.from_step_manifest(step) for step in manifest.enrichments
-    ]
+    steps_by_stage: dict[Stage, tuple[tuple[StepManifest, StepTier], ...]] = dict.fromkeys(
+        Stage, ()
+    )
+    steps_by_stage[Stage.META] = _in_execution_order(manifest.checks)
+    steps_by_stage[Stage.LABELS] = _in_execution_order(manifest.enrichments)
+    return steps_by_stage
+
+
+def _stage_lanes(manifest: PipelineManifest) -> list[PipelineStageLane]:
+    """The stage lanes of the pipeline page, in stage-graph order."""
+    steps_by_stage = registered_steps_by_stage(manifest)
     return [
         PipelineStageLane(
-            stage=stage.value,
+            stage=stage,
             engine_owned=stage in (Stage.SYNC, Stage.MEDIA),
-            steps=steps_by_stage[stage],
+            steps=[
+                PipelineStepManifest.from_step_manifest(step)
+                for step, _tier in steps_by_stage[stage]
+            ],
         )
         for stage in Stage
     ]
@@ -130,8 +180,8 @@ def create_pipeline_router(settings: UiSettings, state: PipelineState) -> APIRou
 
     @router.get("/pipeline")
     def read_pipeline() -> PipelineResponse:
-        if state.application is None:
-            raise HTTPException(status_code=409, detail=state.unavailable_detail)
+        if isinstance(state, PipelineUnavailable):
+            raise HTTPException(status_code=409, detail=state.detail)
         manifest = state.application.manifest()
         observed, stale = _observed_versions_and_stale(settings.data_root, state.application)
         return PipelineResponse(

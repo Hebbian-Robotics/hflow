@@ -22,7 +22,7 @@ import math
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
-from typing import TypeVar
+from typing import Literal, TypeVar
 from urllib.parse import quote
 
 import duckdb
@@ -353,8 +353,14 @@ _NUMERIC_STAT_TYPES = frozenset(
 )
 _CATEGORICAL_STAT_TYPES = frozenset({"VARCHAR", "BOOLEAN"})
 
+# Which mini-distribution a column earns: the same two words the served
+# models discriminate on (_contract.NumericColumnStats.kind /
+# CategoricalColumnStats.kind), so the two dispatches below are checked
+# against the closed set rather than against a bare string.
+_StatKind = Literal["numeric", "categorical"]
 
-def _stat_kind(duckdb_type: str) -> str | None:
+
+def _stat_kind(duckdb_type: str) -> _StatKind | None:
     """ "numeric"/"categorical" for distributable column types, else ``None``
     (timestamps, JSON blobs, and nested types have no mini-distribution)."""
     normalized_type = duckdb_type.upper()
@@ -705,8 +711,19 @@ NANOSECONDS_PER_SECOND = 1_000_000_000
 # episode with intervals carries its own axis; an episode without them can
 # still have a length if some check measured one. A measurement key naming a
 # duration supplies that length: the token after the key's last '_' picks the
-# unit, and a duration key with no recognized unit suffix (``episode_duration``)
-# is read as SECONDS -- the convention every hflow example follows.
+# unit, and a duration key with NO recognized suffix at all
+# (``episode_duration``) is read as SECONDS -- the convention every hflow
+# example follows.
+#
+# The two tables below are one fact split in two, and neither may be read
+# alone: _UNIT_BY_KEY_SUFFIX owns which suffixes name a dimension at all (and
+# what to call it), _NANOSECONDS_PER_DURATION_UNIT owns which of those
+# dimensions are TIMES and how long one is. Every key of the second is a key
+# of the first. A suffix the first knows and the second does not is a
+# NON-time dimension (hz, pct, count, bytes, deg), so a key like
+# ``duty_cycle_duration_pct`` measures no length -- reading it as seconds
+# would both contradict the "45 %" its own bar is labelled with and stretch
+# the episode's axis by 1e9.
 _DURATION_KEY_TOKEN = "duration"
 _NANOSECONDS_PER_DURATION_UNIT: dict[str, float] = {
     "ns": 1.0,
@@ -738,6 +755,7 @@ _UNIT_BY_KEY_SUFFIX: dict[str, str] = {
     "seconds": "s",
     "min": "min",
     "mins": "min",
+    "minute": "min",
     "minutes": "min",
     "hz": "Hz",
     "pct": "%",
@@ -764,13 +782,22 @@ def _measurement_key_suffix(key: str) -> str:
 
 
 def _duration_nanoseconds(key: str, value: float) -> float | None:
-    """A duration-naming measurement converted to nanoseconds, if it is one."""
+    """A duration-naming measurement converted to nanoseconds, if it is one.
+
+    ``None`` for anything that is not a length, INCLUDING a key that says
+    "duration" but carries a suffix naming another dimension (see the note
+    above the tables): a measurement the bars label "45 %" must not also
+    claim the episode ran for 45 seconds.
+    """
     if _DURATION_KEY_TOKEN not in key.lower() or not math.isfinite(value) or value <= 0:
         return None
-    unit_scale = _NANOSECONDS_PER_DURATION_UNIT.get(
-        _measurement_key_suffix(key), _DEFAULT_DURATION_UNIT_NANOSECONDS
-    )
-    return value * unit_scale
+    key_suffix = _measurement_key_suffix(key)
+    unit_scale = _NANOSECONDS_PER_DURATION_UNIT.get(key_suffix)
+    if unit_scale is not None:
+        return value * unit_scale
+    if key_suffix in _UNIT_BY_KEY_SUFFIX:
+        return None
+    return value * _DEFAULT_DURATION_UNIT_NANOSECONDS
 
 
 def _interval_kind(label: str | None, check_name: str | None) -> str:

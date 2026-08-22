@@ -76,6 +76,17 @@ class AirflowHealth:
         return ", ".join(parts)
 
 
+def _dag_run_path(dag_id: str, dag_run_id: str) -> str:
+    """The one owner of run-id-to-URL encoding: every per-run endpoint uses it.
+
+    Run ids carry ':' and '+' (manual__2026-08-22T03:06:55+00:00), and a
+    caller-supplied idempotency id may carry '#' or '?' -- which urllib reads
+    as a fragment or a query and silently drops from the path, so two calls
+    with the same id would address two different runs.
+    """
+    return f"/api/v2/dags/{dag_id}/dagRuns/{urllib.parse.quote(dag_run_id, safe='')}"
+
+
 class AirflowClient:
     """Minimal typed client for the deployment endpoints the SDK needs.
 
@@ -263,7 +274,7 @@ class AirflowClient:
         return self._authenticated("GET", f"/api/v2/dags/{dag_id}")
 
     def dag_run(self, dag_id: str, dag_run_id: str) -> dict[str, Any]:
-        return self._authenticated("GET", f"/api/v2/dags/{dag_id}/dagRuns/{dag_run_id}")
+        return self._authenticated("GET", _dag_run_path(dag_id, dag_run_id))
 
     def dag_runs(
         self, dag_id: str, *, limit: int = 100, order_by: str | None = None
@@ -289,12 +300,7 @@ class AirflowClient:
         HFlow's: this is a thin pass-through so a UI can colour the task graph
         :func:`hflow.runtime.ingest_dag_topology` describes.
         """
-        # Run ids carry ':' and '+' (manual__2026-08-22T03:06:55+00:00), which
-        # must not reach the path unescaped.
-        encoded_run_id = urllib.parse.quote(dag_run_id, safe="")
-        response = self._authenticated(
-            "GET", f"/api/v2/dags/{dag_id}/dagRuns/{encoded_run_id}/taskInstances"
-        )
+        response = self._authenticated("GET", f"{_dag_run_path(dag_id, dag_run_id)}/taskInstances")
         task_instances = response.get("task_instances")
         return task_instances if isinstance(task_instances, list) else []
 
@@ -325,8 +331,15 @@ class AirflowClient:
 
         This method owns the trigger conf's shape: every caller -- the CLI,
         the workspace UI, a control plane -- goes through it rather than
-        rebuilding the dict.
+        rebuilding the dict. Owning the shape includes refusing a value the
+        run cannot honour: ``batch_count`` below 1 raises here rather than
+        reaching the sub-DAG's ``plan`` task, which would fail the run after
+        it exists and leave it in the operator's history.
         """
+        if batch_count is not None and batch_count < 1:
+            # Same wording as hflow.batching.plan_batches, the task-side owner
+            # of this invariant, so both entry points say the same thing.
+            raise ValueError(f"batch_count must be >= 1, got {batch_count}")
         conf: dict[str, Any] = {
             "uris": uris,
             "profile": profile,

@@ -1287,7 +1287,13 @@ def import_pipeline_application(pipeline_spec: str) -> "App":
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
-    except Exception as error:
+    except (Exception, SystemExit) as error:
+        # SystemExit is a BaseException: a pipeline that guards its config at
+        # import time (sys.exit("set ROBOT_FLEET"), or a module-scope argparse)
+        # would otherwise walk past `except Exception` and take the calling
+        # program's exit status with it -- killing a long-lived UI server at
+        # startup. KeyboardInterrupt stays uncaught on purpose: that one
+        # belongs to whoever pressed it, not to the pipeline file.
         raise ValueError(f"importing {pipeline_file} failed: {error}") from error
     application = getattr(module, app_variable, None)
     if not isinstance(application, App):

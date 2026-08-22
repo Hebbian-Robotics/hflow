@@ -17,12 +17,14 @@ def populated_workspace(tmp_path_factory: pytest.TempPathFactory) -> PopulatedWo
 
 @pytest.fixture(scope="session")
 def unbuilt_assets_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """An empty assets directory, pinned explicitly.
+    """An empty assets directory, for the clients that assert on served pages.
 
     The packaged default (hflow_ui/static/) holds the built SPA on a machine
-    that has run the frontend build, and nothing on one that has not -- so
-    every fixture pins assets_dir to keep placeholder assertions independent
-    of local build state.
+    that has run the frontend build, and nothing on one that has not, so any
+    test that asserts on a served PAGE pins assets_dir -- every client fixture
+    below does, through this fixture. A client built inline inside an API test
+    needs no pin: it only ever requests /api paths, which never consult the
+    assets directory.
     """
     return tmp_path_factory.mktemp("ui-no-assets")
 

@@ -47,12 +47,16 @@ from hflow_ui._contract import (
     SavedQueryEntry,
     SavedQueryListResponse,
 )
-from hflow_ui._settings import UiSettings
+from hflow_ui._settings import UiSettings, refuse_when_read_only
 
 MANIFESTS_DIRECTORY_NAME = "manifests"
 
-# The views hflow.open_catalog_connection registers, in browsing order.
-CATALOG_TABLE_NAMES = (
+# BROWSING ORDER only, never membership: which relations exist is
+# hflow.open_catalog_connection's fact, read live off information_schema (see
+# _browsable_relations), so a view the SDK adds or renames shows up here
+# instead of 404ing from the summary route or 500ing on a DESCRIBE. A
+# relation missing from this tuple simply sorts after the familiar ones.
+CATALOG_TABLE_BROWSING_ORDER = (
     "episodes",
     "episodes_latest",
     "episodes_raw",
@@ -64,6 +68,10 @@ CATALOG_TABLE_NAMES = (
 )
 
 _TIMESTAMPTZ_TYPE = "TIMESTAMP WITH TIME ZONE"
+
+# What a read-only launch refuses on this router; the sentence around it (and
+# the 403) belongs to _settings.refuse_when_read_only.
+_STUDIO_WRITE_ACTIONS = "pinning manifests and editing saved queries are"
 
 # Upper bounds on everything that can be persisted into the sidecar (which is
 # fully re-read and re-serialized on every list request): a name, a
@@ -169,6 +177,38 @@ def _sidecar_refusal(error: _sidecar.SidecarError) -> HTTPException:
     return HTTPException(status_code=error.status_code, detail=error.detail)
 
 
+def _browsable_relations(
+    connection: duckdb.DuckDBPyConnection,
+) -> dict[str, CatalogTableKind]:
+    """Every relation this catalog connection registered, in browsing order.
+
+    ``hflow.open_catalog_connection`` owns WHICH relations exist;
+    ``information_schema`` is that fact as the live connection reports it, so
+    this endpoint and the summary route below both derive membership from the
+    connection they already hold rather than from a second list here.
+    """
+    kind_rows = connection.execute(
+        "SELECT table_name, table_type FROM information_schema.tables"
+    ).fetchall()
+    kind_by_name: dict[str, CatalogTableKind] = {
+        str(table_name): ("view" if str(table_type).upper() == "VIEW" else "table")
+        for table_name, table_type in kind_rows
+    }
+    unfamiliar_position = len(CATALOG_TABLE_BROWSING_ORDER)
+    return {
+        name: kind_by_name[name]
+        for name in sorted(
+            kind_by_name,
+            key=lambda name: (
+                CATALOG_TABLE_BROWSING_ORDER.index(name)
+                if name in CATALOG_TABLE_BROWSING_ORDER
+                else unfamiliar_position,
+                name,
+            ),
+        )
+    }
+
+
 def _described_columns(
     connection: duckdb.DuckDBPyConnection, user_sql: str
 ) -> list[ColumnDescriptor]:
@@ -228,6 +268,10 @@ def run_preview(
         row_count=row_count,
         truncated=row_count > len(rows),
         column_stats=column_stats,
+        # The LOGICAL wrapper, deliberately without select_head's REPLACE: the
+        # timestamp rendering is how these rows are transported, not part of
+        # the query a user wrote, so what is served stays copy-pastable -- the
+        # same split (and the same wording) _catalog's episode listing makes.
         sql=f"SELECT * FROM ({user_sql}) LIMIT {limit}",
     )
 
@@ -265,14 +309,6 @@ def create_curation_router(settings: UiSettings) -> APIRouter:
     # process-wide lock serializes the whole load->modify->store of every
     # mutating route -- sufficient for the single-server design.
     sidecar_write_lock = threading.Lock()
-
-    def refuse_when_read_only() -> None:
-        if settings.read_only:
-            raise HTTPException(
-                status_code=403,
-                detail="this workspace UI is running read-only; "
-                "pinning manifests and editing saved queries are disabled",
-            )
 
     def loaded_sidecar_state() -> _sidecar.SidecarState:
         try:
@@ -317,7 +353,7 @@ def create_curation_router(settings: UiSettings) -> APIRouter:
 
     @router.post("/curation/pin")
     def pin_manifest(request: PinRequest) -> PinnedManifestEntry:
-        refuse_when_read_only()
+        refuse_when_read_only(settings, disabled_actions=_STUDIO_WRITE_ACTIONS)
         user_sql = _stripped_sql_or_refuse(request.sql)
         _reject_non_single_select(user_sql)
         manifest_slug = slugified_manifest_name(request.name)
@@ -391,7 +427,7 @@ def create_curation_router(settings: UiSettings) -> APIRouter:
                 str(manifest_file), data_root=settings.data_root
             )
         except _media.MediaResolutionError as error:
-            raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+            raise _media.media_refusal(error) from error
         return _media.served_file_response(
             resolved_file, attachment_filename=Path(entry.manifest_path).name
         )
@@ -403,7 +439,7 @@ def create_curation_router(settings: UiSettings) -> APIRouter:
 
     @router.post("/queries")
     def create_saved_query(request: SavedQueryCreateRequest) -> SavedQueryEntry:
-        refuse_when_read_only()
+        refuse_when_read_only(settings, disabled_actions=_STUDIO_WRITE_ACTIONS)
         query_name = request.name.strip()
         if not query_name:
             raise HTTPException(status_code=400, detail="name must be non-empty")
@@ -430,7 +466,7 @@ def create_curation_router(settings: UiSettings) -> APIRouter:
 
     @router.put("/queries/{query_id}")
     def update_saved_query(query_id: str, request: SavedQueryUpdateRequest) -> SavedQueryEntry:
-        refuse_when_read_only()
+        refuse_when_read_only(settings, disabled_actions=_STUDIO_WRITE_ACTIONS)
         with sidecar_write_lock:
             state = loaded_sidecar_state()
             existing = next(
@@ -462,7 +498,7 @@ def create_curation_router(settings: UiSettings) -> APIRouter:
 
     @router.delete("/queries/{query_id}", status_code=204)
     def delete_saved_query(query_id: str) -> Response:
-        refuse_when_read_only()
+        refuse_when_read_only(settings, disabled_actions=_STUDIO_WRITE_ACTIONS)
         with sidecar_write_lock:
             state = loaded_sidecar_state()
             if all(entry.query_id != query_id for entry in state.saved_queries):
@@ -480,18 +516,11 @@ def create_curation_router(settings: UiSettings) -> APIRouter:
     @router.get("/catalog/tables")
     def list_catalog_tables() -> CatalogTablesResponse:
         with _connections.opened_workspace_connection_or_refuse(settings.data_root) as connection:
-            kind_rows = connection.execute(
-                "SELECT table_name, table_type FROM information_schema.tables"
-            ).fetchall()
-            kind_by_name: dict[str, CatalogTableKind] = {
-                str(table_name): ("view" if str(table_type).upper() == "VIEW" else "table")
-                for table_name, table_type in kind_rows
-            }
             return CatalogTablesResponse(
                 tables=[
                     CatalogTableDescription(
                         name=table_name,
-                        kind=kind_by_name.get(table_name, "view"),
+                        kind=kind,
                         columns=[
                             ColumnDescriptor(name=str(row[0]), type=str(row[1]))
                             for row in connection.execute(
@@ -499,22 +528,24 @@ def create_curation_router(settings: UiSettings) -> APIRouter:
                             ).fetchall()
                         ],
                     )
-                    for table_name in CATALOG_TABLE_NAMES
+                    for table_name, kind in _browsable_relations(connection).items()
                 ]
             )
 
     @router.get("/catalog/tables/{table_name}/summary")
     def read_catalog_table_summary(table_name: str) -> CatalogTableSummaryResponse:
-        # Identifier-validated against the fixed table list: anything else --
-        # including SQL-shaped names -- is simply an unknown table.
-        if table_name not in CATALOG_TABLE_NAMES:
-            raise HTTPException(
-                status_code=404,
-                detail=f"unknown catalog table {table_name!r}; "
-                f"one of: {', '.join(CATALOG_TABLE_NAMES)}",
-            )
-        quoted_table = _catalog.quoted_identifier(table_name)
         with _connections.opened_workspace_connection_or_refuse(settings.data_root) as connection:
+            # Identifier-validated against the relations this connection
+            # actually registered: anything else -- including SQL-shaped names
+            # -- is simply an unknown table, and nothing unvalidated ever
+            # reaches the interpolations below.
+            browsable = _browsable_relations(connection)
+            if table_name not in browsable:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"unknown catalog table {table_name!r}; one of: {', '.join(browsable)}",
+                )
+            quoted_table = _catalog.quoted_identifier(table_name)
             count_row = connection.execute(f"SELECT count(*) FROM {quoted_table}").fetchone()
             return CatalogTableSummaryResponse(
                 row_count=int(count_row[0]) if count_row is not None else 0,

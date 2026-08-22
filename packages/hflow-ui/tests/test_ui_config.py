@@ -38,6 +38,7 @@ def test_config_reports_local_mode_and_capabilities(
     assert payload["capabilities"] == {
         "catalog": True,
         "media": True,
+        "curation": True,  # a local data root: the studio's writes can land
         "runtime": False,  # no bundle rendered and no HFLOW_AIRFLOW_URL exported
         "pipeline": False,  # no --pipeline configured
     }

@@ -2,18 +2,24 @@
 
 The API is the product surface -- the shipped SPA is only its reference
 client, and third parties (increasingly coding agents) build against the
-schema at ``/api/docs``. So every route declares a model from this module as
-its response type instead of hand-building a dict: the model is the ONE owner
-of that payload's field names and types, and the generated OpenAPI describes
-what actually goes over the wire.
+schema at ``/api/openapi.json`` (the schema JSON is the whole published docs
+surface -- FastAPI's Swagger page is disabled because it loads from a CDN).
+So every route declares a model from this module as its response type instead
+of hand-building a dict: the model is the ONE owner of that payload's field
+names and types, and the generated OpenAPI describes what actually goes over
+the wire.
 
-Three shapes stay deliberately open, each because another module owns it and
+Four shapes stay deliberately open, each because another module owns it and
 a mirror here could only drift:
 
 - rows of the wide ``episodes`` view and of a user's own SELECT -- their
   columns ARE data, described alongside the rows by :class:`ColumnDescriptor`;
 - DuckDB ``SUMMARIZE`` rows, whose key set varies by DuckDB version;
-- the pipeline manifest, owned and version-stamped by ``hflow.manifest``.
+- the pipeline manifest, owned and version-stamped by ``hflow.manifest``;
+- a dag run's ``conf`` (:class:`RuntimeRunSummary`), which is whatever the
+  trigger sent -- ``hflow.runtime.AirflowClient.ingest`` owns the shape of
+  the ones this API mints, but a run started from Airflow's own UI can carry
+  anything, so no model here could describe it honestly.
 
 Nullability follows the catalog's DDL (``hflow.catalog.TABLE_COLUMN_DDL``),
 which declares no NOT NULL: a field a stored row could carry as NULL is typed
@@ -21,20 +27,29 @@ nullable, so odd data is served honestly instead of turning into a 500 from
 response validation.
 
 Two of these models are also the sidecar's ON-DISK shape
-(:class:`SavedQueryEntry`, :class:`PinnedManifestEntry`): ``_sidecar`` stores
+(:class:`SavedQueryEntry`, :class:`PinnedManifestEntry`) -- and so is
+everything they nest (:class:`CheckCoverageEntry`): ``_sidecar`` stores
 exactly what the API serves, so the registry a user can read with ``jq`` and
-the payload the API returns can never disagree. Changing either therefore
-changes the stored format, which ``_sidecar.STATE_VERSION`` guards.
+the payload the API returns can never disagree. Changing any of them
+therefore changes the stored format, which ``_sidecar.STATE_VERSION`` guards.
 """
 
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from hflow.manifest import StepManifest
+from hflow.manifest import StepKind, StepManifest
+from hflow.steps import Stage
 
 # --- shared vocabularies -----------------------------------------------------
 
+# Vocabularies the SDK already owns as closed enums (``hflow.steps.Stage``,
+# ``hflow.manifest.StepKind``) are annotated with the enum itself rather than
+# restated as a Literal: pydantic serializes a StrEnum to its value, so the
+# wire bytes are unchanged while the schema publishes the closed set and the
+# adapters below stop unwrapping with ``.value``. The aliases here are for
+# vocabularies no module owns as a type.
+#
 # hflow.curation owns the canonical ok/quarantined rule in SQL (the wide
 # ``episodes`` view's ``CASE WHEN quarantined THEN 'quarantined' ELSE 'ok'
 # END``). This alias is the UI's one restatement of that vocabulary: the
@@ -52,7 +67,8 @@ ListingOrder = Literal["asc", "desc"]
 RuntimeSource = Literal["bundle", "remote"]
 
 # How a stage sub-DAG run was attributed to a master run. "heuristic" is the
-# only honest answer available (see _graph._matched_stage_run).
+# only honest answer available: Airflow stores no parent-run link, so the
+# attribution is by time window alone (see _graph._matched_stage_run).
 StageRunMatch = Literal["heuristic"]
 
 # Which cheap-first tier a registered step runs in (hflow.App._ordered_checks).
@@ -94,6 +110,12 @@ class WorkspaceCapabilities(BaseModel):
 
     catalog: bool
     media: bool
+    curation: bool = Field(
+        description="Whether the curation studio's durable state can be written at "
+        "all: saved queries, the pinned-manifest registry, and the manifest files "
+        "need a LOCAL data root, so a bucket-backed workspace answers 501 for every "
+        "one of them and the frontend should not offer them."
+    )
     runtime: bool
     pipeline: bool
 
@@ -333,11 +355,20 @@ class CurationPreviewResponse(BaseModel):
         "null_percentage, ...). DuckDB owns that shape and varies it by version, "
         "so it is served as-is. Null unless the request asked for stats."
     )
-    sql: str = Field(description="The wrapped SELECT the server actually ran.")
+    sql: str = Field(
+        description="The logical wrapped SELECT, copy-pastable as-is. The executed "
+        "statement adds a '* REPLACE (...)' projection rendering TIMESTAMPTZ columns "
+        "as UTC ISO text (the locked connection cannot SET TimeZone), which is a "
+        "rendering detail of these rows rather than part of the query a user wrote."
+    )
 
 
 class CheckCoverageEntry(BaseModel):
-    """One check's coverage denominator over the WHOLE catalog, not the cut."""
+    """One check's coverage denominator over the WHOLE catalog, not the cut.
+
+    Also the sidecar's stored shape, nested inside every stored manifest
+    entry's ``coverage`` (see the module note).
+    """
 
     check_name: str
     episodes_ran: int
@@ -449,8 +480,16 @@ class RuntimeStatusResponse(BaseModel):
     source: RuntimeSource | None = None
     airflow_web_url: str | None = Field(
         default=None,
-        description="Deep-link base for the Airflow web UI. Only a local bundle records "
-        "its own address; a remote endpoint's is unknown, never guessed.",
+        description="Deep-link base for the Airflow web UI, AS ADDRESSED FROM THE "
+        "WORKSPACE HOST. Only a local bundle records its own address; a remote "
+        "endpoint's is unknown, never guessed.",
+    )
+    airflow_web_url_host_only: bool = Field(
+        default=False,
+        description="True when airflow_web_url is a loopback address, so it resolves "
+        "only on the workspace host: a browser on another machine cannot follow it, "
+        "and the runtime is reachable there only through a tunnel or a wider "
+        "`hflow up --api-bind-host`.",
     )
     dag_id: str | None = None
     registered: bool | None = Field(
@@ -484,7 +523,7 @@ class StageRunSummary(BaseModel):
 class StageRecentRuns(BaseModel):
     """One stage's most recent runs. NOT correlated with any master run."""
 
-    stage: str
+    stage: Stage
     dag_id: str
     recent: list[StageRunSummary]
 
@@ -511,7 +550,7 @@ class PipelineStepManifest(BaseModel):
     """One registered step, exactly as ``hflow.manifest.StepManifest`` renders it."""
 
     name: str
-    kind: str
+    kind: StepKind
     version: str = Field(description="Content hash of the live function.")
     critical: bool
     requires: list[str]
@@ -521,7 +560,7 @@ class PipelineStepManifest(BaseModel):
     def from_step_manifest(cls, step: StepManifest) -> "PipelineStepManifest":
         return cls(
             name=step.name,
-            kind=step.kind.value,
+            kind=step.kind,
             version=step.version,
             critical=step.critical,
             requires=list(step.requires),
@@ -532,12 +571,16 @@ class PipelineStepManifest(BaseModel):
 class PipelineStageLane(BaseModel):
     """One ingest-stage lane of the pipeline page."""
 
-    stage: str
+    stage: Stage
     engine_owned: bool = Field(
         description="True for lanes whose work is engine builtins (sync, media) "
         "rather than user-registered steps."
     )
-    steps: list[PipelineStepManifest]
+    steps: list[PipelineStepManifest] = Field(
+        description="The lane's registered steps in EXECUTION order (cheap tier "
+        "first), the same order and the same steps /pipeline/graph serves as "
+        "'user_steps' -- only the tier field differs."
+    )
 
 
 class ObservedCheckVersion(BaseModel):
@@ -619,8 +662,8 @@ class QuarantineGate(BaseModel):
     """The one real cross-step edge, served as its own object rather than as
     an edge in either graph."""
 
-    from_stage: str
-    to_stages: list[str]
+    from_stage: Stage
+    to_stages: list[Stage]
     critical_step_names: list[str]
     explanation: str
 
@@ -628,7 +671,7 @@ class QuarantineGate(BaseModel):
 class PipelineGraphStage(BaseModel):
     """One stage lane of the pipeline graph: its DAG plus what runs inside it."""
 
-    stage: str
+    stage: Stage
     title: str
     description: str
     gate_task_id: str
@@ -703,14 +746,16 @@ class RunGraphStage(BaseModel):
     """One stage's live state for this master run, or explicit nulls when the
     stage never ran for it."""
 
-    stage: str
+    stage: Stage
     dag_id: str
     dag_run_id: str | None
     state: str | None
     match: StageRunMatch | None = Field(
         description="How this stage run was attributed to the master run. Airflow "
-        "stores no parent-run link, so the only honest answer is 'heuristic' "
-        "(matched by start time) or null (nothing matched)."
+        "stores no parent-run link, so the only honest answer is 'heuristic' -- the "
+        "earliest stage run started inside this master run's own window -- or null "
+        "(nothing matched). Two master runs OVERLAPPING in time can still be "
+        "attributed the same stage run."
     )
     tasks: list[RunTaskInstance]
     mapped_summary: MappedFanOutSummary | None

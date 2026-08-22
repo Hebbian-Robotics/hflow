@@ -2,20 +2,29 @@
 
 The workspace UI is a local web app over one data root: browse episodes and
 their quality evidence, run curation SQL with instant previews, pin
-manifests, monitor ingest runs, and inspect the registered pipeline. It is
-read-only toward your corpus by default-posture design: the only things it
-ever writes are the manifests you pin and its own small state file.
+manifests, monitor and trigger ingest runs, and inspect the registered
+pipeline. The server never rewrites or deletes an episode -- the only files
+it writes are the manifests you pin and its own small state file. It can
+trigger an ingest run, though, which the runtime then writes through the
+normal pipeline; `--read-only` refuses that along with the other writes.
+
+The UI ships as a separate package, `hflow-ui`, on purpose: pipeline workers
+install the `hflow` wheel into every task venv, and they should never carry
+frontend assets. **It is not published to PyPI yet** -- until the first
+release, run it from a clone (this also builds the frontend bundle, which the
+published wheel will carry):
 
 ```bash
-uv add hflow-ui
-hflow ui                       # browses $HFLOW_DATA_ROOT, else ./data
-hflow ui --data-root ./data --no-browser
+git clone https://github.com/Hebbian-Robotics/hflow.git
+cd hflow
+uv sync --all-extras                      # installs hflow and hflow-ui
+(cd ui && pnpm install && pnpm build)     # the frontend bundle
+HFLOW_UI_ASSETS=ui/dist uv run hflow ui   # browses $HFLOW_DATA_ROOT, else ./data
+HFLOW_UI_ASSETS=ui/dist uv run hflow ui --data-root ./data --no-browser
 ```
 
 Starting the server prints a one-time login URL
-(`http://127.0.0.1:4356/?token=...`) and opens your browser. The UI ships as
-a separate package on purpose: pipeline workers install the `hflow` wheel
-into every task venv, and they should never carry frontend assets.
+(`http://127.0.0.1:4356/?token=...`) and opens your browser.
 
 ## What it shows
 
@@ -58,24 +67,33 @@ into every task venv, and they should never carry frontend assets.
 
 ## Nothing is UI-only
 
-The UI is a strict client of a documented JSON API (`/api/v1/...`; interactive
-schema at `/api/docs` on a running server), and each endpoint is a thin call
-into the same library functions the CLI uses -- so everything the UI can show
-or do is reachable with `curl`, scriptable, and buildable-upon. If you want a
-different frontend over your workspace, the API is the contract; the shipped
-UI is the reference client.
+The UI is a strict client of a documented JSON API (`/api/v1/...`; a running
+server publishes its OpenAPI schema at `/api/openapi.json`, ready for a client
+generator or any local OpenAPI viewer). Curation, the runs monitor and the
+pipeline page are thin calls into the same library functions the CLI uses; the
+episode listing, facets, stats and timeline endpoints compile their own
+presentation-shaped SQL over the same [catalog views](./CATALOG.md) that
+`hflow curate` reads. Either way, everything the UI can show or do is
+reachable with `curl`, scriptable, and buildable-upon. If you want a different
+frontend over your workspace, the API is the contract; the shipped UI is the
+reference client.
 
 ## Trust posture
 
 The UI runs fully local: all assets ship in the wheel (no CDN, no fonts, no
-outbound requests), and your data never leaves your machine. The server binds
-loopback with a random per-session token; the browser never sees filesystem
-paths of its choosing (media is addressed by episode and artifact name, and
-the server refuses anything outside the data root), Airflow credentials stay
-server-side behind a proxy, and curation SQL runs on a
+outbound requests), and your data never leaves your machine. That is why the
+server publishes the schema JSON and no interactive Swagger page -- FastAPI's
+built-in one fetches its JavaScript and CSS from a public CDN, which would
+break the promise and run third-party script inside your logged-in session.
+The server binds loopback with a random per-session token; the browser never
+sees filesystem paths of its choosing (media is addressed by episode and
+artifact name, and the server refuses anything outside the data root), Airflow
+credentials stay server-side behind a proxy, and curation SQL runs on a
 [constrained DuckDB connection](./CATALOG.md) that cannot reach the catalog's
-files or the network. State on disk: `<data_root>/ui/state.json` (saved
-queries and the manifest registry) and your pinned manifests -- nothing else.
+files or the network. What this server writes: `<data_root>/ui/state.json`
+(saved queries and the manifest registry) and your pinned manifests -- nothing
+else. Episodes, media and catalog rows are written by the ingest runtime, on
+runs you trigger from the Runs page.
 
 ## See also
 

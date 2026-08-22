@@ -91,6 +91,10 @@ def test_status_reports_a_healthy_bundle_runtime(
         "detail": None,
         "source": "bundle",
         "airflow_web_url": "http://127.0.0.1:8080",
+        # A rendered bundle binds its api-server to loopback, so the address
+        # is only followable on the workspace host -- a browser elsewhere
+        # would aim it at its own machine.
+        "airflow_web_url_host_only": True,
         "dag_id": "demo_pipeline_ingest",
         "registered": True,
         "health": {
@@ -444,3 +448,34 @@ def test_ingest_maps_airflow_errors_to_502(
     )
     assert response.status_code == 502
     assert "scheduler down" in response.json()["detail"]
+
+
+def test_loopback_classification_marks_only_host_local_addresses() -> None:
+    """The Runs page needs to know when a deep link cannot be followed.
+
+    A viewer on another machine reads http://127.0.0.1:8080 as their OWN
+    laptop, so the payload states whether the address is host-local rather
+    than leaving the browser to guess.
+    """
+    from hflow_ui._runtime import is_loopback_web_url
+
+    assert is_loopback_web_url("http://127.0.0.1:8080") is True
+    assert is_loopback_web_url("http://localhost:8080") is True
+    assert is_loopback_web_url("http://[::1]:8080") is True
+    assert is_loopback_web_url("http://100.104.216.28:8080") is False
+    assert is_loopback_web_url("https://airflow.example.com") is False
+    assert is_loopback_web_url(None) is False
+
+
+def test_an_unreachable_bundle_names_the_workspace_host_as_the_caller(
+    bundle_api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failure text must not read as the viewer's own machine failing."""
+
+    def refuse(self: AirflowClient) -> None:
+        raise AirflowClientError("GET http://127.0.0.1:8080/api/v2/monitor/health unreachable")
+
+    monkeypatch.setattr(AirflowClient, "health", refuse)
+    payload = bundle_api.get("/api/v1/runtime/status").json()
+    assert payload["available"] is False
+    assert "the workspace host could not reach its own ingest runtime" in payload["detail"]

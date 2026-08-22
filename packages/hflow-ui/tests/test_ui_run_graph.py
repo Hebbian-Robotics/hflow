@@ -20,6 +20,7 @@ PIPELINE_SOURCE = "import hflow\n\napp = hflow.App('demo', data_root='/opt/airfl
 MASTER_DAG_ID = "demo_pipeline_ingest"
 MASTER_RUN_ID = "manual__2026-08-21T10:00:00+00:00"
 MASTER_STARTED_AT = "2026-08-21T10:00:00+00:00"
+YESTERDAYS_MASTER_RUN_ID = "manual__2026-08-20T09:00:00+00:00"
 
 
 @pytest.fixture()
@@ -292,6 +293,120 @@ def test_run_graph_without_a_master_start_matches_no_stage_run(
     payload = bundle_api.get(f"/api/v1/runtime/runs/{MASTER_RUN_ID}/graph").json()
     assert payload["master"]["state"] == "queued"
     assert all(stage["dag_run_id"] is None for stage in payload["stages"])
+
+
+def test_an_ended_master_run_never_adopts_a_later_unrelated_stage_run(
+    bundle_api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two ingests over one lane: each run shows the stage runs it triggered.
+
+    The stage lanes only look back a fixed number of runs, so an unbounded
+    "started at/after the master" filter matched every candidate for any
+    master run that was not the latest -- and keeping the newest handed an old
+    run today's unrelated stage run, labelled as an attribution.
+    """
+    master_runs = {
+        YESTERDAYS_MASTER_RUN_ID: {
+            "dag_run_id": YESTERDAYS_MASTER_RUN_ID,
+            "state": "success",
+            "start_date": "2026-08-20T09:00:00+00:00",
+            "end_date": "2026-08-20T09:04:00+00:00",
+        },
+        MASTER_RUN_ID: {
+            "dag_run_id": MASTER_RUN_ID,
+            "state": "running",
+            "start_date": MASTER_STARTED_AT,
+            "end_date": None,
+        },
+    }
+    # Newest first, exactly as the runs are fetched (order_by="-id").
+    interleaved_stage_runs = {
+        "demo_pipeline_sync": [
+            {
+                "dag_run_id": "sync__today",
+                "state": "running",
+                "start_date": "2026-08-21T10:00:05+00:00",
+            },
+            {
+                "dag_run_id": "sync__yesterday",
+                "state": "success",
+                "start_date": "2026-08-20T09:00:05+00:00",
+            },
+        ],
+        # Today's ingest reached meta; yesterday's never did.
+        "demo_pipeline_meta": [
+            {
+                "dag_run_id": "meta__today",
+                "state": "running",
+                "start_date": "2026-08-21T10:02:00+00:00",
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        AirflowClient, "dag_run", lambda self, dag_id, dag_run_id: dict(master_runs[dag_run_id])
+    )
+    monkeypatch.setattr(
+        AirflowClient,
+        "dag_runs",
+        lambda self, dag_id, *, limit=100, order_by=None: list(
+            interleaved_stage_runs.get(dag_id, [])
+        ),
+    )
+    monkeypatch.setattr(AirflowClient, "task_instances", lambda self, dag_id, dag_run_id: [])
+
+    yesterday = {
+        stage["stage"]: stage
+        for stage in bundle_api.get(
+            f"/api/v1/runtime/runs/{YESTERDAYS_MASTER_RUN_ID}/graph"
+        ).json()["stages"]
+    }
+    assert yesterday["sync"]["dag_run_id"] == "sync__yesterday"
+    assert yesterday["sync"]["state"] == "success"
+    assert yesterday["sync"]["match"] == "heuristic"
+    # Nothing ran in that master run's window, so the lane stays empty rather
+    # than borrowing today's still-running one.
+    assert yesterday["meta"]["dag_run_id"] is None
+    assert yesterday["meta"]["match"] is None
+
+    today = {
+        stage["stage"]: stage
+        for stage in bundle_api.get(f"/api/v1/runtime/runs/{MASTER_RUN_ID}/graph").json()["stages"]
+    }
+    assert today["sync"]["dag_run_id"] == "sync__today"
+    assert today["meta"]["dag_run_id"] == "meta__today"
+
+
+def test_a_stage_run_starting_just_after_the_master_ended_still_matches(
+    bundle_api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A master that dies right after firing a trigger keeps its stage run.
+
+    The two timestamps come from different components, and a failing master
+    can end before the run it just caused appears, so the window carries a
+    grace period rather than a hard edge.
+    """
+    _stubbed_airflow(
+        monkeypatch,
+        master_run={
+            "dag_run_id": MASTER_RUN_ID,
+            "state": "failed",
+            "start_date": MASTER_STARTED_AT,
+            "end_date": "2026-08-21T10:00:04+00:00",
+        },
+        stage_runs={
+            "demo_pipeline_sync": [
+                {
+                    "dag_run_id": "sync__just_after",
+                    "state": "running",
+                    "start_date": "2026-08-21T10:00:06+00:00",
+                }
+            ]
+        },
+        task_instances={},
+    )
+    payload = bundle_api.get(f"/api/v1/runtime/runs/{MASTER_RUN_ID}/graph").json()
+    sync_stage = next(stage for stage in payload["stages"] if stage["stage"] == "sync")
+    assert sync_stage["dag_run_id"] == "sync__just_after"
 
 
 def test_run_graph_tolerates_unregistered_stage_sub_dags(

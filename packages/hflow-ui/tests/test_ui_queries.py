@@ -1,5 +1,7 @@
 """/api/v1/queries: saved-query CRUD over the sidecar state."""
 
+from collections.abc import Iterator
+
 from fastapi.testclient import TestClient
 from hflow_ui import UiSettings, create_app
 from ui_test_fixtures import PopulatedWorkspace
@@ -78,11 +80,55 @@ def test_create_refuses_oversized_name_and_sql(writable_api: TestClient) -> None
     assert over_long_sql.status_code == 422
 
 
+def _oversized_query_body() -> dict[str, str]:
+    """A body far larger than the request cap, and than any per-field cap."""
+    return {"name": "ok", "sql": "SELECT 1 -- " + "A" * (5 * 1024 * 1024)}
+
+
 def test_oversized_request_body_is_refused_at_the_boundary(writable_api: TestClient) -> None:
-    # A body far larger than any per-field cap is refused (413) before it is
-    # parsed or persisted.
-    huge_body = {"name": "ok", "sql": "SELECT 1 -- " + "A" * (5 * 1024 * 1024)}
-    response = writable_api.post("/api/v1/queries", json=huge_body)
+    # Refused before the body is parsed or persisted, not by a per-field cap.
+    response = writable_api.post("/api/v1/queries", json=_oversized_query_body())
+    assert response.status_code == 413
+
+
+def test_the_body_cap_holds_without_a_declared_content_length(writable_api: TestClient) -> None:
+    """A streamed request declares no length; the cap cannot trust the claim.
+
+    A chunked POST sends no Content-Length at all, so a cap that reads only
+    the header lets the whole body be buffered and parsed -- and a 422 over
+    an oversized SQL string echoes every byte of it back.
+    """
+
+    def streamed_oversized_body() -> Iterator[bytes]:
+        yield b'{"name": "ok", "sql": "SELECT 1 -- '
+        for _ in range(6):
+            yield b"A" * (1024 * 1024)
+        yield b'"}'
+
+    response = writable_api.post(
+        "/api/v1/queries",
+        content=streamed_oversized_body(),
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 413
+    assert "content-length" not in response.request.headers
+
+
+def test_the_body_cap_holds_on_a_token_configured_server(
+    writable_workspace: PopulatedWorkspace,
+) -> None:
+    # Every real `hflow ui` launch mints a token, and the size cap is a
+    # separate middleware from auth -- so it has to be exercised on a server
+    # that has both, not only on the tokenless one the other tests use.
+    session_token = "body-cap-session-token"
+    tokened_api = TestClient(
+        create_app(UiSettings(data_root=str(writable_workspace.data_root), token=session_token))
+    )
+    response = tokened_api.post(
+        "/api/v1/queries",
+        json=_oversized_query_body(),
+        headers={"Authorization": f"Bearer {session_token}"},
+    )
     assert response.status_code == 413
 
 

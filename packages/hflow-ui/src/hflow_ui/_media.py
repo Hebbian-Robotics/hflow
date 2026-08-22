@@ -10,14 +10,16 @@ path (only the containment fact appears in errors).
 import mimetypes
 from pathlib import Path
 
+from fastapi import HTTPException
 from starlette.responses import FileResponse
 
-from hflow.storage import LocalStorageRoot, is_bucket_url, parse_storage_root
+from hflow.storage import is_bucket_url
 from hflow.workspace import (
     CATALOG_DIRECTORY_NAME,
     EPISODES_DIRECTORY_NAME,
     TEST_RUNS_DIRECTORY_NAME,
 )
+from hflow_ui._settings import local_data_root_or_none
 
 # The layout directories a workspace's own files live under, owned by
 # hflow.workspace. Used to recognise a path recorded from another vantage of
@@ -74,14 +76,25 @@ class MediaResolutionError(Exception):
         self.detail = detail
 
 
+def media_refusal(error: MediaResolutionError) -> HTTPException:
+    """The HTTP refusal one unservable URI maps to.
+
+    Lives beside the error it converts (as ``_connections`` and ``_runtime``
+    do for theirs), so the two routes that serve catalog bytes -- episode
+    media and manifest downloads -- share one mapping instead of each copying
+    the two field reads.
+    """
+    return HTTPException(status_code=error.status_code, detail=error.detail)
+
+
 def _resolved_local_data_root(data_root: str) -> Path:
-    workspace_root = parse_storage_root(data_root)
-    if not isinstance(workspace_root, LocalStorageRoot):
+    local_root = local_data_root_or_none(data_root)
+    if local_root is None:
         raise MediaResolutionError(
             501,
             "media serving requires a local data root; bucket-backed workspaces are not served yet",
         )
-    return workspace_root.path.resolve()
+    return local_root.resolve()
 
 
 def _strictly_resolved(candidate: Path) -> Path | None:

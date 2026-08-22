@@ -46,9 +46,15 @@ def budget_gate_task_id(stage: Stage) -> str:
     Meta owns the quarantine budget because it is the stage that runs checks
     and therefore the only one that can quarantine; the others gate on the
     error budget alone. Mirrors the template selection in
-    ``_bundle.render_sub_dag_source``.
+    ``_bundle.render_sub_dag_source``, exhaustively and for the same reason:
+    a new stage must make its author choose a gate here too, rather than
+    inheriting the error budget from an ``else``.
     """
-    return QUARANTINE_BUDGET_GATE_TASK_ID if stage is Stage.META else ERROR_BUDGET_GATE_TASK_ID
+    match stage:
+        case Stage.META:
+            return QUARANTINE_BUDGET_GATE_TASK_ID
+        case Stage.SYNC | Stage.LABELS | Stage.MEDIA:
+            return ERROR_BUDGET_GATE_TASK_ID
 
 
 @dataclass(frozen=True)

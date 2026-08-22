@@ -27,14 +27,14 @@ addressed, and the run graph refuses with the runs monitor's 409/502 idiom.
 import re
 from collections import Counter
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from math import isfinite
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
 from hflow.app import MEDIA_CONTACT_SHEET_STEP_NAME
-from hflow.manifest import PipelineManifest, StepManifest
+from hflow.manifest import PipelineManifest
 from hflow.runtime import (
     AirflowClient,
     AirflowClientError,
@@ -59,9 +59,8 @@ from hflow_ui._contract import (
     RunGraphStage,
     RunTaskInstance,
     StageRunMatch,
-    StepTier,
 )
-from hflow_ui._pipeline import PipelineState
+from hflow_ui._pipeline import PipelineLoaded, PipelineState, registered_steps_by_stage
 from hflow_ui._runtime import (
     ResolvedRuntime,
     RuntimeResolver,
@@ -96,6 +95,14 @@ _DAG_ID_UNSAFE_CHARACTERS = re.compile(r"[^A-Za-z0-9_.-]+")
 
 # How many of a stage sub-DAG's runs the run-graph heuristic looks at.
 _STAGE_RUN_SEARCH_LIMIT = 25
+
+# How long after a master run ENDED a stage run may still start and count as
+# its own. Normally zero is enough (the master defers until each stage run
+# finishes), but a master that fails, times out, or is cleared the moment
+# after firing a trigger ends before the run it just caused appears -- and the
+# two timestamps come from different components' clocks. Generous enough to
+# cover that, far short of the gap between two ingests.
+_STAGE_RUN_START_GRACE_AFTER_MASTER_END = timedelta(minutes=5)
 
 # Airflow reports a task instance that has not been scheduled yet with a null
 # state; the mapped fan-out summary needs a key for those.
@@ -132,39 +139,19 @@ def _display_master_dag_id(pipeline_name: str | None) -> str:
     return sanitized or DISPLAY_ONLY_MASTER_DAG_ID
 
 
-def _step_tier(step: StepManifest) -> StepTier:
-    """Which cheap-first tier this step runs in (1 first, 2 second).
-
-    Mirrors :meth:`hflow.App._ordered_checks` and ``_ordered_enrichments``
-    EXACTLY: both sort on ``bool(requires) or uses is not None``, so tier 2 is
-    precisely the steps declaring a required channel or an endpoint alias.
-    Within a tier there is no ordering at all -- registration order is what
-    the stable sort preserves, not a dependency.
-    """
-    return 2 if (bool(step.requires) or step.uses is not None) else 1
-
-
 def _user_steps(stage: Stage, manifest: PipelineManifest | None) -> list[PipelineUserStep]:
     """The registered steps running inside this stage's ``process_batch``.
 
-    Stage ownership is the engine's (``hflow.steps``/``App.process``):
-    registered checks run in meta, user enrichments in labels; sync and media
-    carry no user-registered steps. Ordered exactly as the engine runs them
-    (tier 1 first, registration order within a tier).
+    Which stage owns which steps, and the order they run in, both come from
+    :func:`hflow_ui._pipeline.registered_steps_by_stage` -- the package's one
+    owner of that mapping -- so this lane and the pipeline page's lane are
+    the same steps in the same order, and only ``tier`` is served here.
     """
     if manifest is None:
         return []
-    if stage is Stage.META:
-        registered_steps: tuple[StepManifest, ...] = manifest.checks
-    elif stage is Stage.LABELS:
-        registered_steps = manifest.enrichments
-    else:
-        return []
     return [
-        PipelineUserStep.from_step_manifest_in_tier(step, _step_tier(step))
-        # Stable sort on the tier alone: the same call App._ordered_checks
-        # makes, so the payload's order IS the execution order.
-        for step in sorted(registered_steps, key=_step_tier)
+        PipelineUserStep.from_step_manifest_in_tier(step, tier)
+        for step, tier in registered_steps_by_stage(manifest)[stage]
     ]
 
 
@@ -230,8 +217,8 @@ def _quarantine_gate(manifest: PipelineManifest | None) -> QuarantineGate | None
         return None
     critical_step_names = [step.name for step in manifest.checks if step.critical]
     return QuarantineGate(
-        from_stage=Stage.META.value,
-        to_stages=[Stage.LABELS.value, Stage.MEDIA.value],
+        from_stage=Stage.META,
+        to_stages=[Stage.LABELS, Stage.MEDIA],
         critical_step_names=critical_step_names,
         explanation=(
             _QUARANTINE_GATE_EXPLANATION if critical_step_names else _NO_CRITICAL_CHECKS_EXPLANATION
@@ -244,7 +231,7 @@ def _stage_graph(
 ) -> PipelineGraphStage:
     stage = stage_topology.stage
     return PipelineGraphStage(
-        stage=stage.value,
+        stage=stage,
         title=_STAGE_TITLES[stage],
         description=_STAGE_DESCRIPTIONS[stage],
         gate_task_id=stage_topology.gate_task_id,
@@ -366,38 +353,83 @@ class _MatchedStageRun:
     match: StageRunMatch
 
 
+@dataclass(frozen=True)
+class _MasterRunWindow:
+    """When a master run was live: the interval its stage runs must start in.
+
+    ``ended_at`` is None while the run is still going, which leaves the window
+    open-ended on the right -- the only case where "no upper bound" is true.
+    """
+
+    started_at: datetime
+    ended_at: datetime | None
+
+    def contains_stage_run_start(self, started_at: datetime) -> bool:
+        if started_at < self.started_at:
+            return False
+        if self.ended_at is None:
+            return True
+        return started_at <= self.ended_at + _STAGE_RUN_START_GRACE_AFTER_MASTER_END
+
+
+def _master_run_window(master_run: dict[str, Any]) -> _MasterRunWindow | None:
+    """One master run's live interval, or None when it has not started yet."""
+    started_at = _parsed_timestamp(master_run.get("start_date"))
+    if started_at is None:
+        return None
+    return _MasterRunWindow(
+        started_at=started_at, ended_at=_parsed_timestamp(master_run.get("end_date"))
+    )
+
+
 def _matched_stage_run(
-    stage_runs: list[dict[str, Any]], master_started_at: datetime | None
+    stage_runs: list[dict[str, Any]], window: _MasterRunWindow | None
 ) -> _MatchedStageRun | None:
-    """The newest run of one stage sub-DAG that started at/after the master's.
+    """The EARLIEST run of one stage sub-DAG that started inside the master's window.
+
+    The master triggers each stage with a deferring
+    ``TriggerDagRunOperator(wait_for_completion=True)`` and chains the stages
+    in order (``hflow.runtime`` renders them that way), so a stage run the
+    master caused always STARTS while the master run is still live. Bounding
+    the search by the master's own end is therefore not a guess, and it is
+    what stops an old master run from adopting an unrelated stage run that
+    happens to be newer -- the stage lanes only ever look back
+    ``_STAGE_RUN_SEARCH_LIMIT`` runs, so without the bound every candidate
+    qualified and the newest won.
+
+    Earliest-in-window, not newest: when two master runs overlap, this
+    master's own stage run is the first one after its start, while the newest
+    is biased toward the other master's. The cost is that a stage triggered
+    twice inside ONE master run (a retried trigger task) shows the first
+    attempt -- accepted, because preferring the newest is exactly what let an
+    unrelated run be adopted.
 
     HONEST LIMITATION, restated in the payload as ``"match": "heuristic"``:
-    the master's ``TriggerDagRunOperator`` lets Airflow mint the sub-DAG's run
-    id and forwards a conf that carries no back-reference, so the API offers
-    nothing that ties a stage run to the master run that triggered it. Two
-    master runs overlapping in time can therefore be attributed the same
-    stage run. A master run that has not started yet (no ``start_date``)
-    matches nothing rather than guessing.
+    the master lets Airflow mint the sub-DAG's run id and forwards a conf that
+    carries no back-reference, so the API offers nothing that ties a stage run
+    to the master run that triggered it. Two master runs whose windows OVERLAP
+    can still be attributed the same stage run. A master run that has not
+    started yet (no ``start_date``) matches nothing rather than guessing.
     """
-    if master_started_at is None:
+    if window is None:
         return None
-    best_run: dict[str, Any] | None = None
-    best_started_at: datetime | None = None
+    earliest_run: dict[str, Any] | None = None
+    earliest_started_at: datetime | None = None
     for run in stage_runs:
         started_at = _parsed_timestamp(run.get("start_date"))
-        if started_at is None or started_at < master_started_at:
+        if started_at is None or not window.contains_stage_run_start(started_at):
             continue
-        if best_started_at is None or started_at > best_started_at:
-            best_run, best_started_at = run, started_at
-    if best_run is None:
+        if earliest_started_at is None or started_at < earliest_started_at:
+            earliest_run, earliest_started_at = run, started_at
+    if earliest_run is None:
         return None
-    return _MatchedStageRun(run=best_run, match="heuristic")
+    return _MatchedStageRun(run=earliest_run, match="heuristic")
 
 
 def _empty_stage_graph(stage_topology: StageTopology) -> RunGraphStage:
     """A stage that never ran for this master run: explicit nulls, not omissions."""
     return RunGraphStage(
-        stage=stage_topology.stage.value,
+        stage=stage_topology.stage,
         dag_id=stage_topology.dag.dag_id,
         dag_run_id=None,
         state=None,
@@ -439,7 +471,9 @@ def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver
         """
         resolution = resolver.resolve()
         dag_ids_known = isinstance(resolution, ResolvedRuntime)
-        application = pipeline_state.application
+        application = (
+            pipeline_state.application if isinstance(pipeline_state, PipelineLoaded) else None
+        )
         master_dag_id = (
             resolution.dag_id
             if isinstance(resolution, ResolvedRuntime)
@@ -480,7 +514,7 @@ def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver
             master_instances = runtime.client.task_instances(runtime.dag_id, dag_run_id)
         except AirflowClientError as error:
             raise airflow_failure_refusal(error, source=runtime.source) from error
-        master_started_at = _parsed_timestamp(master_run.get("start_date"))
+        master_window = _master_run_window(master_run)
 
         stages: list[RunGraphStage] = []
         for stage_topology in topology.stages:
@@ -493,7 +527,7 @@ def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver
                 # An unregistered stage sub-DAG (a partial profile, or a
                 # bundle mid-render) is a stage that never ran here.
                 stage_runs = []
-            matched = _matched_stage_run(stage_runs, master_started_at)
+            matched = _matched_stage_run(stage_runs, master_window)
             if matched is None:
                 stages.append(_empty_stage_graph(stage_topology))
                 continue
@@ -508,7 +542,7 @@ def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver
             )
             stages.append(
                 RunGraphStage(
-                    stage=stage_topology.stage.value,
+                    stage=stage_topology.stage,
                     dag_id=stage_dag_id,
                     dag_run_id=stage_run_id,
                     state=optional_string(matched.run.get("state")),

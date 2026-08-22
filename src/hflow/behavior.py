@@ -1,7 +1,7 @@
 """Processing-behavior versions: what actually changes a corpus's identity.
 
-HFlow's identities are content hashes, and until the identity epoch below
-they folded in ``hflow.__version__`` -- the RELEASE number. That made every
+HFlow's identities are content hashes, and until identity epoch 2 they
+folded in ``hflow.__version__`` -- the RELEASE number. That made every
 release, however unrelated to processing, change three things at once:
 ``pipeline_version`` (so ``hflow stale`` listed the whole corpus),
 ``episode_id`` (because the pipeline version is stamped inside the canonical
@@ -34,6 +34,14 @@ source or its captured configuration changes.
 The release number is not lost, only demoted from identity to provenance:
 :attr:`hflow.PipelineManifest.hflow_version` and the rendered bundle's
 ``hflow-bundle.json`` both record which build produced a pipeline.
+
+Identity epochs live here as prose, not as a constant: no build stamps an
+epoch into a corpus, so a module attribute nothing reads would be a comment
+wearing a type annotation. Epoch 1 folded ``hflow.__version__`` into
+``pipeline_version``, ``episode_id``, and step versions; epoch 2 -- what this
+build produces -- folds in only author-owned facts plus
+``TRANSFORM_BEHAVIOR_VERSION``. Written down so a reader can explain the
+one-time re-version between them rather than guess at it.
 """
 
 # Canonicalization semantics: bump when the transform would write different
@@ -41,9 +49,3 @@ The release number is not lost, only demoted from identity to provenance:
 # as ``str`` rather than inferred as a literal: the whole point is that it
 # changes.
 TRANSFORM_BEHAVIOR_VERSION: str = "1"
-
-# The identity epoch this build stamps. Epoch 1 folded hflow.__version__ into
-# pipeline_version, episode_id, and step versions; epoch 2 folds in only
-# author-owned facts plus TRANSFORM_BEHAVIOR_VERSION. Recorded here so a
-# reader can explain a one-time re-version rather than guess at it.
-IDENTITY_EPOCH: str = "2"
