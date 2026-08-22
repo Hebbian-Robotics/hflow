@@ -75,6 +75,12 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         authorization = self._record(None)
+        if self.path.endswith("/taskInstances"):
+            if not self._bearer_ok(authorization):
+                self._respond(401, {"detail": "expired"})
+                return
+            self._respond(200, {"task_instances": [{"task_id": "plan", "map_index": -1}]})
+            return
         if "/dagRuns/" in self.path:
             if not self._bearer_ok(authorization):
                 self._respond(401, {"detail": "expired"})
@@ -189,6 +195,31 @@ def test_caller_supplied_dag_run_id_makes_retries_idempotent(stub_server: str) -
     assert existing == {"dag_run_id": "already-exists", "state": "running"}
 
 
+def test_per_run_endpoints_address_the_same_run(stub_server: str) -> None:
+    """One run id, one URL rule -- whichever per-run endpoint asks for it.
+
+    Airflow's own ids carry ':' and '+', and a caller-supplied idempotency id
+    may carry '#', which urllib reads as a fragment and drops from the path.
+    Left raw, the run detail and its task instances would describe two
+    different runs (and the 409 retry in trigger_dag_run would 404).
+    """
+    client = AirflowClient(stub_server, "airflow", "right-password")
+    dag_run_id = "manual__2026-08-22T03:06:55+00:00#retry-1"
+    client.dag_run("pipeline_ingest", dag_run_id)
+    client.task_instances("pipeline_ingest", dag_run_id)
+
+    encoded_run = "manual__2026-08-22T03%3A06%3A55%2B00%3A00%23retry-1"
+    per_run_paths = [
+        path
+        for method, path, _payload, _authorization in _StubAirflowHandler.requests_seen
+        if method == "GET" and "/dagRuns/" in path
+    ]
+    assert per_run_paths == [
+        f"/api/v2/dags/pipeline_ingest/dagRuns/{encoded_run}",
+        f"/api/v2/dags/pipeline_ingest/dagRuns/{encoded_run}/taskInstances",
+    ]
+
+
 def test_conflict_without_a_dag_run_id_still_raises(stub_server: str) -> None:
     # Without a caller id there is nothing to idempotently return; the 409
     # must surface.
@@ -196,6 +227,19 @@ def test_conflict_without_a_dag_run_id_still_raises(stub_server: str) -> None:
     with pytest.raises(AirflowClientError) as error_info:
         client.trigger_dag_run("pipeline_ingest", conf={"force_conflict": True})
     assert error_info.value.status == 409
+
+
+def test_ingest_refuses_a_batch_count_the_run_could_not_honour(stub_server: str) -> None:
+    """The conf's owner refuses it here, before a run exists to fail.
+
+    ``plan_batches`` enforces ``>= 1`` inside the sync sub-DAG's plan task, so
+    without this the SDK reports a triggered run and the operator's history
+    collects a failure for a value the client could have named.
+    """
+    client = AirflowClient(stub_server, "airflow", "right-password")
+    with pytest.raises(ValueError, match="batch_count must be >= 1, got 0"):
+        client.ingest("pipeline_ingest", ["a.mcap"], batch_count=0)
+    assert _StubAirflowHandler.requests_seen == []
 
 
 def test_bad_credentials_surface_clearly(stub_server: str) -> None:
