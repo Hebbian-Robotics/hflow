@@ -13,6 +13,15 @@ __pycache__/
 # never source).
 data/
 
+# Frontend build outputs: the source of truth is ui/; built assets are copied
+# into the hflow-server wheel at packaging time, never committed.
+ui/node_modules/
+ui/dist/
+packages/hflow-server/src/hflow_server/static/
+
 # Local maintainer tooling (agent skills, settings); not part of the public repo.
 .claude/
 .agents/
+
+# Transient: `pnpm gen:api` dumps the schema here on its way to src/apiSchema.ts.
+.openapi.json

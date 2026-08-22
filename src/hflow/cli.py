@@ -1,9 +1,16 @@
 """Command-line entry point.
 
 Subcommands: ``curate``, ``stale``, ``doctor``, ``manifest``, the Compose
-runtime family ``up``/``down``/``ingest``/``status``, and ``deploy`` for
-bring-your-own Airflow. Everything the CLI does is a thin call into the
-library: no behavior lives only here.
+runtime family ``up``/``down``/``ingest``/``status``, ``deploy`` for
+bring-your-own Airflow, and ``serve`` for the workspace HTTP server (a
+separate ``hflow-server`` package, imported only when invoked). Everything
+the CLI does is a thin call into the library: no behavior lives only here.
+
+Two of these start long-running processes and they are not the same thing:
+``up`` brings up the RUNTIME that processes episodes (an Airflow stack in
+Docker), while ``serve`` serves the WORKSPACE over HTTP -- one process that
+reads the data root and can trigger a run on a runtime, but executes nothing
+itself. Either is useful without the other.
 
 ``ingest`` and ``status`` address either a LOCAL rendered bundle (the
 default: ``--bundle-dir`` or its auto-discovery) or a REMOTE runtime by URL
@@ -19,7 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from hflow import __version__
-from hflow.app import DATA_ROOT_ENVIRONMENT_VARIABLE, DEFAULT_DATA_ROOT
+from hflow.app import DATA_ROOT_ENVIRONMENT_VARIABLE, DEFAULT_DATA_ROOT, parse_pipeline_spec
 from hflow.curation import curate, stale_episodes
 from hflow.doctor import diagnose
 from hflow.runtime._deploy import DEFAULT_DEPLOY_VENV_PYTHON
@@ -35,6 +42,9 @@ DEFAULT_DEPLOY_OUTPUT_DIR = Path("./deploy")
 # Mirrors RuntimeConfig.api_port; kept here so the parser can state it without
 # importing the runtime package, which `up` defers until it actually runs.
 DEFAULT_API_PORT = 8080
+# The workspace UI's fixed default port ("HFLO" on a phone keypad); stated
+# here so the parser needs no import from the optional hflow-server package.
+DEFAULT_SERVER_PORT = 4356
 
 
 def _environment_data_root() -> str:
@@ -341,6 +351,53 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_remote_endpoint_arguments(status_parser)
+
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help=(
+            "serve this workspace over HTTP: a JSON API over the catalog, and any "
+            "UI assets installed (requires the hflow-server package). Distinct from "
+            "`up`, which starts the runtime that PROCESSES episodes -- this only "
+            "reads the data root, and can trigger a run on a runtime that exists."
+        ),
+    )
+    serve_parser.add_argument(
+        "--data-root",
+        default=_environment_data_root(),
+        help=(
+            f"workspace data root to browse (default: $HFLOW_DATA_ROOT, else {DEFAULT_DATA_ROOT})"
+        ),
+    )
+    serve_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="bind address (default 127.0.0.1; widening past loopback exposes your corpus)",
+    )
+    serve_parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_SERVER_PORT,
+        help=f"port to serve on (default {DEFAULT_SERVER_PORT}; auto-retries upward when taken)",
+    )
+    serve_parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="do not open a browser after starting (headless use)",
+    )
+    serve_parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help="viewer mode: hide and refuse manifest pinning, saved-query edits, and run triggering",
+    )
+    serve_parser.add_argument(
+        "--pipeline",
+        default=None,
+        help=(
+            "pipeline file for the Pipeline page, optionally with the App variable "
+            "name: path/to/pipeline.py[:app]; importing EXECUTES the file, exactly "
+            "like `hflow manifest`"
+        ),
+    )
     return parser
 
 
@@ -398,38 +455,16 @@ def _resolve_bundle_dir(bundle_dir_argument: Path | None) -> Path:
     return candidates[0]
 
 
-def _parse_pipeline_spec(pipeline_spec: str) -> tuple[Path, str]:
-    """Split ``path/to/pipeline.py[:app_variable]`` (default variable: ``app``)."""
-    path_part, separator, variable_part = pipeline_spec.rpartition(":")
-    if separator and path_part and variable_part.isidentifier():
-        return Path(path_part), variable_part
-    return Path(pipeline_spec), "app"
-
-
 def _import_pipeline_app(pipeline_spec: str) -> "App":
     """Import ``path/to/pipeline.py[:app]`` and return its App, loudly.
 
-    The pipeline file is arbitrary user code: any exception it raises is a
-    boundary failure of the calling command (reported as a ``ValueError``
-    naming the file), never a crash.
+    The library owns the contract (:func:`hflow.app.import_pipeline_application`)
+    so every vantage that addresses a pipeline by file -- these commands and
+    the workspace UI -- resolves it identically.
     """
-    import importlib.util
+    from hflow.app import import_pipeline_application
 
-    from hflow.app import App
-
-    pipeline_file, app_variable = _parse_pipeline_spec(pipeline_spec)
-    spec = importlib.util.spec_from_file_location("hflow_user_pipeline", pipeline_file)
-    if spec is None or spec.loader is None:
-        raise ValueError(f"cannot import pipeline file {pipeline_file}")
-    module = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(module)
-    except Exception as error:
-        raise ValueError(f"importing {pipeline_file} failed: {error}") from error
-    app = getattr(module, app_variable, None)
-    if not isinstance(app, App):
-        raise ValueError(f"{pipeline_file} has no hflow.App named {app_variable!r}")
-    return app
+    return import_pipeline_application(pipeline_spec)
 
 
 def _command_manifest(arguments: argparse.Namespace) -> int:
@@ -487,7 +522,7 @@ def _command_up(arguments: argparse.Namespace) -> int:
         started_summary,
     )
 
-    pipeline_file, app_variable = _parse_pipeline_spec(arguments.pipeline)
+    pipeline_file, app_variable = parse_pipeline_spec(arguments.pipeline)
     hflow_source = (
         arguments.hflow_source if arguments.hflow_source is not None else infer_hflow_source()
     )
@@ -553,7 +588,7 @@ def _command_up(arguments: argparse.Namespace) -> int:
 def _command_deploy(arguments: argparse.Namespace) -> int:
     from hflow.runtime._deploy import DeployConfig, render_deploy_bundle
 
-    pipeline_file, app_variable = _parse_pipeline_spec(arguments.pipeline)
+    pipeline_file, app_variable = parse_pipeline_spec(arguments.pipeline)
     try:
         config = DeployConfig(
             pipeline_file=pipeline_file,
@@ -716,6 +751,29 @@ def _command_doctor(arguments: argparse.Namespace) -> int:
     return exit_code
 
 
+def _command_serve(arguments: argparse.Namespace) -> int:
+    try:
+        from hflow_server import ServerSettings, serve
+    except ImportError:
+        print(
+            "serve: the workspace server ships as a separate package so pipeline "
+            "workers never carry it; install it with `uv add hflow-server` "
+            "(or `pip install hflow-server`)",
+            file=sys.stderr,
+        )
+        return 2
+    settings = ServerSettings(
+        data_root=arguments.data_root,
+        host=arguments.host,
+        port=arguments.port,
+        open_browser=not arguments.no_browser,
+        read_only=arguments.read_only,
+        pipeline=arguments.pipeline,
+    )
+    serve(settings)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = _build_parser().parse_args(argv)
 
@@ -743,6 +801,8 @@ def main(argv: list[str] | None = None) -> int:
         return _command_ingest(arguments)
     if arguments.command == "status":
         return _command_status(arguments)
+    if arguments.command == "serve":
+        return _command_serve(arguments)
     raise AssertionError(f"unhandled command {arguments.command!r}")
 
 

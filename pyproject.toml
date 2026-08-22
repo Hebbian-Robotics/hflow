@@ -48,6 +48,10 @@ hflow = "hflow.cli:main"
 
 [dependency-groups]
 dev = [
+    "hflow-server", # the workspace UI package, present in dev so the suite tests it
+    # Starlette's TestClient transport for the hflow-server suite. httpx2, not
+    # httpx: starlette 1.6 deprecates the httpx transport in its favour.
+    "httpx2>=2.10",
     "obstore>=0.10.0", # the bucket extra, present in dev so the suite tests it
     "pytest>=9.1.1",
     "pyyaml>=6.0.3",
@@ -65,8 +69,14 @@ build-backend = "uv_build"
 # trusted first-party packages.
 exclude-newer = "5 days"
 
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+hflow-server = { workspace = true }
+
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "packages/hflow-server/tests"]
 
 [tool.ruff]
 line-length = 100
