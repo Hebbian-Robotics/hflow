@@ -45,7 +45,11 @@ from pathlib import Path
 from mcap.writer import Writer
 
 from hflow.ffmpeg import ffmpeg_path
-from hflow.format import NANOSECONDS_PER_SECOND
+from hflow.format import (
+    EPISODE_KEY_ROBOT_SOFTWARE_VERSION,
+    METADATA_RECORD_EPISODE,
+    NANOSECONDS_PER_SECOND,
+)
 
 JOINT_STATES_TOPIC = "/joint_states"
 JOINT_STATE_SCHEMA_NAME = "sensor_msgs/msg/JointState"
@@ -471,7 +475,7 @@ def _video_episode_metadata(spec: VideoEpisodeSpec) -> dict[str, str]:
     metadata = {
         "task": spec.task,
         "operator": spec.operator,
-        "robot_software_version": spec.robot_software_version,
+        EPISODE_KEY_ROBOT_SOFTWARE_VERSION: spec.robot_software_version,
     }
     if spec.success is not None:
         metadata["success"] = "true" if spec.success else "false"
@@ -479,7 +483,7 @@ def _video_episode_metadata(spec: VideoEpisodeSpec) -> dict[str, str]:
         "task",
         "operator",
         "success",
-        "robot_software_version",
+        EPISODE_KEY_ROBOT_SOFTWARE_VERSION,
     }
     additional_metadata_keys: set[str] = set()
     for metadata_key, metadata_value in spec.metadata:
@@ -529,7 +533,9 @@ def write_video_episode(
             message_encoding="cdr",
             schema_id=schema_id,
         )
-        writer.add_metadata(name="episode/v1", data=_video_episode_metadata(resolved_spec))
+        writer.add_metadata(
+            name=METADATA_RECORD_EPISODE, data=_video_episode_metadata(resolved_spec)
+        )
         for sequence, (log_time_ns, payload) in enumerate(camera_messages):
             writer.add_message(
                 channel_id=channel_id,
@@ -667,12 +673,12 @@ def synthesize_episode(output: Path | str, spec: SyntheticEpisodeSpec | None = N
             for topic, schema_name in channel_topics
         ]
         writer.add_metadata(
-            name="episode/v1",
+            name=METADATA_RECORD_EPISODE,
             data={
                 "task": resolved_spec.task,
                 "operator": resolved_spec.operator,
                 "success": "true" if resolved_spec.success else "false",
-                "robot_software_version": resolved_spec.robot_software_version,
+                EPISODE_KEY_ROBOT_SOFTWARE_VERSION: resolved_spec.robot_software_version,
             },
         )
         writer.add_attachment(
