@@ -34,7 +34,7 @@ class UiSettings:
     # writes, ingest triggering) answers 403 and /api/v1/config reports it
     # (CLI flag: --read-only).
     read_only: bool = False
-    # M2: ``path/to/pipeline.py[:app]`` (CLI flag: --pipeline). The server
+    # ``path/to/pipeline.py[:app]`` (CLI flag: --pipeline). The server
     # imports -- EXECUTES -- this file exactly once at startup to serve
     # /api/v1/pipeline; ``None`` leaves that capability off.
     pipeline: str | None = None

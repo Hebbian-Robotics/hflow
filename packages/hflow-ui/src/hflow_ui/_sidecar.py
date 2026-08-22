@@ -1,6 +1,6 @@
 """The UI sidecar state: ``<data_root>/ui/state.json``, owned by this module.
 
-Workspace convention (M1): the curation studio persists exactly two kinds of
+Workspace convention: the curation studio persists exactly two kinds of
 durable state -- saved queries and the pinned-manifest registry -- in ONE
 JSON sidecar file, ``<data_root>/ui/state.json``. Together with the manifest
 files under ``<data_root>/manifests/``, that sidecar is the ONLY thing the
@@ -16,6 +16,13 @@ Two rules hold at this boundary:
   ``state_version`` this build does not speak, or holds a malformed entry is
   refused with an error NAMING THE FILE -- never silently coerced, dropped,
   or rewritten (the state is the user's curation record).
+
+The stored entries ARE the published contract models
+(:class:`hflow_ui._contract.SavedQueryEntry` and
+:class:`~hflow_ui._contract.PinnedManifestEntry`): the file a user can read
+with ``jq`` and the payload the API serves are one shape with one owner, so
+they cannot drift apart. Changing either therefore changes this file's
+format, which ``STATE_VERSION`` guards.
 """
 
 import json
@@ -24,6 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from hflow.storage import LocalStorageRoot, parse_storage_root
+from hflow_ui._contract import CheckCoverageEntry, PinnedManifestEntry, SavedQueryEntry
 
 STATE_VERSION = 1
 SIDECAR_DIRECTORY_NAME = "ui"
@@ -40,75 +48,11 @@ class SidecarError(Exception):
 
 
 @dataclass(frozen=True)
-class SavedQuery:
-    """One saved studio query, exactly as stored."""
-
-    query_id: str
-    name: str
-    sql: str
-    updated_at: str  # ISO-8601 UTC
-
-    def to_json_dict(self) -> dict[str, str]:
-        return {
-            "id": self.query_id,
-            "name": self.name,
-            "sql": self.sql,
-            "updated_at": self.updated_at,
-        }
-
-
-@dataclass(frozen=True)
-class CoverageEntry:
-    """One check's coverage denominator, frozen at pin time."""
-
-    check_name: str
-    episodes_ran: int
-    total_episodes: int
-    fraction: float
-
-    def to_json_dict(self) -> dict[str, object]:
-        return {
-            "check_name": self.check_name,
-            "episodes_ran": self.episodes_ran,
-            "total_episodes": self.total_episodes,
-            "fraction": self.fraction,
-        }
-
-
-@dataclass(frozen=True)
-class PinnedManifest:
-    """One registry entry for an immutable pinned manifest file."""
-
-    manifest_id: str
-    name: str
-    description: str
-    sql: str
-    manifest_path: str  # data-root-relative, e.g. "manifests/<slug>-<utc>.parquet"
-    row_count: int
-    total_episodes: int
-    coverage: tuple[CoverageEntry, ...]
-    created_at: str  # ISO-8601 UTC
-
-    def to_json_dict(self) -> dict[str, object]:
-        return {
-            "id": self.manifest_id,
-            "name": self.name,
-            "description": self.description,
-            "sql": self.sql,
-            "manifest_path": self.manifest_path,
-            "row_count": self.row_count,
-            "total_episodes": self.total_episodes,
-            "coverage": [entry.to_json_dict() for entry in self.coverage],
-            "created_at": self.created_at,
-        }
-
-
-@dataclass(frozen=True)
 class SidecarState:
     """The whole parsed sidecar; a missing file reads as this default."""
 
-    saved_queries: tuple[SavedQuery, ...] = ()
-    manifests: tuple[PinnedManifest, ...] = ()
+    saved_queries: tuple[SavedQueryEntry, ...] = ()
+    manifests: tuple[PinnedManifestEntry, ...] = ()
 
 
 def local_data_root(data_root: str) -> Path:
@@ -118,7 +62,7 @@ def local_data_root(data_root: str) -> Path:
         raise SidecarError(
             501,
             "saved queries and pinned manifests need a local data root; "
-            "bucket-backed workspaces are not supported by the curation studio in M1",
+            "bucket-backed workspaces are not supported by the curation studio yet",
         )
     return parsed_root.path
 
@@ -143,11 +87,12 @@ def store_sidecar_state(data_root: str, state: SidecarState) -> None:
     """Atomically replace the sidecar with ``state`` (temp file + os.replace)."""
     state_file = sidecar_state_file(data_root)
     state_file.parent.mkdir(parents=True, exist_ok=True)
+    # by_alias: the stored keys are the published ones ("id", not "query_id").
     payload = json.dumps(
         {
             "state_version": STATE_VERSION,
-            "saved_queries": [entry.to_json_dict() for entry in state.saved_queries],
-            "manifests": [entry.to_json_dict() for entry in state.manifests],
+            "saved_queries": [entry.model_dump(by_alias=True) for entry in state.saved_queries],
+            "manifests": [entry.model_dump(by_alias=True) for entry in state.manifests],
         },
         indent=2,
     )
@@ -221,8 +166,10 @@ def _float_field(entry: dict[str, object], key: str, state_file: Path) -> float:
     return float(value)
 
 
-def _parsed_saved_query(entry: dict[str, object], state_file: Path) -> SavedQuery:
-    return SavedQuery(
+def _parsed_saved_query(entry: dict[str, object], state_file: Path) -> SavedQueryEntry:
+    # Field-by-field on purpose: a model_validate refusal would name pydantic's
+    # own error shape, not this file and the fix for it.
+    return SavedQueryEntry(
         query_id=_string_field(entry, "id", state_file),
         name=_string_field(entry, "name", state_file),
         sql=_string_field(entry, "sql", state_file),
@@ -230,22 +177,22 @@ def _parsed_saved_query(entry: dict[str, object], state_file: Path) -> SavedQuer
     )
 
 
-def _parsed_manifest(entry: dict[str, object], state_file: Path) -> PinnedManifest:
+def _parsed_manifest(entry: dict[str, object], state_file: Path) -> PinnedManifestEntry:
     raw_coverage = entry.get("coverage", [])
     if not isinstance(raw_coverage, list) or not all(
         isinstance(coverage_entry, dict) for coverage_entry in raw_coverage
     ):
         raise _refused(state_file, "'coverage' must be a list of objects")
-    coverage = tuple(
-        CoverageEntry(
+    coverage = [
+        CheckCoverageEntry(
             check_name=_string_field(coverage_entry, "check_name", state_file),
             episodes_ran=_int_field(coverage_entry, "episodes_ran", state_file),
             total_episodes=_int_field(coverage_entry, "total_episodes", state_file),
             fraction=_float_field(coverage_entry, "fraction", state_file),
         )
         for coverage_entry in raw_coverage
-    )
-    return PinnedManifest(
+    ]
+    return PinnedManifestEntry(
         manifest_id=_string_field(entry, "id", state_file),
         name=_string_field(entry, "name", state_file),
         description=_string_field(entry, "description", state_file),

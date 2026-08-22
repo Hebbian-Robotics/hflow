@@ -17,11 +17,10 @@ import socket
 import threading
 import webbrowser
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated
 
-import duckdb
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
@@ -33,8 +32,22 @@ from hflow.format import CATALOG_FORMAT_VERSION
 from hflow.steps import RUN_PROFILES, IngestMode
 from hflow.storage import LocalStorageRoot
 from hflow.workspace import Workspace
-from hflow_ui import _catalog, _curation, _graph, _media, _pipeline, _runtime
+from hflow_ui import _catalog, _connections, _curation, _graph, _media, _pipeline, _runtime
 from hflow_ui._auth import SessionTokenMiddleware
+from hflow_ui._contract import (
+    BINARY_FILE_RESPONSES,
+    EpisodeDossierResponse,
+    EpisodeFacetsResponse,
+    EpisodePageResponse,
+    EpisodeStatsResponse,
+    EpisodeStatus,
+    EpisodeTimelineResponse,
+    HealthResponse,
+    ListingOrder,
+    SuccessFilterValue,
+    WorkspaceCapabilities,
+    WorkspaceConfigResponse,
+)
 from hflow_ui._settings import UiSettings
 
 ASSETS_ENVIRONMENT_VARIABLE = "HFLOW_UI_ASSETS"
@@ -83,6 +96,35 @@ _FRONTEND_PLACEHOLDER_PAGE = """<!doctype html>
 """
 
 
+def parse_episode_list_filters(
+    task: Annotated[list[str] | None, Query()] = None,
+    operator: Annotated[list[str] | None, Query()] = None,
+    embodiment: Annotated[list[str] | None, Query()] = None,
+    status: Annotated[EpisodeStatus | None, Query()] = None,
+    success: Annotated[SuccessFilterValue | None, Query()] = None,
+    search: Annotated[str | None, Query()] = None,
+) -> _catalog.EpisodeListFilters:
+    """The filter params /episodes and /episodes/stats BOTH accept.
+
+    One owner for the pair: the two endpoints must describe the same rows, so
+    a filter added here reaches the listing and its distributions together --
+    they cannot drift into accepting different query strings.
+    """
+    return _catalog.EpisodeListFilters(
+        tasks=tuple(task or ()),
+        operators=tuple(operator or ()),
+        embodiments=tuple(embodiment or ()),
+        status=status,
+        success=success,
+        search=search,
+    )
+
+
+EpisodeListFilterParams = Annotated[
+    _catalog.EpisodeListFilters, Depends(parse_episode_list_filters)
+]
+
+
 def create_app(settings: UiSettings) -> FastAPI:
     """The whole UI server as a plain ASGI app."""
     # Late import: hflow_ui/__init__ imports this module, so the package
@@ -110,25 +152,12 @@ def create_app(settings: UiSettings) -> FastAPI:
     # graph routes so both read the same briefly-cached addressing.
     runtime_resolver = _runtime.RuntimeResolver(settings.data_root)
 
-    def open_connection_or_refuse() -> duckdb.DuckDBPyConnection:
-        # A FRESH connection per request: the wide episodes view binds its
-        # measurement columns at open time (hflow.curation), so a held
-        # connection would never show keys recorded after startup.
-        try:
-            return _catalog.open_workspace_connection(settings.data_root)
-        except FileNotFoundError as error:
-            raise HTTPException(status_code=404, detail=str(error)) from error
-        except ValueError as error:
-            # Present but unreadable: a catalog format version this build
-            # cannot read is a state conflict, not a missing resource.
-            raise HTTPException(status_code=409, detail=str(error)) from error
-
     @application.get("/api/v1/health")
-    def read_health() -> JSONResponse:
-        return JSONResponse({"ok": True})
+    def read_health() -> HealthResponse:
+        return HealthResponse(ok=True)
 
     @application.get("/api/v1/config")
-    def read_config() -> JSONResponse:
+    def read_config() -> WorkspaceConfigResponse:
         workspace = Workspace.parse(settings.data_root)
         try:
             identity = workspace.identity()
@@ -136,141 +165,91 @@ def create_app(settings: UiSettings) -> FastAPI:
             # A corrupt identity marker must not stop the UI from booting: the
             # id is informational here, and this surface never mints one.
             identity = None
-        return JSONResponse(
-            {
-                "mode": "local",
-                "read_only": settings.read_only,
-                "hflow_version": hflow.__version__,
-                "hflow_ui_version": hflow_ui_version,
-                "data_root": settings.data_root,
-                "workspace_id": identity.workspace_id if identity is not None else None,
-                "capabilities": {
-                    "catalog": _catalog_marker_readable(workspace),
-                    "media": isinstance(workspace.storage_root, LocalStorageRoot),
-                    # Addressed (bundle dir or HFLOW_AIRFLOW_URL), not
-                    # necessarily reachable -- /runtime/status owns liveness.
-                    "runtime": _runtime.runtime_configured(settings.data_root),
-                    "pipeline": pipeline_state.available,
-                },
-                # Deep-link base for the Runs page, honestly derived from the
-                # addressed bundle's own records; null when none is addressed.
-                "airflow_web_url": _runtime.local_bundle_web_url(settings.data_root),
-                # The trigger form's vocabularies, served so the frontend
-                # never hardcodes them (hflow.steps stays the one owner).
-                "run_profiles": list(RUN_PROFILES),
-                "ingest_modes": [mode.value for mode in IngestMode],
-            }
+        return WorkspaceConfigResponse(
+            mode="local",
+            read_only=settings.read_only,
+            hflow_version=hflow.__version__,
+            hflow_ui_version=hflow_ui_version,
+            data_root=settings.data_root,
+            workspace_id=identity.workspace_id if identity is not None else None,
+            capabilities=WorkspaceCapabilities(
+                catalog=_catalog_marker_readable(workspace),
+                media=isinstance(workspace.storage_root, LocalStorageRoot),
+                # Addressed (bundle dir or HFLOW_AIRFLOW_URL), not necessarily
+                # reachable -- /runtime/status owns liveness, and it is also
+                # the one endpoint that serves the Airflow deep-link base.
+                runtime=_runtime.runtime_configured(settings.data_root),
+                pipeline=pipeline_state.available,
+            ),
+            # The trigger form's vocabularies, served so the frontend never
+            # hardcodes them (hflow.steps stays the one owner).
+            run_profiles=list(RUN_PROFILES),
+            ingest_modes=[mode.value for mode in IngestMode],
         )
 
     @application.get("/api/v1/episodes")
     def list_episodes(
-        task: Annotated[list[str] | None, Query()] = None,
-        operator: Annotated[list[str] | None, Query()] = None,
-        embodiment: Annotated[list[str] | None, Query()] = None,
-        status: Annotated[Literal["ok", "quarantined"] | None, Query()] = None,
-        success: Annotated[Literal["true", "false"] | None, Query()] = None,
-        search: Annotated[str | None, Query()] = None,
+        filters: EpisodeListFilterParams,
         order_by: Annotated[str, Query()] = "recorded_at",
-        order: Annotated[Literal["asc", "desc"], Query()] = "desc",
+        order: Annotated[ListingOrder, Query()] = "desc",
         limit: Annotated[int, Query(ge=1, le=500)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
-    ) -> JSONResponse:
-        filters = _catalog.EpisodeListFilters(
-            tasks=tuple(task or ()),
-            operators=tuple(operator or ()),
-            embodiments=tuple(embodiment or ()),
-            status=status,
-            success=success,
-            search=search,
-        )
-        connection = open_connection_or_refuse()
-        try:
-            page = _catalog.query_episode_page(
-                connection,
-                filters,
-                order_by=order_by,
-                descending=order == "desc",
-                limit=limit,
-                offset=offset,
-            )
-        except _catalog.UnknownOrderColumnError as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
-        finally:
-            connection.close()
-        return JSONResponse(
-            {"rows": page.rows, "total": page.total, "columns": page.columns, "sql": page.sql}
-        )
+    ) -> EpisodePageResponse:
+        with _connections.opened_workspace_connection_or_refuse(settings.data_root) as connection:
+            try:
+                return _catalog.query_episode_page(
+                    connection,
+                    filters,
+                    order_by=order_by,
+                    descending=order == "desc",
+                    limit=limit,
+                    offset=offset,
+                )
+            except _catalog.UnknownOrderColumnError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
 
     @application.get("/api/v1/episodes/facets")
-    def read_episode_facets() -> JSONResponse:
-        connection = open_connection_or_refuse()
-        try:
-            facets = _catalog.query_episode_facets(connection)
-        finally:
-            connection.close()
-        return JSONResponse(facets)
+    def read_episode_facets() -> EpisodeFacetsResponse:
+        with _connections.opened_workspace_connection_or_refuse(settings.data_root) as connection:
+            return _catalog.query_episode_facets(connection)
 
     # Registered before the {episode_id} route below so the literal path
     # segment "stats" can never be read as an episode id.
     @application.get("/api/v1/episodes/stats")
-    def read_episode_stats(
-        task: Annotated[list[str] | None, Query()] = None,
-        operator: Annotated[list[str] | None, Query()] = None,
-        embodiment: Annotated[list[str] | None, Query()] = None,
-        status: Annotated[Literal["ok", "quarantined"] | None, Query()] = None,
-        success: Annotated[Literal["true", "false"] | None, Query()] = None,
-        search: Annotated[str | None, Query()] = None,
-    ) -> JSONResponse:
-        filters = _catalog.EpisodeListFilters(
-            tasks=tuple(task or ()),
-            operators=tuple(operator or ()),
-            embodiments=tuple(embodiment or ()),
-            status=status,
-            success=success,
-            search=search,
-        )
-        connection = open_connection_or_refuse()
-        try:
-            stats = _catalog.query_episode_stats(connection, filters)
-        finally:
-            connection.close()
-        return JSONResponse(stats)
+    def read_episode_stats(filters: EpisodeListFilterParams) -> EpisodeStatsResponse:
+        with _connections.opened_workspace_connection_or_refuse(settings.data_root) as connection:
+            return _catalog.query_episode_stats(connection, filters)
 
     @application.get("/api/v1/episodes/{episode_id}")
-    def read_episode(episode_id: str) -> JSONResponse:
-        connection = open_connection_or_refuse()
-        try:
+    def read_episode(episode_id: str) -> EpisodeDossierResponse:
+        with _connections.opened_workspace_connection_or_refuse(settings.data_root) as connection:
             dossier = _catalog.query_episode_dossier(
                 connection, episode_id, data_root=settings.data_root
             )
-        finally:
-            connection.close()
         if dossier is None:
             raise HTTPException(
                 status_code=404, detail=f"no episode {episode_id!r} in this catalog"
             )
-        return JSONResponse(dossier)
+        return dossier
 
     @application.get("/api/v1/episodes/{episode_id}/timeline")
-    def read_episode_timeline(episode_id: str) -> JSONResponse:
-        connection = open_connection_or_refuse()
-        try:
+    def read_episode_timeline(episode_id: str) -> EpisodeTimelineResponse:
+        with _connections.opened_workspace_connection_or_refuse(settings.data_root) as connection:
             timeline = _catalog.query_episode_timeline(connection, episode_id)
-        finally:
-            connection.close()
         if timeline is None:
             raise HTTPException(
                 status_code=404, detail=f"no episode {episode_id!r} in this catalog"
             )
-        return JSONResponse(timeline)
+        return timeline
 
-    @application.get("/api/v1/episodes/{episode_id}/media/{artifact_name:path}")
+    @application.get(
+        "/api/v1/episodes/{episode_id}/media/{artifact_name:path}",
+        response_class=FileResponse,
+        responses=BINARY_FILE_RESPONSES,
+    )
     def read_episode_media(episode_id: str, artifact_name: str) -> FileResponse:
-        connection = open_connection_or_refuse()
-        try:
+        with _connections.opened_workspace_connection_or_refuse(settings.data_root) as connection:
             media_uri = _catalog.find_media_uri(connection, episode_id, artifact_name)
-        finally:
-            connection.close()
         if media_uri is None:
             raise HTTPException(
                 status_code=404,
@@ -278,22 +257,22 @@ def create_app(settings: UiSettings) -> FastAPI:
             )
         return _served_file_response_or_refuse(media_uri, settings.data_root)
 
-    @application.get("/api/v1/episodes/{episode_id}/canonical")
+    @application.get(
+        "/api/v1/episodes/{episode_id}/canonical",
+        response_class=FileResponse,
+        responses=BINARY_FILE_RESPONSES,
+    )
     def read_episode_canonical(episode_id: str) -> FileResponse:
-        connection = open_connection_or_refuse()
-        try:
+        with _connections.opened_workspace_connection_or_refuse(settings.data_root) as connection:
             canonical_uri = _catalog.find_canonical_uri(connection, episode_id)
-        finally:
-            connection.close()
         if canonical_uri is None:
             raise HTTPException(
                 status_code=404, detail=f"no episode {episode_id!r} in this catalog"
             )
         return _served_file_response_or_refuse(canonical_uri, settings.data_root)
 
-    # M1 curation studio, M2 runs monitor and pipeline routes, and the
-    # visualization routes -- included BEFORE the SPA catch-all below so they
-    # win route matching.
+    # The curation studio, runs monitor, pipeline and visualization routes --
+    # included BEFORE the SPA catch-all below so they win route matching.
     application.include_router(_curation.create_curation_router(settings))
     application.include_router(_runtime.create_runtime_router(settings, runtime_resolver))
     application.include_router(_pipeline.create_pipeline_router(settings, pipeline_state))

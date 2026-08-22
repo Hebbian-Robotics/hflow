@@ -11,7 +11,7 @@ smuggled second statement is a parser error, and every DuckDB parser/binder
 error travels back as a 400 whose detail is DuckDB's own message -- the
 useful part -- never a 500.
 
-Workspace convention (M1): pinned manifests are immutable files at
+Workspace convention: pinned manifests are immutable files at
 ``<data_root>/manifests/<slug>-<utc timestamp>.parquet`` -- never the
 engine's default ``<data_root>/manifest.parquet``, which the CLI's curate
 silently overwrites. A pin refuses loudly rather than overwrite anything.
@@ -26,12 +26,27 @@ from pathlib import Path
 
 import duckdb
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
-from hflow.curation import CurationReport, curate, open_catalog_connection
+from hflow.curation import CurationReport, curate
 from hflow.workspace import Workspace
-from hflow_ui import _catalog, _media, _sidecar
+from hflow_ui import _catalog, _connections, _media, _sidecar
+from hflow_ui._contract import (
+    BINARY_FILE_RESPONSES,
+    CatalogTableDescription,
+    CatalogTableKind,
+    CatalogTablesResponse,
+    CatalogTableSummaryResponse,
+    CheckCoverageEntry,
+    ColumnDescriptor,
+    CurationPreviewResponse,
+    CurationReportResponse,
+    PinnedManifestEntry,
+    PinnedManifestListResponse,
+    SavedQueryEntry,
+    SavedQueryListResponse,
+)
 from hflow_ui._settings import UiSettings
 
 MANIFESTS_DIRECTORY_NAME = "manifests"
@@ -154,36 +169,14 @@ def _sidecar_refusal(error: _sidecar.SidecarError) -> HTTPException:
     return HTTPException(status_code=error.status_code, detail=error.detail)
 
 
-def _open_constrained_connection_or_refuse(data_root: str) -> duckdb.DuckDBPyConnection:
-    """The connection user SQL runs on. Its configuration is locked at open,
-    so the M0 ``SET TimeZone`` pin cannot apply here; timestamp columns are
-    instead rendered to UTC ISO text in SQL (``_timestamp_replace_clause``)."""
-    try:
-        return open_catalog_connection(Workspace.parse(data_root).catalog_root, constrained=True)
-    except FileNotFoundError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-    except ValueError as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
-
-
-def _open_live_connection_or_refuse(data_root: str) -> duckdb.DuckDBPyConnection:
-    """An unconstrained (UTC-pinned) connection for the server's OWN queries."""
-    try:
-        return _catalog.open_workspace_connection(data_root)
-    except FileNotFoundError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-    except ValueError as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
-
-
 def _described_columns(
     connection: duckdb.DuckDBPyConnection, user_sql: str
-) -> list[dict[str, str]]:
+) -> list[ColumnDescriptor]:
     described_rows = connection.execute(f"DESCRIBE SELECT * FROM ({user_sql})").fetchall()
-    return [{"name": str(row[0]), "type": str(row[1])} for row in described_rows]
+    return [ColumnDescriptor(name=str(row[0]), type=str(row[1])) for row in described_rows]
 
 
-def _timestamp_replace_clause(columns: list[dict[str, str]]) -> str:
+def _timestamp_replace_clause(columns: list[ColumnDescriptor]) -> str:
     """A ``* REPLACE (...)`` clause rendering TIMESTAMPTZ results as ISO UTC text.
 
     Materializing a TIMESTAMPTZ into Python requires pytz (deliberately not a
@@ -194,20 +187,20 @@ def _timestamp_replace_clause(columns: list[dict[str, str]]) -> str:
     """
     replacements: list[str] = []
     for column in columns:
-        quoted_name = _catalog.quoted_identifier(column["name"])
-        if column["type"] == _TIMESTAMPTZ_TYPE:
+        quoted_name = _catalog.quoted_identifier(column.name)
+        if column.type == _TIMESTAMPTZ_TYPE:
             replacements.append(
                 f"strftime({quoted_name} AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%S.%f') "
                 f"|| '+00:00' AS {quoted_name}"
             )
-        elif _TIMESTAMPTZ_TYPE in column["type"]:
+        elif _TIMESTAMPTZ_TYPE in column.type:
             replacements.append(f"CAST({quoted_name} AS VARCHAR) AS {quoted_name}")
     return f"REPLACE ({', '.join(replacements)})" if replacements else ""
 
 
 def run_preview(
     connection: duckdb.DuckDBPyConnection, user_sql: str, *, limit: int, include_stats: bool
-) -> dict[str, object]:
+) -> CurationPreviewResponse:
     """Preview rows, the full count, and (optionally) SUMMARIZE column stats."""
     columns = _described_columns(connection, user_sql)
     replace_clause = _timestamp_replace_clause(columns)
@@ -229,14 +222,14 @@ def run_preview(
         if include_stats
         else None
     )
-    return {
-        "columns": columns,
-        "rows": rows,
-        "row_count": row_count,
-        "truncated": row_count > len(rows),
-        "column_stats": column_stats,
-        "sql": f"SELECT * FROM ({user_sql}) LIMIT {limit}",
-    }
+    return CurationPreviewResponse(
+        columns=columns,
+        rows=rows,
+        row_count=row_count,
+        truncated=row_count > len(rows),
+        column_stats=column_stats,
+        sql=f"SELECT * FROM ({user_sql}) LIMIT {limit}",
+    )
 
 
 def _curated_or_refused(data_root: str, user_sql: str, *, output: Path | None) -> CurationReport:
@@ -244,28 +237,27 @@ def _curated_or_refused(data_root: str, user_sql: str, *, output: Path | None) -
         return curate(
             Workspace.parse(data_root).catalog_root, user_sql, output=output, constrained=True
         )
-    except FileNotFoundError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-    except ValueError as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
+    except (FileNotFoundError, ValueError) as error:
+        raise _connections.catalog_unavailable_refusal(error) from error
     except duckdb.Error as error:
         raise _bad_sql_refusal(error) from error
 
 
-def _coverage_entries(report: CurationReport) -> tuple[_sidecar.CoverageEntry, ...]:
-    return tuple(
-        _sidecar.CoverageEntry(
+def _coverage_entries(report: CurationReport) -> list[CheckCoverageEntry]:
+    """One curation report's coverage as the served (and pinned) entries."""
+    return [
+        CheckCoverageEntry(
             check_name=entry.check_name,
             episodes_ran=entry.episodes_ran,
             total_episodes=entry.total_episodes,
             fraction=entry.fraction,
         )
         for entry in report.coverage
-    )
+    ]
 
 
 def create_curation_router(settings: UiSettings) -> APIRouter:
-    """Every M1 curation-studio route, closed over one launch's settings."""
+    """Every curation-studio route, closed over one launch's settings."""
     router = APIRouter(prefix="/api/v1")
     # FastAPI runs these sync endpoints on a threadpool, so two overlapping
     # writes (double-submit, two tabs) would both read the same base sidecar
@@ -301,35 +293,30 @@ def create_curation_router(settings: UiSettings) -> APIRouter:
             raise _sidecar_refusal(error) from error
 
     @router.post("/curation/preview")
-    def run_curation_preview(request: PreviewRequest) -> JSONResponse:
+    def run_curation_preview(request: PreviewRequest) -> CurationPreviewResponse:
         user_sql = _stripped_sql_or_refuse(request.sql)
         _reject_non_single_select(user_sql)
-        connection = _open_constrained_connection_or_refuse(settings.data_root)
-        try:
-            payload = run_preview(
-                connection, user_sql, limit=request.limit, include_stats=request.stats
-            )
-        except duckdb.Error as error:
-            raise _bad_sql_refusal(error) from error
-        finally:
-            connection.close()
-        return JSONResponse(payload)
+        with _connections.opened_constrained_connection_or_refuse(settings.data_root) as connection:
+            try:
+                return run_preview(
+                    connection, user_sql, limit=request.limit, include_stats=request.stats
+                )
+            except duckdb.Error as error:
+                raise _bad_sql_refusal(error) from error
 
     @router.post("/curation/report")
-    def run_curation_report(request: ReportRequest) -> JSONResponse:
+    def run_curation_report(request: ReportRequest) -> CurationReportResponse:
         user_sql = _stripped_sql_or_refuse(request.sql)
         _reject_non_single_select(user_sql)
         report = _curated_or_refused(settings.data_root, user_sql, output=None)
-        return JSONResponse(
-            {
-                "row_count": report.row_count,
-                "total_episodes": report.total_episodes,
-                "coverage": [entry.to_json_dict() for entry in _coverage_entries(report)],
-            }
+        return CurationReportResponse(
+            row_count=report.row_count,
+            total_episodes=report.total_episodes,
+            coverage=_coverage_entries(report),
         )
 
     @router.post("/curation/pin")
-    def pin_manifest(request: PinRequest) -> JSONResponse:
+    def pin_manifest(request: PinRequest) -> PinnedManifestEntry:
         refuse_when_read_only()
         user_sql = _stripped_sql_or_refuse(request.sql)
         _reject_non_single_select(user_sql)
@@ -357,7 +344,7 @@ def create_curation_router(settings: UiSettings) -> APIRouter:
                     "pinned manifests are immutable and never overwritten -- retry the pin",
                 )
             report = _curated_or_refused(settings.data_root, user_sql, output=manifest_file)
-            entry = _sidecar.PinnedManifest(
+            entry = PinnedManifestEntry(
                 manifest_id=uuid.uuid4().hex,
                 name=request.name,
                 description=request.description,
@@ -373,15 +360,19 @@ def create_curation_router(settings: UiSettings) -> APIRouter:
                     saved_queries=state.saved_queries, manifests=(*state.manifests, entry)
                 )
             )
-        return JSONResponse(entry.to_json_dict())
+        return entry
 
     @router.get("/manifests")
-    def list_manifests() -> JSONResponse:
+    def list_manifests() -> PinnedManifestListResponse:
         state = loaded_sidecar_state()
         newest_first = sorted(state.manifests, key=lambda entry: entry.created_at, reverse=True)
-        return JSONResponse({"manifests": [entry.to_json_dict() for entry in newest_first]})
+        return PinnedManifestListResponse(manifests=newest_first)
 
-    @router.get("/manifests/{manifest_id}/download")
+    @router.get(
+        "/manifests/{manifest_id}/download",
+        response_class=FileResponse,
+        responses=BINARY_FILE_RESPONSES,
+    )
     def download_manifest(manifest_id: str) -> FileResponse:
         state = loaded_sidecar_state()
         entry = next(
@@ -406,17 +397,17 @@ def create_curation_router(settings: UiSettings) -> APIRouter:
         )
 
     @router.get("/queries")
-    def list_saved_queries() -> JSONResponse:
+    def list_saved_queries() -> SavedQueryListResponse:
         state = loaded_sidecar_state()
-        return JSONResponse({"queries": [entry.to_json_dict() for entry in state.saved_queries]})
+        return SavedQueryListResponse(queries=list(state.saved_queries))
 
     @router.post("/queries")
-    def create_saved_query(request: SavedQueryCreateRequest) -> JSONResponse:
+    def create_saved_query(request: SavedQueryCreateRequest) -> SavedQueryEntry:
         refuse_when_read_only()
         query_name = request.name.strip()
         if not query_name:
             raise HTTPException(status_code=400, detail="name must be non-empty")
-        entry = _sidecar.SavedQuery(
+        entry = SavedQueryEntry(
             query_id=uuid.uuid4().hex,
             name=query_name,
             sql=_stripped_sql_or_refuse(request.sql),
@@ -435,10 +426,10 @@ def create_curation_router(settings: UiSettings) -> APIRouter:
                     saved_queries=(*state.saved_queries, entry), manifests=state.manifests
                 )
             )
-        return JSONResponse(entry.to_json_dict())
+        return entry
 
     @router.put("/queries/{query_id}")
-    def update_saved_query(query_id: str, request: SavedQueryUpdateRequest) -> JSONResponse:
+    def update_saved_query(query_id: str, request: SavedQueryUpdateRequest) -> SavedQueryEntry:
         refuse_when_read_only()
         with sidecar_write_lock:
             state = loaded_sidecar_state()
@@ -455,7 +446,7 @@ def create_curation_router(settings: UiSettings) -> APIRouter:
             updated_sql = (
                 _stripped_sql_or_refuse(request.sql) if request.sql is not None else existing.sql
             )
-            updated_entry = _sidecar.SavedQuery(
+            updated_entry = SavedQueryEntry(
                 query_id=query_id, name=updated_name, sql=updated_sql, updated_at=_utc_now_iso()
             )
             stored_sidecar_state(
@@ -467,7 +458,7 @@ def create_curation_router(settings: UiSettings) -> APIRouter:
                     manifests=state.manifests,
                 )
             )
-        return JSONResponse(updated_entry.to_json_dict())
+        return updated_entry
 
     @router.delete("/queries/{query_id}", status_code=204)
     def delete_saved_query(query_id: str) -> Response:
@@ -487,35 +478,33 @@ def create_curation_router(settings: UiSettings) -> APIRouter:
         return Response(status_code=204)
 
     @router.get("/catalog/tables")
-    def list_catalog_tables() -> JSONResponse:
-        connection = _open_live_connection_or_refuse(settings.data_root)
-        try:
+    def list_catalog_tables() -> CatalogTablesResponse:
+        with _connections.opened_workspace_connection_or_refuse(settings.data_root) as connection:
             kind_rows = connection.execute(
                 "SELECT table_name, table_type FROM information_schema.tables"
             ).fetchall()
-            kind_by_name = {
+            kind_by_name: dict[str, CatalogTableKind] = {
                 str(table_name): ("view" if str(table_type).upper() == "VIEW" else "table")
                 for table_name, table_type in kind_rows
             }
-            tables = [
-                {
-                    "name": table_name,
-                    "kind": kind_by_name.get(table_name, "view"),
-                    "columns": [
-                        {"name": str(row[0]), "type": str(row[1])}
-                        for row in connection.execute(
-                            f"DESCRIBE {_catalog.quoted_identifier(table_name)}"
-                        ).fetchall()
-                    ],
-                }
-                for table_name in CATALOG_TABLE_NAMES
-            ]
-        finally:
-            connection.close()
-        return JSONResponse({"tables": tables})
+            return CatalogTablesResponse(
+                tables=[
+                    CatalogTableDescription(
+                        name=table_name,
+                        kind=kind_by_name.get(table_name, "view"),
+                        columns=[
+                            ColumnDescriptor(name=str(row[0]), type=str(row[1]))
+                            for row in connection.execute(
+                                f"DESCRIBE {_catalog.quoted_identifier(table_name)}"
+                            ).fetchall()
+                        ],
+                    )
+                    for table_name in CATALOG_TABLE_NAMES
+                ]
+            )
 
     @router.get("/catalog/tables/{table_name}/summary")
-    def read_catalog_table_summary(table_name: str) -> JSONResponse:
+    def read_catalog_table_summary(table_name: str) -> CatalogTableSummaryResponse:
         # Identifier-validated against the fixed table list: anything else --
         # including SQL-shaped names -- is simply an unknown table.
         if table_name not in CATALOG_TABLE_NAMES:
@@ -525,15 +514,13 @@ def create_curation_router(settings: UiSettings) -> APIRouter:
                 f"one of: {', '.join(CATALOG_TABLE_NAMES)}",
             )
         quoted_table = _catalog.quoted_identifier(table_name)
-        connection = _open_live_connection_or_refuse(settings.data_root)
-        try:
+        with _connections.opened_workspace_connection_or_refuse(settings.data_root) as connection:
             count_row = connection.execute(f"SELECT count(*) FROM {quoted_table}").fetchone()
-            row_count = int(count_row[0]) if count_row is not None else 0
-            summary_rows = _catalog.fetched_json_safe_rows(
-                connection.execute(f"SUMMARIZE SELECT * FROM {quoted_table}")
+            return CatalogTableSummaryResponse(
+                row_count=int(count_row[0]) if count_row is not None else 0,
+                columns=_catalog.fetched_json_safe_rows(
+                    connection.execute(f"SUMMARIZE SELECT * FROM {quoted_table}")
+                ),
             )
-        finally:
-            connection.close()
-        return JSONResponse({"row_count": row_count, "columns": summary_rows})
 
     return router

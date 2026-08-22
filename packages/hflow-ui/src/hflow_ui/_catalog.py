@@ -22,16 +22,43 @@ import math
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
+from typing import TypeVar
 from urllib.parse import quote
 
 import duckdb
+from pydantic import BaseModel
 
 from hflow.app import ARTIFACT_MEASUREMENT_KEY_PREFIX, MEDIA_CONTACT_SHEET_STEP_NAME
 from hflow.curation import open_catalog_connection
 from hflow.workspace import Workspace
+from hflow_ui._contract import (
+    CategoricalColumnStats,
+    ColumnDescriptor,
+    DossierEpisode,
+    EpisodeCheckRunRecord,
+    EpisodeColumnStats,
+    EpisodeDossierResponse,
+    EpisodeFacetsResponse,
+    EpisodeIntervalRecord,
+    EpisodeMeasurementRecord,
+    EpisodeMediaArtifact,
+    EpisodePageResponse,
+    EpisodeStatsResponse,
+    EpisodeStatus,
+    EpisodeTagRecord,
+    EpisodeTimelineResponse,
+    NumericColumnStats,
+    NumericHistogramBucket,
+    SuccessFilterValue,
+    TimelineInterval,
+    TimelineMeasurement,
+    ValueCount,
+)
 from hflow_ui._media import is_uri_servable
 
-_FACET_COLUMN_NAMES = ("task", "operator", "embodiment", "status", "pipeline_version")
+# The faceted columns, owned by the response model itself so the served keys
+# and the columns actually counted can never diverge.
+_FACET_COLUMN_NAMES = tuple(EpisodeFacetsResponse.model_fields)
 _SEARCHED_COLUMN_NAMES = ("episode_id", "task", "operator")
 
 # %z renders the locked-UTC offset as "+00" on DuckDB 1.5.5, which JS
@@ -106,26 +133,47 @@ def fetched_json_safe_rows(executed_query: duckdb.DuckDBPyConnection) -> list[di
     ]
 
 
+_ContractRecord = TypeVar("_ContractRecord", bound=BaseModel)
+
+
+def _validated_records(
+    record_model: type[_ContractRecord], executed_query: duckdb.DuckDBPyConnection
+) -> list[_ContractRecord]:
+    """A fixed-column query's rows as contract records.
+
+    Rows pass through :func:`json_safe_value` first, so a NaN double is
+    already null by the time the model sees it.
+    """
+    return [record_model.model_validate(row) for row in fetched_json_safe_rows(executed_query)]
+
+
 @dataclass(frozen=True)
 class EpisodeListFilters:
-    """Parsed /api/v1/episodes filter params -- values only, never SQL."""
+    """Parsed /api/v1/episodes filter params -- values only, never SQL.
+
+    ``status`` and ``success`` keep the refined types the HTTP boundary
+    already parsed them into: this layer never re-checks them, and a caller
+    cannot hand it a spelling the SQL below would silently match nothing for.
+    """
 
     tasks: tuple[str, ...] = ()
     operators: tuple[str, ...] = ()
     embodiments: tuple[str, ...] = ()
-    status: str | None = None
-    success: str | None = None
+    status: EpisodeStatus | None = None
+    success: SuccessFilterValue | None = None
     search: str | None = None
 
 
-@dataclass(frozen=True)
-class EpisodePage:
-    """One page of the wide episodes view, ready to serialize."""
+def episode_status_for_quarantine_flag(quarantined: object) -> EpisodeStatus:
+    """One episode's status derived from its stored ``quarantined`` flag.
 
-    rows: list[dict[str, object]]
-    total: int
-    columns: list[dict[str, str]]
-    sql: str
+    hflow.curation owns the CANONICAL rule as SQL -- the wide ``episodes``
+    view's ``CASE WHEN quarantined THEN 'quarantined' ELSE 'ok' END``. The
+    dossier reads ``episodes_latest``, which carries the raw flag instead of
+    that derived column, so this is the UI's single Python restatement of the
+    rule; every path that needs a status from a flag calls here.
+    """
+    return "quarantined" if quarantined else "ok"
 
 
 def quoted_identifier(column_name: str) -> str:
@@ -215,10 +263,10 @@ def _compiled_conditions(filters: EpisodeListFilters) -> _CompiledFilters:
     )
 
 
-def described_episode_columns(connection: duckdb.DuckDBPyConnection) -> list[dict[str, str]]:
-    """The wide view's live columns as ``{"name", "type"}`` pairs."""
+def described_episode_columns(connection: duckdb.DuckDBPyConnection) -> list[ColumnDescriptor]:
+    """The wide view's live columns."""
     return [
-        {"name": str(row[0]), "type": str(row[1])}
+        ColumnDescriptor(name=str(row[0]), type=str(row[1]))
         for row in connection.execute("DESCRIBE episodes").fetchall()
     ]
 
@@ -231,10 +279,10 @@ def query_episode_page(
     descending: bool,
     limit: int,
     offset: int,
-) -> EpisodePage:
+) -> EpisodePageResponse:
     """One filtered, ordered page plus the total over the SAME filters."""
     columns = described_episode_columns(connection)
-    live_column_names = {column["name"] for column in columns}
+    live_column_names = {column.name for column in columns}
     if order_by not in live_column_names:
         raise UnknownOrderColumnError(
             f"unknown order_by column {order_by!r}; order by one of the episodes view's "
@@ -262,14 +310,12 @@ def query_episode_page(
         f"SELECT count(*) FROM episodes{compiled.executed_where()}", compiled.parameters
     ).fetchone()
     total = int(count_row[0]) if count_row is not None else 0
-    return EpisodePage(rows=rows, total=total, columns=columns, sql=display_sql)
+    return EpisodePageResponse(rows=rows, total=total, columns=columns, sql=display_sql)
 
 
-def query_episode_facets(
-    connection: duckdb.DuckDBPyConnection,
-) -> dict[str, list[dict[str, object]]]:
+def query_episode_facets(connection: duckdb.DuckDBPyConnection) -> EpisodeFacetsResponse:
     """Facet value counts over the wide episodes view; NULL buckets skipped."""
-    facets: dict[str, list[dict[str, object]]] = {}
+    facets: dict[str, list[ValueCount]] = {}
     for facet_column_name in _FACET_COLUMN_NAMES:
         quoted_column = quoted_identifier(facet_column_name)
         value_counts = connection.execute(
@@ -278,9 +324,9 @@ def query_episode_facets(
             "GROUP BY 1 ORDER BY value_count DESC, value ASC"
         ).fetchall()
         facets[facet_column_name] = [
-            {"value": str(value), "count": int(count)} for value, count in value_counts
+            ValueCount(value=str(value), count=int(count)) for value, count in value_counts
         ]
-    return facets
+    return EpisodeFacetsResponse.model_validate(facets)
 
 
 # /api/v1/episodes/stats shape knobs: ~12 histogram buckets per numeric
@@ -342,7 +388,7 @@ class _CategoricalColumnPlan:
 
 def query_episode_stats(
     connection: duckdb.DuckDBPyConnection, filters: EpisodeListFilters
-) -> dict[str, object]:
+) -> EpisodeStatsResponse:
     """Per-column mini-distributions over the CURRENT filter set.
 
     Reuses the episode list's filter compilation (one source of truth), so
@@ -357,12 +403,12 @@ def query_episode_stats(
     parameters = compiled.parameters
     where_sql = compiled.executed_where()
     candidate_columns = [
-        (column["name"], kind)
+        (column.name, kind)
         for column in described_episode_columns(connection)
-        if (kind := _stat_kind(column["type"])) is not None
+        if (kind := _stat_kind(column.type)) is not None
     ]
     if not candidate_columns:
-        return {"columns": []}
+        return EpisodeStatsResponse(columns=[])
 
     aggregate_expressions: list[str] = []
     for column_name, kind in candidate_columns:
@@ -383,7 +429,7 @@ def query_episode_stats(
         f"SELECT {', '.join(aggregate_expressions)} FROM episodes{where_sql}", parameters
     ).fetchone()
     if aggregate_row is None:
-        return {"columns": []}
+        return EpisodeStatsResponse(columns=[])
 
     plans: list[_NumericColumnPlan | _CategoricalColumnPlan] = []
     value_index = 0
@@ -418,7 +464,7 @@ def query_episode_stats(
                 continue
             plans.append(_CategoricalColumnPlan(name=column_name, non_null_count=non_null_count))
     if not plans:
-        return {"columns": []}
+        return EpisodeStatsResponse(columns=[])
 
     union_branches: list[str] = []
     for plan in plans:
@@ -459,27 +505,26 @@ def query_episode_stats(
         else:
             value_counts_by_column.setdefault(str(column_name), []).append((str(value), int(count)))
 
-    stat_columns: list[dict[str, object]] = []
+    stat_columns: list[EpisodeColumnStats] = []
     for plan in plans:
         if isinstance(plan, _NumericColumnPlan):
             bucket_counts = bucket_counts_by_column.get(plan.name, {})
             stat_columns.append(
-                {
-                    "name": plan.name,
-                    "kind": "numeric",
-                    "buckets": [
-                        {
-                            "lo": plan.minimum + index * plan.bucket_width,
-                            "hi": (
+                NumericColumnStats(
+                    name=plan.name,
+                    buckets=[
+                        NumericHistogramBucket(
+                            lo=plan.minimum + index * plan.bucket_width,
+                            hi=(
                                 plan.maximum
                                 if index == HISTOGRAM_BUCKET_COUNT - 1
                                 else plan.minimum + (index + 1) * plan.bucket_width
                             ),
-                            "count": bucket_counts.get(index, 0),
-                        }
+                            count=bucket_counts.get(index, 0),
+                        )
                         for index in range(HISTOGRAM_BUCKET_COUNT)
                     ],
-                }
+                )
             )
         else:
             # UNION ALL guarantees no cross-branch order; re-rank here.
@@ -488,14 +533,13 @@ def query_episode_stats(
                 key=lambda entry: (-entry[1], entry[0]),
             )
             stat_columns.append(
-                {
-                    "name": plan.name,
-                    "kind": "categorical",
-                    "values": [{"value": value, "count": count} for value, count in top_values],
-                    "other_count": plan.non_null_count - sum(count for _value, count in top_values),
-                }
+                CategoricalColumnStats(
+                    name=plan.name,
+                    values=[ValueCount(value=value, count=count) for value, count in top_values],
+                    other_count=plan.non_null_count - sum(count for _value, count in top_values),
+                )
             )
-    return {"columns": stat_columns}
+    return EpisodeStatsResponse(columns=stat_columns)
 
 
 def find_media_uri(
@@ -524,7 +568,7 @@ def find_canonical_uri(connection: duckdb.DuckDBPyConnection, episode_id: str) -
 
 def query_latest_run_intervals(
     connection: duckdb.DuckDBPyConnection, episode_id: str
-) -> list[dict[str, object]]:
+) -> list[EpisodeIntervalRecord]:
     """One episode's intervals from its LATEST run -- the current evidence.
 
     ``check_version`` rides in from that run's ``check_runs`` row because the
@@ -532,7 +576,8 @@ def query_latest_run_intervals(
     dossier and the timeline must never disagree about which run's intervals
     an episode "has".
     """
-    return fetched_json_safe_rows(
+    return _validated_records(
+        EpisodeIntervalRecord,
         connection.execute(
             """
             SELECT i.label, i.start_ns, i.end_ns, i.check_name, r.check_version
@@ -546,13 +591,13 @@ def query_latest_run_intervals(
             ORDER BY i.start_ns, i.label
             """,
             [episode_id],
-        )
+        ),
     )
 
 
 def query_episode_dossier(
     connection: duckdb.DuckDBPyConnection, episode_id: str, *, data_root: str
-) -> dict[str, object] | None:
+) -> EpisodeDossierResponse | None:
     """Everything the episode page shows, or ``None`` when the id is unknown."""
     episode_rows = fetched_json_safe_rows(
         connection.execute(
@@ -568,32 +613,37 @@ def query_episode_dossier(
     quarantine_tags = (
         [str(tag) for tag in json.loads(str(raw_quarantine_tags))] if raw_quarantine_tags else []
     )
-    episode: dict[str, object] = {
-        **episode_row,
-        "status": "quarantined" if episode_row.get("quarantined") else "ok",
-        "quarantine_tags": quarantine_tags,
-    }
+    episode = DossierEpisode.model_validate(
+        {
+            **episode_row,
+            "status": episode_status_for_quarantine_flag(episode_row.get("quarantined")),
+            "quarantine_tags": quarantine_tags,
+        }
+    )
 
-    measurements = fetched_json_safe_rows(
+    measurements = _validated_records(
+        EpisodeMeasurementRecord,
         connection.execute(
             "SELECT key, value_double, value_text, value_bool, check_name, check_version, "
             f"{_recorded_at_as_iso_text()} "
             "FROM measurements_latest WHERE episode_id = ? ORDER BY key",
             [episode_id],
-        )
+        ),
     )
-    check_runs = fetched_json_safe_rows(
+    check_runs = _validated_records(
+        EpisodeCheckRunRecord,
         connection.execute(
             "SELECT check_name, check_version, critical, status, duration_s, error, "
             f"{_recorded_at_as_iso_text()}, run_fingerprint "
             "FROM check_runs WHERE episode_id = ? ORDER BY recorded_at DESC, check_name ASC",
             [episode_id],
-        )
+        ),
     )
     # Intervals and tags are the episode's LATEST run only -- the current
     # evidence.
     intervals = query_latest_run_intervals(connection, episode_id)
-    tags = fetched_json_safe_rows(
+    tags = _validated_records(
+        EpisodeTagRecord,
         connection.execute(
             f"SELECT t.tag, t.check_name, {_recorded_at_as_iso_text('t.recorded_at')} "
             "FROM tags AS t "
@@ -601,7 +651,7 @@ def query_episode_dossier(
             "  ON t.episode_id = e.episode_id AND t.run_fingerprint = e.run_fingerprint "
             "WHERE t.episode_id = ? ORDER BY t.tag",
             [episode_id],
-        )
+        ),
     )
     history = fetched_json_safe_rows(
         connection.execute(
@@ -619,7 +669,7 @@ def query_episode_dossier(
         [episode_id, MEDIA_CONTACT_SHEET_STEP_NAME, ARTIFACT_MEASUREMENT_KEY_PREFIX + "%"],
     ).fetchall()
     quoted_episode_id = quote(episode_id, safe="")
-    media: list[dict[str, object]] = []
+    media: list[EpisodeMediaArtifact] = []
     for key, artifact_uri in media_rows:
         artifact_name = str(key).removeprefix(ARTIFACT_MEASUREMENT_KEY_PREFIX)
         served_url = (
@@ -627,7 +677,9 @@ def query_episode_dossier(
             if is_uri_servable(str(artifact_uri), data_root=data_root)
             else None
         )
-        media.append({"name": artifact_name, "uri": str(artifact_uri), "url": served_url})
+        media.append(
+            EpisodeMediaArtifact(name=artifact_name, uri=str(artifact_uri), url=served_url)
+        )
 
     canonical_uri = episode_row.get("uri")
     canonical_url = (
@@ -635,16 +687,16 @@ def query_episode_dossier(
         if isinstance(canonical_uri, str) and is_uri_servable(canonical_uri, data_root=data_root)
         else None
     )
-    return {
-        "episode": episode,
-        "measurements": measurements,
-        "check_runs": check_runs,
-        "intervals": intervals,
-        "tags": tags,
-        "history": history,
-        "media": media,
-        "canonical_url": canonical_url,
-    }
+    return EpisodeDossierResponse(
+        episode=episode,
+        measurements=measurements,
+        check_runs=check_runs,
+        intervals=intervals,
+        tags=tags,
+        history=history,
+        media=media,
+        canonical_url=canonical_url,
+    )
 
 
 NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -721,7 +773,7 @@ def _duration_nanoseconds(key: str, value: float) -> float | None:
     return value * unit_scale
 
 
-def _interval_kind(label: object, check_name: object) -> str:
+def _interval_kind(label: str | None, check_name: str | None) -> str:
     """The colour group for one interval label.
 
     Labels are conventionally ``<kind>:<topic>`` (``gap:/imu``,
@@ -729,20 +781,14 @@ def _interval_kind(label: object, check_name: object) -> str:
     label with no prefix groups by itself; an empty label falls back to the
     check that produced it, which is the only honest grouping left.
     """
-    text = str(label).strip() if isinstance(label, str) else ""
+    text = label.strip() if label is not None else ""
     if not text:
-        return str(check_name) if isinstance(check_name, str) and check_name else "interval"
+        return check_name if check_name else "interval"
     prefix = text.split(":", 1)[0].strip()
     return prefix or text
 
 
-def _nanoseconds_or_none(value: object) -> int | None:
-    """One interval bound as an int, or None when the row does not carry one."""
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-def _relative_seconds(time_ns: object, span_start_ns: int | None) -> float | None:
-    absolute_ns = _nanoseconds_or_none(time_ns)
+def _relative_seconds(absolute_ns: int | None, span_start_ns: int | None) -> float | None:
     if span_start_ns is None or absolute_ns is None:
         return None
     return (absolute_ns - span_start_ns) / NANOSECONDS_PER_SECOND
@@ -750,7 +796,7 @@ def _relative_seconds(time_ns: object, span_start_ns: int | None) -> float | Non
 
 def query_episode_timeline(
     connection: duckdb.DuckDBPyConnection, episode_id: str
-) -> dict[str, object] | None:
+) -> EpisodeTimelineResponse | None:
     """One episode's time axis, computed server-side (``None`` when unknown).
 
     The span comes from the latest run's intervals, extended by any duration
@@ -780,16 +826,8 @@ def query_episode_timeline(
         if isinstance(value, int | float) and math.isfinite(float(value))
     ]
 
-    interval_starts = [
-        row_start_ns
-        for row in interval_rows
-        if (row_start_ns := _nanoseconds_or_none(row.get("start_ns"))) is not None
-    ]
-    interval_ends = [
-        row_end_ns
-        for row in interval_rows
-        if (row_end_ns := _nanoseconds_or_none(row.get("end_ns"))) is not None
-    ]
+    interval_starts = [row.start_ns for row in interval_rows if row.start_ns is not None]
+    interval_ends = [row.end_ns for row in interval_rows if row.end_ns is not None]
     # Several duration-ish measurements: the largest wins, because the span
     # must contain every interval AND every claimed duration.
     claimed_durations_ns = [
@@ -814,28 +852,26 @@ def query_episode_timeline(
         if start_ns is not None and end_ns is not None
         else None
     )
-    return {
-        "start_ns": start_ns,
-        "end_ns": end_ns,
-        "duration_s": duration_s,
-        "intervals": [
-            {
-                "label": row.get("label"),
-                "start_ns": row.get("start_ns"),
-                "end_ns": row.get("end_ns"),
-                "start_s": _relative_seconds(row.get("start_ns"), start_ns),
-                "end_s": _relative_seconds(row.get("end_ns"), start_ns),
-                "check_name": row.get("check_name"),
-                "kind": _interval_kind(row.get("label"), row.get("check_name")),
-            }
+    return EpisodeTimelineResponse(
+        start_ns=start_ns,
+        end_ns=end_ns,
+        duration_s=duration_s,
+        intervals=[
+            TimelineInterval(
+                label=row.label,
+                start_ns=row.start_ns,
+                end_ns=row.end_ns,
+                start_s=_relative_seconds(row.start_ns, start_ns),
+                end_s=_relative_seconds(row.end_ns, start_ns),
+                check_name=row.check_name,
+                kind=_interval_kind(row.label, row.check_name),
+            )
             for row in interval_rows
         ],
-        "measurements": [
-            {
-                "key": key,
-                "value": value,
-                "unit": _UNIT_BY_KEY_SUFFIX.get(_measurement_key_suffix(key)),
-            }
+        measurements=[
+            TimelineMeasurement(
+                key=key, value=value, unit=_UNIT_BY_KEY_SUFFIX.get(_measurement_key_suffix(key))
+            )
             for key, value in numeric_measurements
         ],
-    }
+    )

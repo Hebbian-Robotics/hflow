@@ -31,7 +31,7 @@ def test_config_reports_local_mode_and_capabilities(
 ) -> None:
     payload = api.get("/api/v1/config").json()
     assert payload["mode"] == "local"
-    assert payload["read_only"] is False  # M1: the default server accepts writes
+    assert payload["read_only"] is False  # the default server accepts writes
     assert isinstance(payload["hflow_version"], str) and payload["hflow_version"]
     assert payload["hflow_ui_version"] == "0.1.0"
     assert payload["data_root"] == str(populated_workspace.data_root)
@@ -41,15 +41,16 @@ def test_config_reports_local_mode_and_capabilities(
         "runtime": False,  # no bundle rendered and no HFLOW_AIRFLOW_URL exported
         "pipeline": False,  # no --pipeline configured
     }
-    assert payload["airflow_web_url"] is None
     # The trigger form's vocabularies come from the server, never hardcoded.
     assert "full" in payload["run_profiles"]
     assert payload["ingest_modes"] == ["batch", "online"]
 
 
-def test_config_runtime_capability_from_a_rendered_bundle(
+def test_config_does_not_restate_the_airflow_deep_link_base(
     tmp_path: Path, unbuilt_assets_dir: Path, no_ambient_runtime: None
 ) -> None:
+    # /runtime/status is the ONE owner of the runtime's addressing facts, the
+    # web URL included; config only reports whether a runtime is addressed.
     data_root = tmp_path / "data"
     pipeline_file = tmp_path / "demo_pipeline.py"
     pipeline_file.write_text("import hflow\n\napp = hflow.App('demo', data_root='/tmp/x')\n")
@@ -60,8 +61,7 @@ def test_config_runtime_capability_from_a_rendered_bundle(
     payload = TestClient(create_app(settings)).get("/api/v1/config").json()
     # Configured, not necessarily reachable: nothing is running here.
     assert payload["capabilities"]["runtime"] is True
-    # The deep-link base is what the bundle itself records (.env API_PORT).
-    assert payload["airflow_web_url"] == "http://127.0.0.1:8080"
+    assert "airflow_web_url" not in payload
 
 
 def test_config_runtime_capability_from_the_remote_environment(
@@ -76,7 +76,6 @@ def test_config_runtime_capability_from_the_remote_environment(
     settings = UiSettings(data_root=str(data_root), token=None, assets_dir=unbuilt_assets_dir)
     payload = TestClient(create_app(settings)).get("/api/v1/config").json()
     assert payload["capabilities"]["runtime"] is True
-    assert payload["airflow_web_url"] is None  # only a local bundle records one
 
 
 def test_config_reports_the_read_only_setting(read_only_api: TestClient) -> None:

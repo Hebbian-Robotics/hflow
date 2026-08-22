@@ -32,7 +32,6 @@ from math import isfinite
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import JSONResponse
 
 from hflow.app import MEDIA_CONTACT_SHEET_STEP_NAME
 from hflow.manifest import PipelineManifest, StepManifest
@@ -46,8 +45,30 @@ from hflow.runtime import (
     ingest_dag_topology,
 )
 from hflow.steps import Stage
+from hflow_ui._contract import (
+    DagTaskNodePayload,
+    DagTopologyPayload,
+    MappedFanOutSummary,
+    PipelineEngineStep,
+    PipelineGraphResponse,
+    PipelineGraphStage,
+    PipelineUserStep,
+    QuarantineGate,
+    RunGraphMaster,
+    RunGraphResponse,
+    RunGraphStage,
+    RunTaskInstance,
+    StageRunMatch,
+    StepTier,
+)
 from hflow_ui._pipeline import PipelineState
-from hflow_ui._runtime import ResolvedRuntime, RuntimeResolver, client_error_detail
+from hflow_ui._runtime import (
+    ResolvedRuntime,
+    RuntimeResolver,
+    airflow_failure_refusal,
+    optional_string,
+    resolved_runtime_or_refuse,
+)
 
 # The display copy for the four stages. Restated here (rather than imported
 # from hflow.runtime._bundle's STAGE_TITLES/STAGE_DESCRIPTIONS, which are
@@ -81,21 +102,21 @@ _STAGE_RUN_SEARCH_LIMIT = 25
 _UNSET_TASK_STATE = "no_status"
 
 
-def _dag_task_node_json(node: DagTaskNode) -> dict[str, object]:
-    return {
-        "task_id": node.task_id,
-        "summary": node.summary,
-        "mapped": node.mapped,
-        "deferred": node.deferred,
-    }
+def _dag_task_node_payload(node: DagTaskNode) -> DagTaskNodePayload:
+    return DagTaskNodePayload(
+        task_id=node.task_id,
+        summary=node.summary,
+        mapped=node.mapped,
+        deferred=node.deferred,
+    )
 
 
-def _dag_topology_json(topology: DagTopology) -> dict[str, object]:
-    return {
-        "dag_id": topology.dag_id,
-        "tasks": [_dag_task_node_json(node) for node in topology.tasks],
-        "edges": [[upstream, downstream] for upstream, downstream in topology.edges],
-    }
+def _dag_topology_payload(topology: DagTopology) -> DagTopologyPayload:
+    return DagTopologyPayload(
+        dag_id=topology.dag_id,
+        tasks=[_dag_task_node_payload(node) for node in topology.tasks],
+        edges=[(upstream, downstream) for upstream, downstream in topology.edges],
+    )
 
 
 def _display_master_dag_id(pipeline_name: str | None) -> str:
@@ -111,7 +132,7 @@ def _display_master_dag_id(pipeline_name: str | None) -> str:
     return sanitized or DISPLAY_ONLY_MASTER_DAG_ID
 
 
-def _step_tier(step: StepManifest) -> int:
+def _step_tier(step: StepManifest) -> StepTier:
     """Which cheap-first tier this step runs in (1 first, 2 second).
 
     Mirrors :meth:`hflow.App._ordered_checks` and ``_ordered_enrichments``
@@ -123,7 +144,7 @@ def _step_tier(step: StepManifest) -> int:
     return 2 if (bool(step.requires) or step.uses is not None) else 1
 
 
-def _user_steps_json(stage: Stage, manifest: PipelineManifest | None) -> list[dict[str, object]]:
+def _user_steps(stage: Stage, manifest: PipelineManifest | None) -> list[PipelineUserStep]:
     """The registered steps running inside this stage's ``process_batch``.
 
     Stage ownership is the engine's (``hflow.steps``/``App.process``):
@@ -140,22 +161,14 @@ def _user_steps_json(stage: Stage, manifest: PipelineManifest | None) -> list[di
     else:
         return []
     return [
-        {
-            "name": step.name,
-            "kind": step.kind.value,
-            "version": step.version,
-            "critical": step.critical,
-            "uses": step.uses,
-            "requires": list(step.requires),
-            "tier": _step_tier(step),
-        }
+        PipelineUserStep.from_step_manifest_in_tier(step, _step_tier(step))
         # Stable sort on the tier alone: the same call App._ordered_checks
         # makes, so the payload's order IS the execution order.
         for step in sorted(registered_steps, key=_step_tier)
     ]
 
 
-def _engine_steps_json(stage: Stage, manifest: PipelineManifest | None) -> list[dict[str, str]]:
+def _engine_steps(stage: Stage, manifest: PipelineManifest | None) -> list[PipelineEngineStep]:
     """The engine's own work inside this stage's ``process_batch``.
 
     Not registrations -- these are what ``App.process`` does around the user's
@@ -176,22 +189,22 @@ def _engine_steps_json(stage: Stage, manifest: PipelineManifest | None) -> list[
                 f"; computes {derived_channel_count} registered derived "
                 f"channel{'s' if derived_channel_count != 1 else ''} over the source"
             )
-        return [{"name": "canonical transform", "summary": summary}]
+        return [PipelineEngineStep(name="canonical transform", summary=summary)]
     if stage is Stage.META:
         return [
-            {
-                "name": "catalog registration",
-                "summary": "append this run's episode row and every step's evidence "
+            PipelineEngineStep(
+                name="catalog registration",
+                summary="append this run's episode row and every step's evidence "
                 "(check runs, measurements, intervals, tags) to the catalog",
-            }
+            )
         ]
     if stage is Stage.MEDIA:
         return [
-            {
-                "name": MEDIA_CONTACT_SHEET_STEP_NAME,
-                "summary": "render one contact sheet per camera and record it as a "
+            PipelineEngineStep(
+                name=MEDIA_CONTACT_SHEET_STEP_NAME,
+                summary="render one contact sheet per camera and record it as a "
                 "catalog artifact; absent when the episode has no cameras",
-            }
+            )
         ]
     return []
 
@@ -211,36 +224,36 @@ _NO_CRITICAL_CHECKS_EXPLANATION = (
 )
 
 
-def _quarantine_gate_json(manifest: PipelineManifest | None) -> dict[str, object] | None:
+def _quarantine_gate(manifest: PipelineManifest | None) -> QuarantineGate | None:
     """The one real edge between user steps, or null when no pipeline is known."""
     if manifest is None:
         return None
     critical_step_names = [step.name for step in manifest.checks if step.critical]
-    return {
-        "from_stage": Stage.META.value,
-        "to_stages": [Stage.LABELS.value, Stage.MEDIA.value],
-        "critical_step_names": critical_step_names,
-        "explanation": (
+    return QuarantineGate(
+        from_stage=Stage.META.value,
+        to_stages=[Stage.LABELS.value, Stage.MEDIA.value],
+        critical_step_names=critical_step_names,
+        explanation=(
             _QUARANTINE_GATE_EXPLANATION if critical_step_names else _NO_CRITICAL_CHECKS_EXPLANATION
         ),
-    }
+    )
 
 
-def _stage_graph_json(
+def _stage_graph(
     stage_topology: StageTopology, manifest: PipelineManifest | None
-) -> dict[str, object]:
+) -> PipelineGraphStage:
     stage = stage_topology.stage
-    return {
-        "stage": stage.value,
-        "title": _STAGE_TITLES[stage],
-        "description": _STAGE_DESCRIPTIONS[stage],
-        "gate_task_id": stage_topology.gate_task_id,
-        "trigger_task_id": stage_topology.trigger_task_id,
-        "enabling_profiles": list(stage_topology.enabling_profiles),
-        "dag": _dag_topology_json(stage_topology.dag),
-        "engine_steps": _engine_steps_json(stage, manifest),
-        "user_steps": _user_steps_json(stage, manifest),
-    }
+    return PipelineGraphStage(
+        stage=stage.value,
+        title=_STAGE_TITLES[stage],
+        description=_STAGE_DESCRIPTIONS[stage],
+        gate_task_id=stage_topology.gate_task_id,
+        trigger_task_id=stage_topology.trigger_task_id,
+        enabling_profiles=list(stage_topology.enabling_profiles),
+        dag=_dag_topology_payload(stage_topology.dag),
+        engine_steps=_engine_steps(stage, manifest),
+        user_steps=_user_steps(stage, manifest),
+    )
 
 
 def _parsed_timestamp(value: object) -> datetime | None:
@@ -277,76 +290,72 @@ def _duration_seconds(instance: dict[str, Any]) -> float | None:
     return None
 
 
-def _optional_string(value: object) -> str | None:
-    return value if isinstance(value, str) else None
-
-
-def _task_instance_json(instance: dict[str, Any]) -> dict[str, object]:
+def _task_instance(instance: dict[str, Any]) -> RunTaskInstance:
     """One Airflow task instance reduced to what the graph draws."""
     try_number = instance.get("try_number")
     map_index = instance.get("map_index")
-    return {
-        "task_id": _optional_string(instance.get("task_id")),
-        "state": _optional_string(instance.get("state")),
-        "start_date": _optional_string(instance.get("start_date")),
-        "end_date": _optional_string(instance.get("end_date")),
-        # When the scheduler queued the task, so a replay can distinguish
-        # "waiting for a worker" from "running". Airflow has spelled this
-        # field both ways across versions and may omit it; absent is fine.
-        "queued_at": _optional_string(instance.get("queued_when") or instance.get("queued_at")),
-        "try_number": int(try_number) if isinstance(try_number, int) else None,
+    return RunTaskInstance(
+        task_id=optional_string(instance.get("task_id")),
+        state=optional_string(instance.get("state")),
+        start_date=optional_string(instance.get("start_date")),
+        end_date=optional_string(instance.get("end_date")),
+        # Airflow has spelled the queued timestamp both ways across versions
+        # and may omit it; absent is fine.
+        queued_at=optional_string(instance.get("queued_when") or instance.get("queued_at")),
+        try_number=int(try_number) if isinstance(try_number, int) else None,
         # -1 is Airflow's "not a mapped instance"; an absent value means the
         # same thing.
-        "map_index": int(map_index) if isinstance(map_index, int) else -1,
-        "duration_s": _duration_seconds(instance),
-    }
+        map_index=int(map_index) if isinstance(map_index, int) else -1,
+        duration_s=_duration_seconds(instance),
+    )
 
 
 def _sorted_task_instances(
     instances: list[dict[str, Any]], topology: DagTopology
-) -> list[dict[str, object]]:
+) -> list[RunTaskInstance]:
     """Task instances in TOPOLOGY order (then by map index), not API order."""
     topology_positions = {node.task_id: index for index, node in enumerate(topology.tasks)}
     unknown_task_position = len(topology_positions)
-    task_json = [_task_instance_json(instance) for instance in instances]
     return sorted(
-        task_json,
+        (_task_instance(instance) for instance in instances),
         key=lambda task: (
-            topology_positions.get(str(task["task_id"]), unknown_task_position),
-            str(task["task_id"]),
-            # map_index is always an int here (_task_instance_json defaults it).
-            task["map_index"] if isinstance(task["map_index"], int) else -1,
+            topology_positions.get(task.task_id or "", unknown_task_position),
+            task.task_id or "",
+            task.map_index,
         ),
     )
 
 
 def _mapped_summary(
-    tasks: list[dict[str, object]], stage_topology: StageTopology
-) -> dict[str, object] | None:
+    tasks: list[RunTaskInstance], stage_topology: StageTopology
+) -> MappedFanOutSummary | None:
     """The fan-out's counts: how many mapped instances are in which state.
 
     The mapped task id comes from the topology (the node flagged ``mapped``),
-    so this never restates a task name the library owns.
+    so this never restates a task name the library owns. Every instance of
+    that task lands in exactly one ``by_state`` bucket -- an unscheduled one
+    under ``no_status`` -- which is what makes the served summary complete
+    enough that a client never has to recount the raw instances.
     """
     mapped_task_ids = [node.task_id for node in stage_topology.dag.tasks if node.mapped]
     if not mapped_task_ids:
         return None
+    # Every generated stage sub-DAG has exactly one mapped node
+    # (``process_batch``); a topology that grows a second one needs a summary
+    # per mapped task, not a silently truncated one.
     mapped_task_id = mapped_task_ids[0]
-    mapped_instances = [task for task in tasks if task["task_id"] == mapped_task_id]
+    mapped_instances = [task for task in tasks if task.task_id == mapped_task_id]
     if not mapped_instances:
         return None
-    state_counts = Counter(
-        str(task["state"]) if isinstance(task["state"], str) else _UNSET_TASK_STATE
-        for task in mapped_instances
-    )
-    return {
-        "task_id": mapped_task_id,
+    state_counts = Counter(task.state or _UNSET_TASK_STATE for task in mapped_instances)
+    return MappedFanOutSummary(
+        task_id=mapped_task_id,
         # Before the fan-out expands, Airflow reports ONE instance with
         # map_index -1; it is counted, because "1 unexpanded instance" is the
         # truth at that moment.
-        "total": len(mapped_instances),
-        "by_state": dict(sorted(state_counts.items())),
-    }
+        total=len(mapped_instances),
+        by_state=dict(sorted(state_counts.items())),
+    )
 
 
 @dataclass(frozen=True)
@@ -354,7 +363,7 @@ class _MatchedStageRun:
     """The stage run a master run most plausibly triggered, and how it matched."""
 
     run: dict[str, Any]
-    match: str
+    match: StageRunMatch
 
 
 def _matched_stage_run(
@@ -385,16 +394,17 @@ def _matched_stage_run(
     return _MatchedStageRun(run=best_run, match="heuristic")
 
 
-def _empty_stage_graph(stage_topology: StageTopology) -> dict[str, object]:
-    return {
-        "stage": stage_topology.stage.value,
-        "dag_id": stage_topology.dag.dag_id,
-        "dag_run_id": None,
-        "state": None,
-        "match": None,
-        "tasks": [],
-        "mapped_summary": None,
-    }
+def _empty_stage_graph(stage_topology: StageTopology) -> RunGraphStage:
+    """A stage that never ran for this master run: explicit nulls, not omissions."""
+    return RunGraphStage(
+        stage=stage_topology.stage.value,
+        dag_id=stage_topology.dag.dag_id,
+        dag_run_id=None,
+        state=None,
+        match=None,
+        tasks=[],
+        mapped_summary=None,
+    )
 
 
 def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver) -> APIRouter:
@@ -405,19 +415,6 @@ def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver
     shared resolver.
     """
     router = APIRouter(prefix="/api/v1")
-
-    def refuse_when_no_runtime() -> ResolvedRuntime:
-        resolution = resolver.resolve()
-        if not isinstance(resolution, ResolvedRuntime):
-            raise HTTPException(status_code=409, detail=resolution.detail)
-        return resolution
-
-    def refuse_airflow_failure(
-        error: AirflowClientError, runtime: ResolvedRuntime
-    ) -> HTTPException:
-        return HTTPException(
-            status_code=502, detail=client_error_detail(error, source=runtime.source)
-        )
 
     def stage_task_instances(
         client: AirflowClient, dag_id: str, dag_run_id: str
@@ -432,7 +429,7 @@ def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver
             return []
 
     @router.get("/pipeline/graph")
-    def read_pipeline_graph() -> JSONResponse:
+    def read_pipeline_graph() -> PipelineGraphResponse:
         """The merged picture: the DAG topology plus the pipeline's user steps.
 
         Three degraded states, each explicit rather than an error: no runtime
@@ -450,27 +447,22 @@ def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver
         )
         manifest = application.manifest() if application is not None else None
         topology: IngestTopology = ingest_dag_topology(master_dag_id)
-        return JSONResponse(
-            {
-                "dag_ids_known": dag_ids_known,
-                "steps_known": manifest is not None,
-                "master": _dag_topology_json(topology.master),
-                "stages": [
-                    _stage_graph_json(stage_topology, manifest)
-                    for stage_topology in topology.stages
-                ],
-                "quarantine_gate": _quarantine_gate_json(manifest),
-            }
+        return PipelineGraphResponse(
+            dag_ids_known=dag_ids_known,
+            steps_known=manifest is not None,
+            master=_dag_topology_payload(topology.master),
+            stages=[_stage_graph(stage_topology, manifest) for stage_topology in topology.stages],
+            quarantine_gate=_quarantine_gate(manifest),
         )
 
     @router.get("/runtime/runs/{dag_run_id}/graph")
-    def read_run_graph(dag_run_id: str) -> JSONResponse:
+    def read_run_graph(dag_run_id: str) -> RunGraphResponse:
         """One master run's live state over the same topology.
 
         The master run is addressed directly; each stage's sub-DAG run is
         resolved by the documented heuristic in :func:`_matched_stage_run`.
         """
-        runtime = refuse_when_no_runtime()
+        runtime = resolved_runtime_or_refuse(resolver)
         topology = ingest_dag_topology(runtime.dag_id)
         try:
             master_run = runtime.client.dag_run(runtime.dag_id, dag_run_id)
@@ -483,14 +475,14 @@ def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver
                     status_code=404,
                     detail=f"no run {dag_run_id!r} of dag {runtime.dag_id!r}",
                 ) from error
-            raise refuse_airflow_failure(error, runtime) from error
+            raise airflow_failure_refusal(error, source=runtime.source) from error
         try:
             master_instances = runtime.client.task_instances(runtime.dag_id, dag_run_id)
         except AirflowClientError as error:
-            raise refuse_airflow_failure(error, runtime) from error
+            raise airflow_failure_refusal(error, source=runtime.source) from error
         master_started_at = _parsed_timestamp(master_run.get("start_date"))
 
-        stages: list[dict[str, object]] = []
+        stages: list[RunGraphStage] = []
         for stage_topology in topology.stages:
             stage_dag_id = stage_topology.dag.dag_id
             try:
@@ -505,7 +497,7 @@ def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver
             if matched is None:
                 stages.append(_empty_stage_graph(stage_topology))
                 continue
-            stage_run_id = _optional_string(matched.run.get("dag_run_id"))
+            stage_run_id = optional_string(matched.run.get("dag_run_id"))
             stage_tasks = (
                 _sorted_task_instances(
                     stage_task_instances(runtime.client, stage_dag_id, stage_run_id),
@@ -515,26 +507,24 @@ def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver
                 else []
             )
             stages.append(
-                {
-                    "stage": stage_topology.stage.value,
-                    "dag_id": stage_dag_id,
-                    "dag_run_id": stage_run_id,
-                    "state": _optional_string(matched.run.get("state")),
-                    "match": matched.match,
-                    "tasks": stage_tasks,
-                    "mapped_summary": _mapped_summary(stage_tasks, stage_topology),
-                }
+                RunGraphStage(
+                    stage=stage_topology.stage.value,
+                    dag_id=stage_dag_id,
+                    dag_run_id=stage_run_id,
+                    state=optional_string(matched.run.get("state")),
+                    match=matched.match,
+                    tasks=stage_tasks,
+                    mapped_summary=_mapped_summary(stage_tasks, stage_topology),
+                )
             )
 
-        return JSONResponse(
-            {
-                "master": {
-                    "dag_run_id": _optional_string(master_run.get("dag_run_id")) or dag_run_id,
-                    "state": _optional_string(master_run.get("state")),
-                    "tasks": _sorted_task_instances(master_instances, topology.master),
-                },
-                "stages": stages,
-            }
+        return RunGraphResponse(
+            master=RunGraphMaster(
+                dag_run_id=optional_string(master_run.get("dag_run_id")) or dag_run_id,
+                state=optional_string(master_run.get("state")),
+                tasks=_sorted_task_instances(master_instances, topology.master),
+            ),
+            stages=stages,
         )
 
     return router

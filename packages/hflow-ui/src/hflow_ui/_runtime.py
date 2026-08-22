@@ -24,10 +24,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from posixpath import normpath
-from typing import Any, Literal
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from hflow.runtime import (
@@ -42,6 +41,16 @@ from hflow.runtime import (
 from hflow.steps import RUN_PROFILES, IngestMode, Stage
 from hflow.storage import is_bucket_url
 from hflow.workspace import RUNTIME_BUNDLE_DIRECTORY_NAME
+from hflow_ui._contract import (
+    IngestTriggerResponse,
+    RuntimeHealthComponents,
+    RuntimeRunsResponse,
+    RuntimeRunSummary,
+    RuntimeSource,
+    RuntimeStatusResponse,
+    StageRecentRuns,
+    StageRunSummary,
+)
 from hflow_ui._settings import UiSettings
 
 # Mirrors hflow.runtime._endpoint's variable name (a documented public
@@ -53,8 +62,9 @@ AIRFLOW_URL_ENVIRONMENT_VARIABLE = "HFLOW_AIRFLOW_URL"
 # filesystem walk, short enough that `hflow up` shows up within seconds.
 RESOLUTION_CACHE_TTL_S = 5.0
 
-# The health components /runtime/status reports, per AirflowHealth's contract.
-_HEALTH_COMPONENT_NAMES = ("metadatabase", "scheduler", "triggerer", "dag_processor")
+# The health components /runtime/status reports, owned by the response model
+# so the served keys and the components actually read can never diverge.
+_HEALTH_COMPONENT_NAMES = tuple(RuntimeHealthComponents.model_fields)
 
 _RECENT_STAGE_RUN_LIMIT = 5
 
@@ -97,7 +107,7 @@ class ResolvedRuntime:
 
     client: AirflowClient
     dag_id: str
-    source: Literal["bundle", "remote"]
+    source: RuntimeSource
     airflow_web_url: str | None
     # (stage name, sub-DAG id) in stage-graph order; None for remote runtimes
     # (only the bundle manifest records the stage sub-DAG ids).
@@ -145,22 +155,6 @@ def runtime_configured(data_root: str) -> bool:
     if find_bundle_directory(data_root) is not None:
         return True
     return bool(os.environ.get(AIRFLOW_URL_ENVIRONMENT_VARIABLE))
-
-
-def local_bundle_web_url(data_root: str) -> str | None:
-    """The addressed local bundle's Airflow URL for browser deep links.
-
-    Derived from what the bundle itself records (``load_bundle`` reads the
-    preserved ``.env``'s API_PORT), so it is the address the operator's own
-    ``hflow up`` printed; ``None`` when no loadable bundle is addressed.
-    """
-    bundle_directory = find_bundle_directory(data_root)
-    if bundle_directory is None:
-        return None
-    try:
-        return load_bundle(bundle_directory).api_base_url
-    except (FileNotFoundError, ValueError):
-        return None
 
 
 def _stage_dag_ids(master_dag_id: str) -> tuple[tuple[str, str], ...]:
@@ -236,65 +230,71 @@ class RuntimeResolver:
         return self._cached_resolution
 
 
-def _unavailable_status_payload(
-    detail: str,
-    *,
-    source: str | None = None,
-    airflow_web_url: str | None = None,
-    dag_id: str | None = None,
-) -> dict[str, object]:
-    return {
-        "available": False,
-        "detail": detail,
-        "source": source,
-        "airflow_web_url": airflow_web_url,
-        "dag_id": dag_id,
-        "registered": None,
-        "health": None,
-    }
+def optional_string(value: object) -> str | None:
+    """One Airflow JSON field as text, or None for anything else.
+
+    Airflow's payloads are an OPEN contract: a field can be absent, null, or
+    (across versions) another type entirely. Parsing here means the response
+    models below never see a shape they would have to 500 over.
+    """
+    return value if isinstance(value, str) else None
 
 
-def _run_summary(run: dict[str, Any]) -> dict[str, object]:
+def _run_summary(run: dict[str, Any]) -> RuntimeRunSummary:
     """One master dag run reduced to the fields the Runs page shows.
 
     The full ``conf`` rides along (it is the trigger's own input); everything
     else Airflow returns stays server-side.
     """
     conf = run.get("conf")
-    return {
-        "dag_run_id": run.get("dag_run_id"),
-        "state": run.get("state"),
-        "logical_date": run.get("logical_date"),
-        "start_date": run.get("start_date"),
-        "end_date": run.get("end_date"),
-        "conf": conf if isinstance(conf, dict) else {},
-    }
+    return RuntimeRunSummary(
+        dag_run_id=optional_string(run.get("dag_run_id")),
+        state=optional_string(run.get("state")),
+        logical_date=optional_string(run.get("logical_date")),
+        start_date=optional_string(run.get("start_date")),
+        end_date=optional_string(run.get("end_date")),
+        conf=conf if isinstance(conf, dict) else {},
+    )
 
 
-def _stage_run_summary(run: dict[str, Any]) -> dict[str, object]:
-    return {
-        "dag_run_id": run.get("dag_run_id"),
-        "state": run.get("state"),
-        "start_date": run.get("start_date"),
-        "end_date": run.get("end_date"),
-    }
+def _stage_run_summary(run: dict[str, Any]) -> StageRunSummary:
+    return StageRunSummary(
+        dag_run_id=optional_string(run.get("dag_run_id")),
+        state=optional_string(run.get("state")),
+        start_date=optional_string(run.get("start_date")),
+        end_date=optional_string(run.get("end_date")),
+    )
+
+
+def resolved_runtime_or_refuse(resolver: RuntimeResolver) -> ResolvedRuntime:
+    """The addressed runtime, or the refusal every runtime-backed route owes.
+
+    409, not 404: an unaddressed (or half-formed) runtime conflicts with the
+    workspace's state, the same mapping an unconfigured pipeline uses. Shared
+    with the graph routes so both refuse identically, detail included.
+    """
+    resolution = resolver.resolve()
+    if isinstance(resolution, RuntimeUnavailable):
+        raise HTTPException(status_code=409, detail=resolution.detail)
+    return resolution
+
+
+def airflow_failure_refusal(error: AirflowClientError, *, source: str) -> HTTPException:
+    """One failed Airflow call as the 502 every proxying route answers with.
+
+    502, not 500: the fault is upstream, and the detail is the browser-safe
+    one :func:`client_error_detail` decides on.
+    """
+    return HTTPException(status_code=502, detail=client_error_detail(error, source=source))
 
 
 def create_runtime_router(settings: UiSettings, resolver: RuntimeResolver) -> APIRouter:
-    """Every M2 runs-monitor route, closed over one launch's settings.
+    """Every runs-monitor route, closed over one launch's settings.
 
     The resolver is passed in (rather than built here) so the run-graph routes
     in ``_graph`` share one addressing cache with this router.
     """
     router = APIRouter(prefix="/api/v1")
-
-    def resolved_or_refuse() -> ResolvedRuntime:
-        resolution = resolver.resolve()
-        if isinstance(resolution, RuntimeUnavailable):
-            # 409: the workspace's runtime state conflicts with the request,
-            # same mapping as an unconfigured pipeline.
-            raise HTTPException(status_code=409, detail=resolution.detail)
-        return resolution
 
     def refuse_when_read_only() -> None:
         if settings.read_only:
@@ -304,22 +304,21 @@ def create_runtime_router(settings: UiSettings, resolver: RuntimeResolver) -> AP
             )
 
     @router.get("/runtime/status")
-    def read_runtime_status() -> JSONResponse:
+    def read_runtime_status() -> RuntimeStatusResponse:
         resolution = resolver.resolve()
         if isinstance(resolution, RuntimeUnavailable):
-            return JSONResponse(_unavailable_status_payload(resolution.detail))
+            return RuntimeStatusResponse(available=False, detail=resolution.detail)
         try:
             health = resolution.client.health()
         except AirflowClientError as error:
             # Addressed but not answering (typical between `hflow up` runs):
             # still an available:false ANSWER, with the addressing facts.
-            return JSONResponse(
-                _unavailable_status_payload(
-                    client_error_detail(error, source=resolution.source),
-                    source=resolution.source,
-                    airflow_web_url=resolution.airflow_web_url,
-                    dag_id=resolution.dag_id,
-                )
+            return RuntimeStatusResponse(
+                available=False,
+                detail=client_error_detail(error, source=resolution.source),
+                source=resolution.source,
+                airflow_web_url=resolution.airflow_web_url,
+                dag_id=resolution.dag_id,
             )
         registered: bool | None
         try:
@@ -329,35 +328,32 @@ def create_runtime_router(settings: UiSettings, resolver: RuntimeResolver) -> AP
             # 404 is the definitive "not registered (yet)"; anything else
             # (auth, transient) leaves registration unknown, not false.
             registered = False if error.status == 404 else None
-        return JSONResponse(
-            {
-                "available": True,
-                "detail": None,
-                "source": resolution.source,
-                "airflow_web_url": resolution.airflow_web_url,
-                "dag_id": resolution.dag_id,
-                "registered": registered,
-                "health": {
+        return RuntimeStatusResponse(
+            available=True,
+            source=resolution.source,
+            airflow_web_url=resolution.airflow_web_url,
+            dag_id=resolution.dag_id,
+            registered=registered,
+            health=RuntimeHealthComponents.model_validate(
+                {
                     component_name: health.components.get(component_name)
                     for component_name in _HEALTH_COMPONENT_NAMES
-                },
-            }
+                }
+            ),
         )
 
     @router.get("/runtime/runs")
     def list_runtime_runs(
         limit: int = Query(default=25, ge=1, le=100),
-    ) -> JSONResponse:
-        runtime = resolved_or_refuse()
+    ) -> RuntimeRunsResponse:
+        runtime = resolved_runtime_or_refuse(resolver)
         try:
             # order_by="-id": Airflow truncates to `limit` in id order, so
             # newest-first is the only ordering that shows recent activity.
             master_runs = runtime.client.dag_runs(runtime.dag_id, limit=limit, order_by="-id")
         except AirflowClientError as error:
-            raise HTTPException(
-                status_code=502, detail=client_error_detail(error, source=runtime.source)
-            ) from error
-        stages: list[dict[str, object]] | None = None
+            raise airflow_failure_refusal(error, source=runtime.source) from error
+        stages: list[StageRecentRuns] | None = None
         if runtime.stage_dag_ids is not None:
             stages = []
             for stage_name, stage_dag_id in runtime.stage_dag_ids:
@@ -370,16 +366,16 @@ def create_runtime_router(settings: UiSettings, resolver: RuntimeResolver) -> AP
                     # an empty strip, not a failed page.
                     recent_runs = []
                 stages.append(
-                    {
-                        "stage": stage_name,
-                        "dag_id": stage_dag_id,
-                        "recent": [_stage_run_summary(run) for run in recent_runs],
-                    }
+                    StageRecentRuns(
+                        stage=stage_name,
+                        dag_id=stage_dag_id,
+                        recent=[_stage_run_summary(run) for run in recent_runs],
+                    )
                 )
-        return JSONResponse({"runs": [_run_summary(run) for run in master_runs], "stages": stages})
+        return RuntimeRunsResponse(runs=[_run_summary(run) for run in master_runs], stages=stages)
 
     @router.post("/runtime/ingest")
-    def trigger_ingest(request: IngestRequest) -> JSONResponse:
+    def trigger_ingest(request: IngestRequest) -> IngestTriggerResponse:
         refuse_when_read_only()
         uris = [uri.strip() for uri in request.uris]
         if any(not uri for uri in uris):
@@ -409,7 +405,7 @@ def create_runtime_router(settings: UiSettings, resolver: RuntimeResolver) -> AP
                 detail=f"unknown ingest mode {request.mode!r}; "
                 f"valid modes: {[known_mode.value for known_mode in IngestMode]}",
             ) from error
-        runtime = resolved_or_refuse()
+        runtime = resolved_runtime_or_refuse(resolver)
         try:
             # AirflowClient.ingest owns the trigger conf's shape (uris/profile/
             # mode/batch_count) for every caller -- CLI, UI, control plane --
@@ -422,14 +418,10 @@ def create_runtime_router(settings: UiSettings, resolver: RuntimeResolver) -> AP
                 batch_count=request.batch_count,
             )
         except AirflowClientError as error:
-            raise HTTPException(
-                status_code=502, detail=client_error_detail(error, source=runtime.source)
-            ) from error
-        return JSONResponse(
-            {
-                "dag_run_id": trigger_response.get("dag_run_id"),
-                "state": trigger_response.get("state"),
-            }
+            raise airflow_failure_refusal(error, source=runtime.source) from error
+        return IngestTriggerResponse(
+            dag_run_id=optional_string(trigger_response.get("dag_run_id")),
+            state=optional_string(trigger_response.get("state")),
         )
 
     return router

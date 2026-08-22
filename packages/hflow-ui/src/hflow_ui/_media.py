@@ -79,8 +79,7 @@ def _resolved_local_data_root(data_root: str) -> Path:
     if not isinstance(workspace_root, LocalStorageRoot):
         raise MediaResolutionError(
             501,
-            "media serving requires a local data root; "
-            "bucket-backed workspaces are not served in M0",
+            "media serving requires a local data root; bucket-backed workspaces are not served yet",
         )
     return workspace_root.path.resolve()
 
@@ -125,7 +124,7 @@ def resolve_served_file(uri: str, *, data_root: str) -> Path:
     """
     if is_bucket_url(uri):
         raise MediaResolutionError(
-            501, "this file lives in an object store; bucket media serving is not implemented in M0"
+            501, "this file lives in an object store; bucket media serving is not implemented yet"
         )
     resolved_data_root = _resolved_local_data_root(data_root)
     recorded_path = Path(uri.removeprefix("file://"))
