@@ -13,13 +13,14 @@ on:
   pull_request:
 
 jobs:
-  checks:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # Floor and current: catches accidental >3.11 syntax and new-runtime breakage.
-        python-version: ["3.11", "3.14"]
+    checks:
+     runs-on: ${{ matrix.os }}
+     strategy:
+       fail-fast: false
+       matrix:
+         os: [ubuntu-latest, macos-latest]
+         # Floor and current: catches accidental >3.11 syntax and new-runtime breakage.
+         python-version: ["3.11", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install ffmpeg (the test suite pins to the system binary)
