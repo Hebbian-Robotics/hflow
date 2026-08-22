@@ -1,5 +1,6 @@
 """Processing, publication, and user-step boundary regressions."""
 
+import functools
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -324,6 +325,56 @@ def test_wrapper_example_binds_every_missing_parameter() -> None:
     message = str(raised.value)
     assert "threshold=..." in message
     assert "topics=..." in message
+
+
+def test_step_version_accepts_functools_partial_with_bound_args() -> None:
+    bound = functools.partial(hflow.checks.action_rate, topics=["/joint_states"])
+    version = compute_check_version("bound", bound, False, frozenset(), None)
+
+    assert version
+
+
+def test_step_version_differs_when_partial_bindings_change() -> None:
+    """Hold the name fixed, so only the binding can move the version.
+
+    The step name is part of the identity, so naming these differently would
+    pass whether or not the bound arguments were read at all.
+    """
+    topics_a = functools.partial(hflow.checks.action_rate, topics=["/joint_states"])
+    topics_b = functools.partial(hflow.checks.action_rate, topics=["/other_stream"])
+    version_a = compute_check_version("same_name", topics_a, False, frozenset(), None)
+    version_b = compute_check_version("same_name", topics_b, False, frozenset(), None)
+
+    assert version_a != version_b
+    # Stable across construction, so the identity cannot be address-derived.
+    rebuilt_a = functools.partial(hflow.checks.action_rate, topics=["/joint_states"])
+    assert compute_check_version("same_name", rebuilt_a, False, frozenset(), None) == version_a
+
+
+def test_step_version_still_refuses_a_partial_bound_to_an_opaque_value() -> None:
+    """Transparency of the wrapper does not make its contents transparent.
+
+    A partial is identifiable only because its bound values are. Bind
+    something the identity machinery cannot describe and it must keep
+    refusing, or the version silently stops tracking that value.
+    """
+
+    class OpaqueClient:
+        pass
+
+    bound = functools.partial(hflow.checks.action_rate, topics=OpaqueClient())
+    with pytest.raises(ValueError, match="cannot derive a stable version identity"):
+        compute_check_version("opaque", bound, False, frozenset(), None)
+
+
+def test_check_registration_accepts_functools_partial() -> None:
+    app = hflow.App("partial-registration", data_root=Path("/tmp"))
+    bound = functools.partial(hflow.checks.action_rate, topics=["/joint_states"])
+
+    app.check(name="bound")(bound)
+
+    assert {check.name for check in app.checks} == {"bound"}
+    assert app.checks[0].version
 
 
 _STEP_VERSION_GLOBAL_THRESHOLD = 0.1
