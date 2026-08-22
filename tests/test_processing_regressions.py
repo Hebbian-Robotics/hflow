@@ -195,6 +195,30 @@ def test_step_version_includes_captured_configuration() -> None:
     assert low_threshold_version != high_threshold_version
 
 
+def test_check_with_required_extra_parameter_fails_at_registration() -> None:
+    app = hflow.App("signature-guard", data_root=Path("/tmp"))
+
+    def requires_topics(ep: hflow.Episode, *, topics: list[str]) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"n": len(topics)})
+
+    with pytest.raises(ValueError, match="topics"):
+        app.check()(cast(hflow.steps.CheckFunction, requires_topics))
+
+    assert app.checks == []
+
+
+def test_check_with_optional_extra_parameter_registers() -> None:
+    app = hflow.App("signature-optional", data_root=Path("/tmp"))
+
+    @app.check()
+    def optional_topic(
+        ep: hflow.Episode, *, topics: tuple[str, ...] = ("/joint_states",)
+    ) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"n": len(topics)})
+
+    assert {check.name for check in app.checks} == {"optional_topic"}
+
+
 _STEP_VERSION_GLOBAL_THRESHOLD = 0.1
 
 

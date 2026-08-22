@@ -15,6 +15,7 @@ quality outcome.
 """
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -296,6 +297,43 @@ class EnrichmentRunReport:
         if self.error is not None:
             return CheckStatus.ERROR
         return CheckStatus.MEASURED
+
+
+def _unsatisfiable_check_parameters(function: Callable[..., object]) -> list[str]:
+    """Names of required parameters a registered check could never receive.
+
+    At run time a check is called with exactly one argument: the canonical
+    episode (``registered.function(canonical_episode)``). A check is only
+    satisfiable if every remaining parameter is optional (has a default) or
+    is a ``*args``/``**kwargs`` sink. Parameters whose defaults the runtime
+    call cannot supply (required positional-or-keyword beyond the episode,
+    required keyword-only) would make every episode fail with a
+    ``TypeError`` that the App records as an infrastructure error at ingest
+    time. Returning their names lets registration reject them up front.
+    """
+    try:
+        parameters = inspect.signature(function).parameters.values()
+    except (TypeError, ValueError):
+        return []
+    seen_episode = False
+    unsatisfiable: list[str] = []
+    for parameter in parameters:
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            if parameter.default is not inspect.Parameter.empty:
+                continue
+            if not seen_episode:
+                seen_episode = True
+                continue
+            unsatisfiable.append(parameter.name)
+        elif (
+            parameter.kind is inspect.Parameter.KEYWORD_ONLY
+            and parameter.default is inspect.Parameter.empty
+        ):
+            unsatisfiable.append(parameter.name)
+    return unsatisfiable
 
 
 def _execute_enrichment(
@@ -580,6 +618,17 @@ class App:
                 raise ValueError("pass name=... when registering a callable without __name__")
             if check_name in self._registered_step_names():
                 raise ValueError(f"a step named {check_name!r} is already registered")
+            unsatisfiable = _unsatisfiable_check_parameters(function)
+            if unsatisfiable:
+                unsatisfiable_list = ", ".join(sorted(unsatisfiable))
+                raise ValueError(
+                    f"check {check_name!r} cannot be called with only an episode: "
+                    f"required parameter(s) without defaults: {unsatisfiable_list}. "
+                    "Wrap it in a function that binds them, e.g.\n\n"
+                    f"    @app.check()\n"
+                    f"    def {check_name}_check(ep: hflow.Episode) -> hflow.CheckResult:\n"
+                    f"        return {getattr(function, '__name__', check_name)}(ep, {unsatisfiable_list.split(', ')[0]}=...)\n"
+                )
             requires_set = frozenset(requires) if requires is not None else frozenset()
             self.checks.append(
                 RegisteredCheck(
