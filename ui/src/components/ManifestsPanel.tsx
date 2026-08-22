@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Download } from "lucide-react";
 import { Fragment, useState } from "react";
-import { fetchManifests, manifestDownloadPath, withSessionToken } from "../api";
+import { fetchManifests, manifestDownloadPath } from "../api";
 import { formatFractionAsPercent, formatTimestamp } from "../format";
 import { EmptyPanel, ErrorPanel, LoadingPanel } from "./QueryStates";
 
@@ -114,7 +114,7 @@ export function ManifestsPanel() {
                     <td>
                       <a
                         className="btn btn-tiny"
-                        href={withSessionToken(manifestDownloadPath(manifest.id))}
+                        href={manifestDownloadPath(manifest.id)}
                         download
                         title={`Download ${manifest.manifest_path}`}
                       >

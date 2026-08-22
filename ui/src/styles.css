@@ -15,44 +15,75 @@
    The two dark blocks are the same palette twice, deliberately: one answers
    the OS, one answers the reader, and neither can be expressed as the other.
    Keep them in sync. Every token has a value in the base :root block, so no
-   colour depends on a media query having matched. */
+   colour depends on a media query having matched.
+
+   ONE RULE decides which tokens may carry a hue:
+
+     CHROME IS NEUTRAL.  Backgrounds, ink, borders, the accent, the focus ring
+     — greys, near-black, near-white. Nothing in the frame competes with the
+     data inside it, and the app stops looking like it has a favourite colour.
+
+     COLOUR MEANS SOMETHING.  --ok / --warn / --err carry run and check status,
+     and --viz-* identifies interval kinds. These are the only hues in the file
+     and each one is answering a question about the data.
+
+   The accent used to be an instrument teal (#0c6d77 light, #56c1cb dark). It
+   is now the far end of the neutral ramp — near-black on light, near-white on
+   dark — so it INVERTS between themes where every hue token merely re-tunes.
+   That inversion is why --accent-contrast exists: "the ink that sits on top of
+   a solid --accent fill" cannot be written as a literal at the call site. */
 
 :root,
 :root[data-theme="light"] {
   color-scheme: light;
 
-  --bg: #f5f6f7;
+  --bg: #f4f4f5;
   --surface: #ffffff;
-  --surface-sunken: #eef0f2;
-  --ink: #1d2329;
-  --ink-muted: #5b6672;
-  --ink-faint: #97a1ab;
-  --border: #e2e5e9;
-  --border-strong: #c9ced4;
+  --surface-sunken: #efeff0;
+  --ink: #1b1c1e;
+  --ink-muted: #4d5054;
+  --ink-faint: #696c70;
+  --border: #e2e2e4;
+  --border-strong: #c6c8ca;
 
-  --accent: #0c6d77;
-  --accent-ink: #0a5a63;
-  --accent-soft: rgba(12, 109, 119, 0.08);
+  /* A boundary a reader has to be able to FIND — the outline of a field, a
+     button, a graph node, the connector that says two nodes are related.
+     Separator greys (--border, --border-strong) are decoration and can stay
+     faint; these carry information, so they are held at 3:1 against every
+     surface they are drawn on (WCAG 1.4.11). */
+  --boundary: #87898b;
 
-  --ok: #1a7f37;
-  --ok-soft: rgba(26, 127, 55, 0.12);
-  --warn: #955d00;
-  --warn-soft: rgba(191, 121, 0, 0.15);
-  --err: #c3352e;
-  --err-soft: rgba(195, 53, 46, 0.11);
+  --accent: #26282b;
+  --accent-ink: #101214;
+  --accent-soft: rgba(28, 30, 33, 0.07);
+  --accent-contrast: #ffffff;
 
-  --focus-ring: #0c6d77;
+  --ok: #15702f;
+  --ok-soft: rgba(21, 112, 47, 0.13);
+  --warn: #7f5300;
+  --warn-soft: rgba(168, 110, 0, 0.16);
+  --err: #b52b25;
+  --err-soft: rgba(181, 43, 37, 0.12);
+
+  --focus-ring: #1b1c1e;
 
   /* Categorical slots for interval kinds, in fixed order — never cycled, never
      reused for status. Validated (OKLCH lightness band, chroma floor, CVD and
      normal-vision separation, contrast vs this mode's surface); a fourth kind
      folds into --viz-other rather than getting a generated hue, and the legend
      always names every kind so identity never rests on colour alone.
-     --viz-ink is the label colour that stays legible on all four fills. */
+     --viz-ink is the label colour that stays legible on all four fills.
+
+     Three of the four stay hued under the neutral-chrome rule because they are
+     the answer to "which kind is this band?" — a categorical encoding needs
+     separable hues, and three greys would not be separable. They appear nowhere
+     in the chrome. --viz-other is the exception and is now a true grey: it is
+     the "everything else" slot, and reading as the absence of an identity is
+     exactly its job. */
   --viz-1: #036bb9;
   --viz-2: #a73189;
   --viz-3: #856302;
-  --viz-other: #5b6672;
+  --viz-other: #63666a;
   --viz-ink: #ffffff;
 
   --font-ui: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -65,18 +96,21 @@
   :root:not([data-theme="light"]) {
     color-scheme: dark;
 
-    --bg: #131619;
-    --surface: #1a1e22;
-    --surface-sunken: #16191d;
-    --ink: #e4e8eb;
-    --ink-muted: #98a3ac;
-    --ink-faint: #6a747e;
-    --border: #2a3036;
-    --border-strong: #3a424a;
+    --bg: #121213;
+    --surface: #1a1a1c;
+    --surface-sunken: #161617;
+    --ink: #e7e7e8;
+    --ink-muted: #a5a8ac;
+    --ink-faint: #83868a;
+    --border: #2b2c2e;
+    --border-strong: #3d3f42;
 
-    --accent: #56c1cb;
-    --accent-ink: #7fd4dc;
-    --accent-soft: rgba(86, 193, 203, 0.12);
+    --boundary: #68696c;
+
+    --accent: #e7e7e8;
+    --accent-ink: #f5f5f6;
+    --accent-soft: rgba(231, 231, 232, 0.1);
+    --accent-contrast: #17181a;
 
     --ok: #46b458;
     --ok-soft: rgba(70, 180, 88, 0.16);
@@ -85,15 +119,15 @@
     --err: #e5726b;
     --err-soft: rgba(229, 114, 107, 0.15);
 
-    --focus-ring: #56c1cb;
+    --focus-ring: #e7e7e8;
 
     /* Dark is selected, not flipped: its own steps, re-validated against the
        dark surface, with a dark label ink because the fills are lighter here. */
     --viz-1: #1795fa;
     --viz-2: #d75eb4;
     --viz-3: #b88a06;
-    --viz-other: #8a949e;
-    --viz-ink: #12161a;
+    --viz-other: #8f9194;
+    --viz-ink: #141416;
   }
 }
 
@@ -101,18 +135,21 @@
 :root[data-theme="dark"] {
   color-scheme: dark;
 
-  --bg: #131619;
-  --surface: #1a1e22;
-  --surface-sunken: #16191d;
-  --ink: #e4e8eb;
-  --ink-muted: #98a3ac;
-  --ink-faint: #6a747e;
-  --border: #2a3036;
-  --border-strong: #3a424a;
+  --bg: #121213;
+  --surface: #1a1a1c;
+  --surface-sunken: #161617;
+  --ink: #e7e7e8;
+  --ink-muted: #a5a8ac;
+  --ink-faint: #83868a;
+  --border: #2b2c2e;
+  --border-strong: #3d3f42;
 
-  --accent: #56c1cb;
-  --accent-ink: #7fd4dc;
-  --accent-soft: rgba(86, 193, 203, 0.12);
+  --boundary: #68696c;
+
+  --accent: #e7e7e8;
+  --accent-ink: #f5f5f6;
+  --accent-soft: rgba(231, 231, 232, 0.1);
+  --accent-contrast: #17181a;
 
   --ok: #46b458;
   --ok-soft: rgba(70, 180, 88, 0.16);
@@ -121,13 +158,32 @@
   --err: #e5726b;
   --err-soft: rgba(229, 114, 107, 0.15);
 
-  --focus-ring: #56c1cb;
+  --focus-ring: #e7e7e8;
 
   --viz-1: #1795fa;
   --viz-2: #d75eb4;
   --viz-3: #b88a06;
-  --viz-other: #8a949e;
-  --viz-ink: #12161a;
+  --viz-other: #8f9194;
+  --viz-ink: #141416;
+}
+
+/* The RUN-IN-FLIGHT tone (src/runState.ts: running, deferred), aliased once and
+   theme-agnostically because var() in a custom property resolves at USE time —
+   so these follow whichever accent block above is in force.
+
+   "In flight" is a status like success and failure, and it used to borrow the
+   chrome accent because the chrome accent happened to be a colour. Now that the
+   chrome is neutral the two have to be named apart, or the next person to
+   restyle a hover state silently restyles what "running" looks like. The tone
+   resolves to the strongest neutral on purpose: against green, amber, red and
+   the faint grey of an unknown state, near-black-on-light (near-white-on-dark)
+   is the most separable remaining slot, and it stays separable under every form
+   of colour blindness because it differs in LIGHTNESS, not in hue. */
+:root {
+  --run: var(--accent);
+  --run-ink: var(--accent-ink);
+  --run-soft: var(--accent-soft);
+  --run-contrast: var(--accent-contrast);
 }
 
 * {
@@ -167,27 +223,45 @@ body {
            Set against the 13px body text so a glyph reads as a sibling of the
            word beside it. Effective stroke 2 x 14/24 = 1.17px, which lands on
            the old hand-drawn 1.4-at-16-viewBox weight.
-     16px  navigation — the rail's four destinations and the brand mark. One
-           step up is enough to make the rail read as chrome, not content.
-   Anything wanting a third size wants a different component instead. */
+     16px  navigation — the rail's four destinations. One step up is enough to
+           make the rail read as chrome, not content.
+   Anything wanting a third size wants a different component instead. The one
+   glyph outside this scale is the brand mark, which is not square; see it
+   below. */
 .lucide {
   width: 14px;
   height: 14px;
   flex: none;
 }
 
-.nav-item > .lucide,
-.brand-mark {
+.nav-item > .lucide {
   width: 16px;
   height: 16px;
 }
 
 /* ---- app shell ---------------------------------------------------------- */
 
+/* The rail has TWO widths and THREE things that can ask for one:
+     --rail-width          the expanded default
+     [data-rail=collapsed] the reader's stored choice (src/railLayout.ts, applied
+                           pre-paint by the inline script in index.html)
+     the 780px breakpoint  which turns the rail into a horizontal bar
+   The breakpoint wins, and says so explicitly at the bottom of this file: a
+   bar has no width to give back, so the manual collapse is SUSPENDED there
+   rather than fighting it, and the stored choice comes back untouched when the
+   window widens. Everything above that width is the reader's call. */
 .app-shell {
+  --rail-width: 184px;
   display: grid;
-  grid-template-columns: 184px minmax(0, 1fr);
+  grid-template-columns: var(--rail-width) minmax(0, 1fr);
   height: 100%;
+  transition: grid-template-columns 140ms ease;
+}
+
+:root[data-rail="collapsed"] .app-shell {
+  /* 56px = 36px of content (a 26px control centred with room to breathe)
+     between the rail's two 10px gutters. */
+  --rail-width: 56px;
 }
 
 .nav-rail {
@@ -198,6 +272,7 @@ body {
   border-right: 1px solid var(--border);
   background: var(--surface);
   min-width: 0;
+  overflow: hidden;
 }
 
 .brand {
@@ -210,7 +285,17 @@ body {
   letter-spacing: 0.01em;
 }
 
+/* The real Hebbian Robotics mark (src/components/BrandMark.tsx, artwork from
+   docs/assets/hebbian-logo-on-black.svg) is upright — 106 x 138 in its own
+   units, so 0.77 : 1. Squeezing it into the square `.lucide` box would letterbox
+   it to about 12px of ink in a 16px slot, so it is sized by HEIGHT and the width
+   follows. `aspect-ratio` states the viewBox ratio outright rather than leaving
+   the width to intrinsic SVG sizing. 18px tall sits level with the 16px nav
+   glyphs beside it: a narrow mark carries less weight per pixel of height. */
 .brand-mark {
+  height: 18px;
+  width: auto;
+  aspect-ratio: 106.03 / 137.62;
   color: var(--accent);
   flex: none;
 }
@@ -224,6 +309,7 @@ body {
   color: var(--ink-muted);
   font-weight: 500;
   text-decoration: none;
+  white-space: nowrap;
   transition:
     color 120ms ease,
     background-color 120ms ease;
@@ -233,9 +319,14 @@ body {
   color: var(--ink);
 }
 
+/* The accent is a neutral now, so "active" cannot rest on a hue the way a teal
+   pill did. Three cues carry it instead, and they survive both themes and
+   greyscale: the fill, the step from muted ink to the strongest ink, and the
+   weight. */
 .nav-item.is-active {
   background: var(--accent-soft);
   color: var(--accent-ink);
+  font-weight: 650;
 }
 
 .rail-foot {
@@ -245,6 +336,14 @@ body {
   min-width: 0;
 }
 
+/* The rail's two chrome controls — collapse and theme — side by side while
+   there is width for them, stacked once there is not. */
+.rail-controls {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
 .rail-meta {
   display: flex;
   flex-direction: column;
@@ -252,39 +351,156 @@ body {
   align-items: flex-start;
 }
 
-/* ---- theme control ------------------------------------------------------- */
+/* ---- collapsed rail ------------------------------------------------------
+   Everything the 56px rail does differently. The labels are CLIPPED, never
+   `display: none`: a clipped label is still the link's accessible name, so a
+   collapsed destination can never end up as an unnamed icon no matter what
+   React and the stylesheet each believe about the current state. */
 
-.theme-control {
-  display: flex;
-  gap: 2px;
-  margin-bottom: 10px;
-  padding: 2px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: var(--surface-sunken);
+:root[data-rail="collapsed"] .brand,
+:root[data-rail="collapsed"] .nav-item,
+:root[data-rail="collapsed"] .rail-controls {
+  justify-content: center;
 }
 
-.theme-control-item {
-  flex: 1;
+:root[data-rail="collapsed"] .brand {
+  padding-left: 0;
+  padding-right: 0;
+}
+
+:root[data-rail="collapsed"] .nav-item {
+  padding-left: 0;
+  padding-right: 0;
+}
+
+:root[data-rail="collapsed"] .brand-word,
+:root[data-rail="collapsed"] .nav-item-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+:root[data-rail="collapsed"] .rail-controls {
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+:root[data-rail="collapsed"] .rail-foot {
+  padding-left: 0;
+  padding-right: 0;
+}
+
+/* The workspace readout has no collapsed form as prose (a filesystem path in
+   36px is an ellipsis); AppShell swaps it for .rail-glyph, which does. */
+:root[data-rail="collapsed"] .rail-glyph {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: 4px 0;
-  border: none;
-  border-radius: 5px;
+  width: 100%;
+  height: 22px;
+  color: var(--ink-faint);
+}
+
+:root[data-rail="collapsed"] .rail-glyph-error {
+  color: var(--err);
+}
+
+/* ---- rail controls ------------------------------------------------------- */
+
+/* The collapse control and the theme toggle are the same kind of thing — a
+   quiet, borderless icon button that only lights up under the pointer or the
+   focus ring — so they share one look and differ only in what they do. */
+.rail-toggle,
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
   background: none;
   color: var(--ink-faint);
   cursor: pointer;
+  transition:
+    color 120ms ease,
+    background-color 120ms ease,
+    border-color 120ms ease;
 }
 
-.theme-control-item:hover {
+.rail-toggle:hover,
+.rail-toggle:focus-visible,
+.theme-toggle:hover,
+.theme-toggle:focus-visible {
+  border-color: var(--border);
+  background: var(--surface-sunken);
   color: var(--ink);
 }
 
-.theme-control-item[data-state="checked"] {
+/* ---- rail tooltip --------------------------------------------------------
+   Radix Tooltip, not a `title` attribute: `title` never appears on keyboard
+   focus, waits out a delay the app cannot tune, and cannot be made to look
+   like the rest of the chrome. Live only while the rail is collapsed — an
+   expanded rail already has the word on screen and a tooltip repeating it is
+   noise. */
+/* --boundary rather than the separator grey the larger overlays use: those are
+   panels carrying a 28px drop shadow, and this is a 20px-tall chip whose fill
+   sits about 1.05:1 from the page behind it. The outline is the only thing
+   saying where it ends. */
+.rail-tooltip {
+  z-index: 40;
+  padding: 3px 8px;
+  border: 1px solid var(--boundary);
+  border-radius: 6px;
   background: var(--surface);
-  color: var(--accent-ink);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: nowrap;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+}
+
+.rail-tooltip-arrow {
+  fill: var(--surface);
+  stroke: var(--boundary);
+  stroke-width: 1px;
+}
+
+/* ---- theme control ------------------------------------------------------- */
+
+/* One quiet icon button that cycles system -> light -> dark. Chrome for chrome:
+   faint and borderless at rest so it never competes with the four destinations
+   above it, and picking up a hairline and a fill only under the pointer or the
+   focus ring. A theme is set once and forgotten; it does not deserve a lit
+   three-way switch parked in the rail for the rest of the session.
+
+   The button's own look lives with .rail-toggle above — they are one control
+   type wearing two glyphs, and the rail is the only place either appears. */
+.theme-control {
+  display: flex;
+}
+
+/* Kept in the accessibility tree, kept out of the picture. Clipped rather than
+   display:none, which would drop it from the tree and silence the live region
+   inside it. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .rail-note {
@@ -316,7 +532,7 @@ body {
   align-items: center;
   gap: 5px;
   padding: 4px 10px;
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--boundary);
   border-radius: 6px;
   background: var(--surface);
   color: var(--ink);
@@ -361,7 +577,7 @@ body {
 
 .input {
   padding: 4px 8px;
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--boundary);
   border-radius: 6px;
   background: var(--surface);
   color: var(--ink);
@@ -405,6 +621,16 @@ body {
   background: var(--surface-sunken);
 }
 
+/* In flight. The one chip that is SOLID rather than tinted: the status hues
+   read as "this finished, here is how", and a run that is still going needs to
+   be louder than any of them without borrowing one of their meanings. Inverted
+   ink-on-accent is the loudest thing the neutral ramp can say. */
+.chip-run {
+  color: var(--run-contrast);
+  background: var(--run);
+}
+
+/* Notable, but not a run state — an endpoint alias, a replay offset. */
 .chip-accent {
   color: var(--accent-ink);
   background: var(--accent-soft);
@@ -1137,16 +1363,26 @@ body {
   color: var(--accent-ink);
 }
 
+/* The one filled button. Its label takes --accent-contrast rather than
+   --surface: the accent now INVERTS between themes, so "the ink that reads on
+   an accent fill" is its own idea and not a coincidence of the surface colour.
+
+   The hover rule has to out-specify `.btn:hover:not(:disabled):not(
+   [data-disabled])` above, which is (0,4,0) and sets `color: var(--accent-ink)`
+   — on a filled button that is ink the same colour as the fill, and the label
+   vanishes. It was already vanishing while the accent was teal (accent-ink on
+   accent-ink, just less obviously); the extra `.btn` here settles it at (0,5,0)
+   instead of leaving it to source order. */
 .btn-primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: var(--surface);
+  color: var(--accent-contrast);
 }
 
-.btn-primary:hover:not(:disabled) {
+.btn.btn-primary:hover:not(:disabled):not([data-disabled]) {
   background: var(--accent-ink);
   border-color: var(--accent-ink);
-  color: var(--surface);
+  color: var(--accent-contrast);
 }
 
 /* ---- curate: SQL editor ---------------------------------------------------- */
@@ -2122,9 +2358,10 @@ body {
   gap: 8px;
 }
 
+/* A pressable card, so its outline is a boundary and not a separator. */
 .step-card {
   padding: 7px 9px;
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--boundary);
   border-radius: 6px;
   background: var(--bg);
 }
@@ -2408,9 +2645,31 @@ body {
   background: var(--surface);
 }
 
+/* Both axes: the chain overflows sideways in every realistic pane, and a pane
+   that also caps the height (a stage lane, a short window) gets the same drag
+   vertically. `scroll-behavior: auto` is pinned because the pan writes the
+   scroll offset directly — under a global smooth-scroll the view would ease
+   after the pointer instead of tracking it, which is exactly the animation
+   prefers-reduced-motion asks us not to invent. */
 .dag-scroll {
-  overflow-x: auto;
+  overflow: auto;
+  scroll-behavior: auto;
   border-radius: 8px 8px 0 0;
+}
+
+/* The empty space between nodes is a drag handle — but only where the graph
+   actually overflows, so the cursor never promises a pan the pane cannot give.
+   Nodes keep `cursor: pointer` by being deeper in the tree; while a pan is
+   running, grabbing wins over everything under the pointer. */
+.dag-scroll.is-pannable {
+  cursor: grab;
+}
+
+.dag-scroll.is-panning,
+.dag-scroll.is-panning * {
+  cursor: grabbing;
+  /* A drag across labels must not paint a text selection behind it. */
+  user-select: none;
 }
 
 .dag-canvas {
@@ -2423,9 +2682,12 @@ body {
   pointer-events: none;
 }
 
+/* A connector IS the dependency — the only place the graph states that two
+   tasks are related — so it takes --boundary rather than the decorative
+   separator grey it used to share with hairlines between rows. */
 .dag-edge {
   fill: none;
-  stroke: var(--border-strong);
+  stroke: var(--boundary);
   stroke-width: 1.5;
   pointer-events: stroke;
 }
@@ -2436,7 +2698,7 @@ body {
 }
 
 .dag-arrow {
-  fill: var(--border-strong);
+  fill: var(--boundary);
 }
 
 .dag-arrow.is-gate {
@@ -2493,7 +2755,7 @@ body {
   width: 100%;
   height: 100%;
   padding: 6px 9px;
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--boundary);
   border-radius: 7px;
   background: var(--bg);
   color: var(--ink);
@@ -2509,10 +2771,13 @@ body {
   border-color: var(--accent);
 }
 
+/* Selection has to stay readable NEXT TO a running node, which now also draws
+   an accent border — so the halo is what says "selected", and it is a real
+   ring rather than the barely-there tint it was while the accent was a hue. */
 .dag-node.is-selected {
   border-color: var(--accent);
   background: var(--accent-soft);
-  box-shadow: 0 0 0 2px var(--accent-soft);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent);
 }
 
 .dag-node.is-expanded {
@@ -2521,23 +2786,23 @@ body {
 }
 
 .dag-node.is-ok {
-  border-color: color-mix(in srgb, var(--ok) 45%, var(--border-strong));
+  border-color: color-mix(in srgb, var(--ok) 45%, var(--boundary));
   background: color-mix(in srgb, var(--ok) 9%, var(--surface));
 }
 
 .dag-node.is-err {
-  border-color: color-mix(in srgb, var(--err) 50%, var(--border-strong));
+  border-color: color-mix(in srgb, var(--err) 50%, var(--boundary));
   background: color-mix(in srgb, var(--err) 10%, var(--surface));
 }
 
 .dag-node.is-warn {
-  border-color: color-mix(in srgb, var(--warn) 45%, var(--border-strong));
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--boundary));
   background: color-mix(in srgb, var(--warn) 10%, var(--surface));
 }
 
-.dag-node.is-accent {
-  border-color: color-mix(in srgb, var(--accent) 50%, var(--border-strong));
-  background: color-mix(in srgb, var(--accent) 9%, var(--surface));
+.dag-node.is-run {
+  border-color: color-mix(in srgb, var(--run) 55%, var(--boundary));
+  background: color-mix(in srgb, var(--run) 9%, var(--surface));
 }
 
 /* Long task ids wrap to a second line instead of being truncated — the id is
@@ -2581,8 +2846,8 @@ body {
   color: var(--warn);
 }
 
-.dag-node-state.is-accent {
-  color: var(--accent-ink);
+.dag-node-state.is-run {
+  color: var(--run-ink);
 }
 
 .dag-node-state.is-muted {
@@ -2594,8 +2859,8 @@ body {
   flex: none;
   padding: 0 6px;
   border-radius: 999px;
-  background: var(--accent-soft);
-  color: var(--accent-ink);
+  background: var(--run-soft);
+  color: var(--run-ink);
   font-size: 9.5px;
   font-weight: 650;
   line-height: 1.7;
@@ -2795,13 +3060,14 @@ body {
   border-radius: 0;
 }
 
+/* Mirrors .dag-node-waits, so it takes the same run tone. */
 .legend-chip {
   flex: none;
   margin-top: 1px;
   padding: 0 6px;
   border-radius: 999px;
-  background: var(--accent-soft);
-  color: var(--accent-ink);
+  background: var(--run-soft);
+  color: var(--run-ink);
   font-size: 9.5px;
   font-weight: 650;
   line-height: 1.7;
@@ -3184,8 +3450,8 @@ body {
   background: var(--warn);
 }
 
-.fanout-seg.is-accent {
-  background: var(--accent);
+.fanout-seg.is-run {
+  background: var(--run);
 }
 
 .fanout-readout {
@@ -3355,7 +3621,7 @@ tr.is-selected-run td {
 }
 
 .replay-live.is-live {
-  border-color: color-mix(in srgb, var(--ok) 45%, var(--border-strong));
+  border-color: color-mix(in srgb, var(--ok) 45%, var(--boundary));
   background: var(--ok-soft);
   color: var(--ok);
   cursor: default;
@@ -3629,8 +3895,8 @@ tr.is-selected-run td {
   background: var(--warn);
 }
 
-.replay-bar.is-accent {
-  background: var(--accent);
+.replay-bar.is-run {
+  background: var(--run);
 }
 
 /* Queued is a WAIT, not work: thinner, hatched, and in the neutral ink so it
@@ -3998,9 +4264,16 @@ tr.is-selected-run td {
   background: var(--accent);
 }
 
-/* A negative value is drawn as magnitude, outlined so the sign is not lost. */
+/* A negative value is drawn as magnitude, outlined so the sign is not lost.
+   The hatch is mixed from --accent rather than taken from --accent-soft: soft
+   is a 7% wash tuned for text backgrounds, and at 9px tall behind an outline
+   it disappeared. */
 .measure-fill.is-negative {
-  background: repeating-linear-gradient(135deg, var(--accent-soft) 0 4px, transparent 4px 8px);
+  background: repeating-linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--accent) 30%, transparent) 0 4px,
+    transparent 4px 8px
+  );
   border: 1px solid var(--accent);
 }
 
@@ -4057,6 +4330,14 @@ tr.is-selected-run td {
   }
 }
 
+/* The rail stops being a rail: it becomes the bar across the top, and the
+   manual collapse is SUSPENDED for as long as it is one. A bar has no width to
+   give back, and an icon-only bar whose expand control has nowhere sensible to
+   live would strand a reader who collapsed the rail on a wide screen and then
+   narrowed the window. The stored choice is untouched — widen past 780px and
+   the rail comes back exactly as it was left. Every rule here therefore has to
+   out-specify the :root[data-rail="collapsed"] block above; the ones that
+   restate a collapsed declaration say so. */
 @media (max-width: 780px) {
   .app-shell {
     grid-template-columns: minmax(0, 1fr);
@@ -4072,16 +4353,47 @@ tr.is-selected-run td {
     border-bottom: 1px solid var(--border);
   }
 
-  .brand {
+  .brand,
+  :root[data-rail="collapsed"] .brand {
     padding: 0 4px 0 0;
   }
 
-  .rail-foot {
+  /* Undo the collapse: labels back on screen, items back to their own padding. */
+  :root[data-rail="collapsed"] .brand-word,
+  :root[data-rail="collapsed"] .nav-item-label {
+    position: static;
+    width: auto;
+    height: auto;
+    margin: 0;
+    overflow: visible;
+    clip-path: none;
+  }
+
+  :root[data-rail="collapsed"] .nav-item {
+    padding: 6px 8px;
+  }
+
+  .rail-foot,
+  :root[data-rail="collapsed"] .rail-foot {
     margin-top: 0;
     margin-left: auto;
     padding: 0;
     border-top: none;
     overflow: hidden;
+  }
+
+  /* The rail is a row here, so the gap under the controls would only push them
+     off the bar's centre line, and stacking them would make the bar taller. */
+  .rail-controls,
+  :root[data-rail="collapsed"] .rail-controls {
+    flex-direction: row;
+    margin-bottom: 0;
+  }
+
+  /* Nothing to collapse, so nothing to press. Removed from the layout rather
+     than hidden, so it leaves the tab order with it. */
+  .rail-toggle {
+    display: none;
   }
 
   .rail-meta .rail-note {
@@ -4112,9 +4424,9 @@ tr.is-selected-run td {
 
    All of it, in one place and last in the file so it wins on order rather
    than on !important: spinner rotation, the live dot, hover transitions, and
-   the theme cross-fade. Replay playback asks matchMedia the same question in
-   JS and simply does not run (its Play control says so), so nothing here
-   animates a playhead across the screen. */
+   the theme cross-fade, and the nav rail's collapse. Replay playback asks
+   matchMedia the same question in JS and simply does not run (its Play control
+   says so), so nothing here animates a playhead across the screen. */
 
 /* src/theme.ts hangs data-theme-changing on <html> for the length of one
    theme change and takes it straight off again, so this blanket transition
@@ -4140,7 +4452,14 @@ tr.is-selected-run td {
 
   .nav-item,
   .btn,
-  .chevron {
+  .chevron,
+  .rail-toggle,
+  .theme-toggle {
+    transition: none;
+  }
+
+  /* The rail changes width in one frame instead of sliding. */
+  .app-shell {
     transition: none;
   }
 

@@ -17,7 +17,7 @@ def bare_root(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def bare_api(bare_root: Path) -> TestClient:
-    return TestClient(create_app(UiSettings(data_root=str(bare_root), token=None)))
+    return TestClient(create_app(UiSettings(data_root=str(bare_root))))
 
 
 def _write_state_file(bare_root: Path, payload: str) -> Path:

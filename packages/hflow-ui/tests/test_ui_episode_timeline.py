@@ -6,8 +6,6 @@ that offers neither returns nulls so the UI can say "unknown" instead of
 drawing a fabricated axis.
 """
 
-from pathlib import Path
-
 import pytest
 from fastapi.testclient import TestClient
 from hflow_ui import UiSettings, create_app
@@ -127,9 +125,7 @@ def timeline_api(
     timeline_workspace: dict[str, str], tmp_path_factory: pytest.TempPathFactory
 ) -> TestClient:
     assets_directory = tmp_path_factory.mktemp("ui-timeline-assets")
-    settings = UiSettings(
-        data_root=timeline_workspace["data_root"], token=None, assets_dir=assets_directory
-    )
+    settings = UiSettings(data_root=timeline_workspace["data_root"], assets_dir=assets_directory)
     return TestClient(create_app(settings))
 
 
@@ -265,16 +261,3 @@ def test_timeline_without_a_catalog_is_a_404_not_a_500(
     response = empty_workspace_api.get("/api/v1/episodes/anything/timeline")
     assert response.status_code == 404
     assert "Traceback" not in response.text
-
-
-def test_timeline_requires_the_session_token(
-    populated_workspace: PopulatedWorkspace, unbuilt_assets_dir: Path
-) -> None:
-    settings = UiSettings(
-        data_root=str(populated_workspace.data_root),
-        token="secret-token",
-        assets_dir=unbuilt_assets_dir,
-    )
-    client = TestClient(create_app(settings))
-    unauthenticated = client.get(f"/api/v1/episodes/{populated_workspace.ok_episode_id}/timeline")
-    assert unauthenticated.status_code == 401

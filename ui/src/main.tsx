@@ -3,7 +3,6 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { createBrowserRouter, RouterProvider } from "react-router-dom";
 import { AppShell } from "./AppShell";
-import { detectCookieAuth } from "./api";
 import { EmptyPanel } from "./components/QueryStates";
 import { CuratePage } from "./pages/CuratePage";
 import { EpisodeDetailPage } from "./pages/EpisodeDetailPage";
@@ -47,17 +46,10 @@ const router = createBrowserRouter([
 const rootElement = document.getElementById("root");
 if (!rootElement) throw new Error("Root element #root is missing from index.html");
 
-function renderApp() {
-  createRoot(rootElement as HTMLElement).render(
-    <StrictMode>
-      <QueryClientProvider client={queryClient}>
-        <RouterProvider router={router} />
-      </QueryClientProvider>
-    </StrictMode>,
-  );
-}
-
-// Media/download URLs must know whether the session cookie authenticates this
-// browser BEFORE anything renders (the answer decides their ?token= fallback);
-// one cached same-origin probe settles it, and the app renders either way.
-void detectCookieAuth().then(renderApp, renderApp);
+createRoot(rootElement).render(
+  <StrictMode>
+    <QueryClientProvider client={queryClient}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>
+  </StrictMode>,
+);

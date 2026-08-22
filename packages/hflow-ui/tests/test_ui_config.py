@@ -58,7 +58,7 @@ def test_config_does_not_restate_the_airflow_deep_link_base(
     render_bundle(
         RuntimeConfig(pipeline_file=pipeline_file, data_root=data_root), data_root / "runtime"
     )
-    settings = UiSettings(data_root=str(data_root), token=None, assets_dir=unbuilt_assets_dir)
+    settings = UiSettings(data_root=str(data_root), assets_dir=unbuilt_assets_dir)
     payload = TestClient(create_app(settings)).get("/api/v1/config").json()
     # Configured, not necessarily reachable: nothing is running here.
     assert payload["capabilities"]["runtime"] is True
@@ -74,7 +74,7 @@ def test_config_runtime_capability_from_the_remote_environment(
     monkeypatch.setenv("HFLOW_AIRFLOW_URL", "https://workspace.example.com")
     data_root = tmp_path / "bare-root"
     data_root.mkdir()
-    settings = UiSettings(data_root=str(data_root), token=None, assets_dir=unbuilt_assets_dir)
+    settings = UiSettings(data_root=str(data_root), assets_dir=unbuilt_assets_dir)
     payload = TestClient(create_app(settings)).get("/api/v1/config").json()
     assert payload["capabilities"]["runtime"] is True
 
@@ -99,7 +99,7 @@ def test_config_reports_missing_catalog(empty_workspace_api: TestClient) -> None
 def test_config_reports_a_minted_workspace_identity(tmp_path: Path) -> None:
     # The TEST mints the identity; the server itself never does.
     minted_identity = Workspace.parse(tmp_path).ensure_identity()
-    client = TestClient(create_app(UiSettings(data_root=str(tmp_path), token=None)))
+    client = TestClient(create_app(UiSettings(data_root=str(tmp_path))))
     payload = client.get("/api/v1/config").json()
     assert payload["workspace_id"] == minted_identity.workspace_id
 

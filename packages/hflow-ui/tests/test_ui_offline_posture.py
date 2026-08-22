@@ -13,8 +13,6 @@ import re
 
 import pytest
 from fastapi.testclient import TestClient
-from hflow_ui import UiSettings, create_app
-from ui_test_fixtures import PopulatedWorkspace
 
 # Every absolute URL, whatever quoting or markup surrounds it.
 _ABSOLUTE_URL = re.compile(r"https?://[^\s\"'<>)]+", re.IGNORECASE)
@@ -55,16 +53,3 @@ def test_the_openapi_schema_is_the_published_contract(api: TestClient) -> None:
     schema = api.get("/api/openapi.json").json()
     assert schema["info"]["title"] == "HFlow workspace UI"
     assert "/api/v1/episodes" in schema["paths"]
-
-
-def test_the_unauthenticated_page_is_self_contained(
-    populated_workspace: PopulatedWorkspace,
-) -> None:
-    # The 401 HTML page is the one surface an unauthenticated browser reaches,
-    # so it is the one most tempting to dress up with a hosted stylesheet.
-    tokened_api = TestClient(
-        create_app(UiSettings(data_root=str(populated_workspace.data_root), token="offline-token"))
-    )
-    response = tokened_api.get("/")
-    assert response.status_code == 401
-    assert _referenced_hosts(response.text) == []

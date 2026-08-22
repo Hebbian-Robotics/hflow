@@ -26,7 +26,6 @@ def built_assets_directory(tmp_path: Path) -> Path:
 def spa_api(populated_workspace: PopulatedWorkspace, built_assets_directory: Path) -> TestClient:
     settings = UiSettings(
         data_root=str(populated_workspace.data_root),
-        token=None,
         assets_dir=built_assets_directory,
     )
     return TestClient(create_app(settings))
@@ -83,9 +82,7 @@ def test_the_assets_environment_override_serves_a_local_build(
     # The lane the placeholder page tells frontend developers to use: no
     # assets_dir pinned, HFLOW_UI_ASSETS pointing at a `pnpm build` output.
     monkeypatch.setenv(ASSETS_ENVIRONMENT_VARIABLE, str(built_assets_directory))
-    client = TestClient(
-        create_app(UiSettings(data_root=str(populated_workspace.data_root), token=None))
-    )
+    client = TestClient(create_app(UiSettings(data_root=str(populated_workspace.data_root))))
     assert "SPA INDEX" in client.get("/").text
 
 
@@ -105,7 +102,6 @@ def test_a_pinned_assets_directory_beats_the_environment_override(
         create_app(
             UiSettings(
                 data_root=str(populated_workspace.data_root),
-                token=None,
                 assets_dir=pinned_directory,
             )
         )
@@ -126,7 +122,7 @@ def test_packaged_assets_are_looked_up_inside_the_installed_package(
     layout degrades every real launch to the placeholder page, silently.
     """
     monkeypatch.delenv(ASSETS_ENVIRONMENT_VARIABLE, raising=False)
-    settings = UiSettings(data_root=str(populated_workspace.data_root), token=None)
+    settings = UiSettings(data_root=str(populated_workspace.data_root))
     packaged_static = Path(str(hflow_ui.__file__)).parent / "static"
 
     assert _assets_directory(settings) == (packaged_static if packaged_static.is_dir() else None)

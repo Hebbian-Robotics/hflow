@@ -2,16 +2,16 @@
 
 ``create_app`` builds the whole API plus SPA serving from one
 :class:`UiSettings` -- no sockets, no side effects. ``serve`` adds the launch
-behavior: pick a free port, print the tokened URL, open the browser, run
-uvicorn. The only workspace files this package ever writes are the curation
-studio's: immutable pinned manifests under ``<data_root>/manifests/`` and
-the ``<data_root>/ui/state.json`` sidecar (both refused when
-``settings.read_only``); the server never mints workspace identity.
+behavior: pick a free port, print the URL, open the browser, run uvicorn. The
+server authenticates nobody: whoever can reach the bound address gets the
+whole API (docs/UI.md, "Trust posture"). The only workspace files this package
+ever writes are the curation studio's: immutable pinned manifests under
+``<data_root>/manifests/`` and the ``<data_root>/ui/state.json`` sidecar (both
+refused when ``settings.read_only``); the server never mints workspace
+identity.
 """
 
-import copy
 import importlib.resources
-import logging
 import os
 import socket
 import threading
@@ -24,15 +24,12 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
-from uvicorn.config import LOGGING_CONFIG
-from uvicorn.logging import AccessFormatter
 
 import hflow
 from hflow.format import CATALOG_FORMAT_VERSION
 from hflow.steps import RUN_PROFILES, IngestMode
 from hflow.workspace import Workspace
 from hflow_ui import _catalog, _connections, _curation, _graph, _media, _pipeline, _runtime
-from hflow_ui._auth import SessionTokenMiddleware
 from hflow_ui._contract import (
     BINARY_FILE_RESPONSES,
     EpisodeDossierResponse,
@@ -203,17 +200,19 @@ def create_app(settings: UiSettings) -> FastAPI:
         # their JS and CSS from cdn.jsdelivr.net, which would break the offline
         # promise this UI makes (docs/UI.md, "Trust posture": no CDN, no
         # outbound requests) and would run third-party script same-origin with
-        # an authenticated workspace session. The generated schema is served as
-        # JSON instead -- that IS the contract, and any local OpenAPI viewer or
-        # client generator reads it. test_ui_offline_posture.py pins this.
+        # this workspace's API. The generated schema is served as JSON instead
+        # -- that IS the contract, and any local OpenAPI viewer or client
+        # generator reads it. test_ui_offline_posture.py pins this.
         docs_url=None,
         openapi_url="/api/openapi.json",
         redoc_url=None,
     )
-    # Body-size cap is outermost (added last): reject an oversized POST before
-    # auth or routing touches it.
-    if settings.token is not None:
-        application.add_middleware(SessionTokenMiddleware, session_token=settings.token)
+    # Starlette runs middleware outermost-first in REVERSE registration order,
+    # so the body-size cap being registered last is what makes it outermost:
+    # an oversized POST is refused before routing touches it. There is no
+    # request guard here -- this server authenticates nobody (docs/UI.md,
+    # "Trust posture") -- and if one is ever added, this is where it goes, in
+    # front of the routes and behind the cap.
     application.add_middleware(RequestBodySizeLimitMiddleware)
 
     # --pipeline is imported -- EXECUTED -- exactly once, here at app
@@ -425,64 +424,30 @@ def _contained_asset_response(assets_directory: Path, requested_path: str) -> Fi
     return FileResponse(resolved_candidate)
 
 
-class _QueryStringStrippingAccessFormatter(AccessFormatter):
-    """uvicorn access formatter that logs the path WITHOUT its query string.
-
-    The login ``?token=`` (and any other query param) would otherwise land in
-    the access line for every request -- a 256-bit credential written to
-    stdout, which ``serve`` itself anticipates being piped to a supervisor's
-    log. Dropping the query string keeps the useful method/path/status line.
-    """
-
-    def formatMessage(self, record: logging.LogRecord) -> str:
-        # uvicorn's access record carries (client_addr, method, full_path,
-        # http_version, status_code); full_path includes the query string.
-        if isinstance(record.args, tuple) and len(record.args) == 5:
-            client_addr, method, full_path, http_version, status_code = record.args
-            path_without_query = str(full_path).split("?", 1)[0]
-            record.args = (client_addr, method, path_without_query, http_version, status_code)
-        return super().formatMessage(record)
-
-
-def _access_log_config() -> dict[str, object]:
-    """uvicorn's default logging config with the query-string-dropping access
-    formatter swapped in."""
-    log_config = copy.deepcopy(LOGGING_CONFIG)
-    log_config["formatters"]["access"]["()"] = (
-        f"{__name__}.{_QueryStringStrippingAccessFormatter.__name__}"
-    )
-    return log_config
-
-
 def serve(settings: UiSettings) -> None:
-    """Run the workspace UI: free port, printed (tokened) URL, browser, uvicorn."""
+    """Run the workspace UI: free port, printed URL, browser, uvicorn."""
     application = create_app(settings)
     chosen_port = _first_free_port(settings.host, settings.port)
     if chosen_port != settings.port:
-        # flush=True throughout: the login URL must reach a piped stdout
-        # (tee, a supervisor's log) before the blocking uvicorn.run call.
+        # flush=True throughout: the URL must reach a piped stdout (tee, a
+        # supervisor's log) before the blocking uvicorn.run call.
         print(
             f"hflow ui: port {settings.port} is taken; serving on port {chosen_port} instead",
             flush=True,
         )
     url_host = "127.0.0.1" if settings.host == "0.0.0.0" else settings.host
-    login_url = f"http://{url_host}:{chosen_port}/"
-    if settings.token is not None:
-        login_url += f"?token={settings.token}"
-    print(f"hflow ui: browsing {settings.data_root} at {login_url}", flush=True)
+    workspace_url = f"http://{url_host}:{chosen_port}/"
+    print(f"hflow ui: browsing {settings.data_root} at {workspace_url}", flush=True)
     if settings.open_browser:
         # uvicorn.run blocks this thread; a short timer opens the browser
         # once the server has had time to bind.
-        browser_timer = threading.Timer(1.0, webbrowser.open, args=[login_url])
+        browser_timer = threading.Timer(1.0, webbrowser.open, args=[workspace_url])
         browser_timer.daemon = True
         browser_timer.start()
-    uvicorn.run(
-        application,
-        host=settings.host,
-        port=chosen_port,
-        log_level="info",
-        log_config=_access_log_config(),
-    )
+    # uvicorn's stock logging config: the access line's query string carries
+    # episode filters and paging, which are useful when debugging a request
+    # and are not credentials -- this server has none.
+    uvicorn.run(application, host=settings.host, port=chosen_port, log_level="info")
 
 
 def _first_free_port(host: str, preferred_port: int) -> int:

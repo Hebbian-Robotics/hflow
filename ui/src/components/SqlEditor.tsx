@@ -68,15 +68,22 @@ const editorTheme = EditorView.theme({
   },
 });
 
+// Syntax highlighting under the app's neutral-chrome rule: the structural
+// tokens separate by WEIGHT and ink step (keyword, type, operator, comment)
+// and only the two token classes that are literal VALUES keep a hue — strings
+// green, numbers amber, the same --ok / --warn that mean "a value" elsewhere.
+// Keywords were accent-coloured while the accent was teal; a near-black accent
+// would have made them indistinguishable from plain text, so the weight that
+// was reinforcing the colour now carries the distinction on its own.
 const sqlHighlightStyle = HighlightStyle.define([
-  { tag: tags.keyword, color: "var(--accent-ink)", fontWeight: "600" },
+  { tag: tags.keyword, color: "var(--ink)", fontWeight: "700" },
   { tag: tags.string, color: "var(--ok)" },
   { tag: tags.number, color: "var(--warn)" },
   { tag: tags.bool, color: "var(--warn)" },
   { tag: tags.comment, color: "var(--ink-faint)", fontStyle: "italic" },
   { tag: tags.operator, color: "var(--ink-muted)" },
   { tag: tags.punctuation, color: "var(--ink-muted)" },
-  { tag: tags.typeName, color: "var(--accent-ink)" },
+  { tag: tags.typeName, color: "var(--ink)", fontWeight: "600" },
 ]);
 
 function sqlLanguageExtension(schema: SqlSchema) {

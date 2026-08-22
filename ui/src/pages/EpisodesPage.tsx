@@ -219,13 +219,8 @@ export function EpisodesPage() {
   const rows = useMemo(() => episodesData?.rows ?? [], [episodesData]);
 
   // Detail-route navigation carries the list URL's search string, so the
-  // detail page's back link can restore the exact filters/sort/page. A landing
-  // ?token= is deliberately NOT carried into more history entries.
-  const listSearch = useMemo(() => {
-    const carried = new URLSearchParams(searchParams);
-    carried.delete("token");
-    return carried.toString();
-  }, [searchParams]);
+  // detail page's back link can restore the exact filters/sort/page.
+  const listSearch = useMemo(() => searchParams.toString(), [searchParams]);
 
   // Columns come from the server's DESCRIBE of the wide view, so the table
   // renders whatever the catalog holds without a hardcoded schema.

@@ -154,6 +154,13 @@ deployment against facts:
   store.
 - **No tenant-facing log or metrics API.** Observability is Airflow's own
   UI and task logs on the workspace.
+- **The workspace UI (`hflow ui`) authenticates nobody.** It is a local
+  developer tool bound to `127.0.0.1`, deliberately without a login; it is
+  not a tenant-facing surface, and serving it to anyone but the workspace's
+  own operator means putting an authenticating proxy in front of it. Signing
+  people in and scoping them to a workspace is the control plane's job --
+  per-user identity and revocable sessions, which no shared launch secret
+  could stand in for.
 - **Task processes share the runtime's environment**, including the
   workspace's storage credentials, and the venv build runs as root at
   provision time -- isolation between principals must come from your

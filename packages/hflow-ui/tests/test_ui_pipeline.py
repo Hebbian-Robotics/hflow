@@ -30,9 +30,7 @@ RAISING_PIPELINE_SOURCE = 'raise RuntimeError("boom at import")\n'
 
 
 def _client_over(data_root: Path, assets_dir: Path, *, pipeline: str | None) -> TestClient:
-    settings = UiSettings(
-        data_root=str(data_root), token=None, assets_dir=assets_dir, pipeline=pipeline
-    )
+    settings = UiSettings(data_root=str(data_root), assets_dir=assets_dir, pipeline=pipeline)
     return TestClient(create_app(settings))
 
 

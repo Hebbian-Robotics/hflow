@@ -3,7 +3,16 @@
 // never drift apart. Unknown states render muted rather than failing (Airflow
 // gains states across versions).
 
-export type RunStateTone = "ok" | "err" | "warn" | "accent" | "muted";
+/**
+ * Five tones, one per thing a run can be saying. "run" is work IN FLIGHT.
+ *
+ * It was called "accent" while the chrome accent happened to be a colour and
+ * could be borrowed; the chrome is neutral now, and a status tone that shares
+ * a name with the hover colour is a status tone somebody will restyle by
+ * accident. The tones name meanings, and styles.css decides what each one
+ * looks like (--ok / --err / --warn / --run / --ink-faint).
+ */
+export type RunStateTone = "ok" | "err" | "warn" | "run" | "muted";
 
 export function runStateTone(state: string | null | undefined): RunStateTone {
   switch (state?.toLowerCase()) {
@@ -13,11 +22,11 @@ export function runStateTone(state: string | null | undefined): RunStateTone {
     case "error":
       return "err";
     case "running":
-      return "accent";
+      return "run";
     // A deferred task released its worker slot and is WAITING on a trigger —
     // it is healthy, so it reads like work in flight, never like a failure.
     case "deferred":
-      return "accent";
+      return "run";
     case "upstream_failed":
     case "up_for_retry":
     case "up_for_reschedule":

@@ -374,11 +374,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="do not open a browser after starting (headless use)",
     )
     ui_parser.add_argument(
-        "--no-token",
-        action="store_true",
-        help="disable the session token (only for a trusted, loopback-only machine)",
-    )
-    ui_parser.add_argument(
         "--read-only",
         action="store_true",
         help="viewer mode: hide and refuse manifest pinning, saved-query edits, and run triggering",
@@ -739,7 +734,7 @@ def _command_doctor(arguments: argparse.Namespace) -> int:
 
 def _command_ui(arguments: argparse.Namespace) -> int:
     try:
-        from hflow_ui import UiSettings, new_session_token, serve
+        from hflow_ui import UiSettings, serve
     except ImportError:
         print(
             "ui: the workspace UI ships as a separate package so pipeline "
@@ -752,7 +747,6 @@ def _command_ui(arguments: argparse.Namespace) -> int:
         data_root=arguments.data_root,
         host=arguments.host,
         port=arguments.port,
-        token=None if arguments.no_token else new_session_token(),
         open_browser=not arguments.no_browser,
         read_only=arguments.read_only,
         pipeline=arguments.pipeline,

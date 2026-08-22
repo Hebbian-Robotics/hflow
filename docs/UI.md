@@ -23,8 +23,9 @@ HFLOW_UI_ASSETS=ui/dist uv run hflow ui   # browses $HFLOW_DATA_ROOT, else ./dat
 HFLOW_UI_ASSETS=ui/dist uv run hflow ui --data-root ./data --no-browser
 ```
 
-Starting the server prints a one-time login URL
-(`http://127.0.0.1:4356/?token=...`) and opens your browser.
+Starting the server prints its URL (`http://127.0.0.1:4356/`) and opens your
+browser. There is no login: see [Trust posture](#trust-posture) for what that
+means and when it stops being appropriate.
 
 ## What it shows
 
@@ -61,7 +62,6 @@ Starting the server prints a one-time login URL
 | `--host` | bind address (default `127.0.0.1`; widening past loopback exposes your corpus) |
 | `--port` | default `4356`, auto-retries upward when taken |
 | `--no-browser` | do not open a browser (headless machines, tunnels) |
-| `--no-token` | disable the session token (trusted, loopback-only machines) |
 | `--read-only` | viewer mode: hides and refuses manifest pinning, saved-query edits, and run triggering |
 | `--pipeline` | pipeline file for the Pipeline page (imported once at startup) |
 
@@ -80,13 +80,36 @@ reference client.
 
 ## Trust posture
 
-The UI runs fully local: all assets ship in the wheel (no CDN, no fonts, no
-outbound requests), and your data never leaves your machine. That is why the
-server publishes the schema JSON and no interactive Swagger page -- FastAPI's
-built-in one fetches its JavaScript and CSS from a public CDN, which would
-break the promise and run third-party script inside your logged-in session.
-The server binds loopback with a random per-session token; the browser never
-sees filesystem paths of its choosing (media is addressed by episode and
+**The server is unauthenticated.** There is no login, no token, and no
+session: anyone who can reach the bound address can read your whole workspace
+and trigger ingest runs. What protects it is the address it binds --
+`127.0.0.1` by default, reachable only from your own machine. This is the
+posture of every local developer tool that browses a working directory
+(`mlflow ui`, TensorBoard, `dagster dev`, the DuckDB UI): a credential in
+front of a single-user machine buys nothing but friction.
+
+Passing `--host` past loopback is therefore a deliberate exposure, and it is
+the only flag that changes who can reach the data. If you need the UI from
+another machine, forward the port over SSH (`ssh -L 4356:127.0.0.1:4356
+host`) rather than binding a network interface; if you must bind one, put a
+reverse proxy that authenticates in front of it and firewall the port itself.
+`--read-only` narrows what a reacher can *do* (no pins, no saved-query edits,
+no triggering) but not what they can *read* -- it is a safety catch, not
+access control.
+
+Hosted, multi-user HFlow is a different problem and is solved elsewhere: the
+control plane authenticates people and scopes them to workspaces
+([HOSTING.md](./HOSTING.md)). That needs per-user identity and revocable
+sessions, which one shared launch secret could never provide -- which is why
+this server does not pretend to have a piece of it.
+
+The rest of the posture is real and holds regardless. The UI runs fully
+local: all assets ship in the wheel (no CDN, no fonts, no outbound requests),
+and your data never leaves your machine. That is why the server publishes the
+schema JSON and no interactive Swagger page -- FastAPI's built-in one fetches
+its JavaScript and CSS from a public CDN, which would break the promise and
+run third-party script same-origin with your workspace's API. The browser
+never sees filesystem paths of its choosing (media is addressed by episode and
 artifact name, and the server refuses anything outside the data root), Airflow
 credentials stay server-side behind a proxy, and curation SQL runs on a
 [constrained DuckDB connection](./CATALOG.md) that cannot reach the catalog's

@@ -29,9 +29,7 @@ PIPELINE_SOURCE = "import hflow\n\napp = hflow.App('demo', data_root='/opt/airfl
 
 
 def _client_over(data_root: Path, assets_dir: Path, *, read_only: bool = False) -> TestClient:
-    settings = UiSettings(
-        data_root=str(data_root), token=None, assets_dir=assets_dir, read_only=read_only
-    )
+    settings = UiSettings(data_root=str(data_root), assets_dir=assets_dir, read_only=read_only)
     return TestClient(create_app(settings))
 
 

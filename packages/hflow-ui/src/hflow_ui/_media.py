@@ -31,8 +31,9 @@ _WORKSPACE_LAYOUT_DIRECTORY_NAMES = frozenset(
 # Media types inert enough to render inline in the browser: raster images and
 # common audio/video containers. Deliberately excludes text/html,
 # image/svg+xml, and application/xhtml+xml -- an active document served from
-# the UI's own origin could read the session token and issue authenticated
-# same-origin calls, so anything not on this list is forced to download.
+# the UI's own origin runs script same-origin with this workspace's API and
+# could drive every endpoint it exposes (read the catalog, pin manifests,
+# trigger runs), so anything not on this list is forced to download.
 _INLINE_SERVABLE_MEDIA_TYPES = frozenset(
     {
         "image/png",

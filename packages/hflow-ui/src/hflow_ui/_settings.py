@@ -7,7 +7,6 @@ the refusal it maps to lives next to it rather than being hand-written per
 router.
 """
 
-import secrets
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,15 +21,10 @@ DEFAULT_PORT = 4356
 # The TCP ports a launch may ask for, the same range (and the same reason for
 # excluding 0) that ``hflow.runtime``'s RuntimeConfig enforces for the
 # bundle's api port: 0 means "any free port" to bind(2), but this value is
-# interpolated into the login URL `serve` prints and hands to the browser,
-# and http://127.0.0.1:0 is not dialable.
+# interpolated into the URL `serve` prints and hands to the browser, and
+# http://127.0.0.1:0 is not dialable.
 MIN_PORT = 1
 MAX_PORT = 65535
-
-
-def new_session_token() -> str:
-    """Mint one launch's browser session token (URL-safe, 256 bits)."""
-    return secrets.token_urlsafe(32)
 
 
 @dataclass(frozen=True)
@@ -38,15 +32,16 @@ class UiSettings:
     """One ``hflow ui`` launch, fully parsed.
 
     ``data_root`` stays a string: it may be a local path or a bucket URL, and
-    ``hflow.workspace.Workspace.parse`` owns that distinction. ``token=None``
-    disables session auth entirely (trusted loopback only); ``assets_dir``
+    ``hflow.workspace.Workspace.parse`` owns that distinction. ``assets_dir``
     overrides where the built SPA is served from (tests and frontend dev).
+
+    Nothing here is a credential: the server authenticates nobody, so ``host``
+    is the whole access-control story (see docs/UI.md, "Trust posture").
     """
 
     data_root: str
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
-    token: str | None = None
     assets_dir: Path | None = None
     open_browser: bool = True
     # When true, every mutating endpoint (manifest pinning, saved-query
@@ -63,7 +58,7 @@ class UiSettings:
         # library caller building UiSettings directly gets the same answer as
         # the command line. Left to bind(2) instead, an out-of-range port
         # surfaces as an OverflowError from inside the port probe, and port 0
-        # binds fine while printing a login URL nobody can open.
+        # binds fine while printing a URL nobody can open.
         if not MIN_PORT <= self.port <= MAX_PORT:
             raise ValueError(f"port {self.port!r} is not in {MIN_PORT}-{MAX_PORT}")
 

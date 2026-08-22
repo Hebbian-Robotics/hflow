@@ -45,9 +45,7 @@ def bundle_workspace(tmp_path: Path) -> Path:
 
 
 def _client_over(data_root: Path, assets_dir: Path) -> TestClient:
-    return TestClient(
-        create_app(UiSettings(data_root=str(data_root), token=None, assets_dir=assets_dir))
-    )
+    return TestClient(create_app(UiSettings(data_root=str(data_root), assets_dir=assets_dir)))
 
 
 @pytest.fixture()

@@ -8,6 +8,11 @@ nothing but your pinned manifests and its own small state file.
 hflow ui --data-root ./data
 ```
 
+It binds `127.0.0.1` and authenticates nobody, like other local developer
+tools that browse a working directory: anyone who can reach the bound address
+can read the workspace and trigger runs, so binding past loopback is a
+deliberate exposure. `docs/UI.md` ("Trust posture") has the details.
+
 This package is not on PyPI yet. Until the first release, run it from a clone
 of the [repository](https://github.com/Hebbian-Robotics/hflow); `docs/UI.md`
 there has the exact steps, including the frontend build.

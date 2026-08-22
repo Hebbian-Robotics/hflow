@@ -15,7 +15,7 @@ from hflow.steps import MeasurementValue
 
 
 def _client_over(data_root: Path) -> TestClient:
-    return TestClient(create_app(UiSettings(data_root=str(data_root), token=None)))
+    return TestClient(create_app(UiSettings(data_root=str(data_root))))
 
 
 def _append_with_measurements(

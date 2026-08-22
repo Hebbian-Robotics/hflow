@@ -14,7 +14,6 @@ import {
   type EpisodeTimeline,
   fetchEpisodeDossier,
   fetchEpisodeTimeline,
-  withSessionToken,
 } from "../api";
 import { MeasurementBars, TimelineStrip } from "../components/EpisodeTimeline";
 import { EmptyPanel, ErrorPanel, LoadingPanel } from "../components/QueryStates";
@@ -64,12 +63,12 @@ function MediaSection({ media }: { media: EpisodeMediaItem[] }) {
             <a
               key={item.name}
               className="media-item"
-              href={withSessionToken(item.url)}
+              href={item.url}
               target="_blank"
               rel="noreferrer"
               title={`Open ${item.name} full-size`}
             >
-              <img src={withSessionToken(item.url)} alt={item.name} loading="lazy" />
+              <img src={item.url} alt={item.name} loading="lazy" />
               <span className="media-name">{item.name}</span>
             </a>
           ) : (
@@ -418,7 +417,7 @@ function DossierView({ dossier }: { dossier: EpisodeDossier }) {
           ))}
           <div className="toolbar-spacer" />
           {dossier.canonical_url ? (
-            <a className="btn" href={withSessionToken(dossier.canonical_url)} download>
+            <a className="btn" href={dossier.canonical_url} download>
               <Download />
               <span>Download canonical</span>
             </a>

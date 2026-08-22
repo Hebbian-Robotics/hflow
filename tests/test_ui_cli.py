@@ -1,10 +1,10 @@
 """``hflow ui`` flags to :class:`hflow_ui.UiSettings` -- the launch contract.
 
-``_command_ui`` is the only place that turns the CLI's flags into a launch,
-and one expression in it decides whether that launch is authenticated at all:
-``UiSettings`` defaults to ``token=None`` (no session middleware), so a
-regression there serves the corpus with no credential while every hflow-ui
-auth test, which builds its settings by hand, still passes.
+``_command_ui`` is the only place that turns the CLI's flags into a launch, so
+a flag that stops reaching ``UiSettings`` (or a default that drifts) is
+invisible to every hflow-ui test, which builds its settings by hand.
+``--host`` is the one flag with a posture consequence: the server
+authenticates nobody, so what it binds is the whole access-control story.
 
 ``serve`` is the process boundary and is monkeypatched here: these tests
 assert the settings it was handed, never a running server.
@@ -55,29 +55,16 @@ def test_ui_flags_land_in_the_launch_settings(
     assert settings.pipeline == "kitchen.py:my_app"
 
 
-def test_ui_mints_a_fresh_session_token_per_launch(
+def test_a_bare_ui_launch_uses_the_documented_defaults(
     served_settings: list[UiSettings], tmp_path: Path
 ) -> None:
-    """Authentication is the default, and no two launches share a credential."""
+    """What `hflow ui` with no flags promises -- loopback above all."""
     assert main(["ui", "--data-root", str(tmp_path)]) == 0
-    assert main(["ui", "--data-root", str(tmp_path)]) == 0
-    first, second = served_settings
-    assert first.token and second.token
-    assert first.token != second.token
-    # The rest of the defaults a bare `hflow ui` promises.
-    assert (first.host, first.port) == ("127.0.0.1", DEFAULT_UI_PORT)
-    assert first.open_browser is True
-    assert first.read_only is False
-    assert first.pipeline is None
-
-
-def test_ui_no_token_serves_without_authentication(
-    served_settings: list[UiSettings], tmp_path: Path
-) -> None:
-    """The opt-out has to be explicit and total: no token, no middleware."""
-    assert main(["ui", "--data-root", str(tmp_path), "--no-token"]) == 0
     (settings,) = served_settings
-    assert settings.token is None
+    assert (settings.host, settings.port) == ("127.0.0.1", DEFAULT_UI_PORT)
+    assert settings.open_browser is True
+    assert settings.read_only is False
+    assert settings.pipeline is None
 
 
 def test_ui_without_the_package_exits_with_the_install_hint(

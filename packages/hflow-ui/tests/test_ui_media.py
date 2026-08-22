@@ -34,7 +34,9 @@ def mixed_media_workspace(tmp_path: Path) -> tuple[TestClient, str]:
     media_dir = data_root / "media"
     media_dir.mkdir()
     (media_dir / "frame.jpg").write_bytes(b"\xff\xd8\xff\xe0 jpeg \xff\xd9")
-    (media_dir / "report.html").write_text("<script>alert(document.cookie)</script>")
+    # The payload names the real risk of rendering this inline: script from
+    # the UI's own origin can drive every endpoint the API exposes.
+    (media_dir / "report.html").write_text("<script>fetch('/api/v1/episodes')</script>")
     (media_dir / "sheet.svg").write_text(
         "<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>"
     )
@@ -60,7 +62,7 @@ def mixed_media_workspace(tmp_path: Path) -> tuple[TestClient, str]:
             )
         ],
     )
-    client = TestClient(create_app(UiSettings(data_root=str(data_root), token=None)))
+    client = TestClient(create_app(UiSettings(data_root=str(data_root))))
     return client, result.episode_id
 
 

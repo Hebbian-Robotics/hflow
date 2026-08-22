@@ -114,24 +114,6 @@ def test_the_body_cap_holds_without_a_declared_content_length(writable_api: Test
     assert "content-length" not in response.request.headers
 
 
-def test_the_body_cap_holds_on_a_token_configured_server(
-    writable_workspace: PopulatedWorkspace,
-) -> None:
-    # Every real `hflow ui` launch mints a token, and the size cap is a
-    # separate middleware from auth -- so it has to be exercised on a server
-    # that has both, not only on the tokenless one the other tests use.
-    session_token = "body-cap-session-token"
-    tokened_api = TestClient(
-        create_app(UiSettings(data_root=str(writable_workspace.data_root), token=session_token))
-    )
-    response = tokened_api.post(
-        "/api/v1/queries",
-        json=_oversized_query_body(),
-        headers={"Authorization": f"Bearer {session_token}"},
-    )
-    assert response.status_code == 413
-
-
 def test_query_writes_are_403_when_read_only(read_only_api: TestClient) -> None:
     assert read_only_api.get("/api/v1/queries").status_code == 200  # reading stays open
     refusals = [
@@ -148,7 +130,5 @@ def test_saved_queries_persist_across_server_restarts(
     writable_api: TestClient, writable_workspace: PopulatedWorkspace
 ) -> None:
     created = _created_query(writable_api, "durable", "SELECT 1")
-    restarted_api = TestClient(
-        create_app(UiSettings(data_root=str(writable_workspace.data_root), token=None))
-    )
+    restarted_api = TestClient(create_app(UiSettings(data_root=str(writable_workspace.data_root))))
     assert restarted_api.get("/api/v1/queries").json()["queries"] == [created]

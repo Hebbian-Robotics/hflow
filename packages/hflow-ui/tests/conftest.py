@@ -31,9 +31,9 @@ def unbuilt_assets_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 @pytest.fixture(scope="session")
 def api(populated_workspace: PopulatedWorkspace, unbuilt_assets_dir: Path) -> TestClient:
-    """A tokenless client (auth disabled) over the populated root."""
+    """A client over the populated root; the server authenticates nobody."""
     settings = UiSettings(
-        data_root=str(populated_workspace.data_root), token=None, assets_dir=unbuilt_assets_dir
+        data_root=str(populated_workspace.data_root), assets_dir=unbuilt_assets_dir
     )
     return TestClient(create_app(settings))
 
@@ -47,7 +47,6 @@ def read_only_api(populated_workspace: PopulatedWorkspace, unbuilt_assets_dir: P
     """
     settings = UiSettings(
         data_root=str(populated_workspace.data_root),
-        token=None,
         assets_dir=unbuilt_assets_dir,
         read_only=True,
     )
@@ -63,7 +62,7 @@ def writable_workspace(tmp_path_factory: pytest.TempPathFactory) -> PopulatedWor
 @pytest.fixture()
 def writable_api(writable_workspace: PopulatedWorkspace, unbuilt_assets_dir: Path) -> TestClient:
     settings = UiSettings(
-        data_root=str(writable_workspace.data_root), token=None, assets_dir=unbuilt_assets_dir
+        data_root=str(writable_workspace.data_root), assets_dir=unbuilt_assets_dir
     )
     return TestClient(create_app(settings))
 
@@ -74,7 +73,7 @@ def empty_workspace_api(
 ) -> TestClient:
     """A client over a data root that has no catalog at all."""
     empty_root = tmp_path_factory.mktemp("ui-empty-root")
-    settings = UiSettings(data_root=str(empty_root), token=None, assets_dir=unbuilt_assets_dir)
+    settings = UiSettings(data_root=str(empty_root), assets_dir=unbuilt_assets_dir)
     return TestClient(create_app(settings))
 
 
@@ -85,5 +84,5 @@ def empty_catalog_api(
     """A client over a catalog that exists but holds zero episodes."""
     data_root = tmp_path_factory.mktemp("ui-empty-catalog-root")
     Catalog(data_root / "catalog")
-    settings = UiSettings(data_root=str(data_root), token=None, assets_dir=unbuilt_assets_dir)
+    settings = UiSettings(data_root=str(data_root), assets_dir=unbuilt_assets_dir)
     return TestClient(create_app(settings))

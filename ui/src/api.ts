@@ -141,89 +141,12 @@ export const MAX_PAGE_SIZE = 500;
 /** The server's default sort column; mirrored so the header indicator is honest. */
 export const DEFAULT_ORDER_BY = "recorded_at";
 
-// --- session token -----------------------------------------------------------
-// `hflow ui` prints a tokened URL; the server sets an HttpOnly session cookie
-// on that first navigation (newer servers redirect it to strip the token from
-// the address bar). We keep any token we saw in the landing URL so API calls
-// still work where the cookie never got set (e.g. behind the Vite dev proxy):
-// XHR always sends it as `Authorization: Bearer`, and media/download URLs fall
-// back to a `?token=` query param ONLY when the cookie is known not to work —
-// never by default, so the credential stays out of access logs and history.
-
-const SESSION_TOKEN_STORAGE_KEY = "hflow-ui-session-token";
-
-function readSessionToken(): string | null {
-  let tokenFromUrl: string | null = null;
-  try {
-    tokenFromUrl = new URLSearchParams(window.location.search).get("token");
-  } catch {
-    tokenFromUrl = null;
-  }
-  try {
-    if (tokenFromUrl) {
-      sessionStorage.setItem(SESSION_TOKEN_STORAGE_KEY, tokenFromUrl);
-      return tokenFromUrl;
-    }
-    return sessionStorage.getItem(SESSION_TOKEN_STORAGE_KEY);
-  } catch {
-    return tokenFromUrl;
-  }
-}
-
-const sessionToken = readSessionToken();
-
-// The session cookie is HttpOnly, so the only way to learn whether it
-// authenticates this browser is to ask the server once and cache the answer.
-const COOKIE_AUTH_STORAGE_KEY = "hflow-ui-cookie-auth";
-
-type CookieAuthAnswer = "yes" | "no" | null;
-
-function readCachedCookieAuthAnswer(): CookieAuthAnswer {
-  try {
-    const cachedAnswer = sessionStorage.getItem(COOKIE_AUTH_STORAGE_KEY);
-    return cachedAnswer === "yes" || cachedAnswer === "no" ? cachedAnswer : null;
-  } catch {
-    return null;
-  }
-}
-
-let cookieAuthAnswer: CookieAuthAnswer = readCachedCookieAuthAnswer();
-
-/**
- * Probe (once per session, before first render) whether the server's session
- * cookie authenticates this browser: one credential-free GET /api/v1/config.
- * 2xx means the cookie (or a token-less server) covers <img>/<a> URLs; a
- * failure status means media URLs need the ?token= fallback.
- */
-export async function detectCookieAuth(): Promise<void> {
-  if (!sessionToken || cookieAuthAnswer !== null) return;
-  let probeResponse: Response;
-  try {
-    probeResponse = await fetch("/api/v1/config", { headers: { Accept: "application/json" } });
-  } catch {
-    return; // Server unreachable — stay undecided and probe again next load.
-  }
-  cookieAuthAnswer = probeResponse.ok ? "yes" : "no";
-  try {
-    sessionStorage.setItem(COOKIE_AUTH_STORAGE_KEY, cookieAuthAnswer);
-  } catch {
-    // Storage unavailable: the in-memory answer still covers this page.
-  }
-}
-
-/**
- * Prepare a same-origin URL the browser fetches outside XHR (<img src>,
- * <a download>): the session cookie authenticates those by default, so the
- * token rides the query string only as the fallback for sessions where the
- * cookie is known not to work (detectCookieAuth answered "no").
- */
-export function withSessionToken(url: string): string {
-  if (!sessionToken || cookieAuthAnswer !== "no") return url;
-  const separator = url.includes("?") ? "&" : "?";
-  return `${url}${separator}token=${encodeURIComponent(sessionToken)}`;
-}
-
 // --- fetch helpers ------------------------------------------------------------
+// The server carries no authentication of its own (see docs/UI.md, "Trust
+// posture"), so every call here is a plain same-origin request: no credential
+// is captured from the landing URL, stored, or attached. Server-side paths
+// (media, canonical downloads, pinned Parquet) are used verbatim in
+// <img src> / <a href>.
 
 type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
 
@@ -234,10 +157,6 @@ async function requestJson<ResponseBody>(
 ): Promise<ResponseBody> {
   const headers: Record<string, string> = { Accept: "application/json" };
   if (requestBody !== undefined) headers["Content-Type"] = "application/json";
-  // XHR authenticates with the Bearer header (the session cookie also rides
-  // along); the token never travels in the query string, where it would land
-  // in access logs — and newer servers refuse query tokens on XHR anyway.
-  if (sessionToken) headers.Authorization = `Bearer ${sessionToken}`;
   let response: Response;
   try {
     response = await fetch(path, {
@@ -444,7 +363,7 @@ export function fetchManifests(): Promise<ManifestRegistryEntry[]> {
   );
 }
 
-/** Same-origin Parquet download path; wrap with withSessionToken() for hrefs. */
+/** Same-origin Parquet download path, ready to use as an href. */
 export function manifestDownloadPath(manifestId: string): string {
   return `/api/v1/manifests/${encodeURIComponent(manifestId)}/download`;
 }
@@ -842,9 +761,6 @@ export function describeApiError(error: unknown): string {
   if (error instanceof ApiError) {
     if (error.status === 0) {
       return `Could not reach the hflow ui server (${error.detail}). Is \`hflow ui\` running?`;
-    }
-    if (error.status === 401) {
-      return "Not authorized. Reopen the tokened URL that `hflow ui` printed.";
     }
     return error.detail;
   }

@@ -96,7 +96,7 @@ class ValueCount(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    """The liveness answer; served without a session token."""
+    """The liveness answer: the cheapest endpoint a probe can poll."""
 
     ok: bool
 

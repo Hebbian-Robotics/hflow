@@ -54,7 +54,7 @@ def _build_stats_workspace(tmp_path: Path) -> Path:
 @pytest.fixture()
 def stats_api(tmp_path: Path, unbuilt_assets_dir: Path) -> TestClient:
     data_root = _build_stats_workspace(tmp_path)
-    settings = UiSettings(data_root=str(data_root), token=None, assets_dir=unbuilt_assets_dir)
+    settings = UiSettings(data_root=str(data_root), assets_dir=unbuilt_assets_dir)
     return TestClient(create_app(settings))
 
 

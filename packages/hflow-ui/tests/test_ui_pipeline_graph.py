@@ -74,9 +74,7 @@ def runtime_free_cwd(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
 
 
 def _client_over(data_root: Path, assets_dir: Path, *, pipeline: str | None = None) -> TestClient:
-    settings = UiSettings(
-        data_root=str(data_root), token=None, assets_dir=assets_dir, pipeline=pipeline
-    )
+    settings = UiSettings(data_root=str(data_root), assets_dir=assets_dir, pipeline=pipeline)
     return TestClient(create_app(settings))
 
 
