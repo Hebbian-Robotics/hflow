@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from hflow import __version__
-from hflow.app import DATA_ROOT_ENVIRONMENT_VARIABLE, DEFAULT_DATA_ROOT
+from hflow.app import DATA_ROOT_ENVIRONMENT_VARIABLE, DEFAULT_DATA_ROOT, parse_pipeline_spec
 from hflow.curation import curate, stale_episodes
 from hflow.doctor import diagnose
 from hflow.runtime._deploy import DEFAULT_DEPLOY_VENV_PYTHON
@@ -449,38 +449,16 @@ def _resolve_bundle_dir(bundle_dir_argument: Path | None) -> Path:
     return candidates[0]
 
 
-def _parse_pipeline_spec(pipeline_spec: str) -> tuple[Path, str]:
-    """Split ``path/to/pipeline.py[:app_variable]`` (default variable: ``app``)."""
-    path_part, separator, variable_part = pipeline_spec.rpartition(":")
-    if separator and path_part and variable_part.isidentifier():
-        return Path(path_part), variable_part
-    return Path(pipeline_spec), "app"
-
-
 def _import_pipeline_app(pipeline_spec: str) -> "App":
     """Import ``path/to/pipeline.py[:app]`` and return its App, loudly.
 
-    The pipeline file is arbitrary user code: any exception it raises is a
-    boundary failure of the calling command (reported as a ``ValueError``
-    naming the file), never a crash.
+    The library owns the contract (:func:`hflow.app.import_pipeline_application`)
+    so every vantage that addresses a pipeline by file -- these commands and
+    the workspace UI -- resolves it identically.
     """
-    import importlib.util
+    from hflow.app import import_pipeline_application
 
-    from hflow.app import App
-
-    pipeline_file, app_variable = _parse_pipeline_spec(pipeline_spec)
-    spec = importlib.util.spec_from_file_location("hflow_user_pipeline", pipeline_file)
-    if spec is None or spec.loader is None:
-        raise ValueError(f"cannot import pipeline file {pipeline_file}")
-    module = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(module)
-    except Exception as error:
-        raise ValueError(f"importing {pipeline_file} failed: {error}") from error
-    app = getattr(module, app_variable, None)
-    if not isinstance(app, App):
-        raise ValueError(f"{pipeline_file} has no hflow.App named {app_variable!r}")
-    return app
+    return import_pipeline_application(pipeline_spec)
 
 
 def _command_manifest(arguments: argparse.Namespace) -> int:
@@ -538,7 +516,7 @@ def _command_up(arguments: argparse.Namespace) -> int:
         started_summary,
     )
 
-    pipeline_file, app_variable = _parse_pipeline_spec(arguments.pipeline)
+    pipeline_file, app_variable = parse_pipeline_spec(arguments.pipeline)
     hflow_source = (
         arguments.hflow_source if arguments.hflow_source is not None else infer_hflow_source()
     )
@@ -596,7 +574,7 @@ def _command_up(arguments: argparse.Namespace) -> int:
 def _command_deploy(arguments: argparse.Namespace) -> int:
     from hflow.runtime._deploy import DeployConfig, render_deploy_bundle
 
-    pipeline_file, app_variable = _parse_pipeline_spec(arguments.pipeline)
+    pipeline_file, app_variable = parse_pipeline_spec(arguments.pipeline)
     try:
         config = DeployConfig(
             pipeline_file=pipeline_file,

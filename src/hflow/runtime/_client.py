@@ -288,6 +288,7 @@ class AirflowClient:
         *,
         profile: str = "full",
         online: bool = False,
+        batch_count: int | None = None,
         dag_run_id: str | None = None,
     ) -> dict[str, Any]:
         """Trigger the MASTER ingest DAG over ``uris`` (the SDK/CLI entry point).
@@ -297,12 +298,20 @@ class AirflowClient:
         only the enabled stage sub-DAGs). ``online`` selects the
         latency-first trigger lane -- the sub-DAGs process the uris as one
         immediate batch, no bin-packing, no stagger -- instead of the default
-        staggered batch lane. Supply ``dag_run_id`` when the caller may retry
+        staggered batch lane. ``batch_count`` overrides the master's own
+        bin-packing for the batch lane (ignored by the online lane, which is
+        always one batch). Supply ``dag_run_id`` when the caller may retry
         (see :meth:`trigger_dag_run` for the idempotency contract).
+
+        This method owns the trigger conf's shape: every caller -- the CLI,
+        the workspace UI, a control plane -- goes through it rather than
+        rebuilding the dict.
         """
-        conf = {
+        conf: dict[str, Any] = {
             "uris": uris,
             "profile": profile,
             "mode": "online" if online else "batch",
         }
+        if batch_count is not None:
+            conf["batch_count"] = batch_count
         return self.trigger_dag_run(dag_id, conf=conf, dag_run_id=dag_run_id)

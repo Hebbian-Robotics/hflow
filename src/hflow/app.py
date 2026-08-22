@@ -121,6 +121,9 @@ def _resolve_data_root(data_root: "Path | str | StorageRoot | None") -> "Path | 
 # contact sheet per camera topic, recorded exactly like an enrichment so its
 # catalog rows flow through CheckRunRow like everything else.
 MEDIA_CONTACT_SHEET_STEP_NAME = "media/contact_sheet"
+# Published artifacts are recorded as measurements under this prefix, so a
+# reader can tell "here is where the file went" from an ordinary label.
+ARTIFACT_MEASUREMENT_KEY_PREFIX = "artifact/"
 _MEDIA_CONTACT_SHEET_FPS = 0.5
 _SYNC_COMPLETION_MARKER_NAME = ".sync-complete.json"
 
@@ -438,7 +441,10 @@ class TestReport:
                         artifact_location = enrichment_run.artifact_uris.get(
                             artifact_name, str(artifact_path)
                         )
-                        lines.append(f"      artifact/{artifact_name} = {artifact_location}")
+                        lines.append(
+                            f"      {ARTIFACT_MEASUREMENT_KEY_PREFIX}{artifact_name} = "
+                            f"{artifact_location}"
+                        )
         return "\n".join(lines)
 
     def __str__(self) -> str:
@@ -1223,7 +1229,7 @@ class App:
                 if enrichment_result is not None:
                     labels.update(
                         {
-                            f"artifact/{artifact_name}": artifact_uri
+                            f"{ARTIFACT_MEASUREMENT_KEY_PREFIX}{artifact_name}": artifact_uri
                             for artifact_name, artifact_uri in enrichment_run.artifact_uris.items()
                         }
                     )
@@ -1252,3 +1258,38 @@ class App:
         if verbose:
             print(report.summary())
         return report
+
+
+def parse_pipeline_spec(pipeline_spec: str) -> tuple[Path, str]:
+    """Split ``path/to/pipeline.py[:app_variable]`` (default variable: ``app``)."""
+    path_part, separator, variable_part = pipeline_spec.rpartition(":")
+    if separator and path_part and variable_part.isidentifier():
+        return Path(path_part), variable_part
+    return Path(pipeline_spec), "app"
+
+
+def import_pipeline_application(pipeline_spec: str) -> "App":
+    """Import ``path/to/pipeline.py[:app]`` and return its :class:`App`, loudly.
+
+    One owner for the "address a pipeline by file" contract every vantage
+    needs -- the CLI's ``manifest``/``up``/``deploy``/``stale``, and any other
+    caller that must hold a user's pipeline (the workspace UI's pipeline
+    page). The pipeline file is arbitrary user code, so importing EXECUTES
+    it: any exception it raises is a boundary failure reported as a
+    ``ValueError`` naming the file, never a crash of the calling program.
+    """
+    import importlib.util
+
+    pipeline_file, app_variable = parse_pipeline_spec(pipeline_spec)
+    spec = importlib.util.spec_from_file_location("hflow_user_pipeline", pipeline_file)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"cannot import pipeline file {pipeline_file}")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as error:
+        raise ValueError(f"importing {pipeline_file} failed: {error}") from error
+    application = getattr(module, app_variable, None)
+    if not isinstance(application, App):
+        raise ValueError(f"{pipeline_file} has no hflow.App named {app_variable!r}")
+    return application
