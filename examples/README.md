@@ -72,6 +72,29 @@ contact-sheet artifacts for the accepted set.
 
 Guide and expected artifacts: [`egocentric/README.md`](./egocentric/README.md)
 
+## Synthetic stress corpus
+
+**Use it for:** a repeatable throughput measurement over a corpus large enough
+to be worth timing, with no download.
+
+**Prerequisites:** the normal development environment plus `ffmpeg` on `PATH`;
+no Docker, network, or API key. Two hundred episodes take a few minutes and
+about 1 GB of disk.
+
+```bash
+uv run python examples/stress/synthetic.py --episodes 200 --seed 42
+```
+
+The example plans a seeded corpus (2 to 10 s, one to three cameras at 10, 15,
+or 30 Hz, with black segments and joint jumps injected at a fixed rate), writes
+it to `./stress_corpus`, runs `App.process` over every episode, and prints the
+per-episode wall time and the distribution of check statuses. The same
+`--episodes` and `--seed` always plan the same corpus, so runs before and after
+a change are comparable. Use `--generate-only` to build a corpus without
+ingesting it, and `--ingest-only` to re-run against one you already have.
+
+Code: [`stress/synthetic.py`](./stress/synthetic.py)
+
 ## Example requirements
 
 Keep examples small enough to read, but complete enough to execute from the
