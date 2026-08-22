@@ -1,0 +1,53 @@
+import { useQuery } from "@tanstack/react-query";
+import { Link, Outlet, useLocation } from "react-router-dom";
+import { fetchWorkspaceConfig } from "./api";
+import { BrandMarkIcon, EpisodesIcon } from "./icons";
+
+// Small workspace readout at the bottom of the rail: where the data lives and
+// which versions are serving it. Quiet on purpose.
+function WorkspaceSummary() {
+  const configQuery = useQuery({ queryKey: ["config"], queryFn: fetchWorkspaceConfig });
+  if (configQuery.isPending) return <p className="rail-note">connecting…</p>;
+  if (configQuery.isError) return <p className="rail-note rail-note-error">server unreachable</p>;
+  const config = configQuery.data;
+  return (
+    <div className="rail-meta">
+      {config.read_only ? <span className="chip chip-muted">read-only</span> : null}
+      <p className="rail-note" title={config.data_root}>
+        {config.data_root}
+      </p>
+      <p className="rail-note">
+        hflow {config.hflow_version} · ui {config.hflow_ui_version}
+      </p>
+    </div>
+  );
+}
+
+export function AppShell() {
+  const location = useLocation();
+  const isEpisodesActive = location.pathname === "/" || location.pathname.startsWith("/episodes");
+  return (
+    <div className="app-shell">
+      <nav className="nav-rail" aria-label="Primary">
+        <div className="brand">
+          <BrandMarkIcon className="brand-mark" />
+          <span>HFlow</span>
+        </div>
+        <Link
+          to="/"
+          className={isEpisodesActive ? "nav-item is-active" : "nav-item"}
+          aria-current={isEpisodesActive ? "page" : undefined}
+        >
+          <EpisodesIcon />
+          <span>Episodes</span>
+        </Link>
+        <div className="rail-foot">
+          <WorkspaceSummary />
+        </div>
+      </nav>
+      <main className="app-main">
+        <Outlet />
+      </main>
+    </div>
+  );
+}

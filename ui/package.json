@@ -1,0 +1,33 @@
+{
+  "name": "hflow-workspace-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Read-only workspace UI for hflow catalogs (M0). Served by the hflow-ui FastAPI package.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "check": "tsc --noEmit && biome check .",
+    "format": "biome check --write ."
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.62.0",
+    "@tanstack/react-table": "^8.20.6",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.30.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.2.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.7.0",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.4"
+  }
+}
