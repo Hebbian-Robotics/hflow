@@ -1,9 +1,10 @@
 """Command-line entry point.
 
 Subcommands: ``curate``, ``stale``, ``doctor``, ``manifest``, the Compose
-runtime family ``up``/``down``/``ingest``/``status``, and ``deploy`` for
-bring-your-own Airflow. Everything the CLI does is a thin call into the
-library: no behavior lives only here.
+runtime family ``up``/``down``/``ingest``/``status``, ``deploy`` for
+bring-your-own Airflow, and ``ui`` for the workspace web UI (a separate
+``hflow-ui`` package, imported only when invoked). Everything the CLI does is
+a thin call into the library: no behavior lives only here.
 
 ``ingest`` and ``status`` address either a LOCAL rendered bundle (the
 default: ``--bundle-dir`` or its auto-discovery) or a REMOTE runtime by URL
@@ -35,6 +36,9 @@ DEFAULT_DEPLOY_OUTPUT_DIR = Path("./deploy")
 # Mirrors RuntimeConfig.api_port; kept here so the parser can state it without
 # importing the runtime package, which `up` defers until it actually runs.
 DEFAULT_API_PORT = 8080
+# The workspace UI's fixed default port ("HFLO" on a phone keypad); stated
+# here so the parser needs no import from the optional hflow-ui package.
+DEFAULT_UI_PORT = 4356
 
 
 def _environment_data_root() -> str:
@@ -341,6 +345,40 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_remote_endpoint_arguments(status_parser)
+
+    ui_parser = subparsers.add_parser(
+        "ui",
+        help="local web UI over this workspace's catalog (requires the hflow-ui package)",
+    )
+    ui_parser.add_argument(
+        "--data-root",
+        default=_environment_data_root(),
+        help=(
+            "workspace data root to browse "
+            f"(default: $HFLOW_DATA_ROOT, else {DEFAULT_DATA_ROOT})"
+        ),
+    )
+    ui_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="bind address (default 127.0.0.1; widening past loopback exposes your corpus)",
+    )
+    ui_parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_UI_PORT,
+        help=f"port to serve on (default {DEFAULT_UI_PORT}; auto-retries upward when taken)",
+    )
+    ui_parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="do not open a browser after starting (headless use)",
+    )
+    ui_parser.add_argument(
+        "--no-token",
+        action="store_true",
+        help="disable the session token (only for a trusted, loopback-only machine)",
+    )
     return parser
 
 
@@ -708,6 +746,28 @@ def _command_doctor(arguments: argparse.Namespace) -> int:
     return exit_code
 
 
+def _command_ui(arguments: argparse.Namespace) -> int:
+    try:
+        from hflow_ui import UiSettings, new_session_token, serve
+    except ImportError:
+        print(
+            "ui: the workspace UI ships as a separate package so pipeline "
+            "workers never carry it; install it with `uv add hflow-ui` "
+            "(or `pip install hflow-ui`)",
+            file=sys.stderr,
+        )
+        return 2
+    settings = UiSettings(
+        data_root=arguments.data_root,
+        host=arguments.host,
+        port=arguments.port,
+        token=None if arguments.no_token else new_session_token(),
+        open_browser=not arguments.no_browser,
+    )
+    serve(settings)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = _build_parser().parse_args(argv)
 
@@ -735,6 +795,8 @@ def main(argv: list[str] | None = None) -> int:
         return _command_ingest(arguments)
     if arguments.command == "status":
         return _command_status(arguments)
+    if arguments.command == "ui":
+        return _command_ui(arguments)
     raise AssertionError(f"unhandled command {arguments.command!r}")
 
 

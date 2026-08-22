@@ -48,6 +48,8 @@ hflow = "hflow.cli:main"
 
 [dependency-groups]
 dev = [
+    "hflow-ui", # the workspace UI package, present in dev so the suite tests it
+    "httpx>=0.28", # starlette's TestClient transport, for the hflow-ui suite
     "obstore>=0.10.0", # the bucket extra, present in dev so the suite tests it
     "pytest>=9.1.1",
     "pyyaml>=6.0.3",
@@ -65,8 +67,14 @@ build-backend = "uv_build"
 # trusted first-party packages.
 exclude-newer = "5 days"
 
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+hflow-ui = { workspace = true }
+
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "packages/hflow-ui/tests"]
 
 [tool.ruff]
 line-length = 100
