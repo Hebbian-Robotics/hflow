@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Read-only workspace UI for hflow catalogs (M0). Served by the hflow-ui FastAPI package.",
+  "description": "Read-only workspace UI for hflow catalogs. Served by the hflow-ui FastAPI package.",
   "license": "Apache-2.0",
   "engines": {
     "node": "^20.19.0 || >=22.12.0"
@@ -25,6 +25,8 @@
     "@lezer/highlight": "^1.2.3",
     "@tanstack/react-query": "^5.62.0",
     "@tanstack/react-table": "^9.1.2",
+    "lucide-react": "^1.33.0",
+    "radix-ui": "^1.6.7",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "react-router-dom": "^7.18.2"
@@ -34,7 +36,7 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
     "@vitejs/plugin-react": "^6.1.0",
-    "typescript": "^5.9.2",
+    "typescript": "^6.0.3",
     "vite": "^8.2.2"
   }
 }
