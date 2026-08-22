@@ -95,6 +95,24 @@ ingesting it, and `--ingest-only` to re-run against one you already have.
 
 Code: [`stress/synthetic.py`](./stress/synthetic.py)
 
+## LeRobot pusht converter
+
+**Use it for:** converting the LeRobot pusht dataset (Parquet + av1 MP4) into
+canonical MCAP episodes with H.264 video, ready for `hflow doctor` and
+`App.process`.
+
+**Prerequisites:** `ffmpeg` on `PATH`; network access to download ~7.5 MB from
+Hugging Face (lerobot/pusht).
+
+```bash
+uv run python examples/lerobot/prepare.py --episode-index 0
+```
+
+Output: one canonical MCAP at `./data/lerobot_pusht/landing/pusht_episode_0001.mcap`
+passing `hflow doctor`.
+
+Code: [`lerobot/prepare.py`](./lerobot/prepare.py)
+
 ## Example requirements
 
 Keep examples small enough to read, but complete enough to execute from the
