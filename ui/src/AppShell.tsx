@@ -161,7 +161,7 @@ function WorkspaceSummary({ isCollapsed }: { isCollapsed: boolean }) {
         {config.data_root}
       </p>
       <p className="rail-note">
-        hflow {config.hflow_version} · ui {config.hflow_ui_version}
+        hflow {config.hflow_version} · server {config.hflow_server_version}
       </p>
     </div>
   );

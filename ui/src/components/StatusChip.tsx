@@ -21,6 +21,9 @@ function toneForStatus(status: string): StatusTone {
   }
 }
 
-export function StatusChip({ status }: { status: string }) {
+export function StatusChip({ status }: { status: string | null }) {
+  // A null state is Airflow's "not scheduled yet", not an error: it reads as
+  // the muted em dash the tables use for every other absent value.
+  if (status === null) return <span className="cell-null">—</span>;
   return <span className={`chip chip-${toneForStatus(status)}`}>{status}</span>;
 }

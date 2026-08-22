@@ -18,14 +18,44 @@ const MIN_BAND_PERCENT = 0.6;
 /** Band height plus the gap that keeps stacked lanes legible. */
 const LANE_PITCH_PX = 22;
 
+/**
+ * An interval the server could place on the episode's clock.
+ *
+ * The served `start_s`/`end_s` are nullable: they are offsets from the
+ * episode's own start, and the server sends null when it cannot derive that
+ * start. An interval with no position cannot go on a time axis, so this type
+ * marks the ones that can, and {@link placeableIntervals} separates them out
+ * once rather than every consumer re-checking.
+ */
+interface PlacedInterval extends Omit<TimelineInterval, "start_s" | "end_s"> {
+  start_s: number;
+  end_s: number;
+}
+
+/** Splits intervals into those that can be drawn and a count of those that
+ * cannot, so an unplaceable interval is reported rather than plotted at zero. */
+function placeableIntervals(intervals: readonly TimelineInterval[]): {
+  placed: PlacedInterval[];
+  unplaceableCount: number;
+} {
+  const placed: PlacedInterval[] = [];
+  let unplaceableCount = 0;
+  for (const interval of intervals) {
+    const { start_s, end_s } = interval;
+    if (start_s === null || end_s === null) unplaceableCount += 1;
+    else placed.push({ ...interval, start_s, end_s });
+  }
+  return { placed, unplaceableCount };
+}
+
 interface PackedInterval {
-  interval: TimelineInterval;
+  interval: PlacedInterval;
   lane: number;
 }
 
 /** Greedy lane packing: overlapping intervals stack instead of hiding each
  * other, and a small gap keeps neighbouring bands visually separate. */
-function packIntoLanes(intervals: readonly TimelineInterval[], spanSeconds: number) {
+function packIntoLanes(intervals: readonly PlacedInterval[], spanSeconds: number) {
   const minimumGapSeconds = spanSeconds * 0.004;
   const ordered = [...intervals].sort(
     (left, right) => left.start_s - right.start_s || left.end_s - right.end_s,
@@ -57,7 +87,10 @@ function secondsLabel(seconds: number): string {
 }
 
 export function TimelineStrip({ timeline }: { timeline: EpisodeTimeline }) {
-  const intervals = timeline.intervals;
+  const { placed: intervals, unplaceableCount } = useMemo(
+    () => placeableIntervals(timeline.intervals),
+    [timeline.intervals],
+  );
   // The server owns the span; when it could not derive one, the intervals
   // themselves are the only honest axis — and with neither, we say so.
   const derivedSpan = intervals.reduce((longest, interval) => Math.max(longest, interval.end_s), 0);
@@ -82,7 +115,12 @@ export function TimelineStrip({ timeline }: { timeline: EpisodeTimeline }) {
   if (intervals.length === 0) {
     return (
       <p className="empty-note">
-        The episode spans {secondsLabel(spanSeconds)}, but no check recorded an interval inside it.
+        The episode spans {secondsLabel(spanSeconds)}, but{" "}
+        {unplaceableCount === 0
+          ? "no check recorded an interval inside it."
+          : `none of its ${unplaceableCount} recorded interval${
+              unplaceableCount === 1 ? "" : "s"
+            } could be placed on that axis: the catalog has no start time to measure them from.`}
       </p>
     );
   }
@@ -158,6 +196,12 @@ export function TimelineStrip({ timeline }: { timeline: EpisodeTimeline }) {
         {isSpanFromIntervals ? (
           <span className="timeline-legend-note">
             axis spans the intervals themselves — the catalog records no episode duration
+          </span>
+        ) : null}
+        {unplaceableCount > 0 ? (
+          <span className="timeline-legend-note">
+            {unplaceableCount} interval{unplaceableCount === 1 ? "" : "s"} not drawn — the catalog
+            has no start time to measure {unplaceableCount === 1 ? "it" : "them"} from
           </span>
         ) : null}
       </div>

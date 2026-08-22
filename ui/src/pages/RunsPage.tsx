@@ -131,9 +131,11 @@ function confSummaryText(conf: Record<string, unknown>): string {
 function airflowRunUrl(
   webUrlBase: string | null,
   dagId: string | null,
-  dagRunId: string,
+  dagRunId: string | null,
 ): string | null {
-  if (!webUrlBase || !dagId) return null;
+  // No base, no dag, or no run id means there is nothing to deep-link to; the
+  // caller renders no link rather than a broken one.
+  if (!webUrlBase || !dagId || !dagRunId) return null;
   const base = webUrlBase.replace(/\/$/, "");
   return `${base}/dags/${encodeURIComponent(dagId)}/runs/${encodeURIComponent(dagRunId)}`;
 }
@@ -199,9 +201,14 @@ function instanceGroupsByTaskId(
 ): Map<string, TaskInstanceGroup> {
   const byTaskId = new Map<string, RunTaskInstance[]>();
   for (const instance of tasks) {
-    const bucket = byTaskId.get(instance.task_id);
+    // task_id is nullable in the served payload; an instance without one
+    // belongs to no node on the graph, so it is left out of the grouping
+    // rather than bucketed under a fabricated key.
+    const taskId = instance.task_id;
+    if (taskId === null) continue;
+    const bucket = byTaskId.get(taskId);
     if (bucket) bucket.push(instance);
-    else byTaskId.set(instance.task_id, [instance]);
+    else byTaskId.set(taskId, [instance]);
   }
   const groups = new Map<string, TaskInstanceGroup>();
   for (const [taskId, instances] of byTaskId) {
@@ -648,6 +655,22 @@ function RunGraphSection({
 
 // ---- tables -------------------------------------------------------------------
 
+/**
+ * A run the server could identify.
+ *
+ * `dag_run_id` is nullable in the served payload, and a run without one cannot
+ * be selected, deep-linked, or used as a React key. {@link identifiedRuns}
+ * separates those out once instead of every use site re-checking.
+ */
+type IdentifiedRun = Omit<RuntimeRun, "dag_run_id"> & { dag_run_id: string };
+
+function identifiedRuns(runs: readonly RuntimeRun[]): IdentifiedRun[] {
+  return runs.flatMap((run) => {
+    const dagRunId = run.dag_run_id;
+    return dagRunId === null ? [] : [{ ...run, dag_run_id: dagRunId }];
+  });
+}
+
 function MasterRunsTable({
   runs,
   airflowWebUrl,
@@ -698,7 +721,7 @@ function MasterRunsTable({
           </tr>
         </thead>
         <tbody>
-          {runs.map((run) => {
+          {identifiedRuns(runs).map((run) => {
             const isExpanded = expandedRunIds.has(run.dag_run_id);
             const isSelected = run.dag_run_id === selectedRunId;
             const runUrl = airflowRunUrl(airflowWebUrl, dagId, run.dag_run_id);
@@ -1085,7 +1108,7 @@ export function RunsPage() {
               key={runGraphQuery.data.master.dag_run_id}
               runGraph={runGraphQuery.data}
               graph={topologyQuery.data}
-              airflowWebUrl={runtimeStatus.airflow_web_url}
+              airflowWebUrl={runtimeStatus.airflow_web_url ?? null}
               isAutoRefreshOn={isAutoRefreshOn}
             />
           ) : runGraphQuery.isError || topologyQuery.isError ? (
@@ -1114,8 +1137,8 @@ export function RunsPage() {
             ) : (
               <MasterRunsTable
                 runs={runsQuery.data.runs}
-                airflowWebUrl={runtimeStatus.airflow_web_url}
-                dagId={runtimeStatus.dag_id}
+                airflowWebUrl={runtimeStatus.airflow_web_url ?? null}
+                dagId={runtimeStatus.dag_id ?? null}
                 selectedRunId={selectedRunId}
                 onSelectRun={setSelectedRunIdChoice}
               />
@@ -1125,7 +1148,7 @@ export function RunsPage() {
           {runsQuery.data?.stages && runsQuery.data.stages.length > 0 ? (
             <StageRunsStrip
               stages={runsQuery.data.stages}
-              airflowWebUrl={runtimeStatus.airflow_web_url}
+              airflowWebUrl={runtimeStatus.airflow_web_url ?? null}
             />
           ) : null}
         </>

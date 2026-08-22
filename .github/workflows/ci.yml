@@ -56,6 +56,16 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           python-version: "3.11"
+      - name: Verify src/apiSchema.ts still matches the server's OpenAPI schema
+        # The browser's types are generated from the server's own declaration.
+        # If a contract change lands without regenerating, they silently drift
+        # apart again -- which is exactly the failure this generation replaced.
+        run: |
+          pnpm gen:api
+          if ! git diff --exit-code src/apiSchema.ts; then
+            echo "src/apiSchema.ts is stale: run \`pnpm gen:api\` and commit the result." >&2
+            exit 1
+          fi
       - name: Verify the hflow-server wheel would carry the built frontend
         working-directory: .
         # The UI is only usable if the built assets reach the package; without

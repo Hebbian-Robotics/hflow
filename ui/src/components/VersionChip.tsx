@@ -7,8 +7,11 @@ import { useCopyToClipboard } from "../useCopyToClipboard";
  * shortFingerprint rule the episode dossier uses), full value on hover, one
  * click copies the whole hash (diffing pipelines needs the exact string).
  */
-export function VersionChip({ version }: { version: string }) {
+export function VersionChip({ version }: { version: string | null }) {
   const { copyState, copyText } = useCopyToClipboard();
+  // Some served versions are nullable (a check_runs LEFT JOIN that matched
+  // nothing). There is no hash to show or copy, so it reads as absent.
+  if (version === null) return <span className="cell-null">—</span>;
 
   const title =
     copyState === "copied"

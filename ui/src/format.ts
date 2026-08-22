@@ -9,7 +9,11 @@ export function looksLikeIsoTimestamp(text: string): boolean {
 }
 
 /** "2026-08-21T14:03:22.123456+00:00" -> "2026-08-21 14:03:22" (full value goes in title). */
-export function formatTimestamp(isoText: string): string {
+export function formatTimestamp(isoText: string | null): string {
+  // Several served timestamps are nullable -- a run Airflow never stamped, a
+  // check_runs join that found no row. Absent renders as the same em dash as
+  // every other missing value, rather than throwing on .replace.
+  if (isoText === null) return "—";
   return isoText.replace("T", " ").replace(/(\.\d+)?(Z|[+-]\d{2}:?\d{2})?$/, "");
 }
 
@@ -24,7 +28,17 @@ export function formatDurationSeconds(seconds: number | null): string {
   return `${seconds.toFixed(3)} s`;
 }
 
-export function nanosecondsToRelativeSeconds(valueNs: number, originNs: number): string {
+export function nanosecondsToRelativeSeconds(
+  valueNs: number | null,
+  originNs: number | null,
+): string {
+  // The served interval rows type their bounds nullable, so a row missing one
+  // has no position to report. Em dash, like every other absent value.
+  if (valueNs === null || originNs === null) return "—";
+  return relativeSeconds(valueNs, originNs);
+}
+
+function relativeSeconds(valueNs: number, originNs: number): string {
   return ((valueNs - originNs) / 1e9).toFixed(3);
 }
 
@@ -59,7 +73,8 @@ export function summarizeValueText(value: unknown): string {
   return JSON.stringify(value);
 }
 
-export function shortFingerprint(fingerprint: string): string {
+export function shortFingerprint(fingerprint: string | null): string {
+  if (fingerprint === null) return "—";
   return fingerprint.length > 10 ? fingerprint.slice(0, 10) : fingerprint;
 }
 

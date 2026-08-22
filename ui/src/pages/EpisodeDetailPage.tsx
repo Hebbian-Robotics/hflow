@@ -197,10 +197,10 @@ function CheckRunsSection({ checkRuns }: { checkRuns: EpisodeCheckRun[] }) {
                       <StatusChip status={run.status} />
                     </td>
                     <td className="cell-num">{formatDurationSeconds(run.duration_s)}</td>
-                    <td className="cell-mono" title={run.recorded_at}>
+                    <td className="cell-mono" title={run.recorded_at ?? undefined}>
                       {formatTimestamp(run.recorded_at)}
                     </td>
-                    <td className="cell-mono" title={run.run_fingerprint}>
+                    <td className="cell-mono" title={run.run_fingerprint ?? undefined}>
                       {shortFingerprint(run.run_fingerprint)}
                     </td>
                     <td>
@@ -263,7 +263,7 @@ function MeasurementsSection({ measurements }: { measurements: EpisodeMeasuremen
                 <td className="cell-mono cell-dim">
                   {measurement.check_name}@{measurement.check_version}
                 </td>
-                <td className="cell-mono" title={measurement.recorded_at}>
+                <td className="cell-mono" title={measurement.recorded_at ?? undefined}>
                   {formatTimestamp(measurement.recorded_at)}
                 </td>
               </tr>
@@ -283,8 +283,13 @@ function IntervalsSection({ intervals }: { intervals: EpisodeInterval[] }) {
       </SectionShell>
     );
   }
-  // Times display in seconds relative to the earliest interval start.
-  const originNs = Math.min(...intervals.map((interval) => interval.start_ns));
+  // Times display in seconds relative to the earliest interval start. Rows
+  // whose start the server could not supply contribute no origin (and render
+  // an em dash below) rather than dragging it to negative infinity.
+  const startTimes = intervals
+    .map((interval) => interval.start_ns)
+    .filter((startNs): startNs is number => startNs !== null);
+  const originNs = startTimes.length > 0 ? Math.min(...startTimes) : null;
   return (
     <SectionShell title="Intervals">
       <div className="table-overflow">

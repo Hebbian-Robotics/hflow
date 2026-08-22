@@ -1,6 +1,21 @@
-// Typed client for the hflow-server JSON API (/api/v1).
-// Interfaces mirror the served contract shapes exactly; this module is
-// the only place that talks to the network.
+// Typed client for the hflow-server JSON API (/api/v1). The only module here
+// that talks to the network.
+//
+// Payload types are ALIASES of `apiSchema.ts`, which `pnpm gen:api` generates
+// from the server's own /api/openapi.json. They were hand-written once and
+// drifted: the server declared `kind: StepKind` while the copy said
+// `kind: string`, it grew a `curation` capability the copy never learned
+// about, and a renamed config field went unnoticed for a release. Nothing
+// caught any of it, because nothing compared them. Now there is one owner --
+// the server -- and regenerating is a diff rather than an audit.
+//
+// What stays hand-written below is the part the server does not declare:
+// request shapes this client composes, and view-model types (`EpisodesQuery`,
+// `FacetName`) that exist only in the browser.
+
+import type { components } from "./apiSchema";
+
+type Served = components["schemas"];
 
 export class ApiError extends Error {
   readonly status: number;
@@ -14,111 +29,36 @@ export class ApiError extends Error {
   }
 }
 
-export interface WorkspaceCapabilities {
-  catalog: boolean;
-  media: boolean;
-  runtime: boolean;
-  /** True when the server imported a --pipeline app at startup. */
-  pipeline: boolean;
-}
+export type WorkspaceCapabilities = Served["WorkspaceCapabilities"];
 
-export interface WorkspaceConfig {
-  mode: string;
-  read_only: boolean;
-  hflow_version: string;
-  hflow_ui_version: string;
-  data_root: string;
-  workspace_id: string | null;
-  capabilities: WorkspaceCapabilities;
-  // These two carry the live vocabularies from hflow.steps so the frontend
-  // never hardcodes them. Required, not optional: this bundle ships inside the
-  // same wheel as the server that serves it, so the two cannot be different
-  // versions and "an older server omits the field" is not a reachable state.
-  run_profiles: string[];
-  ingest_modes: string[];
-}
+export type WorkspaceConfig = Served["WorkspaceConfigResponse"];
 
-export interface EpisodeColumn {
-  name: string;
-  type: string;
-}
+export type EpisodeColumn = Served["ColumnDescriptor"];
 
 /** One row of the wide `episodes` view; columns are described by EpisodeColumn. */
 export type EpisodeRow = Record<string, unknown>;
 
-export interface EpisodesResponse {
-  rows: EpisodeRow[];
-  total: number;
-  columns: EpisodeColumn[];
-  /** The SELECT the server compiled for exactly these filters (with LIMIT/OFFSET). */
-  sql: string;
-}
+export type EpisodesResponse = Served["EpisodePageResponse"];
 
-export interface FacetEntry {
-  value: string;
-  count: number;
-}
+export type FacetEntry = Served["ValueCount"];
 
 export type FacetName = "task" | "operator" | "embodiment" | "status" | "pipeline_version";
 
-export type EpisodeFacets = Record<FacetName, FacetEntry[]>;
+export type EpisodeFacets = Served["EpisodeFacetsResponse"];
 
 export type EpisodeStatus = "ok" | "quarantined";
 
-export interface EpisodeMeasurement {
-  key: string;
-  value_double: number | null;
-  value_text: string | null;
-  value_bool: boolean | null;
-  check_name: string;
-  check_version: string;
-  recorded_at: string;
-}
+export type EpisodeMeasurement = Served["EpisodeMeasurementRecord"];
 
-export interface EpisodeCheckRun {
-  check_name: string;
-  check_version: string;
-  critical: boolean;
-  status: string;
-  duration_s: number | null;
-  error: string | null;
-  recorded_at: string;
-  run_fingerprint: string;
-}
+export type EpisodeCheckRun = Served["EpisodeCheckRunRecord"];
 
-export interface EpisodeInterval {
-  label: string;
-  start_ns: number;
-  end_ns: number;
-  check_name: string;
-  /** Joined from check_runs (LEFT JOIN — the intervals table carries no
-   * version), so it is null when no matching check_runs row exists. */
-  check_version: string | null;
-}
+export type EpisodeInterval = Served["EpisodeIntervalRecord"];
 
-export interface EpisodeTagRecord {
-  tag: string;
-  check_name: string;
-  recorded_at: string;
-}
+export type EpisodeTagRecord = Served["EpisodeTagRecord"];
 
-export interface EpisodeMediaItem {
-  name: string;
-  uri: string;
-  /** Same-origin byte-serving URL, or null when the artifact is not servable. */
-  url: string | null;
-}
+export type EpisodeMediaItem = Served["EpisodeMediaArtifact"];
 
-export interface EpisodeDossier {
-  episode: EpisodeRow & { status: EpisodeStatus; quarantine_tags: string[] };
-  measurements: EpisodeMeasurement[];
-  check_runs: EpisodeCheckRun[];
-  intervals: EpisodeInterval[];
-  tags: EpisodeTagRecord[];
-  history: EpisodeRow[];
-  media: EpisodeMediaItem[];
-  canonical_url: string | null;
-}
+export type EpisodeDossier = Served["EpisodeDossierResponse"];
 
 /** The structured filter params /episodes and /episodes/stats share. */
 export interface EpisodesFilter {
@@ -283,29 +223,11 @@ export interface CurationPreviewRequest {
   stats?: boolean;
 }
 
-export interface CurationPreviewResult {
-  columns: ColumnDescriptor[];
-  rows: ResultRow[];
-  /** Full count over the user's SELECT, independent of the preview limit. */
-  row_count: number;
-  truncated: boolean;
-  column_stats: SummarizeRow[] | null;
-  /** The wrapped SELECT the server actually ran. */
-  sql: string;
-}
+export type CurationPreviewResult = Served["CurationPreviewResponse"];
 
-export interface CoverageEntry {
-  check_name: string;
-  episodes_ran: number;
-  total_episodes: number;
-  fraction: number;
-}
+export type CoverageEntry = Served["CheckCoverageEntry"];
 
-export interface CurationReport {
-  row_count: number;
-  total_episodes: number;
-  coverage: CoverageEntry[];
-}
+export type CurationReport = Served["CurationReportResponse"];
 
 export interface PinManifestRequest {
   sql: string;
@@ -313,36 +235,13 @@ export interface PinManifestRequest {
   description?: string;
 }
 
-export interface ManifestRegistryEntry {
-  id: string;
-  name: string;
-  description: string | null;
-  sql: string;
-  /** Data-root-relative path of the pinned Parquet file. */
-  manifest_path: string;
-  row_count: number;
-  total_episodes: number;
-  coverage: CoverageEntry[];
-  created_at: string;
-}
+export type ManifestRegistryEntry = Served["PinnedManifestEntry"];
 
-export interface SavedQuery {
-  id: string;
-  name: string;
-  sql: string;
-  updated_at: string;
-}
+export type SavedQuery = Served["SavedQueryEntry"];
 
-export interface CatalogTable {
-  name: string;
-  kind: "view" | "table";
-  columns: ColumnDescriptor[];
-}
+export type CatalogTable = Served["CatalogTableDescription"];
 
-export interface CatalogTableSummary {
-  row_count: number;
-  columns: SummarizeRow[];
-}
+export type CatalogTableSummary = Served["CatalogTableSummaryResponse"];
 
 export function runCurationPreview(
   request: CurationPreviewRequest,
@@ -402,59 +301,21 @@ export function fetchCatalogTableSummary(tableName: string): Promise<CatalogTabl
 
 // --- runs monitor -------------------------------------------------------------
 
-/** Per-component health from Airflow's monitor endpoint; null = component absent
- * (triggerer/dag_processor may legitimately be missing in minimal deployments). */
-export interface RuntimeHealth {
-  metadatabase: string | null;
-  scheduler: string | null;
-  triggerer: string | null;
-  dag_processor: string | null;
-}
+export type RuntimeHealth = Served["RuntimeHealthComponents"];
 
-export interface RuntimeStatus {
-  available: boolean;
-  /** Why the runtime is unavailable (only meaningful when available is false). */
-  detail: string | null;
-  source: "bundle" | "remote" | null;
-  /** Deep-link base for the Airflow web UI, when the server knows one. */
-  airflow_web_url: string | null;
-  dag_id: string | null;
-  registered: boolean | null;
-  health: RuntimeHealth | null;
-}
+export type RuntimeStatus = Served["RuntimeStatusResponse"];
 
-export interface RuntimeRun {
-  dag_run_id: string;
-  state: string;
-  logical_date: string | null;
-  start_date: string | null;
-  end_date: string | null;
-  conf: Record<string, unknown>;
-}
+export type RuntimeRun = Served["RuntimeRunSummary"];
 
 /** Canonical hflow.steps.Stage order, for display sorting only — the server
  * may emit stage names this build does not know (forward compat). */
 export const STAGE_ORDER: readonly string[] = ["sync", "meta", "labels", "media"];
 
-export interface StageRun {
-  dag_run_id: string;
-  state: string;
-  start_date: string | null;
-  end_date: string | null;
-}
+export type StageRun = Served["StageRunSummary"];
 
-export interface StageRecentRuns {
-  /** A hflow.steps.Stage value; unknown names can appear under version skew. */
-  stage: string;
-  dag_id: string;
-  recent: StageRun[];
-}
+export type StageRecentRuns = Served["StageRecentRuns"];
 
-export interface RuntimeRunsResponse {
-  runs: RuntimeRun[];
-  /** Recent-per-stage runs (bundle only); NOT correlated with specific master runs. */
-  stages: StageRecentRuns[] | null;
-}
+export type RuntimeRunsResponse = Served["RuntimeRunsResponse"];
 
 export interface IngestRequest {
   uris: string[];
@@ -464,10 +325,7 @@ export interface IngestRequest {
   batch_count?: number;
 }
 
-export interface IngestResponse {
-  dag_run_id: string;
-  state: string;
-}
+export type IngestResponse = Served["IngestTriggerResponse"];
 
 export function fetchRuntimeStatus(): Promise<RuntimeStatus> {
   return fetchJson<RuntimeStatus>("/api/v1/runtime/status");
@@ -513,24 +371,23 @@ export interface PipelineManifest {
   has_transform_override: boolean;
 }
 
-export interface ObservedVersion {
-  check_name: string;
-  check_version: string;
-  first_seen: string;
-  last_seen: string;
-  run_count: number;
-}
+export type ObservedVersion = Served["ObservedCheckVersion"];
 
-export interface StaleSummary {
-  pipeline_version: string;
-  count: number;
-}
+export type StaleSummary = Served["StaleSummary"];
 
-export interface PipelineResponse {
+/**
+ * The served pipeline payload, with `manifest` narrowed.
+ *
+ * This is the one payload the schema cannot type for us: the server declares
+ * `manifest` as an open object because `hflow.manifest` owns that shape and it
+ * is forwarded verbatim rather than mirrored. Everything else here comes from
+ * the generated type; only the hole is filled in, and `PipelineManifest` above
+ * is the local restatement that fills it. Typing it server-side would delete
+ * this narrowing.
+ */
+export type PipelineResponse = Omit<Served["PipelineResponse"], "manifest"> & {
   manifest: PipelineManifest;
-  observed: ObservedVersion[];
-  stale: StaleSummary | null;
-}
+};
 
 /** 409 (ApiError with the server's detail) when no --pipeline is configured. */
 export function fetchPipeline(): Promise<PipelineResponse> {
@@ -539,11 +396,7 @@ export function fetchPipeline(): Promise<PipelineResponse> {
 
 // --- episode column distributions --------------------------------------------------
 
-export interface StatsBucket {
-  lo: number;
-  hi: number;
-  count: number;
-}
+export type StatsBucket = Served["NumericHistogramBucket"];
 
 export interface StatsValue {
   value: string;
@@ -570,9 +423,7 @@ export interface CategoricalColumnStats {
 
 export type EpisodeColumnStats = NumericColumnStats | CategoricalColumnStats;
 
-export interface EpisodesStatsResponse {
-  columns: EpisodeColumnStats[];
-}
+export type EpisodesStatsResponse = Served["EpisodeStatsResponse"];
 
 /** Distributions over the SAME filtered set as /episodes (sort/paging excluded). */
 export function fetchEpisodeStats(filter: EpisodesFilter): Promise<EpisodesStatsResponse> {
@@ -583,155 +434,43 @@ export function fetchEpisodeStats(filter: EpisodesFilter): Promise<EpisodesStats
 
 // --- Visualization wave: DAG topology, live run graph, episode timeline ----------
 
-/** One task of a generated DAG (mirrors hflow.runtime.DagTaskNode). */
-export interface DagTaskNode {
-  task_id: string;
-  summary: string;
-  /** Dynamically mapped: one instance per planned batch — draw it as a fan-out. */
-  mapped: boolean;
-  /** Defers instead of holding a worker slot — say "waiting", never "stalled". */
-  deferred: boolean;
-}
+export type DagTaskNode = Served["DagTaskNodePayload"];
 
-export interface DagTopology {
-  dag_id: string;
-  tasks: DagTaskNode[];
-  /** [upstream, downstream] task-id pairs, declaration order. */
-  edges: [string, string][];
-}
+export type DagTopology = Served["DagTopologyPayload"];
 
-/** Engine work inside one stage that the manifest's step lists do not carry. */
-export interface PipelineEngineStep {
-  name: string;
-  summary: string;
-}
+export type PipelineEngineStep = Served["PipelineEngineStep"];
 
-/**
- * One registered step, as the graph endpoint serves it. `tier` mirrors
- * App._ordered_checks: tier 2 iff the step declares requires or uses, so it
- * runs after the cheap ones. Steps within a tier have NO ordering.
- */
-export interface PipelineUserStep {
-  name: string;
-  kind: string;
-  version: string;
-  critical: boolean;
-  uses: string | null;
-  requires: string[];
-  tier: 1 | 2;
-}
+export type PipelineUserStep = Served["PipelineUserStep"];
 
-export interface PipelineGraphStage {
-  /** A hflow.steps.Stage value; unknown names can appear under version skew. */
-  stage: string;
-  title: string;
-  description: string;
-  gate_task_id: string;
-  trigger_task_id: string;
-  enabling_profiles: string[];
-  dag: DagTopology;
-  engine_steps: PipelineEngineStep[];
-  user_steps: PipelineUserStep[];
-}
+export type PipelineGraphStage = Served["PipelineGraphStage"];
 
-/** The one real cross-step edge: meta's critical checks gate later enrichment. */
-export interface QuarantineGate {
-  from_stage: string;
-  to_stages: string[];
-  critical_step_names: string[];
-  explanation: string;
-}
+export type QuarantineGate = Served["QuarantineGate"];
 
-export interface PipelineGraphResponse {
-  /** False when no runtime is addressed: the master id is display-only. */
-  dag_ids_known: boolean;
-  /** False without --pipeline: the steps inside process_batch are unknown. */
-  steps_known: boolean;
-  master: DagTopology;
-  stages: PipelineGraphStage[];
-  /** Null exactly when steps_known is false. */
-  quarantine_gate: QuarantineGate | null;
-}
+export type PipelineGraphResponse = Served["PipelineGraphResponse"];
 
 export function fetchPipelineGraph(): Promise<PipelineGraphResponse> {
   return fetchJson<PipelineGraphResponse>("/api/v1/pipeline/graph");
 }
 
-/** One Airflow task instance; map_index -1 means the task is not mapped. */
-export interface RunTaskInstance {
-  task_id: string;
-  state: string | null;
-  start_date: string | null;
-  end_date: string | null;
-  /** When the scheduler queued the task, so the replay can tell "waiting for a
-   * worker" from "running". Airflow may omit it, and servers that predate the
-   * field leave the key absent entirely — always treat it as optional. */
-  queued_at: string | null;
-  try_number: number | null;
-  map_index: number;
-  duration_s: number | null;
-}
+export type RunTaskInstance = Served["RunTaskInstance"];
 
-export interface RunGraphMaster {
-  dag_run_id: string;
-  state: string | null;
-  tasks: RunTaskInstance[];
-}
+export type RunGraphMaster = Served["RunGraphMaster"];
 
-export interface MappedFanOutSummary {
-  task_id: string;
-  total: number;
-  by_state: Record<string, number>;
-}
+export type MappedFanOutSummary = Served["MappedFanOutSummary"];
 
-export interface RunGraphStage {
-  stage: string;
-  dag_id: string;
-  /** Null when this stage never ran for this master run. */
-  dag_run_id: string | null;
-  state: string | null;
-  /** "heuristic": matched by start time, not by a stored parent-run link. */
-  match: "heuristic" | null;
-  tasks: RunTaskInstance[];
-  mapped_summary: MappedFanOutSummary | null;
-}
+export type RunGraphStage = Served["RunGraphStage"];
 
-export interface RunGraphResponse {
-  master: RunGraphMaster;
-  stages: RunGraphStage[];
-}
+export type RunGraphResponse = Served["RunGraphResponse"];
 
 export function fetchRunGraph(dagRunId: string): Promise<RunGraphResponse> {
   return fetchJson<RunGraphResponse>(`/api/v1/runtime/runs/${encodeURIComponent(dagRunId)}/graph`);
 }
 
-/** One recorded interval, with seconds relative to the episode span. */
-export interface TimelineInterval {
-  label: string;
-  start_ns: number;
-  end_ns: number;
-  start_s: number;
-  end_s: number;
-  check_name: string;
-  /** Label prefix ("gap", "joint_discontinuity", …) — the colour grouping. */
-  kind: string;
-}
+export type TimelineInterval = Served["TimelineInterval"];
 
-/** A numeric measurement, ready to draw as a bar. */
-export interface TimelineMeasurement {
-  key: string;
-  value: number;
-  unit: string | null;
-}
+export type TimelineMeasurement = Served["TimelineMeasurement"];
 
-export interface EpisodeTimeline {
-  start_ns: number | null;
-  end_ns: number | null;
-  /** Null when nothing in the episode gives a span — the UI must say so. */
-  duration_s: number | null;
-  intervals: TimelineInterval[];
-  measurements: TimelineMeasurement[];
-}
+export type EpisodeTimeline = Served["EpisodeTimelineResponse"];
 
 export function fetchEpisodeTimeline(episodeId: string): Promise<EpisodeTimeline> {
   return fetchJson<EpisodeTimeline>(`/api/v1/episodes/${encodeURIComponent(episodeId)}/timeline`);

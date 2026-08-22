@@ -364,9 +364,14 @@ function buildGroup(
 ): ReplayGroup {
   const instancesByTaskId = new Map<string, RunTaskInstance[]>();
   for (const instance of instances) {
-    const bucket = instancesByTaskId.get(instance.task_id);
+    // The server types task_id as nullable because Airflow may omit it; an
+    // instance with no id cannot be attributed to a node, so it is left out
+    // of the grouping rather than bucketed under a fabricated key.
+    const taskId = instance.task_id;
+    if (taskId === null) continue;
+    const bucket = instancesByTaskId.get(taskId);
     if (bucket) bucket.push(instance);
-    else instancesByTaskId.set(instance.task_id, [instance]);
+    else instancesByTaskId.set(taskId, [instance]);
   }
 
   // Topology order first (the payload is already sorted that way, but the
