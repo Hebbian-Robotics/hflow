@@ -371,6 +371,108 @@ def test_up_rejects_an_out_of_range_api_port_on_an_existing_bundle(
     assert len(compose_calls) == calls_after_first_up
 
 
+def test_up_reports_a_missing_pipeline_file_as_bad_input(
+    compose_calls: list[list[str]],
+    healthy_client: None,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A path that does not exist is an argument error, not a runtime failure.
+
+    `up` used to let FileNotFoundError escape to the interpreter: a traceback
+    and exit 1. 1 means the runtime started and then failed, so the caller is
+    told containers may still be running and to tear them down. Nothing has
+    started here -- render_bundle refuses before it makes the directory -- so
+    the honest answer is 2, the same code every sibling command already returns
+    for the same input.
+    """
+    missing = tmp_path / "no-such-pipeline.py"
+    bundle_dir = tmp_path / "runtime"
+
+    exit_code = main(
+        [
+            "up",
+            "--pipeline",
+            str(missing),
+            "--data-root",
+            str(tmp_path / "data"),
+            "--bundle-dir",
+            str(bundle_dir),
+        ]
+    )
+
+    assert exit_code == 2
+    assert not bundle_dir.exists()
+    assert compose_calls == []
+    streams = capsys.readouterr()
+    assert streams.out == ""
+    # The reason, not just the path: a bare path was the complaint in #26.
+    assert f"up: [Errno 2] No such file or directory: '{missing}'" in streams.err
+    assert "Traceback" not in streams.err
+    assert "containers may still be running" not in streams.err
+
+
+def test_up_reports_a_missing_requirements_file_the_same_way(
+    compose_calls: list[list[str]],
+    healthy_client: None,
+    pipeline_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--requirements takes the same path through render_bundle as --pipeline."""
+    missing = tmp_path / "no-such-requirements.txt"
+
+    exit_code = main(
+        [
+            "up",
+            "--pipeline",
+            str(pipeline_file),
+            "--data-root",
+            str(tmp_path / "data"),
+            "--bundle-dir",
+            str(tmp_path / "runtime"),
+            "--requirements",
+            str(missing),
+        ]
+    )
+
+    assert exit_code == 2
+    assert compose_calls == []
+    streams = capsys.readouterr()
+    assert f"up: [Errno 2] No such file or directory: '{missing}'" in streams.err
+    assert "Traceback" not in streams.err
+
+
+def test_deploy_missing_pipeline_names_the_reason_not_just_the_path(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`deploy` exited 2 already, but printed a bare path.
+
+    That bare form is the #26 complaint, which was only ever fixed in
+    storage.py. Both commands now raise the three-argument FileNotFoundError,
+    so both print why the path failed.
+    """
+    missing = tmp_path / "no-such-pipeline.py"
+
+    exit_code = main(
+        [
+            "deploy",
+            "--pipeline",
+            str(missing),
+            "--data-root-uri",
+            "s3://bucket/data",
+            "--output-dir",
+            str(tmp_path / "out"),
+        ]
+    )
+
+    assert exit_code == 2
+    streams = capsys.readouterr()
+    assert f"deploy: [Errno 2] No such file or directory: '{missing}'" in streams.err
+    assert streams.err.strip() != f"deploy: {missing}"
+
+
 def test_up_from_published_install_uses_matching_distribution(
     compose_calls: list[list[str]],
     healthy_client: None,

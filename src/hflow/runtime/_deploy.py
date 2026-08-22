@@ -29,6 +29,8 @@ spool-through-mirror boundary; workers therefore keep the processing core on
 local files without pretending bucket keys have ``pathlib.Path`` semantics.
 """
 
+import errno
+import os
 import shlex
 import shutil
 from dataclasses import dataclass
@@ -148,7 +150,7 @@ def render_deploy_bundle(config: DeployConfig, output_dir: Path | str) -> Deploy
     output_directory = Path(output_dir)
     pipeline_source = Path(config.pipeline_file)
     if not pipeline_source.is_file():
-        raise FileNotFoundError(pipeline_source)
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(pipeline_source))
 
     dags_dir = output_directory / "dags"
     user_dir = output_directory / "user"
@@ -163,7 +165,9 @@ def render_deploy_bundle(config: DeployConfig, output_dir: Path | str) -> Deploy
     if config.requirements_file is not None:
         requirements_source = Path(config.requirements_file)
         if not requirements_source.is_file():
-            raise FileNotFoundError(requirements_source)
+            raise FileNotFoundError(
+                errno.ENOENT, os.strerror(errno.ENOENT), str(requirements_source)
+            )
         shutil.copyfile(requirements_source, user_dir / "requirements.txt")
         requirements_copied = True
 

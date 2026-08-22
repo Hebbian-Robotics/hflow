@@ -58,6 +58,7 @@ extracts them to temp files):
    mass failure visible.
 """
 
+import errno
 import hashlib
 import json
 import logging
@@ -855,7 +856,9 @@ def render_bundle(config: RuntimeConfig, bundle_dir: Path | str) -> BundlePaths:
     bundle_directory = Path(bundle_dir)
     pipeline_source = Path(config.pipeline_file)
     if not pipeline_source.is_file():
-        raise FileNotFoundError(pipeline_source)
+        # Three-argument form, as storage.py does: str() then carries the errno
+        # text, so the CLI prints why the path failed and not just the path.
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(pipeline_source))
 
     dags_dir = bundle_directory / "dags"
     logs_dir = bundle_directory / "logs"
@@ -889,7 +892,9 @@ def render_bundle(config: RuntimeConfig, bundle_dir: Path | str) -> BundlePaths:
     if config.requirements_file is not None:
         requirements_source = Path(config.requirements_file)
         if not requirements_source.is_file():
-            raise FileNotFoundError(requirements_source)
+            raise FileNotFoundError(
+                errno.ENOENT, os.strerror(errno.ENOENT), str(requirements_source)
+            )
         shutil.copyfile(requirements_source, user_dir / "requirements.txt")
 
     hflow_source = (

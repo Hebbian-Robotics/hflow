@@ -522,6 +522,14 @@ def _command_up(arguments: argparse.Namespace) -> int:
 
     try:
         paths, _ = start_runtime(config, bundle_dir, on_progress=print_progress_to_stderr)
+    except FileNotFoundError as error:
+        # Its own block, not the tuple below. This is raised while rendering the
+        # bundle, before any container exists, so the teardown advice attached to
+        # that handler would send the caller after containers that were never
+        # created. Same reason it exits 2 (bad input, nothing started) and not 1
+        # (started, then failed).
+        print(f"up: {error}", file=sys.stderr)
+        return 2
     except (ComposeError, TimeoutError) as error:
         # Deliberately leave whatever started running: the state is the
         # diagnosis. Tell the user how to look at it and how to tear it down.
