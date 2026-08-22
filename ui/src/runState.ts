@@ -1,0 +1,42 @@
+// The one owner of Airflow's run/task-state vocabulary in the UI: every chip,
+// node fill and legend reads its tone from here so the graph and the tables can
+// never drift apart. Unknown states render muted rather than failing (Airflow
+// gains states across versions).
+
+/**
+ * Five tones, one per thing a run can be saying. "run" is work IN FLIGHT.
+ *
+ * It was called "accent" while the chrome accent happened to be a colour and
+ * could be borrowed; the chrome is neutral now, and a status tone that shares
+ * a name with the hover colour is a status tone somebody will restyle by
+ * accident. The tones name meanings, and styles.css decides what each one
+ * looks like (--ok / --err / --warn / --run / --ink-faint).
+ */
+export type RunStateTone = "ok" | "err" | "warn" | "run" | "muted";
+
+export function runStateTone(state: string | null | undefined): RunStateTone {
+  switch (state?.toLowerCase()) {
+    case "success":
+      return "ok";
+    case "failed":
+    case "error":
+      return "err";
+    case "running":
+      return "run";
+    // A deferred task released its worker slot and is WAITING on a trigger —
+    // it is healthy, so it reads like work in flight, never like a failure.
+    case "deferred":
+      return "run";
+    case "upstream_failed":
+    case "up_for_retry":
+    case "up_for_reschedule":
+    case "restarting":
+      return "warn";
+    default:
+      return "muted";
+  }
+}
+
+export function runStateChipClass(state: string | null | undefined): string {
+  return `chip chip-${runStateTone(state)}`;
+}

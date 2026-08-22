@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from hflow import video as video_module
+from hflow.behavior import TRANSFORM_BEHAVIOR_VERSION
 from hflow.ffmpeg import ffmpeg_version
 from hflow.format import (
     CAMERA_SCHEMA_NAMES,
@@ -144,14 +145,19 @@ def compute_pipeline_version(
     ``derived_versions`` (derived topic -> derived-channel version) folds the
     derived signals into the hash: a passed-in mapping rather than App state,
     so the transform stays a library function.
-    """
-    # Imported here to avoid a cycle with the package root.
-    from hflow import __version__
 
+    The engine's contribution is :data:`hflow.behavior.TRANSFORM_BEHAVIOR_VERSION`,
+    NOT the release number: this hash is stamped into ``provenance/v1``, which
+    lives inside the bytes ``content_episode_id`` hashes, so folding in
+    ``hflow.__version__`` gave every release a new ``pipeline_version`` AND a
+    new ``episode_id`` for byte-identical inputs -- breaking dedupe and making
+    ``hflow stale`` list the whole corpus after a change that processed
+    nothing differently.
+    """
     payload = json.dumps(
         {
             "format": EPISODE_FORMAT_VERSION,
-            "sdk": __version__,
+            "transform_behavior": TRANSFORM_BEHAVIOR_VERSION,
             "gop_preset": str(config.gop_preset),
             "gop_seconds": config.gop_seconds,
             "crf": config.crf,

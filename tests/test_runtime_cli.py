@@ -12,7 +12,8 @@ from pathlib import Path
 import pytest
 
 import hflow
-from hflow.cli import _parse_pipeline_spec, main
+from hflow.app import parse_pipeline_spec
+from hflow.cli import main
 from hflow.runtime import AirflowHealth, RuntimeConfig, render_bundle
 from hflow.runtime._client import AirflowClient, AirflowClientError, PasswordCredentials
 
@@ -71,10 +72,10 @@ def _rendered_bundle(tmp_path: Path, pipeline_file: Path) -> Path:
 
 
 def test_parse_pipeline_spec_variants() -> None:
-    assert _parse_pipeline_spec("pipe.py") == (Path("pipe.py"), "app")
-    assert _parse_pipeline_spec("dir/pipe.py:my_app") == (Path("dir/pipe.py"), "my_app")
+    assert parse_pipeline_spec("pipe.py") == (Path("pipe.py"), "app")
+    assert parse_pipeline_spec("dir/pipe.py:my_app") == (Path("dir/pipe.py"), "my_app")
     # A trailing non-identifier is part of the path, not a variable name.
-    assert _parse_pipeline_spec("dir/pipe.py:not-an-identifier") == (
+    assert parse_pipeline_spec("dir/pipe.py:not-an-identifier") == (
         Path("dir/pipe.py:not-an-identifier"),
         "app",
     )

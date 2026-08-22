@@ -1,0 +1,7 @@
+# ui/ is a standalone pnpm project; this file also carries pnpm settings.
+packages:
+  - "."
+
+# esbuild's postinstall validates its platform binary; allow it to run.
+allowBuilds:
+  esbuild: true

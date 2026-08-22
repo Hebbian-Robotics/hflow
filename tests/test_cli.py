@@ -62,3 +62,22 @@ def test_cli_manifest_reports_a_broken_pipeline_instead_of_crashing(
     exit_code = main(["manifest", "--pipeline", str(pipeline_file)])
     assert exit_code == 2
     assert "boom at import" in capsys.readouterr().err
+
+
+def test_cli_manifest_does_not_inherit_a_pipeline_that_exits(
+    tmp_path: Path, capsys: CaptureFixture
+) -> None:
+    """A config guard at import time is a boundary failure, not our exit code.
+
+    ``sys.exit`` raises SystemExit -- a BaseException -- so importing user code
+    can walk straight past an ``except Exception`` and take the calling program
+    with it. Here that would mean the pipeline's own status instead of 2; in the
+    workspace UI it would kill a long-lived server at startup.
+    """
+    pipeline_file = tmp_path / "guarded.py"
+    pipeline_file.write_text("import sys\n\nsys.exit('set ROBOT_FLEET')\n")
+    exit_code = main(["manifest", "--pipeline", str(pipeline_file)])
+    assert exit_code == 2
+    error_output = capsys.readouterr().err
+    assert str(pipeline_file) in error_output
+    assert "set ROBOT_FLEET" in error_output

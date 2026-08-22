@@ -13,6 +13,12 @@ __pycache__/
 # never source).
 data/
 
+# Workspace UI build outputs: the frontend's source of truth is ui/; built
+# assets are copied into the hflow-ui wheel at packaging time, never committed.
+ui/node_modules/
+ui/dist/
+packages/hflow-ui/src/hflow_ui/static/
+
 # Local maintainer tooling (agent skills, settings); not part of the public repo.
 .claude/
 .agents/
