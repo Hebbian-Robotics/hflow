@@ -857,6 +857,39 @@ def test_api_port_true_is_rejected_even_though_it_passes_the_range(
         replace(config, api_port=True)
 
 
+def test_api_port_accepts_an_int_enum_member(config: RuntimeConfig) -> None:
+    """An IntEnum member is an int, and CONTRIBUTING asks for typed variants.
+
+    This is why the test is `isinstance` and not `type(...) is int`. The member
+    renders as bare digits on 3.11+, so the .env it produces is identical to the
+    one a plain int produces.
+    """
+    from dataclasses import replace
+    from enum import IntEnum
+
+    class Port(IntEnum):
+        API = 9090
+
+    assert replace(config, api_port=Port.API).api_port == 9090
+
+
+def test_api_port_rejects_a_numpy_integer(config: RuntimeConfig) -> None:
+    """A numpy integer is not an int, and a config field is not user data.
+
+    catalog.py accommodates numpy scalars in measurements because those are user
+    data mid-append and a crash would cost the whole episode. api_port is set
+    once by the caller, rendered into a .env that is never rewritten, and
+    interpolated into api_base_url, so refusing it costs one line at the call
+    site and nothing downstream.
+    """
+    from dataclasses import replace
+
+    import numpy as np
+
+    with pytest.raises(ValueError, match="api_port must be an int, not int64"):
+        replace(config, api_port=np.int64(9090))
+
+
 @pytest.mark.parametrize(
     ("bad_port", "type_name"),
     [("8080", "str"), (8080.0, "float"), (None, "NoneType"), (True, "bool"), (False, "bool")],

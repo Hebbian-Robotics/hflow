@@ -218,12 +218,20 @@ class RuntimeConfig:
         # as the command line. Compose reports an out-of-range port only once
         # containers are starting, well past the point it is useful.
         #
-        # Type first, because the range test cannot do it. `isinstance` would
-        # not either: bool subclasses int, so True is 1 to a comparison and
-        # would pass the range on its way to rendering API_PORT=True. The
-        # value is only ever str()-ed from here on, so nothing downstream
-        # would object.
-        if type(self.api_port) is not int:
+        # Type first, because the range test cannot do it. bool subclasses int,
+        # so True is 1 to a comparison and would pass the range on its way to
+        # rendering API_PORT=True. The value is only ever str()-ed from here on,
+        # so nothing downstream would object.
+        #
+        # `isinstance` and not `type(...) is int`, so an IntEnum member is
+        # accepted: it is an int by every test Python has, and CONTRIBUTING
+        # asks for typed variants over bare literals. A numpy integer is not
+        # an int and is refused. That is a narrower line than the one
+        # measurement values get in catalog.py, where non-JSON scalars are
+        # user data accommodated with a repr fingerprint rather than a crash.
+        # A config field is not user data: it is set once, rendered into a
+        # .env that is never rewritten, and interpolated into api_base_url.
+        if not isinstance(self.api_port, int) or isinstance(self.api_port, bool):
             raise ValueError(
                 f"api_port must be an int, not {type(self.api_port).__name__}: {self.api_port!r}"
             )
