@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { ArrowLeft, Download } from "lucide-react";
 import { Fragment, type ReactNode, useEffect, useMemo, useState } from "react";
 import { Link, useLocation, useParams } from "react-router-dom";
 import {
@@ -27,7 +28,6 @@ import {
   nanosecondsToRelativeSeconds,
   shortFingerprint,
 } from "../format";
-import { ArrowLeftIcon, DownloadIcon } from "../icons";
 
 const HEADER_FIELDS = [
   "task",
@@ -419,7 +419,7 @@ function DossierView({ dossier }: { dossier: EpisodeDossier }) {
           <div className="toolbar-spacer" />
           {dossier.canonical_url ? (
             <a className="btn" href={withSessionToken(dossier.canonical_url)} download>
-              <DownloadIcon />
+              <Download />
               <span>Download canonical</span>
             </a>
           ) : null}
@@ -479,7 +479,7 @@ export function EpisodeDetailPage() {
   return (
     <div className="episode-page">
       <Link to={{ pathname: "/", search: location.search }} className="back-link">
-        <ArrowLeftIcon />
+        <ArrowLeft />
         <span>Episodes</span>
       </Link>
       {episodeId === undefined ? (

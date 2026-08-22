@@ -1,5 +1,5 @@
+import { Check, Copy } from "lucide-react";
 import { shortFingerprint } from "../format";
-import { CheckIcon, CopyIcon } from "../icons";
 import { useCopyToClipboard } from "../useCopyToClipboard";
 
 /**
@@ -26,9 +26,9 @@ export function VersionChip({ version }: { version: string }) {
     >
       <span className="version-chip-text">{shortFingerprint(version)}</span>
       {copyState === "copied" ? (
-        <CheckIcon className="version-chip-icon" />
+        <Check className="version-chip-icon" />
       ) : (
-        <CopyIcon className="version-chip-icon" />
+        <Copy className="version-chip-icon" />
       )}
     </button>
   );

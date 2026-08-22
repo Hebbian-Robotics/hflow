@@ -1,5 +1,5 @@
+import { Check, ChevronDown, Copy } from "lucide-react";
 import { useState } from "react";
-import { CheckIcon, ChevronDownIcon, CopyIcon } from "../icons";
 import { useCopyToClipboard } from "../useCopyToClipboard";
 
 /**
@@ -32,7 +32,7 @@ export function SqlFooter({
         aria-expanded={isExpanded}
         title={isExpanded ? "Collapse the compiled query" : "Expand the compiled query"}
       >
-        <ChevronDownIcon className={isExpanded ? "chevron is-open" : "chevron"} />
+        <ChevronDown className={isExpanded ? "chevron is-open" : "chevron"} />
         <span>SQL</span>
       </button>
       {sql ? (
@@ -56,7 +56,7 @@ export function SqlFooter({
         disabled={!sql}
         title="Copy the compiled SQL"
       >
-        {copyState === "copied" ? <CheckIcon /> : <CopyIcon />}
+        {copyState === "copied" ? <Check /> : <Copy />}
         <span>{copyLabel}</span>
       </button>
     </footer>

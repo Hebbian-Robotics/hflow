@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ChevronDown, ExternalLink, Play, RefreshCw } from "lucide-react";
 import { Fragment, useEffect, useMemo, useState } from "react";
 import {
   ApiError,
@@ -35,7 +36,6 @@ import {
   formatOffsetCompact,
   formatTimestamp,
 } from "../format";
-import { ChevronDownIcon, ExternalLinkIcon, PlayIcon, RefreshIcon } from "../icons";
 import { runStateTone } from "../runState";
 import {
   buildRunReplay,
@@ -350,7 +350,7 @@ function TaskInstanceDetails({
       )}
       {taskUrl ? (
         <a className="btn btn-tiny" href={taskUrl} target="_blank" rel="noreferrer">
-          <ExternalLinkIcon />
+          <ExternalLink />
           <span>Open in Airflow</span>
         </a>
       ) : null}
@@ -449,7 +449,7 @@ function StageRunGraph({
         ) : null}
         {runUrl ? (
           <a className="btn btn-ghost btn-tiny" href={runUrl} target="_blank" rel="noreferrer">
-            <ExternalLinkIcon />
+            <ExternalLink />
           </a>
         ) : null}
       </div>
@@ -715,7 +715,7 @@ function MasterRunsTable({
                       aria-expanded={isExpanded}
                       title={isExpanded ? "Hide the full conf" : "Show the full conf"}
                     >
-                      <ChevronDownIcon className={isExpanded ? "chevron is-open" : "chevron"} />
+                      <ChevronDown className={isExpanded ? "chevron is-open" : "chevron"} />
                     </button>
                   </td>
                   <td>
@@ -753,7 +753,7 @@ function MasterRunsTable({
                           rel="noreferrer"
                           title="Open this run in Airflow"
                         >
-                          <ExternalLinkIcon />
+                          <ExternalLink />
                         </a>
                       ) : null}
                     </td>
@@ -834,7 +834,7 @@ function StageRunsStrip({
                           rel="noreferrer"
                           title={`Open ${stageRun.dag_run_id} in Airflow`}
                         >
-                          <ExternalLinkIcon />
+                          <ExternalLink />
                         </a>
                       ) : null}
                     </li>
@@ -948,7 +948,7 @@ function TriggerIngestForm({ config }: { config: WorkspaceConfig | undefined }) 
             disabled={uris.length === 0 || ingestMutation.isPending}
             onClick={submitIngest}
           >
-            <PlayIcon />
+            <Play />
             <span>{ingestMutation.isPending ? "Triggering…" : "Trigger run"}</span>
           </button>
         </div>
@@ -1047,7 +1047,7 @@ export function RunsPage() {
           <span className="toolbar-field-label">auto-refresh 10s</span>
         </label>
         <button type="button" className="btn" onClick={refreshNow} title="Refetch status and runs">
-          <RefreshIcon />
+          <RefreshCw />
           <span>Refresh</span>
         </button>
         {runtimeStatus?.airflow_web_url ? (
@@ -1058,7 +1058,7 @@ export function RunsPage() {
             rel="noreferrer"
             title="Open the Airflow web UI"
           >
-            <ExternalLinkIcon />
+            <ExternalLink />
             <span>Open in Airflow</span>
           </a>
         ) : null}

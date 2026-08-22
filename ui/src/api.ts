@@ -1,5 +1,5 @@
 // Typed client for the hflow-ui JSON API (/api/v1).
-// Interfaces mirror the M0 + M1 + M2 contract shapes exactly; this module is
+// Interfaces mirror the served contract shapes exactly; this module is
 // the only place that talks to the network.
 
 export class ApiError extends Error {
@@ -18,7 +18,7 @@ export interface WorkspaceCapabilities {
   catalog: boolean;
   media: boolean;
   runtime: boolean;
-  /** M2: true when the server imported a --pipeline app at startup. Absent on M0/M1 servers. */
+  /** True when the server imported a --pipeline app at startup. Absent on servers that predate the pipeline page. */
   pipeline?: boolean;
 }
 
@@ -31,7 +31,7 @@ export interface WorkspaceConfig {
   workspace_id: string | null;
   capabilities: WorkspaceCapabilities;
   /** Live run-profile names from hflow.steps.RUN_PROFILES — served so the
-   * frontend never hardcodes them. Absent only on servers that predate M2. */
+   * frontend never hardcodes them. Absent only on servers that predate the runs monitor. */
   run_profiles?: string[];
   /** Live ingest modes from hflow.steps.IngestMode; same contract as run_profiles. */
   ingest_modes?: string[];
@@ -340,7 +340,7 @@ export function fetchEpisodeDossier(episodeId: string): Promise<EpisodeDossier> 
   return fetchJson<EpisodeDossier>(`/api/v1/episodes/${encodeURIComponent(episodeId)}`);
 }
 
-// --- M1: curation studio --------------------------------------------------------
+// --- curation studio --------------------------------------------------------
 
 /** {name, type} column descriptor, as returned by the server's DESCRIBE. */
 export type ColumnDescriptor = EpisodeColumn;
@@ -480,7 +480,7 @@ export function fetchCatalogTableSummary(tableName: string): Promise<CatalogTabl
   );
 }
 
-// --- M2: runs monitor -------------------------------------------------------------
+// --- runs monitor -------------------------------------------------------------
 
 /** Per-component health from Airflow's monitor endpoint; null = component absent
  * (triggerer/dag_processor may legitimately be missing in minimal deployments). */
@@ -569,7 +569,7 @@ export function triggerIngest(request: IngestRequest): Promise<IngestResponse> {
   return requestJson<IngestResponse>("/api/v1/runtime/ingest", "POST", request);
 }
 
-// --- M2: pipeline page --------------------------------------------------------------
+// --- pipeline page --------------------------------------------------------------
 
 /** One registered step out of App.manifest() (hflow.manifest.StepManifest). */
 export interface PipelineStepManifest {
@@ -637,7 +637,7 @@ export function fetchPipeline(): Promise<PipelineResponse> {
   return fetchJson<PipelineResponse>("/api/v1/pipeline");
 }
 
-// --- M2: episode column distributions --------------------------------------------------
+// --- episode column distributions --------------------------------------------------
 
 export interface StatsBucket {
   lo: number;

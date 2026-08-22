@@ -9,6 +9,27 @@
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M1 4.5h8M1 8h13M1 11.5h5' stroke='%230c6d77' stroke-width='2' stroke-linecap='round'/%3E%3Ccircle cx='12.5' cy='4.5' r='1.7' fill='%230c6d77'/%3E%3Ccircle cx='9.5' cy='11.5' r='1.7' fill='%230c6d77'/%3E%3C/svg%3E"
     />
     <title>HFlow</title>
+    <!--
+      Apply the stored theme before the first paint. A classic inline script in
+      <head> runs before the deferred module bundle and before the stylesheet
+      paints, so an explicit light/dark choice never flashes the other theme.
+      Deliberately dependency-free and offline: it duplicates THEME_STORAGE_KEY
+      and the data-theme contract from src/theme.ts — change the two together.
+      "system" stores nothing to apply; the stylesheet's prefers-color-scheme
+      block already has it.
+    -->
+    <script>
+      (function applyStoredTheme() {
+        try {
+          const stored = localStorage.getItem("hflow-ui-theme");
+          if (stored === "dark" || stored === "light") {
+            document.documentElement.setAttribute("data-theme", stored);
+          }
+        } catch {
+          /* localStorage is blocked; fall through to the system theme. */
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

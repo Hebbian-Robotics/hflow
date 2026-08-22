@@ -1,8 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
+import { ChevronDown, Plus, X } from "lucide-react";
 import { useState } from "react";
 import { type CatalogTable, fetchCatalogTableSummary } from "../api";
 import { summarizeValueText } from "../format";
-import { ChevronDownIcon, CloseIcon, PlusIcon } from "../icons";
 import { EmptyPanel, ErrorPanel, LoadingPanel } from "./QueryStates";
 
 // Left pane of the studio: the registered catalog views with expandable
@@ -44,7 +44,7 @@ function TableSummarySection({
           title="Close summary"
           aria-label={`Close summary of ${tableName}`}
         >
-          <CloseIcon />
+          <X />
         </button>
       </header>
       {summaryQuery.isPending ? (
@@ -155,7 +155,7 @@ export function CatalogTree({
                       aria-expanded={isExpanded}
                       aria-label={`${isExpanded ? "Collapse" : "Expand"} columns of ${table.name}`}
                     >
-                      <ChevronDownIcon className={isExpanded ? "chevron is-open" : "chevron"} />
+                      <ChevronDown className={isExpanded ? "chevron is-open" : "chevron"} />
                     </button>
                     <button
                       type="button"
@@ -173,7 +173,7 @@ export function CatalogTree({
                       title={`Insert "${table.name}" into the editor`}
                       aria-label={`Insert ${table.name} into the editor`}
                     >
-                      <PlusIcon />
+                      <Plus />
                     </button>
                   </div>
                   {isExpanded ? (

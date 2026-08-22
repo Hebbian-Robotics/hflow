@@ -1,15 +1,22 @@
-import { useEffect, useRef, useState } from "react";
+import { ChartNoAxesColumn } from "lucide-react";
+import { Popover } from "radix-ui";
 import type { CategoricalColumnStats, EpisodeColumnStats, NumericColumnStats } from "../api";
 import { formatNumber } from "../format";
-import { DistributionIcon } from "../icons";
 
 // Column-header mini-distribution: a small popover fed by /episodes/stats,
-// always computed over the ACTIVE filter set. Opens on hover; a click pins it.
-// For filterable categorical columns a value click applies the structured
-// filter param — the server keeps compiling the SQL (thin-client rule).
-
-/** Mirrors the .stats-popover width so edge flipping matches the CSS. */
-const POPOVER_WIDTH_PX = 236;
+// always computed over the ACTIVE filter set. For filterable categorical
+// columns a value click applies the structured filter param — the server
+// keeps compiling the SQL (thin-client rule).
+//
+// Radix Popover replaces hand-rolled positioning that only ever flipped on the
+// right edge, never repositioned on scroll or resize, and rendered in place —
+// so the panel was clipped by the table's own overflow:hidden. Radix portals
+// it to the body and floating-ui keeps it in view on every axis.
+//
+// It also collapses the old hover-to-peek / click-to-pin pair into one click:
+// once the panel is portaled, hover intent across the gap between trigger and
+// panel needs its own timers, and hovering never let a keyboard user in. One
+// click, Escape or an outside click to dismiss, focus returned to the trigger.
 
 function NumericHistogram({ stats }: { stats: NumericColumnStats }) {
   if (stats.buckets.length === 0) {
@@ -122,70 +129,37 @@ export function HeaderDistribution({
   onSelectValue: ((value: string) => void) | null;
   activeValues: readonly string[];
 }) {
-  // Hover/focus visibility is pure CSS (.th-stats:hover / :focus-within show
-  // the popover); state only tracks the click-pin, so no static element needs
-  // mouse handlers and keyboard users get the same affordance via the button.
-  const [isPinned, setIsPinned] = useState(false);
-  const [isRightAligned, setIsRightAligned] = useState(false);
-  const containerRef = useRef<HTMLDivElement | null>(null);
-
-  // Flip the popover leftward for headers near the scroll container's right
-  // edge, where the default left-aligned panel would be clipped.
-  const updatePopoverAlignment = () => {
-    const container = containerRef.current;
-    if (!container) return;
-    const scrollParent = container.closest(".table-scroll");
-    const rightBound = scrollParent
-      ? scrollParent.getBoundingClientRect().right
-      : window.innerWidth;
-    const triggerLeft = container.getBoundingClientRect().left;
-    setIsRightAligned(triggerLeft + POPOVER_WIDTH_PX > rightBound - 8);
-  };
-
-  useEffect(() => {
-    if (!isPinned) return;
-    const closeOnOutsideClick = (event: MouseEvent) => {
-      const container = containerRef.current;
-      if (container && event.target instanceof Node && !container.contains(event.target)) {
-        setIsPinned(false);
-      }
-    };
-    document.addEventListener("mousedown", closeOnOutsideClick);
-    return () => document.removeEventListener("mousedown", closeOnOutsideClick);
-  }, [isPinned]);
-
+  const label = `Distribution of ${stats.name} under the active filters`;
   return (
-    <div className={isPinned ? "th-stats is-pinned" : "th-stats"} ref={containerRef}>
-      <button
-        type="button"
-        className="th-stats-trigger"
-        onMouseEnter={updatePopoverAlignment}
-        onFocus={updatePopoverAlignment}
-        onClick={() => {
-          updatePopoverAlignment();
-          setIsPinned((previous) => !previous);
-        }}
-        aria-expanded={isPinned}
-        aria-label={`Distribution of ${stats.name} under the active filters`}
-        title={`Distribution of ${stats.name} under the active filters`}
-      >
-        <DistributionIcon />
-      </button>
-      <div className={isRightAligned ? "stats-popover is-right-aligned" : "stats-popover"}>
-        <div className="stats-popover-header">
-          <span className="stats-popover-name">{stats.name}</span>
-          <span className="stats-popover-kind">{stats.kind} · active filters</span>
-        </div>
-        {stats.kind === "numeric" ? (
-          <NumericHistogram stats={stats} />
-        ) : (
-          <CategoricalValues
-            stats={stats}
-            onSelectValue={onSelectValue}
-            activeValues={activeValues}
-          />
-        )}
+    <Popover.Root>
+      <div className="th-stats">
+        <Popover.Trigger className="th-stats-trigger" aria-label={label} title={label}>
+          <ChartNoAxesColumn />
+        </Popover.Trigger>
       </div>
-    </div>
+      <Popover.Portal>
+        <Popover.Content
+          className="stats-popover"
+          side="bottom"
+          align="start"
+          sideOffset={2}
+          collisionPadding={8}
+        >
+          <div className="stats-popover-header">
+            <span className="stats-popover-name">{stats.name}</span>
+            <span className="stats-popover-kind">{stats.kind} · active filters</span>
+          </div>
+          {stats.kind === "numeric" ? (
+            <NumericHistogram stats={stats} />
+          ) : (
+            <CategoricalValues
+              stats={stats}
+              onSelectValue={onSelectValue}
+              activeValues={activeValues}
+            />
+          )}
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
   );
 }

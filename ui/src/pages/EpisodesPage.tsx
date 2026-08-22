@@ -8,6 +8,7 @@ import {
   type Updater,
   useTable,
 } from "@tanstack/react-table";
+import { ChevronDown, Search } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import {
@@ -26,7 +27,6 @@ import { HeaderDistribution } from "../components/HeaderDistribution";
 import { EmptyPanel, ErrorPanel, LoadingPanel } from "../components/QueryStates";
 import { SqlFooter } from "../components/SqlFooter";
 import { ValueCell } from "../components/ValueCell";
-import { ChevronDownIcon, SearchIcon } from "../icons";
 
 const SEARCH_DEBOUNCE_MS = 300;
 const STATS_DEBOUNCE_MS = 250;
@@ -329,7 +329,7 @@ export function EpisodesPage() {
     <div className="episodes-page">
       <div className="toolbar">
         <div className="search-box">
-          <SearchIcon className="search-icon" />
+          <Search className="search-icon" />
           <input
             type="search"
             className="input search-input"
@@ -444,7 +444,7 @@ export function EpisodesPage() {
                               >
                                 {flexRender(header.column.columnDef.header, header.getContext())}
                                 {sortDirection ? (
-                                  <ChevronDownIcon
+                                  <ChevronDown
                                     className={
                                       sortDirection === "asc" ? "sort-arrow is-asc" : "sort-arrow"
                                     }

@@ -1,8 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
+import { Download } from "lucide-react";
 import { Fragment, useState } from "react";
 import { fetchManifests, manifestDownloadPath, withSessionToken } from "../api";
 import { formatFractionAsPercent, formatTimestamp } from "../format";
-import { DownloadIcon } from "../icons";
 import { EmptyPanel, ErrorPanel, LoadingPanel } from "./QueryStates";
 
 // The Manifests tab: the registry of pinned cuts, newest first. Each pin is an
@@ -118,7 +118,7 @@ export function ManifestsPanel() {
                         download
                         title={`Download ${manifest.manifest_path}`}
                       >
-                        <DownloadIcon />
+                        <Download />
                         <span>Parquet</span>
                       </a>
                     </td>

@@ -1,4 +1,6 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { ChevronDown, Trash2 } from "lucide-react";
+import { DropdownMenu } from "radix-ui";
 import { useEffect, useRef, useState } from "react";
 import {
   createSavedQuery,
@@ -8,10 +10,13 @@ import {
   updateSavedQuery,
 } from "../api";
 import { formatTimestamp } from "../format";
-import { ChevronDownIcon, TrashIcon } from "../icons";
 
 // Saved-queries dropdown: load always works; save / save-as / delete are
 // hidden entirely when the workspace is read-only (server 403s them anyway).
+//
+// Radix DropdownMenu supplies the roving arrow-key focus, typeahead, Escape
+// and outside-click dismissal, portalling and focus return that this used to
+// half-implement with two document listeners.
 
 export function SavedQueriesMenu({
   queries,
@@ -38,26 +43,13 @@ export function SavedQueriesMenu({
   const [isOpen, setIsOpen] = useState(false);
   const [isSaveAsOpen, setIsSaveAsOpen] = useState(false);
   const [saveAsName, setSaveAsName] = useState("");
-  const containerRef = useRef<HTMLDivElement | null>(null);
+  const saveAsInputRef = useRef<HTMLInputElement | null>(null);
 
+  // The save-as field is not a menu item, so arrow keys never reach it; put
+  // the caret there the moment it appears instead.
   useEffect(() => {
-    if (!isOpen) return;
-    const handlePointerDown = (event: MouseEvent) => {
-      const container = containerRef.current;
-      if (container && event.target instanceof Node && !container.contains(event.target)) {
-        setIsOpen(false);
-      }
-    };
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setIsOpen(false);
-    };
-    document.addEventListener("mousedown", handlePointerDown);
-    document.addEventListener("keydown", handleKeyDown);
-    return () => {
-      document.removeEventListener("mousedown", handlePointerDown);
-      document.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [isOpen]);
+    if (isSaveAsOpen) saveAsInputRef.current?.focus();
+  }, [isSaveAsOpen]);
 
   const invalidateSavedQueries = () => {
     void queryClient.invalidateQueries({ queryKey: ["saved-queries"] });
@@ -110,21 +102,21 @@ export function SavedQueriesMenu({
         : null;
 
   return (
-    <div className="menu-anchor" ref={containerRef}>
-      <button
-        type="button"
-        className="btn"
-        onClick={() => setIsOpen((previous) => !previous)}
-        aria-expanded={isOpen}
-        title="Saved queries"
-      >
+    <DropdownMenu.Root
+      open={isOpen}
+      onOpenChange={(open) => {
+        setIsOpen(open);
+        if (!open) setIsSaveAsOpen(false);
+      }}
+    >
+      <DropdownMenu.Trigger className="btn" title="Saved queries">
         <span className="menu-toggle-label">
           {loadedQuery ? loadedQuery.name : "Saved queries"}
         </span>
-        <ChevronDownIcon className={isOpen ? "chevron is-open" : "chevron"} />
-      </button>
-      {isOpen ? (
-        <div className="menu-panel">
+        <ChevronDown className={isOpen ? "chevron is-open" : "chevron"} />
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content className="menu-panel" align="start" sideOffset={4}>
           {isPending ? (
             <p className="menu-note">Loading saved queries…</p>
           ) : error ? (
@@ -134,46 +126,48 @@ export function SavedQueriesMenu({
               No saved queries yet.{readOnly ? "" : " Use “Save as…” to keep the current SQL."}
             </p>
           ) : (
-            <ul className="menu-list">
+            <div className="menu-list">
               {(queries ?? []).map((savedQuery) => (
-                <li key={savedQuery.id} className="menu-row">
-                  <button
-                    type="button"
+                <div key={savedQuery.id} className="menu-row">
+                  <DropdownMenu.Item
                     className={
                       savedQuery.id === loadedQuery?.id ? "menu-item is-active" : "menu-item"
                     }
-                    onClick={() => {
-                      onLoad(savedQuery);
-                      setIsOpen(false);
-                    }}
+                    onSelect={() => onLoad(savedQuery)}
                     title={savedQuery.sql}
                   >
                     <span className="menu-item-name">{savedQuery.name}</span>
                     <span className="menu-item-time">{formatTimestamp(savedQuery.updated_at)}</span>
-                  </button>
+                  </DropdownMenu.Item>
                   {readOnly ? null : (
-                    <button
-                      type="button"
+                    <DropdownMenu.Item
                       className="btn btn-ghost btn-tiny"
-                      onClick={() => deleteMutation.mutate(savedQuery.id)}
                       disabled={deleteMutation.isPending}
+                      onSelect={(event) => {
+                        // Deleting must not close the menu — the point is to
+                        // prune several entries in one visit.
+                        event.preventDefault();
+                        deleteMutation.mutate(savedQuery.id);
+                      }}
                       title={`Delete "${savedQuery.name}"`}
                       aria-label={`Delete saved query ${savedQuery.name}`}
                     >
-                      <TrashIcon />
-                    </button>
+                      <Trash2 />
+                    </DropdownMenu.Item>
                   )}
-                </li>
+                </div>
               ))}
-            </ul>
+            </div>
           )}
           {readOnly ? null : (
             <div className="menu-actions">
-              <button
-                type="button"
+              <DropdownMenu.Item
                 className="btn btn-tiny"
-                onClick={saveToLoaded}
                 disabled={!loadedQuery || !hasText || updateMutation.isPending}
+                onSelect={(event) => {
+                  event.preventDefault();
+                  saveToLoaded();
+                }}
                 title={
                   loadedQuery
                     ? `Overwrite "${loadedQuery.name}" with the editor's SQL`
@@ -181,16 +175,18 @@ export function SavedQueriesMenu({
                 }
               >
                 {updateMutation.isPending ? "Saving…" : "Save"}
-              </button>
-              <button
-                type="button"
+              </DropdownMenu.Item>
+              <DropdownMenu.Item
                 className="btn btn-tiny"
-                onClick={() => setIsSaveAsOpen((previous) => !previous)}
                 disabled={!hasText}
+                onSelect={(event) => {
+                  event.preventDefault();
+                  setIsSaveAsOpen((previous) => !previous);
+                }}
                 title="Save the editor's SQL as a new named query"
               >
                 Save as…
-              </button>
+              </DropdownMenu.Item>
             </div>
           )}
           {isSaveAsOpen && !readOnly ? (
@@ -201,11 +197,19 @@ export function SavedQueriesMenu({
                 submitSaveAs();
               }}
             >
+              {/* A text field inside a menu has to opt out of the menu's own
+                  keyboard handling — Radix swallows Tab and reads printable
+                  keys as typeahead. Escape is left alone so the dismiss layer
+                  still closes the menu from inside the field. */}
               <input
                 className="input"
                 placeholder="Query name"
                 value={saveAsName}
                 onChange={(event) => setSaveAsName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key !== "Escape") event.stopPropagation();
+                }}
+                ref={saveAsInputRef}
                 aria-label="New saved query name"
               />
               <button
@@ -220,8 +224,8 @@ export function SavedQueriesMenu({
           {writeError ? (
             <p className="menu-note menu-error">{describeApiError(writeError)}</p>
           ) : null}
-        </div>
-      ) : null}
-    </div>
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
   );
 }

@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { ChevronDown } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import {
   ApiError,
@@ -17,7 +18,6 @@ import { DetailBlock, DetailRow, DetailsPanel } from "../components/DetailsPanel
 import { EmptyPanel, ErrorPanel, LoadingPanel } from "../components/QueryStates";
 import { VersionChip } from "../components/VersionChip";
 import { formatTimestamp } from "../format";
-import { ChevronDownIcon } from "../icons";
 
 // Two nested layers meet on this page and the UI must not conflate them:
 //   1. ORCHESTRATION — a real DAG with real edges (the master chain, and each
@@ -262,7 +262,7 @@ function StageLane({
         onClick={onToggle}
         aria-expanded={isExpanded}
       >
-        <ChevronDownIcon className={isExpanded ? "chevron is-open" : "chevron"} />
+        <ChevronDown className={isExpanded ? "chevron is-open" : "chevron"} />
         <span className="lane-stage">{stage.stage}</span>
         <span className="lane-title">{stage.title}</span>
         <span className="lane-description">{stage.description}</span>

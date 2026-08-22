@@ -1,4 +1,6 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
+import { ChartColumn, FileText, Play } from "lucide-react";
+import { Tabs } from "radix-ui";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
@@ -19,7 +21,6 @@ import { ResultGrid } from "../components/ResultGrid";
 import { SavedQueriesMenu } from "../components/SavedQueriesMenu";
 import { SqlEditor, type SqlEditorHandle, type SqlSchema } from "../components/SqlEditor";
 import { SqlFooter } from "../components/SqlFooter";
-import { PinIcon, PlayIcon, ReportIcon, StatsIcon } from "../icons";
 
 type CurateTab = "studio" | "manifests";
 
@@ -39,7 +40,6 @@ function StudioPane({
   const [hasSelection, setHasSelection] = useState(false);
   const [isStatsOpen, setIsStatsOpen] = useState(true);
   const [lastPreviewSql, setLastPreviewSql] = useState<string | null>(null);
-  const [pinModalSql, setPinModalSql] = useState<string | null>(null);
   const [loadedQuery, setLoadedQuery] = useState<SavedQuery | null>(null);
 
   const catalogQuery = useQuery({ queryKey: ["catalog-tables"], queryFn: fetchCatalogTables });
@@ -83,11 +83,6 @@ function StudioPane({
     if (sqlText) mutateReport(sqlText);
   };
 
-  const openPinModal = () => {
-    const sqlText = editorRef.current?.currentSql(false) ?? "";
-    if (sqlText) setPinModalSql(sqlText);
-  };
-
   const loadSavedQuery = (savedQuery: SavedQuery) => {
     editorRef.current?.setDocument(savedQuery.sql);
     setLoadedQuery(savedQuery);
@@ -117,7 +112,7 @@ function StudioPane({
           disabled={!hasText || previewMutation.isPending}
           title="Cmd/Ctrl+Enter — runs only the selection when text is selected"
         >
-          <PlayIcon />
+          <Play />
           <span>{hasSelection ? "Preview selection" : "Preview"}</span>
         </button>
         <button
@@ -127,20 +122,15 @@ function StudioPane({
           disabled={!hasText || reportMutation.isPending}
           title="Row count, episode total, and per-check coverage for this cut"
         >
-          <ReportIcon />
+          <FileText />
           <span>Report</span>
         </button>
         {readOnly ? null : (
-          <button
-            type="button"
-            className="btn"
-            onClick={openPinModal}
+          <PinManifestModal
             disabled={!hasText}
-            title="Freeze this cut as an immutable Parquet manifest"
-          >
-            <PinIcon />
-            <span>Pin manifest</span>
-          </button>
+            currentSql={() => editorRef.current?.currentSql(false) ?? ""}
+            onOpenManifests={onOpenManifests}
+          />
         )}
         <button
           type="button"
@@ -149,7 +139,7 @@ function StudioPane({
           aria-pressed={isStatsOpen}
           title="Toggle the column-stats panel"
         >
-          <StatsIcon />
+          <ChartColumn />
           <span>Stats</span>
         </button>
       </div>
@@ -221,14 +211,6 @@ function StudioPane({
           <ColumnStatsPanel stats={previewData ? previewData.column_stats : undefined} />
         ) : null}
       </div>
-
-      {pinModalSql !== null && !readOnly ? (
-        <PinManifestModal
-          sql={pinModalSql}
-          onClose={() => setPinModalSql(null)}
-          onOpenManifests={onOpenManifests}
-        />
-      ) : null}
     </>
   );
 }
@@ -236,6 +218,7 @@ function StudioPane({
 export function CuratePage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const activeTab: CurateTab = searchParams.get("tab") === "manifests" ? "manifests" : "studio";
+  const manifestsTabRef = useRef<HTMLButtonElement | null>(null);
 
   const configQuery = useQuery({ queryKey: ["config"], queryFn: fetchWorkspaceConfig });
   // Until the config arrives (or if it fails), keep write affordances hidden.
@@ -248,51 +231,55 @@ export function CuratePage() {
     };
   }, []);
 
-  const selectTab = (tab: CurateTab) => {
-    setSearchParams(
-      (previous) => {
-        const next = new URLSearchParams(previous);
-        if (tab === "manifests") next.set("tab", "manifests");
-        else next.delete("tab");
-        return next;
-      },
-      { replace: true },
-    );
-  };
+  const selectTab = useCallback(
+    (tab: string) => {
+      setSearchParams(
+        (previous) => {
+          const next = new URLSearchParams(previous);
+          if (tab === "manifests") next.set("tab", "manifests");
+          else next.delete("tab");
+          return next;
+        },
+        { replace: true },
+      );
+    },
+    [setSearchParams],
+  );
+
+  // Called from the pin dialog after it closes. Whatever opened that dialog
+  // lives in the studio panel we are about to hide, so focus has to land on
+  // the tab instead — a hidden element cannot take it.
+  const openManifestsTab = useCallback(() => {
+    selectTab("manifests");
+    manifestsTabRef.current?.focus();
+  }, [selectTab]);
 
   return (
-    <div className="curate-page">
-      <div className="curate-tabs" role="tablist" aria-label="Curate sections">
-        <button
-          type="button"
-          role="tab"
-          className={activeTab === "studio" ? "curate-tab is-active" : "curate-tab"}
-          aria-selected={activeTab === "studio"}
-          onClick={() => selectTab("studio")}
-        >
+    <Tabs.Root className="curate-page" value={activeTab} onValueChange={selectTab}>
+      <Tabs.List className="curate-tabs" aria-label="Curate sections">
+        <Tabs.Trigger value="studio" className="curate-tab">
           Studio
-        </button>
-        <button
-          type="button"
-          role="tab"
-          className={activeTab === "manifests" ? "curate-tab is-active" : "curate-tab"}
-          aria-selected={activeTab === "manifests"}
-          onClick={() => selectTab("manifests")}
-        >
+        </Tabs.Trigger>
+        <Tabs.Trigger value="manifests" className="curate-tab" ref={manifestsTabRef}>
           Manifests
-        </button>
-      </div>
+        </Tabs.Trigger>
+      </Tabs.List>
 
-      {/* The studio stays mounted while the Manifests tab shows, so the
-          editor document, preview, and report survive tab switches. */}
-      <div className={activeTab === "studio" ? "curate-tab-body" : "curate-tab-body is-hidden"}>
-        <StudioPane readOnly={readOnly} onOpenManifests={() => selectTab("manifests")} />
-      </div>
-      {activeTab === "manifests" ? (
-        <div className="curate-tab-body">
-          <ManifestsPanel />
-        </div>
-      ) : null}
-    </div>
+      {/* forceMount keeps the studio mounted while the Manifests tab shows, so
+          the editor document, preview, and report survive tab switches; the
+          `hidden` attribute is ours because forceMount also defeats the one
+          Radix would otherwise set. */}
+      <Tabs.Content
+        value="studio"
+        forceMount
+        hidden={activeTab !== "studio"}
+        className="curate-tab-body"
+      >
+        <StudioPane readOnly={readOnly} onOpenManifests={openManifestsTab} />
+      </Tabs.Content>
+      <Tabs.Content value="manifests" className="curate-tab-body">
+        <ManifestsPanel />
+      </Tabs.Content>
+    </Tabs.Root>
   );
 }

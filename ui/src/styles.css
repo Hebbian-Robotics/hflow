@@ -2,8 +2,24 @@
    Minimal, dense, calm. System fonts only; zero external assets.
    Data speaks monospace; chrome speaks tiny uppercase sans. */
 
-:root {
-  color-scheme: light dark;
+/* ---- theme ---------------------------------------------------------------
+   Three states, resolved entirely here; src/theme.ts only stamps data-theme
+   on <html> ("system" leaves it off).
+
+     :root                                       every token, light values
+     :root[data-theme="light"]                   explicit light, wins over the OS
+     @media (prefers-color-scheme: dark)
+       :root:not([data-theme="light"])           OS dark, unless light was chosen
+     :root[data-theme="dark"]                    explicit dark, wins over the OS
+
+   The two dark blocks are the same palette twice, deliberately: one answers
+   the OS, one answers the reader, and neither can be expressed as the other.
+   Keep them in sync. Every token has a value in the base :root block, so no
+   colour depends on a media query having matched. */
+
+:root,
+:root[data-theme="light"] {
+  color-scheme: light;
 
   --bg: #f5f6f7;
   --surface: #ffffff;
@@ -44,8 +60,11 @@
     ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, "Liberation Mono", monospace;
 }
 
+/* OS dark — skipped when the reader has explicitly asked for light. */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+
     --bg: #131619;
     --surface: #1a1e22;
     --surface-sunken: #16191d;
@@ -78,6 +97,39 @@
   }
 }
 
+/* Explicit dark — wins on a light OS. Same palette as the block above. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #131619;
+  --surface: #1a1e22;
+  --surface-sunken: #16191d;
+  --ink: #e4e8eb;
+  --ink-muted: #98a3ac;
+  --ink-faint: #6a747e;
+  --border: #2a3036;
+  --border-strong: #3a424a;
+
+  --accent: #56c1cb;
+  --accent-ink: #7fd4dc;
+  --accent-soft: rgba(86, 193, 203, 0.12);
+
+  --ok: #46b458;
+  --ok-soft: rgba(70, 180, 88, 0.16);
+  --warn: #d9a53a;
+  --warn-soft: rgba(217, 165, 58, 0.16);
+  --err: #e5726b;
+  --err-soft: rgba(229, 114, 107, 0.15);
+
+  --focus-ring: #56c1cb;
+
+  --viz-1: #1795fa;
+  --viz-2: #d75eb4;
+  --viz-3: #b88a06;
+  --viz-other: #8a949e;
+  --viz-ink: #12161a;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -101,6 +153,33 @@ body {
 :focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
+}
+
+/* ---- icon scale ---------------------------------------------------------- */
+
+/* Glyphs come from lucide-react, which stamps every icon with `.lucide` and
+   renders on a 24px grid at stroke-width 2. Sizing lives HERE, in one place,
+   rather than as a `size` prop repeated at ~40 call sites — that is what
+   produced the old 11/12/13/14/15/18px drift.
+
+   The scale is two deliberate steps, and only two:
+     14px  inline glyphs — buttons, chips, menus, table headers, disclosures.
+           Set against the 13px body text so a glyph reads as a sibling of the
+           word beside it. Effective stroke 2 x 14/24 = 1.17px, which lands on
+           the old hand-drawn 1.4-at-16-viewBox weight.
+     16px  navigation — the rail's four destinations and the brand mark. One
+           step up is enough to make the rail read as chrome, not content.
+   Anything wanting a third size wants a different component instead. */
+.lucide {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+
+.nav-item > .lucide,
+.brand-mark {
+  width: 16px;
+  height: 16px;
 }
 
 /* ---- app shell ---------------------------------------------------------- */
@@ -173,6 +252,41 @@ body {
   align-items: flex-start;
 }
 
+/* ---- theme control ------------------------------------------------------- */
+
+.theme-control {
+  display: flex;
+  gap: 2px;
+  margin-bottom: 10px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-sunken);
+}
+
+.theme-control-item {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 0;
+  border: none;
+  border-radius: 5px;
+  background: none;
+  color: var(--ink-faint);
+  cursor: pointer;
+}
+
+.theme-control-item:hover {
+  color: var(--ink);
+}
+
+.theme-control-item[data-state="checked"] {
+  background: var(--surface);
+  color: var(--accent-ink);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+
 .rail-note {
   margin: 0;
   font-family: var(--font-mono);
@@ -215,14 +329,23 @@ body {
     color 120ms ease;
 }
 
-.btn:hover:not(:disabled) {
+.btn:hover:not(:disabled):not([data-disabled]) {
   border-color: var(--accent);
   color: var(--accent-ink);
 }
 
-.btn:disabled {
+/* Radix menu items are divs, so they carry data-disabled / data-highlighted
+   where a <button> would carry :disabled / :hover. */
+.btn:disabled,
+.btn[data-disabled] {
   opacity: 0.45;
   cursor: default;
+}
+
+.btn[data-highlighted]:not([data-disabled]) {
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  outline: none;
 }
 
 .btn-ghost {
@@ -971,7 +1094,7 @@ body {
   color: var(--ink);
 }
 
-.curate-tab.is-active {
+.curate-tab[data-state="active"] {
   color: var(--accent-ink);
   border-bottom-color: var(--accent);
 }
@@ -983,7 +1106,10 @@ body {
   min-height: 0;
 }
 
-.curate-tab-body.is-hidden {
+/* Radix Tabs marks the inactive panel with `hidden`, and the studio panel
+   carries it while staying mounted. An author `display: flex` beats the UA
+   [hidden] rule, so say it here or the hidden panel keeps rendering. */
+.curate-tab-body[hidden] {
   display: none;
 }
 
@@ -1400,10 +1526,6 @@ body {
 
 /* ---- curate: saved-queries menu --------------------------------------------- */
 
-.menu-anchor {
-  position: relative;
-}
-
 .menu-toggle-label {
   max-width: 200px;
   overflow: hidden;
@@ -1411,10 +1533,8 @@ body {
   white-space: nowrap;
 }
 
+/* Radix positions and portals this; it only has to look like a panel. */
 .menu-panel {
-  position: absolute;
-  top: calc(100% + 4px);
-  left: 0;
   z-index: 30;
   width: 300px;
   padding: 6px;
@@ -1425,9 +1545,6 @@ body {
 }
 
 .menu-list {
-  margin: 0;
-  padding: 0;
-  list-style: none;
   max-height: 260px;
   overflow-y: auto;
 }
@@ -1455,8 +1572,12 @@ body {
   cursor: pointer;
 }
 
-.menu-item:hover {
+/* Radix marks the arrow-key-focused item with data-highlighted; it has to read
+   exactly like hover or keyboard users lose their place in the list. */
+.menu-item:hover,
+.menu-item[data-highlighted] {
   background: var(--accent-soft);
+  outline: none;
 }
 
 .menu-item.is-active {
@@ -1509,17 +1630,21 @@ body {
 
 /* ---- curate: pin modal ------------------------------------------------------- */
 
+/* Radix renders the overlay and the dialog as siblings in a body portal, so
+   the scrim no longer centres the panel — the panel centres itself. */
 .modal-overlay {
   position: fixed;
   inset: 0;
   z-index: 50;
-  display: flex;
-  align-items: center;
-  justify-content: center;
   background: rgba(0, 0, 0, 0.35);
 }
 
 .modal {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 51;
   width: min(520px, calc(100vw - 32px));
   max-height: calc(100vh - 48px);
   overflow-y: auto;
@@ -2086,8 +2211,9 @@ body {
   min-width: 0;
 }
 
+/* Just the trigger's slot in the header row now — the popover it opens lives
+   in a body portal, so this needs no positioning context. */
 .th-stats {
-  position: relative;
   flex: none;
   display: flex;
   align-items: center;
@@ -2104,17 +2230,15 @@ body {
 }
 
 .th-stats:hover .th-stats-trigger,
-.th-stats:focus-within .th-stats-trigger,
-.th-stats.is-pinned .th-stats-trigger {
+.th-stats-trigger:focus-visible,
+.th-stats-trigger[data-state="open"] {
   color: var(--accent-ink);
 }
 
-/* Hover/focus shows the popover; a click on the trigger pins it open. */
+/* Radix positions this (floating-ui) and portals it to the body, so it takes
+   no position of its own and inherits nothing from the table header — every
+   text property it used to reset is now stated outright. */
 .stats-popover {
-  display: none;
-  position: absolute;
-  top: 100%;
-  left: 0;
   z-index: 40;
   width: 236px;
   padding: 10px 12px;
@@ -2122,22 +2246,16 @@ body {
   border-radius: 8px;
   background: var(--surface);
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.5;
   white-space: normal;
   text-transform: none;
   letter-spacing: normal;
-  font-weight: 400;
+  text-align: left;
   cursor: default;
-}
-
-.th-stats:hover .stats-popover,
-.th-stats:focus-within .stats-popover,
-.th-stats.is-pinned .stats-popover {
-  display: block;
-}
-
-.stats-popover.is-right-aligned {
-  left: auto;
-  right: 0;
 }
 
 .stats-popover-header {
@@ -3990,12 +4108,27 @@ tr.is-selected-run td {
   }
 }
 
-/* ---- reduced motion ------------------------------------------------------ */
+/* ---- motion --------------------------------------------------------------
 
-/* The only motion in the UI: spinner rotation, the live dot, and hover
-   transitions. Replay playback asks matchMedia the same question and simply
-   does not run (its Play control says so), so nothing here animates a
-   playhead across the screen. */
+   All of it, in one place and last in the file so it wins on order rather
+   than on !important: spinner rotation, the live dot, hover transitions, and
+   the theme cross-fade. Replay playback asks matchMedia the same question in
+   JS and simply does not run (its Play control says so), so nothing here
+   animates a playhead across the screen. */
+
+/* src/theme.ts hangs data-theme-changing on <html> for the length of one
+   theme change and takes it straight off again, so this blanket transition
+   exists for ~160ms and cannot bleed into hover or focus. Its (0, 2, 0)
+   specificity is what puts it over .btn and .chevron for that moment. */
+:root[data-theme-changing] * {
+  transition:
+    background-color 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease,
+    fill 140ms ease,
+    stroke 140ms ease;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .spinner {
     animation: none;
@@ -4008,6 +4141,11 @@ tr.is-selected-run td {
   .nav-item,
   .btn,
   .chevron {
+    transition: none;
+  }
+
+  /* No cross-fade: a theme change lands in one frame. */
+  :root[data-theme-changing] * {
     transition: none;
   }
 }

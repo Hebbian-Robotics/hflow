@@ -1,3 +1,4 @@
+import { ChevronDown, Info, Pause, Play, SkipBack, SkipForward } from "lucide-react";
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
@@ -7,14 +8,6 @@ import {
   useState,
 } from "react";
 import { formatDurationCompact, formatOffsetCompact } from "../format";
-import {
-  ChevronDownIcon,
-  InfoIcon,
-  PauseIcon,
-  PlayIcon,
-  SkipEndIcon,
-  SkipStartIcon,
-} from "../icons";
 import { runStateTone } from "../runState";
 import {
   axisTickOffsetsSeconds,
@@ -392,7 +385,7 @@ export function RunTimeline({
             disabled={!replay.hasTimedInstances}
             title="Jump to the run's start (Home)"
           >
-            <SkipStartIcon />
+            <SkipBack />
           </button>
           <button
             type="button"
@@ -407,7 +400,7 @@ export function RunTimeline({
                   : "Play the run back (Space)"
             }
           >
-            {isPlaying ? <PauseIcon /> : <PlayIcon />}
+            {isPlaying ? <Pause /> : <Play />}
             <span>{isPlaying ? "Pause" : "Play"}</span>
           </button>
           <button
@@ -420,7 +413,7 @@ export function RunTimeline({
             disabled={!replay.hasTimedInstances}
             title="Jump to the end of the axis (End)"
           >
-            <SkipEndIcon />
+            <SkipForward />
           </button>
           <label className="replay-speed">
             <span className="replay-speed-label">speed</span>
@@ -690,7 +683,7 @@ function ReplayRowView({
                   : `Show all ${row.batches.length} batches (fan-outs over ${MAPPED_COLLAPSE_THRESHOLD} collapse by default)`
               }
             >
-              <ChevronDownIcon className={isExpanded ? "chevron is-open" : "chevron"} />
+              <ChevronDown className={isExpanded ? "chevron is-open" : "chevron"} />
               <span>×{row.batches.length}</span>
             </button>
           ) : (
@@ -789,7 +782,7 @@ function ReplayLimits({ replay }: { replay: RunReplay }) {
   return (
     <details className="replay-limits">
       <summary className="replay-limits-summary">
-        <InfoIcon />
+        <Info />
         <span>
           Reconstructed from each task's start and end timestamps — not an event log.
           {replay.retriedTaskCount === 0

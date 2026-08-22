@@ -113,8 +113,9 @@ function StatusFacetGroup({
   );
 }
 
-// pipeline_version is a facet in the counts response but not a list filter in
-// M0, so it renders as informational counts without checkboxes.
+// pipeline_version is a facet in the counts response but the list endpoint
+// takes no such filter param, so it renders as informational counts without
+// checkboxes rather than as a control that would do nothing.
 function CountOnlyFacetGroup({ label, entries }: { label: string; entries: FacetEntry[] }) {
   const [showAll, setShowAll] = useState(false);
   const visibleEntries = showAll ? entries : entries.slice(0, VISIBLE_ENTRY_LIMIT);

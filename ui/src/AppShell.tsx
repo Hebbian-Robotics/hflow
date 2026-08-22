@@ -1,7 +1,9 @@
 import { useQuery } from "@tanstack/react-query";
+import { CirclePlay, Film, Funnel, Waypoints } from "lucide-react";
 import { Link, Outlet, useLocation } from "react-router-dom";
 import { fetchWorkspaceConfig } from "./api";
-import { BrandMarkIcon, CurateIcon, EpisodesIcon, PipelineIcon, RunsIcon } from "./icons";
+import { BrandMark } from "./components/BrandMark";
+import { ThemeControl } from "./components/ThemeControl";
 
 // Small workspace readout at the bottom of the rail: where the data lives and
 // which versions are serving it. Quiet on purpose.
@@ -33,7 +35,7 @@ export function AppShell() {
     <div className="app-shell">
       <nav className="nav-rail" aria-label="Primary">
         <div className="brand">
-          <BrandMarkIcon className="brand-mark" />
+          <BrandMark className="brand-mark" />
           <span>HFlow</span>
         </div>
         <Link
@@ -41,7 +43,7 @@ export function AppShell() {
           className={isEpisodesActive ? "nav-item is-active" : "nav-item"}
           aria-current={isEpisodesActive ? "page" : undefined}
         >
-          <EpisodesIcon />
+          <Film />
           <span>Episodes</span>
         </Link>
         <Link
@@ -49,7 +51,7 @@ export function AppShell() {
           className={isRunsActive ? "nav-item is-active" : "nav-item"}
           aria-current={isRunsActive ? "page" : undefined}
         >
-          <RunsIcon />
+          <CirclePlay />
           <span>Runs</span>
         </Link>
         <Link
@@ -57,7 +59,7 @@ export function AppShell() {
           className={isPipelineActive ? "nav-item is-active" : "nav-item"}
           aria-current={isPipelineActive ? "page" : undefined}
         >
-          <PipelineIcon />
+          <Waypoints />
           <span>Pipeline</span>
         </Link>
         <Link
@@ -65,10 +67,11 @@ export function AppShell() {
           className={isCurateActive ? "nav-item is-active" : "nav-item"}
           aria-current={isCurateActive ? "page" : undefined}
         >
-          <CurateIcon />
+          <Funnel />
           <span>Curate</span>
         </Link>
         <div className="rail-foot">
+          <ThemeControl />
           <WorkspaceSummary />
         </div>
       </nav>
