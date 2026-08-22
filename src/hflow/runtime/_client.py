@@ -17,6 +17,7 @@ import http.client
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -73,6 +74,17 @@ class AirflowHealth:
     def summary(self) -> str:
         parts = [f"{name}={status or 'absent'}" for name, status in sorted(self.components.items())]
         return ", ".join(parts)
+
+
+def _dag_run_path(dag_id: str, dag_run_id: str) -> str:
+    """The one owner of run-id-to-URL encoding: every per-run endpoint uses it.
+
+    Run ids carry ':' and '+' (manual__2026-08-22T03:06:55+00:00), and a
+    caller-supplied idempotency id may carry '#' or '?' -- which urllib reads
+    as a fragment or a query and silently drops from the path, so two calls
+    with the same id would address two different runs.
+    """
+    return f"/api/v2/dags/{dag_id}/dagRuns/{urllib.parse.quote(dag_run_id, safe='')}"
 
 
 class AirflowClient:
@@ -262,7 +274,7 @@ class AirflowClient:
         return self._authenticated("GET", f"/api/v2/dags/{dag_id}")
 
     def dag_run(self, dag_id: str, dag_run_id: str) -> dict[str, Any]:
-        return self._authenticated("GET", f"/api/v2/dags/{dag_id}/dagRuns/{dag_run_id}")
+        return self._authenticated("GET", _dag_run_path(dag_id, dag_run_id))
 
     def dag_runs(
         self, dag_id: str, *, limit: int = 100, order_by: str | None = None
@@ -278,6 +290,20 @@ class AirflowClient:
         runs = response.get("dag_runs")
         return runs if isinstance(runs, list) else []
 
+    def task_instances(self, dag_id: str, dag_run_id: str) -> list[dict[str, Any]]:
+        """Every task instance of one run, as the API returns them.
+
+        Includes one entry per dynamically mapped instance (``process_batch``
+        fans out over the planned batches), distinguished by ``map_index``;
+        ``-1`` means the task was not mapped. What a caller reads from each
+        entry -- state, timings, try number -- is Airflow's vocabulary, not
+        HFlow's: this is a thin pass-through so a UI can colour the task graph
+        :func:`hflow.runtime.ingest_dag_topology` describes.
+        """
+        response = self._authenticated("GET", f"{_dag_run_path(dag_id, dag_run_id)}/taskInstances")
+        task_instances = response.get("task_instances")
+        return task_instances if isinstance(task_instances, list) else []
+
     def unpause_dag(self, dag_id: str) -> dict[str, Any]:
         return self._authenticated("PATCH", f"/api/v2/dags/{dag_id}", {"is_paused": False})
 
@@ -288,6 +314,7 @@ class AirflowClient:
         *,
         profile: str = "full",
         online: bool = False,
+        batch_count: int | None = None,
         dag_run_id: str | None = None,
     ) -> dict[str, Any]:
         """Trigger the MASTER ingest DAG over ``uris`` (the SDK/CLI entry point).
@@ -297,12 +324,27 @@ class AirflowClient:
         only the enabled stage sub-DAGs). ``online`` selects the
         latency-first trigger lane -- the sub-DAGs process the uris as one
         immediate batch, no bin-packing, no stagger -- instead of the default
-        staggered batch lane. Supply ``dag_run_id`` when the caller may retry
+        staggered batch lane. ``batch_count`` overrides the master's own
+        bin-packing for the batch lane (ignored by the online lane, which is
+        always one batch). Supply ``dag_run_id`` when the caller may retry
         (see :meth:`trigger_dag_run` for the idempotency contract).
+
+        This method owns the trigger conf's shape: every caller -- the CLI,
+        the workspace UI, a control plane -- goes through it rather than
+        rebuilding the dict. Owning the shape includes refusing a value the
+        run cannot honour: ``batch_count`` below 1 raises here rather than
+        reaching the sub-DAG's ``plan`` task, which would fail the run after
+        it exists and leave it in the operator's history.
         """
-        conf = {
+        if batch_count is not None and batch_count < 1:
+            # Same wording as hflow.batching.plan_batches, the task-side owner
+            # of this invariant, so both entry points say the same thing.
+            raise ValueError(f"batch_count must be >= 1, got {batch_count}")
+        conf: dict[str, Any] = {
             "uris": uris,
             "profile": profile,
             "mode": "online" if online else "batch",
         }
+        if batch_count is not None:
+            conf["batch_count"] = batch_count
         return self.trigger_dag_run(dag_id, conf=conf, dag_run_id=dag_run_id)
