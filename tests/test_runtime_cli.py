@@ -441,6 +441,7 @@ def test_up_reports_a_missing_requirements_file_the_same_way(
     streams = capsys.readouterr()
     assert f"up: [Errno 2] No such file or directory: '{missing}'" in streams.err
     assert "Traceback" not in streams.err
+    assert "containers may still be running" not in streams.err
 
 
 def test_deploy_missing_pipeline_names_the_reason_not_just_the_path(
@@ -450,8 +451,11 @@ def test_deploy_missing_pipeline_names_the_reason_not_just_the_path(
     """`deploy` exited 2 already, but printed a bare path.
 
     That bare form is the #26 complaint, which was only ever fixed in
-    storage.py. Both commands now raise the three-argument FileNotFoundError,
-    so both print why the path failed.
+    storage.py. The two render functions now raise the three-argument
+    FileNotFoundError, so both commands print why the path failed. Other
+    raise sites still use a message string (load_bundle) or a bare path
+    (testing.py, storage.py:344); this pins the two that `up` and `deploy`
+    reach, not a repo-wide convention.
     """
     missing = tmp_path / "no-such-pipeline.py"
 
@@ -470,7 +474,38 @@ def test_deploy_missing_pipeline_names_the_reason_not_just_the_path(
     assert exit_code == 2
     streams = capsys.readouterr()
     assert f"deploy: [Errno 2] No such file or directory: '{missing}'" in streams.err
-    assert streams.err.strip() != f"deploy: {missing}"
+
+
+def test_deploy_missing_requirements_names_the_reason_too(
+    pipeline_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The other raise site render_deploy_bundle owns.
+
+    Without this, reverting the requirements raise in _deploy.py alone leaves
+    the whole suite green while `deploy --requirements <missing>` goes back to
+    printing a bare path.
+    """
+    missing = tmp_path / "no-such-requirements.txt"
+
+    exit_code = main(
+        [
+            "deploy",
+            "--pipeline",
+            str(pipeline_file),
+            "--data-root-uri",
+            "s3://bucket/data",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--requirements",
+            str(missing),
+        ]
+    )
+
+    assert exit_code == 2
+    streams = capsys.readouterr()
+    assert f"deploy: [Errno 2] No such file or directory: '{missing}'" in streams.err
 
 
 def test_up_from_published_install_uses_matching_distribution(
