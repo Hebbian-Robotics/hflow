@@ -17,6 +17,7 @@ import http.client
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -277,6 +278,25 @@ class AirflowClient:
         response = self._authenticated("GET", f"/api/v2/dags/{dag_id}/dagRuns?{query}")
         runs = response.get("dag_runs")
         return runs if isinstance(runs, list) else []
+
+    def task_instances(self, dag_id: str, dag_run_id: str) -> list[dict[str, Any]]:
+        """Every task instance of one run, as the API returns them.
+
+        Includes one entry per dynamically mapped instance (``process_batch``
+        fans out over the planned batches), distinguished by ``map_index``;
+        ``-1`` means the task was not mapped. What a caller reads from each
+        entry -- state, timings, try number -- is Airflow's vocabulary, not
+        HFlow's: this is a thin pass-through so a UI can colour the task graph
+        :func:`hflow.runtime.ingest_dag_topology` describes.
+        """
+        # Run ids carry ':' and '+' (manual__2026-08-22T03:06:55+00:00), which
+        # must not reach the path unescaped.
+        encoded_run_id = urllib.parse.quote(dag_run_id, safe="")
+        response = self._authenticated(
+            "GET", f"/api/v2/dags/{dag_id}/dagRuns/{encoded_run_id}/taskInstances"
+        )
+        task_instances = response.get("task_instances")
+        return task_instances if isinstance(task_instances, list) else []
 
     def unpause_dag(self, dag_id: str) -> dict[str, Any]:
         return self._authenticated("PATCH", f"/api/v2/dags/{dag_id}", {"is_paused": False})

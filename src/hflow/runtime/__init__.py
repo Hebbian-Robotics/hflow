@@ -48,6 +48,14 @@ from hflow.runtime._lifecycle import (
     start_runtime,
     started_summary,
 )
+from hflow.runtime._topology import (
+    DagTaskNode,
+    DagTopology,
+    IngestTopology,
+    StageTopology,
+    budget_gate_task_id,
+    ingest_dag_topology,
+)
 
 __all__ = [
     "DEFAULT_AIRFLOW_IMAGE",
@@ -58,11 +66,16 @@ __all__ = [
     "BearerToken",
     "BundlePaths",
     "ComposeError",
+    "DagTaskNode",
+    "DagTopology",
     "DeployConfig",
     "DeployPaths",
+    "IngestTopology",
     "PasswordCredentials",
     "RemoteRuntimeEndpoint",
     "RuntimeConfig",
+    "StageTopology",
+    "budget_gate_task_id",
     "bundle_dag_ids",
     "client_for_bundle",
     "client_for_endpoint",
@@ -73,6 +86,7 @@ __all__ = [
     "describe_remote_status",
     "describe_runtime_status",
     "infer_hflow_source",
+    "ingest_dag_topology",
     "load_bundle",
     "render_bundle",
     "render_deploy_bundle",
