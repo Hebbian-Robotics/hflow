@@ -25,8 +25,6 @@ from hflow_ui import _catalog, _connections
 from hflow_ui._contract import (
     ObservedCheckVersion,
     PipelineResponse,
-    PipelineStageLane,
-    PipelineStepManifest,
     StaleSummary,
     StepTier,
 )
@@ -121,22 +119,6 @@ def registered_steps_by_stage(
     return steps_by_stage
 
 
-def _stage_lanes(manifest: PipelineManifest) -> list[PipelineStageLane]:
-    """The stage lanes of the pipeline page, in stage-graph order."""
-    steps_by_stage = registered_steps_by_stage(manifest)
-    return [
-        PipelineStageLane(
-            stage=stage,
-            engine_owned=stage in (Stage.SYNC, Stage.MEDIA),
-            steps=[
-                PipelineStepManifest.from_step_manifest(step)
-                for step, _tier in steps_by_stage[stage]
-            ],
-        )
-        for stage in Stage
-    ]
-
-
 def _observed_versions_and_stale(
     data_root: str, application: App
 ) -> tuple[list[ObservedCheckVersion], StaleSummary | None]:
@@ -186,7 +168,6 @@ def create_pipeline_router(settings: UiSettings, state: PipelineState) -> APIRou
         observed, stale = _observed_versions_and_stale(settings.data_root, state.application)
         return PipelineResponse(
             manifest=manifest.to_json_dict(),
-            stages=_stage_lanes(manifest),
             observed=observed,
             stale=stale,
         )

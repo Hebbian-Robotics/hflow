@@ -59,17 +59,9 @@ def test_pipeline_page_reports_manifest_lanes_observed_and_stale(
     assert manifest["checks"][0]["version"]
     assert [enrichment["name"] for enrichment in manifest["enrichments"]] == ["caption"]
 
-    # Lanes follow the REAL stage semantics (hflow.steps): checks run in the
-    # meta stage, user enrichments in labels; sync and media are engine-owned.
-    stages = payload["stages"]
-    assert [lane["stage"] for lane in stages] == ["sync", "meta", "labels", "media"]
-    lanes_by_stage = {lane["stage"]: lane for lane in stages}
-    assert [step["name"] for step in lanes_by_stage["meta"]["steps"]] == ["joint_check"]
-    assert [step["name"] for step in lanes_by_stage["labels"]["steps"]] == ["caption"]
-    assert lanes_by_stage["sync"]["engine_owned"] is True
-    assert lanes_by_stage["sync"]["steps"] == []
-    assert lanes_by_stage["media"]["engine_owned"] is True
-    assert lanes_by_stage["media"]["steps"] == []
+    # No stage lanes here: /pipeline/graph is the one owner of stage grouping,
+    # so this page cannot disagree with it about which steps run where.
+    assert "stages" not in payload
 
     observed_by_identity = {
         (row["check_name"], row["check_version"]): row for row in payload["observed"]

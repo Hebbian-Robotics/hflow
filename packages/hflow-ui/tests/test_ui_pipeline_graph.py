@@ -283,35 +283,28 @@ def test_graph_tier_derivation_matches_the_engines_own_ordering(
 def test_the_pipeline_page_and_the_graph_describe_one_pipeline_the_same_way(
     runtime_free_cwd: Path, tmp_path: Path, unbuilt_assets_dir: Path
 ) -> None:
-    """The two pages must not show one pipeline as two.
+    """Steps are served in EXECUTION order, not registration order.
 
-    Both project from the same stage->steps owner, so every lane holds the
-    same steps in the same execution order and only the graph's ``tier``
-    field is extra. This fixture registers its tier-2 checks FIRST, so an
-    endpoint that echoed registration order instead would fail here.
+    The graph is the one owner of stage grouping (the pipeline page serves no
+    lanes), so this pins the property that owner must hold: the cheap tier
+    runs first. The fixture registers its tier-2 checks FIRST, so an endpoint
+    that echoed registration order would fail here.
     """
     pipeline_file = _written_pipeline_file(tmp_path, TIERED_PIPELINE_SOURCE)
     data_root = tmp_path / "bare-root"
     data_root.mkdir()
     client = _client_over(data_root, unbuilt_assets_dir, pipeline=str(pipeline_file))
-    lane_steps_by_stage = {
-        lane["stage"]: lane["steps"] for lane in client.get("/api/v1/pipeline").json()["stages"]
-    }
     graph_steps_by_stage = {
         stage["stage"]: stage["user_steps"]
         for stage in client.get("/api/v1/pipeline/graph").json()["stages"]
     }
-    assert list(lane_steps_by_stage) == list(graph_steps_by_stage)
-    for stage_name, lane_steps in lane_steps_by_stage.items():
-        assert lane_steps == [
-            {field: value for field, value in step.items() if field != "tier"}
-            for step in graph_steps_by_stage[stage_name]
-        ]
-    assert [step["name"] for step in lane_steps_by_stage["meta"]] == [
+    meta_steps = graph_steps_by_stage["meta"]
+    assert [step["name"] for step in meta_steps] == [
         "cheap_check",
         "needs_channel",
         "needs_endpoint",
     ]
+    assert [step["tier"] for step in meta_steps] == [1, 2, 2]
 
 
 def test_graph_quarantine_gate_lists_exactly_the_critical_checks(

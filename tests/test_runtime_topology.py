@@ -78,7 +78,11 @@ def test_master_edges_describe_the_stage_chain() -> None:
 @pytest.mark.parametrize("stage", list(Stage))
 def test_sub_dag_tasks_match_the_rendered_stage_dag(rendered_bundle: Path, stage: Stage) -> None:
     source = _dag_source(rendered_bundle, f"ingest_{stage.value}.py")
-    stage_topology = ingest_dag_topology(MASTER_DAG_ID).stage(stage)
+    stage_topology = next(
+        candidate
+        for candidate in ingest_dag_topology(MASTER_DAG_ID).stages
+        if candidate.stage is stage
+    )
 
     assert stage_topology.dag.dag_id == sub_dag_id_for_stage(MASTER_DAG_ID, stage)
     for task in stage_topology.dag.tasks:
@@ -108,8 +112,13 @@ def test_enabling_profiles_name_which_profiles_run_each_stage() -> None:
     A profile missing from a stage's tuple is exactly what the master's gate
     skips on -- metadata_backfill runs meta and nothing else.
     """
-    topology = ingest_dag_topology(MASTER_DAG_ID)
-    assert topology.stage(Stage.SYNC).enabling_profiles == ("full",)
-    assert topology.stage(Stage.META).enabling_profiles == ("full", "metadata_backfill")
-    assert topology.stage(Stage.LABELS).enabling_profiles == ("full", "relabel")
-    assert topology.stage(Stage.MEDIA).enabling_profiles == ("full",)
+    profiles_by_stage = {
+        stage_topology.stage: stage_topology.enabling_profiles
+        for stage_topology in ingest_dag_topology(MASTER_DAG_ID).stages
+    }
+    assert profiles_by_stage == {
+        Stage.SYNC: ("full",),
+        Stage.META: ("full", "metadata_backfill"),
+        Stage.LABELS: ("full", "relabel"),
+        Stage.MEDIA: ("full",),
+    }

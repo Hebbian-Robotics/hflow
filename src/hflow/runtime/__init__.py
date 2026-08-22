@@ -53,7 +53,6 @@ from hflow.runtime._topology import (
     DagTopology,
     IngestTopology,
     StageTopology,
-    budget_gate_task_id,
     ingest_dag_topology,
 )
 
@@ -75,7 +74,6 @@ __all__ = [
     "RemoteRuntimeEndpoint",
     "RuntimeConfig",
     "StageTopology",
-    "budget_gate_task_id",
     "bundle_dag_ids",
     "client_for_bundle",
     "client_for_endpoint",

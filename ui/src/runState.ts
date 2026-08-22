@@ -40,9 +40,3 @@ export function runStateTone(state: string | null | undefined): RunStateTone {
 export function runStateChipClass(state: string | null | undefined): string {
   return `chip chip-${runStateTone(state)}`;
 }
-
-/** States where the honest word is "waiting" rather than "stalled" or "stuck". */
-export function isWaitingState(state: string | null | undefined): boolean {
-  const normalized = state?.toLowerCase();
-  return normalized === "deferred" || normalized === "queued" || normalized === "scheduled";
-}

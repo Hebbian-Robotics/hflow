@@ -10,10 +10,8 @@ import {
   fetchRuntimeRuns,
   fetchRuntimeStatus,
   fetchWorkspaceConfig,
-  INGEST_MODES,
   type MappedFanOutSummary,
   type PipelineGraphResponse,
-  RUN_PROFILE_NAMES,
   type RunGraphResponse,
   type RunGraphStage,
   type RunTaskInstance,
@@ -856,11 +854,11 @@ function TriggerIngestForm({ config }: { config: WorkspaceConfig | undefined }) 
   const [modeChoice, setModeChoice] = useState<string | null>(null);
   const [batchCountText, setBatchCountText] = useState("");
 
-  // The selects offer the LIVE vocabularies /api/v1/config serves (hflow.steps
-  // stays the one owner); the constants are only the fallback for servers that
-  // predate those config fields. Until the user picks, the first option holds.
-  const profileNames = config?.run_profiles ?? RUN_PROFILE_NAMES;
-  const ingestModes = config?.ingest_modes ?? INGEST_MODES;
+  // The selects offer the LIVE vocabularies /api/v1/config serves, so
+  // hflow.steps stays the one owner of both. Empty only before config loads;
+  // until the user picks, the first option holds.
+  const profileNames = config?.run_profiles ?? [];
+  const ingestModes = config?.ingest_modes ?? [];
   const profile = profileChoice ?? profileNames[0] ?? "full";
   const mode = modeChoice ?? ingestModes[0] ?? "batch";
 

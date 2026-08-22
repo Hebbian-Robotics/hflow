@@ -104,12 +104,6 @@ class IngestTopology:
     master: DagTopology
     stages: tuple[StageTopology, ...]
 
-    def stage(self, stage: Stage) -> StageTopology:
-        for stage_topology in self.stages:
-            if stage_topology.stage is stage:
-                return stage_topology
-        raise KeyError(f"no topology for stage {stage!r}")
-
 
 def _sub_dag_topology(master_dag_id: str, stage: Stage) -> DagTopology:
     gate_task_id = budget_gate_task_id(stage)

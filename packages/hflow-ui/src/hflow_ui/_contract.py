@@ -568,21 +568,6 @@ class PipelineStepManifest(BaseModel):
         )
 
 
-class PipelineStageLane(BaseModel):
-    """One ingest-stage lane of the pipeline page."""
-
-    stage: Stage
-    engine_owned: bool = Field(
-        description="True for lanes whose work is engine builtins (sync, media) "
-        "rather than user-registered steps."
-    )
-    steps: list[PipelineStepManifest] = Field(
-        description="The lane's registered steps in EXECUTION order (cheap tier "
-        "first), the same order and the same steps /pipeline/graph serves as "
-        "'user_steps' -- only the tier field differs."
-    )
-
-
 class ObservedCheckVersion(BaseModel):
     """What the catalog has SEEN of one (check, version) pair."""
 
@@ -608,7 +593,6 @@ class PipelineResponse(BaseModel):
         "renders it. hflow.manifest owns that shape and stamps it with "
         "'manifest_version', so it is forwarded rather than mirrored here."
     )
-    stages: list[PipelineStageLane]
     observed: list[ObservedCheckVersion]
     stale: StaleSummary | None = Field(
         description="Null when staleness is unknowable (no catalog yet)."

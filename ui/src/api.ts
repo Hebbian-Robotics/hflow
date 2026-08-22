@@ -18,8 +18,8 @@ export interface WorkspaceCapabilities {
   catalog: boolean;
   media: boolean;
   runtime: boolean;
-  /** True when the server imported a --pipeline app at startup. Absent on servers that predate the pipeline page. */
-  pipeline?: boolean;
+  /** True when the server imported a --pipeline app at startup. */
+  pipeline: boolean;
 }
 
 export interface WorkspaceConfig {
@@ -30,11 +30,12 @@ export interface WorkspaceConfig {
   data_root: string;
   workspace_id: string | null;
   capabilities: WorkspaceCapabilities;
-  /** Live run-profile names from hflow.steps.RUN_PROFILES — served so the
-   * frontend never hardcodes them. Absent only on servers that predate the runs monitor. */
-  run_profiles?: string[];
-  /** Live ingest modes from hflow.steps.IngestMode; same contract as run_profiles. */
-  ingest_modes?: string[];
+  // These two carry the live vocabularies from hflow.steps so the frontend
+  // never hardcodes them. Required, not optional: this bundle ships inside the
+  // same wheel as the server that serves it, so the two cannot be different
+  // versions and "an older server omits the field" is not a reachable state.
+  run_profiles: string[];
+  ingest_modes: string[];
 }
 
 export interface EpisodeColumn {
@@ -455,14 +456,6 @@ export interface RuntimeRunsResponse {
   stages: StageRecentRuns[] | null;
 }
 
-/** Offline fallback for config.run_profiles when the server predates that
- * field — the live vocabulary is served by /api/v1/config (hflow.steps.RUN_PROFILES
- * stays the one owner) and the server validates against it either way. */
-export const RUN_PROFILE_NAMES: readonly string[] = ["full", "metadata_backfill", "relabel"];
-
-/** Offline fallback for config.ingest_modes; same contract as RUN_PROFILE_NAMES. */
-export const INGEST_MODES: readonly string[] = ["batch", "online"];
-
 export interface IngestRequest {
   uris: string[];
   profile: string;
@@ -533,20 +526,8 @@ export interface StaleSummary {
   count: number;
 }
 
-/** One ingest-stage lane as the server groups it: the REAL stage semantics
- * from hflow.steps/App.process, in stage-graph order. */
-export interface PipelineStageLane {
-  stage: string;
-  /** True for lanes whose work is engine builtins (sync, media) rather than
-   * user-registered steps. */
-  engine_owned: boolean;
-  steps: PipelineStepManifest[];
-}
-
 export interface PipelineResponse {
   manifest: PipelineManifest;
-  /** Manifest steps grouped into stage lanes — the one owner of the grouping. */
-  stages: PipelineStageLane[];
   observed: ObservedVersion[];
   stale: StaleSummary | null;
 }
