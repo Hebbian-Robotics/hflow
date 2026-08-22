@@ -378,6 +378,20 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="disable the session token (only for a trusted, loopback-only machine)",
     )
+    ui_parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help="viewer mode: hide and refuse manifest pinning, saved-query edits, and run triggering",
+    )
+    ui_parser.add_argument(
+        "--pipeline",
+        default=None,
+        help=(
+            "pipeline file for the Pipeline page, optionally with the App variable "
+            "name: path/to/pipeline.py[:app]; importing EXECUTES the file, exactly "
+            "like `hflow manifest`"
+        ),
+    )
     return parser
 
 
@@ -762,6 +776,8 @@ def _command_ui(arguments: argparse.Namespace) -> int:
         port=arguments.port,
         token=None if arguments.no_token else new_session_token(),
         open_browser=not arguments.no_browser,
+        read_only=arguments.read_only,
+        pipeline=arguments.pipeline,
     )
     serve(settings)
     return 0
