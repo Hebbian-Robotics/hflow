@@ -37,8 +37,8 @@ from hflow.catalog import (
     AppendResult,
     Catalog,
     CheckRunRow,
+    QuarantineHistory,
     content_episode_id,
-    latest_quarantine,
 )
 from hflow.episode import Episode, _sanitize_topic
 from hflow.ffmpeg import contact_sheet
@@ -122,6 +122,9 @@ def _resolve_data_root(data_root: "Path | str | StorageRoot | None") -> "Path | 
 # contact sheet per camera topic, recorded exactly like an enrichment so its
 # catalog rows flow through CheckRunRow like everything else.
 MEDIA_CONTACT_SHEET_STEP_NAME = "media/contact_sheet"
+# Published artifacts are recorded as measurements under this prefix, so a
+# reader can tell "here is where the file went" from an ordinary label.
+ARTIFACT_MEASUREMENT_KEY_PREFIX = "artifact/"
 _MEDIA_CONTACT_SHEET_FPS = 0.5
 _SYNC_COMPLETION_MARKER_NAME = ".sync-complete.json"
 
@@ -549,7 +552,10 @@ class TestReport:
                         artifact_location = enrichment_run.artifact_uris.get(
                             artifact_name, str(artifact_path)
                         )
-                        lines.append(f"      artifact/{artifact_name} = {artifact_location}")
+                        lines.append(
+                            f"      {ARTIFACT_MEASUREMENT_KEY_PREFIX}{artifact_name} = "
+                            f"{artifact_location}"
+                        )
         return "\n".join(lines)
 
     def __str__(self) -> str:
@@ -1045,6 +1051,7 @@ class App:
         verbose: bool = False,
         record: bool = True,
         stages: Iterable[Stage] | str | None = None,
+        quarantine_history: QuarantineHistory | None = None,
     ) -> TestReport:
         """Process one episode through the enabled stages of the stage
         graph: transform to canonical (``sync``), run checks with gate
@@ -1063,6 +1070,10 @@ class App:
         stamps are reconstructed from its own provenance record. Without
         ``meta``, the quarantine gate for ``labels``/``media`` comes from the
         episode's latest cataloged state (no catalog = no known quarantine).
+
+        ``quarantine_history`` is that gate's catalog reader, open across a
+        whole batch so a stage does not re-sync and re-open the catalog once
+        per episode; omit it and this call opens one for itself.
         """
         enabled_stages = _resolve_stages(stages)
         source_identifier = _source_identity(episode, self.storage_root)
@@ -1242,11 +1253,14 @@ class App:
             # A cataloged quarantine is carried into this run's tags so a
             # recorded run without meta never masks the state.
             if Stage.META not in enabled_stages:
-                cataloged_quarantine = latest_quarantine(
-                    self.workspace.catalog_root, content_episode_id(canonical_path)
-                )
-                if cataloged_quarantine is not None and cataloged_quarantine.quarantined:
-                    report.quarantine_tags.extend(cataloged_quarantine.tags)
+                episode_id = content_episode_id(canonical_path)
+                if quarantine_history is not None:
+                    carried_tags = quarantine_history.quarantine_tags(episode_id)
+                else:
+                    with QuarantineHistory(self.workspace.catalog_root) as history:
+                        carried_tags = history.quarantine_tags(episode_id)
+                if carried_tags is not None:
+                    report.quarantine_tags.extend(carried_tags)
             quarantine_skip_reason = (
                 f"episode quarantined ({', '.join(report.quarantine_tags)})"
                 if report.quarantined
@@ -1349,7 +1363,7 @@ class App:
                 if enrichment_result is not None:
                     labels.update(
                         {
-                            f"artifact/{artifact_name}": artifact_uri
+                            f"{ARTIFACT_MEASUREMENT_KEY_PREFIX}{artifact_name}": artifact_uri
                             for artifact_name, artifact_uri in enrichment_run.artifact_uris.items()
                         }
                     )
@@ -1378,3 +1392,44 @@ class App:
         if verbose:
             print(report.summary())
         return report
+
+
+def parse_pipeline_spec(pipeline_spec: str) -> tuple[Path, str]:
+    """Split ``path/to/pipeline.py[:app_variable]`` (default variable: ``app``)."""
+    path_part, separator, variable_part = pipeline_spec.rpartition(":")
+    if separator and path_part and variable_part.isidentifier():
+        return Path(path_part), variable_part
+    return Path(pipeline_spec), "app"
+
+
+def import_pipeline_application(pipeline_spec: str) -> "App":
+    """Import ``path/to/pipeline.py[:app]`` and return its :class:`App`, loudly.
+
+    One owner for the "address a pipeline by file" contract every vantage
+    needs -- the CLI's ``manifest``/``up``/``deploy``/``stale``, and any other
+    caller that must hold a user's pipeline (the workspace UI's pipeline
+    page). The pipeline file is arbitrary user code, so importing EXECUTES
+    it: any exception it raises is a boundary failure reported as a
+    ``ValueError`` naming the file, never a crash of the calling program.
+    """
+    import importlib.util
+
+    pipeline_file, app_variable = parse_pipeline_spec(pipeline_spec)
+    spec = importlib.util.spec_from_file_location("hflow_user_pipeline", pipeline_file)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"cannot import pipeline file {pipeline_file}")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except (Exception, SystemExit) as error:
+        # SystemExit is a BaseException: a pipeline that guards its config at
+        # import time (sys.exit("set ROBOT_FLEET"), or a module-scope argparse)
+        # would otherwise walk past `except Exception` and take the calling
+        # program's exit status with it -- killing a long-lived UI server at
+        # startup. KeyboardInterrupt stays uncaught on purpose: that one
+        # belongs to whoever pressed it, not to the pipeline file.
+        raise ValueError(f"importing {pipeline_file} failed: {error}") from error
+    application = getattr(module, app_variable, None)
+    if not isinstance(application, App):
+        raise ValueError(f"{pipeline_file} has no hflow.App named {app_variable!r}")
+    return application

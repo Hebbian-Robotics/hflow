@@ -59,23 +59,27 @@ from mcap.records import (
     SummaryOffset,
 )
 
+from hflow.behavior import TRANSFORM_BEHAVIOR_VERSION
 from hflow.format import DEFAULT_CHUNK_SIZE_BYTES, EPISODE_FORMAT_VERSION
 
 MCAP0_MAGIC = struct.pack("<8B", 137, 77, 67, 65, 80, 48, 13, 10)
 
 
 def _default_library_identifier() -> str:
-    """Project name + package version + episode format version.
+    """Project name + episode format version + transform behavior version.
 
     Informational only (MCAP Header ``library`` field): stored-data
     identifiers stay neutral per ``hflow.format``.
     """
-    # Local import: hflow/__init__.py imports this module, so a top-level
-    # import would be circular. By the time a writer is constructed the
-    # package is fully imported.
-    from hflow import __version__ as package_version
-
-    return f"hflow/{package_version} episode-format/{EPISODE_FORMAT_VERSION}"
+    # Deliberately free of the release number: this string is written into
+    # the MCAP header, so it is part of the bytes content_episode_id hashes.
+    # Embedding hflow.__version__ here gave a byte-identical input a new
+    # episode identity on every release, breaking content-addressed dedupe.
+    # The behavior version changes only when canonicalization does.
+    return (
+        f"hflow episode-format/{EPISODE_FORMAT_VERSION} "
+        f"transform-behavior/{TRANSFORM_BEHAVIOR_VERSION}"
+    )
 
 
 class _GroupChunkBuilder:

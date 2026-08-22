@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from hflow import video as video_module
+from hflow.behavior import TRANSFORM_BEHAVIOR_VERSION
 from hflow.ffmpeg import ffmpeg_version
 from hflow.format import (
     CAMERA_SCHEMA_NAMES,
@@ -144,14 +145,19 @@ def compute_pipeline_version(
     ``derived_versions`` (derived topic -> derived-channel version) folds the
     derived signals into the hash: a passed-in mapping rather than App state,
     so the transform stays a library function.
-    """
-    # Imported here to avoid a cycle with the package root.
-    from hflow import __version__
 
+    The engine's contribution is :data:`hflow.behavior.TRANSFORM_BEHAVIOR_VERSION`,
+    NOT the release number: this hash is stamped into ``provenance/v1``, which
+    lives inside the bytes ``content_episode_id`` hashes, so folding in
+    ``hflow.__version__`` gave every release a new ``pipeline_version`` AND a
+    new ``episode_id`` for byte-identical inputs -- breaking dedupe and making
+    ``hflow stale`` list the whole corpus after a change that processed
+    nothing differently.
+    """
     payload = json.dumps(
         {
             "format": EPISODE_FORMAT_VERSION,
-            "sdk": __version__,
+            "transform_behavior": TRANSFORM_BEHAVIOR_VERSION,
             "gop_preset": str(config.gop_preset),
             "gop_seconds": config.gop_seconds,
             "crf": config.crf,
@@ -159,6 +165,13 @@ def compute_pipeline_version(
             "compression": config.compression,
             "topic_groups": dict(sorted(config.topic_groups.items())),
             "derived": dict(sorted(derived_versions.items())) if derived_versions else {},
+            # Only when the episode HAS derived channels: the policy decides
+            # their samples, so a bump must make them stale -- but folding it
+            # unconditionally would re-version corpora that never resampled
+            # anything. A step's own version cannot cover this, because the
+            # taught idiom reaches ``hflow.resample.to_grid`` through the
+            # module and a module contributes only its name to a step hash.
+            **({"resample_policy": RESAMPLE_POLICY_VERSION} if derived_versions else {}),
         },
         sort_keys=True,
     )
@@ -436,7 +449,27 @@ def write_canonical_episode(
                     )
                 )
 
-        outgoing.sort(key=lambda message: message.log_time)
+        # A TOTAL order, because these bytes are the episode's identity.
+        #
+        # log_time alone leaves ties -- on a realistic multi-stream episode
+        # roughly 40% of messages share a timestamp with another -- and a
+        # stable sort then settles them by the order this function happened to
+        # append them in: passthrough during the read, then transcoded video,
+        # then derived channels. That is a property of the code, not of the
+        # episode, so reordering any of those appends would silently change
+        # every content-addressed episode_id in every corpus.
+        #
+        # Topic breaks the tie instead: it is semantic and comparable across
+        # recordings, where a recorder-assigned channel id is neither. Within
+        # one topic the sort's stability preserves the source's own order for
+        # that topic, which is already well defined.
+        def output_topic(message: _OutgoingMessage) -> str:
+            source_channel = message.source_channel_id
+            return (
+                source_channel if isinstance(source_channel, str) else infos[source_channel].topic
+            )
+
+        outgoing.sort(key=lambda message: (message.log_time, output_topic(message)))
 
         from mcap_protobuf.schema import build_file_descriptor_set
 

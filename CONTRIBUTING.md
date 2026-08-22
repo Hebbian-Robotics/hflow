@@ -114,6 +114,26 @@ repository root, and name the observable result. Keep examples on public APIs;
 tests belong to business logic and boundary behavior, not to checking that a
 documentation snippet copied a third-party SDK correctly.
 
+## Changing how episodes are processed
+
+Identities in HFlow are content hashes, and one of them -- `pipeline_version`
+-- is stamped inside the canonical bytes that `episode_id` hashes. A release
+number deliberately does **not** feed any of them: a CLI fix or a docs bump
+must never invalidate somebody's corpus. What does feed them is
+`TRANSFORM_BEHAVIOR_VERSION` in [`src/hflow/behavior.py`](./src/hflow/behavior.py).
+
+**Bump it in the same commit whenever your change makes the transform write
+different bytes for the same input** -- encoder settings or defaults,
+chunking and grouping, timestamp handling, the provenance record's shape, or
+a bugfix to any of those. Bumping re-versions every existing corpus exactly
+once, which is the honest cost; not bumping when behavior changed silently
+mixes two behaviors under one version, which is worse. When in doubt, bump,
+and say so in the pull request.
+
+Changes to checks, enrichments, or anything a step merely calls do not need a
+bump: a step's own content hash already covers its source and captured
+configuration. `tests/test_identity_stability.py` pins these rules.
+
 ## Quality checks
 
 Run the Python quality gate and fix every reported issue:

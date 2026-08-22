@@ -20,11 +20,13 @@ import importlib.util
 import math
 import os
 import traceback
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 
 from hflow.batching import plan_batches
+from hflow.catalog import QuarantineHistory
 from hflow.steps import IngestMode, Stage
 from hflow.storage import is_bucket_url, parse_storage_root
 
@@ -165,30 +167,54 @@ def process_stage_batch(
     gates apply the run budget to the tallies, so mass failure stays loud
     while a stray bad episode never blocks a run.
     """
+    # Stage(stage_name) parses the conf string at this boundary: an unknown
+    # stage is a loud ValueError before any episode is touched.
+    stage = Stage(stage_name)
     data_root = str(application.data_root)
     counts: StageBatchCounts = {"processed": 0, "quarantined": 0, "errors": 0}
-    for uri in uris:
-        try:
-            episode_reference = resolve_episode_reference(data_root, str(uri))
-            # Stage(stage_name) parses the conf string at this boundary: an
-            # unknown stage is a loud ValueError, counted as that episode's
-            # error like any other infrastructure failure.
-            report = application.process(episode_reference, record=True, stages={Stage(stage_name)})
-        except Exception:
-            traceback.print_exc()
-            counts["errors"] += 1
-            continue
-        if report.has_errors:
-            # app.process collects per-step diagnostics for the dev loop and
-            # catalog, so step failures are explicit report outcomes rather
-            # than escaping exceptions. They still count against the
-            # runtime's infrastructure-error budget.
-            counts["errors"] += 1
-        elif report.quarantined:
-            counts["quarantined"] += 1
-        else:
-            counts["processed"] += 1
+    # The labels and media gates read the episode's cataloged quarantine
+    # state; opening that reader once per batch rather than once per episode
+    # is the difference between one mirror sync and one per episode. Stages
+    # that decide quarantine themselves never read it.
+    with _batch_quarantine_history(application, stage) as quarantine_history:
+        for uri in uris:
+            try:
+                episode_reference = resolve_episode_reference(data_root, str(uri))
+                report = application.process(
+                    episode_reference,
+                    record=True,
+                    stages={stage},
+                    quarantine_history=quarantine_history,
+                )
+            except Exception:
+                traceback.print_exc()
+                counts["errors"] += 1
+                continue
+            if report.has_errors:
+                # app.process collects per-step diagnostics for the dev loop
+                # and catalog, so step failures are explicit report outcomes
+                # rather than escaping exceptions. They still count against
+                # the runtime's infrastructure-error budget.
+                counts["errors"] += 1
+            elif report.quarantined:
+                counts["quarantined"] += 1
+            else:
+                counts["processed"] += 1
     return counts
+
+
+@contextmanager
+def _batch_quarantine_history(
+    application: "App", stage: Stage
+) -> Iterator[QuarantineHistory | None]:
+    """One catalog reader for a whole batch, or ``None`` where the stage
+    never asks: only stages running without ``meta`` consult the catalog for
+    quarantine, and ``meta`` itself decides it in memory."""
+    if stage is Stage.META:
+        yield None
+        return
+    with QuarantineHistory(application.workspace.catalog_root) as history:
+        yield history
 
 
 def _tally_batch_counts(batch_counts: Sequence[StageBatchCounts]) -> tuple[int, int, int]:

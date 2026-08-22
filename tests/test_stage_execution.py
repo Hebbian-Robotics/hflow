@@ -4,11 +4,12 @@ per-episode accounting, and the error/quarantine budgets."""
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import cast
+from typing import ClassVar, cast
 
 import pytest
 
 import hflow
+from hflow import stage_execution
 from hflow.stage_execution import (
     StageBatchCounts,
     load_pipeline_application,
@@ -136,17 +137,33 @@ class _StubReport:
 
 
 @dataclass
+class _StubWorkspace:
+    catalog_root: Path
+
+
+@dataclass
 class _StubApp:
     """A processing double at the App boundary: records calls, scripts outcomes."""
 
     data_root: str
+    workspace: _StubWorkspace
+    expected_stage: str = "meta"
     outcomes: dict[str, object] = field(default_factory=dict)
     processed_references: list[object] = field(default_factory=list)
+    received_histories: list[object] = field(default_factory=list)
 
-    def process(self, episode_reference: object, *, record: bool, stages: set[str]) -> _StubReport:
+    def process(
+        self,
+        episode_reference: object,
+        *,
+        record: bool,
+        stages: set[str],
+        quarantine_history: object = None,
+    ) -> _StubReport:
         assert record is True
-        assert stages == {"meta"}
+        assert stages == {self.expected_stage}
         self.processed_references.append(episode_reference)
+        self.received_histories.append(quarantine_history)
         outcome = self.outcomes.get(Path(str(episode_reference)).name, "ok")
         if outcome == "crash":
             raise RuntimeError("episode exploded")
@@ -156,6 +173,7 @@ class _StubApp:
 def test_process_stage_batch_counts_every_outcome_kind(tmp_path: Path) -> None:
     stub_app = _StubApp(
         data_root=str(tmp_path),
+        workspace=_StubWorkspace(catalog_root=tmp_path / "catalog"),
         outcomes={
             "good.mcap": "ok",
             "quarantined.mcap": "quarantined",
@@ -171,3 +189,83 @@ def test_process_stage_batch_counts_every_outcome_kind(tmp_path: Path) -> None:
     # Per-episode crashes are counted, never batch-fatal: all four were tried.
     assert len(stub_app.processed_references) == 4
     assert counts == {"processed": 1, "quarantined": 1, "errors": 2}
+
+
+class _CountingQuarantineHistory:
+    """Stands in for the real reader so opens can be counted, not timed."""
+
+    opened: ClassVar[list[object]] = []
+
+    def __init__(self, catalog_root: object) -> None:
+        type(self).opened.append(catalog_root)
+
+    def quarantine_tags(self, episode_id: str) -> None:
+        return None
+
+    def __enter__(self) -> "_CountingQuarantineHistory":
+        return self
+
+    def __exit__(self, *_exception: object) -> None:
+        return None
+
+
+@pytest.fixture
+def counting_quarantine_history(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    _CountingQuarantineHistory.opened = []
+    monkeypatch.setattr(stage_execution, "QuarantineHistory", _CountingQuarantineHistory)
+    return _CountingQuarantineHistory.opened
+
+
+@pytest.mark.parametrize("stage_name", ["sync", "labels", "media"])
+def test_a_gated_stage_opens_one_quarantine_reader_for_the_whole_batch(
+    tmp_path: Path, counting_quarantine_history: list[object], stage_name: str
+) -> None:
+    """The quarantine gate reads the catalog once per batch, not per episode.
+
+    Every stage but ``meta`` asks the catalog for the episode's recorded
+    quarantine state. Opening that reader per episode makes a bucket catalog
+    re-sync its mirror once per episode for one boolean, which is the whole
+    cost this batching exists to remove -- so count the opens.
+    """
+    catalog_root = tmp_path / "catalog"
+    stub_app = _StubApp(
+        data_root=str(tmp_path),
+        workspace=_StubWorkspace(catalog_root=catalog_root),
+        expected_stage=stage_name,
+    )
+    counts = process_stage_batch(
+        cast("hflow.App", stub_app),
+        [f"episode_{index}.mcap" for index in range(5)],
+        stage_name,
+    )
+
+    assert counts == {"processed": 5, "quarantined": 0, "errors": 0}
+    assert counting_quarantine_history == [catalog_root]
+    # ...and every episode was handed that one reader, so none of them falls
+    # back to opening its own inside App.process.
+    assert stub_app.received_histories == [stub_app.received_histories[0]] * 5
+    assert isinstance(stub_app.received_histories[0], _CountingQuarantineHistory)
+
+
+def test_the_meta_stage_never_opens_the_quarantine_reader(
+    tmp_path: Path, counting_quarantine_history: list[object]
+) -> None:
+    """Meta decides quarantine in memory, so reading it back would be a lie."""
+    stub_app = _StubApp(
+        data_root=str(tmp_path),
+        workspace=_StubWorkspace(catalog_root=tmp_path / "catalog"),
+        expected_stage="meta",
+    )
+    process_stage_batch(cast("hflow.App", stub_app), ["a.mcap", "b.mcap"], "meta")
+
+    assert counting_quarantine_history == []
+    assert stub_app.received_histories == [None, None]
+
+
+def test_an_unknown_stage_is_refused_before_any_episode_is_touched(tmp_path: Path) -> None:
+    stub_app = _StubApp(
+        data_root=str(tmp_path), workspace=_StubWorkspace(catalog_root=tmp_path / "catalog")
+    )
+    with pytest.raises(ValueError, match="not a valid Stage"):
+        process_stage_batch(cast("hflow.App", stub_app), ["a.mcap"], "nonsense")
+    assert stub_app.processed_references == []
