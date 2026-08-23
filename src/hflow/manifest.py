@@ -18,14 +18,16 @@ code must be imported anyway.
 """
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import StrEnum
 
-from hflow.steps import RegisteredCheck, RegisteredEnrichment
+from hflow.steps import Gate, RegisteredCheck, RegisteredEnrichment
 
 # Versions the manifest's own JSON shape; bump on any change so consumers
 # can refuse loudly instead of misreading.
-PIPELINE_MANIFEST_VERSION = 1
+# 2: steps carry their declarative gate, so a service can show WHICH policy
+#    rejected an episode rather than only that some critical check did.
+PIPELINE_MANIFEST_VERSION = 2
 
 
 class StepKind(StrEnum):
@@ -48,6 +50,11 @@ class StepManifest:
     critical: bool
     requires: tuple[str, ...]
     uses: str | None
+    # The policy this step gates on, when it declares one. ``critical`` alone
+    # says a gate exists; this says what it is, which is the difference between
+    # a service reporting "a critical check failed" and reporting which
+    # threshold on which measurement rejected the episode.
+    gate: Gate | None = None
 
     @classmethod
     def from_registered_check(cls, registered: RegisteredCheck) -> "StepManifest":
@@ -58,10 +65,13 @@ class StepManifest:
             critical=registered.critical,
             requires=tuple(sorted(registered.requires)),
             uses=registered.uses,
+            gate=registered.gate,
         )
 
     @classmethod
     def from_registered_enrichment(cls, registered: RegisteredEnrichment) -> "StepManifest":
+        # Enrichments never gate, so there is nothing to report rather than a
+        # gate that is merely absent.
         return cls(
             name=registered.name,
             kind=StepKind.ENRICHMENT,
@@ -79,7 +89,17 @@ class StepManifest:
             "critical": self.critical,
             "requires": list(self.requires),
             "uses": self.uses,
+            "gate": _gate_json(self.gate),
         }
+
+
+def _gate_json(gate: Gate | None) -> dict[str, object] | None:
+    """A gate as plain JSON, derived from the dataclass rather than restated.
+
+    ``asdict`` keeps this from drifting out of step with the fields, and the
+    enum members serialize as their own values because they are ``StrEnum``.
+    """
+    return asdict(gate) if gate is not None else None
 
 
 @dataclass(frozen=True)

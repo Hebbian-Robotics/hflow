@@ -546,6 +546,23 @@ class IngestTriggerResponse(BaseModel):
 # --- /api/v1/pipeline ---------------------------------------------------------
 
 
+class PipelineGateThreshold(BaseModel):
+    """One accept condition of a step's gate."""
+
+    key_pattern: str = Field(description="Glob over the measurement keys this compares.")
+    comparison: str = Field(description="'at_most' or 'at_least', both inclusive.")
+    value: float
+    across: str = Field(
+        description="How several matching keys fold: 'every_key' or 'any_key'.",
+    )
+
+
+class PipelineGate(BaseModel):
+    """A step's declarative accept policy: every threshold must hold."""
+
+    accept_when: list[PipelineGateThreshold]
+
+
 class PipelineStepManifest(BaseModel):
     """One registered step, exactly as ``hflow.manifest.StepManifest`` renders it."""
 
@@ -555,6 +572,13 @@ class PipelineStepManifest(BaseModel):
     critical: bool
     requires: list[str]
     uses: str | None
+    gate: PipelineGate | None = Field(
+        default=None,
+        description=(
+            "The policy this step rejects on, when it declares one. `critical` says "
+            "a gate exists; this says which threshold on which measurement it is."
+        ),
+    )
 
     @classmethod
     def from_step_manifest(cls, step: StepManifest) -> "PipelineStepManifest":
@@ -565,6 +589,21 @@ class PipelineStepManifest(BaseModel):
             critical=step.critical,
             requires=list(step.requires),
             uses=step.uses,
+            gate=(
+                PipelineGate(
+                    accept_when=[
+                        PipelineGateThreshold(
+                            key_pattern=threshold.key_pattern,
+                            comparison=threshold.comparison.value,
+                            value=threshold.value,
+                            across=threshold.across.value,
+                        )
+                        for threshold in step.gate.accept_when
+                    ]
+                )
+                if step.gate is not None
+                else None
+            ),
         )
 
 

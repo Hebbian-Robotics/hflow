@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import hflow
+from hflow.manifest import PIPELINE_MANIFEST_VERSION
 from hflow.storage import LocalStorageRoot
 from hflow.workspace import Workspace
 
@@ -89,7 +90,7 @@ class TestPipelineManifest:
         # Through the JSON round trip: the manifest's serialized form is the
         # contract a service consumes.
         manifest_payload = json.loads(app.manifest().to_json())
-        assert manifest_payload["manifest_version"] == 1
+        assert manifest_payload["manifest_version"] == PIPELINE_MANIFEST_VERSION
         assert manifest_payload["pipeline_name"] == "kitchen"
         assert manifest_payload["hflow_version"] == hflow.__version__
         assert manifest_payload["pipeline_version"] == app.pipeline_version
@@ -111,6 +112,41 @@ class TestPipelineManifest:
 
         assert manifest_payload["endpoint_aliases"] == ["judge"]
         assert manifest_payload["has_transform_override"] is False
+
+    def test_manifest_carries_the_gate_policy_a_step_rejects_on(self, tmp_path: Path) -> None:
+        """``critical`` says a gate exists; the gate says what it is. Without
+        this a service can only report that some critical check failed, not
+        which threshold on which measurement rejected the episode.
+        """
+        app = hflow.App("kitchen", data_root=tmp_path)
+
+        @app.check(critical=True, gate=hflow.checks.RECOMMENDED_CAMERA_INTEGRITY)
+        def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
+            return hflow.CheckResult()
+
+        @app.check()
+        def ungated(ep: hflow.Episode) -> hflow.CheckResult:
+            return hflow.CheckResult()
+
+        payload = json.loads(app.manifest().to_json())
+        gated_entry, ungated_entry = payload["checks"]
+        assert ungated_entry["gate"] is None
+        assert gated_entry["gate"] == {
+            "accept_when": [
+                {
+                    "key_pattern": "*black_frame_pct",
+                    "comparison": "at_most",
+                    "value": 50.0,
+                    "across": "every_key",
+                },
+                {
+                    "key_pattern": "*freeze_total_s",
+                    "comparison": "at_most",
+                    "value": 2.0,
+                    "across": "every_key",
+                },
+            ]
+        }
 
     def test_manifest_json_round_trips(self, tmp_path: Path) -> None:
         app = hflow.App("kitchen", data_root=tmp_path)
