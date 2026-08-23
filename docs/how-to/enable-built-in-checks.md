@@ -3,7 +3,7 @@
 **Goal:** run HFlow's packaged checks over your episodes, and gate on the ones
 you want to reject episodes for, without writing the checks yourself.
 
-HFlow ships fifteen checks as plain functions in
+HFlow ships sixteen checks as plain functions in
 [`hflow.checks`](../../src/hflow/checks.py). They are written in exactly the
 shape you would write your own, so reading one is the fastest way to learn the
 [porting pattern](../PORTING.md) -- and registering one is a single line.
@@ -23,6 +23,7 @@ from hflow.checks import (
     joint_discontinuity,
     keyframe_interval,
     media_digest,
+    required_topics,
     timestamp_regularity,
 )
 
@@ -55,6 +56,11 @@ app.check(name="timestamps")(functools.partial(timestamp_regularity, tolerance_s
 @app.check()
 def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
     return camera_frame_stats(ep, expected_hz={"/wrist_cam/compressed": 30.0})
+
+
+@app.check()
+def topic_inventory(ep: hflow.Episode) -> hflow.CheckResult:
+    return required_topics(ep, topics=["/joint_states", "/imu"])
 ```
 
 Registering the same check twice is refused, because both copies would record
@@ -81,16 +87,18 @@ query later rather than pass/fail decisions baked into your corpus.
 | `trajectory_segments` | When inside the episode did it hold still, change direction sharply, or hit peak speed? |
 | `keyframe_interval` | How seekable is the footage, and can it be cut without re-encoding? |
 | `camera_fps_conformance` | Did the camera run at the rate the corpus says it should? |
+| `required_topics` | Did the recording declare every topic the rig should produce, and how many messages did each carry? |
 | `action_rate` | What message rate did each action topic run at? |
 | `episode_duration` | How long is it, for corpus-relative length cuts. |
 | `content_digest` | Did this same recording arrive twice? |
 | `media_digest` | Did this same *footage* arrive twice, even re-stamped or with different telemetry? |
 
-Two need a topic or a rate you have to supply: `action_rate` takes `topics=`,
-and `camera_fps_conformance` needs `nominal_fps=` to compare against. The
-joint-stream checks default to `/joint_states`; pass `topic=` for anything else,
-and skip them entirely on a corpus with no state streams (human egocentric video,
-for instance -- see [the egocentric example](../../examples/egocentric/)).
+Three need a topic or a rate you have to supply: `required_topics` and
+`action_rate` take `topics=`, and `camera_fps_conformance` needs `nominal_fps=`
+to compare against. The joint-stream checks default to `/joint_states`; pass
+`topic=` for anything else, and skip them entirely on a corpus with no state
+streams (human egocentric video, for instance -- see
+[the egocentric example](../../examples/egocentric/)).
 
 One check needs a dependency the core install does not carry:
 `camera_stability` uses optical flow and so needs OpenCV, which ships in the

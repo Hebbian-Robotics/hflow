@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from mcap.writer import Writer as StockWriter
 
 import hflow
 from hflow.checks import (
@@ -19,6 +20,7 @@ from hflow.checks import (
     joint_discontinuity,
     keyframe_interval,
     media_digest,
+    required_topics,
     timestamp_regularity,
     trajectory_metrics,
     trajectory_segments,
@@ -48,6 +50,7 @@ def test_no_two_builtin_checks_claim_the_same_measurement_key(tmp_path: Path) ->
             "camera_frame_stats": camera_frame_stats(episode),
             "episode_duration": episode_duration(episode),
             "action_rate": action_rate(episode, topics=["/joint_states"]),
+            "required_topics": required_topics(episode, topics=["/rig/required"]),
             "content_digest": content_digest(episode),
             "media_digest": media_digest(episode),
             "keyframe_interval": keyframe_interval(episode),
@@ -209,6 +212,87 @@ def test_episode_duration_matches_the_synthesized_span(jittery_episode: hflow.Ep
     assert duration_s == pytest.approx(4.0, abs=0.1)
     message_count_total = result.measurements["message_count_total"]
     assert isinstance(message_count_total, int) and message_count_total > 0
+
+
+def test_required_topics_records_present_topic_inventory(
+    jittery_episode: hflow.Episode,
+) -> None:
+    requested = ["/joint_states", "/wrist_cam/compressed"]
+    expected_counts = {
+        topic: sum(
+            info.message_count for info in jittery_episode.channels.values() if info.topic == topic
+        )
+        for topic in requested
+    }
+
+    result = required_topics(jittery_episode, topics=requested)
+
+    assert result.measurements == {
+        "/joint_states/present": True,
+        "/joint_states/message_count": expected_counts["/joint_states"],
+        "/wrist_cam/compressed/present": True,
+        "/wrist_cam/compressed/message_count": expected_counts["/wrist_cam/compressed"],
+        "missing_topic_count": 0,
+    }
+    assert result.verdict is None
+
+
+def test_required_topics_counts_one_missing_topic(jittery_episode: hflow.Episode) -> None:
+    result = required_topics(jittery_episode, topics=["/joint_states", "/imu"])
+
+    assert result.measurements["/joint_states/present"] is True
+    assert result.measurements["/imu/present"] is False
+    assert result.measurements["/imu/message_count"] == 0
+    assert result.measurements["missing_topic_count"] == 1
+
+
+def test_required_topics_records_a_topic_absent_from_the_file(
+    jittery_episode: hflow.Episode,
+) -> None:
+    result = required_topics(jittery_episode, topics=["/not-recorded"])
+
+    assert result.measurements == {
+        "/not-recorded/present": False,
+        "/not-recorded/message_count": 0,
+        "missing_topic_count": 1,
+    }
+
+
+def test_required_topics_aggregates_multiple_channels_for_one_topic(tmp_path: Path) -> None:
+    source = tmp_path / "multi-channel.mcap"
+    with source.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        first_channel = writer.register_channel(
+            topic="/status", message_encoding="json", schema_id=0
+        )
+        second_channel = writer.register_channel(
+            topic="/status", message_encoding="json", schema_id=0
+        )
+        for index in range(2):
+            writer.add_message(
+                first_channel,
+                log_time=index,
+                publish_time=index,
+                data=b"{}",
+            )
+        for index in range(3):
+            writer.add_message(
+                second_channel,
+                log_time=10 + index,
+                publish_time=10 + index,
+                data=b"{}",
+            )
+        writer.finish()
+
+    with hflow.Episode(source) as episode:
+        result = required_topics(episode, topics=["/status"])
+
+    assert result.measurements == {
+        "/status/present": True,
+        "/status/message_count": 5,
+        "missing_topic_count": 0,
+    }
 
 
 def test_action_rate_matches_the_synthesized_rate(jittery_episode: hflow.Episode) -> None:

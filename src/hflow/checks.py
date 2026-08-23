@@ -397,6 +397,36 @@ def episode_duration(episode: Episode, *, topics: Sequence[str] | None = None) -
     )
 
 
+def required_topics(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
+    """Presence and message volume for every topic a recording is expected to carry.
+
+    A declared channel makes its topic present even when it contains no
+    messages; the separate message count lets curation policy distinguish an
+    absent topic from an empty publisher. Several channels may share one topic,
+    so their message counts are combined from :attr:`Episode.channels` rather
+    than resolving the ambiguous topic through :meth:`Episode.channel`.
+
+    Evidence only: whether a missing or empty topic rejects an episode remains
+    a user-owned curation decision.
+    """
+    message_counts_by_topic: dict[str, int] = {}
+    for info in episode.channels.values():
+        message_counts_by_topic[info.topic] = (
+            message_counts_by_topic.get(info.topic, 0) + info.message_count
+        )
+
+    measurements: dict[str, MeasurementValue] = {}
+    missing_topic_count = 0
+    for topic in dict.fromkeys(topics):
+        present = topic in message_counts_by_topic
+        measurements[f"{topic}/present"] = present
+        measurements[f"{topic}/message_count"] = message_counts_by_topic.get(topic, 0)
+        if not present:
+            missing_topic_count += 1
+    measurements["missing_topic_count"] = missing_topic_count
+    return CheckResult(measurements=measurements)
+
+
 def action_rate(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
     """Message rate of each given action topic, in hertz, plus a pooled total.
 
