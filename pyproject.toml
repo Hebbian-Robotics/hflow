@@ -53,7 +53,7 @@ hflow = "hflow.cli:main"
 
 [dependency-groups]
 dev = [
-    "hflow-server", # the workspace UI package, present in dev so the suite tests it
+    "hflow-server", # the workspace API package, present in dev so the suite tests it
     # Starlette's TestClient transport for the hflow-server suite. httpx2, not
     # httpx: starlette 1.6 deprecates the httpx transport in its favour.
     "httpx2>=2.10",

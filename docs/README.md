@@ -50,6 +50,7 @@ Use these when you already know the outcome you need.
 - [Run and operate the local Airflow runtime](./RUNTIME.md)
 - [Deploy into an existing Airflow environment](./RUNTIME.md#bring-your-own-airflow-hflow-deploy)
 - [Query quality evidence and create a manifest](./CATALOG.md)
+- [Export a portable review dataset](./how-to/export-review-dataset.md)
 - [Find and reprocess stale episodes](./CATALOG.md#finding-stale-episodes-to-reprocess)
 - [Load a large manifest with memory mapping](./how-to/load-manifest-mmap.md)
 - [Inspect episodes in Foxglove](./how-to/inspect-episodes-in-foxglove.md)
@@ -63,6 +64,7 @@ contracts.
 
 - [Canonical episode format](./FORMAT.md)
 - [Catalog tables and curation API](./CATALOG.md)
+- [Portable review-dataset export](./how-to/export-review-dataset.md#format-contract)
 - [Runtime commands and configuration](./RUNTIME.md)
 - [Native-video provider protocol](./PROVIDERS.md)
 

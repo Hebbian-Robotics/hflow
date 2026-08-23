@@ -1,8 +1,8 @@
 # hflow-server
 
-The HFlow workspace UI: a local web app over one HFlow data root — browse
-episodes, quality evidence, and the Parquet catalog in a browser. It writes
-nothing but your pinned manifests and its own small state file.
+The HFlow workspace JSON API over one HFlow data root. It exposes episodes,
+quality evidence, curation, and runtime operations to HTTP clients. It writes
+nothing but pinned manifests and its own small state file.
 
 ```bash
 hflow serve --data-root ./data
@@ -15,13 +15,13 @@ deliberate exposure. `docs/SERVE.md` ("Trust posture") has the details.
 
 This package is not on PyPI yet. Until the first release, run it from a clone
 of the [repository](https://github.com/Hebbian-Robotics/hflow); `docs/SERVE.md`
-there has the exact steps, including the frontend build.
+there has the exact steps.
 
-The UI is a strict client of the same surfaces the `hflow` CLI uses (the
+Any UI is a strict client of the same surfaces the `hflow` CLI uses (the
 DuckDB-queryable catalog, episode files, and manifests): everything it shows
 is reachable with `curl` against its documented JSON API, and nothing is
-UI-only. It runs fully offline — all assets ship in this wheel, and your data
-never leaves your machine. There is deliberately no Swagger page: FastAPI's
+UI-only. The server runs fully offline, and your data never leaves your
+machine. There is deliberately no Swagger page: FastAPI's
 built-in one would load its JavaScript and CSS from a CDN.
 
 Every endpoint publishes a typed response schema, so `/api/openapi.json` — the

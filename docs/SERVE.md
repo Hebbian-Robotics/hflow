@@ -1,4 +1,4 @@
-# Serve a workspace over HTTP: `hflow serve`
+# Serve the workspace JSON API: `hflow serve`
 
 `hflow serve` is a local read-mostly server over one data root: it answers
 questions about episodes and their quality evidence, compiles curation SQL,
@@ -34,34 +34,35 @@ browser. With no assets installed, that URL serves a page pointing at the
 API. There is no login: see [Trust posture](#trust-posture) for what that
 means and when it stops being appropriate.
 
-## What it shows
+## What the API exposes
 
-- **Episodes** -- the corpus as a faceted, sortable table over the catalog's
+These are API capabilities, not browser screens. A frontend supplied through
+`HFLOW_UI_ASSETS` or any other HTTP client can use them:
+
+- **Episodes data** -- the corpus over the catalog's
   wide `episodes` view (task, operator, status, quality measurements as
-  columns). Every filter you click compiles to DuckDB SQL server-side, and
-  the exact SQL is always visible and copyable at the bottom of the screen --
-  ready to paste into `hflow curate`.
-- **Episode** -- one recording's dossier: status and quarantine tags, contact
+  columns). Filters compile to DuckDB SQL server-side, and the response
+  includes SQL that can be used with `hflow curate`.
+- **Episode data** -- one recording's dossier: status and quarantine tags, contact
   sheets, every check run with its content-hash version, measurements with
   their producing step, intervals, tags, append history, and a canonical-MCAP
   download.
-- **Curate** -- a SQL studio over the catalog views: schema sidebar with
-  per-table profiles, editor with run-selection, result preview with
+- **Curation** -- catalog schema and SQL execution with result rows,
   per-column statistics, and the coverage report (which checks ran over how
-  much of the corpus) before you pin. **Pin manifest** freezes a query's
+  much of the corpus). Pinning a manifest freezes a query's
   result as an immutable Parquet manifest under `<data_root>/manifests/`,
   recorded with its SQL, row count, and coverage in the Manifests registry.
 - **Runs** -- the ingest runtime's health, recent runs with their trigger
-  configuration, per-stage activity, and a trigger form (`hflow ingest`'s
-  wire shape, as a form). It addresses a rendered local bundle or a remote
+  configuration, per-stage activity, and the same trigger operation used by
+  `hflow ingest`. It addresses a rendered local bundle or a remote
   runtime (`HFLOW_AIRFLOW_URL` and friends); when neither is reachable the
-  page says which it looked for and why it failed, rather than disappearing.
-- **Pipeline** -- the generated DAG plus the registered steps by stage, with
+  API reports which it looked for and why it failed.
+- **Pipeline data** -- the generated DAG plus the registered steps by stage, with
   content-hash versions, critical flags, and endpoint aliases, and the
-  versions actually observed in the catalog. Each stage's steps are drawn
-  *inside* its `process_batch` node, which is where they run: they have no
-  dependency edges on each other, so the graph nests them instead of
-  inventing a chain between them. Requires `--pipeline path/to/pipeline.py[:app]`,
+  versions actually observed in the catalog. The data nests each stage's
+  steps inside its `process_batch` node, which is where they run, instead of
+  inventing dependency edges between them. Requires
+  `--pipeline path/to/pipeline.py[:app]`,
   which imports (executes) the pipeline file exactly like `hflow manifest` does.
 
 ## Flags
@@ -72,21 +73,19 @@ means and when it stops being appropriate.
 | `--host` | bind address (default `127.0.0.1`; widening past loopback exposes your corpus) |
 | `--port` | default `4356`, auto-retries upward when taken |
 | `--no-browser` | do not open a browser (headless machines, tunnels) |
-| `--read-only` | viewer mode: hides and refuses manifest pinning, saved-query edits, and run triggering |
-| `--pipeline` | pipeline file for the Pipeline page (imported once at startup) |
+| `--read-only` | refuse manifest pinning, saved-query edits, and run triggering |
+| `--pipeline` | pipeline file for the pipeline metadata endpoints (imported once at startup) |
 
-## Nothing is UI-only
+## No frontend is shipped
 
-The UI is a strict client of a documented JSON API (`/api/v1/...`; a running
+Any UI is a strict client of a documented JSON API (`/api/v1/...`; a running
 server publishes its OpenAPI schema at `/api/openapi.json`, ready for a client
-generator or any local OpenAPI viewer). Curation, the runs monitor and the
-pipeline page are thin calls into the same library functions the CLI uses; the
-episode listing, facets, stats and timeline endpoints compile their own
-presentation-shaped SQL over the same [catalog views](./CATALOG.md) that
-`hflow curate` reads. Either way, everything the UI can show or do is
-reachable with `curl`, scriptable, and buildable-upon. If you want a different
-frontend over your workspace, the API is the contract; the shipped UI is the
-reference client.
+generator or any local OpenAPI viewer). Curation, runtime monitoring, and
+pipeline metadata are thin calls into the same library functions the CLI uses; the
+episode listing, facets, stats and timeline endpoints compile their own SQL
+over the same [catalog views](./CATALOG.md) that `hflow curate` reads. The API
+is reachable with `curl`, scriptable, and buildable-upon. There is currently
+no reference browser client in this repository.
 
 ## Trust posture
 
@@ -113,27 +112,27 @@ control plane authenticates people and scopes them to workspaces
 sessions, which one shared launch secret could never provide -- which is why
 this server does not pretend to have a piece of it.
 
-The rest of the posture is real and holds regardless. The UI runs fully
-local: all assets ship in the wheel (no CDN, no fonts, no outbound requests),
-and your data never leaves your machine. That is why the server publishes the
-schema JSON and no interactive Swagger page -- FastAPI's built-in one fetches
+The rest of the posture is real and holds regardless. The server runs fully
+local, and your data never leaves your machine unless a supplied frontend or
+another API client sends it elsewhere. The server publishes the schema JSON
+and no interactive Swagger page -- FastAPI's built-in one fetches
 its JavaScript and CSS from a public CDN, which would break the promise and
-run third-party script same-origin with your workspace's API. The browser
-never sees filesystem paths of its choosing (media is addressed by episode and
-artifact name, and the server refuses anything outside the data root), Airflow
-credentials stay server-side behind a proxy, and curation SQL runs on a
+run third-party script same-origin with your workspace's API. Media is
+addressed by episode and artifact name rather than caller-chosen filesystem
+paths, and the server refuses anything outside the data root. Airflow
+credentials stay server-side, and curation SQL runs on a
 [constrained DuckDB connection](./CATALOG.md) that cannot reach the catalog's
 files or the network. What this server writes: `<data_root>/curation/state.json`
 (saved queries and the manifest registry) and your pinned manifests -- nothing
 else. Episodes, media and catalog rows are written by the ingest runtime, on
-runs you trigger from the Runs page.
+runs triggered through the API or CLI.
 
 ## See also
 
 - [Catalog tables and curation API](./CATALOG.md) -- the views and SQL idioms
-  the Episodes and Curate screens are built on
-- [Runtime guide](./RUNTIME.md) -- the Airflow runtime the Runs screen fronts
+  the episode and curation endpoints use
+- [Runtime guide](./RUNTIME.md) -- the Airflow runtime the run endpoints address
 - [Hosting HFlow](./HOSTING.md) -- the data-plane contract for operating
   workspaces for other people, whose seams (bucket data roots, scoped
   credentials, constrained SQL, remote runtime addressing) are the ones this
-  UI reads through
+  server reads through

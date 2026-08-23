@@ -154,7 +154,7 @@ deployment against facts:
   store.
 - **No tenant-facing log or metrics API.** Observability is Airflow's own
   UI and task logs on the workspace.
-- **The workspace UI (`hflow serve`) authenticates nobody.** It is a local
+- **The workspace server (`hflow serve`) authenticates nobody.** It is a local
   developer tool bound to `127.0.0.1`, deliberately without a login; it is
   not a tenant-facing surface, and serving it to anyone but the workspace's
   own operator means putting an authenticating proxy in front of it. Signing
