@@ -163,7 +163,10 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Validate container integrity, metadata stamps, chunk-group layout, "
             "and in-band video constraints (docs/FORMAT.md, executable form). "
-            "Accepts multiple files; exit code 0 when all conform, 1 when any does not."
+            "Accepts multiple files, each reported in order whatever happens "
+            "to the others. Exit 0 when all conform, 1 when any file is "
+            "non-conforming or could not be read, 2 when no file could be "
+            "diagnosed (nothing useful happened)."
         ),
     )
     doctor_parser.add_argument(
@@ -738,17 +741,25 @@ def _command_curate(arguments: argparse.Namespace) -> int:
 
 
 def _command_doctor(arguments: argparse.Namespace) -> int:
+    # Findings, not exceptions, across files as well: an unreadable path is a
+    # finding about the corpus, reported in place, so a batch run never loses
+    # the reports for the files it could read. Exit precedence (docs/FORMAT.md):
+    # 2 only when nothing could be diagnosed; otherwise 1 when any file was
+    # non-conforming or unreadable; 0 when everything conformed.
+    diagnosed_any = False
     exit_code = 0
     for file in arguments.file:
         try:
             doctor_report = diagnose(file)
         except (ValueError, FileNotFoundError) as error:
-            print(f"doctor: {error}", file=sys.stderr)
-            return 2
+            print(f"doctor: {file}\n  [error] unreadable: {error}\n  verdict: NOT CONFORMING")
+            exit_code = 1
+            continue
+        diagnosed_any = True
         print(doctor_report.summary())
         if not doctor_report.conforming:
             exit_code = 1
-    return exit_code
+    return 2 if not diagnosed_any else exit_code
 
 
 def _command_serve(arguments: argparse.Namespace) -> int:

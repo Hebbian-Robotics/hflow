@@ -126,9 +126,34 @@ def test_cli_doctor_missing_file_prints_one_line(capsys: pytest.CaptureFixture[s
     missing = "C:/definitely/not/here.mcap"
     assert cli_main(["doctor", missing]) == 2
     captured = capsys.readouterr()
-    assert "doctor:" in captured.err
-    assert "No such file or directory" in captured.err
+    assert "doctor:" in captured.out
+    assert "[error] unreadable:" in captured.out
+    assert "No such file or directory" in captured.out
+    assert "Traceback" not in captured.out
     assert "Traceback" not in captured.err
+
+
+def test_cli_doctor_continues_past_unreadable_file(
+    canonical_episode: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = "C:/definitely/not/here.mcap"
+    assert cli_main(["doctor", str(canonical_episode), missing, str(canonical_episode)]) == 1
+    out = capsys.readouterr().out
+    first = out.index(str(canonical_episode))
+    missing_at = out.index(missing)
+    last = out.rindex(str(canonical_episode))
+    assert first < missing_at < last
+    assert out.count("[error] unreadable:") == 1
+    assert "NOT CONFORMING" in out
+    assert "Traceback" not in out
+
+
+def test_cli_doctor_all_unreadable_exits_2(capsys: pytest.CaptureFixture[str]) -> None:
+    missing = "C:/definitely/not/here.mcap"
+    assert cli_main(["doctor", missing, missing]) == 2
+    captured = capsys.readouterr()
+    assert captured.out.count("[error] unreadable:") == 2
+    assert "Traceback" not in captured.out
 
 
 def test_cli_curate_bad_catalog_prints_one_line(

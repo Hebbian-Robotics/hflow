@@ -143,8 +143,26 @@ A file claiming this convention must satisfy, in increasing strictness:
 5. **Stamps**: `provenance/v1` present with `schema_version` and `pipeline_version`.
 
 `hflow doctor <file.mcap> [more.mcap ...]` executes these checks against every
-file given, printing one report each, and exits with status 0 when all files
-conform or 1 when any reports violations.
+file given, printing one report each in argument order, and exits with status 0
+when all files conform or 1 when any reports violations. An unreadable or
+unparseable path is reported in place, in the same per-file shape (`[error]
+unreadable: ...`), and the run continues with the remaining files.
+
+### Exit codes
+
+Every `hflow` command follows the same three-value convention:
+
+- `0` - success: the command did what it was asked.
+- `1` - ran, and found something to report: `doctor`, a non-conforming file;
+  `stale --exit-code`, stale episodes found; `up`, started then failed, so
+  containers may still be running; `ingest`, episodes failed.
+- `2` - bad input, nothing useful happened: an invalid flag combination, an
+  unreachable endpoint, a missing catalog, or a `doctor` run in which no file
+  could be diagnosed at all.
+
+`doctor` treats an unreadable file as at least as bad as a non-conforming one
+(exit 1), and reserves 2 for runs where nothing was diagnosed, so a batch run
+never both loses its reports and erases the fact that it read anything.
 
 ## References
 
