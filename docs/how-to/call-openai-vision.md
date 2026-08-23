@@ -64,7 +64,7 @@ same file can point at a different endpoint without editing it. Inside the
 step, the endpoint remains an ordinary OpenAI SDK option:
 
 ```python
-@app.check(uses="vision")
+@app.check(uses="vision", version="responses-contact-sheet-v1")
 def describe_activity(episode: hflow.Episode) -> hflow.CheckResult:
     client = OpenAI(
         api_key=os.environ["OPENAI_API_KEY"],
@@ -92,10 +92,10 @@ uv run --extra openai python examples/openai_vision/pipeline.py
 ```
 
 Pass an MCAP path to use your own episode. The example samples frames at 0.5
-FPS, caps the request at 12 tiles, and makes one model request per episode. Those
-choices are part of the measurement definition: change them deliberately and
-version the step explicitly when external model configuration cannot be hashed
-from the function.
+FPS, caps each request at 12 tiles, and makes one model request per check: two
+requests per episode for the two checks it ships. Those choices are part of the
+measurement definition: change them deliberately and version the step explicitly
+when external model configuration cannot be hashed from the function.
 
 ## Keep model output as evidence
 
