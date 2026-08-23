@@ -173,10 +173,6 @@ def _reject_non_single_select(user_sql: str) -> None:
         )
 
 
-def _sidecar_refusal(error: _sidecar.SidecarError) -> HTTPException:
-    return HTTPException(status_code=error.status_code, detail=error.detail)
-
-
 def _browsable_relations(
     connection: duckdb.DuckDBPyConnection,
 ) -> dict[str, CatalogTableKind]:
@@ -310,23 +306,17 @@ def create_curation_router(settings: ServerSettings) -> APIRouter:
     # mutating route -- sufficient for the single-server design.
     sidecar_write_lock = threading.Lock()
 
+    # A SidecarError is already an HTTPException, so these three only bind the
+    # data root -- nothing catches and re-raises, and a refusal raised inside
+    # them reaches the client with the status and detail _sidecar chose.
     def loaded_sidecar_state() -> _sidecar.SidecarState:
-        try:
-            return _sidecar.load_sidecar_state(settings.data_root)
-        except _sidecar.SidecarError as error:
-            raise _sidecar_refusal(error) from error
+        return _sidecar.load_sidecar_state(settings.data_root)
 
     def stored_sidecar_state(state: _sidecar.SidecarState) -> None:
-        try:
-            _sidecar.store_sidecar_state(settings.data_root, state)
-        except _sidecar.SidecarError as error:
-            raise _sidecar_refusal(error) from error
+        _sidecar.store_sidecar_state(settings.data_root, state)
 
     def local_data_root_or_refuse() -> Path:
-        try:
-            return _sidecar.local_data_root(settings.data_root)
-        except _sidecar.SidecarError as error:
-            raise _sidecar_refusal(error) from error
+        return _sidecar.local_data_root(settings.data_root)
 
     @router.post("/curation/preview")
     def run_curation_preview(request: PreviewRequest) -> CurationPreviewResponse:
@@ -420,14 +410,10 @@ def create_curation_router(settings: ServerSettings) -> APIRouter:
                 status_code=404, detail=f"no pinned manifest with id {manifest_id!r}"
             )
         manifest_file = local_data_root_or_refuse() / entry.manifest_path
-        try:
-            # The same strict-resolve + containment check media serving uses:
-            # even a hand-edited registry path can only serve workspace files.
-            resolved_file = _media.resolve_served_file(
-                str(manifest_file), data_root=settings.data_root
-            )
-        except _media.MediaResolutionError as error:
-            raise _media.media_refusal(error) from error
+        # The same strict-resolve + containment check media serving uses: even
+        # a hand-edited registry path can only serve workspace files. Its
+        # refusal is already an HTTPException, so it needs no rewrapping here.
+        resolved_file = _media.resolve_served_file(str(manifest_file), data_root=settings.data_root)
         return _media.served_file_response(
             resolved_file, attachment_filename=Path(entry.manifest_path).name
         )

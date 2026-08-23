@@ -68,24 +68,15 @@ _HARDENING_HEADERS = {
 }
 
 
-class MediaResolutionError(Exception):
-    """One refusal to serve a catalog URI, carrying its HTTP mapping."""
+class MediaResolutionError(HTTPException):
+    """One refusal to serve a catalog URI.
 
-    def __init__(self, status_code: int, detail: str) -> None:
-        super().__init__(detail)
-        self.status_code = status_code
-        self.detail = detail
-
-
-def media_refusal(error: MediaResolutionError) -> HTTPException:
-    """The HTTP refusal one unservable URI maps to.
-
-    Lives beside the error it converts (as ``_connections`` and ``_runtime``
-    do for theirs), so the two routes that serve catalog bytes -- episode
-    media and manifest downloads -- share one mapping instead of each copying
-    the two field reads.
+    It IS the HTTP refusal rather than something a caller converts into one:
+    raised from anywhere under a route, FastAPI renders it with the status and
+    detail given here. It stays its own type so
+    :func:`is_uri_servable` can catch media refusals specifically, without also
+    swallowing an unrelated refusal raised nearby.
     """
-    return HTTPException(status_code=error.status_code, detail=error.detail)
 
 
 def _resolved_local_data_root(data_root: str) -> Path:

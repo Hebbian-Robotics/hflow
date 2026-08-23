@@ -35,6 +35,8 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from fastapi import HTTPException
+
 from hflow_server._contract import CheckCoverageEntry, PinnedManifestEntry, SavedQueryEntry
 from hflow_server._settings import local_data_root_or_none
 
@@ -43,13 +45,13 @@ SIDECAR_DIRECTORY_NAME = "curation"
 SIDECAR_FILE_NAME = "state.json"
 
 
-class SidecarError(Exception):
-    """One refusal to read or write the sidecar, carrying its HTTP mapping."""
+class SidecarError(HTTPException):
+    """One refusal to read or write the sidecar.
 
-    def __init__(self, status_code: int, detail: str) -> None:
-        super().__init__(detail)
-        self.status_code = status_code
-        self.detail = detail
+    It IS the HTTP refusal rather than something the router converts into one:
+    raised from anywhere under a route, FastAPI renders it with the status and
+    detail given here.
+    """
 
 
 @dataclass(frozen=True)

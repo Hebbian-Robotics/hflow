@@ -374,11 +374,10 @@ def _catalog_marker_readable(workspace: Workspace) -> bool:
 
 
 def _served_file_response_or_refuse(uri: str, data_root: str) -> FileResponse:
-    try:
-        resolved_file = _media.resolve_served_file(uri, data_root=data_root)
-    except _media.MediaResolutionError as error:
-        raise _media.media_refusal(error) from error
-    return _media.served_file_response(resolved_file)
+    """Bytes for one catalog URI. An unservable URI raises its own refusal
+    (a ``MediaResolutionError`` IS an ``HTTPException``), so there is nothing
+    to catch and convert here."""
+    return _media.served_file_response(_media.resolve_served_file(uri, data_root=data_root))
 
 
 def _assets_directory(settings: ServerSettings) -> Path | None:
