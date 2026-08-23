@@ -594,7 +594,7 @@ def test_step_version_includes_referenced_global_configuration(
 # between checks: two built-ins share one ffmpeg pass by both calling
 # ``frame_stats``, and the motion checks share ``hflow.motion``. That only
 # keeps its integrity if a step version follows the code the step calls, all
-# the way down -- otherwise editing a parser or a constant one level below the
+# the way down. Otherwise editing a parser or a constant one level below the
 # step changes what it measures while its version stands still, and the new
 # rows append under the old version.
 #
@@ -738,7 +738,7 @@ def test_step_version_ignores_a_logger_a_helper_happens_to_hold() -> None:
 
     A logger is reachable from real built-ins (``hflow.ffmpeg._binary`` warns
     about an unpinned binary), so it must be describable or the walk stops
-    there -- but describing its handlers or level would hash the same code
+    there. Describing its handlers or level would instead hash the same code
     differently under different logging setups.
     """
     logger = logging.getLogger("hflow.test.identity")
@@ -774,7 +774,7 @@ def test_no_builtin_check_leaves_part_of_itself_undescribed(builtin_name: str) -
     describe, which is right for a user's pipeline and wrong for hflow's own
     code: a marker here means someone can edit the helper below it and no
     version will move. That gap is invisible in a hash, which is why this
-    asserts over the payload -- it is the regression this whole change is
+    asserts over the payload. It is the regression this whole change is
     about, one level further down.
     """
     builtin = getattr(hflow.checks, builtin_name)
@@ -787,7 +787,7 @@ def test_step_version_degrades_instead_of_refusing_over_a_helpers_private_state(
     """A user's helper may hold anything; registration must still work.
 
     The step's OWN captured state stays strict (see the opaque-partial test
-    below) -- this is only about state one call further down, where refusing
+    below). This is only about state one call further down, where refusing
     would make an unrelated helper's internals fatal to registering a step
     that is perfectly describable itself.
     """
@@ -806,7 +806,7 @@ def test_step_version_does_not_descend_into_a_dependency() -> None:
     internals would restore exactly the coupling ``hflow.behavior`` removed:
     a numpy or scipy upgrade that changed nothing a step observes would still
     invalidate every corpus. The dependency's own source is still read, so
-    swapping which function is called is caught -- only its private internals
+    swapping which function is called is caught. Only its private internals
     are out of scope.
     """
     dependency = ModuleType("vendor_analytics")
@@ -846,7 +846,7 @@ def _declared_check_after_refactor(_episode: hflow.Episode) -> hflow.CheckResult
 def test_a_declared_version_survives_a_refactor_of_the_step() -> None:
     """The point of declaring: the author judges two spellings equivalent.
 
-    Without this the declaration was advisory -- the source hash leaked back
+    Without this the declaration was advisory: the source hash leaked back
     in, so refactoring a step that had opted out of derived versioning still
     split its rows, which is the one thing declaring exists to prevent.
     """

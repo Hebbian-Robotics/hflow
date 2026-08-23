@@ -34,11 +34,11 @@ hash, because a step hash folds in the source of every function the step
 NAMES and then keeps descending through first-party code: the helpers those
 functions call, and the constants they read, down to the leaves (see
 ``_IdentityScope`` in :mod:`hflow.steps`). That is what keeps composition
-honest here, since checks compose by sharing library code -- two built-ins
-reading one ffmpeg pass, the motion checks sharing :mod:`hflow.motion` --
-rather than by depending on each other's results. Without the descent, tuning
-a threshold inside the shared instrument changed what every one of them
-measured while their versions stood still.
+honest here. Checks compose by sharing library code (two built-ins reading one
+ffmpeg pass, the motion checks sharing :mod:`hflow.motion`) rather than by
+depending on each other's results. Without the descent, tuning a threshold
+inside the shared instrument changed what every one of them measured while
+their versions stood still.
 
 What the descent cannot see is a module reached by ATTRIBUTE: a step whose
 body calls ``hflow.checks.timestamp_regularity`` captures the module, and a
@@ -48,9 +48,9 @@ entirely, which is what the docs and examples teach; a wrapper that reaches
 through the module does not, and is the one remaining spelling where a
 built-in's change goes unversioned. The boundary is deliberate in the other
 direction too: the descent stops at hflow's own code and the pipeline's, never
-entering a dependency, because folding numpy's source into a step version
-would re-version a corpus on a release that changed nothing a step observes --
-this module's whole subject.
+entering a dependency. Folding numpy's source into a step version would
+re-version a corpus on a release that changed nothing a step observes, which
+is this module's whole subject.
 
 Two further exceptions live in
 :func:`hflow.transform.compute_pipeline_version`, which folds in
@@ -65,8 +65,8 @@ Identity epochs live here as prose, not as a constant: no build stamps an
 epoch into a corpus, so a module attribute nothing reads would be a comment
 wearing a type annotation. Epoch 1 folded ``hflow.__version__`` into
 ``pipeline_version``, ``episode_id``, and step versions; epoch 2 folded in
-only author-owned facts plus ``TRANSFORM_BEHAVIOR_VERSION``; epoch 3 -- what
-this build produces -- widened a step hash from the functions a step names to
+only author-owned facts plus ``TRANSFORM_BEHAVIOR_VERSION``; epoch 3, what
+this build produces, widened a step hash from the functions a step names to
 the first-party code those transitively call. Written down so a reader can
 explain the one-time re-version between them rather than guess at it.
 
@@ -75,9 +75,9 @@ most of them. Where such a step is a ``@app.derive`` channel the move carries
 further: derived-channel versions reach ``compute_pipeline_version``, which is
 stamped inside the bytes ``episode_id`` hashes, so corpora WITH derived
 channels re-mint episode identities once. That is the honest outcome rather
-than an accident -- those steps really were versioned as though the code they
-call could not change -- but it is a re-ingest, so it belongs in release notes
-and not only here.
+than an accident, because those steps really were versioned as though the code
+they call could not change. It is still a re-ingest, so it belongs in release
+notes and not only here.
 """
 
 # Canonicalization semantics: bump when the transform would write different

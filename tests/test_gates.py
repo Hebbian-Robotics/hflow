@@ -226,7 +226,7 @@ def test_a_gateless_step_hashes_as_if_gates_did_not_exist() -> None:
     pipeline_version every episode_id in every existing corpus.
 
     Last moved when a declared version stopped being an override laid over the
-    introspected identity and became the whole of it -- ``implementation`` and
+    introspected identity and became the whole of it. ``implementation`` and
     ``configuration`` are absent under ``version='...'`` now, which is what
     lets an author refactor without re-versioning.
     """

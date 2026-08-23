@@ -26,7 +26,7 @@ def my_check(ep: hflow.Episode) -> hflow.CheckResult:
     return hflow.CheckResult(measurements=result)  # our line: record
 ```
 
-`@app.check()` takes `name=` (defaults to the function name), `critical=`, `requires={...}` (capability set, e.g. `{"gpu"}`), `uses="alias"` (a named endpoint; see the VLM section), `gate=` (a declarative accept policy the runner evaluates over what the check returned), and optional `version=`. Step identity automatically includes source, defaults, and captured stable configuration such as numeric thresholds. Pass an explicit `version=` for opaque client objects or external model configuration the SDK cannot inspect deterministically. Checks that declare no resources run before checks that do, so cheap integrity checks gate expensive model calls. Today `requires`/`uses` record intent, order steps, and let preflight verify named endpoints are configured; they do **not** route the step to a particular worker or GPU pool (per-step compute routing is [deferred](./ARCHITECTURE.md#implementation-status)) -- a bring-your-own Airflow deployment arranges those resources itself.
+`@app.check()` takes `name=` (defaults to the function name), `critical=`, `requires={...}` (capability set, e.g. `{"gpu"}`), `uses="alias"` (a named endpoint; see the VLM section), `gate=` (a declarative accept policy the runner evaluates over what the check returned), and optional `version=`. By default a step's identity is derived: its source, its defaults and captured stable configuration such as numeric thresholds, and then transitively the helpers it calls and the constants those read, across your own package and hflow's but never into a dependency. Passing `version=` takes the identity over instead. The function is then not inspected at all, so you can refactor freely and your rows stay comparable, at the cost of remembering to bump the number when behaviour really changes; what you declared beside it (`critical`, `requires`, `uses`, `gate`) still counts. Use it for an opaque client object the SDK cannot inspect deterministically, or for a step you would rather promise about than have measured. Checks that declare no resources run before checks that do, so cheap integrity checks gate expensive model calls. Today `requires`/`uses` record intent, order steps, and let preflight verify named endpoints are configured; they do **not** route the step to a particular worker or GPU pool (per-step compute routing is [deferred](./ARCHITECTURE.md#implementation-status)); a bring-your-own Airflow deployment arranges those resources itself.
 
 Every step is called with exactly one argument, an `Episode`, so `@app.check()`, `@app.enrich()`, and `@app.derive()` refuse a function the runtime could never call: one with a required parameter beyond the episode, or with no positional slot to receive it. That refusal happens at registration, not once per episode, and the error shows the wrapper form to use instead. To pass configuration, bind it in a wrapper (`return action_rate(ep, topics=[...])`) rather than adding a parameter.
 
@@ -99,7 +99,7 @@ Import the built-in as a function rather than reaching it as
 `hflow.checks.camera_frame_stats` inside a wrapper. A step's version
 content-hashes the functions it *names*, and transitively the hflow code those
 call, so an import by name means a change to what the check measures shows up
-as a new step version; a module reached by attribute contributes only its name,
+as a new step version. A module reached by attribute contributes only its name,
 and the change would append rows under the old version instead.
 
 To make it *reject* episodes rather than only measure them, attach a gate at
@@ -240,7 +240,7 @@ two steps claim the same one --
 [the naming rules](./CATALOG.md#naming-measurement-keys) explain why a shared
 key is unrecoverable rather than merely untidy.
 
-Every recorded result also carries the check's version (a content hash of its configuration and source, including any gate you attached), so re-running a changed check -- or a retuned threshold -- appends new-version rows instead of silently overwriting old ones.
+Every recorded result also carries the check's version: a content hash of its source and configuration, of the first-party code it calls, and of any gate you attached. Re-running a changed check, or one whose threshold you retuned, appends new-version rows instead of silently overwriting old ones.
 
 ## The dev loop
 

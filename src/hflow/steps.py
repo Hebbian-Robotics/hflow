@@ -389,10 +389,10 @@ def compute_check_version(
 
     Used for checks and enrichments alike (enrichments pass
     ``critical=False``). By default the version is DERIVED: the function's
-    source, its closure values and defaults, and -- transitively, across
-    first-party modules only (see :class:`_IdentityScope`) -- the helpers it
-    calls and the constants they read. A parser or a threshold one call below
-    the step still moves the step's version.
+    source, its closure values and defaults, then transitively the helpers it
+    calls and the constants they read, across first-party modules only (see
+    :class:`_IdentityScope`). A parser or a threshold one call below the step
+    still moves the step's version.
 
     Pass ``declared_version`` to own the version instead. Nothing derived from
     the function is hashed then, so a refactor the author judges equivalent
@@ -402,9 +402,9 @@ def compute_check_version(
     its author would rather promise than measure.
 
     Deriving is the default because the two mistakes are not symmetric. An
-    unnecessary version split is recoverable -- both hashes exist and a query
-    can union them. A missed one is not: two behaviors under one version, with
-    nothing left to say which row came from which.
+    unnecessary version split is recoverable, since both hashes exist and a
+    query can union them. A missed one is not: two behaviors under one version,
+    with nothing left to say which row came from which.
 
     A ``gate`` arrives from registration rather than from the function, so it
     is folded in under BOTH modes: tuning a threshold has to move the version,
@@ -435,7 +435,7 @@ def step_identity_payload(
     Separate from the hash so the description can be inspected rather than
     only compared. A hash answers "did this change"; only the payload answers
     "what does this version actually cover", which is what
-    ``UNDESCRIBED_CONFIGURATION_KEY`` makes checkable -- a gap in the walk is
+    ``UNDESCRIBED_CONFIGURATION_KEY`` makes checkable. A gap in the walk is
     otherwise invisible until someone edits the code it failed to read.
 
     Two identity modes, and ``declared_version`` chooses between them:
@@ -449,8 +449,8 @@ def step_identity_payload(
 
     What survives declaring is the REGISTRATION: name, ``critical``,
     ``requires``, ``uses``, and the gate. Those are not what the function is
-    made of, they are what the author wrote at the decorator -- changing one
-    is a deliberate edit with a visible diff, not a refactor, and a gate in
+    made of; they are what the author wrote at the decorator. Changing one is
+    a deliberate edit with a visible diff rather than a refactor, and a gate in
     particular must keep moving the version or two threshold policies share
     one and curation can pin neither (see :class:`Gate`).
     """
@@ -465,16 +465,16 @@ def step_identity_payload(
         "uses": uses,
         # Present only when a gate is declared, like transform.py's
         # resample_policy: an unconditional key would re-version every
-        # check, enrichment, and derived channel -- and derived-channel
-        # versions reach pipeline_version, which is stamped inside the
-        # bytes episode_id hashes. One new key would restamp every corpus.
+        # check, enrichment, and derived channel. Derived-channel versions
+        # reach pipeline_version, which is stamped inside the bytes
+        # episode_id hashes, so one new key would restamp every corpus.
         **({"gate": _stable_version_identity_value(gate, scope)} if gate is not None else {}),
     }
     if declared_version is not None:
         # Not introspected at all, rather than introspected and overridden:
         # an opaque vendor client has no describable implementation, and an
         # ordinary function whose author declared a version must not have its
-        # source leak back in -- that would make the declaration advisory and
+        # source leak back in. That would make the declaration advisory, and
         # the refactor it exists to permit would re-version anyway.
         identity["declared_version"] = declared_version
         return identity
@@ -498,15 +498,15 @@ class _IdentityScope:
     A step hash covers the source of every function the step NAMES, but until
     this scope existed it stopped there: editing a constant or a parser one
     call deeper changed what the step measured while its version stood still,
-    and the new rows appended under the old version -- two behaviors sharing
-    one identity, which is the failure this whole module exists to prevent.
-    The built-ins made that concrete, ``camera_signal_quality`` naming
-    ``frame_stats`` while the instrument's own parsing sat a level below.
+    and the new rows appended under the old version. Two behaviors sharing one
+    identity is the failure this whole module exists to prevent. The built-ins
+    made it concrete: ``camera_signal_quality`` names ``frame_stats`` while the
+    instrument's own parsing sits a level below that.
 
     ``first_party_roots`` bounds what "deeper" may mean: hflow's own code,
     plus the top-level package the step itself is defined in (so a pipeline's
     private helpers count, wherever the author put them). A DEPENDENCY is
-    deliberately not followed -- folding numpy's source into a step version
+    deliberately not followed. Folding numpy's source into a step version
     would re-version a corpus on an unrelated numpy release, which is exactly
     the release-number coupling :mod:`hflow.behavior` removed.
 
@@ -552,8 +552,8 @@ def _callable_implementation_identity(
 
     Only reached for a step whose version is derived, so there is no "describe
     it loosely" mode: a callable this cannot read has no honest derived
-    identity, and the refusal points at ``version='...'`` -- which now means
-    the function is not introspected at all rather than introspected weakly.
+    identity, and the refusal points at ``version='...'``. That now means the
+    function is not introspected at all rather than introspected weakly.
     """
     if isinstance(function, functools.partial):
         return {
@@ -634,10 +634,11 @@ def _stable_version_identity_value(
     """
     # Unwrap decorators before deciding what a value is. A memoised helper is
     # its wrapped function plus a cache, and the cache changes no behavior a
-    # step can observe -- so hashing the function underneath is both correct
-    # and the difference between versioning a step and refusing to register
-    # it (hflow.ffmpeg._binary memoises the binary probes the instrument
-    # calls). inspect.unwrap raises on a __wrapped__ cycle; keep the wrapper.
+    # step can observe. Hashing the function underneath is therefore both
+    # correct and the difference between versioning a step and refusing to
+    # register it (hflow.ffmpeg._binary memoises the binary probes the
+    # instrument calls). inspect.unwrap raises on a __wrapped__ cycle, so on a
+    # cycle keep the wrapper.
     if not isinstance(value, type) and callable(value) and hasattr(value, "__wrapped__"):
         with suppress(ValueError):
             value = inspect.unwrap(value)
@@ -656,8 +657,8 @@ def _stable_version_identity_value(
         # A compiled pattern IS behavior, and a common way to express it: the
         # ffmpeg instrument parses its output with two module-level patterns,
         # so editing one changes what every camera check measures. Described
-        # by the pattern and its flags -- the compiled object is opaque, but
-        # what it was compiled FROM is exactly the thing that can change.
+        # by the pattern and its flags, because the compiled object is opaque
+        # while what it was compiled FROM is the thing that can change.
         return {"regex": value.pattern, "regex_flags": int(value.flags)}
     if isinstance(value, logging.Logger):
         # A logger is infrastructure a step carries, never behavior a step
@@ -689,11 +690,11 @@ def _stable_version_identity_value(
             # Follow first-party code one call further: this function's own
             # constants, defaults and callees are part of what the step does.
             # A value the walk cannot describe is NAMED here rather than
-            # raised on -- refusing would break registration of a step over
-            # some helper's private state, while the step's OWN captured
-            # state stays strict because that refusal is raised outside this
-            # branch (see compute_check_version). The name still moves the
-            # hash if the helper is swapped for a different one.
+            # raised on, because refusing would break registration of a step
+            # over some helper's private state. The step's OWN captured state
+            # stays strict, since that refusal is raised outside this branch
+            # (see compute_check_version). The name still moves the hash if
+            # the helper is swapped for a different one.
             try:
                 identity["configuration"] = _callable_behavior_configuration(
                     value, scope=scope.entered(referenced_key)
