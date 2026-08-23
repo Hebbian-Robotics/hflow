@@ -327,10 +327,12 @@ refuse loudly on mismatch.
   0/1). Text-valued measurements stay in the long `measurements` table;
   query them there.
 - A measurement key that collides with an episode column name (`task`,
-  `uri`, `pipeline_version`, ...) makes the wide view error, and the error
-  comes from DuckDB's binder at query time rather than naming the offending
-  key. Follow the [naming rules](#naming-measurement-keys) and it cannot
-  arise.
+  `uri`, `pipeline_version`, ...) is **silently renamed** in the wide view, not
+  refused: the episode column keeps the name and the measurement is reachable
+  only as `task_1`, which no query would think to ask for. `SELECT task` then
+  returns the metadata and never the measurement. Follow the
+  [naming rules](#naming-measurement-keys) and it cannot arise; query the long
+  `measurements` table if you hit it in an existing corpus.
 - The wide view binds its measurement columns to the keys present when the
   connection was opened. `curate()` reopens per call, so this only matters
   if you hold a long-lived connection from `open_catalog_connection()` while
