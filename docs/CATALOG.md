@@ -220,8 +220,8 @@ FROM episodes
 WHERE task = 'fold_napkin'
 ```
 
-Measurement keys carry their topic, so they contain `/` and need double quotes
-in SQL; alias them once, as above, and the rest of the query stays readable.
+Alias a topic-prefixed key once, as above, and the rest of the query stays
+readable.
 
 Cohort statistics are corpus-relative. The z-score depends on which rows the query runs over, including any WHERE clause applied before the window, so compute the window over the same filtered cohort you intend to cut. Also note that STDDEV over a single-row cohort is NULL, which is the correct answer: one episode has no cohort to compare against.
 

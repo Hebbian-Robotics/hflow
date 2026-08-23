@@ -101,6 +101,10 @@ def test_every_builtin_check_registers_bare_and_runs(tmp_path: Path) -> None:
     report = app.test(source, verbose=False)
     assert not report.has_errors, [run.error for run in report.checks if run.error]
     assert len({run.check.version for run in report.checks}) == len(app.checks)
+    # Every built-in is evidence-only. Asserted across the whole set, so a
+    # built-in that starts returning a verdict is caught even where no
+    # per-check test pins it.
+    assert all(run.result is not None and run.result.verdict is None for run in report.checks)
 
 
 @pytest.fixture(scope="module")

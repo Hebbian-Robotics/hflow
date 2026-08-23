@@ -3,7 +3,7 @@
 **Goal:** run HFlow's packaged checks over your episodes, and gate on the ones
 you want to reject episodes for, without writing the checks yourself.
 
-HFlow ships fourteen checks as plain functions in
+HFlow ships fifteen checks as plain functions in
 [`hflow.checks`](../../src/hflow/checks.py). They are written in exactly the
 shape you would write your own, so reading one is the fastest way to learn the
 [porting pattern](../PORTING.md) -- and registering one is a single line.

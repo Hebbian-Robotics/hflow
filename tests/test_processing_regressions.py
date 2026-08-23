@@ -247,11 +247,14 @@ def test_a_check_and_an_enrichment_label_collision_is_refused(tmp_path: Path) ->
         app.test(_state_only_episode(tmp_path), verbose=False)
 
 
-def test_the_dev_loop_refuses_a_collision_without_recording(tmp_path: Path) -> None:
-    """The guard runs outside ``if record:`` so it fires on episode one rather
-    than at the first curation query.
+def test_a_refused_collision_records_nothing(tmp_path: Path) -> None:
+    """The guard runs before the append, so a refused run leaves no row behind.
+
+    Recorded on purpose: ``record=True`` is what ``process`` defaults to and
+    what every DAG batch uses, so testing the non-recording path would prove
+    the ordering only by implication.
     """
-    app = hflow.App("key-collision-dev", data_root=tmp_path / "data")
+    app = hflow.App("key-collision-record", data_root=tmp_path / "data")
 
     @app.check()
     def left(ep: hflow.Episode) -> hflow.CheckResult:
@@ -262,7 +265,7 @@ def test_the_dev_loop_refuses_a_collision_without_recording(tmp_path: Path) -> N
         return hflow.CheckResult(measurements={"same": 2.0})
 
     with pytest.raises(ValueError, match="same measurement key"):
-        app.process(_state_only_episode(tmp_path), record=False)
+        app.process(_state_only_episode(tmp_path), record=True)
 
     catalog_root = tmp_path / "data" / "catalog"
     assert list(catalog_root.rglob("*.parquet")) == []

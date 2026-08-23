@@ -26,7 +26,7 @@ def my_check(ep: hflow.Episode) -> hflow.CheckResult:
     return hflow.CheckResult(measurements=result)  # our line: record
 ```
 
-`@app.check()` takes `name=` (defaults to the function name), `critical=`, `requires={...}` (capability set, e.g. `{"gpu"}`), `uses="alias"` (a named endpoint; see the VLM section), and optional `version=`. Step identity automatically includes source, defaults, and captured stable configuration such as numeric thresholds. Pass an explicit `version=` for opaque client objects or external model configuration the SDK cannot inspect deterministically. Checks that declare no resources run before checks that do, so cheap integrity checks gate expensive model calls. Today `requires`/`uses` record intent, order steps, and let preflight verify named endpoints are configured; they do **not** route the step to a particular worker or GPU pool (per-step compute routing is [deferred](./ARCHITECTURE.md#implementation-status)) -- a bring-your-own Airflow deployment arranges those resources itself.
+`@app.check()` takes `name=` (defaults to the function name), `critical=`, `requires={...}` (capability set, e.g. `{"gpu"}`), `uses="alias"` (a named endpoint; see the VLM section), `gate=` (a declarative accept policy the runner evaluates over what the check returned), and optional `version=`. Step identity automatically includes source, defaults, and captured stable configuration such as numeric thresholds. Pass an explicit `version=` for opaque client objects or external model configuration the SDK cannot inspect deterministically. Checks that declare no resources run before checks that do, so cheap integrity checks gate expensive model calls. Today `requires`/`uses` record intent, order steps, and let preflight verify named endpoints are configured; they do **not** route the step to a particular worker or GPU pool (per-step compute routing is [deferred](./ARCHITECTURE.md#implementation-status)) -- a bring-your-own Airflow deployment arranges those resources itself.
 
 Every step is called with exactly one argument, an `Episode`, so `@app.check()`, `@app.enrich()`, and `@app.derive()` refuse a function the runtime could never call: one with a required parameter beyond the episode, or with no positional slot to receive it. That refusal happens at registration, not once per episode, and the error shows the wrapper form to use instead. To pass configuration, bind it in a wrapper (`return action_rate(ep, topics=[...])`) rather than adding a parameter.
 
@@ -95,32 +95,13 @@ def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
     return hflow.checks.camera_frame_stats(ep)
 ```
 
-To make it *gate*, attach a policy at registration rather than rewriting the
-check. HFlow ships a recommended one you can pass as-is or copy with your own
-numbers, and a failing gate on a `critical` check quarantines the episode:
-
-```python
-@app.check(critical=True, gate=hflow.checks.RECOMMENDED_CAMERA_INTEGRITY)
-def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
-    return hflow.checks.camera_frame_stats(ep)
-
-
-# Your own bar instead: same shape, your numbers.
-STRICTER = hflow.Gate(
-    accept_when=(
-        hflow.Threshold("*black_frame_pct", hflow.Comparison.AT_MOST, 5.0),
-        hflow.Threshold("*freeze_total_s", hflow.Comparison.AT_MOST, 1.0),
-    )
-)
-```
-
-Gating this way keeps the evidence: the check still records every measurement
-whether the gate accepts or rejects. Computing a verdict *inside* the check and
-returning a fresh `CheckResult(verdict=...)` throws away the measurements the
-instrument already produced -- roughly nine per camera plus intervals.
-
-Register any gating check **last**. A critical quarantine skips every check
-after it, and skipped steps do not count toward coverage.
+To make it *reject* episodes rather than only measure them, attach a gate at
+registration instead of computing a verdict inside the check --
+[enabling the built-in checks](./how-to/enable-built-in-checks.md#gate-on-one)
+covers the shipped gates, writing your own, and why registration order matters.
+Gating that way keeps the evidence: a verdict computed inside the check and
+returned as a fresh `CheckResult(verdict=...)` throws away the measurements the
+instrument already produced.
 
 Below the packaged check are the raw instrument and plain ffmpeg, for the
 questions it does not answer. Both are endorsed usage, not workarounds:
@@ -247,10 +228,10 @@ The same is true outside checks entirely: canonical episodes open in Foxglove, R
 | `tags` | `list[str]` | Free-form labels routed to the catalog. |
 | `verdict` | `bool \| None` | Optional, user-owned. `None` means evidence only. `False` on a `critical` check quarantines the episode. Prefer `@app.check(gate=...)` over computing this inline: a gate is evaluated over the measurements you already returned, so a threshold aimed at a missing key cannot cost you the evidence. |
 
-One measurement key may have only one owner. Every step of a run shares that
-run's fingerprint and timestamp, so two steps recording the same key on one
-episode is a tie the catalog resolves arbitrarily -- one value would silently
-disappear. The runner refuses it, naming both steps.
+One measurement key may have only one owner, and the runner refuses a run where
+two steps claim the same one --
+[the naming rules](./CATALOG.md#naming-measurement-keys) explain why a shared
+key is unrecoverable rather than merely untidy.
 
 Every recorded result also carries the check's version (a content hash of its configuration and source, including any gate you attached), so re-running a changed check -- or a retuned threshold -- appends new-version rows instead of silently overwriting old ones.
 
@@ -271,6 +252,8 @@ both paths.
 ## See also
 
 - [Documentation home](./README.md): choose a tutorial, how-to guide, reference, or explanation
+- [Enable the built-in quality checks](./how-to/enable-built-in-checks.md): the fifteen packaged checks, and how to gate on one
+- [Query quality evidence and create a manifest](./CATALOG.md): where measurements land, and the naming rules for keys
 - [Runnable examples](../examples/README.md): commands, prerequisites, and expected output
 - [OpenAI vision how-to](./how-to/call-openai-vision.md): a complete Responses API check
 - [How HFlow fits the robotics data stack](./INTEGRATIONS.md): which responsibilities stay in HFlow and which stay in surrounding tools
