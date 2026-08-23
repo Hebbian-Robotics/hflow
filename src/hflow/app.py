@@ -751,11 +751,13 @@ class App:
         self.transform_override: TransformFunction | None = None
 
     def _registered_step_names(self) -> set[str]:
-        # Checks and enrichments share the catalog's check_name column, so
-        # names are unique across both.
-        return {registered.name for registered in self.checks} | {
-            registered.name for registered in self.enrichments
-        }
+        # Checks, enrichments, and the built-in media step share the catalog's
+        # check_name column, so names are unique across all three.
+        return (
+            {MEDIA_CONTACT_SHEET_STEP_NAME}
+            | {registered.name for registered in self.checks}
+            | {registered.name for registered in self.enrichments}
+        )
 
     @property
     def pipeline_version(self) -> str:

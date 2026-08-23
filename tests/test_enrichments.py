@@ -7,6 +7,7 @@ from typing import cast
 import pytest
 
 import hflow
+from hflow.app import MEDIA_CONTACT_SHEET_STEP_NAME
 from hflow.curation import open_catalog_connection
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
@@ -138,6 +139,22 @@ def test_step_names_are_unique_across_checks_and_enrichments(tmp_path: Path) -> 
         @app.enrich(name="labeling")
         def another(ep: hflow.Episode) -> hflow.EnrichmentResult:
             return hflow.EnrichmentResult()
+
+
+def test_built_in_media_step_name_is_reserved_for_user_steps(tmp_path: Path) -> None:
+    app = hflow.App("reserved-media-name", data_root=tmp_path)
+
+    def check(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult()
+
+    def enrichment(ep: hflow.Episode) -> hflow.EnrichmentResult:
+        return hflow.EnrichmentResult()
+
+    with pytest.raises(ValueError, match=r"media/contact_sheet.*already registered"):
+        app.check(name=MEDIA_CONTACT_SHEET_STEP_NAME)(check)
+
+    with pytest.raises(ValueError, match=r"media/contact_sheet.*already registered"):
+        app.enrich(name=MEDIA_CONTACT_SHEET_STEP_NAME)(enrichment)
 
 
 def test_enrichment_uses_alias_is_preflighted(source_episode: Path, tmp_path: Path) -> None:
