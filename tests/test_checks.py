@@ -6,12 +6,16 @@ import pytest
 
 import hflow
 from hflow.checks import (
+    action_integrity,
     action_rate,
+    camera_fps_conformance,
     camera_frame_stats,
     content_digest,
     episode_duration,
     idle_fraction,
     joint_discontinuity,
+    keyframe_interval,
+    media_digest,
     timestamp_regularity,
 )
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
@@ -40,6 +44,10 @@ def test_no_two_builtin_checks_claim_the_same_measurement_key(tmp_path: Path) ->
             "episode_duration": episode_duration(episode),
             "action_rate": action_rate(episode, topics=["/joint_states"]),
             "content_digest": content_digest(episode),
+            "media_digest": media_digest(episode),
+            "keyframe_interval": keyframe_interval(episode),
+            "camera_fps_conformance": camera_fps_conformance(episode),
+            "action_integrity": action_integrity(episode),
         }
 
     producers_by_key: dict[str, list[str]] = {}
@@ -248,3 +256,142 @@ def test_camera_frame_stats_sees_the_injected_black_segment(tmp_path: Path) -> N
     # No dropped frames were injected: the stored count matches the rate.
     assert result.measurements[f"{camera_topic}/frame_deficit_pct"] == pytest.approx(0.0)
     assert result.measurements[f"{camera_topic}/expected_frame_count"] == message_count
+
+
+def test_media_digest_matches_the_same_footage_under_different_telemetry(
+    tmp_path: Path,
+) -> None:
+    """The case content_digest cannot see: identical footage, everything else
+    different. Camera frames depend only on the camera's own spec fields, so
+    varying the seed changes the joint stream and leaves the footage alone.
+    """
+    first = synthesize_episode(
+        tmp_path / "first.mcap",
+        SyntheticEpisodeSpec(duration_s=2.0, cameras=("wrist_cam",), seed=0),
+    )
+    second = synthesize_episode(
+        tmp_path / "second.mcap",
+        SyntheticEpisodeSpec(duration_s=2.0, cameras=("wrist_cam",), seed=7),
+    )
+    with hflow.Episode(first) as episode:
+        camera_topic = episode.cameras[0]
+        first_media = media_digest(episode).measurements[f"{camera_topic}/media_digest"]
+        first_content = content_digest(episode).measurements["content_digest"]
+        media_bytes = media_digest(episode).measurements[f"{camera_topic}/media_bytes"]
+    with hflow.Episode(second) as episode:
+        second_media = media_digest(episode).measurements[f"{camera_topic}/media_digest"]
+        second_content = content_digest(episode).measurements["content_digest"]
+
+    assert first_media == second_media, "same footage must digest the same"
+    assert first_content != second_content, "differing telemetry must change content_digest"
+    assert isinstance(media_bytes, int) and media_bytes > 0
+
+
+def test_media_digest_separates_different_footage(tmp_path: Path) -> None:
+    plain = synthesize_episode(
+        tmp_path / "plain.mcap",
+        SyntheticEpisodeSpec(duration_s=2.0, cameras=("wrist_cam",), black_segment=None),
+    )
+    blacked_out = synthesize_episode(
+        tmp_path / "blacked.mcap",
+        SyntheticEpisodeSpec(duration_s=2.0, cameras=("wrist_cam",), black_segment=(0.5, 1.5)),
+    )
+    digests = []
+    for source in (plain, blacked_out):
+        with hflow.Episode(source) as episode:
+            camera_topic = episode.cameras[0]
+            digests.append(media_digest(episode).measurements[f"{camera_topic}/media_digest"])
+    assert digests[0] != digests[1]
+
+
+def test_keyframe_interval_reports_the_encoders_gop(tmp_path: Path) -> None:
+    """The canonical encoder writes a keyframe every gop_seconds, so the
+    measured cadence is the writer's own contract read back off the stream.
+    """
+    source = synthesize_episode(
+        tmp_path / "episode.mcap",
+        SyntheticEpisodeSpec(duration_s=4.0, cameras=("wrist_cam",), black_segment=None),
+    )
+    canonical = tmp_path / "episode.canonical.mcap"
+    write_canonical_episode(source, canonical, TransformConfig())
+    with hflow.Episode(canonical) as episode:
+        camera_topic = episode.cameras[0]
+        result = keyframe_interval(episode)
+
+    keyframe_count = result.measurements[f"{camera_topic}/keyframe_count"]
+    assert isinstance(keyframe_count, int) and keyframe_count >= 2
+    assert result.measurements[f"{camera_topic}/first_frame_is_keyframe"] == 1
+    max_gap_s = result.measurements[f"{camera_topic}/max_keyframe_gap_s"]
+    assert isinstance(max_gap_s, float)
+    # The VLA preset targets 1 s GOPs; allow the fps-estimate rounding the
+    # encoder applies when converting seconds to a frame count.
+    assert 0.5 < max_gap_s < 1.6
+    assert result.verdict is None
+
+
+def test_fps_conformance_classifies_matching_and_half_rate_streams(tmp_path: Path) -> None:
+    source = synthesize_episode(
+        tmp_path / "episode.mcap",
+        SyntheticEpisodeSpec(duration_s=2.0, cameras=("wrist_cam",), image_hz=10.0),
+    )
+    with hflow.Episode(source) as episode:
+        camera_topic = episode.cameras[0]
+        matching = camera_fps_conformance(episode, nominal_fps={camera_topic: 10})
+        # The corpus says 5 Hz; this stream ran at twice that.
+        doubled = camera_fps_conformance(episode, nominal_fps={camera_topic: 5})
+        implausible = camera_fps_conformance(episode, nominal_fps={camera_topic: 300})
+        undeclared = camera_fps_conformance(episode)
+
+    assert matching.measurements[f"{camera_topic}/derived_fps"] == 10
+    assert matching.measurements[f"{camera_topic}/fps_resolution"] == "matches-nominal"
+    assert matching.measurements[f"{camera_topic}/fps_ratio"] == pytest.approx(1.0)
+    assert doubled.measurements[f"{camera_topic}/fps_resolution"] == "downsample-2x"
+    assert doubled.measurements[f"{camera_topic}/fps_ratio"] == pytest.approx(2.0)
+    assert implausible.measurements[f"{camera_topic}/fps_resolution"] == "unrecoverable"
+    assert undeclared.measurements[f"{camera_topic}/fps_resolution"] == "no-nominal-declared"
+
+
+def test_action_integrity_finds_the_injected_frozen_run(tmp_path: Path) -> None:
+    """A stalled publisher repeats samples bit-for-bit; a still robot does not.
+    The fixture holds every joint for 1 s of a 4 s stream.
+    """
+    source = synthesize_episode(
+        tmp_path / "frozen.mcap",
+        SyntheticEpisodeSpec(
+            duration_s=4.0,
+            cameras=(),
+            joint_jump_at_s=None,
+            joint_freeze_segment=(1.0, 2.0),
+        ),
+    )
+    with hflow.Episode(source) as episode:
+        result = action_integrity(episode)
+
+    assert result.measurements["/joint_states/nan_count"] == 0
+    assert result.measurements["/joint_states/inf_count"] == 0
+    assert result.measurements["/joint_states/frozen_run_count"] == 1
+    longest_run_fraction = result.measurements["/joint_states/frozen_longest_run_fraction"]
+    assert isinstance(longest_run_fraction, float)
+    # 1 s held out of 4 s recorded.
+    assert longest_run_fraction == pytest.approx(0.25, abs=0.02)
+
+    frozen_intervals = [i for i in result.intervals if i.label == "frozen:/joint_states"]
+    assert len(frozen_intervals) == 1
+    held_duration_s = (frozen_intervals[0].end_ns - frozen_intervals[0].start_ns) / 1e9
+    assert held_duration_s == pytest.approx(1.0, abs=0.05)
+    assert result.verdict is None
+
+
+def test_action_integrity_reports_a_clean_stream_as_clean(tmp_path: Path) -> None:
+    source = synthesize_episode(
+        tmp_path / "clean.mcap",
+        SyntheticEpisodeSpec(duration_s=3.0, cameras=(), joint_jump_at_s=None),
+    )
+    with hflow.Episode(source) as episode:
+        result = action_integrity(episode)
+
+    assert result.measurements["/joint_states/nan_count"] == 0
+    assert result.measurements["/joint_states/frozen_run_count"] == 0
+    assert result.measurements["/joint_states/frozen_step_pct"] == 0.0
+    assert result.measurements["/joint_states/unchanged_dimension_count"] == 0
+    assert result.intervals == []

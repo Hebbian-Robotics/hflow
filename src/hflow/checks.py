@@ -31,6 +31,7 @@ from hflow.steps import (
     MeasurementValue,
     Threshold,
 )
+from hflow.video import split_annex_b_stream
 
 # Recommended camera-integrity thresholds over the keys `camera_frame_stats`
 # emits. Shipped as a VALUE, not a default: nothing gates until a pipeline
@@ -452,3 +453,305 @@ def content_digest(episode: Episode) -> CheckResult:
             digest.update(len(payload).to_bytes(8, "big"))
             digest.update(payload)
     return CheckResult(measurements={"content_digest": digest.hexdigest()})
+
+
+def action_integrity(
+    episode: Episode,
+    *,
+    topic: str = "/joint_states",
+    field: str | None = None,
+    min_frozen_run_fraction: float = 0.05,
+    min_unchanged_dimension_samples: int = 11,
+) -> CheckResult:
+    """Integrity of the recorded values on one action or state stream.
+
+    The other state checks read timing and speed; this one reads the numbers.
+    Three defects it finds that nothing else here would:
+
+    - **Non-finite samples.** A NaN reaching a training set is silent: it
+      compares False against every threshold, so a naive filter reads it as
+      clean rather than rejecting it.
+    - **Frozen runs.** Consecutive samples exactly equal across every
+      dimension, which is a stalled publisher rather than a still robot -- real
+      sensor noise does not repeat bit-for-bit. Runs at least
+      ``min_frozen_run_fraction`` of the stream land as ``frozen:<topic>``
+      intervals.
+    - **Dead dimensions.** A joint that never moves while others do, which is
+      usually a miswired or unpublished channel rather than a task that held
+      one axis still.
+
+    Equality is exact IEEE, deliberately: a tolerance would dissolve the very
+    runs this looks for, and NaN != NaN correctly breaks a run rather than
+    extending it. Run this on raw channels only -- a resampled channel carrying
+    a hold policy manufactures exactly-repeated samples, which is a fabricated
+    frozen run rather than a recorded one.
+    """
+    channel = episode.channel(topic)
+    stamps_ns = channel.timestamps
+    if len(stamps_ns) < 2:
+        return CheckResult(measurements={f"{topic}/integrity_sample_count": len(stamps_ns)})
+
+    samples = channel.to_numpy(field)
+    if samples.ndim == 1:
+        samples = samples[:, np.newaxis]
+    sample_count, dimension_count = samples.shape
+    measurements: dict[str, MeasurementValue] = {
+        f"{topic}/integrity_sample_count": sample_count,
+        f"{topic}/dimension_count": dimension_count,
+        f"{topic}/nan_count": int(np.count_nonzero(np.isnan(samples))),
+        f"{topic}/inf_count": int(np.count_nonzero(np.isinf(samples))),
+        f"{topic}/frozen_run_min_fraction": min_frozen_run_fraction,
+    }
+
+    # A step is frozen when every dimension repeats exactly. NaN != NaN, so a
+    # non-finite sample breaks the run instead of silently extending it.
+    repeats_previous = np.all(samples[1:] == samples[:-1], axis=1)
+    frozen_intervals = _mask_run_intervals(
+        stamps_ns,
+        repeats_previous,
+        f"frozen:{topic}",
+        min_duration_s=0.0,
+    )
+    minimum_run_steps = max(1, int(np.ceil(min_frozen_run_fraction * (sample_count - 1))))
+    run_lengths = _mask_run_lengths(repeats_previous)
+    reported_runs = [length for length in run_lengths if length >= minimum_run_steps]
+    measurements[f"{topic}/frozen_run_count"] = len(reported_runs)
+    measurements[f"{topic}/frozen_longest_run_fraction"] = (
+        max(run_lengths) / (sample_count - 1) if run_lengths else 0.0
+    )
+    measurements[f"{topic}/frozen_step_pct"] = float(np.mean(repeats_previous) * 100.0)
+
+    # Below the sample floor an unchanged fraction is noise, not evidence, so
+    # emit nothing rather than a number that averages into garbage downstream.
+    if sample_count >= min_unchanged_dimension_samples:
+        dimension_ever_changed = np.any(samples[1:] != samples[:-1], axis=0)
+        unchanged_dimensions = np.flatnonzero(~dimension_ever_changed)
+        measurements[f"{topic}/unchanged_dimension_count"] = len(unchanged_dimensions)
+        for dimension_index in unchanged_dimensions:
+            measurements[f"{topic}/dim{int(dimension_index):02d}/unchanged"] = 1
+
+    return CheckResult(
+        measurements=measurements,
+        intervals=[
+            interval
+            for interval, length in zip(frozen_intervals, run_lengths, strict=True)
+            if length >= minimum_run_steps
+        ],
+    )
+
+
+def _mask_run_lengths(step_mask: np.ndarray) -> list[int]:
+    """Lengths of each contiguous True run, in the same order
+    :func:`_mask_run_intervals` yields its intervals."""
+    lengths: list[int] = []
+    run_length = 0
+    for in_run in step_mask:
+        if in_run:
+            run_length += 1
+        elif run_length:
+            lengths.append(run_length)
+            run_length = 0
+    if run_length:
+        lengths.append(run_length)
+    return lengths
+
+
+def camera_fps_conformance(
+    episode: Episode,
+    *,
+    nominal_fps: dict[str, int] | None = None,
+    cameras: Sequence[str] | None = None,
+    max_plausible_fps: int = 240,
+    downsample_tolerance_fps: int = 1,
+) -> CheckResult:
+    """Classify each camera's timestamp-derived rate against the rate declared.
+
+    ``timestamp_regularity`` measures jitter against a stream's own median;
+    this asks the different question of whether the stream ran at the rate the
+    corpus says it should. The distinction that matters in practice is between
+    a stream recorded at half rate -- common, recoverable, and visible as a
+    clean 2x ratio -- and one whose clock is simply not believable.
+
+    ``{topic}/fps_resolution`` is the classification, as text:
+
+    - ``matches-nominal``: derived rate equals the declared rate.
+    - ``downsample-2x``: derived rate is twice nominal within
+      ``downsample_tolerance_fps`` (a true 2x source lands on 59 or 61 as
+      often as 60, which is why the tolerance exists).
+    - ``fallback-nominal``: derived rate exceeds ``max_plausible_fps``, so the
+      timestamps are not believable and the declared rate is all there is.
+    - ``unrecoverable``: a plausible rate that is neither nominal nor 2x, so
+      nothing explains the difference.
+    - ``insufficient-frames`` / ``non-advancing-clock`` / ``no-nominal-declared``:
+      the question could not be asked.
+
+    ``{topic}/fps_ratio`` carries the same fact numerically, because only
+    numeric measurements pivot into the wide view. This check measures and
+    classifies; it never rewrites the stream -- decimating an episode is a
+    transform concern that would move episode identity.
+    """
+    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    measurements: dict[str, MeasurementValue] = {}
+    for topic in selected_cameras:
+        stamps_ns = episode.channel(topic).timestamps
+        measurements[f"{topic}/fps_sample_count"] = len(stamps_ns)
+        declared_fps = (nominal_fps or {}).get(topic)
+        if declared_fps is not None:
+            measurements[f"{topic}/nominal_fps"] = declared_fps
+        if len(stamps_ns) < 2:
+            measurements[f"{topic}/fps_resolution"] = "insufficient-frames"
+            continue
+        intervals_ns = np.diff(stamps_ns)
+        measurements[f"{topic}/nonpositive_interval_count"] = int(np.sum(intervals_ns <= 0))
+        advancing_ns = intervals_ns[intervals_ns > 0]
+        if len(advancing_ns) == 0:
+            measurements[f"{topic}/fps_resolution"] = "non-advancing-clock"
+            continue
+        median_interval_ns = float(np.median(advancing_ns))
+        measurements[f"{topic}/median_frame_interval_ns"] = median_interval_ns
+        derived_fps = round(1e9 / median_interval_ns)
+        measurements[f"{topic}/derived_fps"] = derived_fps
+        if declared_fps is None or declared_fps <= 0:
+            measurements[f"{topic}/fps_resolution"] = "no-nominal-declared"
+            continue
+        measurements[f"{topic}/fps_ratio"] = derived_fps / declared_fps
+        measurements[f"{topic}/fps_resolution"] = _classify_derived_fps(
+            derived_fps=derived_fps,
+            declared_fps=declared_fps,
+            max_plausible_fps=max_plausible_fps,
+            downsample_tolerance_fps=downsample_tolerance_fps,
+        )
+    return CheckResult(measurements=measurements)
+
+
+def _classify_derived_fps(
+    *,
+    derived_fps: int,
+    declared_fps: int,
+    max_plausible_fps: int,
+    downsample_tolerance_fps: int,
+) -> str:
+    """Branch order is the classification: equality first, then plausibility,
+    then the 2x window. A declared rate at or above half the plausibility
+    ceiling therefore shadows ``downsample-2x``, and an equal-but-absurd
+    declared rate still reads as matching -- both deliberate, because a
+    declared rate the operator stands behind outranks our suspicion of it.
+    """
+    if derived_fps == declared_fps:
+        return "matches-nominal"
+    if derived_fps > max_plausible_fps:
+        return "fallback-nominal"
+    if abs(derived_fps - 2 * declared_fps) <= downsample_tolerance_fps:
+        return "downsample-2x"
+    return "unrecoverable"
+
+
+def _payload_starts_a_keyframe(payload: bytes) -> bool:
+    """Whether one canonical video message carries an IDR access unit.
+
+    Reuses the encoder's own Annex B scan rather than re-deriving keyframe
+    syntax here, so the check and the writer can never disagree about what a
+    keyframe is. A payload that is not a single decodable access unit (a
+    non-canonical episode, or a codec this scan does not parse) is not counted:
+    conservative in the same direction as reporting no keyframes at all.
+    """
+    try:
+        access_units = split_annex_b_stream(payload)
+    except ValueError:
+        return False
+    return len(access_units) == 1 and access_units[0].is_keyframe
+
+
+def media_digest(episode: Episode, *, cameras: Sequence[str] | None = None) -> CheckResult:
+    """Per-camera digest of the encoded footage alone, for redundancy hunts.
+
+    SHA-256 over one camera channel's length-framed payload bytes, deliberately
+    excluding log times -- so the same footage delivered twice identifies as the
+    same footage even when the second copy was re-stamped or arrived with
+    different telemetry around it. That is the case ``content_digest`` cannot
+    see, because it hashes log times and every other channel too: use this to
+    find redundant *footage*, that one to find redundant *recordings*.
+
+    Thresholdless by construction: a group is a fact about the collection, not
+    a judgment, so the reduction is a curation query::
+
+        SELECT value_text AS digest, count(*) AS copies, list(episode_id)
+        FROM measurements_latest
+        WHERE key LIKE '%/media_digest'
+        GROUP BY digest HAVING count(*) > 1
+
+    Redundant footage is then ``sum(copies - 1)`` over that result, and
+    ``{topic}/media_bytes`` weights it by what the duplication costs to store.
+    Reads no pixels and runs no decode, so it is exact and cheap.
+    """
+    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    measurements: dict[str, MeasurementValue] = {}
+    for topic in selected_cameras:
+        payloads = episode.channel(topic).raw
+        digest = hashlib.sha256()
+        total_bytes = 0
+        for payload in payloads:
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+            total_bytes += len(payload)
+        measurements[f"{topic}/media_digest"] = digest.hexdigest()
+        measurements[f"{topic}/media_bytes"] = total_bytes
+    return CheckResult(measurements=measurements)
+
+
+def keyframe_interval(episode: Episode, *, cameras: Sequence[str] | None = None) -> CheckResult:
+    """Keyframe cadence per camera: how seekable and cuttable the footage is.
+
+    A keyframe is where a decoder can start, so the longest gap between them
+    bounds both random access and frame-accurate cutting without re-encoding.
+    Measured over true log time rather than the remuxed MP4's synthesized
+    constant-rate clock, so a recording gap legitimately widens the reported
+    gap -- a cut across that gap really does land somewhere else.
+
+    Evidence only. The right bar depends on the read pattern, so it belongs in
+    a curation query: HFlow's own encoder targets 1 s GOPs for VLA-style
+    training and 6 s for world models, while frame-accurate stream-copy cutting
+    wants well under a second. Compare against the GOP your corpus was written
+    with rather than an absolute::
+
+        SELECT episode_id FROM episodes
+        WHERE "/wrist_cam/compressed/max_keyframe_gap_s" <= 1.5
+
+    ``max_keyframe_gap_s`` is omitted when no keyframe was found at all (an
+    open-GOP or intra-refresh source whose recovery points this scan does not
+    count as keyframes), so a ``<=`` filter excludes those rather than reading
+    them as perfect.
+    """
+    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    measurements: dict[str, MeasurementValue] = {}
+    for topic in selected_cameras:
+        channel = episode.channel(topic)
+        stamps_ns = channel.timestamps
+        measurements[f"{topic}/scanned_frame_count"] = len(stamps_ns)
+        if len(stamps_ns) == 0:
+            continue
+        keyframe_indices = [
+            index
+            for index, payload in enumerate(channel.raw)
+            if _payload_starts_a_keyframe(payload)
+        ]
+        measurements[f"{topic}/keyframe_count"] = len(keyframe_indices)
+        measurements[f"{topic}/first_frame_is_keyframe"] = int(
+            bool(keyframe_indices) and keyframe_indices[0] == 0
+        )
+        if not keyframe_indices:
+            continue
+        keyframe_stamps_ns = stamps_ns[keyframe_indices]
+        # The tail matters: a long run after the last keyframe is just as
+        # unseekable as a long run between two.
+        gaps_ns = np.diff(np.append(keyframe_stamps_ns, stamps_ns[-1]))
+        positive_gaps_ns = gaps_ns[gaps_ns > 0]
+        measurements[f"{topic}/max_keyframe_gap_s"] = (
+            float(np.max(positive_gaps_ns) / 1e9) if len(positive_gaps_ns) else 0.0
+        )
+        if len(keyframe_stamps_ns) >= 2:
+            intervals_ns = np.diff(keyframe_stamps_ns)
+            measurements[f"{topic}/median_keyframe_interval_s"] = float(
+                np.median(intervals_ns) / 1e9
+            )
+    return CheckResult(measurements=measurements)

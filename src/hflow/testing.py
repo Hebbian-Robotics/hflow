@@ -115,6 +115,10 @@ class SyntheticEpisodeSpec:
     # Instantaneous joint-position jump (radians) injected at this time.
     joint_jump_at_s: float | None = 5.0
     joint_jump_rad: float = 0.8
+    # Segment, seconds from start, over which every joint holds the position it
+    # had when the segment began -- a stalled publisher, not a still robot.
+    # Repeats are exact, which is what distinguishes the two.
+    joint_freeze_segment: tuple[float, float] | None = None
     # Segment on the first camera whose image timestamps are offset by +3 ms.
     timestamp_offset_segment: tuple[float, float] | None = (6.0, 7.0)
     timestamp_offset_s: float = 0.003
@@ -556,17 +560,27 @@ def _build_joint_messages(spec: SyntheticEpisodeSpec) -> list[tuple[int, bytes]]
     joint_names = [f"joint_{joint_index}" for joint_index in range(spec.joint_count)]
     message_count = round(spec.duration_s * spec.joint_hz)
     messages: list[tuple[int, bytes]] = []
+    freeze_segment = spec.joint_freeze_segment
     for message_index in range(message_count):
         time_s = message_index / spec.joint_hz
+        # A frozen publisher re-sends the sample it last computed, so every
+        # message inside the segment is evaluated at the segment's start --
+        # including the jump, or a jump landing mid-freeze would make the
+        # repeats inexact and stop being a freeze at all.
+        sampled_time_s = (
+            freeze_segment[0]
+            if freeze_segment is not None and _time_is_in_segment(time_s, freeze_segment)
+            else time_s
+        )
         jump_offset_rad = (
             spec.joint_jump_rad
-            if spec.joint_jump_at_s is not None and time_s >= spec.joint_jump_at_s
+            if spec.joint_jump_at_s is not None and sampled_time_s >= spec.joint_jump_at_s
             else 0.0
         )
         positions: list[float] = []
         velocities: list[float] = []
         for frequency_hz, phase_rad in sine_parameters:
-            angle_rad = 2.0 * math.pi * frequency_hz * time_s + phase_rad
+            angle_rad = 2.0 * math.pi * frequency_hz * sampled_time_s + phase_rad
             positions.append(JOINT_SINE_AMPLITUDE_RAD * math.sin(angle_rad) + jump_offset_rad)
             velocities.append(
                 JOINT_SINE_AMPLITUDE_RAD * 2.0 * math.pi * frequency_hz * math.cos(angle_rad)
