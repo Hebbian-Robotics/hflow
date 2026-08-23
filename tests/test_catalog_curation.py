@@ -519,8 +519,8 @@ def test_constrained_curate_writes_the_manifest_but_refuses_outside_reads(
         )
 
 
-def test_append_accepts_non_json_measurement_scalars(tmp_path: Path) -> None:
-    """numpy scalars are user data: they must fingerprint, not crash the append."""
+def test_numpy_scalar_measurements_round_trip(tmp_path: Path) -> None:
+    """NumPy scalars from real check code store readable values, not NULLs."""
     import numpy as np
 
     canonical = tmp_path / "e.canonical.mcap"
@@ -532,9 +532,12 @@ def test_append_accepts_non_json_measurement_scalars(tmp_path: Path) -> None:
         critical=False,
         status=hflow.CheckStatus.MEASURED,
         duration_s=0.1,
-        # cast: deliberately smuggling user-supplied non-JSON scalars past the
+        # cast: deliberately passing user-supplied NumPy scalars past the
         # declared MeasurementValue type -- exactly what real check code does.
-        measurements=cast(dict, {"count": np.int64(3), "flag": np.bool_(True)}),
+        measurements=cast(
+            dict,
+            {"ratio": np.float32(0.4), "frames": np.int64(3), "flag": np.bool_(True)},
+        ),
     )
     result = catalog.append_episode(
         canonical_path=canonical,
@@ -543,14 +546,136 @@ def test_append_accepts_non_json_measurement_scalars(tmp_path: Path) -> None:
         check_rows=[row],
     )
     assert result.written is True
-    replay = catalog.append_episode(
-        canonical_path=canonical,
-        stamps=FAKE_STAMPS,
-        episode_metadata={},
-        check_rows=[row],
+    connection = open_catalog_connection(tmp_path / "catalog")
+    try:
+        raw_rows = connection.execute(
+            "SELECT key, value_double, value_text, value_bool FROM measurements"
+        ).fetchall()
+        raw = {
+            key: (value_double, value_text, value_bool)
+            for key, value_double, value_text, value_bool in raw_rows
+        }
+        wide = connection.execute(
+            "SELECT ratio, frames FROM episodes WHERE episode_id = ?",
+            [result.episode_id],
+        ).fetchone()
+    finally:
+        connection.close()
+    # The measurements table holds one typed column per value.
+    assert raw["ratio"] == (np.float32(0.4).item(), None, None)
+    assert raw["frames"] == (3.0, None, None)
+    assert raw["flag"] == (None, None, True)
+    # The wide view exposes them to threshold predicates.
+    assert wide == pytest.approx((np.float32(0.4).item(), 3.0))
+
+
+def test_numpy_measured_episode_survives_a_manifest_filter(tmp_path: Path) -> None:
+    """A NumPy-measured episode must not vanish from a threshold-filtered manifest."""
+    import numpy as np
+
+    catalog_dir = tmp_path / "catalog"
+    for name, black_pct in (("numpy", np.float32(0.4)), ("python", 0.4)):
+        canonical = tmp_path / f"{name}.canonical.mcap"
+        canonical.write_bytes(name.encode())
+        Catalog(catalog_dir).append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[
+                CheckRunRow(
+                    check_name="camera_blackout",
+                    check_version="v1",
+                    critical=False,
+                    status=hflow.CheckStatus.MEASURED,
+                    duration_s=0.1,
+                    measurements=cast(dict, {"black_pct": black_pct}),
+                )
+            ],
+        )
+    connection = open_catalog_connection(catalog_dir)
+    try:
+        kept = connection.execute(
+            "SELECT episode_id FROM episodes WHERE black_pct < 1.0 AND status != 'quarantined'"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert len(kept) == 2
+
+
+def test_same_value_in_a_numpy_or_python_scalar_replays_as_one_run(
+    tmp_path: Path,
+) -> None:
+    """Equal values across scalar flavors fingerprint identically.
+
+    Idempotence must not depend on which scalar flavor a check happened to
+    return that day. (A genuinely different value -- float32 rounding of 0.4
+    versus the float64 literal, say -- stays a distinct outcome by design.)
+    """
+    import numpy as np
+
+    canonical = tmp_path / "e.canonical.mcap"
+    canonical.write_bytes(b"episode-bytes")
+    catalog = Catalog(tmp_path / "catalog")
+
+    def measure(value: object) -> CheckRunRow:
+        return CheckRunRow(
+            check_name="camera_blackout",
+            check_version="v1",
+            critical=False,
+            status=hflow.CheckStatus.MEASURED,
+            duration_s=0.1,
+            measurements=cast(dict, {"black_pct": value}),
+        )
+
+    float_attempts = [
+        catalog.append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[measure(value)],
+        )
+        for value in (np.float64(0.5), 0.5, np.float64(0.5))
+    ]
+    assert [attempt.written for attempt in float_attempts] == [True, False, False]
+    assert len({attempt.run_fingerprint for attempt in float_attempts}) == 1
+
+    int_canonical = tmp_path / "int.canonical.mcap"
+    int_canonical.write_bytes(b"int-episode-bytes")
+    int_attempts = [
+        catalog.append_episode(
+            canonical_path=int_canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[measure(value)],
+        )
+        for value in (np.int64(7), 7)
+    ]
+    assert [attempt.written for attempt in int_attempts] == [True, False]
+    assert len({attempt.run_fingerprint for attempt in int_attempts}) == 1
+
+
+def test_non_scalar_measurement_is_refused_naming_the_check_and_key(
+    tmp_path: Path,
+) -> None:
+    """An unstoreable measurement raises loudly instead of writing NULLs."""
+    canonical = tmp_path / "e.canonical.mcap"
+    canonical.write_bytes(b"episode-bytes")
+    row = CheckRunRow(
+        check_name="broken_check",
+        check_version="v1",
+        critical=False,
+        status=hflow.CheckStatus.MEASURED,
+        duration_s=0.1,
+        # cast: the misuse this test exists to refuse.
+        measurements=cast(dict, {"bad": {"nested": 1}}),
     )
-    assert replay.written is False
-    assert replay.run_fingerprint == result.run_fingerprint
+    with pytest.raises(ValueError, match=r"broken_check.*'bad'.*dict"):
+        Catalog(tmp_path / "catalog").append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[row],
+        )
 
 
 def test_crash_repaired_append_keeps_one_recorded_at_across_tables(tmp_path: Path) -> None:

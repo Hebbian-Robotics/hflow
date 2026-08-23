@@ -35,11 +35,12 @@ import hashlib
 import json
 import tempfile
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import duckdb
+import numpy as np
 
 from hflow.format import CATALOG_FORMAT_VERSION
 from hflow.steps import CheckResult, CheckStatus, Interval, MeasurementValue
@@ -255,6 +256,31 @@ def content_episode_id(canonical_path: Path) -> str:
     return digest.hexdigest()[:16]
 
 
+def _normalized_measurements(
+    check_name: str, measurements: dict[str, MeasurementValue]
+) -> dict[str, MeasurementValue]:
+    """Coerce NumPy scalars to Python scalars; refuse anything else loudly.
+
+    Real check code returns NumPy scalars (np.mean(), indexing, np.bool_
+    verdicts), and only np.float64 subclasses a Python type -- the rest used
+    to fall through every storage branch into all-NULL value columns while
+    the key still landed. Coercion happens here, before anything consumes
+    the values, so one np.float32(0.4) and float(0.4) outcome fingerprints
+    and stores identically instead of splitting into two runs.
+    """
+    normalized: dict[str, MeasurementValue] = {}
+    for key, value in measurements.items():
+        if isinstance(value, np.generic):
+            value = value.item()
+        if not isinstance(value, MeasurementValue):
+            raise ValueError(
+                f"check {check_name!r} measured {key!r} as {type(value).__name__}: "
+                "measurements hold one int/float/str/bool per key"
+            )
+        normalized[key] = value
+    return normalized
+
+
 def _run_fingerprint(
     episode_id: str,
     pipeline_version: str,
@@ -283,11 +309,8 @@ def _run_fingerprint(
         }
         for row in check_rows
     ]
-    # default=repr: measurement values are user data and may be non-JSON
-    # scalars (numpy integers/bools reach here untouched); repr keeps the
-    # fingerprint deterministic instead of crashing the whole append.
     check_outcomes.sort(
-        key=lambda outcome: json.dumps(outcome, sort_keys=True, separators=(",", ":"), default=repr)
+        key=lambda outcome: json.dumps(outcome, sort_keys=True, separators=(",", ":"))
     )
     payload = json.dumps(
         {
@@ -298,7 +321,6 @@ def _run_fingerprint(
         },
         sort_keys=True,
         separators=(",", ":"),
-        default=repr,
     )
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
@@ -451,6 +473,14 @@ class Catalog:
         address for local roots).
         """
         episode_id = content_episode_id(canonical_path)
+        # One normalized shape feeds every consumer below -- the run
+        # fingerprint, the replay repair pass, and the dependent-table
+        # inserts. Normalizing any later would let np.float32(0.4) and
+        # float(0.4) hash as two outcomes while storing NULL columns.
+        check_rows = [
+            replace(row, measurements=_normalized_measurements(row.check_name, row.measurements))
+            for row in check_rows
+        ]
         run_fingerprint = _run_fingerprint(
             episode_id,
             stamps.pipeline_version,

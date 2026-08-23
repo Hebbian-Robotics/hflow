@@ -74,6 +74,8 @@ def test_enrichment_wrong_return_type_is_an_error(source_episode: Path, tmp_path
 def test_enrichment_labels_and_artifacts_land_in_the_catalog(
     source_episode: Path, tmp_path: Path
 ) -> None:
+    import numpy as np
+
     data_root = tmp_path / "data"
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()
@@ -84,7 +86,14 @@ def test_enrichment_labels_and_artifacts_land_in_the_catalog(
         artifact_path = artifact_dir / "segments.json"
         artifact_path.write_text(json.dumps({"segments": []}))
         return hflow.EnrichmentResult(
-            labels={"caption": "synthetic joints wiggle", "confidence": 0.9},
+            labels=cast(
+                dict,
+                {
+                    "caption": "synthetic joints wiggle",
+                    # real labelers return NumPy scalars; they must store, not NULL out
+                    "confidence": np.float32(0.9),
+                },
+            ),
             artifacts={"segments": artifact_path},
             tags=["labeled"],
         )
@@ -96,6 +105,10 @@ def test_enrichment_labels_and_artifacts_land_in_the_catalog(
             "SELECT value_text FROM measurements WHERE key = 'caption'"
         ).fetchone()
         assert caption_row == ("synthetic joints wiggle",)
+        confidence_row = connection.execute(
+            "SELECT value_double FROM measurements WHERE key = 'confidence'"
+        ).fetchone()
+        assert confidence_row == pytest.approx((np.float32(0.9).item(),))
         artifact_row = connection.execute(
             "SELECT value_text FROM measurements WHERE key = 'artifact/segments'"
         ).fetchone()

@@ -877,11 +877,11 @@ def test_api_port_accepts_an_int_enum_member(config: RuntimeConfig) -> None:
 def test_api_port_rejects_a_numpy_integer(config: RuntimeConfig) -> None:
     """A numpy integer is not an int, and a config field is not user data.
 
-    catalog.py accommodates numpy scalars in measurements because those are user
-    data mid-append and a crash would cost the whole episode. api_port is set
-    once by the caller, rendered into a .env that is never rewritten, and
-    interpolated into api_base_url, so refusing it costs one line at the call
-    site and nothing downstream.
+    catalog.py coerces numpy scalar measurements at its boundary because
+    those are user data mid-append and refusing would cost the whole episode.
+    api_port is set once by the caller, rendered into a .env that is never
+    rewritten, and interpolated into api_base_url, so refusing it costs one
+    line at the call site and nothing downstream.
     """
     from dataclasses import replace
 
