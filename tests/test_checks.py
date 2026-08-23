@@ -60,6 +60,39 @@ def test_no_two_builtin_checks_claim_the_same_measurement_key(tmp_path: Path) ->
     assert collisions == {}
 
 
+def test_every_builtin_check_registers_bare_and_runs(tmp_path: Path) -> None:
+    """``app.check()(builtin)`` with no wrapper is the documented shortest path
+    (docs/how-to/enable-built-in-checks.md, examples/stress/synthetic.py), and
+    registration content-hashes everything a check references. A built-in that
+    reaches for something unhashable -- an lru_cache-wrapped helper, a client
+    object -- therefore breaks that path at registration while still passing
+    every test that calls it as a plain function.
+    """
+    app = hflow.App("bare-registration", data_root=tmp_path / "data")
+    for builtin in (
+        timestamp_regularity,
+        joint_discontinuity,
+        idle_fraction,
+        episode_duration,
+        content_digest,
+        media_digest,
+        keyframe_interval,
+        camera_fps_conformance,
+        action_integrity,
+        camera_frame_stats,
+        camera_signal_quality,
+    ):
+        app.check()(builtin)
+
+    source = synthesize_episode(
+        tmp_path / "episode.mcap",
+        SyntheticEpisodeSpec(duration_s=2.0, cameras=("wrist_cam",)),
+    )
+    report = app.test(source, verbose=False)
+    assert not report.has_errors, [run.error for run in report.checks if run.error]
+    assert len({run.check.version for run in report.checks}) == len(app.checks)
+
+
 @pytest.fixture(scope="module")
 def jittery_episode(tmp_path_factory: pytest.TempPathFactory) -> hflow.Episode:
     """State-only episode with the +3ms timestamp-offset segment enabled...

@@ -21,10 +21,10 @@ import math
 import re
 import statistics
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-from hflow.ffmpeg._binary import ffmpeg_path
+from hflow.ffmpeg._binary import ffmpeg_path, ffmpeg_version
 
 
 class InstrumentParseError(RuntimeError):
@@ -91,6 +91,10 @@ class FrameStats:
     # ``full_range_detected``.
     out_of_legal_range_mean: float
     out_of_legal_range_max: float
+    # Which binary produced these readings. Builds disagree about absolute luma
+    # by more than rounding, so a reading without its instrument is not
+    # comparable to another. Empty when aggregating text rather than decoding.
+    instrument_version: str = ""
 
 
 # ``metadata=mode=print:file=-`` emits one header per frame followed by
@@ -404,8 +408,12 @@ def frame_stats(
     if completed.returncode != 0:
         stderr_tail = "\n".join(completed.stderr.strip().splitlines()[-5:])
         raise RuntimeError(f"ffmpeg instrument pass failed for {video}: {stderr_tail}")
-    return _stats_from_instrument_output(
+    stats = _stats_from_instrument_output(
         completed.stdout,
         bright_luma_threshold=bright_luma_threshold,
         black_frame_amount_pct=black_frame_amount_pct,
     )
+    # Stamped here rather than read by callers: a check that reached for
+    # ``ffmpeg_version`` itself would capture an lru_cache wrapper, which step
+    # identity cannot content-hash, and registering that check would fail.
+    return replace(stats, instrument_version=ffmpeg_version())
