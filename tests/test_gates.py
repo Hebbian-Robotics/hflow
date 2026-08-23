@@ -12,6 +12,8 @@ from hflow.checks import (
     RECOMMENDED_CAMERA_INTEGRITY,
     idle_fraction,
     joint_discontinuity,
+    trajectory_metrics,
+    trajectory_segments,
 )
 from hflow.steps import compute_check_version, evaluate_gate
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
@@ -81,9 +83,14 @@ def test_no_shipped_gate_thresholds_a_motion_smoothness_key(tmp_path: Path) -> N
     """
     source = _state_only_episode(tmp_path)
     with hflow.Episode(source) as episode:
-        smoothness_keys = set(joint_discontinuity(episode).measurements) | set(
-            idle_fraction(episode).measurements
-        )
+        smoothness_keys: set[str] = set()
+        for smoothness_check in (
+            joint_discontinuity,
+            idle_fraction,
+            trajectory_metrics,
+            trajectory_segments,
+        ):
+            smoothness_keys |= set(smoothness_check(episode).measurements)
     assert smoothness_keys, "fixture produced no smoothness measurements to check against"
 
     shipped_gates = [

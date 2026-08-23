@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import hflow
@@ -18,6 +19,8 @@ from hflow.checks import (
     keyframe_interval,
     media_digest,
     timestamp_regularity,
+    trajectory_metrics,
+    trajectory_segments,
 )
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import TransformConfig, write_canonical_episode
@@ -50,6 +53,8 @@ def test_no_two_builtin_checks_claim_the_same_measurement_key(tmp_path: Path) ->
             "camera_fps_conformance": camera_fps_conformance(episode),
             "action_integrity": action_integrity(episode),
             "camera_signal_quality": camera_signal_quality(episode),
+            "trajectory_metrics": trajectory_metrics(episode),
+            "trajectory_segments": trajectory_segments(episode),
         }
 
     producers_by_key: dict[str, list[str]] = {}
@@ -79,6 +84,8 @@ def test_every_builtin_check_registers_bare_and_runs(tmp_path: Path) -> None:
         keyframe_interval,
         camera_fps_conformance,
         action_integrity,
+        trajectory_metrics,
+        trajectory_segments,
         camera_frame_stats,
         camera_signal_quality,
     ):
@@ -503,3 +510,129 @@ def test_camera_signal_quality_sees_a_blacked_out_segment(tmp_path: Path) -> Non
     luma_p90_mean = result.measurements[f"{camera_topic}/luma_p90_mean"]
     assert isinstance(luma_p10_mean, float) and isinstance(luma_p90_mean, float)
     assert luma_p10_mean < luma_p90_mean / 2.0
+
+
+def test_trajectory_metrics_finds_the_injected_hold(tmp_path: Path) -> None:
+    """A held publisher is motionless, and the fraction is time-weighted over
+    the span actually measured rather than the episode span.
+    """
+    source = synthesize_episode(
+        tmp_path / "held.mcap",
+        SyntheticEpisodeSpec(
+            duration_s=4.0,
+            cameras=(),
+            joint_jump_at_s=None,
+            joint_freeze_segment=(1.0, 2.0),
+        ),
+    )
+    with hflow.Episode(source) as episode:
+        result = trajectory_metrics(episode)
+
+    motionless_fraction = result.measurements["/joint_states/motionless_fraction"]
+    assert isinstance(motionless_fraction, float)
+    # 1 s held out of 4 s measured.
+    assert motionless_fraction == pytest.approx(0.25, abs=0.03)
+    assert result.measurements["/joint_states/non_finite_sample_count"] == 0
+    assert result.measurements["/joint_states/scale_source"] == "raw"
+    peak = result.measurements["/joint_states/peak_velocity"]
+    mean = result.measurements["/joint_states/mean_velocity"]
+    assert isinstance(peak, float) and isinstance(mean, float) and peak >= mean > 0.0
+    assert result.verdict is None
+
+
+def test_trajectory_metrics_moving_stream_is_not_motionless(tmp_path: Path) -> None:
+    source = synthesize_episode(
+        tmp_path / "moving.mcap",
+        SyntheticEpisodeSpec(duration_s=3.0, cameras=(), joint_jump_at_s=None),
+    )
+    with hflow.Episode(source) as episode:
+        result = trajectory_metrics(episode)
+    assert result.measurements["/joint_states/motionless_fraction"] == pytest.approx(0.0)
+
+
+def test_trajectory_metrics_dimension_scales_are_recorded_and_validated(
+    tmp_path: Path,
+) -> None:
+    """Scaling is opt-in and its provenance is recorded, because a normalized
+    number and a raw one are not comparable and nothing else would say which.
+    """
+    source = synthesize_episode(
+        tmp_path / "scaled.mcap",
+        SyntheticEpisodeSpec(duration_s=2.0, cameras=(), joint_count=7),
+    )
+    with hflow.Episode(source) as episode:
+        raw = trajectory_metrics(episode)
+        scaled = trajectory_metrics(episode, dimension_scales=[2.0] * 7)
+        with pytest.raises(ValueError, match="dimension_scales has 3 entries"):
+            trajectory_metrics(episode, dimension_scales=[1.0, 1.0, 1.0])
+        with pytest.raises(ValueError, match="finite and positive"):
+            trajectory_metrics(episode, dimension_scales=[0.0] * 7)
+
+    assert scaled.measurements["/joint_states/scale_source"] == "user"
+    raw_peak = raw.measurements["/joint_states/peak_velocity"]
+    scaled_peak = scaled.measurements["/joint_states/peak_velocity"]
+    assert isinstance(raw_peak, float) and isinstance(scaled_peak, float)
+    # Halving every dimension halves the magnitude over all of them.
+    assert scaled_peak == pytest.approx(raw_peak / 2.0)
+
+
+def test_trajectory_segments_localizes_the_hold(tmp_path: Path) -> None:
+    source = synthesize_episode(
+        tmp_path / "held.mcap",
+        SyntheticEpisodeSpec(
+            duration_s=4.0,
+            cameras=(),
+            joint_jump_at_s=None,
+            joint_freeze_segment=(1.0, 2.0),
+        ),
+    )
+    with hflow.Episode(source) as episode:
+        result = trajectory_segments(episode)
+
+    motionless = [i for i in result.intervals if i.label == "motionless:/joint_states"]
+    assert len(motionless) == 1
+    held_s = (motionless[0].end_ns - motionless[0].start_ns) / 1e9
+    assert held_s == pytest.approx(1.0, abs=0.05)
+    assert result.measurements["/joint_states/motionless_span_count"] == 1
+    assert result.verdict is None
+
+
+def test_trajectory_segments_flags_the_injected_jump_as_a_change(tmp_path: Path) -> None:
+    """The jump is a step discontinuity, so it is the sharpest curvature in the
+    episode and must clear a threshold derived from the episode's own spread.
+    """
+    source = synthesize_episode(
+        tmp_path / "jump.mcap",
+        SyntheticEpisodeSpec(duration_s=4.0, cameras=(), joint_jump_at_s=2.0),
+    )
+    with hflow.Episode(source) as episode:
+        result = trajectory_segments(episode)
+
+    changes = [i for i in result.intervals if i.label == "trajectory_change:/joint_states"]
+    assert changes, "the injected jump must register as a trajectory change"
+    jump_ns = min(changes, key=lambda i: i.start_ns)
+    episode_start_ns = int(episode.channel("/joint_states").timestamps[0])
+    assert (jump_ns.start_ns - episode_start_ns) / 1e9 == pytest.approx(2.0, abs=0.1)
+    # A curvature sample spans three stamps, so a reported span is never empty.
+    assert all(i.end_ns > i.start_ns for i in changes)
+
+    # The episode maximum is owned by trajectory_metrics, so read it there
+    # rather than duplicating the key across two checks.
+    threshold = result.measurements["/joint_states/trajectory_change_threshold"]
+    with hflow.Episode(source) as episode:
+        max_change = trajectory_metrics(episode).measurements["/joint_states/max_trajectory_change"]
+    assert isinstance(threshold, float) and isinstance(max_change, float)
+    assert max_change > threshold
+
+
+def test_trajectory_change_threshold_uses_a_true_weighted_median(tmp_path: Path) -> None:
+    """The threshold must come from a value a sample actually took. An
+    interpolating quantile invents one, which shifts which spans flag.
+    """
+    from hflow.checks import _duration_weighted_median
+
+    values = np.array([1.0, 2.0, 100.0])
+    weights = np.array([1.0, 1.0, 1.0])
+    assert _duration_weighted_median(values, weights) == 2.0
+    # Weight concentrated on the smallest value moves the median onto it.
+    assert _duration_weighted_median(values, np.array([10.0, 1.0, 1.0])) == 1.0

@@ -468,6 +468,234 @@ def content_digest(episode: Episode) -> CheckResult:
     return CheckResult(measurements={"content_digest": digest.hexdigest()})
 
 
+def trajectory_metrics(
+    episode: Episode,
+    *,
+    topic: str = "/joint_states",
+    field: str | None = None,
+    dimension_scales: Sequence[float] | None = None,
+    motionless_speed_epsilon: float = 1e-3,
+    final_pose_window_s: float = 0.5,
+) -> CheckResult:
+    """Episode-scope motion facts, for corpus-relative cuts.
+
+    Records how far and how fast the stream moved, how much of it stood still,
+    and whether it was still settling when the recording stopped -- the inputs
+    to "which episodes in this task group look unlike the others", which is a
+    curation query rather than a per-episode judgment.
+
+    Reported in the stream's own units by default. Pass ``dimension_scales``
+    (one positive divisor per dimension) to normalize dimensions that share no
+    unit, and ``{topic}/scale_source`` records which you got. Deliberately no
+    per-episode auto-scaling: a near-still episode has a tiny observed range, so
+    dividing by it would inflate its own sensor jitter into apparent motion --
+    inverting the metric on exactly the episodes worth catching.
+
+    Evidence only, and this one ships no recommended gate at all: these are
+    motion-smoothness metrics, which are known to invert on real defects
+    (Voxel51's audit scored an early-gripper-release defect better than clean
+    demos), so a threshold HFlow chose would reject the wrong episodes.
+    """
+    profile = _trajectory_profile(episode, topic, field, dimension_scales)
+    if profile is None:
+        return CheckResult(
+            measurements={
+                f"{topic}/trajectory_sample_count": len(episode.channel(topic).timestamps)
+            }
+        )
+
+    measurements: dict[str, MeasurementValue] = {
+        f"{topic}/trajectory_sample_count": len(profile.stamps_ns),
+        f"{topic}/non_finite_sample_count": profile.non_finite_sample_count,
+        f"{topic}/scale_source": profile.scale_source,
+        f"{topic}/motionless_speed_epsilon": motionless_speed_epsilon,
+        # Span of the accepted timeline: one corrupt trailing stamp shortens the
+        # episode rather than stretching it, because it was never accepted.
+        f"{topic}/trajectory_span_s": float((profile.stamps_ns[-1] - profile.stamps_ns[0]) / 1e9),
+    }
+
+    measured = np.isfinite(profile.speeds)
+    if not np.any(measured):
+        return CheckResult(measurements=measurements)
+
+    measured_speeds = profile.speeds[measured]
+    measured_durations_s = profile.step_durations_s[measured]
+    # The denominator is the time actually measured, not the episode span:
+    # dividing by the span would silently count rejected samples as motionless.
+    valid_velocity_s = float(np.sum(measured_durations_s))
+    measurements[f"{topic}/valid_velocity_s"] = valid_velocity_s
+    measurements[f"{topic}/peak_velocity"] = float(np.max(measured_speeds))
+    measurements[f"{topic}/mean_velocity"] = float(
+        np.sum(measured_speeds * measured_durations_s) / valid_velocity_s
+    )
+    if valid_velocity_s > 0:
+        motionless_s = float(
+            np.sum(measured_durations_s[measured_speeds < motionless_speed_epsilon])
+        )
+        measurements[f"{topic}/motionless_fraction"] = motionless_s / valid_velocity_s
+        measurements[f"{topic}/motionless_total_s"] = motionless_s
+
+    measured_curvatures = profile.curvatures[np.isfinite(profile.curvatures)]
+    if len(measured_curvatures):
+        measurements[f"{topic}/trajectory_change_p95"] = float(
+            np.percentile(measured_curvatures, 95)
+        )
+        measurements[f"{topic}/max_trajectory_change"] = float(np.max(measured_curvatures))
+
+    # Was the arm still moving when recording stopped? A high ratio means the
+    # episode was cut mid-motion, which matters for anything learning an
+    # end-of-task pose.
+    final_window_mask = measured & (
+        (profile.stamps_ns[-1] - profile.stamps_ns[:-1]) / 1e9 <= final_pose_window_s
+    )
+    if np.any(final_window_mask):
+        mean_speed = measurements[f"{topic}/mean_velocity"]
+        final_speed = float(np.mean(profile.speeds[final_window_mask]))
+        measurements[f"{topic}/final_pose_speed"] = final_speed
+        if isinstance(mean_speed, float) and mean_speed > 0:
+            measurements[f"{topic}/final_pose_unsettled_ratio"] = final_speed / mean_speed
+    return CheckResult(measurements=measurements)
+
+
+def trajectory_segments(
+    episode: Episode,
+    *,
+    topic: str = "/joint_states",
+    field: str | None = None,
+    dimension_scales: Sequence[float] | None = None,
+    motionless_speed_epsilon: float = 1e-3,
+    min_motionless_span_s: float = 0.4,
+) -> CheckResult:
+    """Where in the episode the motion did something worth looking at.
+
+    The companion to :func:`trajectory_metrics`: that one answers "how does this
+    episode compare", this one answers "when, inside it, did things happen".
+    Emits ``motionless:<topic>``, ``trajectory_change:<topic>``, and
+    ``peak_velocity:<topic>`` intervals in log time, which is what a timeline
+    view renders and what an operator scrubs to.
+
+    The change threshold is derived from the episode's own curvature
+    distribution -- a duration-weighted median plus two robust sigmas, sigma
+    from the median absolute deviation -- so it adapts to how energetic the task
+    is rather than assuming a scale. That makes the count comparable across
+    episodes of one task and NOT comparable across tasks; ranking episodes
+    against their peers is a curation query over
+    ``{topic}/max_trajectory_change``.
+
+    Evidence only, and no recommended gate: see :func:`trajectory_metrics`.
+    """
+    profile = _trajectory_profile(episode, topic, field, dimension_scales)
+    if profile is None:
+        return CheckResult(
+            measurements={f"{topic}/segment_sample_count": len(episode.channel(topic).timestamps)}
+        )
+
+    measurements: dict[str, MeasurementValue] = {
+        f"{topic}/segment_sample_count": len(profile.stamps_ns),
+        f"{topic}/min_motionless_span_s": min_motionless_span_s,
+    }
+    intervals: list[Interval] = []
+
+    # Strict `<`: a speed exactly at the epsilon is moving, not motionless.
+    motionless_mask = np.isfinite(profile.speeds) & (profile.speeds < motionless_speed_epsilon)
+    motionless_intervals = _mask_run_intervals(
+        profile.stamps_ns,
+        motionless_mask,
+        f"motionless:{topic}",
+        min_duration_s=min_motionless_span_s,
+    )
+    intervals.extend(motionless_intervals)
+    measurements[f"{topic}/motionless_span_count"] = len(motionless_intervals)
+
+    measured_curvatures = profile.curvatures[np.isfinite(profile.curvatures)]
+    if len(measured_curvatures) >= 2:
+        # Weight each curvature sample by the time it covers, so an irregularly
+        # sampled stream does not let its dense stretches set the threshold.
+        curvature_weights = (profile.step_durations_s[:-1] + profile.step_durations_s[1:])[
+            np.isfinite(profile.curvatures)
+        ]
+        median_curvature = _duration_weighted_median(measured_curvatures, curvature_weights)
+        robust_sigma = _MEDIAN_ABSOLUTE_DEVIATION_TO_SIGMA * _duration_weighted_median(
+            np.abs(measured_curvatures - median_curvature), curvature_weights
+        )
+        threshold = median_curvature + _CHANGE_SIGMA_MULTIPLIER * robust_sigma
+        # The episode's own maximum is published by ``trajectory_metrics``,
+        # which owns the episode-scope comparison facts; duplicating it here
+        # would make the catalog pick one of the two rows arbitrarily.
+        measurements[f"{topic}/trajectory_change_threshold"] = threshold
+        measurements[f"{topic}/curvature_robust_sigma"] = robust_sigma
+
+        # Strict `>`: a sample exactly at the threshold is not a change. A
+        # curvature sample spans three stamps, so a run ending at sample e ends
+        # at stamps[e + 2] -- using e + 1 would shrink every reported segment.
+        change_mask = np.isfinite(profile.curvatures) & (profile.curvatures > threshold)
+        change_intervals = _curvature_run_intervals(
+            profile.stamps_ns, change_mask, f"trajectory_change:{topic}"
+        )
+        intervals.extend(change_intervals)
+        measurements[f"{topic}/trajectory_change_count"] = len(change_intervals)
+
+    measured = np.isfinite(profile.speeds)
+    if np.any(measured):
+        measured_speeds = profile.speeds[measured]
+        measured_durations_s = profile.step_durations_s[measured]
+        peak_speed = float(np.max(measured_speeds))
+        mean_speed = float(
+            np.sum(measured_speeds * measured_durations_s) / np.sum(measured_durations_s)
+        )
+        measurements[f"{topic}/peak_speed"] = peak_speed
+        measurements[f"{topic}/peak_to_mean_speed_ratio"] = (
+            peak_speed / mean_speed if mean_speed > 0 else 0.0
+        )
+        if mean_speed > 0 and peak_speed > _PEAK_VELOCITY_FLAG_FACTOR * mean_speed:
+            peak_step = int(np.argmax(np.where(measured, profile.speeds, -np.inf)))
+            # The speed belongs to the step, so the moment it was reached is the
+            # step's END, not its start.
+            intervals.append(
+                Interval(
+                    start_ns=int(profile.stamps_ns[peak_step]),
+                    end_ns=int(profile.stamps_ns[peak_step + 1]),
+                    label=f"peak_velocity:{topic}",
+                )
+            )
+    return CheckResult(measurements=measurements, intervals=intervals)
+
+
+def _curvature_run_intervals(
+    stamps_ns: np.ndarray, curvature_mask: np.ndarray, label: str
+) -> list[Interval]:
+    """Contiguous curvature runs as intervals, honouring the three-stamp span.
+
+    Curvature sample ``i`` is computed from stamps ``i``, ``i + 1`` and
+    ``i + 2``, so a run of samples ``r``..``e`` covers ``stamps[r]`` through
+    ``stamps[e + 2]``, clamped to the last stamp.
+    """
+    intervals: list[Interval] = []
+    last_index = len(stamps_ns) - 1
+    run_start: int | None = None
+    for index, in_run in enumerate(curvature_mask):
+        if in_run and run_start is None:
+            run_start = index
+        elif not in_run and run_start is not None:
+            intervals.append(
+                Interval(
+                    start_ns=int(stamps_ns[run_start]),
+                    end_ns=int(stamps_ns[min(index + 1, last_index)]),
+                    label=label,
+                )
+            )
+            run_start = None
+    if run_start is not None:
+        intervals.append(
+            Interval(
+                start_ns=int(stamps_ns[run_start]),
+                end_ns=int(stamps_ns[last_index]),
+                label=label,
+            )
+        )
+    return intervals
+
+
 def camera_signal_quality(
     episode: Episode,
     *,
@@ -629,6 +857,121 @@ def action_integrity(
             if length >= minimum_run_steps
         ],
     )
+
+
+# Trajectory analysis constants. These define what the measurements MEAN, so
+# they are fixed rather than exposed: a configurable sigma multiplier would make
+# two corpora's "trajectory change" counts incomparable, which is the one thing
+# a shared measurement has to avoid. Thresholds a user should own live in
+# curation SQL instead.
+_MEDIAN_ABSOLUTE_DEVIATION_TO_SIGMA = 1.482602218505602
+_CHANGE_SIGMA_MULTIPLIER = 2.0
+_PEAK_VELOCITY_FLAG_FACTOR = 3.0
+_FINAL_POSE_UNSETTLED_FACTOR = 2.0
+
+
+@dataclass(frozen=True)
+class _TrajectoryProfile:
+    """Velocity and curvature of one action stream, with invalid samples masked.
+
+    ``speeds[i]`` is the speed over the step from ``stamps_ns[i]`` to
+    ``stamps_ns[i + 1]``; ``curvatures[i]`` is how much the velocity vector
+    turned between step ``i`` and step ``i + 1``, so it spans
+    ``stamps_ns[i]`` through ``stamps_ns[i + 2]``. Both carry NaN where the
+    underlying samples could not be used.
+    """
+
+    stamps_ns: np.ndarray
+    step_durations_s: np.ndarray
+    speeds: np.ndarray
+    curvatures: np.ndarray
+    non_finite_sample_count: int
+    scale_source: str
+
+
+def _trajectory_profile(
+    episode: Episode,
+    topic: str,
+    field: str | None,
+    dimension_scales: Sequence[float] | None,
+) -> _TrajectoryProfile | None:
+    """``None`` when the stream cannot support a velocity at all."""
+    channel = episode.channel(topic)
+    stamps_ns = channel.timestamps
+    samples = channel.to_numpy(field)
+    if samples.ndim == 1:
+        samples = samples[:, np.newaxis]
+    if len(stamps_ns) < 2:
+        return None
+
+    # Duplicate and backward log times are common in real recordings. Keeping
+    # only strictly-increasing stamps is what stops a zero-length step from
+    # dividing into an infinite speed.
+    advancing = np.ones(len(stamps_ns), dtype=bool)
+    advancing[1:] = np.diff(stamps_ns) > 0
+    stamps_ns = stamps_ns[advancing]
+    samples = samples[advancing]
+    if len(stamps_ns) < 2:
+        return None
+
+    non_finite_sample_count = int(np.count_nonzero(~np.isfinite(samples)))
+    # Whole-sample invalidation: one unusable component makes the entire sample
+    # unusable, because the speed is a magnitude over every dimension at once.
+    # Masking per column instead would keep the other dimensions and quietly
+    # report a smaller motion than actually occurred.
+    sample_is_usable = np.all(np.isfinite(samples), axis=1)
+
+    scales = (
+        np.asarray(dimension_scales, dtype=float)
+        if dimension_scales is not None
+        else np.ones(samples.shape[1])
+    )
+    if scales.shape != (samples.shape[1],):
+        raise ValueError(
+            f"dimension_scales has {scales.shape[0]} entries but {topic!r} carries "
+            f"{samples.shape[1]} dimensions"
+        )
+    if np.any(scales <= 0) or not np.all(np.isfinite(scales)):
+        raise ValueError("every dimension_scales entry must be finite and positive")
+    scaled = samples / scales
+
+    step_durations_s = np.diff(stamps_ns) / 1e9
+    step_is_usable = sample_is_usable[:-1] & sample_is_usable[1:]
+    velocities = np.diff(scaled, axis=0) / step_durations_s[:, np.newaxis]
+    speeds = np.where(step_is_usable, np.linalg.norm(velocities, axis=1), np.nan)
+
+    if len(speeds) >= 2:
+        curvature_is_usable = step_is_usable[:-1] & step_is_usable[1:]
+        curvatures = np.where(
+            curvature_is_usable,
+            np.linalg.norm(np.diff(velocities, axis=0), axis=1),
+            np.nan,
+        )
+    else:
+        curvatures = np.empty(0)
+
+    return _TrajectoryProfile(
+        stamps_ns=stamps_ns,
+        step_durations_s=step_durations_s,
+        speeds=speeds,
+        curvatures=curvatures,
+        non_finite_sample_count=non_finite_sample_count,
+        scale_source="user" if dimension_scales is not None else "raw",
+    )
+
+
+def _duration_weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    """The first value whose cumulative weight reaches half the total.
+
+    Not ``np.median`` and not an interpolating weighted quantile: an
+    interpolated value is one no sample actually took, which on a short stream
+    shifts the change threshold below and so changes which spans flag.
+    """
+    order = np.argsort(values, kind="stable")
+    sorted_weights = weights[order]
+    cumulative = np.cumsum(sorted_weights)
+    half = cumulative[-1] / 2.0
+    return float(values[order][int(np.searchsorted(cumulative, half))])
 
 
 def _mask_run_lengths(step_mask: np.ndarray) -> list[int]:
