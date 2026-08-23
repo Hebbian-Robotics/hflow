@@ -477,6 +477,107 @@ def test_deploy_missing_pipeline_names_the_reason_not_just_the_path(
     assert f"deploy: [Errno 2] No such file or directory: '{missing}'" in streams.err
 
 
+def test_up_reports_a_pipeline_directory_as_a_directory(
+    compose_calls: list[list[str]],
+    healthy_client: None,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The command from the #102 report, end to end.
+
+    The unit test on render_bundle pins the raise, and the ENOENT test above
+    pins the handler, but nothing ran the reported command itself. Anything
+    that later branched on errno between render_bundle and here would regress
+    this to a traceback with the whole suite still green.
+    """
+    a_directory = tmp_path / "pipelines"
+    a_directory.mkdir()
+    bundle_dir = tmp_path / "runtime"
+
+    exit_code = main(
+        [
+            "up",
+            "--pipeline",
+            str(a_directory),
+            "--data-root",
+            str(tmp_path / "data"),
+            "--bundle-dir",
+            str(bundle_dir),
+        ]
+    )
+
+    assert exit_code == 2
+    assert not bundle_dir.exists()
+    assert compose_calls == []
+    streams = capsys.readouterr()
+    assert f"up: [Errno 21] Is a directory: '{a_directory}'" in streams.err
+    assert "No such file or directory" not in streams.err
+    assert "Traceback" not in streams.err
+    assert "containers may still be running" not in streams.err
+
+
+def test_up_reports_a_requirements_directory_as_a_directory(
+    compose_calls: list[list[str]],
+    healthy_client: None,
+    pipeline_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The other `up` raise site, so reverting it alone cannot stay green."""
+    a_directory = tmp_path / "reqs"
+    a_directory.mkdir()
+    bundle_dir = tmp_path / "runtime"
+
+    exit_code = main(
+        [
+            "up",
+            "--pipeline",
+            str(pipeline_file),
+            "--data-root",
+            str(tmp_path / "data"),
+            "--bundle-dir",
+            str(bundle_dir),
+            "--requirements",
+            str(a_directory),
+        ]
+    )
+
+    assert exit_code == 2
+    assert compose_calls == []
+    streams = capsys.readouterr()
+    assert f"up: [Errno 21] Is a directory: '{a_directory}'" in streams.err
+    assert "Traceback" not in streams.err
+
+
+def test_deploy_reports_a_requirements_directory_as_a_directory(
+    pipeline_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The fourth raise site, pinned at the CLI like its three siblings."""
+    a_directory = tmp_path / "reqs"
+    a_directory.mkdir()
+
+    exit_code = main(
+        [
+            "deploy",
+            "--pipeline",
+            str(pipeline_file),
+            "--data-root-uri",
+            "s3://bucket/data",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--requirements",
+            str(a_directory),
+        ]
+    )
+
+    assert exit_code == 2
+    streams = capsys.readouterr()
+    assert f"deploy: [Errno 21] Is a directory: '{a_directory}'" in streams.err
+    assert "Traceback" not in streams.err
+
+
 def test_deploy_pipeline_directory_says_is_a_directory(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -503,9 +604,11 @@ def test_deploy_pipeline_directory_says_is_a_directory(
     )
 
     assert exit_code == 2
+    assert not (tmp_path / "out").exists()
     streams = capsys.readouterr()
     assert f"deploy: [Errno 21] Is a directory: '{a_directory}'" in streams.err
     assert "No such file or directory" not in streams.err
+    assert "Traceback" not in streams.err
 
 
 def test_deploy_missing_requirements_names_the_reason_too(

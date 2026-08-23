@@ -857,11 +857,12 @@ def render_bundle(config: RuntimeConfig, bundle_dir: Path | str) -> BundlePaths:
     pipeline_source = Path(config.pipeline_file)
     if pipeline_source.is_dir():
         # Deliberately FileNotFoundError and not IsADirectoryError: the accurate
-        # class subclasses OSError, not FileNotFoundError, so every existing
-        # `except FileNotFoundError` would stop catching this: nine sites in
-        # this package (cli.py, app.py x2, _compose.py, catalog.py, curation.py,
-        # storage.py, workspace.py) plus callers outside the repo. The errno
-        # carries the accurate text without moving the class. See #100 and #102.
+        # class subclasses OSError, not FileNotFoundError, so an `except
+        # FileNotFoundError` stops catching it. Two such handlers sit in this
+        # call path, cli.py:560 for `up` and cli.py:601 for `deploy`, and both
+        # turn this into exit 2; thirteen more name it elsewhere under
+        # src/hflow/, and callers outside the repo are the real unknown.
+        # The errno carries the accurate text without moving the class. #100.
         raise FileNotFoundError(errno.EISDIR, os.strerror(errno.EISDIR), str(pipeline_source))
     if not pipeline_source.is_file():
         # Three-argument form, as storage.py does: str() then carries the errno
