@@ -84,6 +84,17 @@ hflow curate "SELECT episode_id, uri FROM episodes WHERE task = 'fold_napkin'" \
     --catalog data/catalog --output data/manifest.parquet
 ```
 
+For a query stored in a file, pass `--sql-file` instead of the positional SQL
+string:
+
+```bash
+hflow curate --sql-file query.sql \
+    --catalog data/catalog --output data/manifest.parquet
+```
+
+Pass exactly one of the positional SQL string or `--sql-file`; passing both or
+neither is an error.
+
 The manifest is written **manifest-last**: to a temp file, renamed into place
 only after the query completed, so a partial manifest is unreachable.
 
@@ -277,6 +288,12 @@ duckdb.execute(
 the same way. The only reserved file is the `format_version` marker at the
 catalog root (currently `1`); a breaking layout change bumps it, and readers
 refuse loudly on mismatch.
+
+## Troubleshooting
+
+**`<location> is not a catalog root`.** Pass the catalog location created
+beneath the data root, commonly `<data_root>/catalog`, rather than the data root
+itself. A catalog root contains the `format_version` marker.
 
 ## Current limits
 
