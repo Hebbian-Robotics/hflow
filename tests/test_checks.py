@@ -256,6 +256,10 @@ def test_camera_frame_stats_sees_the_injected_black_segment(tmp_path: Path) -> N
     # No dropped frames were injected: the stored count matches the rate.
     assert result.measurements[f"{camera_topic}/frame_deficit_pct"] == pytest.approx(0.0)
     assert result.measurements[f"{camera_topic}/expected_frame_count"] == message_count
+    # Which binary measured this: a pinned-build bump moves readings without
+    # moving the check's version, so the instrument names itself in the row.
+    instrument = result.measurements["camera_instrument"]
+    assert isinstance(instrument, str) and "ffmpeg version" in instrument
 
 
 def test_media_digest_matches_the_same_footage_under_different_telemetry(

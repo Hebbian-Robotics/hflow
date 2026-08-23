@@ -22,7 +22,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from hflow.episode import Episode
-from hflow.ffmpeg import frame_stats
+from hflow.ffmpeg import ffmpeg_version, frame_stats
 from hflow.steps import (
     CheckResult,
     Comparison,
@@ -257,6 +257,13 @@ def camera_frame_stats(
     selected_cameras = list(cameras) if cameras is not None else episode.cameras
     measurements: dict[str, MeasurementValue] = {}
     intervals: list[Interval] = []
+    if selected_cameras:
+        # Which ffmpeg produced these readings. The check's own version covers
+        # its source and thresholds, but not the binary: different builds
+        # genuinely measure differently, so a pin bump would otherwise move
+        # every camera measurement in the corpus with nothing recording that it
+        # had. Text, so it stays out of the wide view's numeric columns.
+        measurements["camera_instrument"] = ffmpeg_version()
     for topic in selected_cameras:
         stamps_ns = episode.channel(topic).timestamps
         message_count = len(stamps_ns)

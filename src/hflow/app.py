@@ -529,16 +529,20 @@ def _raise_if_measurement_keys_collide(check_rows: Sequence[CheckRunRow]) -> Non
         (name for name in reversed(producers) if name != MEDIA_CONTACT_SHEET_STEP_NAME),
         producers[-1],
     )
+    example_function = re.sub(r"\W+", "_", example_step).strip("_") or "renamed_step"
     raise ValueError(
         f"steps recorded the same measurement key on one episode: {described}. "
         "Every step of one run shares its run_fingerprint and recorded_at, so the "
         "catalog ranks these rows as a tie and one of them silently disappears from "
-        "measurements_latest and from the wide episodes view. Give one step its own "
-        "key namespace, e.g.\n\n"
-        f"    result = ...  # what {example_step!r} returns today\n"
+        "measurements_latest and from the wide episodes view. If both steps are "
+        "meant to run, give one its own key namespace; if one is a duplicate "
+        "registration, drop it. Namespacing looks like:\n\n"
+        f"@app.check(name={example_step!r})\n"
+        f"def {example_function}(ep: hflow.Episode) -> hflow.CheckResult:\n"
+        f"    result = ...  # what {example_step!r} computes today\n"
         "    return hflow.CheckResult(\n"
         f'        measurements={{f"{example_step}/{{key}}": value\n'
-        "                      for key, value in result.measurements.items()}},\n"
+        "                      for key, value in result.measurements.items()},\n"
         "        intervals=result.intervals,\n"
         "        tags=result.tags,\n"
         "    )\n"

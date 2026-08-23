@@ -2,6 +2,7 @@
 
 import functools
 import json
+import textwrap
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
@@ -225,6 +226,9 @@ def test_two_checks_recording_one_measurement_key_are_refused(tmp_path: Path) ->
     assert "'shared_count'" in message
     assert "'first'" in message
     assert "'second'" in message
+    # The suggested fix is pasteable, so it has to parse as written.
+    suggestion = message.split("Namespacing looks like:", 1)[1]
+    compile(textwrap.dedent(suggestion).strip(), "<suggestion>", "exec")
 
 
 def test_a_check_and_an_enrichment_label_collision_is_refused(tmp_path: Path) -> None:

@@ -43,6 +43,7 @@ the whole workflow before adapting it.
 
 Use these when you already know the outcome you need.
 
+- [Enable the built-in quality checks](./how-to/enable-built-in-checks.md)
 - [Port existing processing and quality-check code](./PORTING.md)
 - [Serve a workspace over HTTP](./SERVE.md)
 - [Call an OpenAI vision endpoint from a step](./how-to/call-openai-vision.md)
