@@ -34,6 +34,11 @@ before the subcommand:
 - `--version` prints the installed HFlow version and exits.
 - `-v`, `--verbose` enables verbose logging.
 
+Every subcommand follows the same three-value exit-code convention (0 success,
+1 ran and found something to report, 2 bad input and nothing happened), which
+matters when scripting `up` or `ingest`: see
+[Exit codes](./FORMAT.md#exit-codes).
+
 ## What `up` builds: anatomy of the bundle
 
 ```bash
