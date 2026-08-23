@@ -161,7 +161,7 @@ def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
     stats = hflow.ffmpeg.frame_stats(ep.video("wrist_cam"))  # one decode pass
     return hflow.CheckResult(
         measurements={"black_pct": stats.black_frame_pct},
-        verdict=stats.black_frame_pct < 0.5,  # your threshold
+        verdict=stats.black_frame_pct < 50.0,  # percent; your threshold
     )
 
 

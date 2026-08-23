@@ -127,6 +127,38 @@ these views registered (it is what `curate()` uses; take it and explore):
 - `episodes_latest`, `measurements_latest`: one row per episode / per
   (episode, key), most recent append wins.
 
+### Naming measurement keys
+
+Because every numeric key becomes a column of the wide view, key names are a
+queryable surface with no rename path: old rows keep the old name forever.
+Three rules, in decreasing order of how much it hurts to get them wrong.
+
+**One key, one owner.** Every step of a run shares that run's fingerprint and
+timestamp, so two steps recording the same key on one episode is a tie
+`measurements_latest` resolves arbitrarily -- one value silently disappears,
+and the survivor is attributed to whichever step the reader assumes. The runner
+refuses this at the point it happens, naming both steps. Prefixing keys with
+their topic avoids it by construction; where a quantity is genuinely
+episode-scoped, prefix it with the check instead.
+
+**Name keys `<topic>/<metric>_<unit>`.** The topic prefix is what keeps two
+cameras (or two checks) from colliding, and it also keeps a key from clashing
+with an episode column like `task` or `uri`, which makes the wide view error.
+Keys containing `/` need double quotes in SQL:
+
+```sql
+SELECT episode_id, "/wrist_cam/compressed/black_frame_pct" AS black_pct
+FROM episodes WHERE black_pct < 5.0
+```
+
+**End the key with a unit the tooling knows.** The workspace UI labels a value
+by the token after the key's last `_`, so `_s`, `_ms`, `_ns`, `_hz`, `_pct`,
+`_ratio`, `_count`, `_bytes`, `_deg`, `_rad`, and `_m` render with their unit
+and anything else renders as a bare number. Avoid the word `duration` in a key
+that is not an episode length: it is read as a candidate for the episode's
+timeline span, so a summed denominator named `..._duration_s` would claim to be
+one.
+
 ### Worked queries
 
 The everyday cut (this is the README example, running for real):
@@ -181,13 +213,15 @@ Per-episode checks record evidence; cohort math (z-score, percentile) is a query
 
 ```sql
 SELECT episode_id,
-       action_rate_hz,
-       (action_rate_hz - AVG(action_rate_hz) OVER ())
-         / STDDEV(action_rate_hz) OVER () AS action_rate_hz_z,
-       PERCENT_RANK() OVER (ORDER BY action_rate_hz) AS action_rate_hz_pct
+       "/joint_states/message_rate_hz" AS rate_hz,
+       (rate_hz - AVG(rate_hz) OVER ()) / STDDEV(rate_hz) OVER () AS rate_hz_z,
+       PERCENT_RANK() OVER (ORDER BY rate_hz) AS rate_hz_pct
 FROM episodes
 WHERE task = 'fold_napkin'
 ```
+
+Measurement keys carry their topic, so they contain `/` and need double quotes
+in SQL; alias them once, as above, and the rest of the query stays readable.
 
 Cohort statistics are corpus-relative. The z-score depends on which rows the query runs over, including any WHERE clause applied before the window, so compute the window over the same filtered cohort you intend to cut. Also note that STDDEV over a single-row cohort is NULL, which is the correct answer: one episode has no cohort to compare against.
 
@@ -247,6 +281,15 @@ normal, and it must be visible, not inferred. "Ran" means a `check_runs`
 status of `passed`, `failed`, or `measured` (a failed verdict still ran;
 `skipped` and `error` did not produce evidence).
 
+Registration order therefore decides how much evidence a quarantine costs. A
+critical check that quarantines skips every check registered **after** it, and
+those skips are exactly what this block reports as missing coverage -- so
+register gating checks last, after the checks whose measurements you still want
+on a rejected episode. Gating early is how a corpus ends up unable to answer
+why anything was rejected: the evidence that would explain it was never
+gathered, and re-deciding means reprocessing the media rather than writing a
+different query.
+
 ## Enrichment labels and artifacts
 
 Enrichments (`@app.enrich`) record into the same tables, so their outputs
@@ -284,8 +327,10 @@ refuse loudly on mismatch.
   0/1). Text-valued measurements stay in the long `measurements` table;
   query them there.
 - A measurement key that collides with an episode column name (`task`,
-  `uri`, `pipeline_version`, ...) makes the wide view error. Rename the
-  measurement; a `topic/metric` convention avoids the problem entirely.
+  `uri`, `pipeline_version`, ...) makes the wide view error, and the error
+  comes from DuckDB's binder at query time rather than naming the offending
+  key. Follow the [naming rules](#naming-measurement-keys) and it cannot
+  arise.
 - The wide view binds its measurement columns to the keys present when the
   connection was opened. `curate()` reopens per call, so this only matters
   if you hold a long-lived connection from `open_catalog_connection()` while

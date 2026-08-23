@@ -84,23 +84,53 @@ def sharpness(ep: hflow.Episode) -> hflow.CheckResult:
 
 `ep.video()` remuxes the camera's in-band H.264 into a plain MP4 with **no re-encode**: the pixels your check measures are the pixels in the episode. Camera names resolve by full topic or unique substring: `"wrist_cam"` finds `/wrist_cam/compressed`; with a single camera you can omit the argument.
 
-Running your own ffmpeg against that file is endorsed usage, not a workaround:
+For the common camera integrity questions -- blackout, freeze, exposure, frame
+count versus the rate the stream claims -- do not write this one. The packaged
+check already measures every camera in a single decode pass and records freeze
+spans as `freeze:<topic>` intervals, so registering it is the whole job:
 
 ```python
+@app.check()
+def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
+    return hflow.checks.camera_frame_stats(ep)
+```
+
+To make it *gate*, attach a policy at registration rather than rewriting the
+check. HFlow ships a recommended one you can pass as-is or copy with your own
+numbers, and a failing gate on a `critical` check quarantines the episode:
+
+```python
+@app.check(critical=True, gate=hflow.checks.RECOMMENDED_CAMERA_INTEGRITY)
+def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
+    return hflow.checks.camera_frame_stats(ep)
+
+
+# Your own bar instead: same shape, your numbers.
+STRICTER = hflow.Gate(
+    accept_when=(
+        hflow.Threshold("*black_frame_pct", hflow.Comparison.AT_MOST, 5.0),
+        hflow.Threshold("*freeze_total_s", hflow.Comparison.AT_MOST, 1.0),
+    )
+)
+```
+
+Gating this way keeps the evidence: the check still records every measurement
+whether the gate accepts or rejects. Computing a verdict *inside* the check and
+returning a fresh `CheckResult(verdict=...)` throws away the measurements the
+instrument already produced -- roughly nine per camera plus intervals.
+
+Register any gating check **last**. A critical quarantine skips every check
+after it, and skipped steps do not count toward coverage.
+
+Below the packaged check are the raw instrument and plain ffmpeg, for the
+questions it does not answer. Both are endorsed usage, not workarounds:
+
+```python
+stats = hflow.ffmpeg.frame_stats(ep.video("wrist_cam"))  # one decode pass
+# stats.black_frame_pct, stats.freeze_intervals, stats.luma_avg_mean, ...
+
 subprocess.run(["ffmpeg", "-i", str(ep.video("wrist_cam")), ...], check=True)
 ```
-
-For the common camera integrity questions (blackout, freeze, exposure) the built-in single-decode instrument already exists (one pass, one shared frame denominator):
-
-```python
-stats = hflow.ffmpeg.frame_stats(ep.video("wrist_cam"))
-# stats.black_frame_pct, stats.freeze_intervals, stats.luma_avg_mean, ...
-```
-
-The packaged check `hflow.checks.camera_frame_stats(ep)` wraps that instrument
-over every camera, adds the frame-count-vs-expected-rate comparison, and
-returns the results (freeze spans included, as `freeze:<topic>` intervals) as
-a ready-to-register `CheckResult`.
 
 ## Dialect 3: JPEG frames and your own VLM client
 
@@ -212,12 +242,17 @@ The same is true outside checks entirely: canonical episodes open in Foxglove, R
 
 | Field | Type | Meaning |
 |---|---|---|
-| `measurements` | `dict[str, float \| int \| str \| bool]` | Named facts. Keys are flat strings and become catalog columns (record a run with `app.test(..., record=True)`, then query with `hflow.curate()` or any Parquet reader); a `topic/metric` convention keeps them queryable. |
+| `measurements` | `dict[str, float \| int \| str \| bool]` | Named facts that become catalog columns (record a run with `app.test(..., record=True)`, then query with `hflow.curate()` or any Parquet reader). Name them `<topic>/<metric>_<unit>`: the topic prefix keeps two steps from claiming one key, and the unit suffix is what the workspace UI labels the value with. |
 | `intervals` | `list[hflow.Interval]` | Labeled time spans; `Interval(start_ns, end_ns, label)` in nanoseconds of log time (the same clock as `ChannelData.timestamps`). |
 | `tags` | `list[str]` | Free-form labels routed to the catalog. |
-| `verdict` | `bool \| None` | Optional, user-owned. `None` means evidence only. `False` on a `critical` check quarantines the episode. |
+| `verdict` | `bool \| None` | Optional, user-owned. `None` means evidence only. `False` on a `critical` check quarantines the episode. Prefer `@app.check(gate=...)` over computing this inline: a gate is evaluated over the measurements you already returned, so a threshold aimed at a missing key cannot cost you the evidence. |
 
-Every recorded result also carries the check's version (a content hash of its configuration and source), so re-running a changed check appends new-version rows instead of silently overwriting old ones.
+One measurement key may have only one owner. Every step of a run shares that
+run's fingerprint and timestamp, so two steps recording the same key on one
+episode is a tie the catalog resolves arbitrarily -- one value would silently
+disappear. The runner refuses it, naming both steps.
+
+Every recorded result also carries the check's version (a content hash of its configuration and source, including any gate you attached), so re-running a changed check -- or a retuned threshold -- appends new-version rows instead of silently overwriting old ones.
 
 ## The dev loop
 

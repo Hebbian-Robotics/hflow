@@ -18,6 +18,38 @@ from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import TransformConfig, write_canonical_episode
 
 
+def test_no_two_builtin_checks_claim_the_same_measurement_key(tmp_path: Path) -> None:
+    """The catalog ranks measurement rows per (episode_id, key) and every step of
+    one run shares that run's fingerprint and timestamp, so two checks emitting
+    one key on one episode is a tie one of them silently loses. Registering the
+    built-ins together is the documented path (examples/stress/synthetic.py), so
+    their key namespaces must not overlap.
+    """
+    source = synthesize_episode(
+        tmp_path / "episode.mcap",
+        SyntheticEpisodeSpec(duration_s=3.0, cameras=("wrist_cam",), joint_jump_at_s=1.5),
+    )
+    canonical = tmp_path / "episode.canonical.mcap"
+    write_canonical_episode(source, canonical, TransformConfig())
+    with hflow.Episode(canonical) as episode:
+        results_by_check = {
+            "timestamp_regularity": timestamp_regularity(episode),
+            "joint_discontinuity": joint_discontinuity(episode),
+            "idle_fraction": idle_fraction(episode),
+            "camera_frame_stats": camera_frame_stats(episode),
+            "episode_duration": episode_duration(episode),
+            "action_rate": action_rate(episode, topics=["/joint_states"]),
+            "content_digest": content_digest(episode),
+        }
+
+    producers_by_key: dict[str, list[str]] = {}
+    for check_name, result in results_by_check.items():
+        for key in result.measurements:
+            producers_by_key.setdefault(key, []).append(check_name)
+    collisions = {key: names for key, names in producers_by_key.items() if len(names) > 1}
+    assert collisions == {}
+
+
 @pytest.fixture(scope="module")
 def jittery_episode(tmp_path_factory: pytest.TempPathFactory) -> hflow.Episode:
     """State-only episode with the +3ms timestamp-offset segment enabled...
@@ -44,7 +76,7 @@ def test_declared_rate_beats_median_inference(jittery_episode: hflow.Episode) ->
         expected_hz={"/joint_states": 50.0},  # actual: 100 Hz
         tolerance_s=0.001,
     )
-    violation_pct = result.measurements["/joint_states/violation_pct"]
+    violation_pct = result.measurements["/joint_states/period_violation_pct"]
     assert isinstance(violation_pct, float)
     assert violation_pct == 100.0
 
@@ -52,7 +84,7 @@ def test_declared_rate_beats_median_inference(jittery_episode: hflow.Episode) ->
 def test_offset_segment_is_flagged_at_tight_tolerance(jittery_episode: hflow.Episode) -> None:
     camera_topic = "/wrist_cam/compressed"
     result = timestamp_regularity(jittery_episode, topics=[camera_topic], tolerance_s=0.001)
-    violation_pct = result.measurements[f"{camera_topic}/violation_pct"]
+    violation_pct = result.measurements[f"{camera_topic}/period_violation_pct"]
     assert isinstance(violation_pct, float)
     # The +3ms offset produces exactly two anomalous deltas (entry and exit).
     assert violation_pct > 0.0
@@ -124,10 +156,33 @@ def test_episode_duration_matches_the_synthesized_span(jittery_episode: hflow.Ep
 
 def test_action_rate_matches_the_synthesized_rate(jittery_episode: hflow.Episode) -> None:
     result = action_rate(jittery_episode, topics=["/joint_states"])
-    action_rate_hz = result.measurements["action_rate_hz"]
-    assert isinstance(action_rate_hz, float)
+    rate_hz = result.measurements["/joint_states/message_rate_hz"]
+    assert isinstance(rate_hz, float)
     # the synthetic joint stream runs at 100 Hz by SyntheticEpisodeSpec default
-    assert action_rate_hz == pytest.approx(100.0, abs=0.5)
+    assert rate_hz == pytest.approx(100.0, abs=0.5)
+
+
+def test_action_rate_reports_each_topic_at_its_own_rate(
+    jittery_episode: hflow.Episode,
+) -> None:
+    """Pooling several topics into one figure reported their sum as if it were
+    a rate any single stream ran at. Each topic now answers for itself, and the
+    pooled throughput is named as the different quantity it is.
+    """
+    camera_topic = "/wrist_cam/compressed"
+    result = action_rate(jittery_episode, topics=["/joint_states", camera_topic])
+
+    joint_rate_hz = result.measurements["/joint_states/message_rate_hz"]
+    camera_rate_hz = result.measurements[f"{camera_topic}/message_rate_hz"]
+    pooled_rate_hz = result.measurements["pooled_message_rate_hz"]
+    assert isinstance(joint_rate_hz, float)
+    assert isinstance(camera_rate_hz, float)
+    assert isinstance(pooled_rate_hz, float)
+
+    # Adding a 15 Hz camera must not inflate what the 100 Hz joint stream reports.
+    assert joint_rate_hz == pytest.approx(100.0, abs=0.5)
+    assert camera_rate_hz == pytest.approx(15.0, abs=0.5)
+    assert pooled_rate_hz > joint_rate_hz
 
 
 def test_content_digest_identifies_duplicate_content(tmp_path: Path) -> None:

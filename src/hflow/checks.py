@@ -4,6 +4,15 @@ verdicts; thresholds user-owned). Wrap them to register::
     @app.check()
     def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.checks.timestamp_regularity(ep, tolerance_s=0.010)
+
+No two checks here may claim the same measurement key. The catalog ranks
+measurement rows per ``(episode_id, key)`` and every step of one run shares
+that run's fingerprint and timestamp, so two checks emitting one key on one
+episode is a tie one of them silently loses -- vanishing from
+``measurements_latest`` and from the wide ``episodes`` view built on it. Hence
+the per-check prefixes on otherwise-identical quantities
+(``period_sample_count``, ``velocity_sample_count``, ``idle_sample_count``)
+rather than a shared ``message_count``.
 """
 
 import hashlib
@@ -14,7 +23,40 @@ import numpy as np
 
 from hflow.episode import Episode
 from hflow.ffmpeg import frame_stats
-from hflow.steps import CheckResult, Interval, MeasurementValue
+from hflow.steps import (
+    CheckResult,
+    Comparison,
+    Gate,
+    Interval,
+    MeasurementValue,
+    Threshold,
+)
+
+# Recommended camera-integrity thresholds over the keys `camera_frame_stats`
+# emits. Shipped as a VALUE, not a default: nothing gates until a pipeline
+# passes it to `@app.check(gate=...)`. Copy it with your own numbers to tune,
+# or build a Gate of your own.
+#
+# Deliberately no motion-smoothness clause. Smoothness metrics ship as flags
+# only, never a default reject rule -- Voxel51's audit found them scoring an
+# early-gripper-release defect BETTER than clean demos, so a shipped threshold
+# on one would reject the wrong episodes with our name on it. Nothing here
+# matches a key from `joint_discontinuity` or `idle_fraction`, and
+# `tests/test_gates.py` pins that.
+#
+# `*black_frame_pct` rather than `*/black_frame_pct`: the glob's `*` crosses
+# `/`, but a leading `*/` still requires one, and examples/egocentric emits the
+# key unprefixed. This form covers both shapes.
+RECOMMENDED_CAMERA_INTEGRITY = Gate(
+    accept_when=(
+        # Half the episode blind is a dead camera, not a matter of taste. The
+        # number the README, quickstart, and end-to-end camera gates all use.
+        Threshold("*black_frame_pct", Comparison.AT_MOST, 50.0),
+        # Matches camera_frame_stats' own freeze_min_duration_s default, so the
+        # metric and the threshold agree on what counts as a freeze.
+        Threshold("*freeze_total_s", Comparison.AT_MOST, 2.0),
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -112,14 +154,14 @@ def timestamp_regularity(
     for topic in selected:
         stamps_ns = episode.channel(topic).timestamps
         if len(stamps_ns) < 2:
-            measurements[f"{topic}/message_count"] = len(stamps_ns)
+            measurements[f"{topic}/period_sample_count"] = len(stamps_ns)
             continue
         deltas_s = np.diff(stamps_ns) / 1e9
         declared_hz = (expected_hz or {}).get(topic)
         expected_period_s = 1.0 / declared_hz if declared_hz else float(np.median(deltas_s))
         violation_mask = np.abs(deltas_s - expected_period_s) > tolerance_s
         measurements[f"{topic}/median_dt_s"] = float(np.median(deltas_s))
-        measurements[f"{topic}/violation_pct"] = float(np.mean(violation_mask) * 100.0)
+        measurements[f"{topic}/period_violation_pct"] = float(np.mean(violation_mask) * 100.0)
         measurements[f"{topic}/max_gap_s"] = float(np.max(deltas_s))
         gap_indices: list[int] = np.flatnonzero(deltas_s > gap_factor * expected_period_s).tolist()
         intervals.extend(
@@ -169,7 +211,7 @@ def joint_discontinuity(
     profile = _joint_motion_profile(episode, topic, field)
     if profile is None:
         return CheckResult(
-            measurements={f"{topic}/message_count": len(episode.channel(topic).timestamps)}
+            measurements={f"{topic}/velocity_sample_count": len(episode.channel(topic).timestamps)}
         )
     violation_mask = profile.per_step_max_speed > velocity_limit
     return CheckResult(
@@ -279,7 +321,7 @@ def idle_fraction(
     profile = _joint_motion_profile(episode, topic, field)
     if profile is None:
         return CheckResult(
-            measurements={f"{topic}/message_count": len(episode.channel(topic).timestamps)}
+            measurements={f"{topic}/idle_sample_count": len(episode.channel(topic).timestamps)}
         )
     idle_mask = profile.per_step_max_speed < velocity_epsilon
     positive_deltas_s = np.where(profile.deltas_s > 0, profile.deltas_s, 0.0)
@@ -336,36 +378,48 @@ def episode_duration(episode: Episode, *, topics: Sequence[str] | None = None) -
 
 
 def action_rate(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
-    """Mean message rate of the given action topics, in hertz.
+    """Message rate of each given action topic, in hertz, plus a pooled total.
+
+    Per topic, over that topic's own span -- so three 100 Hz streams read
+    100 Hz each, not one number. ``pooled_message_rate_hz`` is the combined
+    throughput over the union span, useful for "how much command traffic did
+    this episode carry" but NOT a rate any single stream ran at; it rises with
+    the number of topics you pass.
 
     Speed-vs-skill is a corpus-relative judgment, so it cannot be decided
     inside a per-episode check; this check records the evidence and the cut
     is a curation query, e.g.::
 
-        SELECT episode_id FROM episodes WHERE action_rate_hz_z > 1.645
+        SELECT episode_id FROM episodes
+        WHERE "/joint_states/message_rate_hz_z" > 1.645
 
-    (the window function producing action_rate_hz_z is documented in the
+    (the window function producing the ``_z`` column is documented in the
     Cohort statistics section of docs/CATALOG.md).
     """
+    measurements: dict[str, MeasurementValue] = {}
     start_candidates_ns: list[int] = []
     end_candidates_ns: list[int] = []
-    message_count_total = 0
-    streams_with_messages = 0
+    interval_count_total = 0
     for topic in topics:
         stamps_ns = episode.channel(topic).timestamps
         if len(stamps_ns) == 0:
             continue
-        message_count_total += len(stamps_ns)
-        streams_with_messages += 1
         start_candidates_ns.append(int(stamps_ns[0]))
         end_candidates_ns.append(int(stamps_ns[-1]))
-    span_s = (
+        # n timestamps on a stream define n - 1 intervals
+        interval_count = len(stamps_ns) - 1
+        interval_count_total += interval_count
+        topic_span_s = float((stamps_ns[-1] - stamps_ns[0]) / 1e9)
+        measurements[f"{topic}/message_rate_hz"] = (
+            interval_count / topic_span_s if topic_span_s > 0 else 0.0
+        )
+    union_span_s = (
         (max(end_candidates_ns) - min(start_candidates_ns)) / 1e9 if start_candidates_ns else 0.0
     )
-    # n timestamps on a stream define n - 1 intervals
-    interval_count = message_count_total - streams_with_messages
-    action_rate_hz = interval_count / span_s if span_s > 0 else 0.0
-    return CheckResult(measurements={"action_rate_hz": action_rate_hz})
+    measurements["pooled_message_rate_hz"] = (
+        interval_count_total / union_span_s if union_span_s > 0 else 0.0
+    )
+    return CheckResult(measurements=measurements)
 
 
 def content_digest(episode: Episode) -> CheckResult:

@@ -196,6 +196,92 @@ def test_step_version_includes_captured_configuration() -> None:
     assert low_threshold_version != high_threshold_version
 
 
+def _state_only_episode(tmp_path: Path) -> Path:
+    """A cheap episode with no cameras, so no ffmpeg runs."""
+    return synthesize_episode(
+        tmp_path / "episode.mcap",
+        SyntheticEpisodeSpec(duration_s=2.0, cameras=()),
+    )
+
+
+def test_two_checks_recording_one_measurement_key_are_refused(tmp_path: Path) -> None:
+    """Every step of one run shares its fingerprint and timestamp, so a shared
+    key is a tie the catalog resolves arbitrarily -- one step's value silently
+    disappears. Refuse it where it is still fixable.
+    """
+    app = hflow.App("key-collision", data_root=tmp_path / "data")
+
+    @app.check()
+    def first(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"shared_count": 1})
+
+    @app.check()
+    def second(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"shared_count": 2})
+
+    with pytest.raises(ValueError, match="same measurement key") as failure:
+        app.test(_state_only_episode(tmp_path), verbose=False)
+    message = str(failure.value)
+    assert "'shared_count'" in message
+    assert "'first'" in message
+    assert "'second'" in message
+
+
+def test_a_check_and_an_enrichment_label_collision_is_refused(tmp_path: Path) -> None:
+    """Checks and enrichment labels share one measurement-key namespace."""
+    app = hflow.App("key-collision-enrich", data_root=tmp_path / "data")
+
+    @app.check()
+    def measures(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"overlap": 1})
+
+    @app.enrich()
+    def labels(ep: hflow.Episode) -> hflow.EnrichmentResult:
+        return hflow.EnrichmentResult(labels={"overlap": 2})
+
+    with pytest.raises(ValueError, match="same measurement key"):
+        app.test(_state_only_episode(tmp_path), verbose=False)
+
+
+def test_the_dev_loop_refuses_a_collision_without_recording(tmp_path: Path) -> None:
+    """The guard runs outside ``if record:`` so it fires on episode one rather
+    than at the first curation query.
+    """
+    app = hflow.App("key-collision-dev", data_root=tmp_path / "data")
+
+    @app.check()
+    def left(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"same": 1.0})
+
+    @app.check()
+    def right(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"same": 2.0})
+
+    with pytest.raises(ValueError, match="same measurement key"):
+        app.process(_state_only_episode(tmp_path), record=False)
+
+    catalog_root = tmp_path / "data" / "catalog"
+    assert list(catalog_root.rglob("*.parquet")) == []
+
+
+def test_two_steps_may_share_a_tag(tmp_path: Path) -> None:
+    """Tags carry check_name and have no per-key latest ranking, so sharing one
+    loses nothing -- the guard must not overreach into them.
+    """
+    app = hflow.App("shared-tag", data_root=tmp_path / "data")
+
+    @app.check()
+    def first(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"first_count": 1}, tags=["reviewed"])
+
+    @app.check()
+    def second(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"second_count": 2}, tags=["reviewed"])
+
+    report = app.test(_state_only_episode(tmp_path), verbose=False)
+    assert not report.has_errors
+
+
 def test_check_with_required_extra_parameter_fails_at_registration() -> None:
     app = hflow.App("signature-guard", data_root=Path("/tmp"))
 

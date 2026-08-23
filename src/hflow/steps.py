@@ -12,9 +12,11 @@ import functools
 import hashlib
 import inspect
 import json
-from collections.abc import Callable
+import math
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum, StrEnum
+from fnmatch import fnmatchcase
 from pathlib import Path
 from types import CodeType, ModuleType
 from typing import TYPE_CHECKING, TypeAlias
@@ -126,6 +128,169 @@ class CheckResult:
 CheckFunction = Callable[["Episode"], CheckResult]
 
 
+class Comparison(StrEnum):
+    """How a threshold compares a measurement to its value. Both inclusive."""
+
+    AT_MOST = "at_most"  # accept while measurement <= value
+    AT_LEAST = "at_least"  # accept while measurement >= value
+
+
+class Aggregation(StrEnum):
+    """How a threshold folds the several keys one pattern matches.
+
+    Measurement keys carry run-time topic names, so one pattern routinely
+    matches once per camera. ``EVERY_KEY`` reads "no camera may be blacked
+    out"; ``ANY_KEY`` reads "at least one camera is usable".
+    """
+
+    EVERY_KEY = "every_key"
+    ANY_KEY = "any_key"
+
+
+@dataclass(frozen=True)
+class Threshold:
+    """One accept condition over the measurement keys a glob matches.
+
+    ``key_pattern`` is an :func:`fnmatch.fnmatchcase` glob over measurement
+    keys. ``*`` crosses ``/``, so ``*/black_frame_pct`` matches
+    ``/wrist_cam/compressed/black_frame_pct`` but NOT a bare
+    ``black_frame_pct``; write ``*black_frame_pct`` to cover both.
+    """
+
+    key_pattern: str
+    comparison: Comparison
+    value: float
+    across: Aggregation = Aggregation.EVERY_KEY
+
+    def __post_init__(self) -> None:
+        if not self.key_pattern:
+            raise ValueError(
+                "threshold key_pattern must not be empty; it is a glob over "
+                "measurement keys, e.g. '*/black_frame_pct'"
+            )
+        if math.isnan(self.value):
+            raise ValueError(
+                f"threshold value for {self.key_pattern!r} must be a number, not NaN: "
+                "every comparison against NaN is False, so this gate would reject "
+                "every episode it evaluated"
+            )
+
+    def holds(self, measurement: float) -> bool:
+        match self.comparison:
+            case Comparison.AT_MOST:
+                return measurement <= self.value
+            case Comparison.AT_LEAST:
+                return measurement >= self.value
+
+
+@dataclass(frozen=True)
+class Gate:
+    """A verdict policy a pipeline attaches to one check: ``@app.check(gate=...)``.
+
+    Every threshold must hold for the episode to be accepted. HFlow ships
+    recommended gates as values (see ``hflow.checks``) and nothing gates until
+    a pipeline passes one in -- so a threshold can have a documented default
+    without a corpus ever being quarantined by a number its owner never chose.
+
+    The runner evaluates a gate over the evidence the check returned, never
+    inside the check: a threshold applied inside would raise on a key that
+    episode never produced, and the runner would record that as an
+    infrastructure error, discarding every measurement already computed.
+
+    A gate reads only the measurements of the check it is attached to. Policy
+    spanning checks is a curation query (docs/ARCHITECTURE.md layer 3): a
+    cross-check gate would depend on registration order and its version would
+    lie about what it depends on.
+    """
+
+    accept_when: tuple[Threshold, ...]
+
+    def __post_init__(self) -> None:
+        if not self.accept_when:
+            raise ValueError(
+                "Gate(accept_when=()) holds no thresholds, so it would accept every "
+                "episode without reading a measurement -- a verdict claiming a check "
+                "passed when nothing was checked. Pass at least one threshold, e.g.\n\n"
+                "    hflow.Gate(accept_when=(\n"
+                '        hflow.Threshold("*/black_frame_pct", hflow.Comparison.AT_MOST, 50.0),\n'
+                "    ))\n"
+            )
+
+
+@dataclass(frozen=True)
+class GateDecided:
+    """The gate owns this verdict."""
+
+    verdict: bool
+
+
+@dataclass(frozen=True)
+class GateAbstained:
+    """The gate cannot claim a pass, so it offers no verdict.
+
+    The named patterns matched no measurement key at all (a key this episode
+    never produced, or a typo), or matched values that are not real numbers.
+    Silence is the honest outcome: a partial conjunction reported as a pass
+    would be a quality claim about evidence nobody looked at.
+    """
+
+    unevaluated_patterns: tuple[str, ...]
+
+
+GateDecision = GateDecided | GateAbstained
+
+# Recorded when a gate could not read a threshold, so one aimed at a key that
+# never exists is a query away instead of invisible.
+GATE_UNEVALUATED_TAG_PREFIX = "gate-unevaluated:"
+
+
+def evaluate_gate(gate: Gate, measurements: Mapping[str, MeasurementValue]) -> GateDecision:
+    """Fold a gate over one check's measurements. Pure: no episode, no I/O.
+
+    A gate is a conjunction, and the two outcomes are not symmetric. Rejecting
+    needs only one threshold to fail -- no amount of unread evidence can make a
+    conjunction true once a conjunct is false -- so a reject stands even when
+    other thresholds could not be evaluated. Accepting needs every threshold
+    read, so an unevaluable one abstains rather than passing: otherwise a
+    typo'd key would quietly weaken a gate into approving what it never
+    inspected.
+    """
+    unevaluated: list[str] = []
+    verdict = True
+    for threshold in gate.accept_when:
+        matched = [
+            value
+            for key, value in sorted(measurements.items())
+            if fnmatchcase(key, threshold.key_pattern)
+        ]
+        comparable = [
+            float(value)
+            for value in matched
+            if isinstance(value, int | float)
+            and not isinstance(value, bool)
+            and not math.isnan(value)
+        ]
+        # Evaluable only when at least one key matched AND every match held a
+        # real number. Ignoring the odd text or NaN value would evaluate a
+        # partial conjunction and report it as a whole one.
+        if not comparable or len(comparable) != len(matched):
+            unevaluated.append(threshold.key_pattern)
+            continue
+        holds = [threshold.holds(value) for value in comparable]
+        match threshold.across:
+            case Aggregation.EVERY_KEY:
+                verdict = verdict and all(holds)
+            case Aggregation.ANY_KEY:
+                verdict = verdict and any(holds)
+    # A failed conjunct settles the conjunction, so reject even while blind to
+    # the rest; only claiming a pass requires having read everything.
+    if not verdict:
+        return GateDecided(verdict=False)
+    if unevaluated:
+        return GateAbstained(unevaluated_patterns=tuple(unevaluated))
+    return GateDecided(verdict=True)
+
+
 @dataclass
 class EnrichmentResult:
     """What an enrichment returns: derived labels and artifacts, no verdicts.
@@ -198,6 +363,7 @@ class RegisteredCheck:
     requires: frozenset[str]
     uses: str | None
     version: str
+    gate: Gate | None = None
 
 
 def compute_check_version(
@@ -207,6 +373,8 @@ def compute_check_version(
     requires: frozenset[str],
     uses: str | None,
     declared_version: str | None = None,
+    *,
+    gate: "Gate | None" = None,
 ) -> str:
     """Content-hash a step's implementation and behavior configuration.
 
@@ -215,6 +383,10 @@ def compute_check_version(
     are included when they can be represented deterministically. Pass an
     explicit ``declared_version`` for opaque clients or other configuration
     that cannot be inspected safely.
+
+    A ``gate`` arrives from registration rather than from the function, so it
+    is folded in here: tuning a threshold has to move the version, or two
+    policies share one and curation can no longer pin either.
     """
     if declared_version is not None and not declared_version:
         raise ValueError(f"declared step version must not be empty for step {name!r}")
@@ -237,6 +409,12 @@ def compute_check_version(
             "uses": uses,
             "implementation": implementation_identity,
             "configuration": behavior_configuration,
+            # Present only when a gate is declared, like transform.py's
+            # resample_policy: an unconditional key would re-version every
+            # check, enrichment, and derived channel -- and derived-channel
+            # versions reach pipeline_version, which is stamped inside the
+            # bytes episode_id hashes. One new key would restamp every corpus.
+            **({"gate": _stable_version_identity_value(gate)} if gate is not None else {}),
         },
         sort_keys=True,
         separators=(",", ":"),

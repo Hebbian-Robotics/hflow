@@ -24,7 +24,7 @@ import sys
 import tempfile
 import time
 import traceback
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -49,6 +49,7 @@ from hflow.manifest import (
 )
 from hflow.resample import DerivedSeries
 from hflow.steps import (
+    GATE_UNEVALUATED_TAG_PREFIX,
     RUN_PROFILES,
     CheckFunction,
     CheckResult,
@@ -57,10 +58,14 @@ from hflow.steps import (
     DerivedFunction,
     EnrichmentFunction,
     EnrichmentResult,
+    Gate,
+    GateAbstained,
+    GateDecided,
     RegisteredCheck,
     RegisteredEnrichment,
     Stage,
     compute_check_version,
+    evaluate_gate,
     stages_for_profile,
 )
 from hflow.storage import (
@@ -441,6 +446,129 @@ def _execute_enrichment(
     return enrichment_run
 
 
+def _check_run_rows(report: "TestReport") -> list[CheckRunRow]:
+    """The catalog rows one processed episode records: every check, then every
+    enrichment's labels and published artifact keys.
+
+    One owner, so the collision guard below and the catalog append can never
+    disagree about what would be written. Artifact keys come from
+    ``artifact_uris`` rather than the result's declared artifacts: a step whose
+    artifact failed to publish contributes no key.
+    """
+    check_rows = [
+        CheckRunRow.from_result(
+            check_name=run.check.name,
+            check_version=run.check.version,
+            critical=run.check.critical,
+            status=run.status,
+            duration_s=run.duration_s,
+            error=run.error,
+            result=run.result,
+        )
+        for run in report.checks
+    ]
+    for enrichment_run in report.enrichments:
+        enrichment_result = enrichment_run.result
+        labels: dict[str, float | int | str | bool] = (
+            dict(enrichment_result.labels) if enrichment_result is not None else {}
+        )
+        if enrichment_result is not None:
+            labels.update(
+                {
+                    f"{ARTIFACT_MEASUREMENT_KEY_PREFIX}{artifact_name}": artifact_uri
+                    for artifact_name, artifact_uri in enrichment_run.artifact_uris.items()
+                }
+            )
+        check_rows.append(
+            CheckRunRow(
+                check_name=enrichment_run.enrichment.name,
+                check_version=enrichment_run.enrichment.version,
+                critical=False,
+                status=enrichment_run.status,
+                duration_s=enrichment_run.duration_s,
+                error=enrichment_run.error,
+                measurements=labels,
+                tags=list(enrichment_result.tags) if enrichment_result is not None else [],
+            )
+        )
+    return check_rows
+
+
+def _raise_if_measurement_keys_collide(check_rows: Sequence[CheckRunRow]) -> None:
+    """Refuse a run in which two steps recorded the same measurement key.
+
+    Curation ranks measurement rows per ``(episode_id, key)`` ordered by the
+    owning episode's ``recorded_at`` then ``run_fingerprint``, and every step of
+    ONE run shares both -- so two steps emitting one key on one episode is a
+    total tie, and one row is dropped arbitrarily from ``measurements_latest``
+    and therefore from the wide ``episodes`` view whose columns are enumerated
+    from it. The surviving value is then attributed to whichever step the reader
+    assumes.
+
+    Keys are built from run-time topic names, so registration cannot know them;
+    this is the one place a single episode's checks, enrichment labels, and
+    published artifact keys are all visible together. Tags and intervals are
+    deliberately unguarded: those tables carry ``check_name`` and have no
+    per-key latest ranking, so two steps sharing one loses nothing.
+    """
+    steps_by_key: dict[str, list[str]] = {}
+    for row in check_rows:
+        for key in row.measurements:
+            steps_by_key.setdefault(key, []).append(row.check_name)
+    collisions = {key: names for key, names in steps_by_key.items() if len(names) > 1}
+    if not collisions:
+        return
+    described = "; ".join(
+        f"{key!r} from {', '.join(repr(name) for name in names)}"
+        for key, names in sorted(collisions.items())
+    )
+    # Name a step the caller can actually edit: the built-in media step is not
+    # theirs to rename, so prefer any other producer for the pasteable fix.
+    producers = collisions[sorted(collisions)[0]]
+    example_step = next(
+        (name for name in reversed(producers) if name != MEDIA_CONTACT_SHEET_STEP_NAME),
+        producers[-1],
+    )
+    raise ValueError(
+        f"steps recorded the same measurement key on one episode: {described}. "
+        "Every step of one run shares its run_fingerprint and recorded_at, so the "
+        "catalog ranks these rows as a tie and one of them silently disappears from "
+        "measurements_latest and from the wide episodes view. Give one step its own "
+        "key namespace, e.g.\n\n"
+        f"    result = ...  # what {example_step!r} returns today\n"
+        "    return hflow.CheckResult(\n"
+        f'        measurements={{f"{example_step}/{{key}}": value\n'
+        "                      for key, value in result.measurements.items()}},\n"
+        "        intervals=result.intervals,\n"
+        "        tags=result.tags,\n"
+        "    )\n"
+    )
+
+
+def _apply_gate(registered: RegisteredCheck, run: "CheckRunReport") -> None:
+    """Turn a registered gate into the verdict the meta loop acts on.
+
+    Evaluated here rather than inside user code: a threshold applied inside a
+    check raises on a key this episode never produced, and the runner records
+    that as an infrastructure error -- discarding every measurement the check
+    had already computed. Out here the evidence is recorded either way, and a
+    gate that cannot be evaluated abstains instead of quietly passing.
+    """
+    result = run.result
+    if registered.gate is None or result is None or run.error is not None:
+        return
+    match evaluate_gate(registered.gate, result.measurements):
+        case GateAbstained(unevaluated_patterns=patterns):
+            result.tags.extend(f"{GATE_UNEVALUATED_TAG_PREFIX}{pattern}" for pattern in patterns)
+        case GateDecided(verdict=gate_verdict):
+            # AND with the check's own verdict: a gate is an additional accept
+            # condition the pipeline attached, so it can tighten policy and can
+            # never resurrect an episode the check itself rejected.
+            result.verdict = (
+                gate_verdict if result.verdict is None else (result.verdict and gate_verdict)
+            )
+
+
 def _status_mark(status: CheckStatus) -> str:
     match status:
         case CheckStatus.PASSED:
@@ -683,9 +811,17 @@ class App:
         critical: bool = False,
         requires: Iterable[str] | None = None,
         uses: str | None = None,
+        gate: Gate | None = None,
         version: str | None = None,
     ) -> Callable[[CheckFunction], CheckFunction]:
         """Register a check function. See ``hflow.steps.CheckResult``.
+
+        ``gate`` attaches a pass/fail policy the runner evaluates over the
+        measurements this check returns, so a built-in that records evidence
+        only can gate without being rewritten. HFlow ships recommended gates
+        as values (``hflow.checks.RECOMMENDED_CAMERA_INTEGRITY``); pass one, or
+        a copy with your own numbers. Combined with ``critical=True`` a failing
+        gate quarantines; without it, the run proceeds with a ``failed:`` tag.
 
         ``version`` explicitly identifies opaque configuration that cannot be
         derived from function source, defaults, or captured stable values.
@@ -700,6 +836,16 @@ class App:
             _raise_if_step_cannot_take_only_an_episode(
                 function, step_kind="check", step_name=check_name, decorator="@app.check()"
             )
+            if gate is not None and not isinstance(gate, Gate):
+                raise ValueError(
+                    f"check {check_name!r} was registered with gate="
+                    f"{type(gate).__name__}, expected an hflow.Gate -- a gate is a value "
+                    "you build once and pass in, e.g.\n\n"
+                    "    @app.check(critical=True, "
+                    "gate=hflow.checks.RECOMMENDED_CAMERA_INTEGRITY)\n"
+                    f"    def {check_name}(ep: hflow.Episode) -> hflow.CheckResult:\n"
+                    "        return hflow.checks.camera_frame_stats(ep)\n"
+                )
             requires_set = frozenset(requires) if requires is not None else frozenset()
             self.checks.append(
                 RegisteredCheck(
@@ -715,7 +861,9 @@ class App:
                         requires_set,
                         uses,
                         version,
+                        gate=gate,
                     ),
+                    gate=gate,
                 )
             )
             return function
@@ -1241,6 +1389,7 @@ class App:
                     run.error = traceback.format_exc(limit=8)
                 finally:
                     run.duration_s = time.perf_counter() - started
+                _apply_gate(registered, run)
                 if run.result is not None and run.result.verdict is False:
                     if registered.critical:
                         report.quarantine_tags.append(f"quarantined:{registered.name}")
@@ -1342,43 +1491,11 @@ class App:
                         else publish_error
                     )
 
+        # Assembled even when not recording, so the dev loop refuses a key
+        # collision on episode one instead of at the first curation query.
+        check_rows = _check_run_rows(report)
+        _raise_if_measurement_keys_collide(check_rows)
         if record:
-            check_rows = [
-                CheckRunRow.from_result(
-                    check_name=run.check.name,
-                    check_version=run.check.version,
-                    critical=run.check.critical,
-                    status=run.status,
-                    duration_s=run.duration_s,
-                    error=run.error,
-                    result=run.result,
-                )
-                for run in report.checks
-            ]
-            for enrichment_run in report.enrichments:
-                enrichment_result = enrichment_run.result
-                labels: dict[str, float | int | str | bool] = (
-                    dict(enrichment_result.labels) if enrichment_result is not None else {}
-                )
-                if enrichment_result is not None:
-                    labels.update(
-                        {
-                            f"{ARTIFACT_MEASUREMENT_KEY_PREFIX}{artifact_name}": artifact_uri
-                            for artifact_name, artifact_uri in enrichment_run.artifact_uris.items()
-                        }
-                    )
-                check_rows.append(
-                    CheckRunRow(
-                        check_name=enrichment_run.enrichment.name,
-                        check_version=enrichment_run.enrichment.version,
-                        critical=False,
-                        status=enrichment_run.status,
-                        duration_s=enrichment_run.duration_s,
-                        error=enrichment_run.error,
-                        measurements=labels,
-                        tags=list(enrichment_result.tags) if enrichment_result is not None else [],
-                    )
-                )
             report.catalog_entry = Catalog(self.workspace.catalog_root).append_episode(
                 canonical_path=canonical_path,
                 uri=canonical_uri,
