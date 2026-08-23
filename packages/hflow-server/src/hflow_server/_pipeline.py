@@ -11,6 +11,7 @@ remembered, the config capability reports false, and /api/v1/pipeline answers
 409 with the stored reason.
 """
 
+import sys
 from dataclasses import dataclass
 
 from fastapi import APIRouter, HTTPException
@@ -52,7 +53,16 @@ PipelineState = PipelineLoaded | PipelineUnavailable
 
 
 def load_pipeline_state(pipeline_spec: str | None) -> PipelineState:
-    """Run the one startup import and remember its outcome, whatever it is."""
+    """Run the one startup import and remember its outcome, whatever it is.
+
+    A configured import that failed also reports itself on stderr, once,
+    here where the outcome is computed: the degrade stays deliberate -- one
+    unimportable file must not stop the catalog, episodes, and curation
+    pages from serving -- but an operator who asked for a pipeline should
+    not have to open the pipeline page and find a 409 to learn this launch
+    does not include one. A missing ``--pipeline`` is the ordinary case and
+    stays silent.
+    """
     if pipeline_spec is None:
         return PipelineUnavailable(
             detail=(
@@ -63,6 +73,11 @@ def load_pipeline_state(pipeline_spec: str | None) -> PipelineState:
     try:
         return PipelineLoaded(application=import_pipeline_application(pipeline_spec))
     except ValueError as error:
+        print(
+            f"hflow serve: --pipeline {pipeline_spec} could not be imported: {error}",
+            file=sys.stderr,
+            flush=True,
+        )
         return PipelineUnavailable(detail=str(error))
 
 

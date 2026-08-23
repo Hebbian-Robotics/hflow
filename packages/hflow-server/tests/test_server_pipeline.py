@@ -7,6 +7,7 @@ startup import is side-effect-free.
 
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from hflow_server import ServerSettings, create_app
 from ui_test_fixtures import PopulatedWorkspace
@@ -135,3 +136,39 @@ def test_pipeline_unconfigured_is_a_409_naming_the_flag(api: TestClient) -> None
     response = api.get("/api/v1/pipeline")
     assert response.status_code == 409
     assert "--pipeline" in response.json()["detail"]
+
+
+def test_failed_startup_import_warns_on_stderr_naming_path_and_reason(
+    tmp_path: Path, unbuilt_assets_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The operator asked for a pipeline and did not get one: the launch says
+    so on stderr, naming the path and the reason, while still serving."""
+    pipeline_file = _written_pipeline_file(tmp_path, RAISING_PIPELINE_SOURCE)
+    data_root = tmp_path / "root"
+    data_root.mkdir()
+    client = _client_over(data_root, unbuilt_assets_dir, pipeline=str(pipeline_file))
+    assert client.get("/api/v1/config").json()["capabilities"]["pipeline"] is False
+    stderr_text = capsys.readouterr().err
+    assert str(pipeline_file) in stderr_text
+    assert "boom at import" in stderr_text
+    assert "--pipeline" in stderr_text
+
+
+def test_no_import_warning_for_a_working_or_unconfigured_launch(
+    populated_workspace: PopulatedWorkspace,
+    unbuilt_assets_dir: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Only a configured-and-failed import warns: a working pipeline and the
+    ordinary no---pipeline launch are both silent."""
+    working_file = _written_pipeline_file(tmp_path, WORKING_PIPELINE_SOURCE)
+    client = _client_over(
+        populated_workspace.data_root, unbuilt_assets_dir, pipeline=str(working_file)
+    )
+    assert client.get("/api/v1/pipeline").status_code == 200
+    assert "could not be imported" not in capsys.readouterr().err
+
+    unconfigured = _client_over(populated_workspace.data_root, unbuilt_assets_dir, pipeline=None)
+    assert unconfigured.get("/api/v1/pipeline").status_code == 409
+    assert "could not be imported" not in capsys.readouterr().err
