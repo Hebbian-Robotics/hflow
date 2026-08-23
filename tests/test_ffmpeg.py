@@ -286,15 +286,42 @@ def test_real_pinned_download_and_version(
     assert PINNED_VERSION_LABEL in ffprobe_version_line
 
 
-_SYNTHETIC_OUTPUT = """\
-frame:0    pts:0       pts_time:0
-lavfi.signalstats.YAVG=100
-frame:1    pts:512     pts_time:0.5
-lavfi.blackframe.pblack=99.5
-lavfi.signalstats.YAVG=10
-frame:2    pts:1024    pts_time:1
-lavfi.signalstats.YAVG=40
-"""
+def _synthetic_frames(
+    *frame_signals: dict[str, float | str],
+    interval_s: float = 0.5,
+) -> str:
+    """Instrument stdout for frames declaring only the signals a test is about.
+
+    Every signal the parser hard-requires gets a benign limited-range default,
+    so a test reads as the one fact it pins rather than a wall of keys -- and a
+    signal added to the instrument later needs one default here, not an edit to
+    every fixture.
+    """
+    defaults: dict[str, float | str] = {
+        "lavfi.blackframe.pblack": 0,
+        "lavfi.signalstats.YMIN": 16,
+        "lavfi.signalstats.YLOW": 32,
+        "lavfi.signalstats.YAVG": 100,
+        "lavfi.signalstats.YHIGH": 200,
+        "lavfi.signalstats.YMAX": 235,
+        "lavfi.signalstats.YDIF": 0,
+        "lavfi.signalstats.TOUT": 0,
+        "lavfi.signalstats.BRNG": 0,
+    }
+    blocks: list[str] = []
+    for frame_index, signals in enumerate(frame_signals):
+        pts_time_s = frame_index * interval_s
+        lines = [f"frame:{frame_index}    pts:{frame_index * 512}    pts_time:{pts_time_s}"]
+        lines.extend(f"{key}={value}" for key, value in (defaults | signals).items())
+        blocks.append("\n".join(lines))
+    return "\n".join(blocks) + "\n"
+
+
+_SYNTHETIC_OUTPUT = _synthetic_frames(
+    {"lavfi.signalstats.YAVG": 100},
+    {"lavfi.signalstats.YAVG": 10, "lavfi.blackframe.pblack": 99.5},
+    {"lavfi.signalstats.YAVG": 40},
+)
 
 
 def test_synthetic_output_aggregates_exactly() -> None:
@@ -315,13 +342,10 @@ def test_synthetic_output_aggregates_exactly() -> None:
 
 def test_synthetic_overexposed_aggregates_exactly() -> None:
     # YAVG: 100 (normal), 240 (overexposed), 250 (overexposed) at default threshold 235.0
-    output = (
-        "frame:0    pts:0    pts_time:0\n"
-        "lavfi.signalstats.YAVG=100\n"
-        "frame:1    pts:512   pts_time:0.5\n"
-        "lavfi.signalstats.YAVG=240\n"
-        "frame:2    pts:1024  pts_time:1\n"
-        "lavfi.signalstats.YAVG=250\n"
+    output = _synthetic_frames(
+        {"lavfi.signalstats.YAVG": 100},
+        {"lavfi.signalstats.YAVG": 240},
+        {"lavfi.signalstats.YAVG": 250},
     )
     stats = _stats_from_instrument_output(output)
     assert stats.frame_count == 3
@@ -332,19 +356,16 @@ def test_synthetic_overexposed_aggregates_exactly() -> None:
 
 
 def test_synthetic_freeze_intervals_including_unterminated() -> None:
-    output_text = (
-        "frame:0    pts:0    pts_time:0\n"
-        "lavfi.signalstats.YAVG=1\n"
-        "frame:1    pts:10   pts_time:1\n"
-        "lavfi.freezedetect.freeze_start=0.5\n"
-        "lavfi.signalstats.YAVG=1\n"
-        "frame:2    pts:20   pts_time:2\n"
-        "lavfi.freezedetect.freeze_duration=1.5\n"
-        "lavfi.freezedetect.freeze_end=2\n"
-        "lavfi.signalstats.YAVG=1\n"
-        "frame:3    pts:30   pts_time:3\n"
-        "lavfi.freezedetect.freeze_start=2.5\n"
-        "lavfi.signalstats.YAVG=1\n"
+    output_text = _synthetic_frames(
+        {"lavfi.signalstats.YAVG": 1},
+        {"lavfi.signalstats.YAVG": 1, "lavfi.freezedetect.freeze_start": 0.5},
+        {
+            "lavfi.signalstats.YAVG": 1,
+            "lavfi.freezedetect.freeze_duration": 1.5,
+            "lavfi.freezedetect.freeze_end": 2,
+        },
+        {"lavfi.signalstats.YAVG": 1, "lavfi.freezedetect.freeze_start": 2.5},
+        interval_s=1.0,
     )
     stats = _stats_from_instrument_output(output_text)
     # Unterminated freeze closes at the duration (3.0 + 1.0 median interval).
@@ -665,3 +686,109 @@ def test_contact_sheet_accepts_apostrophes_in_external_paths(
 def test_contact_sheet_rejects_empty_input(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="at least one frame"):
         contact_sheet([], tmp_path / "never.jpg")
+
+
+def test_coding_range_is_derived_from_luma_and_selects_the_exposure_gates() -> None:
+    """Trusting a container's declared range published a defect share off by a
+    factor of hundreds on real footage, so the range is measured from the pixels.
+    A frame leaving 16-235 proves the stream is full-range, which moves the
+    clipping gate from 246 to 254 -- and a p90 of 250 flips from defect to fine.
+    """
+    limited = _stats_from_instrument_output(
+        _synthetic_frames({"lavfi.signalstats.YHIGH": 250}, {"lavfi.signalstats.YHIGH": 250})
+    )
+    assert limited.full_range_detected is False
+    assert limited.clipped_highlight_pct == pytest.approx(100.0)
+
+    full = _stats_from_instrument_output(
+        _synthetic_frames(
+            {"lavfi.signalstats.YHIGH": 250, "lavfi.signalstats.YMAX": 255},
+            {"lavfi.signalstats.YHIGH": 250, "lavfi.signalstats.YMAX": 255},
+        )
+    )
+    assert full.full_range_detected is True
+    assert full.clipped_highlight_pct == 0.0
+
+
+def test_the_nominal_range_bounds_are_inclusive() -> None:
+    """16 and 235 are themselves limited-range legal; only leaving them counts."""
+    at_bounds = _stats_from_instrument_output(
+        _synthetic_frames({"lavfi.signalstats.YMIN": 16, "lavfi.signalstats.YMAX": 235})
+    )
+    assert at_bounds.full_range_detected is False
+    below = _stats_from_instrument_output(
+        _synthetic_frames({"lavfi.signalstats.YMIN": 15, "lavfi.signalstats.YMAX": 235})
+    )
+    assert below.full_range_detected is True
+
+
+def test_crushed_shadows_use_the_range_selected_gate() -> None:
+    limited = _stats_from_instrument_output(
+        _synthetic_frames({"lavfi.signalstats.YLOW": 3}, {"lavfi.signalstats.YLOW": 200})
+    )
+    assert limited.crushed_shadow_pct == pytest.approx(50.0)
+    # The same p10 in a full-range stream is well inside the wider gate of 1.0.
+    full = _stats_from_instrument_output(
+        _synthetic_frames(
+            {"lavfi.signalstats.YLOW": 3, "lavfi.signalstats.YMAX": 255},
+            {"lavfi.signalstats.YLOW": 200, "lavfi.signalstats.YMAX": 255},
+        )
+    )
+    assert full.crushed_shadow_pct == 0.0
+
+
+def test_black_pixel_share_is_reported_over_every_frame() -> None:
+    """Asking the filter for every frame's share, not just the flagged ones, is
+    what keeps a half-covered lens visible instead of rounding to "not black".
+    """
+    stats = _stats_from_instrument_output(
+        _synthetic_frames(
+            {"lavfi.blackframe.pblack": 50},
+            {"lavfi.blackframe.pblack": 99},
+            {"lavfi.blackframe.pblack": 0},
+        )
+    )
+    # Only the 99% frame clears the 98% flag, but the 50% frame is still evidence.
+    assert stats.black_frame_count == 1
+    assert stats.black_pixel_share_max == pytest.approx(99.0)
+    assert stats.black_pixel_share_mean == pytest.approx(149.0 / 3.0)
+
+
+def test_luma_above_the_eight_bit_scale_raises() -> None:
+    """A lost format pin would put a 10-bit source on a 0-1023 scale, where
+    every threshold here is off by a factor of four. Fail loudly instead.
+    """
+    ten_bit = _synthetic_frames({"lavfi.signalstats.YMAX": 1023})
+    with pytest.raises(InstrumentParseError, match="outside the 8-bit range"):
+        _stats_from_instrument_output(ten_bit)
+
+
+def test_first_frame_frame_difference_is_excluded_by_position() -> None:
+    """The opening frame has no predecessor, so its YDIF is a sentinel zero.
+    Dropping zeros by value would delete the real stillness this measures.
+    """
+    stats = _stats_from_instrument_output(
+        _synthetic_frames(
+            {"lavfi.signalstats.YDIF": 0},
+            {"lavfi.signalstats.YDIF": 4},
+            {"lavfi.signalstats.YDIF": 6},
+        )
+    )
+    # Mean over the two real observations, not three.
+    assert stats.frame_difference_mean == pytest.approx(5.0)
+    assert stats.frame_difference_max == pytest.approx(6.0)
+
+    still = _stats_from_instrument_output(
+        _synthetic_frames({"lavfi.signalstats.YDIF": 0}, {"lavfi.signalstats.YDIF": 0})
+    )
+    assert still.frame_difference_mean == 0.0
+
+
+def test_a_missing_required_signal_raises_instead_of_shrinking_a_denominator() -> None:
+    """A frame silently dropped from a denominator turns "could not measure"
+    into "measured and clean", which is the one answer this must never invent.
+    """
+    missing_tout = _synthetic_frames({"lavfi.signalstats.YAVG": 100})
+    missing_tout = missing_tout.replace("lavfi.signalstats.TOUT=0\n", "")
+    with pytest.raises(InstrumentParseError, match="TOUT"):
+        _stats_from_instrument_output(missing_tout)

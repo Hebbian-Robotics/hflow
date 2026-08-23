@@ -10,6 +10,7 @@ from hflow.checks import (
     action_rate,
     camera_fps_conformance,
     camera_frame_stats,
+    camera_signal_quality,
     content_digest,
     episode_duration,
     idle_fraction,
@@ -48,6 +49,7 @@ def test_no_two_builtin_checks_claim_the_same_measurement_key(tmp_path: Path) ->
             "keyframe_interval": keyframe_interval(episode),
             "camera_fps_conformance": camera_fps_conformance(episode),
             "action_integrity": action_integrity(episode),
+            "camera_signal_quality": camera_signal_quality(episode),
         }
 
     producers_by_key: dict[str, list[str]] = {}
@@ -399,3 +401,72 @@ def test_action_integrity_reports_a_clean_stream_as_clean(tmp_path: Path) -> Non
     assert result.measurements["/joint_states/frozen_step_pct"] == 0.0
     assert result.measurements["/joint_states/unchanged_dimension_count"] == 0
     assert result.intervals == []
+
+
+def test_camera_signal_quality_measures_range_exposure_and_stillness(tmp_path: Path) -> None:
+    source = synthesize_episode(
+        tmp_path / "episode.mcap",
+        SyntheticEpisodeSpec(duration_s=3.0, cameras=("wrist_cam",), black_segment=None),
+    )
+    canonical = tmp_path / "episode.canonical.mcap"
+    write_canonical_episode(source, canonical, TransformConfig())
+    with hflow.Episode(canonical) as episode:
+        camera_topic = episode.cameras[0]
+        result = camera_signal_quality(episode)
+
+    # The coding range is a measured fact, recorded with the evidence behind it.
+    full_range = result.measurements[f"{camera_topic}/full_range_detected"]
+    luma_min = result.measurements[f"{camera_topic}/luma_min"]
+    luma_max = result.measurements[f"{camera_topic}/luma_max"]
+    assert full_range in (0, 1)
+    assert isinstance(luma_min, float) and isinstance(luma_max, float)
+    assert 0.0 <= luma_min <= luma_max <= 255.0
+    # The verdict must be consistent with its own evidence.
+    assert bool(full_range) == (luma_min < 16.0 or luma_max > 235.0)
+
+    # The test pattern moves, so stillness is well above zero.
+    frame_difference_mean = result.measurements[f"{camera_topic}/frame_difference_mean"]
+    assert isinstance(frame_difference_mean, float) and frame_difference_mean > 0.0
+
+    # A clean synthetic encode carries no impulse noise.
+    assert result.measurements[f"{camera_topic}/temporal_outlier_max"] == pytest.approx(
+        0.0, abs=1e-3
+    )
+    assert result.verdict is None
+
+
+def test_camera_signal_quality_sees_a_blacked_out_segment(tmp_path: Path) -> None:
+    """Assertions here are deliberately build-robust.
+
+    The suite runs against whatever ffmpeg is on PATH (see tests/conftest.py),
+    and builds genuinely disagree about absolute luma: on this same fixture,
+    ffmpeg 6.1 range-scales the black frames to a floor of 8 while the pinned
+    8.1 preserves 0. That moves every exposure percentile and so the
+    range-gated shares with it. The gate arithmetic is pinned exactly on
+    synthetic instrument text in tests/test_ffmpeg.py; what must hold on any
+    build is the threshold-based evidence and the ordering between signals.
+    """
+    source = synthesize_episode(
+        tmp_path / "episode.mcap",
+        SyntheticEpisodeSpec(duration_s=4.0, cameras=("wrist_cam",), black_segment=(1.0, 3.0)),
+    )
+    canonical = tmp_path / "episode.canonical.mcap"
+    write_canonical_episode(source, canonical, TransformConfig())
+    with hflow.Episode(canonical) as episode:
+        camera_topic = episode.cameras[0]
+        result = camera_signal_quality(episode)
+
+    # Black pixels are counted against a fixed threshold of 17, which both
+    # builds' black frames sit under, so the share is stable across them.
+    black_share_max = result.measurements[f"{camera_topic}/black_pixel_share_max"]
+    black_share_mean = result.measurements[f"{camera_topic}/black_pixel_share_mean"]
+    assert isinstance(black_share_max, float) and black_share_max > 90.0
+    # 2 s of 4 s blacked out; decode boundaries make the exact count fuzzy.
+    assert isinstance(black_share_mean, float) and 25.0 < black_share_mean < 75.0
+
+    # Half the clip near-black must drag the low percentile far below the high
+    # one, whatever scale the decoder put them on.
+    luma_p10_mean = result.measurements[f"{camera_topic}/luma_p10_mean"]
+    luma_p90_mean = result.measurements[f"{camera_topic}/luma_p90_mean"]
+    assert isinstance(luma_p10_mean, float) and isinstance(luma_p90_mean, float)
+    assert luma_p10_mean < luma_p90_mean / 2.0

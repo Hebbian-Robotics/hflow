@@ -31,6 +31,24 @@ class InstrumentParseError(RuntimeError):
     pass
 
 
+# Nominal limited-range luma bounds. Luma leaving them is what distinguishes
+# full-range footage, and the bounds are inclusive: 16 and 235 themselves are
+# limited-compatible. Verified against this build's ``colordetect`` filter,
+# which reports full range on exactly the same condition -- so the range is
+# derived from luma the instrument already reports rather than scraped out of
+# a filter's log line, which no version of ffmpeg promises to keep stable.
+LIMITED_RANGE_LUMA_FLOOR = 16
+LIMITED_RANGE_LUMA_CEILING = 235
+
+# Exposure gates, selected by the coding range measured above. These are
+# measurement definitions rather than acceptance bars: they say what "clipped"
+# and "crushed" mean, and keeping them fixed is what makes the share
+# comparable across corpora. The 90th/10th luma percentiles are the subject,
+# not the extremes, so one hot pixel cannot manufacture a defect.
+_CLIPPED_HIGHLIGHT_GATE_BY_RANGE = {False: 246.0, True: 254.0}
+_CRUSHED_SHADOW_GATE_BY_RANGE = {False: 5.0, True: 1.0}
+
+
 @dataclass(frozen=True)
 class FrameStats:
     """Aggregated per-frame statistics from one instrument pass."""
@@ -46,6 +64,33 @@ class FrameStats:
     luma_avg_mean: float
     luma_avg_min: float
     luma_avg_max: float
+    # Share of each frame's pixels below the black threshold, over every frame
+    # rather than only the frames flagged black -- so a half-covered lens is
+    # visible instead of rounding to "not a blackout".
+    black_pixel_share_mean: float  # 0.0-100.0
+    black_pixel_share_max: float  # 0.0-100.0
+    # Whole-scale luma extremes, and the coding range they imply.
+    luma_min: float
+    luma_max: float
+    full_range_detected: bool
+    # Robust per-frame luma percentiles, averaged over frames.
+    luma_p10_mean: float
+    luma_p90_mean: float
+    # Range-gated exposure defects, as a share of frames.
+    clipped_highlight_pct: float  # 0.0-100.0
+    crushed_shadow_pct: float  # 0.0-100.0
+    # Mean absolute luma difference between consecutive frames: near zero means
+    # a still scene, which is a different fact from a frozen feed.
+    frame_difference_mean: float
+    frame_difference_max: float
+    # Intra-frame impulse noise and dropout streaks (signalstats TOUT).
+    temporal_outlier_mean: float
+    temporal_outlier_max: float
+    # Share of samples outside the nominal range (signalstats BRNG). Dominated
+    # by range mismatch on full-range footage, so read it with
+    # ``full_range_detected``.
+    out_of_legal_range_mean: float
+    out_of_legal_range_max: float
 
 
 # ``metadata=mode=print:file=-`` emits one header per frame followed by
@@ -59,6 +104,19 @@ _SIGNALSTATS_YAVG_KEY = "lavfi.signalstats.YAVG"
 _BLACKFRAME_PBLACK_KEY = "lavfi.blackframe.pblack"
 _FREEZE_START_KEY = "lavfi.freezedetect.freeze_start"
 _FREEZE_END_KEY = "lavfi.freezedetect.freeze_end"
+_SIGNALSTATS_YMIN_KEY = "lavfi.signalstats.YMIN"
+_SIGNALSTATS_YLOW_KEY = "lavfi.signalstats.YLOW"
+_SIGNALSTATS_YHIGH_KEY = "lavfi.signalstats.YHIGH"
+_SIGNALSTATS_YMAX_KEY = "lavfi.signalstats.YMAX"
+_SIGNALSTATS_YDIF_KEY = "lavfi.signalstats.YDIF"
+_SIGNALSTATS_TOUT_KEY = "lavfi.signalstats.TOUT"
+_SIGNALSTATS_BRNG_KEY = "lavfi.signalstats.BRNG"
+
+# An 8-bit pipeline reports luma on 0-255. Anything above that means the format
+# pin ahead of the measuring filters was lost and a higher-depth source is being
+# read on its own scale, where every threshold here is meaningless -- so fail
+# loudly rather than record numbers four times too large.
+_MAXIMUM_EIGHT_BIT_LUMA = 255.0
 
 
 @dataclass(frozen=True)
@@ -145,8 +203,52 @@ def _collect_freeze_intervals(
     return intervals
 
 
+def _required_luma_series(frames: list[_ParsedFrame], key: str) -> list[float]:
+    """One signalstats luma signal across every frame, hard-validated.
+
+    A missing reading is an error rather than a gap: a frame silently dropped
+    from a denominator turns "we could not measure this" into "we measured it
+    and it was clean", which is the one answer a quality instrument must never
+    invent. The 0-255 bound catches a lost format pin, where a higher-depth
+    source would otherwise report every level four times too large.
+    """
+    values: list[float] = []
+    for frame_index, frame in enumerate(frames):
+        text = frame.metadata.get(key)
+        if text is None:
+            raise InstrumentParseError(
+                f"frame {frame_index} (pts_time {frame.pts_time_s}) is missing {key} "
+                "-- truncated output, or the filter graph did not request it"
+            )
+        value = _parse_finite_float(text, f"{key} of frame {frame_index}")
+        if not 0.0 <= value <= _MAXIMUM_EIGHT_BIT_LUMA:
+            raise InstrumentParseError(
+                f"{key} of frame {frame_index} is {value}, outside the 8-bit range "
+                "0-255: the format pin ahead of the measuring filters was lost"
+            )
+        values.append(value)
+    return values
+
+
+def _required_share_series(frames: list[_ParsedFrame], key: str) -> list[float]:
+    """One signalstats 0-1 share signal across every frame, hard-validated."""
+    values: list[float] = []
+    for frame_index, frame in enumerate(frames):
+        text = frame.metadata.get(key)
+        if text is None:
+            raise InstrumentParseError(
+                f"frame {frame_index} (pts_time {frame.pts_time_s}) is missing {key} "
+                "-- truncated output, or the filter graph did not request it"
+            )
+        values.append(_parse_finite_float(text, f"{key} of frame {frame_index}"))
+    return values
+
+
 def _stats_from_instrument_output(
-    output_text: str, *, bright_luma_threshold: float = 235.0
+    output_text: str,
+    *,
+    bright_luma_threshold: float = 235.0,
+    black_frame_amount_pct: int = 98,
 ) -> FrameStats:
     """Pure aggregation of the instrument's stdout (testable on synthetic text)."""
     frames = _parse_metadata_print_frames(output_text)
@@ -165,16 +267,37 @@ def _stats_from_instrument_output(
         median_frame_interval_s = 0.0
     duration_s = pts_times_s[-1] + median_frame_interval_s
 
-    black_frame_count = 0
-    for frame_index, frame in enumerate(frames):
-        pblack_text = frame.metadata.get(_BLACKFRAME_PBLACK_KEY)
-        if pblack_text is None:
-            continue
-        # blackframe only attaches pblack to frames it flagged; still validate.
-        _parse_finite_float(pblack_text, f"{_BLACKFRAME_PBLACK_KEY} of frame {frame_index}")
-        black_frame_count += 1
-
+    # ``blackframe=amount=0`` reports every frame's share, so the flag is
+    # applied here instead. pblack is an integer percent, matching the integer
+    # ``amount`` the filter would have compared against.
+    black_pixel_shares = _required_share_series(frames, _BLACKFRAME_PBLACK_KEY)
+    black_frame_count = sum(1 for share in black_pixel_shares if share >= black_frame_amount_pct)
     overexposed_frame_count = sum(1 for v in luma_avg_values if v >= bright_luma_threshold)
+
+    luma_minima = _required_luma_series(frames, _SIGNALSTATS_YMIN_KEY)
+    luma_maxima = _required_luma_series(frames, _SIGNALSTATS_YMAX_KEY)
+    luma_p10_values = _required_luma_series(frames, _SIGNALSTATS_YLOW_KEY)
+    luma_p90_values = _required_luma_series(frames, _SIGNALSTATS_YHIGH_KEY)
+    frame_differences = _required_luma_series(frames, _SIGNALSTATS_YDIF_KEY)
+    temporal_outliers = _required_share_series(frames, _SIGNALSTATS_TOUT_KEY)
+    out_of_legal_range = _required_share_series(frames, _SIGNALSTATS_BRNG_KEY)
+
+    luma_min = min(luma_minima)
+    luma_max = max(luma_maxima)
+    # One verdict for the clip, not per frame: a stream is encoded one way, and
+    # any frame leaving the nominal bounds proves which way.
+    full_range_detected = (
+        luma_min < LIMITED_RANGE_LUMA_FLOOR or luma_max > LIMITED_RANGE_LUMA_CEILING
+    )
+    clipped_gate = _CLIPPED_HIGHLIGHT_GATE_BY_RANGE[full_range_detected]
+    crushed_gate = _CRUSHED_SHADOW_GATE_BY_RANGE[full_range_detected]
+    clipped_frame_count = sum(1 for value in luma_p90_values if value > clipped_gate)
+    crushed_frame_count = sum(1 for value in luma_p10_values if value < crushed_gate)
+
+    # The first frame has no predecessor, so its YDIF is a sentinel zero.
+    # Excluded by position, never by value: filtering zeros would delete the
+    # real stillness this signal exists to measure.
+    observed_differences = frame_differences[1:]
 
     freeze_intervals = _collect_freeze_intervals(frames, duration_s)
     return FrameStats(
@@ -189,6 +312,49 @@ def _stats_from_instrument_output(
         luma_avg_mean=statistics.fmean(luma_avg_values),
         luma_avg_min=min(luma_avg_values),
         luma_avg_max=max(luma_avg_values),
+        black_pixel_share_mean=statistics.fmean(black_pixel_shares),
+        black_pixel_share_max=max(black_pixel_shares),
+        luma_min=luma_min,
+        luma_max=luma_max,
+        full_range_detected=full_range_detected,
+        luma_p10_mean=statistics.fmean(luma_p10_values),
+        luma_p90_mean=statistics.fmean(luma_p90_values),
+        clipped_highlight_pct=100.0 * clipped_frame_count / frame_count,
+        crushed_shadow_pct=100.0 * crushed_frame_count / frame_count,
+        frame_difference_mean=statistics.fmean(observed_differences)
+        if observed_differences
+        else 0.0,
+        frame_difference_max=max(observed_differences) if observed_differences else 0.0,
+        temporal_outlier_mean=statistics.fmean(temporal_outliers),
+        temporal_outlier_max=max(temporal_outliers),
+        out_of_legal_range_mean=statistics.fmean(out_of_legal_range),
+        out_of_legal_range_max=max(out_of_legal_range),
+    )
+
+
+def instrument_filter_graph(
+    *,
+    black_pixel_threshold: int,
+    freeze_noise_db: float,
+    freeze_min_duration_s: float,
+) -> str:
+    """The measuring graph, as one string so it can be recorded as evidence.
+
+    ``format=pix_fmts=yuv420p`` comes first and is load-bearing: without it a
+    higher-depth source reaches the measuring filters on its own scale, where
+    every luma threshold below is off by a factor of four. It is a no-op for the
+    8-bit H.264 canonical episodes carry.
+
+    ``blackframe=amount=0`` asks for every frame's black-pixel share rather than
+    only the frames a filter-side threshold would have flagged; the flag is
+    applied during aggregation, which yields the same count plus the
+    distribution behind it.
+    """
+    return (
+        "format=pix_fmts=yuv420p,"
+        f"blackframe=amount=0:threshold={black_pixel_threshold},"
+        f"freezedetect=n={freeze_noise_db}dB:d={freeze_min_duration_s},"
+        "signalstats=stat=tout+brng,metadata=mode=print:file=-"
     )
 
 
@@ -196,27 +362,31 @@ def frame_stats(
     video: Path,
     *,
     black_frame_amount_pct: int = 98,
-    black_pixel_threshold: int = 32,
+    black_pixel_threshold: int = 17,
     freeze_noise_db: float = -60.0,
     freeze_min_duration_s: float = 2.0,
     bright_luma_threshold: float = 235.0,
 ) -> FrameStats:
     """Run the instrument over ``video`` and aggregate.
 
-    - ``blackframe=amount:threshold`` flags frames whose pixels are
-      near-black; ``black_frame_pct`` uses the signalstats frame count as the
-      shared denominator.
+    One decode pass, one filter graph, one shared frame denominator.
+
+    - ``blackframe`` yields each frame's black-pixel share; frames at or above
+      ``black_frame_amount_pct`` are counted black. ``black_pixel_threshold``
+      defaults to 17, which includes video-range black (16) and excludes the
+      ordinary dark detail that ffmpeg's own default of 32 reads as dark.
     - ``freezedetect=n={noise}dB:d={duration}`` yields freeze intervals; an
       unterminated freeze at EOF closes at the video duration.
-    - ``signalstats`` yields per-frame YAVG, aggregated to mean/min/max.
+    - ``signalstats`` yields per-frame luma extremes and percentiles, frame
+      differences, impulse noise, and nominal-range excursions. The coding
+      range is derived from the luma extremes, and selects the exposure gates.
     - Frames with average luma at or above ``bright_luma_threshold`` are
-      counted as overexposed; ``overexposed_frame_pct`` uses the same
-      frame-count denominator as ``black_frame_pct``.
+      counted as overexposed, on the same frame-count denominator.
     """
-    filter_graph = (
-        f"blackframe=amount={black_frame_amount_pct}:threshold={black_pixel_threshold},"
-        f"freezedetect=n={freeze_noise_db}dB:d={freeze_min_duration_s},"
-        "signalstats,metadata=mode=print:file=-"
+    graph = instrument_filter_graph(
+        black_pixel_threshold=black_pixel_threshold,
+        freeze_noise_db=freeze_noise_db,
+        freeze_min_duration_s=freeze_min_duration_s,
     )
     command = [
         str(ffmpeg_path()),
@@ -225,7 +395,7 @@ def frame_stats(
         "-i",
         str(video),
         "-vf",
-        filter_graph,
+        graph,
         "-f",
         "null",
         "-",
@@ -235,5 +405,7 @@ def frame_stats(
         stderr_tail = "\n".join(completed.stderr.strip().splitlines()[-5:])
         raise RuntimeError(f"ffmpeg instrument pass failed for {video}: {stderr_tail}")
     return _stats_from_instrument_output(
-        completed.stdout, bright_luma_threshold=bright_luma_threshold
+        completed.stdout,
+        bright_luma_threshold=bright_luma_threshold,
+        black_frame_amount_pct=black_frame_amount_pct,
     )

@@ -235,7 +235,7 @@ def camera_frame_stats(
     cameras: Sequence[str] | None = None,
     expected_hz: dict[str, float] | None = None,
     black_frame_amount_pct: int = 98,
-    black_pixel_threshold: int = 32,
+    black_pixel_threshold: int = 17,
     freeze_noise_db: float = -60.0,
     freeze_min_duration_s: float = 2.0,
     bright_luma_threshold: float = 235.0,
@@ -253,6 +253,13 @@ def camera_frame_stats(
 
     Evidence only, as always: blackout/exposure thresholds (including
     ``bright_luma_threshold``) and any verdict stay user-owned.
+
+    ``black_pixel_threshold`` defaults to 17 rather than ffmpeg's own 32:
+    17 still counts video-range black (16) as black, where 32 also counts
+    ordinary dark detail and reads a few percent of unremarkable footage as
+    dark. Signal-quality measurements from the same decode pass -- coding
+    range, exposure, impulse noise -- live in
+    :func:`camera_signal_quality`.
     """
     selected_cameras = list(cameras) if cameras is not None else episode.cameras
     measurements: dict[str, MeasurementValue] = {}
@@ -460,6 +467,84 @@ def content_digest(episode: Episode) -> CheckResult:
             digest.update(len(payload).to_bytes(8, "big"))
             digest.update(payload)
     return CheckResult(measurements={"content_digest": digest.hexdigest()})
+
+
+def camera_signal_quality(
+    episode: Episode,
+    *,
+    cameras: Sequence[str] | None = None,
+    black_pixel_threshold: int = 17,
+    freeze_noise_db: float = -60.0,
+    freeze_min_duration_s: float = 2.0,
+) -> CheckResult:
+    """Signal-level camera evidence: coding range, exposure, noise, stillness.
+
+    Separate from :func:`camera_frame_stats` rather than folded into it, because
+    a check is the unit of three things at once -- one gate decision, one
+    coverage denominator, and one content-hash version. Twenty-odd measurements
+    under one name would mean a threshold on any of them gating all of them, and
+    one changed constant re-versioning the lot. Both checks read the same cached
+    remux, so the second costs a decode and no more.
+
+    The coding range is measured from the pixels, never read from the
+    container's declared range. That tag lies in practice -- a corpus can
+    declare limited range while filling the full scale -- and believing it
+    published an exposure-defect share off by more than two orders of
+    magnitude. ``{topic}/full_range_detected`` records what was measured, and it
+    selects which exposure gates apply, so the shares below mean the same thing
+    across corpora encoded differently.
+
+    Read ``out_of_legal_range_mean`` together with ``full_range_detected``: on
+    full-range footage it is dominated by that range mismatch rather than by any
+    defect, so it is an encoding-hygiene signal there, not a quality one.
+
+    These readings are comparable only within one ffmpeg build. Builds disagree
+    about absolute luma by more than rounding -- on the same file, ffmpeg 6.1
+    range-scales full-range footage to a floor of 8 where the pinned 8.1
+    preserves 0, which moves every percentile here and the range-gated shares
+    with them. That is why HFlow pins its own binary and why
+    ``camera_frame_stats`` records which one measured; compare across a pin bump
+    only after re-measuring, not by reading old rows next to new ones.
+    """
+    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    measurements: dict[str, MeasurementValue] = {}
+    for topic in selected_cameras:
+        stats = frame_stats(
+            episode.video(topic),
+            black_pixel_threshold=black_pixel_threshold,
+            freeze_noise_db=freeze_noise_db,
+            freeze_min_duration_s=freeze_min_duration_s,
+        )
+        measurements.update(
+            {
+                f"{topic}/signal_frame_count": stats.frame_count,
+                # Coding range, and the whole-scale extremes behind the verdict,
+                # so a borderline call is auditable rather than asserted.
+                f"{topic}/full_range_detected": int(stats.full_range_detected),
+                f"{topic}/luma_min": stats.luma_min,
+                f"{topic}/luma_max": stats.luma_max,
+                # Robust exposure: the 10th/90th luma percentiles, so one hot or
+                # dead pixel cannot manufacture a defect.
+                f"{topic}/luma_p10_mean": stats.luma_p10_mean,
+                f"{topic}/luma_p90_mean": stats.luma_p90_mean,
+                f"{topic}/clipped_highlight_pct": stats.clipped_highlight_pct,
+                f"{topic}/crushed_shadow_pct": stats.crushed_shadow_pct,
+                # Black-pixel share over every frame, not only flagged frames.
+                f"{topic}/black_pixel_share_mean": stats.black_pixel_share_mean,
+                f"{topic}/black_pixel_share_max": stats.black_pixel_share_max,
+                # Stillness, which is a different fact from a frozen feed: a
+                # motionless scene reads near zero while freeze detection stays
+                # silent.
+                f"{topic}/frame_difference_mean": stats.frame_difference_mean,
+                f"{topic}/frame_difference_max": stats.frame_difference_max,
+                # Impulse noise and dropout streaks.
+                f"{topic}/temporal_outlier_mean": stats.temporal_outlier_mean,
+                f"{topic}/temporal_outlier_max": stats.temporal_outlier_max,
+                f"{topic}/out_of_legal_range_mean": stats.out_of_legal_range_mean,
+                f"{topic}/out_of_legal_range_max": stats.out_of_legal_range_max,
+            }
+        )
+    return CheckResult(measurements=measurements)
 
 
 def action_integrity(
