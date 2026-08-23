@@ -43,6 +43,7 @@ from hflow.ffmpeg._instrument import (
     _stats_from_instrument_output,
     frame_stats,
 )
+from hflow.ffmpeg._raw_frames import RawFrameError, luma_frames
 
 
 def _system_ffmpeg() -> str:
@@ -538,6 +539,61 @@ def test_frame_stats_truncated_video_file_raises(tmp_path: Path) -> None:
     not_a_video.write_bytes(b"\x00\x01\x02not a video")
     with pytest.raises(RuntimeError):
         frame_stats(not_a_video)
+
+
+def test_luma_frames_streams_every_frame_at_the_coded_size(black_tail_video: Path) -> None:
+    """Full rate and no re-encode, which is what a frame-to-frame measurement
+    needs and what ``Episode.frames()`` deliberately does not give.
+    """
+    with luma_frames(black_tail_video) as frames:
+        shapes = [frame.shape for frame in frames]
+    assert len(shapes) == 60
+    assert set(shapes) == {(120, 160)}
+
+
+def test_luma_frames_reaps_ffmpeg_when_the_caller_stops_early(
+    black_tail_video: Path,
+) -> None:
+    """Abandoning the iterator closes the pipe, which makes ffmpeg fail its
+    write. That is not a decode failure and must not be raised as one -- and the
+    exit code cannot tell the two apart, so the helper tracks whether the stream
+    was drained instead.
+    """
+    with luma_frames(black_tail_video) as frames:
+        first_frame = next(iter(frames))
+    assert first_frame.shape == (120, 160)
+
+
+def test_luma_frames_on_a_non_video_raises(tmp_path: Path) -> None:
+    not_a_video = tmp_path / "garbage.mp4"
+    not_a_video.write_bytes(b"\x00\x01\x02not a video")
+    with pytest.raises(RawFrameError), luma_frames(not_a_video) as frames:
+        list(frames)
+
+
+def test_missing_motion_extra_names_the_install_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The documented promise for the one built-in with an optional dependency:
+    it fails with the command that fixes it, not a bare ImportError.
+
+    Mocked at the import boundary, which is where the failure lives -- the suite
+    installs the extra, so this case is otherwise unreachable.
+    """
+    import builtins
+
+    from hflow.motion import MotionExtraNotInstalledError, _import_cv2
+
+    real_import = builtins.__import__
+
+    def refuse_cv2(name: str, *arguments: object, **keywords: object) -> object:
+        if name == "cv2":
+            raise ModuleNotFoundError("No module named 'cv2'")
+        return real_import(name, *arguments, **keywords)  # ty: ignore
+
+    monkeypatch.setattr(builtins, "__import__", refuse_cv2)
+    with pytest.raises(MotionExtraNotInstalledError, match=r"hflow\[motion\]"):
+        _import_cv2()
 
 
 def _probe_dimensions(image: Path) -> tuple[int, int]:

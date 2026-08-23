@@ -14,7 +14,7 @@ import pytest
 
 import hflow
 from hflow.checks import camera_stability
-from hflow.ffmpeg import ffmpeg_path, luma_frames
+from hflow.ffmpeg import ffmpeg_path
 from hflow.motion import CameraMotion, measure_camera_motion
 
 pytest.importorskip("cv2", reason="camera-motion measurement needs the 'motion' extra")
@@ -161,6 +161,76 @@ def test_every_pair_is_accounted_for_as_measured_or_unclassified(
     assert motion.unstable_s <= motion.measured_s
 
 
+def test_footage_with_nothing_to_track_reports_no_coverage_not_steadiness(
+    tmp_path: Path,
+) -> None:
+    """Featureless footage cannot be measured, and must say so.
+
+    The dangerous failure here is reporting it as steady: a caller reading
+    ``unstable_share`` alone would see 0.0 and conclude the camera was fine,
+    when in fact no transform could be fitted to a single pair. Reporting the
+    whole clip as unclassified, with coverage at zero, is what makes the share
+    honest -- and this is the only fixture that drives the unmeasurable side of
+    the accounting above zero at all.
+    """
+    flat = tmp_path / "flat.mp4"
+    subprocess.run(
+        [
+            str(ffmpeg_path()),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=gray:size=320x240:rate={_FRAMES_PER_SECOND}:duration={_DURATION_S}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-x264-params",
+            "keyint=30:min-keyint=30:scenecut=0:bframes=0",
+            str(flat),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    motion = _measure(flat)
+
+    pair_count = _FRAMES_PER_SECOND * _DURATION_S - 1
+    assert motion.measured_s == 0.0
+    assert motion.unclassified_s == pytest.approx(pair_count / _FRAMES_PER_SECOND, abs=0.05)
+    assert motion.unstable_s == 0.0
+    # Zero over nothing measured, which the coverage beside it qualifies.
+    assert motion.unstable_share == 0.0
+
+    # The check turns that into a coverage of zero rather than a clean bill.
+    from hflow.testing import VideoEpisodeSpec, write_video_episode
+    from hflow.transform import TransformConfig, write_canonical_episode
+
+    source = write_video_episode(
+        flat,
+        tmp_path / "episode.mcap",
+        VideoEpisodeSpec(
+            duration_s=float(_DURATION_S),
+            image_hz=float(_FRAMES_PER_SECOND),
+            image_width=320,
+            image_height=240,
+            camera_name="head_camera",
+        ),
+    )
+    canonical = tmp_path / "episode.canonical.mcap"
+    write_canonical_episode(source, canonical, TransformConfig())
+    with hflow.Episode(canonical) as episode:
+        camera_topic = episode.cameras[0]
+        result = camera_stability(episode)
+    assert result.measurements[f"{camera_topic}/coverage_share"] == 0.0
+    assert result.intervals == []
+
+
 def test_the_check_reports_stability_with_its_coverage(still_texture: Path, tmp_path: Path) -> None:
     """End to end through a canonical episode, which is what a pipeline sees."""
     from hflow.testing import VideoEpisodeSpec, write_video_episode
@@ -196,25 +266,6 @@ def test_the_check_reports_stability_with_its_coverage(still_texture: Path, tmp_
     assert result.verdict is None
 
 
-def test_luma_frames_streams_every_frame_without_re_encoding(
-    still_texture: Path, tmp_path: Path
-) -> None:
-    video = _render_camera_path(still_texture, tmp_path / "static.mp4", "160", "120")
-    with luma_frames(video) as frames:
-        shapes = [frame.shape for frame in frames]
-    assert len(shapes) == _FRAMES_PER_SECOND * _DURATION_S
-    assert set(shapes) == {(240, 320)}
-
-
-def test_luma_frames_reaps_ffmpeg_when_the_caller_stops_early(
-    still_texture: Path, tmp_path: Path
-) -> None:
-    """Abandoning the iterator must not leave a decode running."""
-    video = _render_camera_path(still_texture, tmp_path / "static.mp4", "160", "120")
-
-    # Reading one frame and leaving the block is the abandonment case: ffmpeg
-    # then fails writing to a closed pipe, which must not be reported as a
-    # decode failure.
-    with luma_frames(video) as frames:
-        first_frame = next(iter(frames))
-    assert first_frame.shape == (240, 320)
+# ``luma_frames`` itself is tested in tests/test_ffmpeg.py, beside the other
+# ffmpeg helpers: it needs only numpy, so keeping it here would have skipped it
+# whenever the motion extra is absent.
