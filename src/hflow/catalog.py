@@ -103,6 +103,23 @@ _reconciled_append_stems: set[tuple[str, str]] = set()
 
 _FORMAT_MARKER_NAME = "format_version"
 
+# The quarantine state rendered as a queryable column by the curation
+# views (curation.py builds both episodes views with it). Declared here
+# because measurement keys are validated against the episodes view's full
+# column list -- the table's columns plus this derived one.
+EPISODES_VIEW_STATUS_COLUMN = "status"
+
+# Lowercased name -> canonical spelling of every column a measurement key
+# must not claim. Derived from the episodes DDL plus the derived column
+# above, so a new episode column is guarded without touching the check.
+_EPISODES_VIEW_RESERVED_COLUMNS: dict[str, str] = {
+    **{
+        column.split()[0].lower(): column.split()[0]
+        for column in TABLE_COLUMN_DDL["episodes"].split(",")
+    },
+    EPISODES_VIEW_STATUS_COLUMN.lower(): EPISODES_VIEW_STATUS_COLUMN,
+}
+
 
 @dataclass(frozen=True)
 class CheckRunRow:
@@ -279,6 +296,34 @@ def _normalized_measurements(
             )
         normalized[key] = value
     return normalized
+
+
+def _raise_if_measurement_keys_shadow_episode_columns(
+    check_rows: Sequence[CheckRunRow],
+) -> None:
+    """Refuse a run whose measurement key claims an ``episodes`` column.
+
+    The wide ``episodes`` view pivots each numeric key into a column beside
+    the promoted episode columns; DuckDB resolves such a collision by
+    silently renaming the pivoted column to ``<key>_1``, so queries reading
+    the episode column get the episode value and never the measurement.
+    Keys compare case-insensitively -- DuckDB identifiers are, so ``Task``
+    shadows ``task`` all the same.
+    """
+    shadowed = [
+        f"{key!r} from {row.check_name!r} shadows {_EPISODES_VIEW_RESERVED_COLUMNS[key.lower()]!r}"
+        for row in check_rows
+        for key in row.measurements
+        if key.lower() in _EPISODES_VIEW_RESERVED_COLUMNS
+    ]
+    if not shadowed:
+        return
+    raise ValueError(
+        f"measurement keys collide with episodes columns: {'; '.join(shadowed)}. The wide "
+        "episodes view pivots keys into columns beside those names, so DuckDB renames the "
+        "measurement to <column>_1 and SELECT <column> returns the episode value instead. "
+        "Rename the measurement key."
+    )
 
 
 def _run_fingerprint(
@@ -481,6 +526,7 @@ class Catalog:
             replace(row, measurements=_normalized_measurements(row.check_name, row.measurements))
             for row in check_rows
         ]
+        _raise_if_measurement_keys_shadow_episode_columns(check_rows)
         run_fingerprint = _run_fingerprint(
             episode_id,
             stamps.pipeline_version,

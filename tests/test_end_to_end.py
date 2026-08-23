@@ -319,3 +319,19 @@ def test_colliding_endpoint_alias_names_are_refused(
 
     with pytest.raises(ValueError, match="HFLOW_ENDPOINT_JUDGE_V1"):
         app.test(state_only_source_episode, verbose=False)
+
+
+def test_check_claiming_an_episode_column_refuses_the_append(
+    state_only_source_episode: Path, tmp_path: Path
+) -> None:
+    """The #130 repro: a check measuring ``task`` used to land as ``task_1``
+    beside the real column, so SELECT task returned the metadata (here
+    'fold_napkin') and never the measurement. The append now refuses."""
+    app = hflow.App("reserved-key", data_root=tmp_path / "data")
+
+    @app.check()
+    def claims_task(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"task": 99.0})
+
+    with pytest.raises(ValueError, match=r"'claims_task'.*shadows 'task'"):
+        app.test(state_only_source_episode, verbose=False, record=True)

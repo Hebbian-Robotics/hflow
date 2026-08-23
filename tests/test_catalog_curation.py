@@ -678,6 +678,49 @@ def test_non_scalar_measurement_is_refused_naming_the_check_and_key(
         )
 
 
+def test_measurement_key_claiming_an_episode_column_is_refused(tmp_path: Path) -> None:
+    """A key named like an episodes column would pivot into <key>_1 beside it."""
+    canonical = tmp_path / "e.canonical.mcap"
+    canonical.write_bytes(b"episode-bytes")
+    row = CheckRunRow(
+        check_name="claims_task",
+        check_version="v1",
+        critical=False,
+        status=hflow.CheckStatus.MEASURED,
+        duration_s=0.1,
+        measurements={"task": 99.0},
+    )
+    with pytest.raises(ValueError, match=r"'claims_task'.*'task'"):
+        Catalog(tmp_path / "catalog").append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[row],
+        )
+    assert list((tmp_path / "catalog" / "episodes").glob("*.parquet")) == []
+
+
+def test_measurement_key_shadowing_is_case_insensitive(tmp_path: Path) -> None:
+    """DuckDB identifiers are case-insensitive, so 'Task' shadows 'task' too."""
+    canonical = tmp_path / "e.canonical.mcap"
+    canonical.write_bytes(b"episode-bytes")
+    row = CheckRunRow(
+        check_name="claims_task",
+        check_version="v1",
+        critical=False,
+        status=hflow.CheckStatus.MEASURED,
+        duration_s=0.1,
+        measurements={"Task": 1.0},
+    )
+    with pytest.raises(ValueError, match=r"'Task'.*shadows 'task'"):
+        Catalog(tmp_path / "catalog").append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[row],
+        )
+
+
 def test_crash_repaired_append_keeps_one_recorded_at_across_tables(tmp_path: Path) -> None:
     """A retry after a crashed append must not mix timestamps across tables.
 

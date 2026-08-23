@@ -18,11 +18,11 @@ Views registered on the connection:
 - ``episodes`` -- the wide view for everyday queries: latest episode rows,
   a ``status`` column (``'quarantined'``/``'ok'``), and one numeric column
   per measurement key (booleans as 0/1; text-valued measurements stay in the
-  long table). A measurement key that collides with an episode column name is
-  silently renamed rather than refused: the episode column keeps the name and
-  the measurement becomes ``<key>_1``, so ``SELECT task`` returns the metadata
-  and never the measurement. Name keys ``<topic>/<metric>`` and it cannot
-  arise.
+  long table). A measurement key claiming an episode column -- or this
+  derived ``status`` -- is refused at append time: pivoted beside the real
+  column, DuckDB would silently rename it to ``<key>_1``, and ``SELECT task``
+  would return the metadata where the measurement was meant. Name keys
+  ``<topic>/<metric>`` and the collision cannot arise.
 
 Dataset-level reporting always includes coverage denominators: which checks
 ran on what fraction of episodes, because a statistic over half a delivery
@@ -37,7 +37,7 @@ from pathlib import Path
 
 import duckdb
 
-from hflow.catalog import TABLE_COLUMN_DDL
+from hflow.catalog import EPISODES_VIEW_STATUS_COLUMN, TABLE_COLUMN_DDL
 from hflow.format import CATALOG_FORMAT_VERSION
 from hflow.steps import CheckStatus
 from hflow.storage import (
@@ -312,7 +312,7 @@ def _open_connection_over_root(
             CREATE VIEW episodes AS
             SELECT
                 e.* EXCLUDE (quarantined),
-                CASE WHEN e.quarantined THEN 'quarantined' ELSE 'ok' END AS status,
+                CASE WHEN e.quarantined THEN 'quarantined' ELSE 'ok' END AS {EPISODES_VIEW_STATUS_COLUMN},
                 m.* EXCLUDE (episode_id)
             FROM episodes_latest e
             LEFT JOIN (
@@ -334,11 +334,11 @@ def _open_connection_over_root(
         )
     else:
         connection.execute(
-            """
+            f"""
             CREATE VIEW episodes AS
             SELECT
                 * EXCLUDE (quarantined),
-                CASE WHEN quarantined THEN 'quarantined' ELSE 'ok' END AS status
+                CASE WHEN quarantined THEN 'quarantined' ELSE 'ok' END AS {EPISODES_VIEW_STATUS_COLUMN}
             FROM episodes_latest
             """
         )
