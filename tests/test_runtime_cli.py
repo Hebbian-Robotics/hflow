@@ -891,6 +891,22 @@ def test_ingest_rejects_unknown_profile(pipeline_file: Path, tmp_path: Path) -> 
     assert exit_info.value.code == 2
 
 
+@pytest.mark.parametrize("uri", ["/abs/x.mcap", "../x.mcap"])
+def test_ingest_rejects_uris_outside_data_root(
+    uri: str,
+    pipeline_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Runtime URIs cannot be absolute or escape the configured data root."""
+    bundle_dir = _rendered_bundle(tmp_path, pipeline_file)
+
+    exit_code = main(["ingest", uri, "--bundle-dir", str(bundle_dir)])
+
+    assert exit_code == 2
+    assert "is not relative to the data root" in capsys.readouterr().err
+
+
 def test_start_runtime_waits_for_all_five_dags(
     compose_calls: list[list[str]],
     pipeline_file: Path,
