@@ -149,6 +149,14 @@ def render_deploy_bundle(config: DeployConfig, output_dir: Path | str) -> Deploy
     """
     output_directory = Path(output_dir)
     pipeline_source = Path(config.pipeline_file)
+    if pipeline_source.is_dir():
+        # Deliberately FileNotFoundError and not IsADirectoryError: the accurate
+        # class subclasses OSError, not FileNotFoundError, so every existing
+        # `except FileNotFoundError` would stop catching this: nine sites in
+        # this package (cli.py, app.py x2, _compose.py, catalog.py, curation.py,
+        # storage.py, workspace.py) plus callers outside the repo. The errno
+        # carries the accurate text without moving the class. See #100 and #102.
+        raise FileNotFoundError(errno.EISDIR, os.strerror(errno.EISDIR), str(pipeline_source))
     if not pipeline_source.is_file():
         raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(pipeline_source))
 
@@ -164,6 +172,11 @@ def render_deploy_bundle(config: DeployConfig, output_dir: Path | str) -> Deploy
     requirements_copied = False
     if config.requirements_file is not None:
         requirements_source = Path(config.requirements_file)
+        if requirements_source.is_dir():
+            # FileNotFoundError, not IsADirectoryError, for the reason above.
+            raise FileNotFoundError(
+                errno.EISDIR, os.strerror(errno.EISDIR), str(requirements_source)
+            )
         if not requirements_source.is_file():
             raise FileNotFoundError(
                 errno.ENOENT, os.strerror(errno.ENOENT), str(requirements_source)

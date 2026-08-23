@@ -477,6 +477,37 @@ def test_deploy_missing_pipeline_names_the_reason_not_just_the_path(
     assert f"deploy: [Errno 2] No such file or directory: '{missing}'" in streams.err
 
 
+def test_deploy_pipeline_directory_says_is_a_directory(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The #102 repro end to end: the path exists, it is just the wrong kind.
+
+    The exit code and the absent traceback were already right (#90, #95); this
+    pins the message only. The class stays FileNotFoundError on purpose, so the
+    handler in cli.py that turns this into exit 2 keeps catching it.
+    """
+    a_directory = tmp_path / "pipelines"
+    a_directory.mkdir()
+
+    exit_code = main(
+        [
+            "deploy",
+            "--pipeline",
+            str(a_directory),
+            "--data-root-uri",
+            "s3://bucket/data",
+            "--output-dir",
+            str(tmp_path / "out"),
+        ]
+    )
+
+    assert exit_code == 2
+    streams = capsys.readouterr()
+    assert f"deploy: [Errno 21] Is a directory: '{a_directory}'" in streams.err
+    assert "No such file or directory" not in streams.err
+
+
 def test_deploy_missing_requirements_names_the_reason_too(
     pipeline_file: Path,
     tmp_path: Path,

@@ -2,6 +2,7 @@
 template rendered against deploy values, DEPLOY.md contents, data-root URI
 validation, and the CLI wiring (no Docker, no Airflow, no platform APIs)."""
 
+import errno
 from dataclasses import replace
 from pathlib import Path
 
@@ -418,3 +419,26 @@ def test_cli_deploy_rejects_relative_data_root(
     assert "deploy:" in errors
     assert "'./data'" in errors
     assert not (tmp_path / "deploy").exists()
+
+
+def test_pipeline_directory_says_is_a_directory(config: DeployConfig, tmp_path: Path) -> None:
+    """A directory exists, so ENOENT was the wrong reason (#102)."""
+    a_directory = tmp_path / "pipelines"
+    a_directory.mkdir()
+    broken = replace(config, pipeline_file=a_directory)
+    with pytest.raises(FileNotFoundError) as excinfo:
+        render_deploy_bundle(broken, tmp_path / "deploy")
+    assert excinfo.value.errno == errno.EISDIR
+    assert excinfo.value.filename == str(a_directory)
+    assert "Is a directory" in str(excinfo.value)
+
+
+def test_requirements_directory_says_is_a_directory(config: DeployConfig, tmp_path: Path) -> None:
+    a_directory = tmp_path / "reqs"
+    a_directory.mkdir()
+    broken = replace(config, requirements_file=a_directory)
+    with pytest.raises(FileNotFoundError) as excinfo:
+        render_deploy_bundle(broken, tmp_path / "deploy")
+    assert excinfo.value.errno == errno.EISDIR
+    assert excinfo.value.filename == str(a_directory)
+    assert "Is a directory" in str(excinfo.value)

@@ -1,6 +1,7 @@
 """render_bundle unit tests: bundle layout, compose shape, .env create-if-absent,
 and the generated master/sub-DAG sources (no Docker, no Airflow imports)."""
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -909,3 +910,30 @@ def test_api_port_of_the_wrong_type_is_rejected_at_construction(
 
     with pytest.raises(ValueError, match=f"api_port must be an int, not {type_name}"):
         replace(config, api_port=bad_port)
+
+
+def test_pipeline_directory_says_is_a_directory(config: RuntimeConfig, tmp_path: Path) -> None:
+    """A directory exists, so ENOENT was the wrong reason (#102)."""
+    from dataclasses import replace
+
+    a_directory = tmp_path / "pipelines"
+    a_directory.mkdir()
+    broken = replace(config, pipeline_file=a_directory)
+    with pytest.raises(FileNotFoundError) as excinfo:
+        render_bundle(broken, tmp_path / "bundle")
+    assert excinfo.value.errno == errno.EISDIR
+    assert excinfo.value.filename == str(a_directory)
+    assert "Is a directory" in str(excinfo.value)
+
+
+def test_requirements_directory_says_is_a_directory(config: RuntimeConfig, tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    a_directory = tmp_path / "reqs"
+    a_directory.mkdir()
+    broken = replace(config, requirements_file=a_directory)
+    with pytest.raises(FileNotFoundError) as excinfo:
+        render_bundle(broken, tmp_path / "bundle")
+    assert excinfo.value.errno == errno.EISDIR
+    assert excinfo.value.filename == str(a_directory)
+    assert "Is a directory" in str(excinfo.value)
