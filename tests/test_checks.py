@@ -12,6 +12,7 @@ from hflow.checks import (
     camera_fps_conformance,
     camera_frame_stats,
     camera_signal_quality,
+    camera_stability,
     content_digest,
     episode_duration,
     idle_fraction,
@@ -55,6 +56,7 @@ def test_no_two_builtin_checks_claim_the_same_measurement_key(tmp_path: Path) ->
             "camera_signal_quality": camera_signal_quality(episode),
             "trajectory_metrics": trajectory_metrics(episode),
             "trajectory_segments": trajectory_segments(episode),
+            "camera_stability": camera_stability(episode),
         }
 
     producers_by_key: dict[str, list[str]] = {}
@@ -88,6 +90,7 @@ def test_every_builtin_check_registers_bare_and_runs(tmp_path: Path) -> None:
         trajectory_segments,
         camera_frame_stats,
         camera_signal_quality,
+        camera_stability,
     ):
         app.check()(builtin)
 

@@ -3,7 +3,7 @@
 **Goal:** run HFlow's packaged checks over your episodes, and gate on the ones
 you want to reject episodes for, without writing the checks yourself.
 
-HFlow ships thirteen checks as plain functions in
+HFlow ships fourteen checks as plain functions in
 [`hflow.checks`](../../src/hflow/checks.py). They are written in exactly the
 shape you would write your own, so reading one is the fastest way to learn the
 [porting pattern](../PORTING.md) -- and registering one is a single line.
@@ -75,6 +75,7 @@ query later rather than pass/fail decisions baked into your corpus.
 | `joint_discontinuity` | Does any joint move faster than a limit you set? |
 | `idle_fraction` | How much of the episode had nothing moving? |
 | `camera_signal_quality` | Coding range, range-gated exposure, impulse noise, and stillness -- from the same decode pass. |
+| `camera_stability` | How much footage is shaky rather than deliberately moving. Needs the `motion` extra. |
 | `action_integrity` | Are the recorded values sound -- no NaNs, no publisher stalls repeating a sample, no dimension that never moves? |
 | `trajectory_metrics` | How far and fast did it move, how much stood still, was it still settling when recording stopped? |
 | `trajectory_segments` | When inside the episode did it hold still, change direction sharply, or hit peak speed? |
@@ -90,6 +91,12 @@ and `camera_fps_conformance` needs `nominal_fps=` to compare against. The
 joint-stream checks default to `/joint_states`; pass `topic=` for anything else,
 and skip them entirely on a corpus with no state streams (human egocentric video,
 for instance -- see [the egocentric example](../../examples/egocentric/)).
+
+One check needs a dependency the core install does not carry:
+`camera_stability` uses optical flow and so needs OpenCV, which ships in the
+optional `motion` extra (`pip install 'hflow[motion]'`). Everything else here
+runs on the core install. Enabling it without the extra raises at the first
+episode with the install command in the message, rather than failing obscurely.
 
 The trajectory checks report in the stream's own units. If your dimensions share
 no unit -- a gripper width beside a shoulder angle -- pass `dimension_scales=`,

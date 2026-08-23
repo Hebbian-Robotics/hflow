@@ -758,6 +758,9 @@ _UNIT_BY_KEY_SUFFIX: dict[str, str] = {
     "minute": "min",
     "minutes": "min",
     "hz": "Hz",
+    # Angular rate. Spelled as one token deliberately: a key ending
+    # ``_deg_per_s`` would have ``s`` as its tail and be labelled seconds.
+    "dps": "deg/s",
     "pct": "%",
     "percent": "%",
     "ratio": "ratio",

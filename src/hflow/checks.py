@@ -23,6 +23,12 @@ import numpy as np
 
 from hflow.episode import Episode
 from hflow.ffmpeg import frame_stats
+
+# Imported at module scope, not inside the check: a function referenced as a
+# global has its source folded into the check's content-hash version, so a
+# change to the instrument re-versions the measurements it produced. OpenCV
+# itself stays lazy inside hflow.motion, so this costs the core install nothing.
+from hflow.motion import DEFAULT_HORIZONTAL_FIELD_OF_VIEW_DEGREES, measure_camera_motion
 from hflow.steps import (
     CheckResult,
     Comparison,
@@ -466,6 +472,90 @@ def content_digest(episode: Episode) -> CheckResult:
             digest.update(len(payload).to_bytes(8, "big"))
             digest.update(payload)
     return CheckResult(measurements={"content_digest": digest.hexdigest()})
+
+
+def camera_stability(
+    episode: Episode,
+    *,
+    cameras: Sequence[str] | None = None,
+    horizontal_field_of_view_degrees: float = DEFAULT_HORIZONTAL_FIELD_OF_VIEW_DEGREES,
+) -> CheckResult:
+    """How much of each camera's footage is shaky rather than deliberately moving.
+
+    Requires the ``motion`` extra (``pip install 'hflow[motion]'``). This is the
+    one built-in with a dependency outside the core install, because optical flow
+    and a RANSAC similarity fit have no numpy-only equivalent that measures the
+    same thing.
+
+    Tracks features between adjacent frames, fits a similarity transform to the
+    tracks so independently moving subjects are discarded as outliers, converts
+    the fit to angular rates, and splits those rates in time: below roughly 1 Hz
+    is deliberate camera movement, above it is shake. A pair is unstable when its
+    shake exceeds both the deliberate motion in that same pair and the
+    instrument's own resolution floor -- so nothing here is a threshold anyone
+    chose. Verified on synthetic footage: a static camera and a smooth pan both
+    report no unstable footage, while injected shake scales monotonically with
+    its amplitude.
+
+    Read ``unstable_share`` next to ``coverage_share``. Footage no transform
+    could be fitted to is reported as unclassified rather than as steady, so a
+    low coverage means the share describes only the part that was measurable.
+
+    Rates are degrees per second, named ``_dps``. Do not read the frame-to-frame
+    difference in :func:`camera_signal_quality` as a stability signal: it cannot
+    separate a shaking camera from a moving subject, which is the entire reason
+    this check exists.
+    """
+
+    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    measurements: dict[str, MeasurementValue] = {}
+    intervals: list[Interval] = []
+    for topic in selected_cameras:
+        stamps_ns = episode.channel(topic).timestamps
+        if len(stamps_ns) < 2:
+            measurements[f"{topic}/stability_sample_count"] = len(stamps_ns)
+            continue
+        # The stream's real rate, not a nominal one: the rates below are per
+        # second, so a wrong fps scales every one of them.
+        median_interval_s = float(np.median(np.diff(stamps_ns)) / 1e9)
+        if median_interval_s <= 0:
+            measurements[f"{topic}/stability_sample_count"] = len(stamps_ns)
+            continue
+        motion = measure_camera_motion(
+            episode.video(topic),
+            frames_per_second=1.0 / median_interval_s,
+            horizontal_field_of_view_degrees=horizontal_field_of_view_degrees,
+        )
+        if motion is None:
+            measurements[f"{topic}/stability_sample_count"] = len(stamps_ns)
+            continue
+        observed_s = motion.measured_s + motion.unclassified_s
+        measurements.update(
+            {
+                f"{topic}/stability_sample_count": len(stamps_ns),
+                f"{topic}/unstable_share": motion.unstable_share,
+                f"{topic}/unstable_s": motion.unstable_s,
+                f"{topic}/measured_s": motion.measured_s,
+                f"{topic}/unclassified_s": motion.unclassified_s,
+                f"{topic}/coverage_share": (
+                    motion.measured_s / observed_s if observed_s > 0 else 0.0
+                ),
+                f"{topic}/shake_rate_p50_dps": motion.shake_rate_p50_deg_per_s,
+                f"{topic}/shake_rate_p95_dps": motion.shake_rate_p95_deg_per_s,
+                f"{topic}/intentional_rate_p50_dps": motion.intentional_rate_p50_deg_per_s,
+                f"{topic}/resolution_floor_dps": motion.resolution_floor_deg_per_s,
+                f"{topic}/median_inlier_ratio": motion.median_inlier_ratio,
+                f"{topic}/horizontal_fov_degrees": horizontal_field_of_view_degrees,
+            }
+        )
+        # Pair i spans frame i to frame i + 1, and canonical episodes carry one
+        # frame per message, so a pair maps onto two consecutive log times.
+        unstable_mask = np.zeros(max(len(stamps_ns) - 1, 0), dtype=bool)
+        for pair_index in motion.unstable_pair_indices:
+            if pair_index < len(unstable_mask):
+                unstable_mask[pair_index] = True
+        intervals.extend(_mask_run_intervals(stamps_ns, unstable_mask, f"unstable:{topic}"))
+    return CheckResult(measurements=measurements, intervals=intervals)
 
 
 def trajectory_metrics(

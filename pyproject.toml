@@ -36,6 +36,11 @@ arrow = ["pyarrow>=25.0.1"]
 # object_store crate as a single dependency-free wheel; local-path roots
 # never import it.
 bucket = ["obstore>=0.10.0"]
+# Camera-shake measurement: pyramidal Lucas-Kanade optical flow and a RANSAC
+# similarity fit. No numpy-only equivalent preserves the instrument, and
+# reimplementing them would make it a different, unvalidated one -- so the
+# dependency is real, and confined to the one check that needs it.
+motion = ["opencv-python-headless>=4.10"]
 openai = ["openai>=3.0.0"]
 
 [project.urls]
@@ -53,6 +58,9 @@ dev = [
     # httpx: starlette 1.6 deprecates the httpx transport in its favour.
     "httpx2>=2.10",
     "obstore>=0.10.0", # the bucket extra, present in dev so the suite tests it
+    # the motion extra, present in dev so the suite tests it rather than
+    # skipping the one check that cannot be verified any other way
+    "opencv-python-headless>=4.10",
     "pytest>=9.1.1",
     "pyyaml>=6.0.3",
     "ruff>=0.16.2",

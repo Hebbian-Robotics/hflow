@@ -18,6 +18,7 @@ from hflow.ffmpeg._binary import (
 )
 from hflow.ffmpeg._contact_sheet import ContactSheet, contact_sheet
 from hflow.ffmpeg._instrument import FrameStats, InstrumentParseError, frame_stats
+from hflow.ffmpeg._raw_frames import RawFrameError, luma_frames
 
 __all__ = [
     "FFMPEG_ENV_VAR",
@@ -27,10 +28,12 @@ __all__ = [
     "FfprobeNotFoundError",
     "FrameStats",
     "InstrumentParseError",
+    "RawFrameError",
     "contact_sheet",
     "ffmpeg_path",
     "ffmpeg_version",
     "ffprobe_path",
     "ffprobe_version",
     "frame_stats",
+    "luma_frames",
 ]
