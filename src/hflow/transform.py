@@ -9,8 +9,9 @@ v1 behavior:
 - Channels already carrying ``foxglove.CompressedVideo`` pass through
   byte-for-byte, but only after every message is validated against the
   canonical video constraints (``format="h264"``, one AUD-delimited access
-  unit per message, SPS+PPS on keyframes) -- the provenance stamp asserts
-  conformance, so nonconforming video must fail loudly, never pass silently.
+  unit per message, SPS+PPS on keyframes, each channel starts on a keyframe) --
+  the provenance stamp asserts conformance, so nonconforming video must fail
+  loudly, never pass silently.
   Raw ``sensor_msgs/msg/Image``/``foxglove.RawImage`` is not supported in v1
   (explicit error).
 - Every other channel passes through byte-for-byte with its original schema.
@@ -226,7 +227,9 @@ def _resolve_decoder(topic: str, info: TopicInfo) -> Callable[[bytes], Any]:
     )
 
 
-def _validate_passthrough_video_payload(topic: str, decoded_message: Any) -> None:
+def _validate_passthrough_video_payload(
+    topic: str, decoded_message: Any, *, is_first_message: bool
+) -> None:
     """Enforce the canonical video constraints on a pass-through message.
 
     The provenance stamp asserts the whole file conforms (FORMAT.md), so a
@@ -252,10 +255,16 @@ def _validate_passthrough_video_payload(topic: str, decoded_message: Any) -> Non
             f"{len(access_units)} access units; the canonical convention requires "
             "exactly one decodable frame per message"
         )
-    if access_units[0].is_keyframe and not access_units[0].has_parameter_sets:
+    access_unit = access_units[0]
+    if access_unit.is_keyframe and not access_unit.has_parameter_sets:
         raise ValueError(
             f"pass-through video topic {topic!r} has a keyframe without SPS/PPS; "
             "the canonical convention requires parameter sets on every keyframe"
+        )
+    if is_first_message and not access_unit.is_keyframe:
+        raise ValueError(
+            f"pass-through video topic {topic!r} starts mid-GOP: its first message "
+            "is not a keyframe, so the stream is not decodable from the start"
         )
 
 
@@ -362,6 +371,7 @@ def write_canonical_episode(
             if info.schema_name in _PASSTHROUGH_VIDEO_SCHEMAS
         }
         passthrough_video_decoders: dict[int, Callable[[bytes], Any]] = {}
+        passthrough_video_channels_with_messages: set[int] = set()
         for batch in reader.iter_batches():
             if batch.channel_id in camera_payloads:
                 camera_log_times[batch.channel_id].extend(int(t) for t in batch.log_times)
@@ -375,7 +385,15 @@ def write_canonical_episode(
                         )
                     decode = passthrough_video_decoders[batch.channel_id]
                     for payload in batch.data:
-                        _validate_passthrough_video_payload(batch.topic, decode(payload))
+                        is_first_message = (
+                            batch.channel_id not in passthrough_video_channels_with_messages
+                        )
+                        _validate_passthrough_video_payload(
+                            batch.topic,
+                            decode(payload),
+                            is_first_message=is_first_message,
+                        )
+                        passthrough_video_channels_with_messages.add(batch.channel_id)
                 outgoing.extend(
                     _OutgoingMessage(
                         log_time=int(batch.log_times[index]),

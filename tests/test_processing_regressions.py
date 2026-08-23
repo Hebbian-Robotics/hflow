@@ -14,12 +14,21 @@ from mcap.writer import Writer as StockWriter
 from mcap_protobuf.schema import build_file_descriptor_set
 
 import hflow
+from hflow.doctor import diagnose
 from hflow.format import METADATA_RECORD_EPISODE
 from hflow.mcap_writer import CanonicalMcapWriter
 from hflow.steps import compute_check_version
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import write_canonical_episode
 from hflow.video import estimate_fps_from_log_times
+
+ANNEX_B_START_CODE = b"\x00\x00\x00\x01"
+KEYFRAME_ACCESS_UNIT = b"".join(
+    ANNEX_B_START_CODE + bytes([nal_type]) + b"payload" for nal_type in (0x09, 0x67, 0x68, 0x65)
+)
+NON_KEYFRAME_ACCESS_UNIT = b"".join(
+    ANNEX_B_START_CODE + bytes([nal_type]) + b"payload" for nal_type in (0x09, 0x41)
+)
 
 
 def test_estimate_fps_normal_stream() -> None:
@@ -93,6 +102,83 @@ def test_transform_rejects_nonconforming_passthrough_video(tmp_path: Path) -> No
         writer.finish()
     with pytest.raises(ValueError, match="requires 'h264'"):
         write_canonical_episode(source, tmp_path / "out.mcap")
+
+
+def _write_passthrough_video_source(
+    path: Path, messages: list[tuple[str, int, bytes]]
+) -> dict[str, list[bytes]]:
+    payloads_by_topic: dict[str, list[bytes]] = {}
+    with path.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        schema_id = writer.register_schema(
+            name="foxglove.CompressedVideo",
+            encoding="protobuf",
+            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
+        )
+        channel_ids = {
+            topic: writer.register_channel(
+                topic=topic, message_encoding="protobuf", schema_id=schema_id
+            )
+            for topic in dict.fromkeys(topic for topic, _log_time, _data in messages)
+        }
+        for topic, log_time, access_unit_data in messages:
+            message = CompressedVideo()
+            message.timestamp.FromNanoseconds(log_time)
+            message.frame_id = topic.strip("/")
+            message.data = access_unit_data
+            message.format = "h264"
+            payload = message.SerializeToString()
+            writer.add_message(
+                channel_ids[topic], log_time=log_time, data=payload, publish_time=log_time
+            )
+            payloads_by_topic.setdefault(topic, []).append(payload)
+        writer.finish()
+    return payloads_by_topic
+
+
+def test_transform_rejects_each_passthrough_video_channel_starting_mid_gop(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "interleaved-mid-gop.mcap"
+    _write_passthrough_video_source(
+        source,
+        [
+            ("/cam/left", 1, KEYFRAME_ACCESS_UNIT),
+            ("/cam/right", 2, NON_KEYFRAME_ACCESS_UNIT),
+            ("/cam/left", 3, NON_KEYFRAME_ACCESS_UNIT),
+        ],
+    )
+
+    with pytest.raises(ValueError, match=r"/cam/right.*starts mid-GOP"):
+        write_canonical_episode(source, tmp_path / "out.mcap")
+
+
+def test_transform_accepts_independent_interleaved_passthrough_video_channels(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "interleaved-keyframes.mcap"
+    expected_payloads = _write_passthrough_video_source(
+        source,
+        [
+            ("/cam/left", 1, KEYFRAME_ACCESS_UNIT),
+            ("/cam/right", 2, KEYFRAME_ACCESS_UNIT),
+            ("/cam/left", 3, NON_KEYFRAME_ACCESS_UNIT),
+            ("/cam/right", 4, NON_KEYFRAME_ACCESS_UNIT),
+        ],
+    )
+    output = tmp_path / "out.mcap"
+
+    write_canonical_episode(source, output)
+
+    with output.open("rb") as stream:
+        reader = make_reader(stream)
+        actual_payloads: dict[str, list[bytes]] = {}
+        for _schema, channel, message in reader.iter_messages(log_time_order=True):
+            actual_payloads.setdefault(channel.topic, []).append(message.data)
+    assert actual_payloads == expected_payloads
+    report = diagnose(output)
+    assert report.conforming, report.summary()
 
 
 def test_aborted_writer_does_not_publish_partial_file(tmp_path: Path) -> None:
