@@ -224,9 +224,14 @@ def test_a_gateless_step_hashes_as_if_gates_did_not_exist() -> None:
     if the identity dict's SHAPE changed. An unconditional new key there would
     re-version every check, every derived channel, and through
     pipeline_version every episode_id in every existing corpus.
+
+    Last moved when a declared version stopped being an override laid over the
+    introspected identity and became the whole of it -- ``implementation`` and
+    ``configuration`` are absent under ``version='...'`` now, which is what
+    lets an author refactor without re-versioning.
     """
     identity = compute_check_version("probe", len, False, frozenset(), None, "v1")
-    assert identity == "59895cb283c3"
+    assert identity == "fec021d42dba"
     assert (
         compute_check_version("probe", len, False, frozenset(), None, "v1", gate=None) == identity
     )

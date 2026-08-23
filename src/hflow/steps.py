@@ -385,21 +385,30 @@ def compute_check_version(
     *,
     gate: "Gate | None" = None,
 ) -> str:
-    """Content-hash a step's implementation and behavior configuration.
+    """Content-hash a step, or record the version its author declared.
 
     Used for checks and enrichments alike (enrichments pass
-    ``critical=False``). Closure values, defaults, and callable-instance state
-    are included when they can be represented deterministically. Pass an
-    explicit ``declared_version`` for opaque clients or other configuration
-    that cannot be inspected safely.
+    ``critical=False``). By default the version is DERIVED: the function's
+    source, its closure values and defaults, and -- transitively, across
+    first-party modules only (see :class:`_IdentityScope`) -- the helpers it
+    calls and the constants they read. A parser or a threshold one call below
+    the step still moves the step's version.
+
+    Pass ``declared_version`` to own the version instead. Nothing derived from
+    the function is hashed then, so a refactor the author judges equivalent
+    keeps the identity and its rows stay comparable; the cost is that they
+    must remember to bump it when behavior really does change. Use it for an
+    opaque client the machinery cannot read, and for a step stable enough that
+    its author would rather promise than measure.
+
+    Deriving is the default because the two mistakes are not symmetric. An
+    unnecessary version split is recoverable -- both hashes exist and a query
+    can union them. A missed one is not: two behaviors under one version, with
+    nothing left to say which row came from which.
 
     A ``gate`` arrives from registration rather than from the function, so it
-    is folded in here: tuning a threshold has to move the version, or two
-    policies share one and curation can no longer pin either.
-
-    The walk into referenced code is transitive across first-party modules
-    (see :class:`_IdentityScope`), so a constant or a parser one call deeper
-    than the step still moves the step's version.
+    is folded in under BOTH modes: tuning a threshold has to move the version,
+    or two policies share one and curation can no longer pin either.
     """
     identity = json.dumps(
         step_identity_payload(
@@ -428,28 +437,32 @@ def step_identity_payload(
     "what does this version actually cover", which is what
     ``UNDESCRIBED_CONFIGURATION_KEY`` makes checkable -- a gap in the walk is
     otherwise invisible until someone edits the code it failed to read.
+
+    Two identity modes, and ``declared_version`` chooses between them:
+
+    - **Derived** (the default): the implementation and everything it
+      transitively reaches decide the version. Nothing to remember, and the
+      version cannot claim two behaviors are one.
+    - **Declared**: the author owns the version outright and NOTHING derived
+      from the function reaches the hash, so a refactor they judge equivalent
+      keeps the identity and its rows stay comparable.
+
+    What survives declaring is the REGISTRATION: name, ``critical``,
+    ``requires``, ``uses``, and the gate. Those are not what the function is
+    made of, they are what the author wrote at the decorator -- changing one
+    is a deliberate edit with a visible diff, not a refactor, and a gate in
+    particular must keep moving the version or two threshold policies share
+    one and curation can pin neither (see :class:`Gate`).
     """
     if declared_version is not None and not declared_version:
         raise ValueError(f"declared step version must not be empty for step {name!r}")
 
     scope = _identity_scope_for(function)
-    implementation_identity = _callable_implementation_identity(
-        function,
-        allow_opaque=declared_version is not None,
-    )
-    behavior_configuration: VersionIdentityValue
-    if declared_version is not None:
-        behavior_configuration = {"declared_version": declared_version}
-    else:
-        behavior_configuration = _callable_behavior_configuration(function, scope=scope)
-
-    return {
+    identity: dict[str, VersionIdentityValue] = {
         "name": name,
         "critical": critical,
         "requires": sorted(requires),
         "uses": uses,
-        "implementation": implementation_identity,
-        "configuration": behavior_configuration,
         # Present only when a gate is declared, like transform.py's
         # resample_policy: an unconditional key would re-version every
         # check, enrichment, and derived channel -- and derived-channel
@@ -457,6 +470,17 @@ def step_identity_payload(
         # bytes episode_id hashes. One new key would restamp every corpus.
         **({"gate": _stable_version_identity_value(gate, scope)} if gate is not None else {}),
     }
+    if declared_version is not None:
+        # Not introspected at all, rather than introspected and overridden:
+        # an opaque vendor client has no describable implementation, and an
+        # ordinary function whose author declared a version must not have its
+        # source leak back in -- that would make the declaration advisory and
+        # the refactor it exists to permit would re-version anyway.
+        identity["declared_version"] = declared_version
+        return identity
+    identity["implementation"] = _callable_implementation_identity(function)
+    identity["configuration"] = _callable_behavior_configuration(function, scope=scope)
+    return identity
 
 
 # Marks a point where the identity walk could not describe a transitively
@@ -523,9 +547,14 @@ def _identity_scope_for(function: Callable[..., object]) -> _IdentityScope:
 
 def _callable_implementation_identity(
     function: Callable[..., object],
-    *,
-    allow_opaque: bool = False,
 ) -> VersionIdentityValue:
+    """What a callable IS, or a refusal naming the way out.
+
+    Only reached for a step whose version is derived, so there is no "describe
+    it loosely" mode: a callable this cannot read has no honest derived
+    identity, and the refusal points at ``version='...'`` -- which now means
+    the function is not introspected at all rather than introspected weakly.
+    """
     if isinstance(function, functools.partial):
         return {
             "partial_func": _callable_implementation_identity(function.func),
@@ -541,10 +570,6 @@ def _callable_implementation_identity(
         code = getattr(source_target, "__code__", None)
         if isinstance(code, CodeType):
             return {"code": _code_identity(code)}
-    if allow_opaque:
-        return {
-            "opaque_callable_type": f"{type(function).__module__}.{type(function).__qualname__}"
-        }
     raise ValueError(
         f"cannot derive a stable implementation identity for {function!r}; "
         "register it with version='...'"

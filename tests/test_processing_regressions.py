@@ -654,8 +654,11 @@ def _check_over_mutual_recursion(_episode: hflow.Episode) -> hflow.CheckResult:
     return hflow.CheckResult(verdict=_mutually_recursive_even(2))
 
 
+_NONE: frozenset[str] = frozenset()
+
+
 def _version_of(function: Callable[..., object], name: str = "probe") -> str:
-    return compute_check_version(name, function, False, frozenset(), None)
+    return compute_check_version(name, function, False, _NONE, None)
 
 
 def test_step_version_follows_a_helper_the_step_does_not_name(
@@ -827,6 +830,61 @@ def test_step_version_does_not_descend_into_a_dependency() -> None:
     )
 
     assert _version_of(check_over_a_dependency) == before
+
+
+def _declared_check_before_refactor(_episode: hflow.Episode) -> hflow.CheckResult:
+    total = 0
+    return hflow.CheckResult(measurements={"n": total})
+
+
+def _declared_check_after_refactor(_episode: hflow.Episode) -> hflow.CheckResult:
+    # Renamed local, added comment, reads the shared constant the same way.
+    running_total = 0
+    return hflow.CheckResult(measurements={"n": running_total})
+
+
+def test_a_declared_version_survives_a_refactor_of_the_step() -> None:
+    """The point of declaring: the author judges two spellings equivalent.
+
+    Without this the declaration was advisory -- the source hash leaked back
+    in, so refactoring a step that had opted out of derived versioning still
+    split its rows, which is the one thing declaring exists to prevent.
+    """
+    before = compute_check_version(
+        "owned", _declared_check_before_refactor, False, _NONE, None, "3"
+    )
+    after = compute_check_version("owned", _declared_check_after_refactor, False, _NONE, None, "3")
+
+    assert before == after
+    assert _version_of(_declared_check_before_refactor) != _version_of(
+        _declared_check_after_refactor
+    ), "the same refactor must still move a DERIVED version"
+
+
+def test_a_declared_version_still_tracks_what_was_declared_beside_it() -> None:
+    """Declaring owns the implementation, never the registration.
+
+    ``critical`` and a gate are written at the decorator, not refactored into
+    existence: changing one is a deliberate policy edit with a visible diff,
+    and a gate especially must keep moving the version or two thresholds share
+    one and curation can pin neither.
+    """
+    owned = ("owned", _declared_check_before_refactor, False, _NONE, None, "3")
+    baseline = compute_check_version(*owned)
+    gate = hflow.Gate(accept_when=(hflow.Threshold("n", hflow.Comparison.AT_MOST, 1.0),))
+    looser = hflow.Gate(accept_when=(hflow.Threshold("n", hflow.Comparison.AT_MOST, 9.0),))
+
+    assert compute_check_version(*owned, gate=gate) != baseline
+    assert compute_check_version(*owned, gate=looser) != compute_check_version(*owned, gate=gate)
+    critical_owned = ("owned", _declared_check_before_refactor, True, _NONE, None, "3")
+    assert compute_check_version(*critical_owned) != baseline
+
+
+def test_bumping_a_declared_version_is_what_moves_it() -> None:
+    """The author's promise is the whole identity, so the promise must count."""
+    arguments = ("owned", _declared_check_before_refactor, False, _NONE, None)
+
+    assert compute_check_version(*arguments, "3") != compute_check_version(*arguments, "4")
 
 
 def test_declared_step_version_supports_opaque_callable() -> None:
