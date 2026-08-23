@@ -288,7 +288,7 @@ both paths.
 ## See also
 
 - [Documentation home](./README.md): choose a tutorial, how-to guide, reference, or explanation
-- [Enable the built-in quality checks](./how-to/enable-built-in-checks.md): the fifteen packaged checks, and how to gate on one
+- [Enable the built-in quality checks](./how-to/enable-built-in-checks.md): the sixteen packaged checks, and how to gate on one
 - [Query quality evidence and create a manifest](./CATALOG.md): where measurements land, and the naming rules for keys
 - [Runnable examples](../examples/README.md): commands, prerequisites, and expected output
 - [OpenAI vision how-to](./how-to/call-openai-vision.md): a complete Responses API check
