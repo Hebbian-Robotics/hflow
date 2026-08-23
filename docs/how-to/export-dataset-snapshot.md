@@ -35,8 +35,10 @@ uv run hflow export snapshot \
 ```
 
 Omit `--manifest` to export every latest episode in the catalog. An existing
-output directory is refused by default; pass `--overwrite` to replace it only
-after the new export has been staged completely.
+output directory is refused by default. `--overwrite` replaces it only when
+its `format.json` identifies a supported HFlow dataset snapshot, and only
+after the new export has been staged completely. Unmarked directories and
+snapshots with unknown format versions are never removed.
 
 The observable result is:
 
@@ -97,6 +99,11 @@ report = hflow.export_dataset_snapshot(
 )
 print(report)
 ```
+
+If activation succeeds but deleting the previous snapshot fails, the export
+still returns successfully because the requested snapshot is already live.
+`report.retained_backup` then identifies the backup directory and cleanup
+error, and the report summary prints the same warning for CLI users.
 
 ## Open it in dataframe tools
 

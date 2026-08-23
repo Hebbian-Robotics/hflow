@@ -47,6 +47,7 @@ from hflow.snapshot import (
     DATASET_SNAPSHOT_FORMAT_NAME,
     DATASET_SNAPSHOT_FORMAT_VERSION,
     DatasetSnapshotReport,
+    RetainedDatasetSnapshotBackup,
     SnapshotMediaMode,
     export_dataset_snapshot,
 )
@@ -132,6 +133,7 @@ __all__ = [
     "RegisteredCheck",
     "RegisteredEnrichment",
     "ResamplePolicy",
+    "RetainedDatasetSnapshotBackup",
     "SnapshotMediaMode",
     "Stage",
     "StaleEpisode",

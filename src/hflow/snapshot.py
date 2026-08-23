@@ -42,6 +42,26 @@ class SnapshotMediaMode(StrEnum):
     COPY = "copy"
 
 
+class _SnapshotMediaKind(StrEnum):
+    IMAGE = "image"
+    VIDEO = "video"
+    AUDIO = "audio"
+    OTHER = "other"
+
+
+class _SnapshotMediaRole(StrEnum):
+    CONTACT_SHEET = "contact_sheet"
+    ARTIFACT = "artifact"
+
+
+@dataclass(frozen=True)
+class RetainedDatasetSnapshotBackup:
+    """A prior snapshot retained because post-activation cleanup failed."""
+
+    directory: Path
+    cleanup_error: str
+
+
 @dataclass(frozen=True)
 class DatasetSnapshotReport:
     """Observable result of one completed dataset snapshot export."""
@@ -55,13 +75,20 @@ class DatasetSnapshotReport:
     tag_count: int
     interval_count: int
     media_mode: SnapshotMediaMode
+    retained_backup: RetainedDatasetSnapshotBackup | None = None
 
     def summary(self) -> str:
-        return (
+        completed_summary = (
             f"dataset snapshot: {self.output_directory} "
             f"({self.episode_count} episodes, {self.measurement_count} measurements, "
             f"{self.media_count} media references, {self.copied_media_count} media files copied, "
             f"{self.tag_count} tags, {self.interval_count} intervals)"
+        )
+        if self.retained_backup is None:
+            return completed_summary
+        return (
+            f"{completed_summary}; warning: previous snapshot backup retained at "
+            f"{self.retained_backup.directory}: {self.retained_backup.cleanup_error}"
         )
 
     def __str__(self) -> str:
@@ -215,25 +242,82 @@ def _register_latest_check_runs(connection: duckdb.DuckDBPyConnection) -> None:
         CREATE TEMP VIEW snapshot_check_runs_latest AS
         SELECT * EXCLUDE (row_rank) FROM (
             SELECT
-                check_runs.*,
+                check_runs.* EXCLUDE (recorded_at),
+                episodes.recorded_at,
                 row_number() OVER (
                     PARTITION BY check_runs.episode_id, check_runs.check_name
-                    ORDER BY check_runs.recorded_at DESC, check_runs.run_fingerprint DESC
+                    ORDER BY episodes.recorded_at DESC, check_runs.run_fingerprint DESC
                 ) AS row_rank
             FROM check_runs
+            JOIN episodes_raw episodes USING (episode_id, run_fingerprint)
             JOIN snapshot_selected_episode_ids selected USING (episode_id)
         ) WHERE row_rank = 1
         """
     )
 
 
-def _media_kind_for_mime_type(mime_type: str | None) -> str:
+def _media_kind_for_mime_type(mime_type: str | None) -> _SnapshotMediaKind:
     if mime_type is None:
-        return "other"
+        return _SnapshotMediaKind.OTHER
     top_level_type, _, _subtype = mime_type.partition("/")
-    if top_level_type in {"image", "video", "audio"}:
-        return top_level_type
-    return "other"
+    match top_level_type:
+        case "image":
+            return _SnapshotMediaKind.IMAGE
+        case "video":
+            return _SnapshotMediaKind.VIDEO
+        case "audio":
+            return _SnapshotMediaKind.AUDIO
+        case _:
+            return _SnapshotMediaKind.OTHER
+
+
+def _media_selection_rank(role: _SnapshotMediaRole, media_kind: _SnapshotMediaKind) -> int:
+    match role, media_kind:
+        case _SnapshotMediaRole.CONTACT_SHEET, _:
+            return 0
+        case _SnapshotMediaRole.ARTIFACT, _SnapshotMediaKind.IMAGE:
+            return 1
+        case _SnapshotMediaRole.ARTIFACT, _SnapshotMediaKind.VIDEO:
+            return 2
+        case _SnapshotMediaRole.ARTIFACT, _SnapshotMediaKind.AUDIO:
+            return 3
+        case _SnapshotMediaRole.ARTIFACT, _SnapshotMediaKind.OTHER:
+            return 4
+
+
+def _require_database_string(value: object, *, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"snapshot media {field_name} must be a string, got {type(value).__name__}")
+    return value
+
+
+@dataclass(frozen=True)
+class _ExportedMediaRow:
+    episode_id: str
+    artifact_name: str
+    producer: str
+    producer_version: str
+    role: _SnapshotMediaRole
+    media_kind: _SnapshotMediaKind
+    mime_type: str | None
+    uri: str
+    recorded_at: str
+
+    def database_values(
+        self,
+    ) -> tuple[str, str, str, str, str, str, str | None, str, str, int]:
+        return (
+            self.episode_id,
+            self.artifact_name,
+            self.producer,
+            self.producer_version,
+            self.role.value,
+            self.media_kind.value,
+            self.mime_type,
+            self.uri,
+            self.recorded_at,
+            _media_selection_rank(self.role, self.media_kind),
+        )
 
 
 def _safe_file_name(file_name: str) -> str:
@@ -284,11 +368,12 @@ def _write_media_table(
             media_kind VARCHAR,
             mime_type VARCHAR,
             uri VARCHAR,
-            recorded_at TIMESTAMPTZ
+            recorded_at TIMESTAMPTZ,
+            selection_rank INTEGER
         )
         """
     )
-    exported_media_rows: list[tuple[object, ...]] = []
+    exported_media_rows: list[_ExportedMediaRow] = []
     copied_media_count = 0
     for (
         episode_id_value,
@@ -298,10 +383,22 @@ def _write_media_table(
         uri_value,
         recorded_at,
     ) in artifact_rows:
-        episode_id = str(episode_id_value)
-        artifact_name = str(key_value).removeprefix(ARTIFACT_MEASUREMENT_KEY_PREFIX)
-        artifact_uri = str(uri_value)
+        episode_id = _require_database_string(episode_id_value, field_name="episode_id")
+        measurement_key = _require_database_string(key_value, field_name="measurement key")
+        artifact_name = measurement_key.removeprefix(ARTIFACT_MEASUREMENT_KEY_PREFIX)
+        producer_name = _require_database_string(producer, field_name="producer")
+        producer_version_name = _require_database_string(
+            producer_version, field_name="producer version"
+        )
+        artifact_uri = _require_database_string(uri_value, field_name="URI")
+        recorded_at_text = _require_database_string(recorded_at, field_name="recorded_at")
         mime_type, _encoding = mimetypes.guess_type(artifact_uri)
+        media_kind = _media_kind_for_mime_type(mime_type)
+        role = (
+            _SnapshotMediaRole.CONTACT_SHEET
+            if producer_name == MEDIA_CONTACT_SHEET_STEP_NAME
+            else _SnapshotMediaRole.ARTIFACT
+        )
         exported_uri = artifact_uri
         if media_mode is SnapshotMediaMode.COPY:
             source_file = fetch_uri(artifact_uri)
@@ -316,48 +413,40 @@ def _write_media_table(
             exported_uri = copied_relative_path.as_posix()
             copied_media_count += 1
         exported_media_rows.append(
-            (
-                episode_id,
-                artifact_name,
-                str(producer),
-                str(producer_version),
-                "contact_sheet" if producer == MEDIA_CONTACT_SHEET_STEP_NAME else "artifact",
-                _media_kind_for_mime_type(mime_type),
-                mime_type,
-                exported_uri,
-                recorded_at,
+            _ExportedMediaRow(
+                episode_id=episode_id,
+                artifact_name=artifact_name,
+                producer=producer_name,
+                producer_version=producer_version_name,
+                role=role,
+                media_kind=media_kind,
+                mime_type=mime_type,
+                uri=exported_uri,
+                recorded_at=recorded_at_text,
             )
         )
 
     if exported_media_rows:
         connection.executemany(
-            "INSERT INTO snapshot_exported_media VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            exported_media_rows,
+            "INSERT INTO snapshot_exported_media VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [exported_media_row.database_values() for exported_media_row in exported_media_rows],
         )
     media_count = _copy_query_to_parquet(
         connection,
-        "SELECT * FROM snapshot_exported_media ORDER BY episode_id, artifact_name",
+        "SELECT * EXCLUDE (selection_rank) FROM snapshot_exported_media "
+        "ORDER BY episode_id, artifact_name",
         staging_directory / _MEDIA_TABLE_FILE_NAME,
     )
     connection.execute(
         """
         CREATE TEMP VIEW snapshot_primary_media AS
-        SELECT * EXCLUDE (media_rank)
+        SELECT * EXCLUDE (selection_rank, media_rank)
         FROM (
             SELECT
                 media.*,
                 row_number() OVER (
                     PARTITION BY media.episode_id
-                    ORDER BY
-                        CASE WHEN media.role = 'contact_sheet' THEN 0 ELSE 1 END,
-                        CASE media.media_kind
-                            WHEN 'image' THEN 0
-                            WHEN 'video' THEN 1
-                            WHEN 'audio' THEN 2
-                            ELSE 3
-                        END,
-                        media.artifact_name,
-                        media.uri
+                    ORDER BY media.selection_rank, media.artifact_name, media.uri
                 ) AS media_rank
             FROM snapshot_exported_media media
         )
@@ -367,35 +456,99 @@ def _write_media_table(
     return media_count, copied_media_count
 
 
-def _activate_staged_export(
-    staging_directory: Path, output_directory: Path, *, overwrite: bool
-) -> None:
-    if output_directory.exists() and not overwrite:
+@dataclass(frozen=True)
+class _NewDatasetSnapshotDestination:
+    directory: Path
+
+
+@dataclass(frozen=True)
+class _ReplaceableDatasetSnapshotDestination:
+    directory: Path
+
+
+_DatasetSnapshotDestination = (
+    _NewDatasetSnapshotDestination | _ReplaceableDatasetSnapshotDestination
+)
+
+
+def _parse_dataset_snapshot_destination(
+    output_directory: Path, *, overwrite: bool
+) -> _DatasetSnapshotDestination:
+    if output_directory.is_symlink():
+        raise ValueError(f"snapshot export destination {output_directory} must not be a symlink")
+    if not output_directory.exists():
+        return _NewDatasetSnapshotDestination(output_directory)
+    if not output_directory.is_dir():
+        raise NotADirectoryError(
+            f"snapshot export destination {output_directory} is not a directory"
+        )
+    if not overwrite:
         raise FileExistsError(
             f"snapshot export destination {output_directory} already exists; "
             "pass overwrite=True (CLI: --overwrite) to replace it"
         )
-    if output_directory.is_symlink():
-        raise ValueError(f"snapshot export destination {output_directory} must not be a symlink")
-    if output_directory.exists() and not output_directory.is_dir():
-        raise NotADirectoryError(
-            f"snapshot export destination {output_directory} is not a directory"
-        )
 
-    previous_directory: Path | None = None
-    if output_directory.exists():
-        previous_directory = output_directory.with_name(
-            f".{output_directory.name}.previous-{uuid4().hex}"
+    format_marker_path = output_directory / _FORMAT_MARKER_FILE_NAME
+    if format_marker_path.is_symlink() or not format_marker_path.is_file():
+        raise ValueError(
+            f"snapshot export destination {output_directory} cannot be replaced because it "
+            f"does not contain a regular {_FORMAT_MARKER_FILE_NAME}"
         )
-        output_directory.replace(previous_directory)
     try:
-        staging_directory.replace(output_directory)
+        format_marker = json.loads(format_marker_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"snapshot export destination {output_directory} cannot be replaced because "
+            f"{_FORMAT_MARKER_FILE_NAME} is unreadable: {error}"
+        ) from error
+    if not isinstance(format_marker, dict):
+        raise ValueError(
+            f"snapshot export destination {output_directory} cannot be replaced because "
+            f"{_FORMAT_MARKER_FILE_NAME} is not a JSON object"
+        )
+    if (
+        format_marker.get("format") != DATASET_SNAPSHOT_FORMAT_NAME
+        or format_marker.get("format_version") != DATASET_SNAPSHOT_FORMAT_VERSION
+    ):
+        raise ValueError(
+            f"snapshot export destination {output_directory} cannot be replaced because "
+            f"{_FORMAT_MARKER_FILE_NAME} does not identify supported "
+            f"{DATASET_SNAPSHOT_FORMAT_NAME!r} format version "
+            f"{DATASET_SNAPSHOT_FORMAT_VERSION!r}"
+        )
+    return _ReplaceableDatasetSnapshotDestination(output_directory)
+
+
+def _activate_staged_export(
+    staging_directory: Path, output_directory: Path, *, overwrite: bool
+) -> RetainedDatasetSnapshotBackup | None:
+    # The destination can change while the replacement is being staged, so
+    # validate it again immediately before the first filesystem mutation.
+    destination = _parse_dataset_snapshot_destination(output_directory, overwrite=overwrite)
+    previous_directory: Path | None = None
+    match destination:
+        case _NewDatasetSnapshotDestination(directory=validated_output_directory):
+            pass
+        case _ReplaceableDatasetSnapshotDestination(directory=validated_output_directory):
+            previous_directory = validated_output_directory.with_name(
+                f".{validated_output_directory.name}.previous-{uuid4().hex}"
+            )
+            validated_output_directory.replace(previous_directory)
+    try:
+        staging_directory.replace(validated_output_directory)
     except Exception:
         if previous_directory is not None:
-            previous_directory.replace(output_directory)
+            previous_directory.replace(validated_output_directory)
         raise
     if previous_directory is not None:
-        shutil.rmtree(previous_directory)
+        try:
+            shutil.rmtree(previous_directory)
+        except OSError as error:
+            return RetainedDatasetSnapshotBackup(
+                directory=previous_directory,
+                cleanup_error=str(error),
+            )
+    return None
 
 
 def export_dataset_snapshot(
@@ -416,19 +569,16 @@ def export_dataset_snapshot(
     media table stores a path relative to the export directory.
 
     The completed directory appears atomically. Existing destinations are
-    refused unless ``overwrite=True``; even then, the prior export remains in
+    refused unless ``overwrite=True`` and ``format.json`` identifies a
+    supported HFlow dataset snapshot; even then, the prior export remains in
     place until the replacement is fully staged.
     """
     resolved_media_mode = SnapshotMediaMode(media_mode)
     resolved_output_directory = Path(output_directory)
-    if not resolved_output_directory.name:
+    if resolved_output_directory.name in {"", ".", ".."}:
         raise ValueError("snapshot export destination must name a directory, not a filesystem root")
     resolved_output_directory.parent.mkdir(parents=True, exist_ok=True)
-    if resolved_output_directory.exists() and not overwrite:
-        raise FileExistsError(
-            f"snapshot export destination {resolved_output_directory} already exists; "
-            "pass overwrite=True (CLI: --overwrite) to replace it"
-        )
+    _parse_dataset_snapshot_destination(resolved_output_directory, overwrite=overwrite)
 
     staging_directory = Path(
         tempfile.mkdtemp(
@@ -468,7 +618,7 @@ def export_dataset_snapshot(
             tag_count = _copy_query_to_parquet(
                 connection,
                 """
-                SELECT tags.*
+                SELECT tags.* EXCLUDE (recorded_at), latest.recorded_at
                 FROM tags
                 JOIN snapshot_check_runs_latest latest
                   USING (episode_id, run_fingerprint, check_name)
@@ -479,7 +629,7 @@ def export_dataset_snapshot(
             interval_count = _copy_query_to_parquet(
                 connection,
                 """
-                SELECT intervals.*
+                SELECT intervals.* EXCLUDE (recorded_at), latest.recorded_at
                 FROM intervals
                 JOIN snapshot_check_runs_latest latest
                   USING (episode_id, run_fingerprint, check_name)
@@ -510,7 +660,9 @@ def export_dataset_snapshot(
         (staging_directory / _FORMAT_MARKER_FILE_NAME).write_text(
             json.dumps(format_marker, indent=2, sort_keys=True) + "\n"
         )
-        _activate_staged_export(staging_directory, resolved_output_directory, overwrite=overwrite)
+        retained_backup = _activate_staged_export(
+            staging_directory, resolved_output_directory, overwrite=overwrite
+        )
     finally:
         if staging_directory.exists():
             shutil.rmtree(staging_directory)
@@ -525,4 +677,5 @@ def export_dataset_snapshot(
         tag_count=tag_count,
         interval_count=interval_count,
         media_mode=resolved_media_mode,
+        retained_backup=retained_backup,
     )
