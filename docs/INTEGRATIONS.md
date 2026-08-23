@@ -19,7 +19,7 @@ robot or human -> MCAP -> HFlow steps -> canonical MCAP -> Parquet SQL -> manife
 | **MCAP** | Standard container for timestamped multimodal messages | Reads source episodes and writes the canonical episode convention used downstream |
 | **Airflow 3** | Scheduling, task state, retries, logs, and operator UI | Generates and deploys DAGs from the same Python pipeline used in local development |
 | **Foxglove and Rerun** | Interactive inspection of synchronized video and state streams | Writes standard MCAP that these tools can open without an HFlow-specific viewer |
-| **Parquet** | Portable columnar storage | Stores append-only catalog facts, curated manifests, and portable review-dataset snapshots |
+| **Parquet** | Portable columnar storage | Stores append-only catalog facts, curated manifests, and portable dataset snapshots |
 | **DuckDB** | SQL analytics over files | Queries the catalog, reports coverage, and selects manifest rows |
 | **Object storage** | Durable shared storage for episodes and artifacts | Treats a local directory or bucket prefix as the data root and mirrors remote objects per worker |
 | **FFmpeg** | Video encoding, decoding, and deterministic media analysis | Uses it behind batch-oriented episode accessors and built-in video checks |
@@ -71,11 +71,11 @@ The files remain usable without HFlow helpers: DuckDB, pandas, polars, and
 other Parquet readers can read them directly. See the
 [catalog and curation guide](./CATALOG.md).
 
-For review tools that need preview media beside those facts,
-[`hflow export review`](./how-to/export-review-dataset.md) writes a selected
-snapshot as generic Parquet tables and either preserves artifact URIs or
-copies their files into a self-contained directory. Renumics Spotlight is one
-documented consumer of that export, not a dependency or privileged format.
+For downstream tools that need media beside those facts,
+[`hflow export snapshot`](./how-to/export-dataset-snapshot.md) writes a
+selected snapshot as generic Parquet tables and either preserves artifact URIs
+or copies their files into a self-contained directory. Renumics Spotlight and
+FiftyOne are documented consumers, not dependencies or privileged formats.
 
 ## Model clients stay in user code
 

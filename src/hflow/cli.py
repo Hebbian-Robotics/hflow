@@ -1,6 +1,6 @@
 """Command-line entry point.
 
-Subcommands: ``curate``, ``export review``, ``stale``, ``doctor``,
+Subcommands: ``curate``, ``export snapshot``, ``stale``, ``doctor``,
 ``manifest``, the Compose runtime family ``up``/``down``/``ingest``/``status``,
 ``deploy`` for bring-your-own Airflow, and ``serve`` for the workspace HTTP
 server (a separate ``hflow-server`` package, imported only when invoked).
@@ -123,15 +123,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="export catalog selections in portable downstream formats",
     )
     export_subparsers = export_parser.add_subparsers(dest="export_command", required=True)
-    review_export_parser = export_subparsers.add_parser(
-        "review",
-        help="write a tool-neutral Parquet review dataset",
+    snapshot_export_parser = export_subparsers.add_parser(
+        "snapshot",
+        help="write a tool-neutral Parquet dataset snapshot",
         description=(
             "Snapshot selected episodes, measurements, artifact media, check runs, "
             "tags, and intervals into a local directory of standard Parquet files."
         ),
     )
-    review_export_parser.add_argument(
+    snapshot_export_parser.add_argument(
         "--catalog",
         default=_default_catalog_location(),
         help=(
@@ -139,7 +139,7 @@ def _build_parser() -> argparse.ArgumentParser:
             f"(default: $HFLOW_DATA_ROOT/catalog, else {DEFAULT_DATA_ROOT}/catalog)"
         ),
     )
-    review_export_parser.add_argument(
+    snapshot_export_parser.add_argument(
         "--manifest",
         default=None,
         help=(
@@ -147,14 +147,14 @@ def _build_parser() -> argparse.ArgumentParser:
             "without it, export every latest catalog episode"
         ),
     )
-    review_export_parser.add_argument(
+    snapshot_export_parser.add_argument(
         "--output",
         "-o",
         type=Path,
         required=True,
         help="local directory to create",
     )
-    review_export_parser.add_argument(
+    snapshot_export_parser.add_argument(
         "--media",
         choices=("references", "copy"),
         default="references",
@@ -163,7 +163,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "directory (default: references)"
         ),
     )
-    review_export_parser.add_argument(
+    snapshot_export_parser.add_argument(
         "--overwrite",
         action="store_true",
         help="atomically replace an existing export directory",
@@ -410,7 +410,7 @@ def _build_parser() -> argparse.ArgumentParser:
     serve_parser = subparsers.add_parser(
         "serve",
         help=(
-            "serve this workspace over HTTP: a JSON API over the catalog, and any "
+            "serve this workspace over HTTP: a REST API over the catalog, and any "
             "UI assets installed (requires the hflow-server package). Distinct from "
             "`up`, which starts the runtime that PROCESSES episodes -- this only "
             "reads the data root, and can trigger a run on a runtime that exists."
@@ -792,11 +792,11 @@ def _command_curate(arguments: argparse.Namespace) -> int:
     return 0
 
 
-def _command_export_review(arguments: argparse.Namespace) -> int:
-    from hflow.review import export_review_dataset
+def _command_export_snapshot(arguments: argparse.Namespace) -> int:
+    from hflow.snapshot import export_dataset_snapshot
 
     try:
-        report = export_review_dataset(
+        report = export_dataset_snapshot(
             arguments.catalog,
             arguments.output,
             manifest=arguments.manifest,
@@ -804,7 +804,7 @@ def _command_export_review(arguments: argparse.Namespace) -> int:
             overwrite=arguments.overwrite,
         )
     except (ValueError, FileNotFoundError, FileExistsError, NotADirectoryError) as error:
-        print(f"export review: {error}", file=sys.stderr)
+        print(f"export snapshot: {error}", file=sys.stderr)
         return 2
     print(report.summary())
     return 0
@@ -867,8 +867,8 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.command == "curate":
         return _command_curate(arguments)
     if arguments.command == "export":
-        if arguments.export_command == "review":
-            return _command_export_review(arguments)
+        if arguments.export_command == "snapshot":
+            return _command_export_snapshot(arguments)
         raise AssertionError(f"unhandled export command {arguments.export_command!r}")
     if arguments.command == "stale":
         return _command_stale(arguments)

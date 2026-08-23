@@ -1,6 +1,6 @@
 # hflow-server
 
-The HFlow workspace JSON API over one HFlow data root. It exposes episodes,
+The HFlow workspace REST API over one HFlow data root. It exposes episodes,
 quality evidence, curation, and runtime operations to HTTP clients. It writes
 nothing but pinned manifests and its own small state file.
 
@@ -19,7 +19,7 @@ there has the exact steps.
 
 Any UI is a strict client of the same surfaces the `hflow` CLI uses (the
 DuckDB-queryable catalog, episode files, and manifests): everything it shows
-is reachable with `curl` against its documented JSON API, and nothing is
+is reachable with `curl` against its documented REST API, and nothing is
 UI-only. The server runs fully offline, and your data never leaves your
 machine. There is deliberately no Swagger page: FastAPI's
 built-in one would load its JavaScript and CSS from a CDN.

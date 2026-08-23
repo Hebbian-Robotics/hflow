@@ -146,7 +146,7 @@ _FRONTEND_PLACEHOLDER_PAGE = """<!doctype html>
   <head><title>HFlow workspace API</title></head>
   <body>
     <h1>HFlow workspace API</h1>
-    <p>No frontend bundle is installed here. The JSON API is live under
+    <p>No frontend bundle is installed here. The REST API is live under
     <code>/api/v1</code>, and its OpenAPI schema is at
     <code>/api/openapi.json</code> &mdash; that schema is the product surface:
     everything a UI can show is reachable from it, so any client can be built

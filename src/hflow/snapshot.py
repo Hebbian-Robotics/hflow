@@ -1,4 +1,4 @@
-"""Portable review-dataset exports over a curated catalog snapshot.
+"""Portable dataset snapshots over a curated catalog selection.
 
 The export is intentionally made only of Parquet tables, ordinary media
 files, and one JSON format marker.  HFlow-specific viewers and third-party
@@ -23,10 +23,10 @@ from hflow.app import ARTIFACT_MEASUREMENT_KEY_PREFIX, MEDIA_CONTACT_SHEET_STEP_
 from hflow.curation import open_catalog_connection
 from hflow.storage import StorageRoot, fetch_uri
 
-REVIEW_DATASET_FORMAT_NAME = "hflow-review-dataset"
-REVIEW_DATASET_FORMAT_VERSION = "1"
+DATASET_SNAPSHOT_FORMAT_NAME = "hflow-dataset-snapshot"
+DATASET_SNAPSHOT_FORMAT_VERSION = "1"
 
-_EPISODES_TABLE_FILE_NAME = "episodes.parquet"
+_SAMPLES_TABLE_FILE_NAME = "samples.parquet"
 _MEASUREMENTS_TABLE_FILE_NAME = "measurements.parquet"
 _MEDIA_TABLE_FILE_NAME = "media.parquet"
 _CHECK_RUNS_TABLE_FILE_NAME = "check_runs.parquet"
@@ -35,16 +35,16 @@ _INTERVALS_TABLE_FILE_NAME = "intervals.parquet"
 _FORMAT_MARKER_FILE_NAME = "format.json"
 
 
-class ReviewMediaMode(StrEnum):
-    """How artifact URIs are represented in an exported review dataset."""
+class SnapshotMediaMode(StrEnum):
+    """How artifact URIs are represented in an exported dataset snapshot."""
 
     REFERENCES = "references"
     COPY = "copy"
 
 
 @dataclass(frozen=True)
-class ReviewDatasetReport:
-    """Observable result of one completed review-dataset export."""
+class DatasetSnapshotReport:
+    """Observable result of one completed dataset snapshot export."""
 
     output_directory: Path
     episode_count: int
@@ -54,11 +54,11 @@ class ReviewDatasetReport:
     check_run_count: int
     tag_count: int
     interval_count: int
-    media_mode: ReviewMediaMode
+    media_mode: SnapshotMediaMode
 
     def summary(self) -> str:
         return (
-            f"review dataset: {self.output_directory} "
+            f"dataset snapshot: {self.output_directory} "
             f"({self.episode_count} episodes, {self.measurement_count} measurements, "
             f"{self.media_count} media references, {self.copied_media_count} media files copied, "
             f"{self.tag_count} tags, {self.interval_count} intervals)"
@@ -90,38 +90,38 @@ def _register_selected_episode_ids(
 ) -> int:
     if manifest is None:
         connection.execute(
-            "CREATE TEMP TABLE review_selected_episode_ids AS "
+            "CREATE TEMP TABLE snapshot_selected_episode_ids AS "
             "SELECT episode_id FROM episodes_latest"
         )
     else:
         local_manifest = fetch_uri(manifest)
         try:
             connection.execute(
-                "CREATE TEMP TABLE review_selected_episode_ids AS "
+                "CREATE TEMP TABLE snapshot_selected_episode_ids AS "
                 "SELECT DISTINCT CAST(episode_id AS VARCHAR) AS episode_id "
                 "FROM read_parquet(?)",
                 [str(local_manifest)],
             )
         except duckdb.BinderException as error:
             raise ValueError(
-                f"review manifest {manifest!s} must contain an episode_id column"
+                f"snapshot manifest {manifest!s} must contain an episode_id column"
             ) from error
         except duckdb.Error as error:
-            raise ValueError(f"could not read review manifest {manifest!s}: {error}") from error
+            raise ValueError(f"could not read snapshot manifest {manifest!s}: {error}") from error
 
         (null_episode_count_value,) = connection.execute(
-            "SELECT count(*) FROM review_selected_episode_ids WHERE episode_id IS NULL"
+            "SELECT count(*) FROM snapshot_selected_episode_ids WHERE episode_id IS NULL"
         ).fetchone() or (0,)
         null_episode_count = int(null_episode_count_value)
         if null_episode_count:
-            raise ValueError(f"review manifest {manifest!s} contains a null episode_id")
+            raise ValueError(f"snapshot manifest {manifest!s} contains a null episode_id")
 
     missing_episode_ids = [
         str(row[0])
         for row in connection.execute(
             """
             SELECT selected.episode_id
-            FROM review_selected_episode_ids selected
+            FROM snapshot_selected_episode_ids selected
             LEFT JOIN episodes_latest cataloged USING (episode_id)
             WHERE cataloged.episode_id IS NULL
             ORDER BY selected.episode_id
@@ -132,24 +132,24 @@ def _register_selected_episode_ids(
     if missing_episode_ids:
         examples = ", ".join(repr(episode_id) for episode_id in missing_episode_ids)
         raise ValueError(
-            "review manifest selects episode IDs absent from the catalog; "
+            "snapshot manifest selects episode IDs absent from the catalog; "
             f"first missing values: {examples}"
         )
 
     (selected_episode_count,) = connection.execute(
-        "SELECT count(*) FROM review_selected_episode_ids"
+        "SELECT count(*) FROM snapshot_selected_episode_ids"
     ).fetchone() or (0,)
     return int(selected_episode_count)
 
 
-def _episodes_snapshot_query(connection: duckdb.DuckDBPyConnection) -> str:
+def _samples_snapshot_query(connection: duckdb.DuckDBPyConnection) -> str:
     numeric_measurement_keys = [
         str(row[0])
         for row in connection.execute(
             """
             SELECT DISTINCT measurements.key
             FROM measurements_latest measurements
-            JOIN review_selected_episode_ids selected USING (episode_id)
+            JOIN snapshot_selected_episode_ids selected USING (episode_id)
             WHERE measurements.value_double IS NOT NULL
                OR measurements.value_bool IS NOT NULL
             ORDER BY measurements.key
@@ -160,9 +160,15 @@ def _episodes_snapshot_query(connection: duckdb.DuckDBPyConnection) -> str:
         return """
             SELECT
                 episodes.* EXCLUDE (quarantined),
-                CASE WHEN episodes.quarantined THEN 'quarantined' ELSE 'ok' END AS status
+                CASE WHEN episodes.quarantined THEN 'quarantined' ELSE 'ok' END AS status,
+                primary_media.uri AS media_uri,
+                primary_media.media_kind,
+                primary_media.mime_type AS media_mime_type,
+                primary_media.role AS media_role,
+                primary_media.artifact_name AS media_artifact_name
             FROM episodes_latest episodes
-            JOIN review_selected_episode_ids selected USING (episode_id)
+            JOIN snapshot_selected_episode_ids selected USING (episode_id)
+            LEFT JOIN snapshot_primary_media primary_media USING (episode_id)
             ORDER BY episodes.episode_id
         """
 
@@ -173,9 +179,14 @@ def _episodes_snapshot_query(connection: duckdb.DuckDBPyConnection) -> str:
         SELECT
             episodes.* EXCLUDE (quarantined),
             CASE WHEN episodes.quarantined THEN 'quarantined' ELSE 'ok' END AS status,
-            measurements.* EXCLUDE (episode_id)
+            measurements.* EXCLUDE (episode_id),
+            primary_media.uri AS media_uri,
+            primary_media.media_kind,
+            primary_media.mime_type AS media_mime_type,
+            primary_media.role AS media_role,
+            primary_media.artifact_name AS media_artifact_name
         FROM episodes_latest episodes
-        JOIN review_selected_episode_ids selected USING (episode_id)
+        JOIN snapshot_selected_episode_ids selected USING (episode_id)
         LEFT JOIN (
             PIVOT (
                 SELECT
@@ -189,10 +200,11 @@ def _episodes_snapshot_query(connection: duckdb.DuckDBPyConnection) -> str:
                         END
                     ) AS value
                 FROM measurements_latest latest
-                JOIN review_selected_episode_ids selected USING (episode_id)
+                JOIN snapshot_selected_episode_ids selected USING (episode_id)
                 WHERE latest.value_double IS NOT NULL OR latest.value_bool IS NOT NULL
             ) ON key IN ({quoted_measurement_keys}) USING first(value) GROUP BY episode_id
         ) measurements USING (episode_id)
+        LEFT JOIN snapshot_primary_media primary_media USING (episode_id)
         ORDER BY episodes.episode_id
     """
 
@@ -200,7 +212,7 @@ def _episodes_snapshot_query(connection: duckdb.DuckDBPyConnection) -> str:
 def _register_latest_check_runs(connection: duckdb.DuckDBPyConnection) -> None:
     connection.execute(
         """
-        CREATE TEMP VIEW review_check_runs_latest AS
+        CREATE TEMP VIEW snapshot_check_runs_latest AS
         SELECT * EXCLUDE (row_rank) FROM (
             SELECT
                 check_runs.*,
@@ -209,7 +221,7 @@ def _register_latest_check_runs(connection: duckdb.DuckDBPyConnection) -> None:
                     ORDER BY check_runs.recorded_at DESC, check_runs.run_fingerprint DESC
                 ) AS row_rank
             FROM check_runs
-            JOIN review_selected_episode_ids selected USING (episode_id)
+            JOIN snapshot_selected_episode_ids selected USING (episode_id)
         ) WHERE row_rank = 1
         """
     )
@@ -241,7 +253,7 @@ def _copied_media_relative_path(*, episode_id: str, artifact_name: str, artifact
 def _write_media_table(
     connection: duckdb.DuckDBPyConnection,
     staging_directory: Path,
-    media_mode: ReviewMediaMode,
+    media_mode: SnapshotMediaMode,
 ) -> tuple[int, int]:
     artifact_rows = connection.execute(
         """
@@ -253,7 +265,7 @@ def _write_media_table(
             measurements.value_text,
             CAST(measurements.recorded_at AS VARCHAR) AS recorded_at
         FROM measurements_latest measurements
-        JOIN review_selected_episode_ids selected USING (episode_id)
+        JOIN snapshot_selected_episode_ids selected USING (episode_id)
         WHERE starts_with(measurements.key, ?)
           AND measurements.value_text IS NOT NULL
         ORDER BY measurements.episode_id, measurements.key
@@ -263,7 +275,7 @@ def _write_media_table(
 
     connection.execute(
         """
-        CREATE TEMP TABLE review_exported_media (
+        CREATE TEMP TABLE snapshot_exported_media (
             episode_id VARCHAR,
             artifact_name VARCHAR,
             producer VARCHAR,
@@ -291,7 +303,7 @@ def _write_media_table(
         artifact_uri = str(uri_value)
         mime_type, _encoding = mimetypes.guess_type(artifact_uri)
         exported_uri = artifact_uri
-        if media_mode is ReviewMediaMode.COPY:
+        if media_mode is SnapshotMediaMode.COPY:
             source_file = fetch_uri(artifact_uri)
             copied_relative_path = _copied_media_relative_path(
                 episode_id=episode_id,
@@ -319,13 +331,38 @@ def _write_media_table(
 
     if exported_media_rows:
         connection.executemany(
-            "INSERT INTO review_exported_media VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO snapshot_exported_media VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             exported_media_rows,
         )
     media_count = _copy_query_to_parquet(
         connection,
-        "SELECT * FROM review_exported_media ORDER BY episode_id, artifact_name",
+        "SELECT * FROM snapshot_exported_media ORDER BY episode_id, artifact_name",
         staging_directory / _MEDIA_TABLE_FILE_NAME,
+    )
+    connection.execute(
+        """
+        CREATE TEMP VIEW snapshot_primary_media AS
+        SELECT * EXCLUDE (media_rank)
+        FROM (
+            SELECT
+                media.*,
+                row_number() OVER (
+                    PARTITION BY media.episode_id
+                    ORDER BY
+                        CASE WHEN media.role = 'contact_sheet' THEN 0 ELSE 1 END,
+                        CASE media.media_kind
+                            WHEN 'image' THEN 0
+                            WHEN 'video' THEN 1
+                            WHEN 'audio' THEN 2
+                            ELSE 3
+                        END,
+                        media.artifact_name,
+                        media.uri
+                ) AS media_rank
+            FROM snapshot_exported_media media
+        )
+        WHERE media_rank = 1
+        """
     )
     return media_count, copied_media_count
 
@@ -335,13 +372,15 @@ def _activate_staged_export(
 ) -> None:
     if output_directory.exists() and not overwrite:
         raise FileExistsError(
-            f"review export destination {output_directory} already exists; "
+            f"snapshot export destination {output_directory} already exists; "
             "pass overwrite=True (CLI: --overwrite) to replace it"
         )
     if output_directory.is_symlink():
-        raise ValueError(f"review export destination {output_directory} must not be a symlink")
+        raise ValueError(f"snapshot export destination {output_directory} must not be a symlink")
     if output_directory.exists() and not output_directory.is_dir():
-        raise NotADirectoryError(f"review export destination {output_directory} is not a directory")
+        raise NotADirectoryError(
+            f"snapshot export destination {output_directory} is not a directory"
+        )
 
     previous_directory: Path | None = None
     if output_directory.exists():
@@ -359,14 +398,14 @@ def _activate_staged_export(
         shutil.rmtree(previous_directory)
 
 
-def export_review_dataset(
+def export_dataset_snapshot(
     catalog_root: Path | str | StorageRoot,
     output_directory: Path | str,
     *,
     manifest: Path | str | None = None,
-    media_mode: ReviewMediaMode | str = ReviewMediaMode.REFERENCES,
+    media_mode: SnapshotMediaMode | str = SnapshotMediaMode.REFERENCES,
     overwrite: bool = False,
-) -> ReviewDatasetReport:
+) -> DatasetSnapshotReport:
     """Export a portable snapshot selected by an optional Parquet manifest.
 
     The destination is a local directory containing ordinary Parquet tables
@@ -380,14 +419,14 @@ def export_review_dataset(
     refused unless ``overwrite=True``; even then, the prior export remains in
     place until the replacement is fully staged.
     """
-    resolved_media_mode = ReviewMediaMode(media_mode)
+    resolved_media_mode = SnapshotMediaMode(media_mode)
     resolved_output_directory = Path(output_directory)
     if not resolved_output_directory.name:
-        raise ValueError("review export destination must name a directory, not a filesystem root")
+        raise ValueError("snapshot export destination must name a directory, not a filesystem root")
     resolved_output_directory.parent.mkdir(parents=True, exist_ok=True)
     if resolved_output_directory.exists() and not overwrite:
         raise FileExistsError(
-            f"review export destination {resolved_output_directory} already exists; "
+            f"snapshot export destination {resolved_output_directory} already exists; "
             "pass overwrite=True (CLI: --overwrite) to replace it"
         )
 
@@ -403,17 +442,12 @@ def export_review_dataset(
             episode_count = _register_selected_episode_ids(connection, manifest)
             _register_latest_check_runs(connection)
 
-            _copy_query_to_parquet(
-                connection,
-                _episodes_snapshot_query(connection),
-                staging_directory / _EPISODES_TABLE_FILE_NAME,
-            )
             measurement_count = _copy_query_to_parquet(
                 connection,
                 """
                 SELECT measurements.*
                 FROM measurements_latest measurements
-                JOIN review_selected_episode_ids selected USING (episode_id)
+                JOIN snapshot_selected_episode_ids selected USING (episode_id)
                 ORDER BY measurements.episode_id, measurements.key
                 """,
                 staging_directory / _MEASUREMENTS_TABLE_FILE_NAME,
@@ -421,9 +455,14 @@ def export_review_dataset(
             media_count, copied_media_count = _write_media_table(
                 connection, staging_directory, resolved_media_mode
             )
+            _copy_query_to_parquet(
+                connection,
+                _samples_snapshot_query(connection),
+                staging_directory / _SAMPLES_TABLE_FILE_NAME,
+            )
             check_run_count = _copy_query_to_parquet(
                 connection,
-                "SELECT * FROM review_check_runs_latest ORDER BY episode_id, check_name",
+                "SELECT * FROM snapshot_check_runs_latest ORDER BY episode_id, check_name",
                 staging_directory / _CHECK_RUNS_TABLE_FILE_NAME,
             )
             tag_count = _copy_query_to_parquet(
@@ -431,7 +470,7 @@ def export_review_dataset(
                 """
                 SELECT tags.*
                 FROM tags
-                JOIN review_check_runs_latest latest
+                JOIN snapshot_check_runs_latest latest
                   USING (episode_id, run_fingerprint, check_name)
                 ORDER BY tags.episode_id, tags.check_name, tags.tag
                 """,
@@ -442,7 +481,7 @@ def export_review_dataset(
                 """
                 SELECT intervals.*
                 FROM intervals
-                JOIN review_check_runs_latest latest
+                JOIN snapshot_check_runs_latest latest
                   USING (episode_id, run_fingerprint, check_name)
                 ORDER BY intervals.episode_id, intervals.check_name,
                          intervals.start_ns, intervals.end_ns
@@ -453,14 +492,14 @@ def export_review_dataset(
             connection.close()
 
         format_marker = {
-            "format": REVIEW_DATASET_FORMAT_NAME,
-            "format_version": REVIEW_DATASET_FORMAT_VERSION,
+            "format": DATASET_SNAPSHOT_FORMAT_NAME,
+            "format_version": DATASET_SNAPSHOT_FORMAT_VERSION,
             "media_mode": resolved_media_mode.value,
             "media_uri_base": (
-                "export_directory" if resolved_media_mode is ReviewMediaMode.COPY else None
+                "export_directory" if resolved_media_mode is SnapshotMediaMode.COPY else None
             ),
             "tables": {
-                "episodes": _EPISODES_TABLE_FILE_NAME,
+                "samples": _SAMPLES_TABLE_FILE_NAME,
                 "measurements": _MEASUREMENTS_TABLE_FILE_NAME,
                 "media": _MEDIA_TABLE_FILE_NAME,
                 "check_runs": _CHECK_RUNS_TABLE_FILE_NAME,
@@ -476,7 +515,7 @@ def export_review_dataset(
         if staging_directory.exists():
             shutil.rmtree(staging_directory)
 
-    return ReviewDatasetReport(
+    return DatasetSnapshotReport(
         output_directory=resolved_output_directory,
         episode_count=episode_count,
         measurement_count=measurement_count,

@@ -11,13 +11,13 @@ from hflow.transform import EpisodeStamps
 
 TEST_EPISODE_STAMPS = EpisodeStamps(
     schema_version="1",
-    pipeline_version="review-pipeline-v1",
+    pipeline_version="snapshot-pipeline-v1",
     ffmpeg_version="ffmpeg test",
     robot_software_version="robot test",
 )
 
 
-def _append_review_episode(
+def _append_snapshot_episode(
     catalog: Catalog,
     working_directory: Path,
     *,
@@ -45,8 +45,8 @@ def _append_review_episode(
                 critical=False,
                 status=hflow.CheckStatus.MEASURED,
                 duration_s=0.1,
-                measurements={"quality/score": score, "caption": f"review {name}"},
-                tags=["needs-review"],
+                measurements={"quality/score": score, "caption": f"sample {name}"},
+                tags=["needs-inspection"],
                 intervals=[hflow.Interval(start_ns=10, end_ns=20, label="inspect")],
             ),
             CheckRunRow(
@@ -62,9 +62,9 @@ def _append_review_episode(
     return append_result.episode_id, preview_file
 
 
-def test_review_export_is_a_tool_neutral_snapshot_selected_by_manifest(tmp_path: Path) -> None:
+def test_dataset_snapshot_is_tool_neutral_and_selected_by_manifest(tmp_path: Path) -> None:
     catalog = Catalog(tmp_path / "catalog")
-    selected_episode_id, preview_file = _append_review_episode(
+    selected_episode_id, preview_file = _append_snapshot_episode(
         catalog,
         tmp_path,
         name="fold-shirt",
@@ -72,7 +72,7 @@ def test_review_export_is_a_tool_neutral_snapshot_selected_by_manifest(tmp_path:
         with_media=True,
     )
     assert preview_file is not None
-    _append_review_episode(
+    _append_snapshot_episode(
         catalog,
         tmp_path,
         name="pour-water",
@@ -86,8 +86,8 @@ def test_review_export_is_a_tool_neutral_snapshot_selected_by_manifest(tmp_path:
         output=manifest,
     )
 
-    output_directory = tmp_path / "review-dataset"
-    report = hflow.export_review_dataset(
+    output_directory = tmp_path / "dataset-snapshot"
+    report = hflow.export_dataset_snapshot(
         catalog.location,
         output_directory,
         manifest=manifest,
@@ -98,7 +98,7 @@ def test_review_export_is_a_tool_neutral_snapshot_selected_by_manifest(tmp_path:
     assert report.copied_media_count == 0
     assert {path.name for path in output_directory.iterdir() if path.is_file()} == {
         "format.json",
-        "episodes.parquet",
+        "samples.parquet",
         "measurements.parquet",
         "media.parquet",
         "check_runs.parquet",
@@ -106,22 +106,36 @@ def test_review_export_is_a_tool_neutral_snapshot_selected_by_manifest(tmp_path:
         "intervals.parquet",
     }
     format_marker = json.loads((output_directory / "format.json").read_text())
-    assert format_marker["format"] == "hflow-review-dataset"
+    assert format_marker["format"] == "hflow-dataset-snapshot"
     assert format_marker["format_version"] == "1"
     assert format_marker["media_mode"] == "references"
 
-    episode_row = duckdb.execute(
-        'SELECT episode_id, task, status, "quality/score" FROM read_parquet(?)',
-        [str(output_directory / "episodes.parquet")],
+    sample_row = duckdb.execute(
+        """
+        SELECT episode_id, task, status, "quality/score", media_uri,
+               media_kind, media_mime_type, media_role, media_artifact_name
+        FROM read_parquet(?)
+        """,
+        [str(output_directory / "samples.parquet")],
     ).fetchone()
-    assert episode_row == (selected_episode_id, "fold-shirt", "ok", 0.75)
+    assert sample_row == (
+        selected_episode_id,
+        "fold-shirt",
+        "ok",
+        0.75,
+        str(preview_file.resolve()),
+        "image",
+        "image/jpeg",
+        "contact_sheet",
+        "/wrist_cam/compressed",
+    )
     measurement_rows = duckdb.execute(
         "SELECT key, value_double, value_text FROM read_parquet(?) ORDER BY key",
         [str(output_directory / "measurements.parquet")],
     ).fetchall()
     assert measurement_rows == [
         ("artifact//wrist_cam/compressed", None, str(preview_file.resolve())),
-        ("caption", None, "review fold-shirt"),
+        ("caption", None, "sample fold-shirt"),
         ("quality/score", 0.75, None),
     ]
     media_row = duckdb.execute(
@@ -138,18 +152,18 @@ def test_review_export_is_a_tool_neutral_snapshot_selected_by_manifest(tmp_path:
     assert duckdb.execute(
         "SELECT tag FROM read_parquet(?)",
         [str(output_directory / "tags.parquet")],
-    ).fetchall() == [("needs-review",)]
+    ).fetchall() == [("needs-inspection",)]
     assert duckdb.execute(
         "SELECT label, start_ns, end_ns FROM read_parquet(?)",
         [str(output_directory / "intervals.parquet")],
     ).fetchall() == [("inspect", 10, 20)]
 
 
-def test_cli_review_export_copy_mode_materializes_media_and_refuses_implicit_overwrite(
+def test_cli_snapshot_copy_mode_materializes_media_and_refuses_implicit_overwrite(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     catalog = Catalog(tmp_path / "catalog")
-    selected_episode_id, preview_file = _append_review_episode(
+    selected_episode_id, preview_file = _append_snapshot_episode(
         catalog,
         tmp_path,
         name="stack-blocks",
@@ -157,12 +171,12 @@ def test_cli_review_export_copy_mode_materializes_media_and_refuses_implicit_ove
         with_media=True,
     )
     assert preview_file is not None
-    output_directory = tmp_path / "portable-review"
+    output_directory = tmp_path / "portable-snapshot"
 
     exit_code = cli_main(
         [
             "export",
-            "review",
+            "snapshot",
             "--catalog",
             str(catalog.location),
             "--output",
@@ -185,11 +199,15 @@ def test_cli_review_export_copy_mode_materializes_media_and_refuses_implicit_ove
     assert copied_media.is_file()
     assert copied_media.read_bytes() == preview_file.read_bytes()
     assert selected_episode_id in copied_media.parts
+    assert duckdb.execute(
+        "SELECT media_uri FROM read_parquet(?)",
+        [str(output_directory / "samples.parquet")],
+    ).fetchone() == (media_uri,)
 
     repeated_exit_code = cli_main(
         [
             "export",
-            "review",
+            "snapshot",
             "--catalog",
             str(catalog.location),
             "--output",
@@ -202,7 +220,7 @@ def test_cli_review_export_copy_mode_materializes_media_and_refuses_implicit_ove
     overwrite_exit_code = cli_main(
         [
             "export",
-            "review",
+            "snapshot",
             "--catalog",
             str(catalog.location),
             "--output",
@@ -215,7 +233,7 @@ def test_cli_review_export_copy_mode_materializes_media_and_refuses_implicit_ove
     assert not copied_media.exists()
 
 
-def test_review_export_rejects_manifest_episode_ids_absent_from_catalog(tmp_path: Path) -> None:
+def test_dataset_snapshot_rejects_manifest_episode_ids_absent_from_catalog(tmp_path: Path) -> None:
     catalog = Catalog(tmp_path / "catalog")
     manifest = tmp_path / "manifest.parquet"
     duckdb.execute("CREATE TABLE selected (episode_id VARCHAR)")
@@ -223,10 +241,10 @@ def test_review_export_rejects_manifest_episode_ids_absent_from_catalog(tmp_path
     duckdb.execute(f"COPY selected TO '{manifest}' (FORMAT PARQUET)")
 
     with pytest.raises(ValueError, match="missing-episode"):
-        hflow.export_review_dataset(
+        hflow.export_dataset_snapshot(
             catalog.location,
-            tmp_path / "review-dataset",
+            tmp_path / "dataset-snapshot",
             manifest=manifest,
         )
 
-    assert not (tmp_path / "review-dataset").exists()
+    assert not (tmp_path / "dataset-snapshot").exists()

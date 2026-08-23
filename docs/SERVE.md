@@ -1,4 +1,4 @@
-# Serve the workspace JSON API: `hflow serve`
+# Serve the workspace REST API: `hflow serve`
 
 `hflow serve` is a local read-mostly server over one data root: it answers
 questions about episodes and their quality evidence, compiles curation SQL,
@@ -8,7 +8,7 @@ only files it writes are the manifests you pin and its own small state file.
 It can trigger an ingest run, though, which the runtime then writes through
 the normal pipeline; `--read-only` refuses that along with the other writes.
 
-**The JSON API is the product surface, not an implementation detail of some
+**The REST API is the product surface, not an implementation detail of some
 frontend.** Every fact a browser could show is reachable from `/api/v1`, and
 the OpenAPI schema at `/api/openapi.json` describes all of it -- so a
 workspace UI is a *client*, and you can build or swap one without touching
@@ -78,7 +78,7 @@ These are API capabilities, not browser screens. A frontend supplied through
 
 ## No frontend is shipped
 
-Any UI is a strict client of a documented JSON API (`/api/v1/...`; a running
+Any UI is a strict client of a documented REST API (`/api/v1/...`; a running
 server publishes its OpenAPI schema at `/api/openapi.json`, ready for a client
 generator or any local OpenAPI viewer). Curation, runtime monitoring, and
 pipeline metadata are thin calls into the same library functions the CLI uses; the
