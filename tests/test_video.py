@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from hflow.ffmpeg import ffmpeg_path
+from hflow.ffmpeg import ffmpeg_path, ffprobe_path
 from hflow.video import (
     AccessUnit,
     VideoEncodeError,
@@ -151,9 +151,7 @@ def test_png_input_codec_upholds_guarantees(tmp_path: Path) -> None:
 
 def _ffprobe_video_stream_fields(mp4_path: Path) -> dict[str, str]:
     """Read codec/profile/decoded-frame-count fields from the first video stream."""
-    ffprobe_binary = ffmpeg_path().with_name("ffprobe")
-    if not ffprobe_binary.is_file():
-        ffprobe_binary = Path("/usr/bin/ffprobe")
+    ffprobe_binary = ffprobe_path()
     completed = subprocess.run(
         [
             str(ffprobe_binary),
