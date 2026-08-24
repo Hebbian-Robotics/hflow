@@ -470,7 +470,7 @@ def _check_run_rows(report: "TestReport") -> list[CheckRunRow]:
     for enrichment_run in report.enrichments:
         enrichment_result = enrichment_run.result
         labels: dict[str, float | int | str | bool] = (
-            dict(enrichment_result.labels) if enrichment_result is not None else {}
+            {k: v for k, v in dict(enrichment_result.labels).items() if not str(k).startswith(ARTIFACT_MEASUREMENT_KEY_PREFIX)} if enrichment_result is not None else {}
         )
         if enrichment_result is not None:
             labels.update(
