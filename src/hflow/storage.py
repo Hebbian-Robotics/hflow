@@ -343,9 +343,9 @@ class LocalStorageRoot:
         if local_file.is_dir():
             # Deliberately FileNotFoundError and not IsADirectoryError: the accurate
             # class subclasses OSError, not FileNotFoundError, so an `except
-            # FileNotFoundError` stops catching it. cli.py:835 is one such handler,
-            # reached from `hflow doctor` through fetch_uri below, and it turns this
-            # into a finding rather than a traceback; sixteen more name the class
+            # FileNotFoundError` stops catching it. `_command_doctor` is one such
+            # handler, reached through fetch_uri below, and it turns this into a
+            # finding rather than a traceback; sixteen more name the class
             # elsewhere under src/hflow/, and callers outside the repo are the real
             # unknown. The errno carries the accurate text without moving the class.
             # Same decision as the four sites #102 covered. #144.
