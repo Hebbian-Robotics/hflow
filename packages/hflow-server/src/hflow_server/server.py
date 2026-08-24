@@ -428,6 +428,17 @@ def _contained_asset_response(assets_directory: Path, requested_path: str) -> Fi
     return FileResponse(resolved_candidate)
 
 
+class ServerStartupError(RuntimeError):
+    """The launch could not be started, and nothing is serving.
+
+    Its own type so ``hflow serve`` can answer a launch that never got off the
+    ground with exit 2 (bad input, nothing happened) without also catching a
+    RuntimeError raised out of ``uvicorn.run`` once the server is up, which is
+    exit 1 (started, then failed). Subclasses RuntimeError so callers that
+    already catch that keep working.
+    """
+
+
 def serve(settings: ServerSettings) -> None:
     """Run the workspace server: free port, printed URL, browser, uvicorn."""
     application = create_app(settings)
@@ -470,4 +481,6 @@ def _first_free_port(host: str, preferred_port: int) -> int:
             except OSError:
                 continue
         return candidate_port
-    raise RuntimeError(f"no free port between {preferred_port} and {last_candidate_port} on {host}")
+    raise ServerStartupError(
+        f"no free port between {preferred_port} and {last_candidate_port} on {host}"
+    )

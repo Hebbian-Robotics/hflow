@@ -20,6 +20,7 @@ environment credentials) -- the same commands drive a hosted workspace.
 """
 
 import argparse
+import errno
 import logging
 import os
 import sys
@@ -844,7 +845,7 @@ def _command_doctor(arguments: argparse.Namespace) -> int:
 
 def _command_serve(arguments: argparse.Namespace) -> int:
     try:
-        from hflow_server import ServerSettings, serve
+        from hflow_server import ServerSettings, ServerStartupError, serve
     except ImportError:
         print(
             "serve: the workspace server ships as a separate package so pipeline "
@@ -853,15 +854,38 @@ def _command_serve(arguments: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    settings = ServerSettings(
-        data_root=arguments.data_root,
-        host=arguments.host,
-        port=arguments.port,
-        open_browser=not arguments.no_browser,
-        read_only=arguments.read_only,
-        pipeline=arguments.pipeline,
-    )
-    serve(settings)
+    try:
+        settings = ServerSettings(
+            data_root=arguments.data_root,
+            host=arguments.host,
+            port=arguments.port,
+            open_browser=not arguments.no_browser,
+            read_only=arguments.read_only,
+            pipeline=arguments.pipeline,
+        )
+    except ValueError as error:
+        # Its own block, before anything is built: nothing is serving, so this
+        # is bad input (2) and not a launch that started and then died (1).
+        print(f"serve: {error}", file=sys.stderr)
+        return 2
+    # A bucket data root has no local directory to check, the same distinction
+    # `up` draws for its bundle dir. A local root that is a file, or is not
+    # there at all, otherwise serves an empty workspace at a printed URL and
+    # says nothing about why it is empty.
+    if not is_bucket_url(settings.data_root):
+        local_data_root = Path(settings.data_root)
+        if not local_data_root.is_dir():
+            reason = errno.ENOTDIR if local_data_root.exists() else errno.ENOENT
+            print(f"serve: {os.strerror(reason)}: {local_data_root}", file=sys.stderr)
+            return 2
+    try:
+        serve(settings)
+    except ServerStartupError as error:
+        # Only the startup failure, not RuntimeError at large: the free-port
+        # probe runs before uvicorn binds, so this is still "nothing started".
+        # A RuntimeError out of a running server stays an unhandled crash.
+        print(f"serve: {error}", file=sys.stderr)
+        return 2
     return 0
 
 

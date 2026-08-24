@@ -1025,3 +1025,80 @@ def test_app_run_errors_helpfully_without_a_script_file(
     monkeypatch.setitem(sys.modules, "__main__", types.ModuleType("__main__"))
     with pytest.raises(RuntimeError, match="notebook"):
         app.run()
+
+
+def test_serve_refuses_a_port_it_cannot_serve(capsys: pytest.CaptureFixture[str]) -> None:
+    """Bad launch input is exit 2 and one line, the answer every other command gives.
+
+    Exit 1 would say the server started and then failed. Nothing started: the
+    port never got as far as the free-port probe.
+    """
+    for unusable_port in ("99999", "0"):
+        exit_code = main(["serve", "--data-root", "/tmp", "--port", unusable_port, "--no-browser"])
+        assert exit_code == 2
+        stderr = capsys.readouterr().err
+        assert stderr.startswith("serve: ")
+        assert "1-65535" in stderr
+        assert "Traceback" not in stderr
+
+
+def test_serve_refuses_a_data_root_that_is_not_a_directory(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A file, or nothing at all, used to serve an empty workspace and say nothing.
+
+    Both answer with the stock errno sentence the rest of the CLI uses, so the
+    message names which of the two it is rather than leaving the caller to
+    guess why their workspace looks empty.
+    """
+    data_root_file = tmp_path / "not-a-directory"
+    data_root_file.write_text("")
+    missing_data_root = tmp_path / "never-created"
+
+    for data_root, expected in (
+        (data_root_file, "Not a directory"),
+        (missing_data_root, "No such file or directory"),
+    ):
+        exit_code = main(["serve", "--data-root", str(data_root), "--no-browser"])
+        assert exit_code == 2
+        stderr = capsys.readouterr().err
+        assert stderr.startswith("serve: ")
+        assert expected in stderr
+        assert str(data_root) in stderr
+
+
+def test_serve_refuses_a_host_it_cannot_bind(capsys: pytest.CaptureFixture[str]) -> None:
+    """The probe's failure is a launch failure, so it exits 2 like the rest.
+
+    This one arrives as ServerStartupError rather than ValueError, which is why
+    it gets its own handler around ``serve`` instead of being folded into the
+    construction handler above.
+    """
+    exit_code = main(
+        ["serve", "--data-root", "/tmp", "--host", "not-a-host", "--port", "4512", "--no-browser"]
+    )
+    assert exit_code == 2
+    stderr = capsys.readouterr().err
+    assert stderr.startswith("serve: ")
+    assert "no free port" in stderr
+    assert "Traceback" not in stderr
+
+
+def test_serve_does_not_turn_a_running_server_crash_into_bad_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The handler catches the startup failure only, not RuntimeError at large.
+
+    A RuntimeError out of a server that is already up means it started and then
+    died, which is exit 1. Widening the handler to RuntimeError would report
+    that as bad launch input and exit 2, which is the bug this issue is about
+    in reverse.
+    """
+    import hflow_server
+
+    def crash_once_running(_settings: object) -> None:
+        raise RuntimeError("uvicorn fell over mid-run")
+
+    monkeypatch.setattr(hflow_server, "serve", crash_once_running)
+    with pytest.raises(RuntimeError, match="mid-run"):
+        main(["serve", "--data-root", "/tmp", "--no-browser"])

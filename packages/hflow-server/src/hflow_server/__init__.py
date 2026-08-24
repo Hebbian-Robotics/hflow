@@ -6,8 +6,8 @@ subcommand is a thin caller of exactly these two names.
 """
 
 from hflow_server._settings import ServerSettings
-from hflow_server.server import create_app, serve
+from hflow_server.server import ServerStartupError, create_app, serve
 
 __version__ = "0.1.0"
 
-__all__ = ["ServerSettings", "__version__", "create_app", "serve"]
+__all__ = ["ServerSettings", "ServerStartupError", "__version__", "create_app", "serve"]

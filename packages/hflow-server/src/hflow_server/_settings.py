@@ -59,6 +59,17 @@ class ServerSettings:
         # the command line. Left to bind(2) instead, an out-of-range port
         # surfaces as an OverflowError from inside the port probe, and port 0
         # binds fine while printing a URL nobody can open.
+        # Type first, because the range test cannot do it. bool subclasses int,
+        # so True is 1 to a comparison and would pass the range on its way into
+        # the URL this launch prints and hands to the browser. Ordered first for
+        # a second reason: a str port reaching the range test raises TypeError
+        # from the comparison, and every caller here is catching ValueError.
+        #
+        # `isinstance` and not `type(...) is int`, so an IntEnum member is
+        # accepted; this mirrors RuntimeConfig.api_port in `hflow.runtime`,
+        # message shape included, because the two fields are the same field.
+        if not isinstance(self.port, int) or isinstance(self.port, bool):
+            raise ValueError(f"port must be an int, not {type(self.port).__name__}: {self.port!r}")
         if not MIN_PORT <= self.port <= MAX_PORT:
             raise ValueError(f"port {self.port!r} is not in {MIN_PORT}-{MAX_PORT}")
 

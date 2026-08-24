@@ -30,11 +30,15 @@ def served_settings(monkeypatch: pytest.MonkeyPatch) -> list[ServerSettings]:
 def test_ui_flags_land_in_the_launch_settings(
     served_settings: list[ServerSettings], tmp_path: Path
 ) -> None:
+    # A real directory: `serve` refuses a data root that is not one before it
+    # builds the launch, and this test is about the flags reaching it.
+    workspace_directory = tmp_path / "workspace"
+    workspace_directory.mkdir()
     exit_code = main(
         [
             "serve",
             "--data-root",
-            str(tmp_path / "workspace"),
+            str(workspace_directory),
             "--host",
             "0.0.0.0",
             "--port",
@@ -47,7 +51,7 @@ def test_ui_flags_land_in_the_launch_settings(
     )
     assert exit_code == 0
     (settings,) = served_settings
-    assert settings.data_root == str(tmp_path / "workspace")
+    assert settings.data_root == str(workspace_directory)
     assert settings.host == "0.0.0.0"
     assert settings.port == 9999
     assert settings.open_browser is False

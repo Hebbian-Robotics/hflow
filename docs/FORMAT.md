@@ -157,8 +157,9 @@ Every `hflow` command follows the same three-value convention:
   `stale --exit-code`, stale episodes found; `up`, started then failed, so
   containers may still be running; `ingest`, episodes failed.
 - `2` - bad input, nothing useful happened: an invalid flag combination, an
-  unreachable endpoint, a missing catalog, or a `doctor` run in which no file
-  could be diagnosed at all.
+  unreachable endpoint, a missing catalog, a `serve` launch that never started
+  (a port outside 1-65535, a data root that is not a directory, a host with no
+  free port), or a `doctor` run in which no file could be diagnosed at all.
 
 `doctor` treats an unreadable file as at least as bad as a non-conforming one
 (exit 1), and reserves 2 for runs where nothing was diagnosed, so a batch run
