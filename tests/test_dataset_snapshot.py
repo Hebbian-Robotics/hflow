@@ -477,3 +477,43 @@ def test_dataset_snapshot_selects_primary_media_by_typed_precedence(tmp_path: Pa
         ("sound.wav", "audio"),
         ("z-image.jpg", "image"),
     ]
+
+
+def test_exporting_without_a_manifest_takes_one_row_per_source(tmp_path: Path) -> None:
+    """The default export is the corpus, not the corpus plus its history.
+
+    Without ``--manifest`` the export selects every episode ``episodes_latest``
+    holds, so a reprocessed recording used to arrive as two sample rows
+    pointing at one file, the older of which no longer hashed the bytes at
+    its own address.
+    """
+    catalog = Catalog(tmp_path / "catalog")
+    for content, score in ((b"first canonical bytes", 1.0), (b"reprocessed bytes", 2.0)):
+        canonical_episode = tmp_path / f"fold-{score}.canonical.mcap"
+        canonical_episode.write_bytes(content)
+        catalog.append_episode(
+            canonical_path=canonical_episode,
+            stamps=TEST_EPISODE_STAMPS,
+            episode_metadata={"task": "fold_napkin"},
+            check_rows=[
+                CheckRunRow(
+                    check_name="quality",
+                    check_version="quality-v1",
+                    critical=False,
+                    status=hflow.CheckStatus.MEASURED,
+                    duration_s=0.1,
+                    measurements={"quality/score": score},
+                )
+            ],
+            source_uri="episodes-in/fold.mcap",
+            uri="/data/episodes/fold.canonical.mcap",
+        )
+
+    report = hflow.export_dataset_snapshot(catalog.location, tmp_path / "dataset-snapshot")
+
+    assert report.episode_count == 1
+    sample_rows = duckdb.execute(
+        'SELECT task, "quality/score" FROM read_parquet(?)',
+        [str(tmp_path / "dataset-snapshot" / "samples.parquet")],
+    ).fetchall()
+    assert sample_rows == [("fold_napkin", 2.0)]

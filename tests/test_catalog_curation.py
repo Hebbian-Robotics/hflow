@@ -556,6 +556,55 @@ def test_stale_episodes_lists_only_episodes_behind_the_current_versions(tmp_path
     }
 
 
+def test_reprocessing_a_source_supersedes_its_previous_generation(tmp_path: Path) -> None:
+    """One row per source recording, everywhere the corpus is counted.
+
+    Reprocessing mints a new content-addressed episode_id, so a per-episode
+    ranking would leave both generations in ``episodes_latest`` -- and both
+    carry the SAME ``uri``, because publication overwrites in place, so the
+    duplicate is not even distinguishable by address.
+    """
+    catalog = Catalog(tmp_path / "catalog")
+    first_generation = _fake_canonical(tmp_path, content=b"first canonical bytes")
+    catalog.append_episode(
+        canonical_path=first_generation,
+        stamps=FAKE_STAMPS,
+        episode_metadata={"task": "fold_napkin"},
+        check_rows=[_check_row(value=1.0)],
+        source_uri="episodes-in/fold.mcap",
+        uri="/data/episodes/fold.canonical.mcap",
+    )
+    reprocessed = tmp_path / "fold-reprocessed.canonical.mcap"
+    reprocessed.write_bytes(b"reprocessed canonical bytes")
+    second_append = catalog.append_episode(
+        canonical_path=reprocessed,
+        stamps=FAKE_STAMPS,
+        episode_metadata={"task": "fold_napkin"},
+        check_rows=[_check_row(value=2.0)],
+        source_uri="episodes-in/fold.mcap",
+        uri="/data/episodes/fold.canonical.mcap",
+    )
+
+    connection = open_catalog_connection(tmp_path / "catalog")
+    try:
+        assert connection.execute("SELECT count(*) FROM episodes_raw").fetchone() == (2,)
+        latest = connection.execute("SELECT episode_id FROM episodes_latest").fetchall()
+        assert latest == [(second_append.episode_id,)]
+        # The wide view is the documented raw-SQL surface, so it must agree:
+        # otherwise every user query counts the recording twice.
+        wide = connection.execute("SELECT task, example_metric FROM episodes").fetchall()
+        assert wide == [("fold_napkin", 2.0)]
+    finally:
+        connection.close()
+
+    # Coverage is the honesty feature: the denominator is the corpus, not the
+    # corpus plus its history.
+    report = curate(tmp_path / "catalog", "SELECT episode_id FROM episodes")
+    assert report.total_episodes == 1
+    assert report.row_count == 1
+    assert {entry.check_name: entry.fraction for entry in report.coverage} == {"example_check": 1.0}
+
+
 def test_cli_stale_prints_source_uris_for_ingest(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
