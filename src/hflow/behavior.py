@@ -84,4 +84,13 @@ notes and not only here.
 # bytes for the same input. See the module docstring for the rule. Annotated
 # as ``str`` rather than inferred as a literal: the whole point is that it
 # changes.
-TRANSFORM_BEHAVIOR_VERSION: str = "2"
+#
+# "3": bulk non-camera channels (point clouds, occupancy grids -- anything
+# averaging over BULK_MESSAGE_BYTES per message) now get their own chunk
+# group instead of sharing chunks with proprio-sized telemetry, and the
+# resolved topic-to-group map is written into provenance/v1. Both change the
+# bytes. docs/BENCHMARKS.md measured the old behavior dragging 230 MB through
+# an /imu scan because /imu shared chunks with lidar, against 4 MB grouped by
+# read pattern; a recording with no bulk channels is laid out exactly as
+# before and only re-versions because this constant moved.
+TRANSFORM_BEHAVIOR_VERSION: str = "3"

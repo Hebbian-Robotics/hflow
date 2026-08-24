@@ -59,6 +59,14 @@ RESAMPLE_POLICY_VERSION: str = "2"
 PROVENANCE_KEY_RESAMPLE_POLICY_VERSION = "resample_policy_version"
 PROVENANCE_KEY_DERIVED_PREFIX = "derived/"
 
+# Which group each topic's channels were written into. Recorded because the
+# assignment is now partly DATA-derived (see DEFAULT_BULK_GROUP): group names
+# appear nowhere in the MCAP itself, so without this the resolved layout of a
+# published episode could only be guessed at from chunk membership, and
+# `hflow doctor`'s chunk-mixes-video-and-state finding could not be checked
+# against what the transform intended.
+PROVENANCE_KEY_TOPIC_GROUP_PREFIX = "group/"
+
 # Schema record name for derived channels (JSON messages on a grid). Neutral
 # and format-versioned like every stored identifier in this module.
 DERIVED_SCHEMA_NAME = "derived/v1"
@@ -69,6 +77,22 @@ CATALOG_FORMAT_VERSION = "1"
 
 DEFAULT_CAMERA_GROUP = "cameras"
 DEFAULT_STATE_GROUP = "state"
+
+# Bulk modalities (lidar and radar point clouds, occupancy grids) get their
+# own group instead of sharing chunks with proprio-sized telemetry. Grouping
+# is a READ-PATTERN decision, not a schema one: a training sample co-reads
+# cameras and small state channels, and never the point clouds, so mixing
+# them makes every state read drag bulk bytes along. docs/BENCHMARKS.md
+# measured exactly that on real footage -- an `/imu` scan pulled 230 MB
+# through the reader because `/imu` shared chunks with lidar, against 4 MB
+# once the bulk channels moved out.
+DEFAULT_BULK_GROUP = "bulk"
+
+# Mean payload bytes at or below which a non-camera channel counts as
+# proprio-like telemetry that samples co-read. Above it, the channel is bulk.
+# The threshold the benchmark's read-pattern mode used to produce the numbers
+# in docs/BENCHMARKS.md.
+BULK_MESSAGE_BYTES = 16_384
 
 # Target uncompressed chunk size per group, in bytes. Small enough that a
 # few-second time slice of a group is one or two fetches; measured defaults

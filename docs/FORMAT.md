@@ -31,8 +31,9 @@ layout change at ~3.4× fewer chunk fetches and ~2.9× faster reads at their sca
 
 | Convention | Value |
 |---|---|
-| Default groups | `cameras` (topics whose schema is a camera schema; see below), `state` (everything else) |
-| Group override | Per-topic, at transform configuration time (`TransformConfig.topic_groups`) |
+| Default groups | `cameras` (topics whose schema is a camera schema; see below), `bulk` (non-camera topics averaging over 16 384 bytes per message: point clouds, occupancy grids), `state` (everything else) |
+| Group override | Per-topic, at transform configuration time (`TransformConfig.topic_groups`); beats both defaults |
+| Resolved layout | Recorded per topic in `provenance/v1` as `group/<topic>` |
 | Target uncompressed chunk size | 800 000 bytes per group (configurable; measured defaults are a benchmark-report deliverable) |
 | Camera schemas | `foxglove.CompressedVideo`, `foxglove.CompressedImage`, `foxglove.RawImage`, `foxglove_msgs/msg/CompressedVideo`, `sensor_msgs/msg/CompressedImage`, `sensor_msgs/msg/Image` |
 
