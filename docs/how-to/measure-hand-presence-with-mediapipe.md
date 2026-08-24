@@ -203,7 +203,7 @@ things.
 ## See also
 
 - [Enable the built-in quality checks](./enable-built-in-checks.md) -- the
-  fifteen deterministic checks, which this is not one of.
+  deterministic checks, none of which this is.
 - [Call an OpenAI vision endpoint from a step](./call-openai-vision.md) -- the
   other way to ask about hands, and the one that can answer questions a
   landmark detector cannot (whose hands, gloved or bare, holding what).
