@@ -120,6 +120,17 @@ class TestLocalStorageRoot:
         assert "No such file or directory" in str(excinfo.value)
         assert str(missing) in str(excinfo.value)
 
+    def test_fetch_directory_says_is_a_directory(self, tmp_path: Path) -> None:
+        """A directory exists, so ENOENT was the wrong reason (#144)."""
+        root = LocalStorageRoot(tmp_path)
+        a_directory = tmp_path / "landing"
+        a_directory.mkdir()
+        with pytest.raises(FileNotFoundError) as excinfo:
+            root.fetch("landing")
+        assert excinfo.value.errno == errno.EISDIR
+        assert excinfo.value.filename == str(a_directory)
+        assert "Is a directory" in str(excinfo.value)
+
     def test_publish_copies_only_when_needed(self, tmp_path: Path) -> None:
         root = LocalStorageRoot(tmp_path / "root")
         outside_file = tmp_path / "made-elsewhere.bin"
@@ -202,6 +213,16 @@ class TestBucketStorageRoot:
         assert excinfo.value.errno == 2
         assert "No such file or directory" in str(excinfo.value)
         assert str(missing) in str(excinfo.value)
+
+    def test_fetch_local_directory_says_is_a_directory(self, tmp_path: Path) -> None:
+        """`hflow doctor <a directory>` reaches this and reported ENOENT (#144)."""
+        a_directory = tmp_path / "adir"
+        a_directory.mkdir()
+        with pytest.raises(FileNotFoundError) as excinfo:
+            fetch_uri(a_directory)
+        assert excinfo.value.errno == errno.EISDIR
+        assert excinfo.value.filename == str(a_directory)
+        assert "Is a directory" in str(excinfo.value)
 
     def test_publish_uploads_and_warms_mirror(self, tmp_path: Path) -> None:
         root, remote_dir = bucket_over_tmp(tmp_path)

@@ -340,6 +340,16 @@ class LocalStorageRoot:
     def fetch(self, relative: str) -> Path:
         """The local file at ``relative`` (it already lives here)."""
         local_file = self.path / _validated_relative_key(relative)
+        if local_file.is_dir():
+            # Deliberately FileNotFoundError and not IsADirectoryError: the accurate
+            # class subclasses OSError, not FileNotFoundError, so an `except
+            # FileNotFoundError` stops catching it. cli.py:835 is one such handler,
+            # reached from `hflow doctor` through fetch_uri below, and it turns this
+            # into a finding rather than a traceback; sixteen more name the class
+            # elsewhere under src/hflow/, and callers outside the repo are the real
+            # unknown. The errno carries the accurate text without moving the class.
+            # Same decision as the four sites #102 covered. #144.
+            raise FileNotFoundError(errno.EISDIR, os.strerror(errno.EISDIR), str(local_file))
         if not local_file.is_file():
             raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(local_file))
         return local_file
@@ -652,6 +662,9 @@ def fetch_uri(uri: "str | Path") -> Path:
             raise ValueError(f"bucket URI {uri!r} names no object")
         return BucketStorageRoot(parent_url).fetch(name)
     local_file = Path(uri)
+    if local_file.is_dir():
+        # FileNotFoundError, not IsADirectoryError, for the reason above.
+        raise FileNotFoundError(errno.EISDIR, os.strerror(errno.EISDIR), str(local_file))
     if not local_file.is_file():
         raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(local_file))
     return local_file
