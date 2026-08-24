@@ -516,6 +516,64 @@ def test_up_reports_a_pipeline_directory_as_a_directory(
     assert "containers may still be running" not in streams.err
 
 
+def test_up_reports_a_data_root_that_is_a_file(
+    compose_calls: list[list[str]],
+    healthy_client: None,
+    pipeline_file: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#145. Every mkdir under <data-root>/runtime raised NotADirectoryError."""
+    a_file = tmp_path / "afile"
+    a_file.write_text("not a directory")
+
+    exit_code = main(["up", "--pipeline", str(pipeline_file), "--data-root", str(a_file)])
+
+    assert exit_code == 2
+    assert compose_calls == []
+    streams = capsys.readouterr()
+    assert f"up: Not a directory: {a_file}" in streams.err
+    assert "Traceback" not in streams.err
+    assert "containers may still be running" not in streams.err
+
+
+def test_up_still_accepts_a_data_root_that_is_not_there_yet(
+    compose_calls: list[list[str]],
+    healthy_client: None,
+    pipeline_file: Path,
+    tmp_path: Path,
+) -> None:
+    """The carve-out in #145: only a root that exists and is not a directory is
+    refused. Whether a missing root should be refused is open on #143, and until
+    that lands `up` must not answer it differently from how it always has.
+    """
+    missing_root = tmp_path / "not_there_yet"
+
+    exit_code = main(["up", "--pipeline", str(pipeline_file), "--data-root", str(missing_root)])
+
+    assert exit_code == 0
+    assert compose_calls != []
+
+
+def test_curate_reports_a_sql_file_that_is_a_directory(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#145. read_text on a directory raises IsADirectoryError, which subclasses
+    OSError and not FileNotFoundError, so it walked past the handler.
+    """
+    a_directory = tmp_path / "sql"
+    a_directory.mkdir()
+
+    exit_code = main(["curate", "--catalog", str(tmp_path), "--sql-file", str(a_directory)])
+
+    assert exit_code == 2
+    streams = capsys.readouterr()
+    assert f"curate: [Errno 21] Is a directory: '{a_directory}'" in streams.err
+    assert "No such file or directory" not in streams.err
+    assert "Traceback" not in streams.err
+
+
 def test_up_reports_a_requirements_directory_as_a_directory(
     compose_calls: list[list[str]],
     healthy_client: None,

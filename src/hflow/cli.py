@@ -603,6 +603,23 @@ def _command_up(arguments: argparse.Namespace) -> int:
         # be false.
         print(f"up: {error}", file=sys.stderr)
         return 2
+    # A bucket data root has no local directory to check, the same distinction
+    # drawn for the bundle dir below. Only a root that exists and is not a
+    # directory is refused here: every one of the three `mkdir` calls in
+    # render_bundle raises NotADirectoryError against it, and nothing has been
+    # rendered or started when that happens, so it is bad input (2).
+    # A *missing* local root is deliberately left alone. `serve` refuses that
+    # case too, but whether it should is open on #143, and until that lands the
+    # two commands agreeing on the wrong answer is worse than only this one
+    # answering the case that is bad input under any reading.
+    if not is_bucket_url(arguments.data_root):
+        local_data_root = Path(arguments.data_root)
+        if local_data_root.exists() and not local_data_root.is_dir():
+            print(
+                f"up: {os.strerror(errno.ENOTDIR)}: {local_data_root}",
+                file=sys.stderr,
+            )
+            return 2
     # A bucket data root has no local directory to host the bundle: ./runtime.
     default_bundle_dir = (
         Path(RUNTIME_BUNDLE_DIRECTORY_NAME)
@@ -789,8 +806,22 @@ def _command_curate(arguments: argparse.Namespace) -> int:
     if (arguments.sql is None) == (arguments.sql_file is None):
         print("curate: pass exactly one of a SQL string or --sql-file", file=sys.stderr)
         return 2
+    if arguments.sql_file is not None:
+        try:
+            sql = arguments.sql_file.read_text()
+        except OSError as error:
+            # Its own block around the read alone, rather than widening the
+            # handler below. `read_text` on a directory raises
+            # IsADirectoryError, which subclasses OSError and not
+            # FileNotFoundError, so it walked past that handler. Catching
+            # OSError here is safe precisely because this block spans one
+            # read of one caller-named path: nothing curate does can reach it,
+            # so a mid-run filesystem failure is still an unhandled crash.
+            print(f"curate: {error}", file=sys.stderr)
+            return 2
+    else:
+        sql = arguments.sql
     try:
-        sql = arguments.sql if arguments.sql is not None else arguments.sql_file.read_text()
         report = curate(
             arguments.catalog,
             sql,
