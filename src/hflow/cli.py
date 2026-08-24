@@ -107,7 +107,8 @@ def _build_parser() -> argparse.ArgumentParser:
             f"(default: $HFLOW_DATA_ROOT/catalog, else {DEFAULT_DATA_ROOT}/catalog)"
         ),
     )
-    curate_parser.add_argument(
+    curate_output_group = curate_parser.add_mutually_exclusive_group()
+    curate_output_group.add_argument(
         "--output",
         "-o",
         default=f"{_environment_data_root().rstrip('/')}/manifest.parquet",
@@ -116,6 +117,11 @@ def _build_parser() -> argparse.ArgumentParser:
             f"(default: $HFLOW_DATA_ROOT/manifest.parquet, else "
             f"{DEFAULT_DATA_ROOT}/manifest.parquet)"
         ),
+    )
+    curate_output_group.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="run the query and report row count and coverage without writing a manifest",
     )
 
     export_parser = subparsers.add_parser(
@@ -784,7 +790,11 @@ def _command_curate(arguments: argparse.Namespace) -> int:
         return 2
     try:
         sql = arguments.sql if arguments.sql is not None else arguments.sql_file.read_text()
-        report = curate(arguments.catalog, sql, output=arguments.output)
+        report = curate(
+            arguments.catalog,
+            sql,
+            output=None if arguments.dry_run else arguments.output,
+        )
     except (ValueError, FileNotFoundError) as error:
         print(f"curate: {error}", file=sys.stderr)
         return 2

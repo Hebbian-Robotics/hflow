@@ -82,9 +82,12 @@ class CurationReport:
     coverage: list[CheckCoverage]
 
     def summary(self) -> str:
+        if self.manifest_path is None:
+            manifest = "manifest: (not written; dry run)"
+        else:
+            manifest = f"manifest: {self.manifest_path}"
         lines = [
-            f"manifest: {self.manifest_path} ({self.row_count} rows, "
-            f"from {self.total_episodes} cataloged episodes)"
+            f"{manifest} ({self.row_count} rows, from {self.total_episodes} cataloged episodes)"
         ]
         lines.append("coverage (episodes each check ran on):")
         for entry in sorted(self.coverage, key=lambda item: item.check_name):

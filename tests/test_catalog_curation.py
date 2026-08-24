@@ -10,7 +10,7 @@ import pytest
 import hflow
 from hflow.catalog import TABLE_COLUMN_DDL, Catalog, CheckRunRow, content_episode_id
 from hflow.cli import main as cli_main
-from hflow.curation import curate, open_catalog_connection
+from hflow.curation import CurationReport, curate, open_catalog_connection
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import EpisodeStamps
 
@@ -436,6 +436,59 @@ def test_cli_curate(
 
 def test_cli_curate_requires_exactly_one_sql_source(tmp_path: Path) -> None:
     assert cli_main(["curate", "--catalog", str(tmp_path)]) == 2
+
+
+def test_cli_curate_dry_run_reports_without_writing_a_manifest(
+    recorded_data_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    data_root = tmp_path / "data-root"
+    monkeypatch.setenv("HFLOW_DATA_ROOT", str(data_root))
+    exit_code = cli_main(
+        [
+            "curate",
+            "SELECT episode_id, task FROM episodes WHERE status != 'quarantined'",
+            "--catalog",
+            str(recorded_data_root / "catalog"),
+            "--dry-run",
+        ]
+    )
+    assert exit_code == 0
+    printed = capsys.readouterr().out
+    assert "1 rows" in printed
+    assert "manifest: (not written; dry run)" in printed
+    assert "manifest: None" not in printed
+    assert not (data_root / "manifest.parquet").exists()
+
+
+def test_cli_curate_rejects_dry_run_with_an_explicit_output(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main(
+            [
+                "curate",
+                "SELECT 1",
+                "--catalog",
+                str(tmp_path),
+                "--dry-run",
+                "--output",
+                str(tmp_path / "manifest.parquet"),
+            ]
+        )
+    assert exc_info.value.code == 2
+
+
+def test_curation_report_summary_renders_the_no_output_case() -> None:
+    report = CurationReport(
+        manifest_path=None,
+        row_count=3,
+        total_episodes=10,
+        coverage=[],
+    )
+    summary = report.summary()
+    assert "manifest: (not written; dry run)" in summary
+    assert "manifest: None" not in summary
 
 
 def test_stale_episodes_lists_only_episodes_behind_the_current_versions(tmp_path: Path) -> None:
