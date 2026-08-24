@@ -1,0 +1,482 @@
+/*
+ * One stylesheet. Both palettes are declared here under prefers-color-scheme,
+ * so there is no theme toggle, nothing stored, and no pre-paint script.
+ *
+ * Every colour is a token. The six tone tokens are the tone names from
+ * src/tones.ts, which is what lets that module decide MEANING while this one
+ * decides appearance.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  --bg: #f7f7f8;
+  --bg-panel: #ffffff;
+  --bg-sunken: #eeeef0;
+  --line: #d8d8dd;
+  --line-strong: #b6b6bf;
+  --ink: #17171a;
+  --ink-soft: #55555f;
+  --ink-faint: #85858f;
+
+  --ok: #1a7f4b;
+  --err: #b8321f;
+  --warn: #9a6206;
+  --run: #1f5fbf;
+  --info: #5b4bb8;
+  --muted: #85858f;
+
+  --radius: 8px;
+  --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16161a;
+    --bg-panel: #1e1e24;
+    --bg-sunken: #121216;
+    --line: #33333d;
+    --line-strong: #4a4a58;
+    --ink: #ececf0;
+    --ink-soft: #a8a8b4;
+    --ink-faint: #7b7b88;
+
+    --ok: #4cc38a;
+    --err: #f26d5b;
+    --warn: #e0a458;
+    --run: #6ba4f8;
+    --info: #a394f5;
+    --muted: #7b7b88;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+/* --- shell ---------------------------------------------------------------- */
+
+.app {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  height: 100dvh;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  font-weight: 650;
+  letter-spacing: 0.01em;
+}
+
+.topbar-spacer {
+  flex: 1;
+}
+
+.topbar-meta {
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: 12px;
+  max-width: 40ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.run-picker-label {
+  color: var(--ink-faint);
+  font-size: 12px;
+}
+
+.run-picker select {
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 12px;
+  max-width: 46ch;
+  padding: 4px 6px;
+}
+
+.body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  min-height: 0;
+}
+
+.stage-area {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+  min-width: 0;
+  padding: 12px 16px 16px;
+}
+
+.inspector {
+  background: var(--bg-panel);
+  border-left: 1px solid var(--line);
+  overflow-y: auto;
+  padding: 14px 16px;
+}
+
+/* --- breadcrumb and captions --------------------------------------------- */
+
+.crumbs {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.crumb {
+  background: none;
+  border: 0;
+  border-radius: 5px;
+  color: var(--run);
+  cursor: pointer;
+  font: inherit;
+  padding: 2px 5px;
+}
+
+.crumb:hover {
+  background: var(--bg-sunken);
+}
+
+.crumb:disabled {
+  color: var(--ink);
+  cursor: default;
+  font-weight: 600;
+}
+
+.crumb-sep {
+  color: var(--ink-faint);
+}
+
+.caption {
+  color: var(--ink-soft);
+  margin: 0;
+}
+
+.notice {
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--warn);
+  border-radius: 4px;
+  color: var(--ink-soft);
+  margin: 0;
+  padding: 6px 10px;
+}
+
+/* --- canvas -------------------------------------------------------------- */
+
+.surface {
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.surface-message {
+  align-items: center;
+  color: var(--ink-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  justify-content: center;
+  padding: 24px;
+  text-align: center;
+}
+
+.error-title {
+  color: var(--err);
+  font-weight: 600;
+  margin: 0;
+}
+
+.error-detail {
+  font-family: var(--mono);
+  font-size: 12px;
+  margin: 0;
+  max-width: 70ch;
+}
+
+/* React Flow paints its own surface; ours is the one behind it. */
+.react-flow {
+  background: transparent;
+}
+
+.react-flow__edge-path {
+  stroke: var(--line-strong);
+  stroke-width: 1.5;
+}
+
+.edge-dashed .react-flow__edge-path {
+  stroke-dasharray: 4 4;
+}
+
+.react-flow__edge-text {
+  fill: var(--ink-faint);
+  font-size: 10px;
+}
+
+/* React Flow paints a rect behind an edge label; without a fill matching the
+   canvas the label sits on top of whatever the edge crosses. */
+.react-flow__edge-textbg {
+  fill: var(--bg-sunken);
+}
+
+.react-flow__handle {
+  background: var(--line-strong);
+  border: 0;
+  height: 5px;
+  min-height: 5px;
+  min-width: 5px;
+  width: 5px;
+}
+
+/* Scoped through .react-flow__controls to outrank React Flow's own rule, which
+   hardcodes a near-white button and would stay light in the dark palette. */
+.react-flow__controls .react-flow__controls-button {
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--line);
+  fill: var(--ink-soft);
+}
+
+.react-flow__controls .react-flow__controls-button:hover {
+  background: var(--bg-sunken);
+  fill: var(--ink);
+}
+
+.react-flow__attribution {
+  background: transparent;
+}
+
+.react-flow__attribution a {
+  color: var(--ink-faint);
+}
+
+/* --- nodes --------------------------------------------------------------- */
+
+.node {
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--tone, var(--muted));
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  height: 100%;
+  overflow: hidden;
+  padding: 8px 10px;
+  width: 100%;
+}
+
+.node[data-drillable="true"] {
+  cursor: pointer;
+}
+
+.node[data-selected="true"] {
+  border-color: var(--line-strong);
+  box-shadow: 0 0 0 2px var(--tone, var(--muted));
+}
+
+.node-note {
+  background: var(--bg-sunken);
+  border-style: dashed;
+  border-left-style: solid;
+}
+
+.node-title {
+  align-items: baseline;
+  display: flex;
+  gap: 6px;
+  justify-content: space-between;
+}
+
+.node-title-text {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-drill {
+  color: var(--ink-faint);
+  flex: none;
+  font-size: 15px;
+  line-height: 1;
+}
+
+.node-subtitle {
+  color: var(--ink-soft);
+  /* Two lines, then elide: the box is a fixed size the layout was told about,
+     so text must never be what decides how tall a node is. */
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  display: -webkit-box;
+  font-size: 11px;
+  line-height: 1.3;
+  overflow: hidden;
+}
+
+.node-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: auto;
+  overflow: hidden;
+}
+
+.badge {
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--ink-soft);
+  font-size: 10px;
+  line-height: 1.5;
+  padding: 0 6px;
+  white-space: nowrap;
+}
+
+/* --- tones --------------------------------------------------------------- */
+
+/* One rule per tone, setting the token every tone-aware element reads. */
+.tone-ok {
+  --tone: var(--ok);
+}
+.tone-err {
+  --tone: var(--err);
+}
+.tone-warn {
+  --tone: var(--warn);
+}
+.tone-run {
+  --tone: var(--run);
+}
+.tone-info {
+  --tone: var(--info);
+}
+.tone-muted {
+  --tone: var(--muted);
+}
+
+.chip {
+  background: var(--bg-sunken);
+  border: 1px solid var(--tone, var(--muted));
+  border-radius: 999px;
+  color: var(--tone, var(--muted));
+  display: inline-block;
+  font-size: 11px;
+  margin: 0;
+  padding: 1px 8px;
+}
+
+/* --- inspector ----------------------------------------------------------- */
+
+.inspector-empty {
+  color: var(--ink-soft);
+}
+
+.inspector-hint {
+  color: var(--ink-faint);
+  font-size: 12px;
+}
+
+.inspector-title {
+  border-left: 3px solid var(--tone, var(--muted));
+  font-family: var(--mono);
+  font-size: 14px;
+  margin: 0 0 8px;
+  overflow-wrap: anywhere;
+  padding-left: 8px;
+}
+
+.inspector-subtitle {
+  color: var(--ink-soft);
+  margin: 8px 0;
+}
+
+.drill-button {
+  background: var(--bg-sunken);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  color: var(--ink);
+  cursor: pointer;
+  font: inherit;
+  margin: 8px 0;
+  padding: 4px 10px;
+}
+
+.drill-button:hover {
+  border-color: var(--run);
+  color: var(--run);
+}
+
+.inspector-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0 0;
+}
+
+.detail-line dt {
+  color: var(--ink-faint);
+  font-size: 11px;
+  text-transform: lowercase;
+}
+
+.detail-line dd {
+  font-family: var(--mono);
+  font-size: 12px;
+  margin: 1px 0 0;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 900px) {
+  .body {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+
+  .inspector {
+    border-left: 0;
+    border-top: 1px solid var(--line);
+    max-height: 40dvh;
+  }
+}
