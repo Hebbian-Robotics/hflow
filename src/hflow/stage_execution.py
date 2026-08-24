@@ -16,7 +16,6 @@ so the quarantine budget applies only in the meta stage, and a run where
 EVERY episode errored always fails regardless of budget.
 """
 
-import importlib.util
 import math
 import os
 import traceback
@@ -86,18 +85,20 @@ def load_pipeline_application(pipeline_path: str, app_variable: str) -> "App":
     This is the execution contract a deployment wraps its isolation around:
     the file is arbitrary user code, imported (executed) in the user venv,
     and must expose an ``hflow.App`` under ``app_variable``.
-    """
-    from hflow.app import App
 
-    spec = importlib.util.spec_from_file_location("hflow_user_pipeline", pipeline_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load user pipeline at {pipeline_path}")
-    pipeline_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(pipeline_module)
-    application = getattr(pipeline_module, app_variable, None)
-    if not isinstance(application, App):
-        raise RuntimeError(f"{pipeline_path} has no hflow.App named {app_variable!r}")
-    return application
+    A thin adapter over :func:`hflow.app.load_pipeline_application`, which
+    owns the loading itself so this path cannot drift from the CLI's and the
+    workspace UI's. The only thing that differs here is the error type: a
+    task boundary has no caller that recovers, so a failure is
+    ``RuntimeError`` rather than the ``ValueError`` the CLI catches to exit 2
+    and the server catches to degrade to an unavailable pipeline page.
+    """
+    from hflow.app import load_pipeline_application as load_application
+
+    try:
+        return load_application(pipeline_path, app_variable)
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
 
 
 def require_application_data_root(application: "App", expected_data_root: str) -> None:

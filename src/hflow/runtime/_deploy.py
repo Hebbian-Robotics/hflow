@@ -36,6 +36,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+from hflow.app import DEFAULT_APP_VARIABLE
 from hflow.runtime._bundle import (
     BundleKind,
     hflow_distribution_requirement,
@@ -107,7 +108,7 @@ class DeployConfig:
 
     pipeline_file: Path
     data_root_uri: str
-    app_variable: str = "app"
+    app_variable: str = DEFAULT_APP_VARIABLE
     requirements_file: Path | None = None
     venv_python_path: str = DEFAULT_DEPLOY_VENV_PYTHON
     dag_id: str | None = None

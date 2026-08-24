@@ -81,6 +81,22 @@ def test_parse_pipeline_spec_variants() -> None:
     )
 
 
+def test_addressing_a_pipeline_by_spec_string_imports_its_siblings(tmp_path: Path) -> None:
+    # The same multi-file guarantee the runtime path has: `hflow manifest`,
+    # `hflow stale --pipeline`, and `hflow serve --pipeline` all arrive here.
+    from hflow import import_pipeline_application
+
+    (tmp_path / "rig_constants.py").write_text("FLEET_NAME = 'kitchen'\n")
+    pipeline_file = tmp_path / "pipeline.py"
+    pipeline_file.write_text(
+        "import hflow\n"
+        "from rig_constants import FLEET_NAME\n\n"
+        "fleet = hflow.App(FLEET_NAME, data_root='./data')\n"
+    )
+    application = import_pipeline_application(f"{pipeline_file}:fleet")
+    assert application.name == "kitchen"
+
+
 def test_up_renders_starts_and_prints(
     compose_calls: list[list[str]],
     healthy_client: None,

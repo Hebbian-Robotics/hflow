@@ -129,6 +129,28 @@ class TestPipelineLoading:
         with pytest.raises(RuntimeError, match=r"no hflow\.App named 'app'"):
             load_pipeline_application(str(pipeline_file), "app")
 
+    def test_a_pipeline_can_import_a_sibling_module(self, tmp_path: Path) -> None:
+        # A pipeline is an ordinary multi-file project: `python pipeline.py`
+        # puts its directory on sys.path, and loading the same file BY PATH
+        # (which is all the runtime ever does) has to agree.
+        (tmp_path / "rig_constants.py").write_text("FLEET_NAME = 'kitchen'\n")
+        pipeline_file = tmp_path / "pipeline.py"
+        pipeline_file.write_text(
+            "import hflow\n"
+            "from rig_constants import FLEET_NAME\n\n"
+            "app = hflow.App(FLEET_NAME, data_root='/opt/airflow/data')\n"
+        )
+        assert load_pipeline_application(str(pipeline_file), "app").name == "kitchen"
+
+    def test_a_pipeline_exiting_at_import_fails_the_task_diagnosably(self, tmp_path: Path) -> None:
+        # SystemExit is a BaseException: a module-scope sys.exit() (a config
+        # guard, a stray argparse) must not walk past the loader and take the
+        # worker down with the pipeline's own exit status.
+        pipeline_file = tmp_path / "pipeline.py"
+        pipeline_file.write_text("import sys\n\nsys.exit('set ROBOT_FLEET')\n")
+        with pytest.raises(RuntimeError, match="set ROBOT_FLEET"):
+            load_pipeline_application(str(pipeline_file), "app")
+
 
 @dataclass
 class _StubReport:

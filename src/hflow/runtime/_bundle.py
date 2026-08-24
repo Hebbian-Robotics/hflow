@@ -71,7 +71,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from hflow import __version__
-from hflow.app import ENDPOINT_ENVIRONMENT_VARIABLE_PREFIX
+from hflow.app import DEFAULT_APP_VARIABLE, ENDPOINT_ENVIRONMENT_VARIABLE_PREFIX
 from hflow.runtime._templates import (
     COMPOSE_TEMPLATE,
     DAG_BUNDLE_CONFIG_LIST_JSON,
@@ -200,7 +200,7 @@ class RuntimeConfig:
 
     pipeline_file: Path
     data_root: Path | str
-    app_variable: str = "app"
+    app_variable: str = DEFAULT_APP_VARIABLE
     requirements_file: Path | None = None
     hflow_source: Path | None = None
     dag_id: str | None = None

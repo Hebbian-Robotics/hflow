@@ -96,6 +96,12 @@ TransformFunction = Callable[[Path, Path, TransformConfig], EpisodeStamps]
 DATA_ROOT_ENVIRONMENT_VARIABLE = "HFLOW_DATA_ROOT"
 DEFAULT_DATA_ROOT = "./data"
 
+# The module-level name a pipeline file is expected to bind its App to, when
+# an address does not spell one out as ``pipeline.py:other_name``. One owner,
+# because the CLI, the bundle renderer, and the generated DAG tasks all have
+# to agree on it.
+DEFAULT_APP_VARIABLE = "app"
+
 # Environment overrides for endpoint aliases (see App(endpoints=...)):
 # HFLOW_ENDPOINT_<ALIAS>, the alias uppercased with every non-alphanumeric
 # character replaced by "_". The deployment exports the variable; the
@@ -1533,25 +1539,52 @@ def parse_pipeline_spec(pipeline_spec: str) -> tuple[Path, str]:
     path_part, separator, variable_part = pipeline_spec.rpartition(":")
     if separator and path_part and variable_part.isidentifier():
         return Path(path_part), variable_part
-    return Path(pipeline_spec), "app"
+    return Path(pipeline_spec), DEFAULT_APP_VARIABLE
 
 
-def import_pipeline_application(pipeline_spec: str) -> "App":
-    """Import ``path/to/pipeline.py[:app]`` and return its :class:`App`, loudly.
+def _add_pipeline_directory_to_import_path(pipeline_file: Path) -> None:
+    """Make the pipeline's own directory importable, like running it would.
 
-    One owner for the "address a pipeline by file" contract every vantage
-    needs -- the CLI's ``manifest``/``up``/``deploy``/``stale``, and any other
-    caller that must hold a user's pipeline (the workspace UI's pipeline
-    page). The pipeline file is arbitrary user code, so importing EXECUTES
-    it: any exception it raises is a boundary failure reported as a
-    ``ValueError`` naming the file, never a crash of the calling program.
+    ``python pipeline.py`` puts the script's directory on ``sys.path``, which
+    is why ``app.run()`` can ``import helpers`` from a sibling file and
+    loading that same file BY PATH could not: the CLI, the workspace UI, and
+    the generated DAG tasks all address a pipeline by path, so a multi-file
+    project raised ``ModuleNotFoundError`` at every vantage except the one
+    the quickstart uses. Restoring that one line of CPython's behavior is
+    what makes a pipeline an ordinary Python project.
+
+    The entry is left in place rather than restored around the import: a
+    step may import a sibling lazily, long after loading returns (inside a
+    check body, on the first episode), and each process loads exactly one
+    pipeline.
+    """
+    pipeline_directory = str(pipeline_file.resolve().parent)
+    if pipeline_directory not in sys.path:
+        sys.path.insert(0, pipeline_directory)
+
+
+def load_pipeline_application(
+    pipeline_file: Path | str, app_variable: str = DEFAULT_APP_VARIABLE
+) -> "App":
+    """Import a pipeline file by path and return its :class:`App`, loudly.
+
+    The one owner of the "address a pipeline by file" contract, for every
+    vantage that must hold a user's pipeline: the CLI's ``manifest``/``up``/
+    ``deploy``/``stale``, the workspace UI's pipeline page, and the generated
+    DAG tasks (through :func:`hflow.stage_execution.load_pipeline_application`,
+    a thin adapter that only translates the error type its boundary wants).
+
+    The pipeline file is arbitrary user code, so importing EXECUTES it: any
+    exception it raises is a boundary failure reported as a ``ValueError``
+    naming the file, never a crash of the calling program.
     """
     import importlib.util
 
-    pipeline_file, app_variable = parse_pipeline_spec(pipeline_spec)
-    spec = importlib.util.spec_from_file_location("hflow_user_pipeline", pipeline_file)
+    pipeline_path = Path(pipeline_file)
+    _add_pipeline_directory_to_import_path(pipeline_path)
+    spec = importlib.util.spec_from_file_location("hflow_user_pipeline", pipeline_path)
     if spec is None or spec.loader is None:
-        raise ValueError(f"cannot import pipeline file {pipeline_file}")
+        raise ValueError(f"cannot import pipeline file {pipeline_path}")
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
@@ -1560,10 +1593,21 @@ def import_pipeline_application(pipeline_spec: str) -> "App":
         # import time (sys.exit("set ROBOT_FLEET"), or a module-scope argparse)
         # would otherwise walk past `except Exception` and take the calling
         # program's exit status with it -- killing a long-lived UI server at
-        # startup. KeyboardInterrupt stays uncaught on purpose: that one
-        # belongs to whoever pressed it, not to the pipeline file.
-        raise ValueError(f"importing {pipeline_file} failed: {error}") from error
+        # startup, or failing an Airflow task with the pipeline's own exit
+        # code instead of a diagnosable message. KeyboardInterrupt stays
+        # uncaught on purpose: that one belongs to whoever pressed it.
+        raise ValueError(f"importing {pipeline_path} failed: {error}") from error
     application = getattr(module, app_variable, None)
     if not isinstance(application, App):
-        raise ValueError(f"{pipeline_file} has no hflow.App named {app_variable!r}")
+        raise ValueError(f"{pipeline_path} has no hflow.App named {app_variable!r}")
     return application
+
+
+def import_pipeline_application(pipeline_spec: str) -> "App":
+    """Import ``path/to/pipeline.py[:app]`` and return its :class:`App`, loudly.
+
+    The spec-string front door to :func:`load_pipeline_application`, for the
+    callers that take a pipeline address as one user-supplied argument.
+    """
+    pipeline_file, app_variable = parse_pipeline_spec(pipeline_spec)
+    return load_pipeline_application(pipeline_file, app_variable)
