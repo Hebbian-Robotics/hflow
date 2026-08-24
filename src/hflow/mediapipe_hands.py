@@ -3,12 +3,11 @@
 This is **not** one of hflow's deterministic built-in checks. It runs a model,
 and the model is named at every call site on purpose: what it records is what
 MediaPipe *detected*, which is not the same claim as what was in the frame.
-A gloved hand is present, is visible, and is not detected. That gap is the
-whole reason this module is separate from :mod:`hflow.checks`, and the
-limitations a user is accepting are documented in
-``docs/how-to/measure-hand-presence-with-mediapipe.md``. Read them before
-gating anything on these numbers -- which is also why nothing here ships a
-recommended gate.
+A gloved hand is present, is visible, and is not detected -- Google's model
+card puts gloves out of scope outright. That gap is the whole reason this
+module is separate from :mod:`hflow.checks`, and why nothing here ships a
+recommended gate;
+``docs/how-to/measure-hand-presence-with-mediapipe.md`` collects the rest.
 
 Mechanism: frames are sampled from a camera at a declared rate, decoded
 straight to RGB by the pinned ffmpeg, and passed to the Hand Landmarker in
@@ -35,6 +34,7 @@ from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import numpy as np
 
@@ -69,7 +69,10 @@ HAND_LANDMARKER_MODEL_ENV_VAR = "HFLOW_HAND_LANDMARKER_MODEL"
 # compete for the two slots. Not a parameter, because raising it would change
 # what every recorded share means without changing its name.
 MAXIMUM_HANDS = 2
-LANDMARKS_PER_HAND = 21
+# What ``two_hand_detected_frame_share`` counts. Spelled separately from the cap
+# above even though both are 2: they are equal by coincidence, and defining the
+# share as "at the cap" would silently redefine the measurement if the cap moved.
+_TWO_HANDS = 2
 
 # One frame a second: enough to characterize an episode, cheap at ~11 ms of
 # inference per frame, and the rate a frames-only VLM reads the same footage
@@ -122,6 +125,15 @@ class FrameHandCounts:
     left_hand_count: int
     right_hand_count: int
 
+    def __post_init__(self) -> None:
+        # The labelled hands are a subset of the detected ones, so a count that
+        # breaks that is a parsing bug, and every share computed from it would
+        # be wrong in a way no downstream assertion would catch.
+        if min(self.hand_count, self.left_hand_count, self.right_hand_count) < 0:
+            raise ValueError(f"hand counts must not be negative: {self}")
+        if self.left_hand_count + self.right_hand_count > self.hand_count:
+            raise ValueError(f"more labelled hands than detected hands: {self}")
+
 
 @dataclass(frozen=True)
 class HandDetectionSummary:
@@ -160,7 +172,7 @@ def summarize_hand_detections(detections: Sequence[FrameHandCounts]) -> HandDete
     return HandDetectionSummary(
         frame_count=len(detections),
         frames_with_any_hand=sum(1 for frame in detections if frame.hand_count >= 1),
-        frames_with_two_hands=sum(1 for frame in detections if frame.hand_count >= MAXIMUM_HANDS),
+        frames_with_two_hands=sum(1 for frame in detections if frame.hand_count >= _TWO_HANDS),
         frames_with_a_left_hand=sum(1 for frame in detections if frame.left_hand_count >= 1),
         frames_with_a_right_hand=sum(1 for frame in detections if frame.right_hand_count >= 1),
     )
@@ -282,7 +294,7 @@ def _resolved_hand_model_digest() -> str:
     return sha256_hex_of_file(hand_landmarker_model_path())
 
 
-def _handedness_of(handedness_categories: Sequence[object]) -> Handedness:
+def _handedness_of(handedness_categories: Sequence[Any]) -> Handedness:
     """The highest-scoring label MediaPipe assigned to one detected hand.
 
     The score is a handedness confidence, NOT a detection confidence, however
@@ -346,26 +358,30 @@ def detect_hands_in_frames(
     return detections
 
 
-def _frame_hand_counts(result: object) -> FrameHandCounts:
-    """One MediaPipe result, reduced to counts.
+def _frame_hand_counts(result: Any) -> FrameHandCounts:
+    """Parse one MediaPipe result into counts.
 
-    A structural mismatch raises rather than being coerced: it means this
-    build of MediaPipe returns a shape this code was not written against, and
-    a quietly wrong count is worse than a failed run.
+    This is the boundary, and the one place ``Any`` is allowed: MediaPipe's
+    result classes are not typed in a way this module can rely on across
+    builds, so the loose value is accepted here and converted immediately into
+    :class:`FrameHandCounts`, which everything downstream uses. Two safeguards
+    stand in for the types. An unrecognized handedness label becomes
+    :attr:`Handedness.UNKNOWN` rather than a guess, and attributes are read
+    directly rather than through ``getattr`` defaults -- a renamed field then
+    raises instead of quietly reading as "no hands detected", which would
+    record a wrong zero rather than failing the run.
+
+    Mismatched list lengths raise for the same reason: one detection without
+    its label means this build returns a shape this code was not written
+    against.
     """
-    hand_landmarks = getattr(result, "hand_landmarks", None) or []
-    handedness_per_hand = getattr(result, "handedness", None) or []
+    hand_landmarks = result.hand_landmarks
+    handedness_per_hand = result.handedness
     if len(handedness_per_hand) != len(hand_landmarks):
         raise HandLandmarkerError(
             f"MediaPipe returned {len(hand_landmarks)} landmark sets and "
             f"{len(handedness_per_hand)} handedness sets for one frame"
         )
-    for landmarks in hand_landmarks:
-        if len(landmarks) != LANDMARKS_PER_HAND:
-            raise HandLandmarkerError(
-                f"MediaPipe returned {len(landmarks)} landmarks for one hand, "
-                f"expected {LANDMARKS_PER_HAND}"
-            )
     labels = [_handedness_of(categories) for categories in handedness_per_hand]
     return FrameHandCounts(
         hand_count=len(hand_landmarks),

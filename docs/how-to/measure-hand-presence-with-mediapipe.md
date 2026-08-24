@@ -105,56 +105,58 @@ MediaPipe itself does not, which is why every row also carries
 
 ## Limitations you are accepting
 
-**These come from the model, and HFlow has not measured any of them.** They are
-documented from MediaPipe's training domain and from the behaviour of the
-instrument, not from a validation run on robot footage. Treat them as things to
-verify on your own data.
+These are the model's, and Google states most of them outright in the
+[Hand Tracking model card](https://storage.googleapis.com/mediapipe-assets/Model%20Card%20Hand%20Tracking%20(Lite_Full)%20with%20Fairness%20Oct%202021.pdf).
+Read that page as the authority; the rest of this section is what its wording
+means for a robot-data pipeline.
 
-**Gloves.** The Hand Landmarker is trained on in-the-wild images of bare
-hands. Gloved hands -- nitrile, work gloves, anything that changes hand colour
-and texture -- are the known failure case. If your operators wear gloves, this
-check may report near-zero on footage that is full of hands, and it cannot
-tell you that is what happened. The predecessor system that this check was
+**Gloves are out of scope.** The model card lists "predicting hand landmarks
+with gloves or occlusions" under out-of-scope applications, alongside holding
+objects and decoration on the hand -- jewelry, tattoos, henna. If your
+operators wear gloves, this check can report near-zero on footage full of
+hands, and it cannot tell you that is what happened. The system this check was
 ported from never asked the landmarker about gloves; it asked a
 vision-language model a separate categorical question (bare / gloved / mixed /
-other), which is the honest way to get that answer.
+other), which is how to get that answer.
 
-**It detects hands, not the camera wearer's hands.** A coworker in frame, a
-bystander, a hand on a monitor -- all count. On footage with other people in
-it, the share reads higher than "the operator's hands were visible".
+**Counting hands in a crowd is out of scope too**, in the card's own words. Two
+things follow. It detects hands, not *the camera wearer's* hands, so a coworker
+in frame or a hand on a monitor counts; and the model returns at most two
+detections per frame, so extra hands do not raise the count past two, they
+compete for the two slots. `two_hand_detected_frame_share` can therefore
+describe two people's hands rather than one person's pair.
 
-**Two hands is a hard cap.** The model returns at most two detections per
-frame. Extra hands in frame do not raise the count; they compete for the two
-slots, so `two_hand_detected_frame_share` can describe two people's hands
-rather than one person's pair.
+**Low light, motion blur, and occluded joints degrade it.** The card is
+explicit that the model has not been tested in "in-the-wild" conditions
+including low light and motion blur, that quality degrades in extreme
+conditions, and that error is larger for blurry or occluded joints. An
+egocentric camera looking down at a grasp hits several of those at once.
+
+**It is for experimental use.** The card says the model was trained on limited
+datasets, is meant for experimental usage, and is not intended for
+human-life-critical decisions.
 
 **The handedness score is not a detection confidence.** It says how sure the
 model is that a hand it already found is a left hand. HFlow uses it only to
 pick between labels and never records it as a grade on the detection, and
 neither should you.
 
-**Ordinary vision failures suppress detections**: motion blur, low light,
-hands far from the camera, and hands occluded by the object being held. An
-egocentric camera looking down at a grasp is a hard case for all four at once.
-
-**Hand order is not an identity track.** Frame-to-frame, the model does not
+**Hand order is not an identity track.** Frame to frame, the model does not
 promise that hand 0 is the same hand it was. The measurements here are counts
 precisely because they do not depend on that.
 
-**The count is a floor, never a ceiling.** Every limitation above pushes
-detections down, except the bystander case, which pushes them up. A high share
-is fairly strong evidence hands were visible; a low share is weak evidence of
-anything.
+**So the count is a floor, not a ceiling.** Every limitation above pushes
+detections down, except the crowd case, which pushes them up. A high share is
+good evidence hands were visible; a low share is weak evidence of anything.
 
-**It is not bit-reproducible across machines.** Float16 inference on CPU can
-differ slightly between architectures, so two runs of the same version on
-different hardware may not produce identical numbers. The check's version
-covers the weights and the settings, not the arithmetic of the host.
+That is why nothing here ships a recommended gate and no example marks it
+`critical=True`. Quarantining an episode because a model did not see hands in
+it is exactly the mistake the glove limitation sets up.
 
-This is also why nothing here ships a recommended gate, and why
-`mediapipe_hand_detection` is not `critical=True` in any example. Quarantining
-an episode because a model did not see hands in it is exactly the mistake the
-gloves limitation sets up.
+One more, from the instrument rather than the card: float16 inference on CPU
+can differ slightly between architectures, so the same version on different
+hardware may not produce identical numbers. The version covers the weights and
+the settings, not the arithmetic of the host.
 
 ## Sanity-check it on your own footage
 

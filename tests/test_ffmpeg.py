@@ -44,7 +44,12 @@ from hflow.ffmpeg._instrument import (
     _stats_from_instrument_output,
     frame_stats,
 )
-from hflow.ffmpeg._raw_frames import RawFrameError, luma_frames, rgb_frames, scaled_frame_shape
+from hflow.ffmpeg._raw_frames import (
+    RawFrameError,
+    _scaled_frame_shape,
+    luma_frames,
+    rgb_frames,
+)
 
 
 def _system_ffmpeg() -> str:
@@ -622,12 +627,12 @@ def test_rgb_frames_reject_a_non_positive_rate(black_tail_video: Path) -> None:
 def test_scaled_frame_shape_is_proportional_and_rounds_half_up(
     source_shape: tuple[int, int], long_edge_pixels: int | None, expected: tuple[int, int]
 ) -> None:
-    assert scaled_frame_shape(source_shape, long_edge_pixels) == expected
+    assert _scaled_frame_shape(source_shape, long_edge_pixels) == expected
 
 
 def test_scaled_frame_shape_refuses_a_degenerate_long_edge() -> None:
     with pytest.raises(ValueError, match="at least 2"):
-        scaled_frame_shape((120, 160), 1)
+        _scaled_frame_shape((120, 160), 1)
 
 
 def test_missing_motion_extra_names_the_install_command(

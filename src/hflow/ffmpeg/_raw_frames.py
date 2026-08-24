@@ -62,7 +62,7 @@ def _probe_frame_shape(video: Path) -> tuple[int, int]:
     return height, width
 
 
-def scaled_frame_shape(
+def _scaled_frame_shape(
     source_shape: tuple[int, int], long_edge_pixels: int | None
 ) -> tuple[int, int]:
     """Proportionally resize (height, width) so its long edge matches.
@@ -171,17 +171,16 @@ def rgb_frames(
 
     ``fps`` resamples before any colour conversion or scaling, so sampling one
     frame a second from 30 fps footage converts one frame's pixels rather than
-    thirty. ``long_edge_pixels`` resizes proportionally (see
-    :func:`scaled_frame_shape`) with bilinear interpolation; both are omitted
-    from the filter graph entirely when unset, so an unresampled, unresized
-    call puts nothing between the file and the frame.
+    thirty. ``long_edge_pixels`` resizes proportionally, bilinearly, rounding
+    half up; both are omitted from the filter graph entirely when unset, so an
+    unresampled, unresized call puts nothing between the file and the frame.
 
     The array layout -- contiguous, uint8, height by width by RGB -- is what
     local vision models take directly.
     """
     if fps is not None and fps <= 0:
         raise ValueError(f"fps must be positive, got {fps}")
-    frame_height, frame_width = scaled_frame_shape(_probe_frame_shape(video), long_edge_pixels)
+    frame_height, frame_width = _scaled_frame_shape(_probe_frame_shape(video), long_edge_pixels)
     filters = []
     if fps is not None:
         filters.append(f"fps={fps:g}")

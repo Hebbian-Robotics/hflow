@@ -13,6 +13,7 @@ manual probe -- and it leaves one honest gap, recorded at the bottom of this
 file.
 """
 
+import functools
 import hashlib
 import json
 import os
@@ -26,7 +27,6 @@ from hflow.mediapipe_hands import (
     HAND_LANDMARKER_MODEL_ENV_VAR,
     PINNED_HAND_MODEL_SHA256,
     FrameHandCounts,
-    Handedness,
     HandModelNotAvailableError,
     _no_detection_intervals,
     _resolved_hand_model_digest,
@@ -47,6 +47,10 @@ MEDIAPIPE_TESTS_ENABLED = os.environ.get("HFLOW_MEDIAPIPE_TESTS") == "1"
 
 def _frame(hand_count: int, left: int = 0, right: int = 0) -> FrameHandCounts:
     return FrameHandCounts(hand_count=hand_count, left_hand_count=left, right_hand_count=right)
+
+
+def _check_version() -> str:
+    return compute_check_version("hands", mediapipe_hand_detection, False, frozenset(), None)
 
 
 @pytest.fixture
@@ -99,9 +103,6 @@ class TestFrameArithmetic:
         assert summary.frames_with_any_hand == 1
         assert summary.frames_with_a_left_hand == 0
         assert summary.frames_with_a_right_hand == 0
-
-    def test_handedness_has_an_unknown_case(self) -> None:
-        assert set(Handedness) == {Handedness.LEFT, Handedness.RIGHT, Handedness.UNKNOWN}
 
 
 class TestAbsenceIntervals:
@@ -223,22 +224,16 @@ class TestRegistrationWithoutTheModel:
         assert registered.name == "mediapipe_hand_detection"
         assert registered.version
 
-    def test_the_version_covers_the_model_pin(self) -> None:
-        """Bumping the pinned asset must move every measurement's version: the
-        weights are what produced the numbers, so two models cannot share one
-        identity.
+    def test_changing_the_model_pin_moves_the_version(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Different weights cannot share one identity: they are what produced
+        the numbers, so a re-pin has to append new-version rows rather than
+        mixing two models' measurements under one version.
         """
-        payload = json.dumps(
-            step_identity_payload(
-                "mediapipe_hand_detection",
-                mediapipe_hand_detection,
-                False,
-                frozenset(),
-                None,
-            )
-        )
-        assert PINNED_HAND_MODEL_SHA256 in payload
-        assert HAND_LANDMARKER_MODEL_ENV_VAR in payload
+        version_on_the_pinned_model = _check_version()
+        monkeypatch.setattr("hflow.mediapipe_hands.PINNED_HAND_MODEL_SHA256", "0" * 64)
+        assert _check_version() != version_on_the_pinned_model
 
     def test_the_version_leaves_nothing_undescribed(self) -> None:
         """Same bar as the built-ins: a marker here means someone can edit the
@@ -250,11 +245,7 @@ class TestRegistrationWithoutTheModel:
         assert UNDESCRIBED_CONFIGURATION_KEY not in json.dumps(payload)
 
     def test_retuning_a_confidence_moves_the_version(self) -> None:
-        import functools
-
-        default_version = compute_check_version(
-            "hands", mediapipe_hand_detection, False, frozenset(), None
-        )
+        default_version = _check_version()
         retuned_version = compute_check_version(
             "hands",
             functools.partial(mediapipe_hand_detection, minimum_hand_detection_confidence=0.8),

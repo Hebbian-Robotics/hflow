@@ -261,8 +261,9 @@ landmark detector and a vision-language model answer different questions about t
 holding what -- and the value is in comparing them, which requires both to survive. The
 separation is enforced by construction: the check lives outside `hflow.checks` with the vendor in
 its name, needs an opt-in extra and a digest-pinned model asset, ships no recommended gate, and
-records the model build as evidence on every row. Its limitations are the model's, gloves first,
-and they are documented as inherited rather than measured.
+records the model build as evidence on every row. Its limitations are the model's own, gloves
+first -- Google's model card puts gloves and crowd counting out of scope explicitly -- and the
+how-to states them next to the measurements they constrain.
 
 ## Catalog and curation storage
 
