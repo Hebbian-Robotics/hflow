@@ -154,6 +154,24 @@ class TestCliPrecedence:
         assert cli_main(["manifest"]) == 0
         assert '"pipeline_name": "kitchen"' in capsys.readouterr().out
 
+    def test_the_conventional_pipeline_is_found_from_a_subdirectory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Otherwise a command run from notebooks/ would take the data root
+        from the project and the pipeline from the shell's directory, which is
+        the one combination guaranteed to address two different things."""
+        monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
+        (tmp_path / "pipeline.py").write_text(
+            "import hflow\n\nkitchen = hflow.App('kitchen', data_root='./data')\n"
+        )
+        _write_config(tmp_path, 'data_root = "./data"\n')
+        working_directory = tmp_path / "notebooks"
+        working_directory.mkdir()
+        monkeypatch.chdir(working_directory)
+
+        assert cli_main(["manifest"]) == 0
+        assert '"pipeline_name": "kitchen"' in capsys.readouterr().out
+
     def test_no_pipeline_anywhere_says_all_three_ways_to_supply_one(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:

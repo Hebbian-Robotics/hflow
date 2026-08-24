@@ -86,16 +86,25 @@ def _default_catalog_location() -> str:
 def _configured_pipeline_spec() -> str | None:
     """The pipeline this project points at, if it points at one.
 
-    ``hflow.toml``'s ``pipeline``, else ``./pipeline.py`` when it exists.
-    ``None`` is an ordinary answer, not a failure: ``hflow serve`` runs fine
-    without a pipeline and simply turns its pipeline page off.
+    ``hflow.toml``'s ``pipeline``, else ``pipeline.py`` beside it. ``None`` is
+    an ordinary answer, not a failure: ``hflow serve`` runs fine without a
+    pipeline and simply turns its pipeline page off.
+
+    The conventional fallback looks in the PROJECT's directory, not the
+    working one, whenever an ``hflow.toml`` located the project. Otherwise
+    running a command from ``notebooks/`` would resolve the data root from the
+    project and the pipeline from wherever the shell happened to be, which is
+    the one combination guaranteed to address two different things.
     """
-    match find_project_config():
-        case ProjectConfig(pipeline_file=configured_pipeline) if configured_pipeline is not None:
-            return str(configured_pipeline)
-        case _:
-            conventional_pipeline = Path(DEFAULT_PIPELINE_FILE_NAME)
-            return str(conventional_pipeline) if conventional_pipeline.is_file() else None
+    project_config = find_project_config()
+    if isinstance(project_config, ProjectConfig):
+        if project_config.pipeline_file is not None:
+            return str(project_config.pipeline_file)
+        search_directory = project_config.config_file.parent
+    else:
+        search_directory = Path.cwd()
+    conventional_pipeline = search_directory / DEFAULT_PIPELINE_FILE_NAME
+    return str(conventional_pipeline) if conventional_pipeline.is_file() else None
 
 
 def _require_pipeline_spec(explicit_pipeline: str | None) -> str:
