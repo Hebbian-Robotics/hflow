@@ -1176,3 +1176,78 @@ def test_serve_does_not_turn_a_running_server_crash_into_bad_input(
     monkeypatch.setattr(hflow_server, "serve", crash_once_running)
     with pytest.raises(RuntimeError, match="mid-run"):
         main(["serve", "--data-root", "/tmp", "--no-browser"])
+
+
+def test_an_address_without_a_variable_discovers_the_sole_app(tmp_path: Path) -> None:
+    from hflow import import_pipeline_application
+
+    pipeline_file = tmp_path / "pipeline.py"
+    pipeline_file.write_text("import hflow\n\nkitchen = hflow.App('kitchen', data_root='./data')\n")
+    assert import_pipeline_application(str(pipeline_file)).name == "kitchen"
+
+
+def test_the_conventional_name_still_wins_over_discovery(tmp_path: Path) -> None:
+    # Two Apps is normally ambiguous, but a file that binds `app` has already
+    # said which one it means, and always resolved that way.
+    from hflow import import_pipeline_application
+
+    pipeline_file = tmp_path / "pipeline.py"
+    pipeline_file.write_text(
+        "import hflow\n\n"
+        "staging = hflow.App('staging', data_root='./data')\n"
+        "app = hflow.App('production', data_root='./data')\n"
+    )
+    assert import_pipeline_application(str(pipeline_file)).name == "production"
+
+
+def test_several_apps_refuse_and_name_the_candidates(tmp_path: Path) -> None:
+    from hflow import import_pipeline_application
+
+    pipeline_file = tmp_path / "pipeline.py"
+    pipeline_file.write_text(
+        "import hflow\n\n"
+        "kitchen = hflow.App('kitchen', data_root='./data')\n"
+        "garage = hflow.App('garage', data_root='./data')\n"
+    )
+    with pytest.raises(ValueError, match=r"'kitchen', 'garage'"):
+        import_pipeline_application(str(pipeline_file))
+    # The suggestion in the message has to be an address that works.
+    assert import_pipeline_application(f"{pipeline_file}:garage").name == "garage"
+
+
+def test_a_file_with_no_app_says_so_rather_than_naming_a_missing_variable(
+    tmp_path: Path,
+) -> None:
+    from hflow import import_pipeline_application
+
+    pipeline_file = tmp_path / "pipeline.py"
+    pipeline_file.write_text("value = 42\n")
+    with pytest.raises(ValueError, match=r"defines no hflow\.App"):
+        import_pipeline_application(str(pipeline_file))
+
+
+def test_an_app_imported_from_a_sibling_does_not_create_ambiguity(tmp_path: Path) -> None:
+    # Only names bound in the pipeline file count, so a shared helper module
+    # that builds an App cannot make every pipeline importing it ambiguous.
+    from hflow import import_pipeline_application
+
+    (tmp_path / "shared_rig.py").write_text(
+        "import hflow\n\nshared = hflow.App('shared', data_root='./data')\n"
+    )
+    pipeline_file = tmp_path / "pipeline.py"
+    pipeline_file.write_text(
+        "import hflow\nimport shared_rig  # noqa: F401\n\n"
+        "kitchen = hflow.App('kitchen', data_root='./data')\n"
+    )
+    assert import_pipeline_application(str(pipeline_file)).name == "kitchen"
+
+
+def test_naming_a_missing_variable_is_still_refused(tmp_path: Path) -> None:
+    # Discovery is for addresses that did not say; one that did must not
+    # quietly resolve to something else.
+    from hflow import import_pipeline_application
+
+    pipeline_file = tmp_path / "pipeline.py"
+    pipeline_file.write_text("import hflow\n\nkitchen = hflow.App('kitchen', data_root='./data')\n")
+    with pytest.raises(ValueError, match=r"no hflow\.App named 'garage'"):
+        import_pipeline_application(f"{pipeline_file}:garage")

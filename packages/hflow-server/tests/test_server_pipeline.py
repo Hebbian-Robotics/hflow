@@ -120,16 +120,16 @@ def test_pipeline_import_failure_is_remembered_not_fatal(
     assert "boom at import" in response.json()["detail"]
 
 
-def test_pipeline_file_without_the_app_variable_is_a_409(
-    tmp_path: Path, unbuilt_assets_dir: Path
-) -> None:
+def test_pipeline_file_defining_no_app_is_a_409(tmp_path: Path, unbuilt_assets_dir: Path) -> None:
     pipeline_file = _written_pipeline_file(tmp_path, "x = 1\n")
     data_root = tmp_path / "root"
     data_root.mkdir()
     client = _client_over(data_root, unbuilt_assets_dir, pipeline=str(pipeline_file))
     response = client.get("/api/v1/pipeline")
     assert response.status_code == 409
-    assert "no hflow.App named 'app'" in response.json()["detail"]
+    # The address named no variable, so the reason is that the file binds no
+    # App at all -- not that some particular spelling was missing.
+    assert "defines no hflow.App" in response.json()["detail"]
 
 
 def test_pipeline_unconfigured_is_a_409_naming_the_flag(api: TestClient) -> None:

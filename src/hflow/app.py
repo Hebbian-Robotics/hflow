@@ -27,7 +27,7 @@ import traceback
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, ModuleType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -1534,12 +1534,77 @@ class App:
         return report
 
 
-def parse_pipeline_spec(pipeline_spec: str) -> tuple[Path, str]:
-    """Split ``path/to/pipeline.py[:app_variable]`` (default variable: ``app``)."""
+def parse_pipeline_address(pipeline_spec: str) -> tuple[Path, str | None]:
+    """Split ``path/to/pipeline.py[:app_variable]``, keeping "unnamed" distinct.
+
+    ``None`` means the address named no variable, which is a different fact
+    from naming ``app``: it is what lets the loader discover the App instead
+    of demanding one particular spelling.
+    """
     path_part, separator, variable_part = pipeline_spec.rpartition(":")
     if separator and path_part and variable_part.isidentifier():
         return Path(path_part), variable_part
-    return Path(pipeline_spec), DEFAULT_APP_VARIABLE
+    return Path(pipeline_spec), None
+
+
+def parse_pipeline_spec(pipeline_spec: str) -> tuple[Path, str]:
+    """Split ``path/to/pipeline.py[:app_variable]`` (default variable: ``app``).
+
+    For the callers that must commit to a NAME rather than resolve an App:
+    the bundle renderers bake the variable into generated DAG source without
+    ever importing the pipeline, so they cannot discover it.
+    """
+    pipeline_file, app_variable = parse_pipeline_address(pipeline_spec)
+    return pipeline_file, app_variable if app_variable is not None else DEFAULT_APP_VARIABLE
+
+
+@dataclass(frozen=True)
+class SoleApplicationFound:
+    """Exactly one :class:`App` is defined in the pipeline module."""
+
+    variable_name: str
+    application: "App"
+
+
+@dataclass(frozen=True)
+class NoApplicationDefined:
+    """The module imported cleanly but binds no :class:`App` at all."""
+
+
+@dataclass(frozen=True)
+class SeveralApplicationsDefined:
+    """More than one :class:`App`, so the caller has to say which."""
+
+    variable_names: tuple[str, ...]
+
+
+ApplicationDiscovery = SoleApplicationFound | NoApplicationDefined | SeveralApplicationsDefined
+
+
+def discover_pipeline_application(pipeline_module: ModuleType) -> ApplicationDiscovery:
+    """Which :class:`App` an imported pipeline module defines, if one is obvious.
+
+    Scanning the module's own globals is deliberately the whole search. It
+    cannot reach into ``sys.modules``, so a shared helper that happens to
+    construct an App does not make every pipeline that ``import``s it
+    ambiguous -- only a name bound in the pipeline file itself counts, which
+    is the same set a reader of that file would name.
+
+    Definition order is preserved so the ambiguous case can suggest a real
+    address rather than an arbitrary one.
+    """
+    defined_applications = tuple(
+        (name, value) for name, value in vars(pipeline_module).items() if isinstance(value, App)
+    )
+    match defined_applications:
+        case ():
+            return NoApplicationDefined()
+        case ((sole_variable, sole_application),):
+            return SoleApplicationFound(variable_name=sole_variable, application=sole_application)
+        case _:
+            return SeveralApplicationsDefined(
+                variable_names=tuple(name for name, _ in defined_applications)
+            )
 
 
 def _add_pipeline_directory_to_import_path(pipeline_file: Path) -> None:
@@ -1563,9 +1628,7 @@ def _add_pipeline_directory_to_import_path(pipeline_file: Path) -> None:
         sys.path.insert(0, pipeline_directory)
 
 
-def load_pipeline_application(
-    pipeline_file: Path | str, app_variable: str = DEFAULT_APP_VARIABLE
-) -> "App":
+def load_pipeline_application(pipeline_file: Path | str, app_variable: str | None = None) -> "App":
     """Import a pipeline file by path and return its :class:`App`, loudly.
 
     The one owner of the "address a pipeline by file" contract, for every
@@ -1573,6 +1636,13 @@ def load_pipeline_application(
     ``deploy``/``stale``, the workspace UI's pipeline page, and the generated
     DAG tasks (through :func:`hflow.stage_execution.load_pipeline_application`,
     a thin adapter that only translates the error type its boundary wants).
+
+    ``app_variable`` names the module global to take. ``None`` means the
+    caller did not say, and the App is resolved instead: the conventional
+    ``app`` if the file binds one, else the only :class:`App` the file
+    defines. Naming a variable that is absent stays an error either way --
+    an address that asks for something specific should never quietly get
+    something else.
 
     The pipeline file is arbitrary user code, so importing EXECUTES it: any
     exception it raises is a boundary failure reported as a ``ValueError``
@@ -1597,17 +1667,38 @@ def load_pipeline_application(
         # code instead of a diagnosable message. KeyboardInterrupt stays
         # uncaught on purpose: that one belongs to whoever pressed it.
         raise ValueError(f"importing {pipeline_path} failed: {error}") from error
-    application = getattr(module, app_variable, None)
-    if not isinstance(application, App):
-        raise ValueError(f"{pipeline_path} has no hflow.App named {app_variable!r}")
-    return application
+    if app_variable is not None:
+        named_application = getattr(module, app_variable, None)
+        if not isinstance(named_application, App):
+            raise ValueError(f"{pipeline_path} has no hflow.App named {app_variable!r}")
+        return named_application
+    # The conventional name wins before discovery, so a file that binds `app`
+    # alongside a second App keeps resolving exactly as it always has.
+    conventional_application = getattr(module, DEFAULT_APP_VARIABLE, None)
+    if isinstance(conventional_application, App):
+        return conventional_application
+    match discover_pipeline_application(module):
+        case SoleApplicationFound(application=sole_application):
+            return sole_application
+        case NoApplicationDefined():
+            raise ValueError(
+                f"{pipeline_path} defines no hflow.App -- a pipeline file assigns one at "
+                f'module level, e.g. `{DEFAULT_APP_VARIABLE} = hflow.App("my-pipeline")`'
+            )
+        case SeveralApplicationsDefined(variable_names=variable_names):
+            named = ", ".join(repr(name) for name in variable_names)
+            raise ValueError(
+                f"{pipeline_path} defines {len(variable_names)} hflow.App objects ({named}); "
+                f"address the one you mean as {pipeline_path}:{variable_names[0]}"
+            )
 
 
 def import_pipeline_application(pipeline_spec: str) -> "App":
     """Import ``path/to/pipeline.py[:app]`` and return its :class:`App`, loudly.
 
     The spec-string front door to :func:`load_pipeline_application`, for the
-    callers that take a pipeline address as one user-supplied argument.
+    callers that take a pipeline address as one user-supplied argument. An
+    address without ``:variable`` leaves the App to be discovered.
     """
-    pipeline_file, app_variable = parse_pipeline_spec(pipeline_spec)
+    pipeline_file, app_variable = parse_pipeline_address(pipeline_spec)
     return load_pipeline_application(pipeline_file, app_variable)
