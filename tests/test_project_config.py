@@ -128,6 +128,60 @@ class TestCliPrecedence:
         assert cli_main(["curate", "SELECT 1"]) == 2
         assert str(tmp_path / "from-environment" / "catalog") in capsys.readouterr().err
 
+    def test_the_file_supplies_the_pipeline(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "ingest.py").write_text(
+            "import hflow\n\nkitchen = hflow.App('kitchen', data_root='./data')\n"
+        )
+        _write_config(tmp_path, 'pipeline = "src/ingest.py"\n')
+        monkeypatch.chdir(tmp_path)
+
+        assert cli_main(["manifest"]) == 0
+        assert '"pipeline_name": "kitchen"' in capsys.readouterr().out
+
+    def test_a_conventional_pipeline_py_needs_no_configuration_at_all(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
+        (tmp_path / "pipeline.py").write_text(
+            "import hflow\n\nkitchen = hflow.App('kitchen', data_root='./data')\n"
+        )
+        monkeypatch.chdir(tmp_path)
+
+        assert cli_main(["manifest"]) == 0
+        assert '"pipeline_name": "kitchen"' in capsys.readouterr().out
+
+    def test_no_pipeline_anywhere_says_all_three_ways_to_supply_one(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
+        monkeypatch.chdir(tmp_path)
+
+        assert cli_main(["manifest"]) == 2
+        errors = capsys.readouterr().err
+        assert "--pipeline" in errors
+        assert PROJECT_CONFIG_FILE_NAME in errors
+        assert "pipeline.py" in errors
+
+    def test_an_explicit_flag_outranks_the_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
+        (tmp_path / "configured.py").write_text(
+            "import hflow\n\nconfigured = hflow.App('configured', data_root='./data')\n"
+        )
+        (tmp_path / "asked_for.py").write_text(
+            "import hflow\n\nasked_for = hflow.App('asked-for', data_root='./data')\n"
+        )
+        _write_config(tmp_path, 'pipeline = "configured.py"\n')
+        monkeypatch.chdir(tmp_path)
+
+        assert cli_main(["manifest", "--pipeline", "asked_for.py"]) == 0
+        assert '"pipeline_name": "asked-for"' in capsys.readouterr().out
+
     def test_an_unreadable_file_exits_two_rather_than_crashing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:

@@ -31,7 +31,12 @@ from hflow import __version__
 from hflow.app import DATA_ROOT_ENVIRONMENT_VARIABLE, DEFAULT_DATA_ROOT, parse_pipeline_spec
 from hflow.curation import curate, stale_episodes
 from hflow.doctor import diagnose
-from hflow.project import ProjectConfig, find_project_config
+from hflow.project import (
+    DEFAULT_PIPELINE_FILE_NAME,
+    PROJECT_CONFIG_FILE_NAME,
+    ProjectConfig,
+    find_project_config,
+)
 from hflow.runtime._deploy import DEFAULT_DEPLOY_VENV_PYTHON
 from hflow.steps import RUN_PROFILES
 from hflow.storage import is_bucket_url
@@ -77,6 +82,35 @@ def _default_catalog_location() -> str:
     return f"{_environment_data_root().rstrip('/')}/{CATALOG_DIRECTORY_NAME}"
 
 
+def _configured_pipeline_spec() -> str | None:
+    """The pipeline this project points at, if it points at one.
+
+    ``hflow.toml``'s ``pipeline``, else ``./pipeline.py`` when it exists.
+    ``None`` is an ordinary answer, not a failure: ``hflow serve`` runs fine
+    without a pipeline and simply turns its pipeline page off.
+    """
+    match find_project_config():
+        case ProjectConfig(pipeline_file=configured_pipeline) if configured_pipeline is not None:
+            return str(configured_pipeline)
+        case _:
+            conventional_pipeline = Path(DEFAULT_PIPELINE_FILE_NAME)
+            return str(conventional_pipeline) if conventional_pipeline.is_file() else None
+
+
+def _require_pipeline_spec(explicit_pipeline: str | None) -> str:
+    """The pipeline address for a command that cannot run without one."""
+    if explicit_pipeline is not None:
+        return explicit_pipeline
+    configured_pipeline = _configured_pipeline_spec()
+    if configured_pipeline is None:
+        raise ValueError(
+            "no pipeline found: pass --pipeline path/to/pipeline.py, add "
+            f'`pipeline = "..."` to {PROJECT_CONFIG_FILE_NAME}, or run from a '
+            f"directory holding {DEFAULT_PIPELINE_FILE_NAME}"
+        )
+    return configured_pipeline
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hflow",
@@ -118,7 +152,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=_default_catalog_location(),
         help=(
             "catalog directory or object-store prefix "
-            f"(default: $HFLOW_DATA_ROOT/catalog, else {DEFAULT_DATA_ROOT}/catalog)"
+            f"(default: $HFLOW_DATA_ROOT, else {PROJECT_CONFIG_FILE_NAME}'s data_root, "
+            f"else {DEFAULT_DATA_ROOT} -- plus /catalog)"
         ),
     )
     curate_output_group = curate_parser.add_mutually_exclusive_group()
@@ -128,8 +163,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=f"{_environment_data_root().rstrip('/')}/manifest.parquet",
         help=(
             "manifest path or object-store URL "
-            f"(default: $HFLOW_DATA_ROOT/manifest.parquet, else "
-            f"{DEFAULT_DATA_ROOT}/manifest.parquet)"
+            f"(default: $HFLOW_DATA_ROOT, else {PROJECT_CONFIG_FILE_NAME}'s data_root, "
+            f"else {DEFAULT_DATA_ROOT} -- plus /manifest.parquet)"
         ),
     )
     curate_output_group.add_argument(
@@ -156,7 +191,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=_default_catalog_location(),
         help=(
             "catalog directory or object-store prefix "
-            f"(default: $HFLOW_DATA_ROOT/catalog, else {DEFAULT_DATA_ROOT}/catalog)"
+            f"(default: $HFLOW_DATA_ROOT, else {PROJECT_CONFIG_FILE_NAME}'s data_root, "
+            f"else {DEFAULT_DATA_ROOT} -- plus /catalog)"
         ),
     )
     snapshot_export_parser.add_argument(
@@ -204,15 +240,19 @@ def _build_parser() -> argparse.ArgumentParser:
         default=_default_catalog_location(),
         help=(
             "catalog directory or object-store prefix "
-            f"(default: $HFLOW_DATA_ROOT/catalog, else {DEFAULT_DATA_ROOT}/catalog)"
+            f"(default: $HFLOW_DATA_ROOT, else {PROJECT_CONFIG_FILE_NAME}'s data_root, "
+            f"else {DEFAULT_DATA_ROOT} -- plus /catalog)"
         ),
     )
-    stale_group = stale_parser.add_mutually_exclusive_group(required=True)
+    # Not required: without either flag the pipeline is resolved from
+    # hflow.toml or ./pipeline.py, exactly as the other commands do.
+    stale_group = stale_parser.add_mutually_exclusive_group()
     stale_group.add_argument(
         "--pipeline",
         help=(
             "pipeline file to compute the current version from, optionally with the "
-            "App variable name: path/to/pipeline.py[:app]"
+            "App variable name: path/to/pipeline.py[:app]. Defaults to hflow.toml's "
+            f"`pipeline`, else ./{DEFAULT_PIPELINE_FILE_NAME}"
         ),
     )
     stale_group.add_argument(
@@ -258,8 +298,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     manifest_parser.add_argument(
         "--pipeline",
-        required=True,
-        help="pipeline file, optionally with the App variable name: path/to/pipeline.py[:app]",
+        default=None,
+        help=(
+            "pipeline file, optionally with the App variable name: "
+            "path/to/pipeline.py[:app]. Defaults to hflow.toml's `pipeline`, "
+            f"else ./{DEFAULT_PIPELINE_FILE_NAME}"
+        ),
     )
 
     up_parser = subparsers.add_parser(
@@ -273,8 +317,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     up_parser.add_argument(
         "--pipeline",
-        required=True,
-        help="pipeline file, optionally with the App variable name: path/to/pipeline.py[:app]",
+        default=None,
+        help=(
+            "pipeline file, optionally with the App variable name: "
+            "path/to/pipeline.py[:app]. Defaults to hflow.toml's `pipeline`, "
+            f"else ./{DEFAULT_PIPELINE_FILE_NAME}"
+        ),
     )
     up_parser.add_argument(
         "--data-root",
@@ -283,7 +331,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "host directory mounted at /opt/airflow/data, or a bucket URL "
             "(gs://, s3://, az://) the runtime talks to natively "
-            f"(default: $HFLOW_DATA_ROOT, else {DEFAULT_DATA_ROOT})"
+            f"(default: $HFLOW_DATA_ROOT, else {PROJECT_CONFIG_FILE_NAME}'s "
+            f"data_root, else {DEFAULT_DATA_ROOT})"
         ),
     )
     up_parser.add_argument(
@@ -330,8 +379,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     deploy_parser.add_argument(
         "--pipeline",
-        required=True,
-        help="pipeline file, optionally with the App variable name: path/to/pipeline.py[:app]",
+        default=None,
+        help=(
+            "pipeline file, optionally with the App variable name: "
+            "path/to/pipeline.py[:app]. Defaults to hflow.toml's `pipeline`, "
+            f"else ./{DEFAULT_PIPELINE_FILE_NAME}"
+        ),
     )
     deploy_parser.add_argument(
         "--data-root-uri",
@@ -544,7 +597,7 @@ def _import_pipeline_app(pipeline_spec: str) -> "App":
 
 def _command_manifest(arguments: argparse.Namespace) -> int:
     try:
-        app = _import_pipeline_app(arguments.pipeline)
+        app = _import_pipeline_app(_require_pipeline_spec(arguments.pipeline))
     except ValueError as error:
         print(f"manifest: {error}", file=sys.stderr)
         return 2
@@ -554,11 +607,11 @@ def _command_manifest(arguments: argparse.Namespace) -> int:
 
 def _command_stale(arguments: argparse.Namespace) -> int:
     schema_version: str | None = None
-    if arguments.pipeline is not None:
+    if arguments.pipeline_version is None:
         from hflow.format import EPISODE_FORMAT_VERSION
 
         try:
-            app = _import_pipeline_app(arguments.pipeline)
+            app = _import_pipeline_app(_require_pipeline_spec(arguments.pipeline))
         except ValueError as error:
             print(f"stale: {error}", file=sys.stderr)
             return 2
@@ -597,7 +650,13 @@ def _command_up(arguments: argparse.Namespace) -> int:
         started_summary,
     )
 
-    pipeline_file, app_variable = parse_pipeline_spec(arguments.pipeline)
+    try:
+        pipeline_file, app_variable = parse_pipeline_spec(
+            _require_pipeline_spec(arguments.pipeline)
+        )
+    except ValueError as error:
+        print(f"up: {error}", file=sys.stderr)
+        return 2
     hflow_source = (
         arguments.hflow_source if arguments.hflow_source is not None else infer_hflow_source()
     )
@@ -680,7 +739,13 @@ def _command_up(arguments: argparse.Namespace) -> int:
 def _command_deploy(arguments: argparse.Namespace) -> int:
     from hflow.runtime._deploy import DeployConfig, render_deploy_bundle
 
-    pipeline_file, app_variable = parse_pipeline_spec(arguments.pipeline)
+    try:
+        pipeline_file, app_variable = parse_pipeline_spec(
+            _require_pipeline_spec(arguments.pipeline)
+        )
+    except ValueError as error:
+        print(f"deploy: {error}", file=sys.stderr)
+        return 2
     try:
         config = DeployConfig(
             pipeline_file=pipeline_file,
@@ -905,7 +970,10 @@ def _command_serve(arguments: argparse.Namespace) -> int:
             port=arguments.port,
             open_browser=not arguments.no_browser,
             read_only=arguments.read_only,
-            pipeline=arguments.pipeline,
+            # A project that names its pipeline gets the pipeline page without
+            # asking; a directory that holds none still serves the catalog,
+            # so this stays the one place a missing pipeline is not an error.
+            pipeline=arguments.pipeline or _configured_pipeline_spec(),
         )
     except ValueError as error:
         # Its own block, before anything is built: nothing is serving, so this

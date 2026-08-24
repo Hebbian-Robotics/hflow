@@ -37,6 +37,12 @@ from hflow.storage import StorageRoot, is_bucket_url, parse_storage_root
 
 PROJECT_CONFIG_FILE_NAME = "hflow.toml"
 
+# The pipeline file a project is assumed to hold when neither a flag nor
+# ``hflow.toml`` names one. A convention, not a requirement: a project whose
+# pipeline lives elsewhere says so in the file, once, instead of on every
+# command line.
+DEFAULT_PIPELINE_FILE_NAME = "pipeline.py"
+
 # Versions the FILE's shape, not the episode schema and not the catalog
 # layout -- hence ``config_version`` rather than the ``schema_version`` that
 # already means "episode format" in provenance, in the catalog, and in
