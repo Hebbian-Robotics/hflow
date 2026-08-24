@@ -31,6 +31,7 @@ from hflow import __version__
 from hflow.app import DATA_ROOT_ENVIRONMENT_VARIABLE, DEFAULT_DATA_ROOT, parse_pipeline_spec
 from hflow.curation import curate, stale_episodes
 from hflow.doctor import diagnose
+from hflow.project import ProjectConfig, find_project_config
 from hflow.runtime._deploy import DEFAULT_DEPLOY_VENV_PYTHON
 from hflow.steps import RUN_PROFILES
 from hflow.storage import is_bucket_url
@@ -50,13 +51,25 @@ DEFAULT_SERVER_PORT = 4356
 
 
 def _environment_data_root() -> str:
-    """The data root the App itself would resolve: ``HFLOW_DATA_ROOT`` wins.
+    """The data root these commands default to when no flag names one.
 
-    CLI defaults derive from the same variable so a shell configured for one
-    workspace addresses that workspace's catalog and runtime consistently --
-    never a hardcoded ``./data`` beside it.
+    ``HFLOW_DATA_ROOT`` wins, then the nearest ancestor ``hflow.toml``, then
+    ``./data``. The environment outranks the file on purpose: the file is
+    committed beside the pipeline, and a shell or a control plane pointing at
+    a different workspace must not need the repository edited.
+
+    CLI defaults derive from the same resolution the App itself uses, so a
+    shell configured for one workspace addresses that workspace's catalog and
+    runtime consistently -- never a hardcoded ``./data`` beside it.
     """
-    return os.environ.get(DATA_ROOT_ENVIRONMENT_VARIABLE) or DEFAULT_DATA_ROOT
+    environment_data_root = os.environ.get(DATA_ROOT_ENVIRONMENT_VARIABLE)
+    if environment_data_root:
+        return environment_data_root
+    match find_project_config():
+        case ProjectConfig(storage_root=configured_root) if configured_root is not None:
+            return str(configured_root)
+        case _:
+            return DEFAULT_DATA_ROOT
 
 
 def _default_catalog_location() -> str:
@@ -921,7 +934,17 @@ def _command_serve(arguments: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    arguments = _build_parser().parse_args(argv)
+    try:
+        parser = _build_parser()
+    except ValueError as error:
+        # Building the parser resolves defaults, which reads hflow.toml. A
+        # file that exists and cannot be understood is refused rather than
+        # skipped -- falling back to ./data because of a typo would write a
+        # corpus into a directory nobody chose -- but it is the user's own
+        # just-edited file, so it earns a message and exit 2, not a traceback.
+        print(f"hflow: {error}", file=sys.stderr)
+        return 2
+    arguments = parser.parse_args(argv)
 
     logging.basicConfig(
         level=logging.INFO if arguments.verbose else logging.WARNING,
