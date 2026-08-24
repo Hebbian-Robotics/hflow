@@ -218,7 +218,7 @@ class TestRegistrationWithoutTheModel:
         ``camera_frame_stats`` shipped with when it read the ffmpeg version at
         registration.
         """
-        app = hflow.App("hands", data_root=tmp_path)
+        app = hflow.App("hands", data_root=tmp_path, default_checks=())
         app.check()(mediapipe_hand_detection)
         (registered,) = app.checks
         assert registered.name == "mediapipe_hand_detection"

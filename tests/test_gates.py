@@ -38,7 +38,7 @@ def test_a_gate_fires_only_when_the_pipeline_opts_in(tmp_path: Path) -> None:
     """
     episode_path = _state_only_episode(tmp_path)
 
-    ungated = hflow.App("ungated", data_root=tmp_path / "ungated")
+    ungated = hflow.App("ungated", data_root=tmp_path / "ungated", default_checks=())
 
     @ungated.check(critical=True)
     def blackout(ep: hflow.Episode) -> hflow.CheckResult:
@@ -50,7 +50,7 @@ def test_a_gate_fires_only_when_the_pipeline_opts_in(tmp_path: Path) -> None:
     assert ungated_report.checks[0].status is hflow.CheckStatus.MEASURED
     assert not ungated_report.quarantined
 
-    gated = hflow.App("gated", data_root=tmp_path / "gated")
+    gated = hflow.App("gated", data_root=tmp_path / "gated", default_checks=())
 
     @gated.check(critical=True, gate=RECOMMENDED_CAMERA_INTEGRITY)
     def blackout_gated(ep: hflow.Episode) -> hflow.CheckResult:
@@ -62,7 +62,7 @@ def test_a_gate_fires_only_when_the_pipeline_opts_in(tmp_path: Path) -> None:
 
 
 def test_a_shipped_gate_accepts_healthy_evidence(tmp_path: Path) -> None:
-    app = hflow.App("healthy", data_root=tmp_path / "data")
+    app = hflow.App("healthy", data_root=tmp_path / "data", default_checks=())
 
     @app.check(critical=True, gate=RECOMMENDED_CAMERA_INTEGRITY)
     def camera(ep: hflow.Episode) -> hflow.CheckResult:
@@ -113,7 +113,7 @@ def test_a_clause_matching_no_key_abstains_instead_of_passing(tmp_path: Path) ->
     )
     assert decision == hflow.GateAbstained(unevaluated_patterns=("*/absent_key",))
 
-    app = hflow.App("abstain", data_root=tmp_path / "data")
+    app = hflow.App("abstain", data_root=tmp_path / "data", default_checks=())
 
     @app.check(critical=True, gate=_gate(hflow.Threshold("*/nope", hflow.Comparison.AT_MOST, 1.0)))
     def measures(ep: hflow.Episode) -> hflow.CheckResult:
@@ -171,7 +171,7 @@ def test_a_gate_can_only_tighten_a_checks_own_verdict(tmp_path: Path) -> None:
     """A gate is an additional accept condition, so it never resurrects an
     episode the check itself rejected.
     """
-    app = hflow.App("compose", data_root=tmp_path / "data")
+    app = hflow.App("compose", data_root=tmp_path / "data", default_checks=())
     permissive = _gate(hflow.Threshold("v", hflow.Comparison.AT_MOST, 100.0))
 
     @app.check(critical=True, gate=permissive)
@@ -184,7 +184,7 @@ def test_a_gate_can_only_tighten_a_checks_own_verdict(tmp_path: Path) -> None:
 
 
 def test_a_gate_on_a_noncritical_check_tags_and_the_run_proceeds(tmp_path: Path) -> None:
-    app = hflow.App("flags-only", data_root=tmp_path / "data")
+    app = hflow.App("flags-only", data_root=tmp_path / "data", default_checks=())
 
     @app.check(gate=_gate(hflow.Threshold("v", hflow.Comparison.AT_MOST, 1.0)))
     def flags(ep: hflow.Episode) -> hflow.CheckResult:
@@ -248,7 +248,7 @@ def test_a_nan_threshold_is_refused_at_construction() -> None:
 
 
 def test_a_non_gate_argument_is_refused_at_registration() -> None:
-    app = hflow.App("bad-gate", data_root=Path("/tmp"))
+    app = hflow.App("bad-gate", data_root=Path("/tmp"), default_checks=())
 
     with pytest.raises(ValueError, match=re.escape("expected an hflow.Gate")):
 

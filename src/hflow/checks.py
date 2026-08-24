@@ -30,6 +30,7 @@ from hflow.ffmpeg import frame_stats
 # itself stays lazy inside hflow.motion, so this costs the core install nothing.
 from hflow.motion import DEFAULT_HORIZONTAL_FIELD_OF_VIEW_DEGREES, measure_camera_motion
 from hflow.steps import (
+    CheckFunction,
     CheckResult,
     Comparison,
     Gate,
@@ -1309,3 +1310,36 @@ def keyframe_interval(episode: Episode, *, cameras: Sequence[str] | None = None)
                 np.median(intervals_ns) / 1e9
             )
     return CheckResult(measurements=measurements)
+
+
+# The checks an App runs unless its pipeline says otherwise. Every episode
+# gets a baseline of evidence without anyone opting in, because the answer to
+# "was this recording sound?" should not depend on whether the pipeline author
+# remembered to ask.
+#
+# Membership has three conditions, and each one excludes something:
+#
+# - **Registrable with no configuration.** `required_topics`, `action_rate`,
+#   and `camera_fps_conformance` need a topic list or a nominal rate that is
+#   the pipeline author's to supply, so they cannot be defaults.
+# - **Meaningful on any corpus.** The joint and trajectory checks assume a
+#   state stream; on human egocentric video there is none, and a default that
+#   records nothing on a whole class of corpora is noise. A camera-less or
+#   camera-only recording simply gets fewer keys from the checks below.
+# - **Cheap enough to never think about.** `camera_frame_stats` costs one
+#   ffmpeg decode per camera and earns it (blackout, freeze, exposure, and
+#   the stored-versus-claimed frame count all come from that one pass).
+#   `camera_signal_quality` would cost a SECOND decode for a deeper reading of
+#   the same footage, so it stays opt-in, as does `camera_stability`, which
+#   needs the `motion` extra the core install does not carry.
+#
+# Pass `hflow.App(default_checks=...)` to change the set; registering one of
+# these yourself replaces the automatic copy rather than colliding with it.
+DEFAULT_CHECKS: tuple[CheckFunction, ...] = (
+    episode_duration,
+    timestamp_regularity,
+    camera_frame_stats,
+    keyframe_interval,
+    content_digest,
+    media_digest,
+)

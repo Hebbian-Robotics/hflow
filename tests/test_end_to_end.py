@@ -78,12 +78,18 @@ def test_whole_pipeline_runs_without_quarantine(
     report, _app = report_and_app
     assert not report.quarantined
     assert report.canonical_path.is_file()
-    assert [run.status for run in report.checks] == [
-        "measured",
-        "measured",
-        "measured",
-        "passed",
-    ]
+    status_by_check = {run.check.name: run.status for run in report.checks}
+    assert status_by_check["joint_smoothness"] == "measured"
+    assert status_by_check["timestamps"] == "measured"
+    assert status_by_check["joint_jumps"] == "measured"
+    assert status_by_check["camera_blackout"] == "passed"
+    # The baseline nobody registered, running beside the pipeline's own steps.
+    assert status_by_check["episode_duration"] == "measured"
+    assert status_by_check["media_digest"] == "measured"
+    # ...except where the pipeline already measures the same thing: `timestamps`
+    # wraps timestamp_regularity, so the automatic copy yields rather than
+    # colliding with it.
+    assert status_by_check["timestamp_regularity"] == "skipped"
     summary_text = report.summary()
     assert "pipeline_version=" in summary_text
     assert "camera_blackout" in summary_text

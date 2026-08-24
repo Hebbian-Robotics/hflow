@@ -218,7 +218,7 @@ def test_sources_with_the_same_basename_get_distinct_artifact_paths(tmp_path: Pa
         tmp_path / "robot-b" / "run.mcap",
         SyntheticEpisodeSpec(duration_s=1.0, cameras=(), task="task-b"),
     )
-    app = hflow.App("artifact-identity", data_root=tmp_path / "data")
+    app = hflow.App("artifact-identity", data_root=tmp_path / "data", default_checks=())
 
     first_report = app.process(first_source, record=False, stages={hflow.Stage.SYNC})
     first_canonical_bytes = first_report.canonical_path.read_bytes()
@@ -233,7 +233,7 @@ def test_failed_sync_clears_completion_proof_and_blocks_later_stages(tmp_path: P
         tmp_path / "source.mcap",
         SyntheticEpisodeSpec(duration_s=1.0, cameras=()),
     )
-    app = hflow.App("sync-proof", data_root=tmp_path / "data")
+    app = hflow.App("sync-proof", data_root=tmp_path / "data", default_checks=())
     successful_report = app.process(source, record=False, stages={hflow.Stage.SYNC})
     previous_canonical_bytes = successful_report.canonical_path.read_bytes()
 
@@ -252,7 +252,7 @@ def test_check_returning_wrong_type_is_an_error_not_a_crash(tmp_path: Path) -> N
     source = synthesize_episode(
         tmp_path / "episode.mcap", SyntheticEpisodeSpec(duration_s=2.0, cameras=())
     )
-    app = hflow.App("boundary", data_root=tmp_path / "data")
+    app = hflow.App("boundary", data_root=tmp_path / "data", default_checks=())
 
     @app.check()
     def returns_a_dict(ep: hflow.Episode) -> hflow.CheckResult:
@@ -303,7 +303,7 @@ def test_two_checks_recording_one_measurement_key_are_refused(tmp_path: Path) ->
     key is a tie the catalog resolves arbitrarily -- one step's value silently
     disappears. Refuse it where it is still fixable.
     """
-    app = hflow.App("key-collision", data_root=tmp_path / "data")
+    app = hflow.App("key-collision", data_root=tmp_path / "data", default_checks=())
 
     @app.check()
     def first(ep: hflow.Episode) -> hflow.CheckResult:
@@ -326,7 +326,7 @@ def test_two_checks_recording_one_measurement_key_are_refused(tmp_path: Path) ->
 
 def test_a_check_and_an_enrichment_label_collision_is_refused(tmp_path: Path) -> None:
     """Checks and enrichment labels share one measurement-key namespace."""
-    app = hflow.App("key-collision-enrich", data_root=tmp_path / "data")
+    app = hflow.App("key-collision-enrich", data_root=tmp_path / "data", default_checks=())
 
     @app.check()
     def measures(ep: hflow.Episode) -> hflow.CheckResult:
@@ -347,7 +347,7 @@ def test_a_refused_collision_records_nothing(tmp_path: Path) -> None:
     what every DAG batch uses, so testing the non-recording path would prove
     the ordering only by implication.
     """
-    app = hflow.App("key-collision-record", data_root=tmp_path / "data")
+    app = hflow.App("key-collision-record", data_root=tmp_path / "data", default_checks=())
 
     @app.check()
     def left(ep: hflow.Episode) -> hflow.CheckResult:
@@ -368,7 +368,7 @@ def test_two_steps_may_share_a_tag(tmp_path: Path) -> None:
     """Tags carry check_name and have no per-key latest ranking, so sharing one
     loses nothing -- the guard must not overreach into them.
     """
-    app = hflow.App("shared-tag", data_root=tmp_path / "data")
+    app = hflow.App("shared-tag", data_root=tmp_path / "data", default_checks=())
 
     @app.check()
     def first(ep: hflow.Episode) -> hflow.CheckResult:
@@ -383,7 +383,7 @@ def test_two_steps_may_share_a_tag(tmp_path: Path) -> None:
 
 
 def test_check_with_required_extra_parameter_fails_at_registration() -> None:
-    app = hflow.App("signature-guard", data_root=Path("/tmp"))
+    app = hflow.App("signature-guard", data_root=Path("/tmp"), default_checks=())
 
     def requires_topics(ep: hflow.Episode, *, topics: list[str]) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"n": len(topics)})
@@ -395,7 +395,7 @@ def test_check_with_required_extra_parameter_fails_at_registration() -> None:
 
 
 def test_check_with_optional_extra_parameter_registers() -> None:
-    app = hflow.App("signature-optional", data_root=Path("/tmp"))
+    app = hflow.App("signature-optional", data_root=Path("/tmp"), default_checks=())
 
     @app.check()
     def optional_topic(
@@ -407,7 +407,7 @@ def test_check_with_optional_extra_parameter_registers() -> None:
 
 
 def test_check_without_episode_parameter_fails_at_registration() -> None:
-    app = hflow.App("signature-zeroarg", data_root=Path("/tmp"))
+    app = hflow.App("signature-zeroarg", data_root=Path("/tmp"), default_checks=())
 
     def no_episode() -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"n": 1})
@@ -419,7 +419,7 @@ def test_check_without_episode_parameter_fails_at_registration() -> None:
 
 
 def test_check_with_only_kwargs_fails_at_registration() -> None:
-    app = hflow.App("signature-kwargs-only", data_root=Path("/tmp"))
+    app = hflow.App("signature-kwargs-only", data_root=Path("/tmp"), default_checks=())
 
     def kwargs_only(**kwargs: object) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"n": len(kwargs)})
@@ -431,7 +431,7 @@ def test_check_with_only_kwargs_fails_at_registration() -> None:
 
 
 def test_check_with_varargs_registers() -> None:
-    app = hflow.App("signature-varargs", data_root=Path("/tmp"))
+    app = hflow.App("signature-varargs", data_root=Path("/tmp"), default_checks=())
 
     @app.check()
     def varargs_check(*args: object) -> hflow.CheckResult:
@@ -449,7 +449,7 @@ def test_check_whose_episode_parameter_has_a_default_registers_and_runs() -> Non
     before claiming the episode's slot, which rejected this at registration
     even though it had always worked.
     """
-    app = hflow.App("signature-defaulted-episode", data_root=Path("/tmp"))
+    app = hflow.App("signature-defaulted-episode", data_root=Path("/tmp"), default_checks=())
 
     @app.check()
     def defaulted_episode(episode: hflow.Episode | None = None) -> hflow.CheckResult:
@@ -471,7 +471,7 @@ def test_enrichments_and_derives_reject_unsatisfiable_signatures(step_kind: str)
     structurally identical registration paths accepting a signature the
     runtime could never call.
     """
-    app = hflow.App(f"guard-{step_kind.split()[0]}", data_root=Path("/tmp"))
+    app = hflow.App(f"guard-{step_kind.split()[0]}", data_root=Path("/tmp"), default_checks=())
 
     def needs_topics(episode: hflow.Episode, *, topics: list[str]) -> object:
         return None
@@ -499,7 +499,7 @@ def test_wrapper_example_binds_every_missing_parameter() -> None:
     Binding only the first left a snippet that still raised TypeError on the
     second parameter.
     """
-    app = hflow.App("wrapper-example", data_root=Path("/tmp"))
+    app = hflow.App("wrapper-example", data_root=Path("/tmp"), default_checks=())
 
     def two_missing(
         episode: hflow.Episode, *, topics: list[str], threshold: float
@@ -557,7 +557,7 @@ def test_step_version_still_refuses_a_partial_bound_to_an_opaque_value() -> None
 
 
 def test_check_registration_accepts_functools_partial() -> None:
-    app = hflow.App("partial-registration", data_root=Path("/tmp"))
+    app = hflow.App("partial-registration", data_root=Path("/tmp"), default_checks=())
     bound = functools.partial(hflow.checks.action_rate, topics=["/joint_states"])
 
     app.check(name="bound")(bound)
@@ -919,13 +919,13 @@ def test_non_sync_stages_never_fetch_the_raw_source(tmp_path: Path) -> None:
     )
     data_root.publish(episode_file, "landing/e.mcap")
 
-    app = hflow.App("fetchless", data_root=data_root)
+    app = hflow.App("fetchless", data_root=data_root, default_checks=())
     app.process("landing/e.mcap", record=True)
 
     data_root.delete("landing/e.mcap")
     # A different worker: same bucket, fresh mirror (no cached source).
     fresh_root = BucketStorageRoot(f"file://{remote_dir}", mirror=tmp_path / "mirror-b")
-    relabel_app = hflow.App("fetchless", data_root=fresh_root)
+    relabel_app = hflow.App("fetchless", data_root=fresh_root, default_checks=())
     report = relabel_app.process("landing/e.mcap", record=True, stages={hflow.Stage.LABELS})
     assert report.stamps.pipeline_version
 
@@ -936,7 +936,7 @@ def test_missing_artifact_is_the_steps_error_not_the_runs(tmp_path: Path) -> Non
     episode_file = synthesize_episode(
         tmp_path / "e.mcap", SyntheticEpisodeSpec(cameras=(), black_segment=None, duration_s=2.0)
     )
-    app = hflow.App("artifact-crash", data_root=tmp_path / "data")
+    app = hflow.App("artifact-crash", data_root=tmp_path / "data", default_checks=())
 
     @app.enrich()
     def declares_a_ghost(ep: hflow.Episode) -> hflow.EnrichmentResult:
@@ -964,11 +964,11 @@ def test_source_identity_is_stable_across_vantage_points(
         data_root / "landing" / "e.mcap",
         SyntheticEpisodeSpec(cameras=(), black_segment=None, duration_s=2.0),
     )
-    app = hflow.App("vantage", data_root=data_root)
+    app = hflow.App("vantage", data_root=data_root, default_checks=())
     full_report = app.process(episode_file.resolve(), record=True)
 
     monkeypatch.chdir(tmp_path)
-    relative_app = hflow.App("vantage", data_root=Path("data"))
+    relative_app = hflow.App("vantage", data_root=Path("data"), default_checks=())
     relabel_report = relative_app.process(
         "data/landing/e.mcap", record=True, stages={hflow.Stage.LABELS}
     )

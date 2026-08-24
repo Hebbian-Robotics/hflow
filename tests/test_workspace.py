@@ -73,7 +73,12 @@ class TestEnvironmentResolvedDataRoot:
 
 class TestPipelineManifest:
     def test_manifest_describes_the_registrations(self, tmp_path: Path) -> None:
-        app = hflow.App("kitchen", data_root=tmp_path, endpoints={"judge": "http://judge:8000"})
+        app = hflow.App(
+            "kitchen",
+            data_root=tmp_path,
+            endpoints={"judge": "http://judge:8000"},
+            default_checks=(),
+        )
 
         @app.check(critical=True)
         def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
@@ -118,7 +123,7 @@ class TestPipelineManifest:
         this a service can only report that some critical check failed, not
         which threshold on which measurement rejected the episode.
         """
-        app = hflow.App("kitchen", data_root=tmp_path)
+        app = hflow.App("kitchen", data_root=tmp_path, default_checks=())
 
         @app.check(critical=True, gate=hflow.checks.RECOMMENDED_CAMERA_INTEGRITY)
         def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
@@ -149,7 +154,7 @@ class TestPipelineManifest:
         }
 
     def test_manifest_json_round_trips(self, tmp_path: Path) -> None:
-        app = hflow.App("kitchen", data_root=tmp_path)
+        app = hflow.App("kitchen", data_root=tmp_path, default_checks=())
         parsed = json.loads(app.manifest().to_json())
         assert parsed["pipeline_name"] == "kitchen"
         assert parsed["checks"] == []

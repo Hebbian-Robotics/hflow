@@ -22,7 +22,7 @@ def test_cli_manifest_prints_the_pipeline_manifest_json(
     pipeline_file = tmp_path / "kitchen.py"
     pipeline_file.write_text(
         "import hflow\n\n"
-        "my_app = hflow.App('kitchen', data_root='./data')\n\n"
+        "my_app = hflow.App('kitchen', data_root='./data', default_checks=())\n\n"
         "@my_app.check(critical=True)\n"
         "def blackout(ep: hflow.Episode) -> hflow.CheckResult:\n"
         "    return hflow.CheckResult()\n"

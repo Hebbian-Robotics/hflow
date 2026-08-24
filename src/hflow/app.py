@@ -732,6 +732,7 @@ class App:
         *,
         transform: TransformConfig | None = None,
         endpoints: dict[str, str] | None = None,
+        default_checks: Iterable[CheckFunction] | None = None,
     ) -> None:
         self.name = name
         self.storage_root = parse_storage_root(_resolve_data_root(data_root))
@@ -755,6 +756,78 @@ class App:
         self.enrichments: list[RegisteredEnrichment] = []
         self.derived: list[DerivedChannel] = []
         self.transform_override: TransformFunction | None = None
+        # Which registrations came from ``default_checks`` rather than from
+        # the pipeline: registering one of these yourself replaces it (that
+        # is how a default gets a gate or a bound parameter), while two USER
+        # steps sharing a name stays a refusal.
+        self._default_check_names: set[str] = set()
+        self._register_default_checks(default_checks)
+
+    def _yield_defaults_superseded_by_the_pipeline(self, report: "TestReport") -> None:
+        """A pipeline's own step outranks a default measuring the same thing.
+
+        The documented way to configure a built-in is to wrap it under a name
+        of your own (``camera_health`` calling ``camera_frame_stats``), which
+        emits the built-in's keys under a different check name. Against an
+        automatic baseline that is a duplicate-key collision, and refusing the
+        run over it would mean every pipeline that binds a parameter to a
+        built-in had to also opt out of the default -- an opinion that fights
+        the user is not worth holding.
+
+        So the default yields: it contributed nothing this pipeline did not
+        already measure, and it is recorded as skipped with the reason rather
+        than silently dropped, so the catalog never shows a check version that
+        claims measurements it did not supply.
+
+        Only a DEFAULT ever yields. Two of the pipeline's own steps sharing a
+        key is still refused, because there the engine has no basis to pick a
+        winner and one row would vanish from ``measurements_latest``.
+        """
+        if not self._default_check_names:
+            return
+        pipeline_measurement_keys: set[str] = set()
+        for run in report.checks:
+            if run.check.name not in self._default_check_names and run.result is not None:
+                pipeline_measurement_keys.update(run.result.measurements)
+        for enrichment_run in report.enrichments:
+            if enrichment_run.result is not None:
+                pipeline_measurement_keys.update(enrichment_run.result.labels)
+        if not pipeline_measurement_keys:
+            return
+        for run in report.checks:
+            if run.check.name not in self._default_check_names or run.result is None:
+                continue
+            superseded_keys = sorted(set(run.result.measurements) & pipeline_measurement_keys)
+            if not superseded_keys:
+                continue
+            run.skipped_reason = (
+                f"superseded by this pipeline's own steps, which measure "
+                f"{', '.join(repr(key) for key in superseded_keys[:3])}"
+                f"{' and more' if len(superseded_keys) > 3 else ''}; pass "
+                "hflow.App(default_checks=...) to change the automatic set"
+            )
+            run.result = None
+
+    def _register_default_checks(self, default_checks: "Iterable[CheckFunction] | None") -> None:
+        """Register the baseline every episode gets without anyone opting in.
+
+        ``None`` means :data:`hflow.checks.DEFAULT_CHECKS`; any iterable
+        replaces the set outright, and an empty one turns the baseline off.
+        A collection rather than a boolean because the real need is "all of
+        them except the one I configured with a wrapper", which an on/off
+        switch cannot say -- it would force opting out of every default to
+        change one.
+        """
+        from hflow.checks import DEFAULT_CHECKS
+
+        for check_function in DEFAULT_CHECKS if default_checks is None else default_checks:
+            self.check()(check_function)
+            self._default_check_names.add(getattr(check_function, "__name__", ""))
+
+    def _remove_registered_check(self, check_name: str) -> None:
+        """Drop one registration by name, so a user's can take its place."""
+        self.checks = [registered for registered in self.checks if registered.name != check_name]
+        self._default_check_names.discard(check_name)
 
     def _registered_step_names(self) -> set[str]:
         # Checks, enrichments, and the built-in media step share the catalog's
@@ -843,6 +916,12 @@ class App:
             check_name = name if name is not None else getattr(function, "__name__", "")
             if not check_name:
                 raise ValueError("pass name=... when registering a callable without __name__")
+            if check_name in self._default_check_names:
+                # Registering a default yourself is how you configure it --
+                # add a gate, mark it critical, bind a parameter -- so it
+                # replaces the automatic copy instead of colliding with it.
+                # Two USER steps sharing a name still refuse below.
+                self._remove_registered_check(check_name)
             if check_name in self._registered_step_names():
                 raise ValueError(f"a step named {check_name!r} is already registered")
             _raise_if_step_cannot_take_only_an_episode(
@@ -1515,6 +1594,7 @@ class App:
 
         # Assembled even when not recording, so the dev loop refuses a key
         # collision on episode one instead of at the first curation query.
+        self._yield_defaults_superseded_by_the_pipeline(report)
         check_rows = _check_run_rows(report)
         _raise_if_measurement_keys_collide(check_rows)
         if record:

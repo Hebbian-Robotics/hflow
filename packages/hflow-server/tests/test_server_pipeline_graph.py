@@ -21,7 +21,7 @@ from hflow.steps import RUN_PROFILES, Stage
 # echoed registration order would fail the ordering assertions.
 TIERED_PIPELINE_SOURCE = """import hflow
 
-app = hflow.App("tiered-demo", endpoints={"vlm": "http://vlm.invalid"})
+app = hflow.App("tiered-demo", endpoints={"vlm": "http://vlm.invalid"}, default_checks=())
 
 
 @app.check(name="needs_channel", requires=["/camera/wrist"], critical=True)
@@ -51,7 +51,7 @@ def cheap_label(episode):
 
 NO_CRITICAL_PIPELINE_SOURCE = """import hflow
 
-app = hflow.App("no-critical-demo")
+app = hflow.App("no-critical-demo", default_checks=())
 
 
 @app.check(name="just_evidence")
@@ -351,7 +351,7 @@ def test_graph_sync_engine_step_reports_a_transform_override(
         tmp_path,
         """import hflow
 
-app = hflow.App("override-demo")
+app = hflow.App("override-demo", default_checks=())
 
 
 @app.transform

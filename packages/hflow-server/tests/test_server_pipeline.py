@@ -14,7 +14,7 @@ from ui_test_fixtures import PopulatedWorkspace
 
 WORKING_PIPELINE_SOURCE = """import hflow
 
-app = hflow.App("ui-demo")
+app = hflow.App("ui-demo", default_checks=())
 
 
 @app.check(name="joint_check", critical=True)

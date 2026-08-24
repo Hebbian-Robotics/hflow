@@ -19,7 +19,7 @@ def source_episode(tmp_path: Path) -> Path:
 
 
 def _app_with_check_and_enrichment(data_root: Path) -> hflow.App:
-    app = hflow.App("profiles", data_root=data_root)
+    app = hflow.App("profiles", data_root=data_root, default_checks=())
 
     @app.check()
     def joints(ep: hflow.Episode) -> hflow.CheckResult:
@@ -111,7 +111,7 @@ def test_quarantine_is_honored_across_invocations_via_the_catalog(
     source_episode: Path, tmp_path: Path
 ) -> None:
     data_root = tmp_path / "data"
-    app = hflow.App("profiles-quarantine", data_root=data_root)
+    app = hflow.App("profiles-quarantine", data_root=data_root, default_checks=())
     enrichment_ran = False
 
     @app.check(critical=True)
@@ -146,7 +146,7 @@ def test_no_catalog_means_no_known_quarantine(source_episode: Path, tmp_path: Pa
 def test_media_stage_records_a_contact_sheet_artifact(tmp_path: Path) -> None:
     source_episode = synthesize_episode(tmp_path / "camera_episode.mcap", CAMERA_SPEC)
     data_root = tmp_path / "data"
-    app = hflow.App("profiles-media", data_root=data_root)
+    app = hflow.App("profiles-media", data_root=data_root, default_checks=())
 
     report = app.process(source_episode, stages={hflow.Stage.SYNC, hflow.Stage.MEDIA})
     media_runs = [run for run in report.enrichments if run.enrichment.name == "media/contact_sheet"]
