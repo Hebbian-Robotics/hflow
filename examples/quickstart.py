@@ -34,7 +34,7 @@ def check_joint_smoothness(joints: np.ndarray, rate_hz: float) -> dict[str, floa
     }
 
 
-app = hflow.App("kitchen-pipeline", data_root="./data")
+app = hflow.App("kitchen-pipeline")
 
 
 @app.check()

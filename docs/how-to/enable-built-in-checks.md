@@ -27,7 +27,7 @@ from hflow.checks import (
     timestamp_regularity,
 )
 
-app = hflow.App("my-pipeline", data_root="./data")
+app = hflow.App("my-pipeline")
 
 app.check()(timestamp_regularity)
 app.check()(joint_discontinuity)

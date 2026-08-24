@@ -223,6 +223,24 @@ recommended shape is to construct the App **without** a `data_root` argument:
 app = hflow.App("my-pipeline")  # resolves HFLOW_DATA_ROOT, else ./data
 ```
 
+Locally, an `hflow.toml` at the root of your project supplies the same root
+to the CLI, so `hflow curate` and `hflow stale` stop needing `--catalog`, and
+`hflow manifest` stops needing `--pipeline`:
+
+```toml
+data_root = "./data"        # or gs://…, s3://…, az://…
+pipeline = "pipeline.py"    # optional; ./pipeline.py is assumed
+```
+
+Resolution is `--flag`, then the environment, then the nearest ancestor
+`hflow.toml`, then `./data`. The environment outranks the file deliberately:
+the file is committed beside your pipeline, so a shell (or a control plane)
+pointing at a different workspace must never require editing the repository.
+Relative paths in it resolve against the file's own directory, so running a
+command from a subdirectory addresses the same workspace as running it from
+the project root. Runtime URLs and credentials are **not** in this file and
+stay environment-injected (see [HOSTING.md](./HOSTING.md#the-environment-injection-contract)).
+
 The generated process task exports `HFLOW_DATA_ROOT=/opt/airflow/data` before
 importing your pipeline, so the same file runs unedited in the dev loop
 (where the root falls back to `./data`, or whatever you export) and inside

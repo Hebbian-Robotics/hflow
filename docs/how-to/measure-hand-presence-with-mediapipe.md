@@ -72,7 +72,7 @@ model is a visible fact in the catalog rather than a silent substitution.
 import hflow
 from hflow.mediapipe_hands import mediapipe_hand_detection
 
-app = hflow.App("my-pipeline", data_root="./data")
+app = hflow.App("my-pipeline")
 
 app.check()(mediapipe_hand_detection)
 ```

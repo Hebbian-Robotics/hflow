@@ -149,7 +149,7 @@ and other physical-AI recordings.
 import hflow
 from your_existing_qc import check_joint_smoothness  # use your existing checks
 
-app = hflow.App("kitchen-pipeline", data_root="./data")
+app = hflow.App("kitchen-pipeline")  # data root: $HFLOW_DATA_ROOT, hflow.toml, else ./data
 
 
 @app.check()

@@ -16,7 +16,7 @@ A check *may* also declare a `verdict`, a boolean you compute from your own thre
 import hflow
 from your_existing_qc import your_function  # untouched
 
-app = hflow.App("my-pipeline", data_root="./data")
+app = hflow.App("my-pipeline")
 
 
 @app.check()
@@ -137,7 +137,6 @@ import base64
 
 app = hflow.App(
     "my-pipeline",
-    data_root="./data",
     endpoints={"judge": "http://localhost:8000/v1"},  # vLLM, Ollama, or hosted
 )
 
