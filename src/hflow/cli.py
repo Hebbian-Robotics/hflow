@@ -1,9 +1,10 @@
 """Command-line entry point.
 
-Subcommands: ``curate``, ``export snapshot``, ``stale``, ``doctor``,
-``manifest``, the Compose runtime family ``up``/``down``/``ingest``/``status``,
-``deploy`` for bring-your-own Airflow, and ``serve`` for the workspace HTTP
-server (a separate ``hflow-server`` package, imported only when invoked).
+Subcommands: ``curate``, ``dataset create``, ``export snapshot``, ``stale``,
+``doctor``, ``manifest``, the Compose runtime family
+``up``/``down``/``ingest``/``status``, ``deploy`` for bring-your-own Airflow,
+and ``serve`` for the workspace HTTP server (a separate ``hflow-server``
+package, imported only when invoked).
 Everything the CLI does is a thin call into the library: no behavior lives
 only here.
 
@@ -171,6 +172,50 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="run the query and report row count and coverage without writing a manifest",
+    )
+
+    dataset_parser = subparsers.add_parser(
+        "dataset",
+        help="create version-pinned dataset manifests from the pipeline's own policy",
+    )
+    dataset_subparsers = dataset_parser.add_subparsers(dest="dataset_command", required=True)
+    dataset_create_parser = dataset_subparsers.add_parser(
+        "create",
+        help="write an immutable manifest of every episode this pipeline stands behind",
+        description=(
+            "Select the current generation of every source recording that is not "
+            "quarantined, was produced by this pipeline's current transform, and "
+            "has every registered step recorded at its current version. Writes "
+            "manifests/<name>-<timestamp>.parquet plus a .json recording the "
+            "effective SQL and the versions it required. Importing EXECUTES the "
+            "pipeline file, so run this in the pipeline's own environment."
+        ),
+    )
+    dataset_create_parser.add_argument(
+        "name",
+        help="a name for the dataset; slugified into the manifest's filename",
+    )
+    dataset_create_parser.add_argument(
+        "--pipeline",
+        default=None,
+        help=(
+            "pipeline file, optionally with the App variable name: "
+            "path/to/pipeline.py[:app]. Defaults to hflow.toml's `pipeline`, "
+            f"else ./{DEFAULT_PIPELINE_FILE_NAME}"
+        ),
+    )
+    dataset_create_parser.add_argument(
+        "--sql",
+        default=None,
+        help=(
+            "replace the default policy with your own SELECT, keeping the "
+            "immutable artifact and the provenance record"
+        ),
+    )
+    dataset_create_parser.add_argument(
+        "--print-sql",
+        action="store_true",
+        help="print the SQL this would run and exit, writing nothing",
     )
 
     export_parser = subparsers.add_parser(
@@ -611,6 +656,28 @@ def _import_pipeline_app(pipeline_spec: str) -> "App":
     from hflow.app import import_pipeline_application
 
     return import_pipeline_application(pipeline_spec)
+
+
+def _command_dataset_create(arguments: argparse.Namespace) -> int:
+    from hflow.dataset import create_dataset, default_dataset_sql
+
+    try:
+        app = _import_pipeline_app(_require_pipeline_spec(arguments.pipeline))
+    except ValueError as error:
+        print(f"dataset create: {error}", file=sys.stderr)
+        return 2
+    if arguments.print_sql:
+        # The policy is never hidden: it can always be read, edited, and
+        # handed back through --sql or `hflow curate`.
+        print(arguments.sql if arguments.sql is not None else default_dataset_sql(app))
+        return 0
+    try:
+        dataset = create_dataset(app, arguments.name, sql=arguments.sql)
+    except (ValueError, FileNotFoundError) as error:
+        print(f"dataset create: {error}", file=sys.stderr)
+        return 2
+    print(dataset.summary())
+    return 0
 
 
 def _command_manifest(arguments: argparse.Namespace) -> int:
@@ -1088,6 +1155,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if arguments.command == "curate":
         return _command_curate(arguments)
+    if arguments.command == "dataset":
+        if arguments.dataset_command == "create":
+            return _command_dataset_create(arguments)
+        raise AssertionError(f"unhandled dataset command {arguments.dataset_command!r}")
     if arguments.command == "export":
         if arguments.export_command == "snapshot":
             return _command_export_snapshot(arguments)

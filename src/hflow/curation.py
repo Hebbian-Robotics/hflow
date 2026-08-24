@@ -54,7 +54,7 @@ import duckdb
 
 from hflow.catalog import EPISODES_VIEW_STATUS_COLUMN, TABLE_COLUMN_DDL
 from hflow.format import CATALOG_FORMAT_VERSION
-from hflow.steps import CheckStatus
+from hflow.steps import RAN_STATUSES
 from hflow.storage import (
     BucketStorageRoot,
     LocalStorageRoot,
@@ -72,8 +72,9 @@ _TABLE_DIRECTORIES = {
     "intervals": "intervals",
 }
 
-# Statuses that mean "the check actually ran on this episode" for coverage.
-_RAN_STATUSES = (CheckStatus.PASSED.value, CheckStatus.FAILED.value, CheckStatus.MEASURED.value)
+# "The check actually ran on this episode", owned by hflow.steps because
+# dataset membership asks the same question and the two answers must agree.
+_RAN_STATUSES = tuple(status.value for status in RAN_STATUSES)
 
 
 @dataclass(frozen=True)

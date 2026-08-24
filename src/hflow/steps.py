@@ -107,6 +107,28 @@ class CheckStatus(StrEnum):
     ERROR = "error"  # crashed: infrastructure, not data
 
 
+# The statuses that mean "this check actually ran on this episode". One owner,
+# because more than one thing asks: coverage denominators and dataset
+# membership both turn on it, and two private copies of "ran" is how those two
+# answers drift apart.
+#
+# PASSED is deliberately not the whole set, and assuming it is yields an EMPTY
+# answer: an evidence-only check offers no verdict, so it records MEASURED, and
+# HFlow's entire built-in library is evidence-only by contract. FAILED counts
+# too -- a check that ran and returned a False verdict measured the episode;
+# whether to KEEP such an episode is a separate question its gate answers.
+#
+# ERROR is excluded, and that is a deliberate reading of
+# docs/ARCHITECTURE.md's "a check crashing is infrastructure, not data": a
+# crash means the evidence is missing, not that the episode is bad, so it
+# lowers coverage and is a retry rather than a verdict about the recording.
+RAN_STATUSES: tuple[CheckStatus, ...] = (
+    CheckStatus.PASSED,
+    CheckStatus.FAILED,
+    CheckStatus.MEASURED,
+)
+
+
 @dataclass(frozen=True)
 class Interval:
     """A labeled time span inside an episode, in nanoseconds of log time."""

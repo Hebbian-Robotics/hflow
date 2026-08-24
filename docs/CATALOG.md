@@ -188,8 +188,31 @@ WHERE task = 'fold_napkin'
   AND black_pct < 1.0          -- measurement keys are columns; units are yours
 ```
 
-Pinning a check version (the mixed-version-corpus reality). `check_version`
-is a content hash, not ordered, so pin exact values (or filter
+For the everyday cut you do not have to write any of this. `hflow dataset
+create` asks the pipeline itself:
+
+```bash
+hflow dataset create clean
+hflow dataset create clean --print-sql   # see the policy, change nothing
+```
+
+It selects the current generation of every source recording that is not
+quarantined, was produced by this pipeline's current transform, and has every
+registered step recorded at its current version, then writes two immutable
+files: `manifests/clean-<timestamp>.parquet` (the selection, which
+`hflow export snapshot --manifest` reads) and `manifests/clean-<timestamp>.json`
+(the effective SQL, the version stamps it required, the row count, and the
+coverage). Nothing is hidden -- `--print-sql` gives you the query to edit into
+a sharper one, and `--sql` runs yours instead while keeping the artifact and
+the provenance record.
+
+One subtlety worth knowing if you write the equivalent yourself: the policy
+asks whether each check **ran**, not whether it passed. Evidence-only checks
+offer no verdict and record `measured`, so a `status = 'passed'` filter
+selects nothing at all.
+
+Pinning a check version by hand (the mixed-version-corpus reality).
+`check_version` is a content hash, not ordered, so pin exact values (or filter
 `recorded_at`), never compare with `>=`:
 
 ```sql
