@@ -19,7 +19,7 @@ EVERY episode errored always fails regardless of budget.
 import math
 import os
 import traceback
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
@@ -218,6 +218,49 @@ def process_stage_batch(
             else:
                 counts["processed"] += 1
     return counts
+
+
+def run_stages_directly(
+    application: "App",
+    uris: Sequence[str],
+    stages: Iterable[Stage],
+    *,
+    orchestrator_run_id: str | None = None,
+) -> dict[Stage, StageBatchCounts]:
+    """Run the stage graph in this process, with the runtime's own semantics.
+
+    The no-scheduler backend: the same per-episode accounting and the same
+    mass-failure budgets the generated DAGs apply, minus the scheduler. Nobody
+    should reimplement the loop, which is why this lives beside
+    :func:`process_stage_batch` rather than in the CLI -- a hand-rolled
+    ``for uri in uris: app.process(uri)`` silently drops the budgets, and a
+    run that quarantined half its input would then report success.
+
+    Lane planning is deliberately absent. Bin-packing and staggered starts
+    exist to spread work over workers that run concurrently; here there is one
+    process, so every episode is one batch and a stagger would be pure delay.
+
+    Stages run in stage-graph order (sync, then meta, then labels, then
+    media), and each stage's gate applies before the next begins -- so a
+    corpus that fails the error budget in ``sync`` never spends an ffmpeg
+    decode pass on ``meta``. The budgets themselves are per-stage exactly as
+    in the sub-DAGs: the quarantine budget only in ``meta``, because checks
+    are what decide quarantine.
+    """
+    enabled_stages = set(stages)
+    counts_by_stage: dict[Stage, StageBatchCounts] = {}
+    for stage in Stage:
+        if stage not in enabled_stages:
+            continue
+        counts = process_stage_batch(
+            application, uris, stage.value, orchestrator_run_id=orchestrator_run_id
+        )
+        counts_by_stage[stage] = counts
+        if stage is Stage.META:
+            summarize_quarantine_budget([counts])
+        else:
+            summarize_error_budget([counts])
+    return counts_by_stage
 
 
 @contextmanager

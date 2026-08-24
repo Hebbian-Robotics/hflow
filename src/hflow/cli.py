@@ -464,6 +464,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "(no bin-packing, no stagger) -- for per-episode runs as data lands"
         ),
     )
+    ingest_parser.add_argument(
+        "--pipeline",
+        default=None,
+        help=(
+            "pipeline to run when no runtime is addressed and the episodes are "
+            "processed in this process; ignored when a bundle or --airflow-url "
+            f"is addressed, since the runtime holds its own copy. Defaults to "
+            f"{PROJECT_CONFIG_FILE_NAME}'s `pipeline`, else ./{DEFAULT_PIPELINE_FILE_NAME}"
+        ),
+    )
 
     status_parser = subparsers.add_parser(
         "status",
@@ -562,25 +572,33 @@ def _remote_endpoint_for_command(arguments: argparse.Namespace) -> "RemoteRuntim
     return resolve_remote_endpoint(airflow_url=arguments.airflow_url, dag_id=arguments.dag_id)
 
 
-def _resolve_bundle_dir(bundle_dir_argument: Path | None) -> Path:
-    """The bundle a command addresses when ``--bundle-dir`` was not given.
+def _found_bundle_dir(bundle_dir_argument: Path | None) -> Path | None:
+    """The bundle this command addresses, or ``None`` if there is none.
 
-    Local-mode runtimes render at ``<data-root>/runtime`` -- resolved from
-    ``HFLOW_DATA_ROOT`` when set (matching where ``up`` rendered), else the
-    ``./data/runtime`` default; bucket-mode runtimes have no local data root
-    and render at ``./runtime``. Try each in that order, falling back to the
-    primary candidate so ``load_bundle``'s error names it.
+    ``hflow.runtime.find_bundle_directory`` owns the probe, so the CLI and the
+    workspace server cannot disagree about which runtime a workspace has.
     """
+    from hflow.runtime import find_bundle_directory
+
     if bundle_dir_argument is not None:
         return bundle_dir_argument
+    return find_bundle_directory(_environment_data_root())
+
+
+def _resolve_bundle_dir(bundle_dir_argument: Path | None) -> Path:
+    """The bundle a command addresses, naming a candidate even when absent.
+
+    For the commands that cannot proceed without one (``down``, ``status``):
+    falling back to the primary candidate is what makes ``load_bundle``'s
+    error name a path the user recognizes rather than reporting nothing.
+    """
+    found_bundle_dir = _found_bundle_dir(bundle_dir_argument)
+    if found_bundle_dir is not None:
+        return found_bundle_dir
     environment_data_root = _environment_data_root()
-    candidates = [Path(RUNTIME_BUNDLE_DIRECTORY_NAME)]
-    if not is_bucket_url(environment_data_root):
-        candidates.insert(0, Path(environment_data_root) / RUNTIME_BUNDLE_DIRECTORY_NAME)
-    for candidate in candidates:
-        if (candidate / "docker-compose.yaml").is_file():
-            return candidate
-    return candidates[0]
+    if is_bucket_url(environment_data_root):
+        return Path(RUNTIME_BUNDLE_DIRECTORY_NAME)
+    return Path(environment_data_root) / RUNTIME_BUNDLE_DIRECTORY_NAME
 
 
 def _import_pipeline_app(pipeline_spec: str) -> "App":
@@ -787,6 +805,47 @@ def _command_down(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _ingest_in_process(arguments: argparse.Namespace) -> int:
+    """Ingest with no runtime at all: import the pipeline and run the stages.
+
+    The third executor. A workspace with no rendered bundle and no
+    ``HFLOW_AIRFLOW_URL`` used to be a failure (``run `hflow up` first``);
+    it is now an ordinary case, because the scale that needs a scheduler and
+    the scale that needs one command are different scales.
+
+    ``--online`` and ``--bundle-dir`` have nothing to answer here: there is
+    one process, so there are no lanes to pick between and no bundle to
+    address. ``--profile`` still selects which stages run.
+    """
+    from hflow.stage_execution import run_stages_directly
+    from hflow.steps import stages_for_profile
+
+    try:
+        app = _import_pipeline_app(_require_pipeline_spec(arguments.pipeline))
+    except ValueError as error:
+        print(f"ingest: {error}", file=sys.stderr)
+        return 2
+    stages = stages_for_profile(arguments.profile)
+    print(
+        f"ingest: no runtime addressed; processing {len(arguments.uris)} episode(s) "
+        f"in this process against {app.data_root}",
+        file=sys.stderr,
+    )
+    try:
+        counts_by_stage = run_stages_directly(app, list(arguments.uris), stages)
+    except RuntimeError as error:
+        # The mass-failure gates, verbatim: the same budgets a scheduled run
+        # applies, so a corpus that would fail there fails here too.
+        print(f"ingest: {error}", file=sys.stderr)
+        return 1
+    for stage, counts in counts_by_stage.items():
+        print(
+            f"{stage.value}: {counts['processed']} processed, "
+            f"{counts['quarantined']} quarantined, {counts['errors']} errors"
+        )
+    return 0
+
+
 def _command_ingest(arguments: argparse.Namespace) -> int:
     from posixpath import normpath
 
@@ -819,8 +878,15 @@ def _command_ingest(arguments: argparse.Namespace) -> int:
         dag_id = endpoint.dag_id
         watch_location = endpoint.base_url
     else:
+        bundle_dir = _found_bundle_dir(arguments.bundle_dir)
+        if bundle_dir is None:
+            # Nothing addressed: run it here rather than refusing. Starting
+            # Airflow is several GB of images and services, far too much to
+            # do on someone's behalf inside an ordinary ingest, and far more
+            # than a handful of episodes needs.
+            return _ingest_in_process(arguments)
         try:
-            paths = load_bundle(_resolve_bundle_dir(arguments.bundle_dir))
+            paths = load_bundle(bundle_dir)
         except (ValueError, FileNotFoundError) as error:
             print(f"ingest: {error}", file=sys.stderr)
             return 2

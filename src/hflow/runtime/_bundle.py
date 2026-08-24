@@ -88,6 +88,7 @@ from hflow.storage import (
     is_bucket_url,
     parse_storage_root,
 )
+from hflow.workspace import RUNTIME_BUNDLE_DIRECTORY_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -804,6 +805,31 @@ def _dag_id_from_bundle_manifest(bundle_directory: Path) -> str | None:
         return None
     dag_id = manifest_payload.get("dag_id")
     return dag_id if isinstance(dag_id, str) and dag_id else None
+
+
+def find_bundle_directory(data_root: Path | str) -> Path | None:
+    """The rendered bundle a workspace addresses, or ``None`` if none exists.
+
+    ``<data_root>/runtime`` first, then ``./runtime``; a candidate counts only
+    once its ``docker-compose.yaml`` exists, so a directory mid-render is not
+    mistaken for a runtime. Bucket data roots have no local root, so only the
+    fallback applies to them.
+
+    One owner for the probe, beside the renderer that writes the marker: the
+    CLI and the workspace server both ask this question, and their answers
+    have to agree or `hflow ingest` and the UI's Runs page drive different
+    runtimes from one workspace. What each caller does with ``None`` is its
+    own business -- the CLI names its primary candidate so ``load_bundle``'s
+    error is actionable, while the server treats "no bundle anywhere" as a
+    real answer.
+    """
+    candidates = [Path(RUNTIME_BUNDLE_DIRECTORY_NAME)]
+    if not is_bucket_url(str(data_root)):
+        candidates.insert(0, Path(data_root) / RUNTIME_BUNDLE_DIRECTORY_NAME)
+    for candidate in candidates:
+        if (candidate / "docker-compose.yaml").is_file():
+            return candidate
+    return None
 
 
 def load_bundle(bundle_dir: Path | str) -> BundlePaths:

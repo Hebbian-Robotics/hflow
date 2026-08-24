@@ -39,8 +39,8 @@ from hflow.runtime import (
     resolve_remote_endpoint,
     sub_dag_id_for_stage,
 )
+from hflow.runtime import find_bundle_directory as sdk_find_bundle_directory
 from hflow.steps import RUN_PROFILES, IngestMode, Stage
-from hflow.storage import is_bucket_url
 from hflow.workspace import RUNTIME_BUNDLE_DIRECTORY_NAME
 from hflow_server._contract import (
     IngestTriggerResponse,
@@ -173,26 +173,13 @@ class IngestRequest(BaseModel):
 def find_bundle_directory(data_root: str) -> Path | None:
     """The rendered local bundle this workspace addresses, if one exists.
 
-    Mirrors the CLI's ``_resolve_bundle_dir`` probing: ``<data_root>/runtime``
-    first (bucket data roots have no local root, so only the fallback
-    applies), then ``./runtime``; a candidate counts only when its
-    ``docker-compose.yaml`` exists. Unlike the CLI there is no primary-
-    candidate fallback -- "no bundle anywhere" is a real answer here.
-
-    The probe ideally belongs in the SDK, beside the renderer that writes the
-    marker file: a public ``hflow.runtime.find_bundle_directory(data_root)``
-    would leave the CLI and this package as one call plus their differing
-    fallbacks, the way ``hflow.import_pipeline_application`` already does for
-    "address a pipeline by file". Until it lands, this is the mirror, and the
-    only thing that differs is the fallback.
+    The SDK owns the probe (``hflow.runtime.find_bundle_directory``), beside
+    the renderer that writes the marker file, so this package and the CLI
+    cannot answer "which runtime does this workspace have" differently. Kept
+    as a named seam here because the server's own modules and tests address
+    it by this name.
     """
-    candidates = [Path(RUNTIME_BUNDLE_DIRECTORY_NAME)]
-    if not is_bucket_url(data_root):
-        candidates.insert(0, Path(data_root) / RUNTIME_BUNDLE_DIRECTORY_NAME)
-    for candidate in candidates:
-        if (candidate / "docker-compose.yaml").is_file():
-            return candidate
-    return None
+    return sdk_find_bundle_directory(data_root)
 
 
 def runtime_addressed(resolution: RuntimeResolution) -> bool:
