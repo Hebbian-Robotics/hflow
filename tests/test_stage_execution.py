@@ -151,6 +151,7 @@ class _StubApp:
     outcomes: dict[str, object] = field(default_factory=dict)
     processed_references: list[object] = field(default_factory=list)
     received_histories: list[object] = field(default_factory=list)
+    received_run_ids: list[str | None] = field(default_factory=list)
 
     def process(
         self,
@@ -159,11 +160,13 @@ class _StubApp:
         record: bool,
         stages: set[str],
         quarantine_history: object = None,
+        orchestrator_run_id: str | None = None,
     ) -> _StubReport:
         assert record is True
         assert stages == {self.expected_stage}
         self.processed_references.append(episode_reference)
         self.received_histories.append(quarantine_history)
+        self.received_run_ids.append(orchestrator_run_id)
         outcome = self.outcomes.get(Path(str(episode_reference)).name, "ok")
         if outcome == "crash":
             raise RuntimeError("episode exploded")
@@ -189,6 +192,33 @@ def test_process_stage_batch_counts_every_outcome_kind(tmp_path: Path) -> None:
     # Per-episode crashes are counted, never batch-fatal: all four were tried.
     assert len(stub_app.processed_references) == 4
     assert counts == {"processed": 1, "quarantined": 1, "errors": 2}
+    # No orchestrator, so nothing is claimed about one.
+    assert stub_app.received_run_ids == [None, None, None, None]
+
+
+def test_the_orchestrator_run_id_reaches_every_episode_in_the_batch(tmp_path: Path) -> None:
+    """One run id for the whole batch, recorded per episode.
+
+    The generated DAGs bind it once with ``partial()`` across the whole
+    fan-out, so every episode a mapped instance touches has to carry it or the
+    catalog could not answer which run produced a given row.
+    """
+    stub_app = _StubApp(
+        data_root=str(tmp_path),
+        workspace=_StubWorkspace(catalog_root=tmp_path / "catalog"),
+        outcomes={"crash.mcap": "crash"},
+    )
+
+    process_stage_batch(
+        cast("hflow.App", stub_app),  # a double at the App boundary
+        ["good.mcap", "crash.mcap", "also_good.mcap"],
+        "meta",
+        "scheduled__2026-08-23T00:00:00+00:00",
+    )
+
+    # Including the episode that crashed: it was still attempted under this
+    # run, and the id is handed over before the outcome is known.
+    assert stub_app.received_run_ids == ["scheduled__2026-08-23T00:00:00+00:00"] * 3
 
 
 class _CountingQuarantineHistory:

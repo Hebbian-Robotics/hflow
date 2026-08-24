@@ -42,7 +42,9 @@ These are API capabilities, not browser screens. A frontend supplied through
 - **Episodes data** -- the corpus over the catalog's
   wide `episodes` view (task, operator, status, quality measurements as
   columns). Filters compile to DuckDB SQL server-side, and the response
-  includes SQL that can be used with `hflow curate`.
+  includes SQL that can be used with `hflow curate`. `orchestrator_run_id`
+  filters to what one orchestrated run recorded, which is the join from a run
+  the runs endpoints are reporting on back to the corpus it produced.
 - **Episode data** -- one recording's dossier: status and quarantine tags, contact
   sheets, every check run with its content-hash version, measurements with
   their producing step, intervals, tags, append history, and a canonical-MCAP

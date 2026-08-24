@@ -1206,6 +1206,7 @@ class App:
         record: bool = True,
         stages: Iterable[Stage] | str | None = None,
         quarantine_history: QuarantineHistory | None = None,
+        orchestrator_run_id: str | None = None,
     ) -> TestReport:
         """Process one episode through the enabled stages of the stage
         graph: transform to canonical (``sync``), run checks with gate
@@ -1228,6 +1229,15 @@ class App:
         ``quarantine_history`` is that gate's catalog reader, open across a
         whole batch so a stage does not re-sync and re-open the catalog once
         per episode; omit it and this call opens one for itself.
+
+        ``orchestrator_run_id`` records which orchestrated run produced the
+        row, so "which run wrote this" is answerable from the catalog alone.
+        Named for the role rather than for a scheduler: the generated Airflow
+        DAGs pass their stage sub-DAG's own run id, which is the id the runs
+        API reports for that stage, and another backend would pass its own
+        equivalent. The dev loop passes nothing and records NULL. Provenance
+        only, never part of any identity hash (see
+        :meth:`hflow.catalog.Catalog.append_episode`).
         """
         enabled_stages = _resolve_stages(stages)
         source_identifier = _source_identity(episode, self.storage_root)
@@ -1510,6 +1520,7 @@ class App:
                 check_rows=check_rows,
                 quarantine_tags=report.quarantine_tags,
                 source_uri=source_identifier,
+                orchestrator_run_id=orchestrator_run_id,
             )
 
         if verbose:

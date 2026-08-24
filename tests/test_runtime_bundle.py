@@ -432,10 +432,20 @@ def test_sub_dag_sources_compile_and_encode_contract(config: RuntimeConfig, tmp_
         assert "resolve_user_pipeline_path('my_pipeline.py')" in dag_source
         assert 'load_pipeline_application(pipeline_path, "app")' in dag_source
         # Each sub-DAG runs exactly its own stage of the stage graph.
-        assert f'process_stage_batch(app, batch["items"], "{stage.value}")' in dag_source
+        assert (
+            f'process_stage_batch(app, batch["items"], "{stage.value}", orchestrator_run_id)'
+            in dag_source
+        )
         # The stagger, mapped batches, and budget gate are one contract.
         assert 'time.sleep(float(batch["start_delay_s"]))' in dag_source
-        assert "process_batch.expand(batch=batches)" in dag_source
+        # partial() binds this sub-DAG's own run id across the whole fan-out.
+        # It is a rendered template argument because the callable runs under
+        # expect_airflow=False and so cannot read the Airflow context, and it
+        # is what lets a catalog row name the run that produced it.
+        assert (
+            'process_batch.partial(orchestrator_run_id="{{ run_id }}").expand(batch=batches)'
+            in dag_source
+        )
         # The gate materializes the mapped results (lazy XCom proxies cannot
         # cross the external-python pickle boundary; list-typed task_ids keeps
         # a single-batch run from being flattened) and keeps the edge explicit.

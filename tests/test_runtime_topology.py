@@ -91,7 +91,8 @@ def test_sub_dag_tasks_match_the_rendered_stage_dag(rendered_bundle: Path, stage
         (PLAN_TASK_ID, PROCESS_BATCH_TASK_ID),
         (PROCESS_BATCH_TASK_ID, budget_gate_task_id(stage)),
     )
-    assert f"{PROCESS_BATCH_TASK_ID}.expand(" in source  # the fan-out the UI draws
+    assert f"{PROCESS_BATCH_TASK_ID}.partial(" in source  # binds this run's id
+    assert ".expand(" in source  # the fan-out the UI draws
 
 
 def test_only_meta_gates_on_the_quarantine_budget() -> None:

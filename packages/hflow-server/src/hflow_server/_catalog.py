@@ -159,6 +159,10 @@ class EpisodeListFilters:
     tasks: tuple[str, ...] = ()
     operators: tuple[str, ...] = ()
     embodiments: tuple[str, ...] = ()
+    # Which orchestrated run recorded the episode. The one filter that joins
+    # the corpus back to a run the runs API is reporting on, so a client can
+    # ask "what did this run produce" without a second query language.
+    orchestrator_run_ids: tuple[str, ...] = ()
     status: EpisodeStatus | None = None
     success: SuccessFilterValue | None = None
     search: str | None = None
@@ -224,6 +228,7 @@ def _compiled_conditions(filters: EpisodeListFilters) -> _CompiledFilters:
         ("task", filters.tasks),
         ("operator", filters.operators),
         ("embodiment", filters.embodiments),
+        ("orchestrator_run_id", filters.orchestrator_run_ids),
     )
     for column_name, values in exact_match_columns:
         if values:

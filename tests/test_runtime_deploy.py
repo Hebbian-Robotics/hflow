@@ -91,7 +91,7 @@ def test_dag_sources_compile_and_carry_deploy_values(config: DeployConfig, tmp_p
         compile(dag_source, str(sub_dag_file), "exec")
 
         assert f'dag_id="my_pipeline_{stage.value}"' in dag_source
-        assert f'"{stage.value}")' in dag_source
+        assert f'"{stage.value}", orchestrator_run_id)' in dag_source
         # The deploy data root reaches the library calls as a repr() literal
         # (not bare text in a pre-quoted slot), so this holds for any data
         # root content, not just this plain-path case -- see

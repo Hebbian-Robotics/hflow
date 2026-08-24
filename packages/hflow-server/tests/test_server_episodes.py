@@ -3,7 +3,12 @@
 from datetime import datetime
 
 from fastapi.testclient import TestClient
-from ui_test_fixtures import PIPELINE_VERSION, PopulatedWorkspace
+from ui_test_fixtures import (
+    LATEST_ORCHESTRATOR_RUN_ID,
+    PIPELINE_VERSION,
+    SUPERSEDED_ORCHESTRATOR_RUN_ID,
+    PopulatedWorkspace,
+)
 
 import hflow
 
@@ -88,6 +93,34 @@ def test_different_filters_are_and_combined(api: TestClient) -> None:
     payload = _episode_rows(api, task="fold_napkin", operator="alice")
     assert payload["total"] == 1
     assert payload["rows"][0]["operator"] == "alice"
+
+
+def test_orchestrator_run_filter_selects_what_that_run_recorded(api: TestClient) -> None:
+    """The join from a run back to the corpus it produced.
+
+    This is the filter the run view needs: the runs API reports a run id, and
+    the same id selects the episodes whose current rows came out of it.
+    """
+    payload = _episode_rows(api, orchestrator_run_id=LATEST_ORCHESTRATOR_RUN_ID)
+    assert payload["total"] == 2
+    assert all(row["orchestrator_run_id"] == LATEST_ORCHESTRATOR_RUN_ID for row in payload["rows"])
+
+
+def test_a_superseded_run_no_longer_selects_the_episode_it_reprocessed(api: TestClient) -> None:
+    """Filters read the LATEST row per episode, and this one is no exception.
+
+    The same episode was recorded twice; a later run replaced what a query
+    sees, so the earlier run selects nothing. The filter answers "whose work
+    is the current answer", not "which runs ever touched this", and the
+    distinction matters enough to pin rather than leave to be discovered.
+    """
+    payload = _episode_rows(api, orchestrator_run_id=SUPERSEDED_ORCHESTRATOR_RUN_ID)
+    assert payload["total"] == 0
+
+
+def test_an_unorchestrated_episode_matches_no_run_filter(api: TestClient) -> None:
+    payload = _episode_rows(api, orchestrator_run_id="never__ran")
+    assert payload["total"] == 0
 
 
 def test_status_filter(api: TestClient, populated_workspace: PopulatedWorkspace) -> None:

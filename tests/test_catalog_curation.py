@@ -8,7 +8,7 @@ import duckdb
 import pytest
 
 import hflow
-from hflow.catalog import Catalog, CheckRunRow, content_episode_id
+from hflow.catalog import TABLE_COLUMN_DDL, Catalog, CheckRunRow, content_episode_id
 from hflow.cli import main as cli_main
 from hflow.curation import curate, open_catalog_connection
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
@@ -60,6 +60,112 @@ def test_append_is_idempotent_for_the_same_content_versions_and_outcome(tmp_path
     assert first.episode_id == second.episode_id == content_episode_id(canonical)
     parquet_files = list((tmp_path / "catalog" / "measurements").glob("*.parquet"))
     assert len(parquet_files) == 1
+
+
+def test_the_orchestrator_run_id_is_recorded_without_entering_the_fingerprint(
+    tmp_path: Path,
+) -> None:
+    """Provenance, not identity.
+
+    The run fingerprint exists so replaying an identical outcome is a no-op.
+    If the orchestrated run's id reached that hash, every rerun would append a
+    duplicate of data already stored, which is the property this asserts is
+    still intact: same outcome under a different run id is still one append.
+    """
+    catalog = Catalog(tmp_path / "catalog")
+    canonical = _fake_canonical(tmp_path)
+    first = catalog.append_episode(
+        canonical_path=canonical,
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[_check_row()],
+        orchestrator_run_id="manual__2026-08-23T00:00:00+00:00",
+    )
+    replayed_under_another_run = catalog.append_episode(
+        canonical_path=canonical,
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[_check_row()],
+        orchestrator_run_id="scheduled__2026-08-24T00:00:00+00:00",
+    )
+
+    assert first.written and not replayed_under_another_run.written
+    assert first.run_fingerprint == replayed_under_another_run.run_fingerprint
+    assert len(list((tmp_path / "catalog" / "episodes").glob("*.parquet"))) == 1
+
+    connection = open_catalog_connection(tmp_path / "catalog")
+    try:
+        # The row keeps the run that FIRST recorded the outcome: the second
+        # append did nothing, so claiming it as that run's output would be a
+        # fiction. Documented on append_episode.
+        assert connection.execute("SELECT orchestrator_run_id FROM episodes").fetchall() == [
+            ("manual__2026-08-23T00:00:00+00:00",)
+        ]
+    finally:
+        connection.close()
+
+
+def test_an_unorchestrated_append_records_no_run(tmp_path: Path) -> None:
+    """The dev loop and any non-runtime caller pass nothing and stay valid."""
+    catalog = Catalog(tmp_path / "catalog")
+    catalog.append_episode(
+        canonical_path=_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[_check_row()],
+    )
+
+    connection = open_catalog_connection(tmp_path / "catalog")
+    try:
+        assert connection.execute("SELECT orchestrator_run_id FROM episodes").fetchall() == [
+            (None,)
+        ]
+    finally:
+        connection.close()
+
+
+def test_a_corpus_written_before_the_run_id_column_still_reads(tmp_path: Path) -> None:
+    """No migration: an older episodes file reads back with NULL.
+
+    Every glob reader passes ``union_by_name=true`` and the views select ``*``,
+    so adding a column is backward compatible. This pins that rather than
+    trusting it, because the alternative to it being true is a corpus that
+    stops opening after an upgrade.
+    """
+    catalog_root = tmp_path / "catalog"
+    catalog = Catalog(catalog_root)
+    catalog.append_episode(
+        canonical_path=_fake_canonical(tmp_path, b"new bytes"),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[_check_row()],
+        orchestrator_run_id="manual__2026-08-23T00:00:00+00:00",
+    )
+
+    # An episodes file in the pre-column shape, beside the new one.
+    legacy_columns = TABLE_COLUMN_DDL["episodes"].replace("orchestrator_run_id VARCHAR, ", "")
+    legacy_file = str(catalog_root / "episodes" / "legacy-episode-000000000000.parquet")
+    writer = duckdb.connect()
+    try:
+        writer.execute(f"CREATE TABLE legacy ({legacy_columns})")
+        writer.execute(
+            "INSERT INTO legacy VALUES "
+            "('legacyepisode', 'legacyrun000', 'file:///legacy.mcap', NULL, '1', "
+            "'abc123def456', NULL, NULL, NULL, NULL, NULL, NULL, '{}', false, '[]', now())"
+        )
+        writer.execute(f"COPY legacy TO '{legacy_file}' (FORMAT PARQUET)")
+    finally:
+        writer.close()
+
+    connection = open_catalog_connection(catalog_root)
+    try:
+        rows = connection.execute(
+            "SELECT episode_id, orchestrator_run_id FROM episodes ORDER BY episode_id"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert ("legacyepisode", None) in rows
+    assert any(run_id == "manual__2026-08-23T00:00:00+00:00" for _episode_id, run_id in rows)
 
 
 def test_rerunning_a_changed_check_appends_new_version_rows(tmp_path: Path) -> None:

@@ -159,13 +159,28 @@ def plan_stage_batches(
 
 
 def process_stage_batch(
-    application: "App", uris: Sequence[str], stage_name: str
+    application: "App",
+    uris: Sequence[str],
+    stage_name: str,
+    orchestrator_run_id: str | None = None,
 ) -> StageBatchCounts:
     """Run one stage over every episode in a batch, counting outcomes.
 
     Per-episode crashes are counted as errors, never batch-fatal; the budget
     gates apply the run budget to the tallies, so mass failure stays loud
     while a stray bad episode never blocks a run.
+
+    ``orchestrator_run_id`` is recorded on every episode this batch appends,
+    so the catalog can be asked which orchestrated run produced a row.
+
+    Named for the ROLE, not for Airflow, because this module is the one owner
+    of run semantics across execution backends and nothing here should have to
+    change to serve a second one. Whatever scheduled the work supplies its own
+    identifier for the attempt and this records it verbatim; the generated
+    Airflow DAGs hand over ``{{ run_id }}``, and a different backend would
+    hand over whatever it calls the same thing. Optional, so a caller with no
+    orchestrator at all (the dev loop, a bare script) keeps working and
+    records NULL.
     """
     # Stage(stage_name) parses the conf string at this boundary: an unknown
     # stage is a loud ValueError before any episode is touched.
@@ -185,6 +200,7 @@ def process_stage_batch(
                     record=True,
                     stages={stage},
                     quarantine_history=quarantine_history,
+                    orchestrator_run_id=orchestrator_run_id,
                 )
             except Exception:
                 traceback.print_exc()

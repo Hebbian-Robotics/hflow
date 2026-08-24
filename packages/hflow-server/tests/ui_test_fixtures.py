@@ -17,6 +17,12 @@ from hflow.transform import EpisodeStamps
 
 PIPELINE_VERSION = "pipeline0000001"
 
+# Two orchestrated runs over the same episode, so a run filter can be tested
+# against BOTH the run that produced the row a query now sees and one whose
+# row has since been superseded.
+SUPERSEDED_ORCHESTRATOR_RUN_ID = "scheduled__2026-08-22T00:00:00+00:00"
+LATEST_ORCHESTRATOR_RUN_ID = "scheduled__2026-08-23T00:00:00+00:00"
+
 STAMPS = EpisodeStamps(
     schema_version="1",
     pipeline_version=PIPELINE_VERSION,
@@ -92,6 +98,7 @@ def build_populated_workspace(tmp_path_factory: pytest.TempPathFactory) -> Popul
         stamps=STAMPS,
         episode_metadata=ok_metadata,
         check_rows=[joint_check_row(1.5), contact_sheet_row],
+        orchestrator_run_id=SUPERSEDED_ORCHESTRATOR_RUN_ID,
     )
     # Distinct recorded_at so "latest run" ordering stays deterministic.
     time.sleep(0.01)
@@ -100,6 +107,7 @@ def build_populated_workspace(tmp_path_factory: pytest.TempPathFactory) -> Popul
         stamps=STAMPS,
         episode_metadata=ok_metadata,
         check_rows=[joint_check_row(2.0), contact_sheet_row],
+        orchestrator_run_id=LATEST_ORCHESTRATOR_RUN_ID,
     )
     assert first_append.written and second_append.written
     assert first_append.episode_id == second_append.episode_id
@@ -109,6 +117,7 @@ def build_populated_workspace(tmp_path_factory: pytest.TempPathFactory) -> Popul
     quarantined_canonical.write_bytes(b"canonical pour water B")
     quarantined_append = catalog.append_episode(
         canonical_path=quarantined_canonical,
+        orchestrator_run_id=LATEST_ORCHESTRATOR_RUN_ID,
         stamps=STAMPS,
         episode_metadata={
             "task": "pour_water",

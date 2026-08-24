@@ -466,12 +466,17 @@ $stage_plan_filter        return plan_stage_batches(
         )
 
     @task.external_python(python=$venv_python, expect_airflow=False$task_queue_argument)
-    def process_batch(batch):
+    def process_batch(batch, orchestrator_run_id):
         """Sleep the stagger delay, then run this sub-DAG's stage on every episode.
 
         The pipeline-loading contract and the per-episode accounting loop live
         in hflow.stage_execution; this task binds them to the rendered
         data root and pipeline file.
+
+        orchestrator_run_id arrives as a rendered template argument, not from the
+        Airflow context: expect_airflow=False means Airflow is not importable
+        in the user venv this runs in, so the run id has to be handed over
+        from the DAG side. It is recorded on every episode the batch appends.
         """
         import os
         import time
@@ -494,7 +499,7 @@ $stage_plan_filter        return plan_stage_batches(
         pipeline_path = resolve_user_pipeline_path($pipeline_filename)
         app = load_pipeline_application(pipeline_path, "$app_variable")
         require_application_data_root(app, expected_data_root)
-        return process_stage_batch(app, batch["items"], "$stage_name")
+        return process_stage_batch(app, batch["items"], "$stage_name", orchestrator_run_id)
 '''
 
 _SUB_DAG_QUARANTINE_GATE = '''\
@@ -534,7 +539,13 @@ _SUB_DAG_FOOTER = """\
         mode="{{ params.mode }}",
         batch_count="{{ params.batch_count }}",
     )
-    batch_counts = process_batch.expand(batch=batches)
+    # partial() binds the run id once for every mapped instance: it is the
+    # same value for the whole fan-out, and only expand()'s argument varies.
+    # "{{ run_id }}" is THIS sub-DAG's run id, which is what the runs API
+    # reports for this stage, so a catalog row joins straight to the run the
+    # UI is drawing. Rendering happens DAG-side, before the external-python
+    # callable is invoked, which is the only way in (expect_airflow=False).
+    batch_counts = process_batch.partial(orchestrator_run_id="{{ run_id }}").expand(batch=batches)
     # The mapped task's aggregated XCom is a lazy proxy that cannot cross the
     # external-python pickle boundary (it references the in-DAG callable), so
     # the gate pulls it via a template: `| list` materializes plain dicts

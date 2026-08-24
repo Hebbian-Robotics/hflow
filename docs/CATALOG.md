@@ -37,7 +37,7 @@ One append writes one Parquet file into each of five table directories under
 
 | Table | One row per | Carries |
 |---|---|---|
-| `episodes` | episode append | `uri`, `source_uri`, version stamps (`schema_version`, `pipeline_version`, `robot_software_version`, `ffmpeg_version`), promoted semantics (`task`, `operator`, `success`, `embodiment`), the rest of `episode/v1` as `metadata_json`, `quarantined` + `quarantine_tags_json`, `recorded_at` |
+| `episodes` | episode append | `uri`, `source_uri`, version stamps (`schema_version`, `pipeline_version`, `robot_software_version`, `ffmpeg_version`), promoted semantics (`task`, `operator`, `success`, `embodiment`), the rest of `episode/v1` as `metadata_json`, `quarantined` + `quarantine_tags_json`, `orchestrator_run_id`, `recorded_at` |
 | `check_runs` | (episode, step) invocation | `check_name`, `check_version`, `critical`, `status`, `duration_s`, `error`; present even when a step produced nothing, which is what makes coverage countable |
 | `measurements` | measurement key | `key`, typed value columns (`value_double`, `value_text`, `value_bool`), the producing `check_name`/`check_version` |
 | `tags` | tag | `check_name`, `tag` |
@@ -55,6 +55,13 @@ Three durability rules govern writes:
 - **Append, never overwrite**: change a check's source or config and its
   `check_version` changes, so re-running adds *new-version* rows next to the
   old ones. The corpus is assumed permanently mixed-version; curation picks.
+- **Provenance, not identity**: `orchestrator_run_id` records which
+  orchestrated run recorded the row (the generated Airflow DAGs pass their
+  stage sub-DAG's own run id; a local run records NULL). It is deliberately
+  outside `run_fingerprint`, or a rerun producing the same outcome would stop
+  deduplicating. So it names the run that FIRST recorded an outcome, and since
+  filters read the latest row per episode, selecting on it answers "whose work
+  is the current answer" rather than "which runs ever touched this".
 
 One timestamp per append: every file of one `(episode_id, run_fingerprint)`
 carries the episodes file's `recorded_at` (its create-if-absent is the
