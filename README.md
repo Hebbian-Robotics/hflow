@@ -117,7 +117,7 @@ To run the repository's bundled quickstart:
 ```bash
 git clone https://github.com/Hebbian-Robotics/hflow.git
 cd hflow
-uv sync --locked --all-extras
+uv sync --locked
 uv run python examples/quickstart.py
 ```
 

@@ -47,6 +47,7 @@ Use these when you already know the outcome you need.
 - [Port existing processing and quality-check code](./PORTING.md)
 - [Serve a workspace over HTTP](./SERVE.md)
 - [Call an OpenAI vision endpoint from a step](./how-to/call-openai-vision.md)
+- [Measure hand presence with MediaPipe](./how-to/measure-hand-presence-with-mediapipe.md)
 - [Run and operate the local Airflow runtime](./RUNTIME.md)
 - [Deploy into an existing Airflow environment](./RUNTIME.md#bring-your-own-airflow-hflow-deploy)
 - [Query quality evidence and create a manifest](./CATALOG.md)

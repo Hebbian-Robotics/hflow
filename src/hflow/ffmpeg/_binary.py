@@ -29,7 +29,6 @@ directory -- such incomplete directories are healed by re-extracting both
 binaries from a fresh verified download.
 """
 
-import hashlib
 import logging
 import os
 import platform
@@ -37,10 +36,16 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
-import urllib.request
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+
+from hflow._pinned_asset import (
+    PinnedAssetError,
+    download_url_to_file,
+    user_cache_dir,
+    verify_sha256,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,42 +104,12 @@ class PinnedDownloadError(FfmpegNotFoundError):
     """The pinned build could not be downloaded, verified, or extracted."""
 
 
-def _pinned_cache_dir() -> Path:
-    """``<user cache>/hflow/ffmpeg`` (respects ``XDG_CACHE_HOME``)."""
-    xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
-    cache_base = Path(xdg_cache_home) if xdg_cache_home else Path.home() / ".cache"
-    return cache_base / "hflow" / "ffmpeg"
-
-
 def _pinned_install_dir(machine: str) -> Path:
-    return _pinned_cache_dir() / f"{PINNED_RELEASE_TAG}-{machine}"
+    return user_cache_dir("ffmpeg") / f"{PINNED_RELEASE_TAG}-{machine}"
 
 
 def _install_is_complete(install_dir: Path) -> bool:
     return all((install_dir / binary_name).is_file() for binary_name in _PINNED_BINARY_NAMES)
-
-
-def _download_url_to_file(url: str, destination: Path) -> None:
-    with urllib.request.urlopen(url) as response, destination.open("wb") as destination_file:
-        shutil.copyfileobj(response, destination_file)
-
-
-def _sha256_hex_of_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as file:
-        while chunk := file.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _verify_sha256(path: Path, expected_sha256_hex: str, url: str) -> None:
-    actual_sha256_hex = _sha256_hex_of_file(path)
-    if actual_sha256_hex != expected_sha256_hex:
-        raise PinnedDownloadError(
-            f"sha256 mismatch for {url}: expected {expected_sha256_hex}, "
-            f"got {actual_sha256_hex}. The pinned release asset should be immutable; "
-            "this indicates a corrupted download or a tampered mirror."
-        )
 
 
 def _extract_archive_member(archive: Path, member_name: str, destination: Path) -> None:
@@ -164,8 +139,14 @@ def _install_pinned_build(build: PinnedBuild, install_dir: Path) -> Path:
     with tempfile.TemporaryDirectory(dir=install_dir, prefix=".install-") as staging_dir_name:
         staging_dir = Path(staging_dir_name)
         archive_path = staging_dir / "download.tar.xz"
-        _download_url_to_file(build.url, archive_path)
-        _verify_sha256(archive_path, build.sha256_hex, build.url)
+        # The shared mechanism raises its own error type; this module's callers
+        # catch PinnedDownloadError (an FfmpegNotFoundError), so translate at
+        # the boundary rather than widening what they must handle.
+        try:
+            download_url_to_file(build.url, archive_path)
+            verify_sha256(archive_path, build.sha256_hex, build.url)
+        except PinnedAssetError as error:
+            raise PinnedDownloadError(str(error)) from error
         staged_binaries_by_name: dict[str, Path] = {}
         for binary_name in _PINNED_BINARY_NAMES:
             staged_binary = staging_dir / binary_name

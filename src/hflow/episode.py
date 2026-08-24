@@ -492,21 +492,15 @@ class Episode:
             staging_dir.replace(output_dir)
 
         # Map each extracted frame back to the source message it came from.
-        # The remux is index-preserving at constant source fps, and ffmpeg's
-        # fps filter emits the frame VISIBLE at each output tick (the last
-        # frame at-or-before it), so time t maps to floor(t * source_fps);
-        # the epsilon absorbs float error in the estimated rate.
-        source_fps = self._video_fps[topic]
-        source_timestamps_ns = self.channel(topic).timestamps
         frame_paths = sorted(output_dir.glob("frame_*.jpg"))
-        extracted_frames: list[ExtractedFrame] = []
-        for index, frame_path in enumerate(frame_paths):
-            mp4_time_s = window_start_s + index / fps
-            source_index = min(int(mp4_time_s * source_fps + 1e-6), len(source_timestamps_ns) - 1)
-            extracted_frames.append(
-                ExtractedFrame(
-                    path=frame_path,
-                    log_time_ns=int(source_timestamps_ns[source_index]),
-                )
-            )
-        return extracted_frames
+        log_times_ns = video_module.source_log_times_for_sampled_frames(
+            self.channel(topic).timestamps.tolist(),
+            source_fps=self._video_fps[topic],
+            sample_fps=fps,
+            start_s=window_start_s,
+            frame_count=len(frame_paths),
+        )
+        return [
+            ExtractedFrame(path=frame_path, log_time_ns=log_time_ns)
+            for frame_path, log_time_ns in zip(frame_paths, log_times_ns, strict=True)
+        ]

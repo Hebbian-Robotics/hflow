@@ -12,7 +12,7 @@ episode.
 no Docker, scheduler, network service, or API key.
 
 ```bash
-uv sync --locked --all-extras
+uv sync --locked
 uv run python examples/quickstart.py
 ```
 

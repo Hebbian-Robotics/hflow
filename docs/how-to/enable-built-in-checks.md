@@ -171,6 +171,17 @@ SELECT episode_id, "/wrist_cam/compressed/black_frame_pct" AS black_pct
 FROM episodes WHERE status != 'quarantined' AND black_pct < 5.0
 ```
 
+## One packaged check that is not in this list
+
+`hflow.mediapipe_hands.mediapipe_hand_detection` also ships with HFlow, and is
+deliberately not one of the fifteen: it runs a model rather than computing a
+signal statistic. Everything above -- evidence-only results, content-hash
+versions, gates you attach -- works the same way for it, but it needs an opt-in
+extra and a downloaded model asset, and what it records is what MediaPipe
+*detected*, which is a weaker claim than what was in the frame. See
+[Measure hand presence with MediaPipe](./measure-hand-presence-with-mediapipe.md),
+particularly the limitations.
+
 ## See also
 
 - [Add existing robotics quality checks](../PORTING.md) -- for the checks HFlow

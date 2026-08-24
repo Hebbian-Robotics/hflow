@@ -15,6 +15,7 @@ import tarfile
 from collections.abc import Iterator
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from hflow.episode import ExtractedFrame
@@ -43,7 +44,7 @@ from hflow.ffmpeg._instrument import (
     _stats_from_instrument_output,
     frame_stats,
 )
-from hflow.ffmpeg._raw_frames import RawFrameError, luma_frames
+from hflow.ffmpeg._raw_frames import RawFrameError, luma_frames, rgb_frames, scaled_frame_shape
 
 
 def _system_ffmpeg() -> str:
@@ -569,6 +570,64 @@ def test_luma_frames_on_a_non_video_raises(tmp_path: Path) -> None:
     not_a_video.write_bytes(b"\x00\x01\x02not a video")
     with pytest.raises(RawFrameError), luma_frames(not_a_video) as frames:
         list(frames)
+
+
+def test_rgb_frames_streams_three_channels_at_the_coded_size(black_tail_video: Path) -> None:
+    with rgb_frames(black_tail_video) as frames:
+        shapes = [frame.shape for frame in frames]
+    assert len(shapes) == 60
+    assert set(shapes) == {(120, 160, 3)}
+
+
+def test_rgb_frames_resamples_and_resizes_in_one_decode(black_tail_video: Path) -> None:
+    """A local model wants few frames at its own size; doing both in the filter
+    graph converts one frame's pixels per output tick rather than every
+    frame's.
+    """
+    with rgb_frames(black_tail_video, fps=1.0, long_edge_pixels=80) as frames:
+        shapes = [frame.shape for frame in frames]
+    # 6 seconds at 10 fps sampled to 1 fps, and 160x120 scaled to an 80 long edge.
+    assert len(shapes) == 6
+    assert set(shapes) == {(60, 80, 3)}
+
+
+def test_rgb_frames_are_contiguous_uint8(black_tail_video: Path) -> None:
+    """The layout a local vision model takes directly; a non-contiguous or
+    wider dtype would have to be copied and converted at every call site.
+    """
+    with rgb_frames(black_tail_video) as frames:
+        frame = next(iter(frames))
+    assert frame.dtype == np.uint8
+    assert frame.flags["C_CONTIGUOUS"]
+
+
+def test_rgb_frames_reject_a_non_positive_rate(black_tail_video: Path) -> None:
+    with (
+        pytest.raises(ValueError, match="fps must be positive"),
+        rgb_frames(black_tail_video, fps=0.0),
+    ):
+        pass
+
+
+@pytest.mark.parametrize(
+    ("source_shape", "long_edge_pixels", "expected"),
+    [
+        ((120, 160), None, (120, 160)),  # unset leaves the coded size alone
+        ((120, 160), 80, (60, 80)),
+        ((160, 120), 80, (80, 60)),  # portrait: the long edge is the height
+        ((120, 160), 320, (240, 320)),  # upscaling is allowed on purpose
+        ((99, 160), 80, (50, 80)),  # 49.5 rounds half UP, not to even
+    ],
+)
+def test_scaled_frame_shape_is_proportional_and_rounds_half_up(
+    source_shape: tuple[int, int], long_edge_pixels: int | None, expected: tuple[int, int]
+) -> None:
+    assert scaled_frame_shape(source_shape, long_edge_pixels) == expected
+
+
+def test_scaled_frame_shape_refuses_a_degenerate_long_edge() -> None:
+    with pytest.raises(ValueError, match="at least 2"):
+        scaled_frame_shape((120, 160), 1)
 
 
 def test_missing_motion_extra_names_the_install_command(

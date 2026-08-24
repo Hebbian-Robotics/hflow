@@ -252,6 +252,18 @@ statistic, and the [OpenAI vision example](../examples/openai_vision/pipeline.py
 contact-sheet VLM check. Native-video protocols are a contributor-shaped provider extension
 point.
 
+Hands are also the one place HFlow ships a **local** model rather than only the surface to call
+a remote one: `hflow.mediapipe_hands` runs MediaPipe's Hand Landmarker over sampled frames
+([how to use it, and what it cannot tell you](./how-to/measure-hand-presence-with-mediapipe.md)).
+It is deliberately a second artifact rather than a second opinion inside the first, because a
+landmark detector and a vision-language model answer different questions about the same footage
+-- the detector counts hands it can see, the VLM can be asked *whose* hands, gloved or bare,
+holding what -- and the value is in comparing them, which requires both to survive. The
+separation is enforced by construction: the check lives outside `hflow.checks` with the vendor in
+its name, needs an opt-in extra and a digest-pinned model asset, ships no recommended gate, and
+records the model build as evidence on every row. Its limitations are the model's, gloves first,
+and they are documented as inherited rather than measured.
+
 ## Catalog and curation storage
 
 The ingest DAG appends one row per episode to Parquet under the data root, and

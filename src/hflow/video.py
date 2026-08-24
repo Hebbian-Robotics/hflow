@@ -75,6 +75,44 @@ def estimate_fps_from_log_times(log_times_ns: Sequence[int], *, topic: str) -> f
     return 1e9 / median_delta_ns
 
 
+def source_log_times_for_sampled_frames(
+    source_timestamps_ns: Sequence[int],
+    *,
+    source_fps: float,
+    sample_fps: float,
+    start_s: float,
+    frame_count: int,
+) -> list[int]:
+    """Log times of the source messages behind ``frame_count`` sampled frames.
+
+    Anything that resamples a camera stream -- JPEG extraction for a model
+    call, raw frames for a measurement -- needs the same answer: which
+    recorded message does sampled frame *i* come from? One owner, because the
+    reasoning is subtle in two places.
+
+    The remux is index-preserving at constant source fps, and ffmpeg's ``fps``
+    filter emits the frame VISIBLE at each output tick (the last frame
+    at-or-before it), so output time *t* maps to source index
+    ``floor(t * source_fps)``. The epsilon absorbs float error in an estimated
+    rate. Times past the end of the stream clamp to the final message rather
+    than raising: ffmpeg may emit one tick beyond it, and a frame it did
+    produce must still be attributable.
+    """
+    if not source_timestamps_ns:
+        raise ValueError("cannot map sampled frames onto an empty source stream")
+    if source_fps <= 0 or sample_fps <= 0:
+        raise ValueError(
+            f"source_fps and sample_fps must both be positive, got {source_fps} and {sample_fps}"
+        )
+    last_source_index = len(source_timestamps_ns) - 1
+    log_times_ns: list[int] = []
+    for frame_index in range(frame_count):
+        output_time_s = start_s + frame_index / sample_fps
+        source_index = min(int(output_time_s * source_fps + 1e-6), last_source_index)
+        log_times_ns.append(int(source_timestamps_ns[source_index]))
+    return log_times_ns
+
+
 def encode_images_to_h264(
     images: Sequence[bytes],
     *,

@@ -40,8 +40,14 @@ Clone the repository and create the locked development environment:
 ```bash
 git clone https://github.com/Hebbian-Robotics/hflow.git
 cd hflow
-uv sync --locked --all-extras
+uv sync --locked
 ```
+
+Every extra the suite exercises is mirrored into the `dev` group, so a plain
+sync is the whole development environment. Two extras stay opt-in because
+nothing in the suite runs them -- `openai`, which talks to a real endpoint, and
+`mediapipe`, which is a model that adds ~430 MB and a second OpenCV
+distribution. Add either with `--extra <name>` when you are working on it.
 
 Confirm the package and CLI are available:
 
@@ -72,17 +78,27 @@ CI runs the suite on Python 3.11 and 3.14. When changing compatibility-sensitive
 code, exercise both ends locally:
 
 ```bash
-uv run --python 3.11 --locked --all-extras pytest -q
-uv run --python 3.14 --locked --all-extras pytest -q
+uv run --python 3.11 --locked pytest -q
+uv run --python 3.14 --locked pytest -q
 ```
 
-Three integration test suites are intentionally opt-in because they need
-network access, Docker, or a writable object-store prefix:
+Four integration test suites are intentionally opt-in because they need network
+access, Docker, a writable object-store prefix, or a model outside the default
+environment:
 
 ```bash
 HFLOW_NETWORK_TESTS=1 uv run pytest tests/test_ffmpeg.py -q
 HFLOW_DOCKER_TESTS=1 uv run pytest tests/test_runtime_integration.py -q
 HFLOW_TEST_BUCKET_URL=gs://your-bucket/tmp-prefix uv run pytest tests/test_storage.py -q
+HFLOW_MEDIAPIPE_TESTS=1 uv run --extra mediapipe pytest tests/test_mediapipe_hands.py -q
+```
+
+The MediaPipe one brings its own OpenCV, and the OpenCV wheels share one
+`cv2/` directory, so syncing back out can leave `import cv2` broken while
+`uv sync` still calls the environment correct. One command puts it back:
+
+```bash
+uv sync --locked --reinstall-package opencv-python-headless
 ```
 
 Run the Docker test when changing the runtime bundle, DAG templates, REST

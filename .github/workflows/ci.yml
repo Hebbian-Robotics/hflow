@@ -28,7 +28,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Sync environment
-        run: uv sync --locked --all-extras
+        # Not --all-extras: the mediapipe extra is a model, deliberately not
+        # exercised here (see pyproject.toml). Every extra the suite does test
+        # is mirrored into the dev group, so a plain sync is the full env.
+        run: uv sync --locked
       - name: Lint
         run: uv run ruff check
       - name: Format check

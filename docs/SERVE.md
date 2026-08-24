@@ -24,7 +24,7 @@ run it from a clone:
 ```bash
 git clone https://github.com/Hebbian-Robotics/hflow.git
 cd hflow
-uv sync --all-extras                 # installs hflow and hflow-server
+uv sync                              # installs hflow and hflow-server
 uv run hflow serve                      # browses $HFLOW_DATA_ROOT, else ./data
 uv run hflow serve --data-root ./data --no-browser
 ```

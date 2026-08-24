@@ -73,7 +73,7 @@ ln -s /mnt/c/Users/you/hflow ~/hflow
 ## 5. Install the locked development environment
 
 ```bash
-uv sync --locked --all-extras
+uv sync --locked
 ```
 
 ## 5. Verify the install
