@@ -55,6 +55,10 @@ def test_argument_validation() -> None:
         plan_batches({"a": 1}, batch_count=1, target_batch_bytes=1)
     with pytest.raises(ValueError, match="negative"):
         plan_batches({"a": -1}, batch_count=1)
+    with pytest.raises(ValueError, match="batch_count must be >= 1, got 0"):
+        plan_batches({"a": 1}, batch_count=0)
+    with pytest.raises(ValueError, match="target_batch_bytes must be >= 1, got 0"):
+        plan_batches({"a": 1}, target_batch_bytes=0)
     assert plan_batches({}, batch_count=3) == []
 
 
