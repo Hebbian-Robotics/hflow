@@ -23,6 +23,11 @@ EPISODE_SPECIFICATIONS = (
     ("pour", "carol", 20.0),
 )
 
+# One orchestrated run over a SUBSET spanning both tasks, so a run filter can
+# be asserted as narrowing rather than as emptying. The rest record no run.
+STATS_ORCHESTRATOR_RUN_ID = "scheduled__2026-08-23T00:00:00+00:00"
+STATS_ORCHESTRATED_INDICES = frozenset({0, 1, 4})
+
 
 def _build_stats_workspace(tmp_path: Path) -> Path:
     data_root = tmp_path / "stats-root"
@@ -46,9 +51,55 @@ def _build_stats_workspace(tmp_path: Path) -> Path:
                     measurements={"max_velocity": velocity},
                 )
             ],
+            orchestrator_run_id=(
+                STATS_ORCHESTRATOR_RUN_ID if index in STATS_ORCHESTRATED_INDICES else None
+            ),
         )
         assert appended.written
     return data_root
+
+
+def test_the_orchestrator_run_filter_narrows_the_distributions_too(
+    stats_api: TestClient,
+) -> None:
+    """The listing and its distributions must describe the SAME rows.
+
+    ``parse_episode_list_filters`` owns that pairing for both endpoints, so
+    this pins the claim rather than trusting the shared dependency: a filter
+    that reached the listing alone would draw a sidebar describing episodes
+    the table is not showing.
+
+    Asserted as NARROWING, over a run that recorded some episodes of each
+    task. Filtering to nothing would also pass an ignored filter through the
+    degenerate-column rules, which drop every column once no row survives,
+    leaving nothing to make an assertion about.
+    """
+    unfiltered = _columns_by_name(stats_api.get("/api/v1/episodes/stats").json())
+    assert unfiltered["task"]["values"] == [
+        {"value": "fold", "count": 4},
+        {"value": "pour", "count": 2},
+    ]
+
+    response = stats_api.get(
+        "/api/v1/episodes/stats", params={"orchestrator_run_id": STATS_ORCHESTRATOR_RUN_ID}
+    )
+    assert response.status_code == 200, response.text
+    filtered = _columns_by_name(response.json())
+
+    assert filtered["task"]["values"] == [
+        {"value": "fold", "count": 2},
+        {"value": "pour", "count": 1},
+    ]
+    assert sum(bucket["count"] for bucket in filtered["max_velocity"]["buckets"]) == 3
+
+
+def test_an_unrecorded_run_leaves_the_distributions_empty(stats_api: TestClient) -> None:
+    """A filter matching nothing describes nothing, rather than everything."""
+    response = stats_api.get(
+        "/api/v1/episodes/stats", params={"orchestrator_run_id": "scheduled__never_ran"}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["columns"] == []
 
 
 @pytest.fixture()

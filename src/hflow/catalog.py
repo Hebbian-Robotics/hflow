@@ -531,6 +531,15 @@ class Catalog:
         append that did nothing. ``None`` (the local dev loop, any caller
         outside the runtime) records NULL.
         """
+        # One stored representation of "no orchestrator". A blank arrives
+        # easily from an adapter reading its own environment
+        # (``os.environ.get("RUN_ID", "")``), and storing it verbatim would
+        # leave NULL and '' both meaning unorchestrated, so an IS NULL query
+        # would miss rows and a filter could match a value naming nothing.
+        # Blank-or-whitespace only: any other id is stored VERBATIM, because
+        # it has to compare equal to what the orchestrator's own API reports.
+        if orchestrator_run_id is not None and not orchestrator_run_id.strip():
+            orchestrator_run_id = None
         episode_id = content_episode_id(canonical_path)
         # One normalized shape feeds every consumer below -- the run
         # fingerprint, the replay repair pass, and the dependent-table

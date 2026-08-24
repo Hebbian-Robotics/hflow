@@ -124,6 +124,57 @@ def test_an_unorchestrated_append_records_no_run(tmp_path: Path) -> None:
         connection.close()
 
 
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+def test_a_blank_run_id_records_as_absent_rather_than_as_a_value(
+    tmp_path: Path, blank: str
+) -> None:
+    """One stored representation of "no orchestrator".
+
+    A blank falls out of an adapter reading its own environment. Stored
+    verbatim it would leave NULL and '' both meaning unorchestrated, so an
+    IS NULL query would miss rows and a filter could match a value that names
+    no run.
+    """
+    catalog = Catalog(tmp_path / "catalog")
+    catalog.append_episode(
+        canonical_path=_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[_check_row()],
+        orchestrator_run_id=blank,
+    )
+
+    connection = open_catalog_connection(tmp_path / "catalog")
+    try:
+        assert connection.execute(
+            "SELECT count(*) FROM episodes WHERE orchestrator_run_id IS NULL"
+        ).fetchone() == (1,)
+    finally:
+        connection.close()
+
+
+def test_a_real_run_id_is_stored_verbatim(tmp_path: Path) -> None:
+    """Never normalized beyond blankness: it has to compare equal to the id
+    the orchestrator's own API reports, or the join it exists for breaks."""
+    run_id = "scheduled__2026-08-23T00:00:00+00:00"
+    catalog = Catalog(tmp_path / "catalog")
+    catalog.append_episode(
+        canonical_path=_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[_check_row()],
+        orchestrator_run_id=run_id,
+    )
+
+    connection = open_catalog_connection(tmp_path / "catalog")
+    try:
+        assert connection.execute("SELECT orchestrator_run_id FROM episodes").fetchall() == [
+            (run_id,)
+        ]
+    finally:
+        connection.close()
+
+
 def test_a_corpus_written_before_the_run_id_column_still_reads(tmp_path: Path) -> None:
     """No migration: an older episodes file reads back with NULL.
 
