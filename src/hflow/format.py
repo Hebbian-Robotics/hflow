@@ -51,7 +51,7 @@ NANOSECONDS_PER_SECOND = 1_000_000_000
 # versioned: bump this when the grid or selection semantics change.
 # Annotated as ``str`` rather than inferred as a literal, for the same reason
 # TRANSFORM_BEHAVIOR_VERSION is: the whole point is that it changes.
-RESAMPLE_POLICY_VERSION: str = "1"
+RESAMPLE_POLICY_VERSION: str = "2"
 
 # ``provenance/v1`` keys written when derived channels are present:
 # ``derived/<topic>`` holds each derived channel's content-hash version, and

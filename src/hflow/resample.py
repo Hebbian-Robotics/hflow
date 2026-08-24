@@ -6,7 +6,7 @@ versioned: ``hflow.format.RESAMPLE_POLICY_VERSION`` names the semantics
 below and is stamped into ``provenance/v1`` whenever derived channels are
 written.
 
-Resample policy version "1":
+Resample policy version "2":
 
 - The grid steps by ``1e9 / rate_hz`` nanoseconds and is anchored to integer
   multiples of the step (epoch-anchored): it runs from the first multiple at
@@ -17,6 +17,8 @@ Resample policy version "1":
 - ``interpolate``: linear interpolation per column (``numpy.interp``).
 - ``nearest``: the value of the source sample nearest in time to each grid
   point; the earlier sample wins an exact tie.
+- ``slerp``: shortest-arc spherical interpolation of four-component rotation
+  fields after source normalization and sequential hemisphere alignment.
 """
 
 import math
@@ -31,7 +33,9 @@ from hflow.format import NANOSECONDS_PER_SECOND
 if TYPE_CHECKING:
     from hflow.episode import ChannelData
 
-ResamplePolicy = Literal["interpolate", "nearest"]
+ResamplePolicy = Literal["interpolate", "nearest", "slerp"]
+
+_SLERP_NEAR_PARALLEL_DOT = 1.0 - 1e-7
 
 
 @dataclass(frozen=True)
@@ -120,10 +124,9 @@ def _source_columns(channel: "ChannelData", field: str | None) -> dict[str, np.n
 
 
 # Componentwise interpolation of quaternions produces unnormalized rotations
-# and is wrong across antipodal sign flips; refuse the obvious cases until a
-# proper slerp alignment policy lands (tracked follow-up). Name-based
-# detection is best-effort: it cannot catch every quaternion field, but it
-# catches the conventional ones (orientation/quaternion/rotation, 4 columns).
+# and is wrong across antipodal sign flips. Name-based detection is best-effort:
+# it cannot catch every quaternion field, but it catches the conventional ones
+# (orientation/quaternion/rotation, 4 columns).
 _QUATERNION_NAME_HINTS = ("quat", "orientation", "rotation")
 
 
@@ -152,6 +155,72 @@ def _nearest_source_indices(
     return np.where(distance_to_earlier <= distance_to_later, earlier, later)
 
 
+def _slerp_quaternions(
+    source_timestamps_ns: np.ndarray,
+    source_quaternions: np.ndarray,
+    grid_timestamps_ns: np.ndarray,
+) -> np.ndarray:
+    """Shortest-arc interpolation of four-component rotations.
+
+    Component order is deliberately opaque: dot products, normalization, and
+    scalar multiplication work identically for ``xyzw`` and ``wxyz`` input.
+    """
+    source_norms = np.linalg.norm(source_quaternions, axis=1)
+    if np.any(~np.isfinite(source_quaternions)) or np.any(~np.isfinite(source_norms)):
+        raise ValueError("slerp source quaternions must contain only finite values")
+    if np.any(source_norms == 0.0):
+        raise ValueError("slerp source quaternions must have nonzero norm")
+
+    aligned = source_quaternions / source_norms[:, np.newaxis]
+    aligned = aligned.copy()
+    for source_index in range(1, len(aligned)):
+        if np.dot(aligned[source_index - 1], aligned[source_index]) < 0.0:
+            aligned[source_index] *= -1.0
+
+    later_indices = np.searchsorted(source_timestamps_ns, grid_timestamps_ns, side="left")
+    later_indices = np.clip(later_indices, 0, len(source_timestamps_ns) - 1)
+    earlier_indices = np.maximum(later_indices - 1, 0)
+    earlier_timestamps = source_timestamps_ns[earlier_indices]
+    later_timestamps = source_timestamps_ns[later_indices]
+    intervals = later_timestamps - earlier_timestamps
+    interpolation_fractions = np.divide(
+        grid_timestamps_ns - earlier_timestamps,
+        intervals,
+        out=np.zeros(len(grid_timestamps_ns), dtype=np.float64),
+        where=intervals != 0,
+    )
+
+    earlier_quaternions = aligned[earlier_indices]
+    later_quaternions = aligned[later_indices]
+    pair_dots = np.clip(np.einsum("ij,ij->i", earlier_quaternions, later_quaternions), -1.0, 1.0)
+    interpolated = np.empty_like(earlier_quaternions)
+
+    # Below this angle, sin(theta) is small enough that the textbook slerp
+    # quotient loses precision. 1e-7 follows the issue's requested scale and
+    # keeps the normalized-lerp approximation far below float64 data noise.
+    near_parallel = pair_dots > _SLERP_NEAR_PARALLEL_DOT
+    if np.any(near_parallel):
+        fractions = interpolation_fractions[near_parallel, np.newaxis]
+        interpolated[near_parallel] = earlier_quaternions[near_parallel] + fractions * (
+            later_quaternions[near_parallel] - earlier_quaternions[near_parallel]
+        )
+
+    spherical = ~near_parallel
+    if np.any(spherical):
+        theta = np.arccos(pair_dots[spherical])
+        sin_theta = np.sin(theta)
+        fractions = interpolation_fractions[spherical]
+        earlier_weights = np.sin((1.0 - fractions) * theta) / sin_theta
+        later_weights = np.sin(fractions * theta) / sin_theta
+        interpolated[spherical] = (
+            earlier_weights[:, np.newaxis] * earlier_quaternions[spherical]
+            + later_weights[:, np.newaxis] * later_quaternions[spherical]
+        )
+
+    output_norms = np.linalg.norm(interpolated, axis=1)
+    return interpolated / output_norms[:, np.newaxis]
+
+
 def to_grid(
     channel: "ChannelData",
     rate_hz: float,
@@ -164,8 +233,10 @@ def to_grid(
     Numeric fields only (reuses :meth:`ChannelData.to_numpy`, including its
     automatic field selection when ``field`` is None). A 2-D field of shape
     (n_messages, m) becomes m columns named ``<field>_0 .. <field>_{m-1}``.
-    Semantics are pinned by ``hflow.format.RESAMPLE_POLICY_VERSION`` (see
-    the module docstring).
+    ``policy="slerp"`` requires exactly four columns but deliberately does not
+    assume whether their source order is ``xyzw`` or ``wxyz``. Semantics are
+    pinned by ``hflow.format.RESAMPLE_POLICY_VERSION`` (see the module
+    docstring).
     """
     if rate_hz <= 0.0:
         raise ValueError(f"rate_hz must be positive, got {rate_hz}")
@@ -180,8 +251,13 @@ def to_grid(
         raise ValueError(
             f"field {field!r} of topic {channel.topic!r} looks like a quaternion; "
             "componentwise interpolation corrupts rotations (unnormalized, wrong "
-            "across sign flips). Use policy='nearest' for now -- slerp-based "
-            "quaternion alignment is a tracked follow-up."
+            "across sign flips). Use policy='slerp' for rotation-aware interpolation "
+            "or policy='nearest' to copy source samples."
+        )
+    if policy == "slerp" and len(source_columns) != 4:
+        raise ValueError(
+            f"policy='slerp' requires a field with exactly 4 columns, got "
+            f"{len(source_columns)} for field {field!r} of topic {channel.topic!r}"
         )
     match policy:
         case "interpolate":
@@ -201,6 +277,15 @@ def to_grid(
             resampled_columns = {
                 column_name: column_values[nearest_indices]
                 for column_name, column_values in source_columns.items()
+            }
+        case "slerp":
+            source_quaternions = np.column_stack(list(source_columns.values())).astype(np.float64)
+            resampled_quaternions = _slerp_quaternions(
+                source_timestamps_ns, source_quaternions, grid_timestamps_ns
+            )
+            resampled_columns = {
+                column_name: resampled_quaternions[:, component_index]
+                for component_index, column_name in enumerate(source_columns)
             }
         case _:
             assert_never(policy)

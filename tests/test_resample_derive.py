@@ -132,6 +132,75 @@ def test_to_grid_vector_field_becomes_named_columns() -> None:
     np.testing.assert_allclose(series.values["position_1"], [0.0, 50.0, 100.0, 150.0, 200.0])
 
 
+def quaternion_channel(timestamps_ns: list[int], quaternions: list[list[float]]) -> ChannelData:
+    return make_json_channel(
+        timestamps_ns,
+        [{"orientation": quaternion} for quaternion in quaternions],
+    )
+
+
+def quaternion_values(series: DerivedSeries) -> np.ndarray:
+    return np.column_stack(
+        [series.values[f"orientation_{component_index}"] for component_index in range(4)]
+    )
+
+
+def test_to_grid_slerp_interpolates_180_degree_rotation() -> None:
+    assert RESAMPLE_POLICY_VERSION == "2"
+    source = quaternion_channel(
+        [0, 2_000_000_000],
+        [[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 0.0]],
+    )
+
+    series = to_grid(source, 1.0, policy="slerp", field="orientation")
+    quaternions = quaternion_values(series)
+
+    np.testing.assert_allclose(np.linalg.norm(quaternions, axis=1), 1.0)
+    np.testing.assert_allclose(quaternions[1], [0.0, 0.0, np.sqrt(0.5), np.sqrt(0.5)], atol=1e-12)
+    assert abs(np.dot(quaternions[-1], np.array([0.0, 0.0, 1.0, 0.0]))) == pytest.approx(1.0)
+
+
+def test_to_grid_slerp_aligns_antipodal_sign_flip() -> None:
+    rotation = np.array([0.0, 0.0, np.sqrt(0.5), np.sqrt(0.5)])
+    source = quaternion_channel(
+        [0, 1_000_000_000, 2_000_000_000],
+        [[0.0, 0.0, 0.0, 1.0], rotation.tolist(), (-rotation).tolist()],
+    )
+
+    series = to_grid(source, 2.0, policy="slerp", field="orientation")
+    quaternions = quaternion_values(series)
+
+    np.testing.assert_allclose(np.linalg.norm(quaternions, axis=1), 1.0)
+    assert abs(np.dot(quaternions[-1], -rotation)) == pytest.approx(1.0)
+    assert abs(np.dot(quaternions[-2], rotation)) == pytest.approx(1.0)
+
+
+def test_to_grid_slerp_near_parallel_fallback_stays_normalized() -> None:
+    tiny_angle = 1e-5
+    nearly_identical = [0.0, 0.0, np.sin(tiny_angle / 2.0), np.cos(tiny_angle / 2.0)]
+    source = quaternion_channel(
+        [0, 2_000_000_000],
+        [[0.0, 0.0, 0.0, 2.0], nearly_identical],
+    )
+
+    series = to_grid(source, 1.0, policy="slerp", field="orientation")
+    quaternions = quaternion_values(series)
+
+    np.testing.assert_allclose(np.linalg.norm(quaternions, axis=1), 1.0)
+    expected_midpoint = np.array([0.0, 0.0, np.sin(tiny_angle / 4.0), np.cos(tiny_angle / 4.0)])
+    assert abs(np.dot(quaternions[1], expected_midpoint)) == pytest.approx(1.0)
+
+
+def test_to_grid_slerp_rejects_non_quaternion_width() -> None:
+    channel = make_json_channel(
+        [0, 1_000_000_000],
+        [{"rotation": [1.0, 0.0, 0.0]}, {"rotation": [0.0, 1.0, 0.0]}],
+    )
+
+    with pytest.raises(ValueError, match="exactly 4 columns, got 3"):
+        to_grid(channel, 1.0, policy="slerp", field="rotation")
+
+
 def test_to_grid_rejects_span_shorter_than_one_step() -> None:
     with pytest.raises(ValueError, match="shorter than one grid step"):
         to_grid(ramp_channel(), 0.01, policy="interpolate")
@@ -318,8 +387,7 @@ def test_second_transform_override_errors(tmp_path: Path) -> None:
 
 
 def test_interpolate_refuses_quaternion_shaped_fields() -> None:
-    """Componentwise lerp corrupts rotations; the guard fails loudly until
-    slerp-based alignment lands (dependency-assessment follow-up)."""
+    """Componentwise lerp corrupts rotations; the guard points to slerp."""
     from typing import cast
 
     import numpy as np
@@ -346,7 +414,7 @@ def test_interpolate_refuses_quaternion_shaped_fields() -> None:
 
     # Duck-typed test double smuggled past the checker, like untyped user code.
     channel = cast(ChannelData, _FakeQuaternionChannel())
-    with pytest.raises(ValueError, match="quaternion"):
+    with pytest.raises(ValueError, match="policy='slerp'"):
         to_grid(channel, 10.0, policy="interpolate", field="orientation")
     # nearest copies whole samples and stays quaternion-safe.
     series = to_grid(channel, 10.0, policy="nearest", field="orientation")
