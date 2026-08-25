@@ -233,13 +233,34 @@ def _print_pattern_table(title: str, stats_rows: list[PatternStats]) -> None:
         )
 
 
+DERIVED_CHUNK_SIZE_ARGUMENT = "derived"
+
+
+def _parse_chunk_size_argument(raw_value: str) -> int | None:
+    """``--chunk-size-bytes``: a flat integer target, or the derived default.
+
+    ``None`` is what :class:`hflow.TransformConfig` reads as "size each group
+    from its own byte rate", so the benchmark can measure the layout the
+    library actually ships rather than an approximation of it.
+    """
+    if raw_value == DERIVED_CHUNK_SIZE_ARGUMENT:
+        return None
+    return int(raw_value)
+
+
+def _describe_chunk_size(chunk_size_bytes: int | None) -> str:
+    if chunk_size_bytes is None:
+        return f"{DERIVED_CHUNK_SIZE_ARGUMENT} per group (baselines at {DEFAULT_CHUNK_SIZE_BYTES})"
+    return str(chunk_size_bytes)
+
+
 def _measure_source(
     source_path: Path,
     working_dir: Path,
     sample_count: int,
     header: str,
     topic_groups: dict[str, str] | None = None,
-    chunk_size_bytes: int = DEFAULT_CHUNK_SIZE_BYTES,
+    chunk_size_bytes: int | None = DEFAULT_CHUNK_SIZE_BYTES,
 ) -> None:
     """The full three-layout comparison over one source recording."""
     grouped_path = working_dir / "topic-group.mcap"
@@ -254,13 +275,19 @@ def _measure_source(
         ),
     )
     transform_seconds = time.perf_counter() - transform_started
+    # The baselines have no per-group concept to derive from: per-topic groups
+    # are single topics, and the stock writer has exactly one chunk buffer. So
+    # a derived run measures them at the flat default, and the header says so.
+    baseline_chunk_size = (
+        chunk_size_bytes if chunk_size_bytes is not None else DEFAULT_CHUNK_SIZE_BYTES
+    )
     per_topic_path = working_dir / "per-topic.mcap"
     _rewrite(
         grouped_path,
         per_topic_path,
         "per-topic rewrite",
         group_for_topic=lambda t: t,
-        chunk_size_bytes=chunk_size_bytes,
+        chunk_size_bytes=baseline_chunk_size,
     )
     interleaved_path = working_dir / "interleaved.mcap"
     _rewrite(
@@ -268,7 +295,7 @@ def _measure_source(
         interleaved_path,
         "interleaved rewrite",
         group_for_topic=None,
-        chunk_size_bytes=chunk_size_bytes,
+        chunk_size_bytes=baseline_chunk_size,
     )
 
     # Camera/state discovery runs on the CANONICAL file so it works for both
@@ -308,7 +335,7 @@ def _measure_source(
     ]
     print(
         f"read benchmark: {header}, {len(topics.camera_topics)} cameras + {topics.state_topic}, "
-        f"chunk_size={chunk_size_bytes}, local disk "
+        f"chunk_size={_describe_chunk_size(chunk_size_bytes)}, local disk "
         f"(transform to canonical: {transform_seconds:.1f} s)"
     )
     if topic_groups:
@@ -361,7 +388,7 @@ def run_read_benchmark_on_input(
     input_path: Path,
     sample_count: int,
     grouping: str,
-    chunk_size_bytes: int,
+    chunk_size_bytes: int | None,
 ) -> None:
     source_topics = discover_topics(input_path)
     topic_groups = (
@@ -408,9 +435,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--chunk-size-bytes",
-        type=int,
+        type=_parse_chunk_size_argument,
         default=DEFAULT_CHUNK_SIZE_BYTES,
-        help="uncompressed chunk-size target for every layout (a tuned parameter)",
+        help=(
+            "uncompressed chunk-size target: an integer pins one flat target on "
+            "every group, `derived` runs the SHIPPED DEFAULT, which sizes each "
+            "group from its own byte rate. A flat number equal to the derived "
+            "camera target is not the same layout -- it also moves every state "
+            "group off the floor -- so a published `derived` row has to be "
+            "measured this way"
+        ),
     )
     arguments = parser.parse_args()
     sample_count = QUICK_SAMPLE_COUNT if arguments.quick else FULL_SAMPLE_COUNT

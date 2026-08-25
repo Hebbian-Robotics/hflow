@@ -111,9 +111,12 @@ class TransformConfig:
     # ``None`` (the default) derives a target PER GROUP from the rate that
     # group is written at and the preset's read window; an int pins one target
     # for every group. Deriving is the default because it is measured: on the
-    # reference recording it fetches 3.08 chunks per sample against 9.18 at a
-    # flat 800 KB and 2.69 at a flat 8 MB, and it is the minimum of
-    # fetches x bytes across all three (docs/BENCHMARKS.md).
+    # reference recording it fetches 3.79 chunks per sample against 9.18 at
+    # the flat 800 KB it replaced, for 1.7x the bytes. It is NOT the optimum
+    # there -- a flat 5.41 MB beat it -- but 5.41 MB is that recording's
+    # camera rate and would mis-fit the next corpus, which is the mistake the
+    # flat default already made. Pin an int when you can measure your own
+    # workload; docs/BENCHMARKS.md has the full table.
     chunk_size_bytes: int | None = None
     compression: Literal["zstd", "none"] = "zstd"
     # topic -> group name, beating the defaults; topics not listed go to

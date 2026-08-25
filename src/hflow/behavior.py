@@ -96,9 +96,13 @@ notes and not only here.
 #
 # "4": chunk targets are now derived per group from that group's own byte rate
 # and the preset's read window, instead of one flat 800 KB for every group.
-# Measured on the reference recording (docs/BENCHMARKS.md): 3.08 chunk fetches
-# per training sample against 9.18 at a flat 800 KB and 2.69 at a flat 8 MB,
-# and the minimum of fetches x bytes across all three. Groups whose rate falls
-# below the floor -- every state group, every synthetic fixture -- keep their
-# previous layout and re-version only because this constant moved.
+# Measured on the reference recording (docs/BENCHMARKS.md): 3.79 chunk fetches
+# per training sample fetching 11.21 MB, against 9.18 fetching 6.65 MB at the
+# flat 800 KB this replaced -- half the round trips for 1.7x the bytes, the
+# trade worth making when round trips dominate. It is NOT the measured minimum
+# of fetches x bytes: a flat 5.41 MB beat it there on that recording, and the
+# default stands anyway because 5.41 MB is that recording's camera rate rather
+# than a principle. Groups whose rate falls below the floor -- every state
+# group there, every synthetic fixture -- keep their previous layout and
+# re-version only because this constant moved.
 TRANSFORM_BEHAVIOR_VERSION: str = "4"

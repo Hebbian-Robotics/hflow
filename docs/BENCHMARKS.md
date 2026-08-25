@@ -192,46 +192,72 @@ cameras + `/imu`):
 
 | chunk size | layout | fetches/sample | compressed MB fetched/sample |
 |---|---|---|---|
-| 800 KB | per-topic (Dyna's baseline) | 12.93 | 10.14 |
-| 800 KB | topic-group (read-pattern) | **9.17** | **6.65** |
-| 8 MB | per-topic (Dyna's baseline) | 7.56 | 49.26 |
-| 8 MB | topic-group (read-pattern) | **2.69** | **15.34** |
-| 5.41 MB, derived | topic-group (read-pattern) | **3.08** | **12.32** |
+| 800 KB flat | per-topic (Dyna's baseline) | 12.93 | 10.14 |
+| 800 KB flat | topic-group (read-pattern) | **9.18** | **6.65** |
+| 8 MB flat | per-topic (Dyna's baseline) | 7.56 | 49.26 |
+| 8 MB flat | topic-group (read-pattern) | **2.69** | **15.34** |
+| 5.41 MB flat | topic-group (read-pattern) | **3.08** | **12.32** |
+| **derived per group** (the default) | topic-group (read-pattern) | **3.79** | **11.21** |
 
-### Why 5.41 MB, and why it is now the default
+### Per-group derived targets: what they buy, and what they do not
 
 Chunk size stopped being a flat tuned constant. Each group's target is derived
 from the rate *that group* is written at and the read window its workload
 implies (`hflow.format.derived_chunk_size_bytes`): a read covering `W` seconds
 of a group written at `R` costs about `1 + R*W/C` fetches and `C + R*W` bytes,
 so with `x = C/(R*W)` their product is `R*W*(2 + x + 1/x)` -- minimized exactly
-at `C = R*W`. For this recording's camera group that is 5.4 MB/s x 1 s.
+at `C = R*W`. For this recording's camera group that is 5.4 MB/s x 1 s; every
+other group here falls below the 800 KB floor and takes it.
 
-The row above is that prediction measured. It sits between the two flat sizes
-on both axes and is the minimum of the product they trade off:
+Measured against the flat targets on the product they trade off:
 
 | chunk size | fetches x MB |
 |---|---|
-| 800 KB | 61.0 |
-| **5.41 MB, derived** | **37.9** |
-| 8 MB | 41.3 |
+| 800 KB flat | 61.0 |
+| 8 MB flat | 41.3 |
+| **derived per group** (the default) | **42.5** |
+| 5.41 MB flat | 38.0 |
 
-Concretely: the derived target captures 94% of the fetch reduction that 8 MB
-buys, while fetching 20% fewer bytes than 8 MB. Groups whose rate falls below
-the 800 KB floor -- every state group here -- keep the old layout exactly, so
-this changes the layout of high-rate groups and nothing else.
+Read that honestly: **the derived policy is not the minimum here.** It roughly
+halves the fetches of the 800 KB default it replaced (3.79 against 9.18) at
+1.7x the bytes, which is the trade worth making when round trips dominate --
+and it fetches the fewest bytes of any layout that gets under four fetches per
+sample. But a flat 5.41 MB measured better than it on both the product and the
+fetch count, because a flat target also lifts this recording's *state* group
+off the floor, and the training sample reads a state topic too. The same shows
+up in the full `/imu` scan: 16 fetches derived against 3 at flat 5.41 MB, for
+the same 4 MB.
 
-Reproduce with `--chunk-size-bytes 5411000` against the same input; the two
-flat rows above reproduce at `800000` and `8000000`.
+It is still the default, for a reason that is about defaults rather than about
+this table: 5.41 MB is this recording's camera rate, not a principle. Shipping
+it as a constant would fit nuScenes and mis-fit the next corpus, which is the
+mistake the flat 800 KB default already made. The formula transfers; the
+number does not. If your workload is one recording you can measure, pin
+`TransformConfig(chunk_size_bytes=...)` and beat the default -- that is what
+the knob is for.
+
+The floor is the part with the least evidence behind it. 800 KB is where the
+measurements start, not a measured optimum, and this table is the first
+evidence that it is too low for a busy state group. Worth revisiting with a
+recording whose state group is proprio-rate rather than 20 topics of vehicle
+telemetry.
+
+Reproduce the default with `--chunk-size-bytes derived` against the same
+input; the flat rows reproduce at `800000`, `5411000` and `8000000`. A flat
+`5411000` is deliberately NOT the same layout as `derived`, which is what made
+an earlier version of this table wrong.
 
 Observations:
 
-- At the default 800 KB chunks, six 1600x900 cameras produce ~5.4 MB/s, so a
-  1 s window spans ~7 camera chunks by sheer byte volume: fetch counts are
-  byte-bound, not layout-bound, and grouping buys only 1.41x. Chunk size is a
-  tuned parameter (docs/ARCHITECTURE.md); at 8 MB chunks the layout effect
-  dominates: **2.81x fewer fetches and 3.21x fewer bytes** than the per-topic
-  baseline, against Dyna's ~3.4x with more topics per sample.
+- At a flat 800 KB, six 1600x900 cameras produce ~5.4 MB/s, so a 1 s window
+  spans ~7 camera chunks by sheer byte volume: fetch counts are byte-bound,
+  not layout-bound, and grouping buys only 1.41x. Chunk size is a tuned
+  parameter (docs/ARCHITECTURE.md); at 8 MB the layout effect dominates:
+  **2.81x fewer fetches and 3.21x fewer bytes** than the per-topic baseline,
+  against Dyna's ~3.4x with more topics per sample. The shipped derived
+  default lands at **3.41x fewer fetches** than per-topic -- the best fetch
+  ratio in this report, and the closest to Dyna's -- while fetching 0.90x its
+  bytes.
 - The `/imu` scan under read-pattern grouping fetches 4 MB (vs 230 MB
   naive-grouped, 322-344 MB interleaved); per-topic remains the optimum for
   single-topic scans, as always.
