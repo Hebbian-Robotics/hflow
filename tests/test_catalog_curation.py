@@ -8,7 +8,13 @@ import duckdb
 import pytest
 
 import hflow
-from hflow.catalog import TABLE_COLUMN_DDL, Catalog, CheckRunRow, content_episode_id
+from hflow.catalog import (
+    _EPISODES_VIEW_RESERVED_COLUMNS,
+    TABLE_COLUMN_DDL,
+    Catalog,
+    CheckRunRow,
+    content_episode_id,
+)
 from hflow.cli import main as cli_main
 from hflow.curation import CurationReport, curate, open_catalog_connection
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
@@ -1032,6 +1038,49 @@ def test_measurement_key_claiming_an_episode_column_is_refused(tmp_path: Path) -
             check_rows=[row],
         )
     assert list((tmp_path / "catalog" / "episodes").glob("*.parquet")) == []
+
+
+def test_episodes_view_reserved_columns_match_queryable_episode_columns(
+    tmp_path: Path,
+) -> None:
+    """Keep the shadow guard aligned with the curated episodes view."""
+    Catalog(tmp_path / "catalog").append_episode(
+        canonical_path=_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[],
+    )
+
+    connection = open_catalog_connection(tmp_path / "catalog")
+    try:
+        view_columns = [
+            column[0] for column in connection.execute("SELECT * FROM episodes").description
+        ]
+    finally:
+        connection.close()
+
+    view_columns_by_lookup_key = {column.lower(): column for column in view_columns}
+    reserved_columns_by_lookup_key = dict(_EPISODES_VIEW_RESERVED_COLUMNS)
+    # The wide episodes view deliberately excludes the stored quarantine flag, but
+    # it stays reserved because the derived status column is computed from it.
+    reserved_only_exemptions = {"quarantined"}
+
+    reserved_not_in_view = sorted(
+        reserved_columns_by_lookup_key[key]
+        for key in reserved_columns_by_lookup_key.keys()
+        - view_columns_by_lookup_key.keys()
+        - reserved_only_exemptions
+    )
+    view_not_reserved = sorted(
+        view_columns_by_lookup_key[key]
+        for key in view_columns_by_lookup_key.keys() - reserved_columns_by_lookup_key.keys()
+    )
+
+    assert not reserved_not_in_view and not view_not_reserved, (
+        "episodes view reserved-column drift: "
+        f"reserved_not_in_view={reserved_not_in_view}, "
+        f"view_not_reserved={view_not_reserved}"
+    )
 
 
 def test_measurement_key_shadowing_is_case_insensitive(tmp_path: Path) -> None:
