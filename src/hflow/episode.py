@@ -113,6 +113,18 @@ class ChannelData:
         return self._log_times
 
     @property
+    def publish_times(self) -> np.ndarray:
+        """Publish times in nanoseconds, shape (n,). Does not decode.
+
+        These are when the publisher stamped each message, not when the
+        recorder wrote it -- unlike :attr:`timestamps`, they are **not**
+        guaranteed to be ascending, since messages can be logged out of
+        publish order. Compare against :attr:`timestamps` to measure
+        recording latency.
+        """
+        return self._publish_times
+
+    @property
     def raw(self) -> list[bytes]:
         """Raw encoded message payloads. Does not decode."""
         return self._raw

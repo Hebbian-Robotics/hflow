@@ -1192,26 +1192,21 @@ def test_serve_refuses_a_port_it_cannot_serve(capsys: pytest.CaptureFixture[str]
 def test_serve_refuses_a_data_root_that_is_not_a_directory(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    """A file, or nothing at all, used to serve an empty workspace and say nothing.
+    """A file used to serve an empty workspace and say nothing about why.
 
-    Both answer with the stock errno sentence the rest of the CLI uses, so the
-    message names which of the two it is rather than leaving the caller to
-    guess why their workspace looks empty.
+    It answers with the stock errno sentence the rest of the CLI uses, so the
+    caller is not left guessing why their workspace looks empty.
     """
     data_root_file = tmp_path / "not-a-directory"
     data_root_file.write_text("")
-    missing_data_root = tmp_path / "never-created"
 
-    for data_root, expected in (
-        (data_root_file, "Not a directory"),
-        (missing_data_root, "No such file or directory"),
-    ):
-        exit_code = main(["serve", "--data-root", str(data_root), "--no-browser"])
-        assert exit_code == 2
-        stderr = capsys.readouterr().err
-        assert stderr.startswith("serve: ")
-        assert expected in stderr
-        assert str(data_root) in stderr
+    exit_code = main(["serve", "--data-root", str(data_root_file), "--no-browser"])
+
+    assert exit_code == 2
+    stderr = capsys.readouterr().err
+    assert stderr.startswith("serve: ")
+    assert "Not a directory" in stderr
+    assert str(data_root_file) in stderr
 
 
 def test_serve_refuses_a_host_it_cannot_bind(capsys: pytest.CaptureFixture[str]) -> None:

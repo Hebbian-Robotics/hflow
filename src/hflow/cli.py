@@ -1170,14 +1170,26 @@ def _command_serve(arguments: argparse.Namespace) -> int:
         print(f"serve: {error}", file=sys.stderr)
         return 2
     # A bucket data root has no local directory to check, the same distinction
-    # `up` draws for its bundle dir. A local root that is a file, or is not
-    # there at all, otherwise serves an empty workspace at a printed URL and
-    # says nothing about why it is empty.
+    # `up` draws for its bundle dir. A local root that EXISTS and is not a
+    # directory otherwise serves an empty workspace at a printed URL and says
+    # nothing about why it is empty.
+    #
+    # A root that is not there yet is deliberately allowed through, and `up`
+    # agrees (#145). Nothing creates the data root eagerly -- the catalog makes
+    # it on first append -- so on a fresh install ./data does not exist until
+    # something ingests, and `serve` is a reasonable first command. The server
+    # is built for that state: /api/v1/config reports the missing catalog as a
+    # capability the frontend hides affordances behind, rather than refusing.
+    # An absent root and an empty one look the same to someone who has not
+    # ingested yet, so refusing one and serving the other would be a
+    # distinction only we can see.
     if not is_bucket_url(settings.data_root):
         local_data_root = Path(settings.data_root)
-        if not local_data_root.is_dir():
-            reason = errno.ENOTDIR if local_data_root.exists() else errno.ENOENT
-            print(f"serve: {os.strerror(reason)}: {local_data_root}", file=sys.stderr)
+        if local_data_root.exists() and not local_data_root.is_dir():
+            print(
+                f"serve: {os.strerror(errno.ENOTDIR)}: {local_data_root}",
+                file=sys.stderr,
+            )
             return 2
     try:
         serve(settings)

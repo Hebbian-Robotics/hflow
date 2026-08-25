@@ -8,7 +8,13 @@ import duckdb
 import pytest
 
 import hflow
-from hflow.catalog import TABLE_COLUMN_DDL, Catalog, CheckRunRow, content_episode_id
+from hflow.catalog import (
+    _EPISODES_VIEW_RESERVED_COLUMNS,
+    TABLE_COLUMN_DDL,
+    Catalog,
+    CheckRunRow,
+    content_episode_id,
+)
 from hflow.cli import main as cli_main
 from hflow.curation import CurationReport, curate, open_catalog_connection
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
@@ -913,6 +919,130 @@ def test_same_value_in_a_numpy_or_python_scalar_replays_as_one_run(
     assert len({attempt.run_fingerprint for attempt in int_attempts}) == 1
 
 
+def test_numpy_scalar_interval_bounds_round_trip(tmp_path: Path) -> None:
+    """A user check building interval bounds from a NumPy array stores real ints."""
+    import numpy as np
+
+    canonical = tmp_path / "e.canonical.mcap"
+    canonical.write_bytes(b"episode-bytes")
+    row = CheckRunRow(
+        check_name="segment_check",
+        check_version="v1",
+        critical=False,
+        status=hflow.CheckStatus.MEASURED,
+        duration_s=0.1,
+        intervals=[
+            # cast: real check code indexes channel.to_numpy() and gets np.int64.
+            hflow.Interval(
+                start_ns=cast(int, np.int64(0)),
+                end_ns=cast(int, np.int64(5)),
+                label="segment",
+            )
+        ],
+    )
+    result = Catalog(tmp_path / "catalog").append_episode(
+        canonical_path=canonical,
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[row],
+    )
+    assert result.written is True
+    connection = open_catalog_connection(tmp_path / "catalog")
+    try:
+        stored = connection.execute(
+            "SELECT start_ns, end_ns, label FROM intervals WHERE start_ns = 0 AND end_ns = 5"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert stored == [(0, 5, "segment")]
+
+
+def test_a_float_interval_bound_is_refused_naming_the_check_and_bound(
+    tmp_path: Path,
+) -> None:
+    """A float bound is not a nanosecond timestamp, so it raises rather than coercing."""
+    import numpy as np
+
+    canonical = tmp_path / "e.canonical.mcap"
+    canonical.write_bytes(b"episode-bytes")
+    row = CheckRunRow(
+        check_name="segment_check",
+        check_version="v1",
+        critical=False,
+        status=hflow.CheckStatus.MEASURED,
+        duration_s=0.1,
+        # cast: the misuse this test exists to refuse.
+        intervals=[hflow.Interval(start_ns=cast(int, np.float64(5.0)), end_ns=10)],
+    )
+    with pytest.raises(ValueError, match=r"segment_check.*start_ns.*float"):
+        Catalog(tmp_path / "catalog").append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[row],
+        )
+
+
+def test_a_bool_interval_bound_is_refused_rather_than_stored_as_one_nanosecond(
+    tmp_path: Path,
+) -> None:
+    """``bool`` subclasses ``int``, so ``True`` passes an isinstance test and
+    would store as 1 ns. It is a mistake, not a timestamp."""
+    canonical = tmp_path / "e.canonical.mcap"
+    canonical.write_bytes(b"episode-bytes")
+    row = CheckRunRow(
+        check_name="segment_check",
+        check_version="v1",
+        critical=False,
+        status=hflow.CheckStatus.MEASURED,
+        duration_s=0.1,
+        # cast: the misuse this test exists to refuse.
+        intervals=[hflow.Interval(start_ns=cast(int, True), end_ns=10)],
+    )
+    with pytest.raises(ValueError, match=r"segment_check.*start_ns.*bool"):
+        Catalog(tmp_path / "catalog").append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[row],
+        )
+
+
+def test_same_interval_bound_in_a_numpy_or_python_scalar_replays_as_one_run(
+    tmp_path: Path,
+) -> None:
+    """Equal interval bounds across scalar flavors fingerprint identically."""
+    import numpy as np
+
+    canonical = tmp_path / "e.canonical.mcap"
+    canonical.write_bytes(b"episode-bytes")
+    catalog = Catalog(tmp_path / "catalog")
+
+    def segment(start: object, end: object) -> CheckRunRow:
+        return CheckRunRow(
+            check_name="segment_check",
+            check_version="v1",
+            critical=False,
+            status=hflow.CheckStatus.MEASURED,
+            duration_s=0.1,
+            intervals=[
+                hflow.Interval(start_ns=cast(int, start), end_ns=cast(int, end), label="segment")
+            ],
+        )
+
+    attempts = [
+        catalog.append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[segment(start, end)],
+        )
+        for start, end in ((np.int64(0), np.int64(5)), (0, 5))
+    ]
+    assert [attempt.written for attempt in attempts] == [True, False]
+    assert len({attempt.run_fingerprint for attempt in attempts}) == 1
+
+
 def test_non_scalar_measurement_is_refused_naming_the_check_and_key(
     tmp_path: Path,
 ) -> None:
@@ -957,6 +1087,49 @@ def test_measurement_key_claiming_an_episode_column_is_refused(tmp_path: Path) -
             check_rows=[row],
         )
     assert list((tmp_path / "catalog" / "episodes").glob("*.parquet")) == []
+
+
+def test_episodes_view_reserved_columns_match_queryable_episode_columns(
+    tmp_path: Path,
+) -> None:
+    """Keep the shadow guard aligned with the curated episodes view."""
+    Catalog(tmp_path / "catalog").append_episode(
+        canonical_path=_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[],
+    )
+
+    connection = open_catalog_connection(tmp_path / "catalog")
+    try:
+        view_columns = [
+            column[0] for column in connection.execute("SELECT * FROM episodes").description
+        ]
+    finally:
+        connection.close()
+
+    view_columns_by_lookup_key = {column.lower(): column for column in view_columns}
+    reserved_columns_by_lookup_key = dict(_EPISODES_VIEW_RESERVED_COLUMNS)
+    # The wide episodes view deliberately excludes the stored quarantine flag, but
+    # it stays reserved because the derived status column is computed from it.
+    reserved_only_exemptions = {"quarantined"}
+
+    reserved_not_in_view = sorted(
+        reserved_columns_by_lookup_key[key]
+        for key in reserved_columns_by_lookup_key.keys()
+        - view_columns_by_lookup_key.keys()
+        - reserved_only_exemptions
+    )
+    view_not_reserved = sorted(
+        view_columns_by_lookup_key[key]
+        for key in view_columns_by_lookup_key.keys() - reserved_columns_by_lookup_key.keys()
+    )
+
+    assert not reserved_not_in_view and not view_not_reserved, (
+        "episodes view reserved-column drift: "
+        f"reserved_not_in_view={reserved_not_in_view}, "
+        f"view_not_reserved={view_not_reserved}"
+    )
 
 
 def test_measurement_key_shadowing_is_case_insensitive(tmp_path: Path) -> None:

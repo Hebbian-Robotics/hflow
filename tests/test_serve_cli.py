@@ -30,8 +30,8 @@ def served_settings(monkeypatch: pytest.MonkeyPatch) -> list[ServerSettings]:
 def test_ui_flags_land_in_the_launch_settings(
     served_settings: list[ServerSettings], tmp_path: Path
 ) -> None:
-    # A real directory: `serve` refuses a data root that is not one before it
-    # builds the launch, and this test is about the flags reaching it.
+    # A real directory: `serve` refuses a root that exists and is not one
+    # before it builds the launch, and this test is about the flags reaching it.
     workspace_directory = tmp_path / "workspace"
     workspace_directory.mkdir()
     exit_code = main(
@@ -57,6 +57,28 @@ def test_ui_flags_land_in_the_launch_settings(
     assert settings.open_browser is False
     assert settings.read_only is True
     assert settings.pipeline == "kitchen.py:my_app"
+
+
+def test_serve_still_launches_over_a_data_root_that_is_not_there_yet(
+    served_settings: list[ServerSettings], tmp_path: Path
+) -> None:
+    """A missing root is "nothing ingested yet", not bad input.
+
+    Nothing creates the data root eagerly -- the catalog makes it on first
+    append -- so on a fresh install ./data does not exist until something
+    ingests, and `serve` is a reasonable first command. The server already
+    renders that state instead of refusing it: /api/v1/config reports the
+    missing catalog as a capability the frontend hides affordances behind.
+    This is the other half of `up`'s carve-out in #145, so the two commands
+    answer a missing root the same way.
+    """
+    missing_data_root = tmp_path / "not_there_yet"
+
+    exit_code = main(["serve", "--data-root", str(missing_data_root), "--no-browser"])
+
+    assert exit_code == 0
+    (settings,) = served_settings
+    assert settings.data_root == str(missing_data_root)
 
 
 def test_a_bare_ui_launch_uses_the_documented_defaults(

@@ -173,7 +173,12 @@ episode-scoped, prefix it with the check instead.
 
 **Name keys `<topic>/<metric>_<unit>`.** The topic prefix is what keeps two
 cameras (or two checks) from colliding, and it also keeps a key from clashing
-with an episode column like `task` or `uri`, which makes the wide view error.
+with an episode column like `task` or `uri`. Two namespaces are not yours to
+take, and both are refused at append time rather than resolved silently: an
+episode column name, refused naming the check, the key, and the column it
+shadows; and anything starting with `artifact/`, which is reserved for the URIs
+the framework publishes -- a snapshot export treats every key under that prefix
+as media, so a user key there would ship as media the pipeline never produced.
 Keys containing `/` need double quotes in SQL:
 
 ```sql
