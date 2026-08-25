@@ -31,6 +31,16 @@ DAG_BUNDLE_CONFIG_LIST_JSON = (
 )
 
 
+# The ONLY package the user venv needs besides hflow and the user's own
+# dependencies: ExternalPythonOperator's per-task bootstrap probe is exactly
+# `import pendulum` when expect_airflow=False, and lazy_object_proxy never
+# crosses into the venv because proxies resolve host-side before pickling.
+# Pinned to apache/airflow:3.3.1's own constraint so a future pendulum major
+# cannot break context unpickling. One owner, because both renderers install
+# it and a drift between them is a task that fails its probe on one path only.
+EXTERNAL_PYTHON_BOOTSTRAP_REQUIREMENT = "pendulum==3.2.0"
+
+
 class ComposeTemplate(Template):
     """``string.Template`` with ``%name`` / ``%{name}`` placeholders.
 
@@ -154,6 +164,22 @@ services:
         set -euo pipefail
         mkdir -p /opt/venvs/cache
         marker_file=/opt/venvs/user/.hflow-content-hash
+        # uv, which apache/airflow ships on PATH, resolves and installs an
+        # order of magnitude faster than pip and reads the user's uv.lock
+        # directly -- so a locked project gets the exact versions it locked.
+        export UV_PROJECT_ENVIRONMENT=/opt/venvs/user
+        # The image's default cache is under /tmp: ephemeral, and on a
+        # different filesystem from the volume, so every rebuild would
+        # re-download everything.
+        export UV_CACHE_DIR=/opt/venvs/uv-cache
+        # Never fetch a managed interpreter. The venv must be the IMAGE's
+        # Python or the external-python pickle boundary breaks between
+        # Airflow's process and the task's.
+        export UV_PYTHON_DOWNLOADS=never
+        # The image exports VIRTUAL_ENV=/home/airflow/.local -- Airflow's OWN
+        # environment. Left set, uv would treat it as the target.
+        unset VIRTUAL_ENV
+        venv_python=/opt/venvs/user/bin/python
         # pendulum silences ExternalPythonOperator's noisy per-task bootstrap
         # probe -- at providers-standard 1.17.0 the venv probe is exactly
         # `import pendulum`, and lazy_object_proxy never crosses into the venv
@@ -161,9 +187,10 @@ services:
         # The pin matches apache/airflow:3.3.1's constraint so a future
         # pendulum major can never break context unpickling. Joins the hash
         # input so previously built venvs rebuild exactly once.
-        bootstrap_packages="pendulum==3.2.0"
+        bootstrap_packages="%{external_python_bootstrap_requirement}"
         hflow_install_target='%{hflow_install_target}'
-        desired_hash="$$({ echo "bootstrap: $$bootstrap_packages"; echo "install: $$hflow_install_target"; cat /opt/user/requirements.txt 2>/dev/null || true; cat /opt/hflow-src/pyproject.toml 2>/dev/null || true; } | sha256sum | cut -d ' ' -f 1)"
+        hflow_expected_version='%{hflow_expected_version}'
+        desired_hash="$$({ echo "bootstrap: $$bootstrap_packages"; echo "install: $$hflow_install_target"; cat /opt/user/pyproject.toml 2>/dev/null || true; cat /opt/user/uv.lock 2>/dev/null || true; cat /opt/user/requirements.txt 2>/dev/null || true; cat /opt/hflow-src/pyproject.toml 2>/dev/null || true; } | sha256sum | cut -d ' ' -f 1)"
         if [ -f "$$marker_file" ] && [ "$$(cat "$$marker_file")" = "$$desired_hash" ]; then
           chown "${AIRFLOW_UID}:0" /opt/venvs /opt/venvs/cache
           echo "user venv matches content hash $$desired_hash -- skipping rebuild"
@@ -171,13 +198,35 @@ services:
         fi
         echo "building user venv for content hash $$desired_hash"
         rm -rf /opt/venvs/user
-        python -m venv /opt/venvs/user
-        /opt/venvs/user/bin/pip install --no-cache-dir --upgrade pip
-        /opt/venvs/user/bin/pip install --no-cache-dir $$bootstrap_packages
-        if [ -f /opt/user/requirements.txt ]; then
-          /opt/venvs/user/bin/pip install --no-cache-dir -r /opt/user/requirements.txt
+        uv venv --python "$$(command -v python)" /opt/venvs/user
+        # A locked project first, then a bare pyproject, then requirements.txt
+        # -- and requirements.txt applies on top either way, so the legacy
+        # escape hatch keeps working beside a project.
+        if [ -f /opt/user/uv.lock ]; then
+          # --inexact: the target venv also holds pendulum and hflow, which are
+          # OURS, not the user's. Without it uv prunes them and every stage
+          # task fails its bootstrap probe.
+          # --no-install-project: /opt/user is mounted read-only, and a build
+          # backend writing metadata into the source tree would fail there.
+          uv sync --project /opt/user --frozen --inexact --no-install-project
+        elif [ -f /opt/user/pyproject.toml ]; then
+          uv pip install --python "$$venv_python" -r /opt/user/pyproject.toml
         fi
-        /opt/venvs/user/bin/pip install --no-cache-dir "$$hflow_install_target"
+        if [ -f /opt/user/requirements.txt ]; then
+          uv pip install --python "$$venv_python" -r /opt/user/requirements.txt
+        fi
+        uv pip install --python "$$venv_python" $$bootstrap_packages "$$hflow_install_target"
+        uv pip check --python "$$venv_python" || echo "warning: user venv has conflicting dependencies (see above)" >&2
+        # The rendered DAGs call this library; a user lockfile pinning another
+        # hflow would run generated code against a version it was not rendered
+        # for. Before this, the bundle's own install target made skew
+        # impossible; a project's lockfile can now win the resolution, so the
+        # guarantee has to be checked instead of assumed.
+        installed_hflow_version="$$("$$venv_python" -c 'import hflow; print(hflow.__version__)')"
+        if [ "$$installed_hflow_version" != "$$hflow_expected_version" ]; then
+          echo "user venv has hflow $$installed_hflow_version but these DAGs were rendered by $$hflow_expected_version; pin hflow==$$hflow_expected_version in your project" >&2
+          exit 1
+        fi
         # Pre-warm the pinned ffmpeg into the volume-backed cache so the
         # download happens here, under the user's eyes at provision time,
         # instead of stalling the first task. Best-effort (|| true): air-gapped

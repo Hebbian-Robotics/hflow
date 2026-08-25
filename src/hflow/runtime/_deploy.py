@@ -39,13 +39,17 @@ from pathlib import Path
 from hflow.app import DEFAULT_APP_VARIABLE
 from hflow.runtime._bundle import (
     BundleKind,
+    copy_user_project,
     hflow_distribution_requirement,
     render_dag_sources,
     sub_dag_id_for_stage,
     warn_if_pipeline_data_root_differs,
     write_bundle_manifest,
 )
-from hflow.runtime._templates import DAG_BUNDLE_CONFIG_LIST_JSON
+from hflow.runtime._templates import (
+    DAG_BUNDLE_CONFIG_LIST_JSON,
+    EXTERNAL_PYTHON_BOOTSTRAP_REQUIREMENT,
+)
 from hflow.stage_execution import USER_DIRECTORY_DEFAULT
 from hflow.steps import RUN_PROFILES, Stage
 from hflow.storage import is_bucket_url, parse_storage_root
@@ -58,7 +62,12 @@ DEFAULT_DEPLOY_VENV_PYTHON = "/opt/venvs/user/bin/python"
 # What the external-python venv must contain besides the user's requirements
 # (references/airflow3-notes.md, "External-python": virtualenv preinstalled;
 # pendulum + lazy_object_proxy for the operator's datetime context probes).
-DEPLOY_VENV_BASE_PACKAGES = ("virtualenv", "pendulum", "lazy_object_proxy")
+# One owner with the Compose renderer, and pinned: an unpinned pendulum here
+# against a pinned one there is a task that fails its bootstrap probe on one
+# deployment path only. virtualenv and lazy_object_proxy are deliberately
+# gone: with expect_airflow=False the venv probe is exactly `import pendulum`,
+# and proxies resolve host-side before pickling so they never cross into it.
+DEPLOY_VENV_BASE_PACKAGES = (EXTERNAL_PYTHON_BOOTSTRAP_REQUIREMENT,)
 
 
 def validate_data_root_uri(data_root_uri: str) -> str:
@@ -167,7 +176,7 @@ def render_deploy_bundle(config: DeployConfig, output_dir: Path | str) -> Deploy
     for directory in (dags_dir, user_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
-    shutil.copyfile(pipeline_source, user_dir / pipeline_source.name)
+    copy_user_project(pipeline_source, user_dir, bundle_directory=output_directory)
     warn_if_pipeline_data_root_differs(
         (user_dir / pipeline_source.name).read_text(), pipeline_source.name, config.data_root_uri
     )

@@ -59,7 +59,7 @@ runtime:
 | `docker-compose.yaml` | The official Airflow 3.3.1 reference compose reduced to LocalExecutor: `postgres`, `airflow-init`, `user-venv-init`, `airflow-apiserver`, `airflow-scheduler`, `airflow-dag-processor`, `airflow-triggerer`. No Redis, no Celery worker. The API binds to `127.0.0.1` only (widen deliberately via `API_BIND_HOST` in `.env`). Overwritten on every re-render. |
 | `.env` | Generated secrets (JWT secret, admin password, Postgres password), the API port and bind host, image tags, your UID. **Create-if-absent**: written once at `0600`, never overwritten by a re-render; your secrets and edits survive, and what's on disk wins over config. |
 | `dags/` | The five generated DAG files (below): the master `ingest.py` (`dag_id` defaults to `<pipeline stem>_ingest`) plus the four stage sub-DAGs `ingest_sync.py` / `ingest_meta.py` / `ingest_labels.py` / `ingest_media.py` (`<stem>_sync` etc.). |
-| `user/` | A copy of your pipeline file and requirements, mounted read-only into the containers. Refreshed on every re-render; re-run `up` after editing your pipeline. |
+| `user/` | A copy of your pipeline file's **directory** -- sibling modules, `pyproject.toml`, `uv.lock`, `requirements.txt` -- minus environments (`.venv`), caches, version-control metadata and `data/`. Mounted read-only into the containers. Refreshed on every re-render; re-run `up` after editing your pipeline. |
 | `logs/` | Airflow task logs, readable from the host. |
 | `hflow-bundle.json` | The bundle described as data: manifest version, kind (`compose`/`deploy`), hflow version, master and sub-DAG ids, data root, pipeline filename, app variable, whether requirements were included, task queue, and the task venv's interpreter path. What tooling (and `load_bundle`) reads instead of parsing generated code; `hflow deploy` emits the same file. |
 
@@ -71,12 +71,18 @@ Two details exist because their absence bites:
   and share volumes (`down --volumes` in one would wipe the other's database).
   Each bundle gets a name derived from its absolute path.
 - **The user venv.** The worker carries two Python environments: Airflow's
-  own, and a venv built from your `--requirements` file inside a named
-  volume. Every DAG task runs in *your* venv via `@task.external_python`, so
-  your dependencies and Airflow's ~128 pins never meet. The venv is keyed to a
-  content hash of your requirements and the exact HFlow install target:
-  unchanged inputs skip the rebuild entirely; a changed requirement or HFlow
-  version rebuilds exactly once. Provisioning also pre-warms HFlow's pinned
+  own, and a venv built from **your project** inside a named volume, with
+  `uv`, which the Airflow image ships. A `uv.lock` beside your pipeline
+  installs exactly the versions you locked; otherwise a `pyproject.toml` is
+  resolved, and a `requirements.txt` applies on top either way (so
+  `--requirements` remains, for one that lives somewhere else). Every DAG task
+  runs in *your* venv via `@task.external_python`, so your dependencies and
+  Airflow's ~128 pins never meet. The venv is keyed to a content hash of your
+  project files and the exact HFlow install target: unchanged inputs skip the
+  rebuild entirely; a changed dependency or HFlow version rebuilds exactly
+  once, and editing the pipeline itself rebuilds nothing. Provisioning refuses
+  to finish if your project resolves a different HFlow than the one that
+  rendered the DAGs, naming the version to pin. Provisioning also pre-warms HFlow's pinned
   ffmpeg into the same volume, so the download happens under your eyes at `up`
   time instead of stalling the first task (best-effort: air-gapped
   provisioning still succeeds, and the task-time fallback remains).

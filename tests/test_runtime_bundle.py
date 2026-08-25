@@ -176,7 +176,7 @@ def test_compose_hflow_source_mount_absent_when_unset(
     ]
     _, script = compose["services"]["user-venv-init"]["command"]
     assert f"hflow_install_target='hflow=={hflow.__version__}'" in script
-    assert 'pip install --no-cache-dir "$$hflow_install_target"' in script
+    assert '"$$hflow_install_target"' in script
     assert "if [ -d /opt/hflow-src ]" not in script
 
 
@@ -258,13 +258,27 @@ def test_user_venv_init_builds_with_content_hash_marker(
     assert flag == "-c"
     # Compose interpolation escaping: shell variables stay $$-escaped in YAML.
     assert "sha256sum" in script
-    assert "python -m venv /opt/venvs/user" in script
-    assert "pip install --no-cache-dir -r /opt/user/requirements.txt" in script
+    # uv, which the Airflow image ships on PATH, with the image's own
+    # interpreter: a managed CPython would break the external-python pickle
+    # boundary between Airflow's process and the task's.
+    assert 'uv venv --python "$$(command -v python)" /opt/venvs/user' in script
+    assert "export UV_PYTHON_DOWNLOADS=never" in script
+    # The image exports VIRTUAL_ENV pointing at Airflow's OWN environment.
+    assert "unset VIRTUAL_ENV" in script
+    assert "export UV_PROJECT_ENVIRONMENT=/opt/venvs/user" in script
+    # A locked project gets the versions it locked; --inexact keeps uv from
+    # pruning pendulum and hflow, which are ours rather than the user's, and
+    # --no-install-project keeps a build backend out of the read-only mount.
+    assert "uv sync --project /opt/user --frozen --inexact --no-install-project" in script
+    assert 'uv pip install --python "$$venv_python" -r /opt/user/requirements.txt' in script
     # The install target is a shell variable so bucket-mode bundles can add
     # the [bucket] extra; local mode renders the bare source path. Shell
     # variables stay $$-escaped in the YAML for Compose's interpolation.
     assert "hflow_install_target='/opt/hflow-src'" in script
-    assert 'pip install --no-cache-dir "$$hflow_install_target"' in script
+    assert '"$$hflow_install_target"' in script
+    # A user lockfile can now win the resolution, so the version the DAGs were
+    # rendered by has to be checked rather than assumed.
+    assert "these DAGs were rendered by" in script
     assert "marker_file=/opt/venvs/user/.hflow-content-hash" in script
     assert "skipping rebuild" in script
     assert "exit 0" in script
@@ -276,8 +290,12 @@ def test_user_venv_init_builds_with_content_hash_marker(
     # Exactly pendulum, pinned to the image's constraint; lazy_object_proxy
     # never crosses into the venv so it is deliberately absent from this list.
     assert 'bootstrap_packages="pendulum==3.2.0"' in script
-    assert "pip install --no-cache-dir $$bootstrap_packages" in script
+    assert '$$bootstrap_packages "$$hflow_install_target"' in script
     assert 'echo "bootstrap: $$bootstrap_packages"' in script
+    # A project's own inputs join the rebuild hash, so editing the pipeline
+    # still refreshes code without rebuilding dependencies.
+    assert "cat /opt/user/pyproject.toml" in script
+    assert "cat /opt/user/uv.lock" in script
 
 
 def test_user_venv_init_prewarms_ffmpeg_best_effort(config: RuntimeConfig, tmp_path: Path) -> None:

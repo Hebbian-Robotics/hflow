@@ -21,14 +21,16 @@ Bundle contents:
 - ``dags/`` -- the FIVE generated DAG files (the ingest stage graph): the master
   ``ingest.py`` plus the four sub-DAGs ``ingest_sync.py`` / ``ingest_meta.py``
   / ``ingest_labels.py`` / ``ingest_media.py`` (see below).
-- ``user/`` -- a copy of the user's pipeline file and requirements, mounted
-  into the containers.
+- ``user/`` -- a copy of the pipeline file's DIRECTORY (minus environments,
+  caches, version-control metadata and ``data/``), mounted into the
+  containers, so a pipeline that imports a module beside it works.
 - ``user-venv`` named volume + an init service that builds the user's venv
-  with ``python -m venv`` + ``pip`` inside the Airflow image (the
-  external-python pattern: user dependencies never meet Airflow's pins;
-  the image ships no ``uv``). The venv is rebuilt
-  only when the requirements/hflow-source content hash changes (a marker
-  file inside the volume is the checkpoint).
+  with ``uv`` inside the Airflow image, which ships it on PATH (the
+  external-python pattern: user dependencies never meet Airflow's pins). A
+  ``uv.lock`` beside the pipeline installs the versions it locked; otherwise a
+  ``pyproject.toml``, and a ``requirements.txt`` applies on top either way.
+  The venv is rebuilt only when the project/requirements/hflow-source content
+  hash changes (a marker file inside the volume is the checkpoint).
 
 The master DAG (the stage graph's master half) runs entirely in Airflow's own
 environment: a plain ``@task`` resolves the run profile against a dict
@@ -75,6 +77,7 @@ from hflow.app import DEFAULT_APP_VARIABLE, ENDPOINT_ENVIRONMENT_VARIABLE_PREFIX
 from hflow.runtime._templates import (
     COMPOSE_TEMPLATE,
     DAG_BUNDLE_CONFIG_LIST_JSON,
+    EXTERNAL_PYTHON_BOOTSTRAP_REQUIREMENT,
     MASTER_DAG_TEMPLATE,
     MEDIA_PLAN_FILTER_TEMPLATE,
     SUB_DAG_ERROR_GATE_TEMPLATE,
@@ -416,6 +419,8 @@ def _render_compose(
         bucket_credentials_env=environment_passthrough,
         bucket_credentials_mount=bucket_credentials_mount,
         hflow_install_target=hflow_install_target,
+        hflow_expected_version=__version__,
+        external_python_bootstrap_requirement=EXTERNAL_PYTHON_BOOTSTRAP_REQUIREMENT,
         dag_bundle_config_list=DAG_BUNDLE_CONFIG_LIST_JSON,
         airflow_hflow_source_mount=airflow_hflow_source_mount,
         venv_init_hflow_source_mount=venv_init_hflow_source_mount,
@@ -807,6 +812,58 @@ def _dag_id_from_bundle_manifest(bundle_directory: Path) -> str | None:
     return dag_id if isinstance(dag_id, str) and dag_id else None
 
 
+# Never copied into a bundle: environments and caches are the host's and would
+# be wrong (or enormous) inside a container, version-control metadata is not
+# input, and data directories are mounted rather than shipped. Matched on the
+# directory name at any depth.
+EXCLUDED_PROJECT_DIRECTORY_NAMES = frozenset(
+    {
+        ".venv",
+        "venv",
+        ".git",
+        ".hg",
+        ".svn",
+        "__pycache__",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".pytest_cache",
+        ".ipynb_checkpoints",
+        "node_modules",
+        "data",
+    }
+)
+
+
+def copy_user_project(pipeline_file: Path, user_dir: Path, *, bundle_directory: Path) -> None:
+    """Copy the pipeline and the modules beside it into the bundle's ``user/``.
+
+    A pipeline is an ordinary Python project, so shipping only the file it
+    lives in made ``import rig_constants`` a ModuleNotFoundError inside every
+    task. The unit copied is the pipeline FILE'S DIRECTORY, not a project root
+    discovered from ``hflow.toml``: the bundle itself renders to
+    ``<data-root>/runtime``, which for the default ``./data`` sits inside the
+    project, so copying a discovered root would copy the bundle into itself
+    and grow on every render.
+
+    The bundle directory is excluded explicitly for the same reason, as are
+    environments, caches, version-control metadata, and ``data/``.
+    """
+    project_directory = pipeline_file.parent.resolve()
+    resolved_bundle_directory = bundle_directory.resolve()
+
+    def ignored_names(directory: str, names: list[str]) -> set[str]:
+        current = Path(directory).resolve()
+        ignored = {name for name in names if name in EXCLUDED_PROJECT_DIRECTORY_NAMES}
+        ignored.update(
+            name for name in names if (current / name).resolve() == resolved_bundle_directory
+        )
+        return ignored
+
+    if user_dir.exists():
+        shutil.rmtree(user_dir)
+    shutil.copytree(project_directory, user_dir, ignore=ignored_names, dirs_exist_ok=True)
+
+
 def find_bundle_directory(data_root: Path | str) -> Path | None:
     """The rendered bundle a workspace addresses, or ``None`` if none exists.
 
@@ -920,7 +977,7 @@ def render_bundle(config: RuntimeConfig, bundle_dir: Path | str) -> BundlePaths:
             dag_data_root = parsed_data_root.url
 
     # user/ contents are derived from config, so they are always refreshed.
-    shutil.copyfile(pipeline_source, user_dir / pipeline_source.name)
+    copy_user_project(pipeline_source, user_dir, bundle_directory=bundle_directory)
     warn_if_pipeline_data_root_differs(
         (user_dir / pipeline_source.name).read_text(), pipeline_source.name, dag_data_root
     )

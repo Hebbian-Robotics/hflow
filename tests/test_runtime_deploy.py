@@ -66,9 +66,47 @@ def test_bundle_layout_and_paths(config: DeployConfig, tmp_path: Path) -> None:
     assert (paths.output_dir / "dags" / ".airflowignore").read_text() == "user/\n"
 
 
-def test_requirements_absent_when_not_supplied(config: DeployConfig, tmp_path: Path) -> None:
-    paths = _render(replace(config, requirements_file=None), tmp_path / "deploy")
+def test_requirements_absent_when_the_project_has_none(tmp_path: Path) -> None:
+    project_dir = tmp_path / "bare-project"
+    project_dir.mkdir()
+    pipeline_file = project_dir / "my_pipeline.py"
+    pipeline_file.write_text(PIPELINE_SOURCE)
+    paths = _render(
+        DeployConfig(pipeline_file=pipeline_file, data_root_uri="/mnt/robot-data"),
+        tmp_path / "deploy",
+    )
     assert not (paths.user_dir / "requirements.txt").exists()
+
+
+def test_a_requirements_file_beside_the_pipeline_ships_with_the_project(
+    config: DeployConfig, tmp_path: Path
+) -> None:
+    """The bundle carries the pipeline's whole directory now, so a
+    requirements.txt sitting in it is part of the project -- --requirements is
+    for pointing at one somewhere else."""
+    paths = _render(replace(config, requirements_file=None), tmp_path / "deploy")
+    assert (paths.user_dir / "requirements.txt").read_text() == "numpy>=2\n"
+
+
+def test_a_sibling_module_ships_so_the_pipeline_can_import_it(
+    config: DeployConfig, tmp_path: Path
+) -> None:
+    (Path(config.pipeline_file).parent / "rig_constants.py").write_text("FLEET = 'kitchen'\n")
+    paths = _render(config, tmp_path / "deploy")
+    assert (paths.user_dir / "rig_constants.py").read_text() == "FLEET = 'kitchen'\n"
+
+
+def test_environments_and_caches_never_ship(config: DeployConfig, tmp_path: Path) -> None:
+    project_dir = Path(config.pipeline_file).parent
+    (project_dir / ".venv" / "bin").mkdir(parents=True)
+    (project_dir / ".venv" / "bin" / "python").write_text("#!/host/python\n")
+    (project_dir / "__pycache__").mkdir()
+    (project_dir / "__pycache__" / "stale.pyc").write_bytes(b"\x00")
+
+    paths = _render(config, tmp_path / "deploy")
+
+    assert not (paths.user_dir / ".venv").exists()
+    assert not (paths.user_dir / "__pycache__").exists()
 
 
 def test_dag_sources_compile_and_carry_deploy_values(config: DeployConfig, tmp_path: Path) -> None:
@@ -201,7 +239,7 @@ def test_deploy_md_contents(config: DeployConfig, tmp_path: Path) -> None:
     assert "my_pipeline_ingest" in deploy_md
     # The external-python venv's package list (virtualenv preinstalled,
     # pendulum + lazy_object_proxy for the operator's datetime probes).
-    assert f"virtualenv pendulum lazy_object_proxy hflow=={hflow.__version__}" in deploy_md
+    assert f"pendulum==3.2.0 hflow=={hflow.__version__}" in deploy_md
     assert "user/requirements.txt" in deploy_md
     # Per-platform placement plus the env var the DAG expects.
     for platform_name in ("Astronomer", "MWAA", "Cloud Composer", "Self-managed"):
