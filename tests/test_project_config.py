@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import hflow
 from hflow.cli import main as cli_main
 from hflow.project import (
     PROJECT_CONFIG_FILE_NAME,
@@ -199,6 +200,53 @@ class TestCliPrecedence:
 
         assert cli_main(["manifest", "--pipeline", "asked_for.py"]) == 0
         assert '"pipeline_name": "asked-for"' in capsys.readouterr().out
+
+    def test_the_pipeline_and_the_cli_address_one_workspace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The whole point of the file, and the case every other test here
+        misses: they all configure `./data`, which is byte-identical to the
+        built-in default, so they pass whether or not anything reads the file.
+
+        A pipeline written the way the docs now teach -- `hflow.App("name")`,
+        no `data_root=` -- has to land in the workspace `hflow.toml` names, or
+        `hflow ingest` writes one corpus while `hflow curate` reads another and
+        both report success against paths the user never configured.
+        """
+        monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
+        _write_config(tmp_path, 'data_root = "./corpus"\n')
+        (tmp_path / "pipeline.py").write_text("import hflow\n\napp = hflow.App('demo')\n")
+        monkeypatch.chdir(tmp_path)
+
+        application = hflow.import_pipeline_application(str(tmp_path / "pipeline.py"))
+
+        assert Path(str(application.data_root)).resolve() == (tmp_path / "corpus").resolve()
+
+    def test_the_environment_still_outranks_the_file_for_the_pipeline_too(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_config(tmp_path, 'data_root = "./corpus"\n')
+        (tmp_path / "pipeline.py").write_text("import hflow\n\napp = hflow.App('demo')\n")
+        monkeypatch.setenv("HFLOW_DATA_ROOT", str(tmp_path / "from-environment"))
+        monkeypatch.chdir(tmp_path)
+
+        application = hflow.import_pipeline_application(str(tmp_path / "pipeline.py"))
+
+        assert str(application.data_root) == str(tmp_path / "from-environment")
+
+    def test_an_explicit_data_root_still_outranks_the_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
+        _write_config(tmp_path, 'data_root = "./corpus"\n')
+        (tmp_path / "pipeline.py").write_text(
+            "import hflow\n\napp = hflow.App('demo', data_root='./pinned')\n"
+        )
+        monkeypatch.chdir(tmp_path)
+
+        application = hflow.import_pipeline_application(str(tmp_path / "pipeline.py"))
+
+        assert Path(str(application.data_root)).name == "pinned"
 
     def test_an_unreadable_file_exits_two_rather_than_crashing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]

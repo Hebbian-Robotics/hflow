@@ -133,18 +133,50 @@ def endpoint_environment_variable_name(alias: str) -> str:
     return f"{ENDPOINT_ENVIRONMENT_VARIABLE_PREFIX}{sanitized_alias}"
 
 
+def default_data_root() -> "Path | str | StorageRoot":
+    """The workspace hflow acts on when no argument and no flag names one.
+
+    The one owner of that answer, because more than one entry point asks it and
+    they must not disagree. The CLI resolves it for ``--catalog`` and
+    ``--output`` defaults; :class:`App` resolves it for a pipeline written as
+    ``hflow.App("name")``, which is the shape the docs and examples now teach.
+    Two implementations of this order is how ``hflow ingest`` ends up writing
+    one workspace while ``hflow curate`` reads another.
+
+    1. ``HFLOW_DATA_ROOT`` -- how a runtime or a control plane injects the
+       workspace's root, and above the file on purpose: the file is committed
+       beside the pipeline, and a shell pointed at another workspace must not
+       need the repository edited.
+    2. the nearest ancestor ``hflow.toml`` (:mod:`hflow.project`)
+    3. ``./data``, the historical local default
+
+    An explicit ``data_root=`` argument or ``--data-root`` flag outranks all
+    three and never reaches here.
+    """
+    environment_data_root = os.environ.get(DATA_ROOT_ENVIRONMENT_VARIABLE)
+    if environment_data_root:
+        return environment_data_root
+    # Imported here rather than at module scope: hflow.project is a small leaf
+    # module, but App construction is on the import path of every pipeline and
+    # the ancestor walk only matters when nothing else answered.
+    from hflow.project import ProjectConfig, find_project_config
+
+    match find_project_config():
+        case ProjectConfig(storage_root=configured_root) if configured_root is not None:
+            return configured_root
+        case _:
+            return DEFAULT_DATA_ROOT
+
+
 def _resolve_data_root(data_root: "Path | str | StorageRoot | None") -> "Path | str | StorageRoot":
     """Resolve the App's data root at the construction boundary.
 
-    An explicit argument always wins; ``None`` means "let the environment
-    decide": :data:`DATA_ROOT_ENVIRONMENT_VARIABLE` if set (how a runtime or
-    control plane injects the workspace's root), else ``./data`` (the
-    historical local default).
+    An explicit argument always wins; ``None`` means "resolve it the way every
+    other hflow entry point does" (:func:`default_data_root`).
     """
     if data_root is not None:
         return data_root
-    environment_data_root = os.environ.get(DATA_ROOT_ENVIRONMENT_VARIABLE)
-    return environment_data_root if environment_data_root else DEFAULT_DATA_ROOT
+    return default_data_root()
 
 
 # The ingest stage graph's "Media" sub-DAG collapsed to its v1 built-in: one

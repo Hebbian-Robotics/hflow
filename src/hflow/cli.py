@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from hflow import __version__
-from hflow.app import DATA_ROOT_ENVIRONMENT_VARIABLE, DEFAULT_DATA_ROOT, parse_pipeline_spec
+from hflow.app import DEFAULT_DATA_ROOT, default_data_root, parse_pipeline_spec
 from hflow.curation import curate, stale_episodes
 from hflow.doctor import diagnose
 from hflow.project import (
@@ -59,23 +59,12 @@ DEFAULT_SERVER_PORT = 4356
 def _environment_data_root() -> str:
     """The data root these commands default to when no flag names one.
 
-    ``HFLOW_DATA_ROOT`` wins, then the nearest ancestor ``hflow.toml``, then
-    ``./data``. The environment outranks the file on purpose: the file is
-    committed beside the pipeline, and a shell or a control plane pointing at
-    a different workspace must not need the repository edited.
-
-    CLI defaults derive from the same resolution the App itself uses, so a
-    shell configured for one workspace addresses that workspace's catalog and
-    runtime consistently -- never a hardcoded ``./data`` beside it.
+    Literally :func:`hflow.app.default_data_root`, as a string for the URL and
+    path joins below. Shared rather than reimplemented: an App written as
+    ``hflow.App("name")`` resolves its root through the same function, so
+    ``hflow ingest`` writes the workspace ``hflow curate`` reads.
     """
-    environment_data_root = os.environ.get(DATA_ROOT_ENVIRONMENT_VARIABLE)
-    if environment_data_root:
-        return environment_data_root
-    match find_project_config():
-        case ProjectConfig(storage_root=configured_root) if configured_root is not None:
-            return str(configured_root)
-        case _:
-            return DEFAULT_DATA_ROOT
+    return str(default_data_root())
 
 
 def _default_catalog_location() -> str:
