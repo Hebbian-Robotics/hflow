@@ -1844,7 +1844,21 @@ class App:
             for registered in checks_to_run:
                 run = CheckRunReport(check=registered)
                 report.checks.append(run)
-                if report.quarantined:
+                # Quarantine stops the user's own steps from piling more
+                # work onto an already-rejected episode, but the defaults
+                # are cheap diagnostic evidence and the episode you most
+                # need to diagnose is the one that just tripped a gate:
+                # ``content_digest`` and ``media_digest`` are exactly the
+                # rows that help tell whether the rejected recording is
+                # the same as a previous one. They are also what the
+                # quarantine tag itself was derived from, so skipping
+                # them on the same run that produced the tag blanks the
+                # catalog row you'd grep for. Defaults still respect the
+                # gate -- their result carries the ``failed:<name>`` or
+                # is recorded normally, and a failing critical default
+                # *adds* a quarantine tag rather than gating later
+                # ones. They just do not get blanket-skipped.
+                if report.quarantined and registered.name not in self._default_check_names:
                     run.not_run = SkippedByQuarantine(tuple(report.quarantine_tags))
                     continue
                 # A default with a registered key pattern: if any pipeline

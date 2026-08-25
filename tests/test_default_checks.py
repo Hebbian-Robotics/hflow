@@ -6,13 +6,13 @@ from typing import Any
 import pytest
 
 import hflow
+from hflow._video_measurements import _frame_statistics
 from hflow.checks import (
     _DEFAULT_KEY_PATTERNS,
     DEFAULT_CHECKS,
     camera_frame_stats,
     episode_duration,
 )
-from hflow.ffmpeg import _instrument
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
 
@@ -185,11 +185,14 @@ def test_a_wrapper_with_non_default_parameters_supersedes_the_default_without_ru
     - the wrapper's measurements are kept;
     - exactly one ffmpeg decode pass happened for the one camera.
 
-    The fake forwards encode, probe, and version calls to the real
-    ``subprocess.run`` so the canonical transcode still happens; only the
-    instrument's ``-vf`` pass is counted. ``Any`` keeps ``ty`` happy on the
-    forwarded call (the variadic ``object`` types ``ty`` rejects because
-    they fail to match any of ``subprocess.run``'s overloads).
+    The fake forwards to the real ``subprocess.Popen`` so the canonical
+    transcode and the instrument pass both still work, and counts only
+    the invocations whose command has both ``-vf`` and ``blackframe``
+    (the camera-measuring filter graph, unique to the instrument
+    pass; ``Episode.frames`` uses ``fps=`` and the contact sheet uses
+    ``scale=...tile=...``). ``Any`` keeps ``ty`` happy on the forwarded
+    call (the variadic ``object`` types ``ty`` rejects because they
+    fail to match any of ``subprocess.Popen``'s overloads).
     """
     app = hflow.App("non-default-wrap", data_root=tmp_path / "data")
 
@@ -200,9 +203,9 @@ def test_a_wrapper_with_non_default_parameters_supersedes_the_default_without_ru
         return hflow.checks.camera_frame_stats(ep, freeze_min_duration_s=5.0)
 
     decode_calls: list[int] = []
-    real_run = _instrument.subprocess.run
+    real_popen = _frame_statistics.subprocess.Popen
 
-    def fake_run(*arguments: Any, **keywords: Any) -> Any:
+    def fake_popen(*arguments: Any, **keywords: Any) -> Any:
         command = arguments[0] if arguments else keywords.get("args", [])
         # The instrument pass is the one whose filter graph contains
         # ``blackframe`` (the camera-measuring graph). ``Episode.frames``
@@ -214,9 +217,9 @@ def test_a_wrapper_with_non_default_parameters_supersedes_the_default_without_ru
             and any("blackframe" in str(arg) for arg in command)
         ):
             decode_calls.append(1)
-        return real_run(*arguments, **keywords)
+        return real_popen(*arguments, **keywords)
 
-    monkeypatch.setattr(_instrument.subprocess, "run", fake_run)
+    monkeypatch.setattr(_frame_statistics.subprocess, "Popen", fake_popen)
     report = app.process(camera_source, stages="full", record=False)
     by_name = {run.check.name: run for run in report.checks}
 
@@ -400,3 +403,59 @@ def test_every_default_in_the_pattern_registry_is_drift_free(
             f"drift in {emitted_name}: pattern predicts {sorted(predicted)} "
             f"but the default emitted {sorted(emitted)}"
         )
+
+
+def test_quarantined_episode_still_carries_default_measurements(
+    camera_source: Path, tmp_path: Path
+) -> None:
+    """Kingston's #177 review (round 1): the reorder that puts user steps
+    ahead of defaults for the supersession decision used to be paired with
+    the pre-existing blanket ``if report.quarantined: continue`` skip,
+    which meant a user critical check that tripped on the first user step
+    would cascade-skip every default, including ``content_digest`` and
+    ``media_digest`` -- the rows you most need to diagnose why a
+    recording was rejected. Defaults are the cheap diagnostic evidence
+    the quarantine itself was derived from, so they keep running and
+    recording on a quarantined episode. User-registered steps still
+    skip; the boundary moves only for the engine's own auto-registered
+    baseline. Pinned here so a future re-ordering can't silently
+    re-couple the two without a test review.
+    """
+    app = hflow.App("quarantining", data_root=tmp_path / "data")
+
+    @app.check(
+        critical=True,
+        gate=hflow.checks.RECOMMENDED_CAMERA_INTEGRITY,
+    )
+    def blackout(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"*black_frame_pct": 99.0})
+
+    report = app.test(camera_source, verbose=False)
+    by_name = {run.check.name: run for run in report.checks}
+    # The user's check did its job: the episode is quarantined.
+    assert report.quarantined is not None
+    assert "blackout" in report.quarantine_tags[0]
+    # User-registered steps after the quarantining one still skip --
+    # that is the right answer for the pipeline's own work and the
+    # reason the blanket skip exists.
+    user = by_name["blackout"]
+    assert user.result is not None
+    assert user.result.verdict is False
+    # The defaults are exempt from the skip: they recorded their
+    # measurements and the report carries them. The two digests are
+    # the explicit ones called out in the review; episode_duration is
+    # the third.
+    episode_duration = by_name["episode_duration"]
+    assert episode_duration.result is not None
+    assert episode_duration.status is hflow.CheckStatus.MEASURED
+    content_digest = by_name["content_digest"]
+    assert content_digest.result is not None
+    assert content_digest.status is hflow.CheckStatus.MEASURED
+    media_digest = by_name["media_digest"]
+    assert media_digest.result is not None
+    assert media_digest.status is hflow.CheckStatus.MEASURED
+    # The camera_frame_stats default also still records its measurements,
+    # so the diagnostic digests on the row that just tripped a gate are
+    # available alongside the user's own evidence.
+    camera = by_name["camera_frame_stats"]
+    assert camera.result is not None

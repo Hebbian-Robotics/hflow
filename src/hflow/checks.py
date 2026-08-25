@@ -1406,10 +1406,12 @@ def _camera_frame_stats_keys(episode: Episode) -> set[str]:
     topic carries at least two messages (the function uses them to compute a
     frame deficit). Every camera the episode declares contributes the same
     eight luma/black/freeze keys plus ``message_count`` and, when applicable,
-    the frame-deficit pair; ``camera_instrument`` is the single non-topic
-    key the ffmpeg version stamp produces, and the function only writes it
-    once it has run the instrument over at least one camera -- an episode
-    with no declared cameras does not get the stamp.
+    the frame-deficit pair. ``camera_instrument`` and
+    ``camera_measurement_definition`` are the two non-topic keys: the
+    function writes them inside the per-topic loop, so a multi-camera
+    episode overwrites the value but never adds a new key, and an episode
+    with no declared cameras records neither -- the loop body never runs
+    and so does not stamp the definition version or the ffmpeg binary.
     """
     keys: set[str] = set()
     for topic in episode.cameras:
@@ -1426,6 +1428,7 @@ def _camera_frame_stats_keys(episode: Episode) -> set[str]:
         keys.add(f"{topic}/luma_avg_max")
     if episode.cameras:
         keys.add("camera_instrument")
+        keys.add("camera_measurement_definition")
     return keys
 
 
@@ -1478,6 +1481,24 @@ def _keyframe_interval_keys(episode: Episode) -> set[str]:
     """Mirror of ``keyframe_interval``: per-camera keys, with
     ``max_keyframe_gap_s`` and ``median_keyframe_interval_s`` conditional on
     whether the camera carried at least one (or two) keyframes.
+
+    The keyframe walk parses every payload in ``channel.raw``, which is
+    the same work the real check does to count keyframes. The exact
+    key set needs the count -- ``median_keyframe_interval_s`` only
+    appears when the camera has at least two keyframes, and there is
+    no cheaper signal that distinguishes the empty / single / multi
+    cases. The scan is acceptable here because it runs at most once
+    per default that could be superseded (the super-sede path is
+    only entered for ``keyframe_interval`` when a pipeline step has
+    already emitted one of the eight per-topic keys above, and only
+    the four ``*_count`` / ``*_is_keyframe`` / ``*_gap_s`` keys are
+    *new* relative to a no-pipeline-cover run); the saved work is
+    the ffmpeg decode the default would otherwise pay, which is the
+    two-to-five-second step per camera the cache from #175 still
+    has to re-run on a fresh episode. Trade documented here so a
+    future change to ``keyframe_interval`` (e.g. a payload-size
+    short-circuit, a cached keyframe count on the channel) can
+    revisit this prediction.
     """
     keys: set[str] = set()
     for topic in episode.cameras:
