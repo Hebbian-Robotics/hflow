@@ -682,7 +682,7 @@ def _command_dataset_create(arguments: argparse.Namespace) -> int:
         return 0
     try:
         dataset = create_dataset(app, arguments.name, sql=arguments.sql)
-    except (ValueError, FileNotFoundError) as error:
+    except (ValueError, FileNotFoundError, FileExistsError) as error:
         print(f"dataset create: {error}", file=sys.stderr)
         return 2
     print(dataset.summary())

@@ -22,6 +22,7 @@ The artifact is a pair, both immutable and never overwritten:
 """
 
 import json
+import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,18 +32,36 @@ from hflow.catalog import EPISODES_VIEW_STATUS_COLUMN
 from hflow.curation import CheckCoverage, CurationReport, curate
 from hflow.format import EPISODE_FORMAT_VERSION
 from hflow.steps import RAN_STATUSES
-from hflow.workspace import Workspace
+from hflow.workspace import MANIFESTS_DIRECTORY_NAME, Workspace
 
 if TYPE_CHECKING:
     from hflow.app import App
-
-MANIFESTS_DIRECTORY_NAME = "manifests"
 
 # Versions this sidecar's shape (not the episode schema, not the catalog
 # layout), following identity_version in workspace.json.
 DATASET_MANIFEST_VERSION = 1
 
 _FALLBACK_DATASET_SLUG = "dataset"
+
+
+class ManifestAlreadyExistsError(FileExistsError):
+    """A manifest already occupies that key.
+
+    Never an overwrite: these artifacts are the record of what a dataset was,
+    and silently replacing one would make an earlier answer unreproducible
+    without anyone noticing. A ``FileExistsError`` so callers that already
+    handle one keep working.
+    """
+
+
+@dataclass(frozen=True)
+class WrittenManifest:
+    """One manifest published into a workspace's ``manifests/``."""
+
+    relative_key: str
+    uri: str
+    file_stem: str
+    report: CurationReport
 
 
 @dataclass(frozen=True)
@@ -69,20 +88,80 @@ class DatasetManifest:
         return self.summary()
 
 
-def dataset_slug(raw_name: str) -> str:
+def dataset_slug(raw_name: str, *, fallback: str = _FALLBACK_DATASET_SLUG) -> str:
     """A user-given name as a filename slug: lowercase, ``[a-z0-9-]``.
 
-    Same rule the workspace server already applies to pinned manifests, so one
-    workspace's ``manifests/`` directory keeps one naming convention whichever
-    surface wrote the file. A name with no ASCII alphanumerics slugs to the
-    fallback rather than being refused.
+    One rule for every surface that writes into ``manifests/``, so a workspace
+    keeps one naming convention whichever wrote the file. A name with no ASCII
+    alphanumerics slugs to ``fallback`` rather than being refused, because a
+    name is a label and refusing one over its alphabet would be absurd.
     """
     slug = "".join(
         character if character.isalnum() and character.isascii() else "-"
         for character in raw_name.lower()
     )
     slug = "-".join(part for part in slug.split("-") if part)
-    return slug or _FALLBACK_DATASET_SLUG
+    return slug or fallback
+
+
+def manifest_file_stem(raw_name: str, *, fallback: str = _FALLBACK_DATASET_SLUG) -> str:
+    """``<slug>-<utc timestamp>``, the filename both writers agree on.
+
+    Microsecond precision, so two manifests of one name in the same second
+    still get distinct files: nothing here is ever overwritten.
+    """
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    return f"{dataset_slug(raw_name, fallback=fallback)}-{stamp}"
+
+
+def write_dataset_manifest(
+    workspace: Workspace,
+    *,
+    name: str,
+    sql: str,
+    constrained: bool = False,
+    file_stem: str | None = None,
+    fallback_slug: str = _FALLBACK_DATASET_SLUG,
+) -> WrittenManifest:
+    """Run ``sql`` and publish the result as an immutable manifest.
+
+    The one owner of "write a manifest into this workspace", shared by
+    ``hflow dataset create`` and the workspace server's pinning route. Neither
+    calls the other: the CLI needs an App for its default policy and provenance
+    record, the server has no App to require and must run tenant SQL
+    ``constrained``, and both need exactly this.
+
+    Staged into a temporary directory outside the workspace and then published
+    create-if-absent, which is what makes "never overwritten" a property of the
+    store rather than of a check-then-write race. Bucket roots get the same
+    guarantee: the conditional put is the arbiter.
+    """
+    manifests_root = workspace.manifests_root
+    stem = file_stem if file_stem is not None else manifest_file_stem(name, fallback=fallback_slug)
+    manifest_key = f"{stem}.parquet"
+    if manifests_root.exists(manifest_key):
+        # A cheap refusal before the query runs, so a collision never pays for
+        # the work. The create-if-absent publish below is the real arbiter.
+        raise ManifestAlreadyExistsError(
+            f"a manifest already exists at {manifests_root.uri_for(manifest_key)}; "
+            "manifests are immutable and never overwritten"
+        )
+    with tempfile.TemporaryDirectory(prefix="hflow-manifest-") as staging_directory:
+        staged_manifest = Path(staging_directory) / manifest_key
+        report = curate(
+            workspace.catalog_root, sql, output=staged_manifest, constrained=constrained
+        )
+        if not manifests_root.store_file_if_absent(staged_manifest, manifest_key):
+            raise ManifestAlreadyExistsError(
+                f"a manifest already exists at {manifests_root.uri_for(manifest_key)}; "
+                "manifests are immutable and never overwritten"
+            )
+    return WrittenManifest(
+        relative_key=f"{MANIFESTS_DIRECTORY_NAME}/{manifest_key}",
+        uri=manifests_root.uri_for(manifest_key),
+        file_stem=stem,
+        report=report,
+    )
 
 
 def _quote_sql_string(value: str) -> str:
@@ -155,37 +234,29 @@ def create_dataset(
     """
     workspace = Workspace(application.storage_root)
     stamped_at = created_at if created_at is not None else datetime.now(UTC).isoformat()
-    # Microsecond precision, so two datasets of one name in the same second
-    # still get distinct files: these are never overwritten.
-    file_stem = f"{dataset_slug(name)}-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}"
-    manifests_root = workspace.storage_root.child(MANIFESTS_DIRECTORY_NAME)
     effective_sql = sql if sql is not None else default_dataset_sql(application)
 
-    report = curate(
-        workspace.catalog_root,
-        effective_sql,
-        output=manifests_root.uri_for(f"{file_stem}.parquet"),
-    )
-    sidecar_name = f"{file_stem}.json"
+    written = write_dataset_manifest(workspace, name=name, sql=effective_sql)
+    sidecar_name = f"{written.file_stem}.json"
     sidecar_payload = _sidecar_payload(
         application=application,
         name=name,
         sql=effective_sql,
-        report=report,
+        report=written.report,
         created_at=stamped_at,
         workspace=workspace,
     )
-    manifests_root.write_bytes_if_absent(
+    workspace.manifests_root.write_bytes_if_absent(
         sidecar_name, (json.dumps(sidecar_payload, indent=2, sort_keys=True) + "\n").encode()
     )
     return DatasetManifest(
-        manifest_path=report.manifest_path if report.manifest_path is not None else "",
-        sidecar_path=manifests_root.uri_for(sidecar_name),
+        manifest_path=written.uri,
+        sidecar_path=workspace.manifests_root.uri_for(sidecar_name),
         name=name,
         sql=effective_sql,
-        row_count=report.row_count,
-        total_episodes=report.total_episodes,
-        coverage=report.coverage,
+        row_count=written.report.row_count,
+        total_episodes=written.report.total_episodes,
+        coverage=written.report.coverage,
         created_at=stamped_at,
     )
 

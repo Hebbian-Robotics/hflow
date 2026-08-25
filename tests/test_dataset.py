@@ -195,3 +195,52 @@ class TestCli:
 def test_slugs_fall_back_rather_than_being_refused() -> None:
     assert dataset_slug("Clean Corpus!") == "clean-corpus"
     assert dataset_slug("!!!") == "dataset"
+
+
+def test_a_bucket_backed_workspace_can_write_a_manifest(tmp_path: Path) -> None:
+    """The hosted case, and the reason this moved out of the server: hosted
+    workspaces are bucket data roots, and pinning used to refuse them with a
+    501 because it did local path arithmetic."""
+    pytest.importorskip("obstore", reason="bucket tests need the hflow[bucket] extra")
+    from hflow.dataset import write_dataset_manifest
+    from hflow.storage import BucketStorageRoot
+    from hflow.workspace import Workspace
+
+    remote_dir = tmp_path / "bucket"
+    remote_dir.mkdir()
+    storage_root = BucketStorageRoot(f"file://{remote_dir}", mirror=tmp_path / "mirror")
+    workspace = Workspace(storage_root)
+    app = hflow.App("bucket-demo", data_root=storage_root, default_checks=())
+    source = synthesize_episode(
+        tmp_path / "episode_0001.mcap", SyntheticEpisodeSpec(duration_s=1.0, cameras=())
+    )
+    app.process(source, record=True, verbose=False)
+
+    written = write_dataset_manifest(workspace, name="clean", sql="SELECT episode_id FROM episodes")
+
+    assert written.relative_key.startswith("manifests/clean-")
+    assert written.report.row_count == 1
+    # The object really landed in the store, not only in the local mirror.
+    assert (remote_dir / written.relative_key).is_file()
+
+
+def test_a_manifest_is_never_overwritten(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two writers racing one key: the store arbitrates, not a check-then-write."""
+    from hflow.dataset import ManifestAlreadyExistsError, write_dataset_manifest
+    from hflow.workspace import Workspace
+
+    data_root = tmp_path / "data"
+    app = hflow.App("collide", data_root=data_root, default_checks=())
+    source = synthesize_episode(
+        tmp_path / "episode_0001.mcap", SyntheticEpisodeSpec(duration_s=1.0, cameras=())
+    )
+    app.process(source, record=True, verbose=False)
+    workspace = Workspace.parse(data_root)
+
+    write_dataset_manifest(
+        workspace, name="clean", sql="SELECT episode_id FROM episodes", file_stem="pinned"
+    )
+    with pytest.raises(ManifestAlreadyExistsError):
+        write_dataset_manifest(
+            workspace, name="clean", sql="SELECT episode_id FROM episodes", file_stem="pinned"
+        )

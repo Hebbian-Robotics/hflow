@@ -33,6 +33,7 @@ EPISODES_DIRECTORY_NAME = "episodes"
 CATALOG_DIRECTORY_NAME = "catalog"
 TEST_RUNS_DIRECTORY_NAME = "test-runs"
 RUNTIME_BUNDLE_DIRECTORY_NAME = "runtime"
+MANIFESTS_DIRECTORY_NAME = "manifests"
 
 WORKSPACE_IDENTITY_FILE_NAME = "workspace.json"
 
@@ -118,6 +119,16 @@ class Workspace:
     def test_runs_root(self) -> StorageRoot:
         """Where dev-loop runs land: ``<data_root>/test-runs/``."""
         return self.storage_root.child(TEST_RUNS_DIRECTORY_NAME)
+
+    @property
+    def manifests_root(self) -> StorageRoot:
+        """Where curated selections land: ``<data_root>/manifests/``.
+
+        Two surfaces write here -- ``hflow dataset create`` and the workspace
+        server's manifest pinning -- so the directory name and the layout
+        belong to the workspace rather than to either of them.
+        """
+        return self.storage_root.child(MANIFESTS_DIRECTORY_NAME)
 
     def identity(self) -> WorkspaceIdentity | None:
         """The stored identity, or ``None`` when none was ever minted."""

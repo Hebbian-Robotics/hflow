@@ -54,6 +54,10 @@ These are API capabilities, not browser screens. A frontend supplied through
   much of the corpus). Pinning a manifest freezes a query's
   result as an immutable Parquet manifest under `<data_root>/manifests/`,
   recorded with its SQL, row count, and coverage in the Manifests registry.
+  The same directory and the same naming `hflow dataset create` writes into,
+  through the same SDK writer, so a workspace has one manifest convention
+  whichever surface produced the file -- including a bucket-backed workspace,
+  where saved queries and pinned manifests work like any other.
 - **Runs** -- the ingest runtime's health, recent runs with their trigger
   configuration, per-stage activity, and the same trigger operation used by
   `hflow ingest`. It addresses a rendered local bundle or a remote

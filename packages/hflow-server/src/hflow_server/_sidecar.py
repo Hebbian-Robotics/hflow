@@ -31,14 +31,12 @@ format, which ``STATE_VERSION`` guards.
 """
 
 import json
-import uuid
 from dataclasses import dataclass
-from pathlib import Path
 
 from fastapi import HTTPException
 
+from hflow.storage import parse_storage_root
 from hflow_server._contract import CheckCoverageEntry, PinnedManifestEntry, SavedQueryEntry
-from hflow_server._settings import local_data_root_or_none
 
 STATE_VERSION = 1
 SIDECAR_DIRECTORY_NAME = "curation"
@@ -62,38 +60,40 @@ class SidecarState:
     manifests: tuple[PinnedManifestEntry, ...] = ()
 
 
-def local_data_root(data_root: str) -> Path:
-    """The data root as a local directory; sidecar and manifest writes need one."""
-    local_root = local_data_root_or_none(data_root)
-    if local_root is None:
-        raise SidecarError(
-            501,
-            "saved queries and pinned manifests need a local data root; "
-            "bucket-backed workspaces are not supported by the curation studio yet",
-        )
-    return local_root
+SIDECAR_STATE_KEY = f"{SIDECAR_DIRECTORY_NAME}/{SIDECAR_FILE_NAME}"
 
 
-def sidecar_state_file(data_root: str) -> Path:
-    return local_data_root(data_root) / SIDECAR_DIRECTORY_NAME / SIDECAR_FILE_NAME
+def sidecar_state_description(data_root: str) -> str:
+    """How the sidecar is named in refusals: the root as given, plus the key.
+
+    Deliberately the root's own string rather than a resolved URI, so an error
+    names the workspace the operator launched against.
+    """
+    return f"{parse_storage_root(data_root)}/{SIDECAR_STATE_KEY}"
 
 
 def load_sidecar_state(data_root: str) -> SidecarState:
     """The parsed sidecar; empty when never written, loud on anything corrupt."""
-    state_file = sidecar_state_file(data_root)
+    state_description = sidecar_state_description(data_root)
     try:
-        raw_payload = state_file.read_text(encoding="utf-8")
+        raw_payload = parse_storage_root(data_root).read_bytes(SIDECAR_STATE_KEY).decode("utf-8")
     except FileNotFoundError:
         return SidecarState()
-    except OSError as error:
-        raise SidecarError(500, f"cannot read curation state file {state_file}: {error}") from error
-    return _parsed_state(raw_payload, state_file)
+    except (OSError, UnicodeDecodeError) as error:
+        raise SidecarError(
+            500, f"cannot read curation state file {state_description}: {error}"
+        ) from error
+    return _parsed_state(raw_payload, state_description)
 
 
 def store_sidecar_state(data_root: str, state: SidecarState) -> None:
-    """Atomically replace the sidecar with ``state`` (temp file + os.replace)."""
-    state_file = sidecar_state_file(data_root)
-    state_file.parent.mkdir(parents=True, exist_ok=True)
+    """Replace the sidecar with ``state``.
+
+    Written through the storage root, so a bucket-backed workspace keeps saved
+    queries and pinned manifests like any other. Both backends replace the
+    object in one step -- a local temp-file rename, a single bucket PUT -- so a
+    reader sees the old complete state or the new one, never a mix.
+    """
     # by_alias: the stored keys are the published ones ("id", not "query_id").
     payload = json.dumps(
         {
@@ -103,26 +103,22 @@ def store_sidecar_state(data_root: str, state: SidecarState) -> None:
         },
         indent=2,
     )
-    temporary_file = state_file.parent / f".{SIDECAR_FILE_NAME}.{uuid.uuid4().hex}.tmp"
     try:
-        temporary_file.write_text(payload + "\n", encoding="utf-8")
-        # Path.replace is os.replace: atomic on one filesystem, so a reader
-        # (or a crash) sees the old complete state or the new one, never a mix.
-        temporary_file.replace(state_file)
+        parse_storage_root(data_root).write_bytes(SIDECAR_STATE_KEY, (payload + "\n").encode())
     except OSError as error:
-        temporary_file.unlink(missing_ok=True)
         raise SidecarError(
-            500, f"cannot write curation state file {state_file}: {error}"
+            500,
+            f"cannot write curation state file {sidecar_state_description(data_root)}: {error}",
         ) from error
 
 
-def _refused(state_file: Path, problem: str) -> SidecarError:
+def _refused(state_file: str, problem: str) -> SidecarError:
     return SidecarError(
         500, f"corrupt curation state file {state_file}: {problem}; fix or remove the file"
     )
 
 
-def _parsed_state(raw_payload: str, state_file: Path) -> SidecarState:
+def _parsed_state(raw_payload: str, state_file: str) -> SidecarState:
     try:
         parsed = json.loads(raw_payload)
     except json.JSONDecodeError as error:
@@ -152,35 +148,35 @@ def _parsed_state(raw_payload: str, state_file: Path) -> SidecarState:
     return SidecarState(saved_queries=saved_queries, manifests=manifests)
 
 
-def _entry_list(parsed: dict[str, object], key: str, state_file: Path) -> list[dict[str, object]]:
+def _entry_list(parsed: dict[str, object], key: str, state_file: str) -> list[dict[str, object]]:
     entries = parsed.get(key, [])
     if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
         raise _refused(state_file, f"{key!r} must be a list of objects")
     return entries
 
 
-def _string_field(entry: dict[str, object], key: str, state_file: Path) -> str:
+def _string_field(entry: dict[str, object], key: str, state_file: str) -> str:
     value = entry.get(key)
     if not isinstance(value, str):
         raise _refused(state_file, f"entry field {key!r} must be a string, got {value!r}")
     return value
 
 
-def _int_field(entry: dict[str, object], key: str, state_file: Path) -> int:
+def _int_field(entry: dict[str, object], key: str, state_file: str) -> int:
     value = entry.get(key)
     if isinstance(value, bool) or not isinstance(value, int):
         raise _refused(state_file, f"entry field {key!r} must be an integer, got {value!r}")
     return value
 
 
-def _float_field(entry: dict[str, object], key: str, state_file: Path) -> float:
+def _float_field(entry: dict[str, object], key: str, state_file: str) -> float:
     value = entry.get(key)
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise _refused(state_file, f"entry field {key!r} must be a number, got {value!r}")
     return float(value)
 
 
-def _parsed_saved_query(entry: dict[str, object], state_file: Path) -> SavedQueryEntry:
+def _parsed_saved_query(entry: dict[str, object], state_file: str) -> SavedQueryEntry:
     # Field-by-field on purpose: a model_validate refusal would name pydantic's
     # own error shape, not this file and the fix for it.
     return SavedQueryEntry(
@@ -191,7 +187,7 @@ def _parsed_saved_query(entry: dict[str, object], state_file: Path) -> SavedQuer
     )
 
 
-def _parsed_manifest(entry: dict[str, object], state_file: Path) -> PinnedManifestEntry:
+def _parsed_manifest(entry: dict[str, object], state_file: str) -> PinnedManifestEntry:
     raw_coverage = entry.get("coverage", [])
     if not isinstance(raw_coverage, list) or not all(
         isinstance(coverage_entry, dict) for coverage_entry in raw_coverage

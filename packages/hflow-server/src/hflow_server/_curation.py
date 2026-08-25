@@ -30,6 +30,7 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 from hflow.curation import CurationReport, curate
+from hflow.dataset import ManifestAlreadyExistsError, write_dataset_manifest
 from hflow.workspace import Workspace
 from hflow_server import _catalog, _connections, _media, _sidecar
 from hflow_server._contract import (
@@ -48,8 +49,6 @@ from hflow_server._contract import (
     SavedQueryListResponse,
 )
 from hflow_server._settings import ServerSettings, refuse_when_read_only
-
-MANIFESTS_DIRECTORY_NAME = "manifests"
 
 # BROWSING ORDER only, never membership: which relations exist is
 # hflow.open_catalog_connection's fact, read live off information_schema (see
@@ -315,9 +314,6 @@ def create_curation_router(settings: ServerSettings) -> APIRouter:
     def stored_sidecar_state(state: _sidecar.SidecarState) -> None:
         _sidecar.store_sidecar_state(settings.data_root, state)
 
-    def local_data_root_or_refuse() -> Path:
-        return _sidecar.local_data_root(settings.data_root)
-
     @router.post("/curation/preview")
     def run_curation_preview(request: PreviewRequest) -> CurationPreviewResponse:
         user_sql = _stripped_sql_or_refuse(request.sql)
@@ -359,26 +355,37 @@ def create_curation_router(settings: ServerSettings) -> APIRouter:
                     detail=f"this workspace already has {_MAX_PINNED_MANIFESTS} pinned "
                     "manifests (the registry cap); remove some before pinning more",
                 )
-            manifests_directory = local_data_root_or_refuse() / MANIFESTS_DIRECTORY_NAME
-            manifest_file = manifests_directory / (
-                f"{manifest_slug}-{_manifest_timestamp()}.parquet"
-            )
-            if manifest_file.exists():
+            # The SDK owns writing a manifest into a workspace (staging, the
+            # create-if-absent publish, the filename convention), so pinning
+            # works on a bucket-backed workspace and cannot drift from
+            # `hflow dataset create`. Constrained, because this SQL is the
+            # tenant's.
+            try:
+                written = write_dataset_manifest(
+                    Workspace.parse(settings.data_root),
+                    name=request.name,
+                    sql=user_sql,
+                    constrained=True,
+                    file_stem=f"{manifest_slug}-{_manifest_timestamp()}",
+                )
+            except ManifestAlreadyExistsError as error:
                 raise HTTPException(
                     status_code=409,
-                    detail=f"manifest file {manifest_file.name} already exists; "
-                    "pinned manifests are immutable and never overwritten -- retry the pin",
-                )
-            report = _curated_or_refused(settings.data_root, user_sql, output=manifest_file)
+                    detail=f"{error} -- retry the pin",
+                ) from error
+            except (FileNotFoundError, ValueError) as error:
+                raise _connections.catalog_unavailable_refusal(error) from error
+            except duckdb.Error as error:
+                raise _bad_sql_refusal(error) from error
             entry = PinnedManifestEntry(
                 manifest_id=uuid.uuid4().hex,
                 name=request.name,
                 description=request.description,
                 sql=user_sql,
-                manifest_path=f"{MANIFESTS_DIRECTORY_NAME}/{manifest_file.name}",
-                row_count=report.row_count,
-                total_episodes=report.total_episodes,
-                coverage=_coverage_entries(report),
+                manifest_path=written.relative_key,
+                row_count=written.report.row_count,
+                total_episodes=written.report.total_episodes,
+                coverage=_coverage_entries(written.report),
                 created_at=_utc_now_iso(),
             )
             stored_sidecar_state(
@@ -409,7 +416,30 @@ def create_curation_router(settings: ServerSettings) -> APIRouter:
             raise HTTPException(
                 status_code=404, detail=f"no pinned manifest with id {manifest_id!r}"
             )
-        manifest_file = local_data_root_or_refuse() / entry.manifest_path
+        # Fetched through the storage root, so a bucket-backed workspace serves
+        # its manifests like any other: fetch downloads into the mirror there
+        # and is the file itself for a local root.
+        try:
+            manifest_file = Workspace.parse(settings.data_root).storage_root.fetch(
+                entry.manifest_path
+            )
+        except ValueError as error:
+            # A hand-edited registry key that escapes the root. The storage
+            # layer refuses it before any filesystem call, one step earlier
+            # than the served-file containment check below -- so it has to
+            # land on the same 403, and the path is never echoed back.
+            raise HTTPException(
+                status_code=403,
+                detail="pinned manifest path is not inside this workspace",
+            ) from error
+        except (FileNotFoundError, OSError) as error:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"pinned manifest {entry.manifest_path!r} is registered but its file "
+                    f"is not in this workspace: {error}"
+                ),
+            ) from error
         # The same strict-resolve + containment check media serving uses: even
         # a hand-edited registry path can only serve workspace files. Its
         # refusal is already an HTTPException, so it needs no rewrapping here.
