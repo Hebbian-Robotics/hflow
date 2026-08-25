@@ -1,9 +1,14 @@
 """GET /api/v1/episodes/{episode_id}: the dossier shape."""
 
 from datetime import datetime
+from pathlib import Path
 
 from fastapi.testclient import TestClient
-from ui_test_fixtures import PopulatedWorkspace
+from hflow_server import ServerSettings, create_app
+from ui_test_fixtures import STAMPS, PopulatedWorkspace
+
+import hflow
+from hflow.catalog import Catalog, CheckRunRow
 
 
 def _dossier(api: TestClient, episode_id: str) -> dict:
@@ -144,3 +149,43 @@ def test_unknown_episode_is_a_404_with_detail(api: TestClient) -> None:
     response = api.get("/api/v1/episodes/definitely-not-an-id")
     assert response.status_code == 404
     assert "definitely-not-an-id" in response.json()["detail"]
+
+
+def test_dossier_reports_unverified_when_a_critical_check_crashed(
+    tmp_path: Path, unbuilt_assets_dir: Path
+) -> None:
+    """#164 item 7: the server renders the third status value.
+
+    Built on its own root rather than the shared populated workspace, so the
+    episode counts other tests pin stay as they are.
+    """
+    data_root = tmp_path / "data"
+    catalog_root = data_root / "catalog"
+    episodes_directory = data_root / "episodes"
+    episodes_directory.mkdir(parents=True)
+    canonical = episodes_directory / "crashed.canonical.mcap"
+    canonical.write_bytes(b"canonical for a crashed critical check")
+
+    catalog = Catalog(catalog_root)
+    append = catalog.append_episode(
+        canonical_path=canonical,
+        stamps=STAMPS,
+        episode_metadata={"task": "fold_napkin"},
+        check_rows=[
+            CheckRunRow(
+                check_name="camera_blackout",
+                check_version="v1",
+                critical=True,
+                status=hflow.CheckStatus.ERROR,
+                duration_s=0.01,
+                error="ffmpeg exited 1",
+            )
+        ],
+    )
+
+    api = TestClient(
+        create_app(ServerSettings(data_root=str(data_root), assets_dir=unbuilt_assets_dir))
+    )
+    episode = _dossier(api, append.episode_id)["episode"]
+    assert episode["status"] == "unverified"
+    assert episode["quarantine_tags"] == []
