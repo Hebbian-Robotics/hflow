@@ -41,7 +41,10 @@ from hflow.ffmpeg._contact_sheet import (
 )
 from hflow.ffmpeg._instrument import (
     InstrumentParseError,
+    _instrument_cache_path,
+    _read_instrument_cache,
     _stats_from_instrument_output,
+    _write_instrument_cache,
     frame_stats,
 )
 from hflow.ffmpeg._raw_frames import (
@@ -912,3 +915,259 @@ def test_a_missing_required_signal_raises_instead_of_shrinking_a_denominator() -
     missing_tout = missing_tout.replace("lavfi.signalstats.TOUT=0\n", "")
     with pytest.raises(InstrumentParseError, match="TOUT"):
         _stats_from_instrument_output(missing_tout)
+
+
+# --- frame_stats workdir cache ------------------------------------------------
+#
+# Tests for the issue #173 fix: the raw instrument stdout is cached in a
+# ``.instrument.txt`` file beside the video, so two callers reaching for the
+# same video (the camera_frame_stats + camera_signal_quality built-in pair, or
+# a wrapper that calls frame_stats directly) share one ffmpeg decode pass.
+# Aggregation thresholds re-run from the cached text on every call, so the
+# cache is keyed on the video path only.
+
+
+def _fake_completed_process(stdout: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
+
+
+def test_instrument_cache_path_lives_next_to_the_mp4() -> None:
+    """A workdir-MP4 path gets a sibling ``.instrument.txt``. A non-MP4 path
+    returns None so the caller knows caching is off for that path -- a
+    ``.h264`` source has no canonical sibling name in the workdir convention.
+    """
+    assert _instrument_cache_path(Path("/work/wrist_cam.mp4")) == Path(
+        "/work/wrist_cam.instrument.txt"
+    )
+    assert _instrument_cache_path(Path("/work/WRIST_CAM.MP4")) == Path(
+        "/work/WRIST_CAM.instrument.txt"
+    )
+    assert _instrument_cache_path(Path("/work/raw.h264")) is None
+
+
+def test_write_and_read_round_trip(tmp_path: Path) -> None:
+    """A cache write followed by a read returns the same text. The write
+    uses an atomic ``.tmp`` rename so a partial file cannot masquerade as a
+    complete cache, the same shape the MP4 remux uses (``video.py:259,295``).
+    """
+    cache_path = tmp_path / "video.instrument.txt"
+    payload = _synthetic_frames({"lavfi.signalstats.YAVG": 100})
+    _write_instrument_cache(cache_path, payload)
+    assert _read_instrument_cache(cache_path) == payload
+    # No leftover ``.tmp`` from a clean write.
+    assert not (tmp_path / "video.instrument.txt.tmp").exists()
+
+
+def test_write_cleans_up_temp_on_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failure inside the write path removes the ``.tmp`` so a half-written
+    file cannot be read as a complete cache by the next call.
+    """
+    cache_path = tmp_path / "video.instrument.txt"
+
+    def explode(*arguments: object, **keywords: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("os.replace", explode)
+    with pytest.raises(OSError, match="disk full"):
+        _write_instrument_cache(cache_path, "anything\n")
+    assert not (tmp_path / "video.instrument.txt.tmp").exists()
+    assert not cache_path.exists()
+
+
+def test_read_returns_none_when_cache_missing(tmp_path: Path) -> None:
+    cache_path = tmp_path / "video.instrument.txt"
+    assert _read_instrument_cache(cache_path) is None
+
+
+def test_read_deletes_corrupt_cache_and_returns_none(tmp_path: Path) -> None:
+    """A cache file that is not valid UTF-8 is deleted and treated as a
+    miss, so the next call re-decodes. Same self-healing shape as a corrupt
+    MP4 triggering a re-remux.
+    """
+    cache_path = tmp_path / "video.instrument.txt"
+    cache_path.write_bytes(b"\xff\xfe\xff invalid utf-8")
+    assert _read_instrument_cache(cache_path) is None
+    assert not cache_path.exists()
+
+
+def test_frame_stats_caches_subsequent_calls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Two ``frame_stats`` calls on the same video shell out to ffmpeg once.
+    A pipeline that calls ``frame_stats`` twice -- the camera_frame_stats +
+    camera_signal_quality built-in pair, or a wrapper that re-reaches for
+    the instrument -- pays the decode cost the first time only.
+    """
+    video = tmp_path / "wrist_cam.mp4"
+    video.write_bytes(b"")  # file existence is all the cache key needs.
+    instrument_stdout = _synthetic_frames(
+        {"lavfi.signalstats.YAVG": 100},
+        {"lavfi.signalstats.YAVG": 200},
+    )
+    counter_box: list[int] = [0]
+
+    def counted(*arguments: object, **keywords: object) -> subprocess.CompletedProcess[str]:
+        # ``frame_stats`` invokes subprocess.run for the instrument pass;
+        # ``ffmpeg_version`` separately shells out to read the version line.
+        # We count only the instrument pass: its argv has ``-vf`` (the
+        # measuring filter graph), which the version probe does not.
+        command = arguments[0] if arguments else keywords.get("args", [])
+        if isinstance(command, (list, tuple)) and "-vf" in command:
+            counter_box[0] += 1
+        return _fake_completed_process(instrument_stdout)
+
+    monkeypatch.setattr("hflow.ffmpeg._instrument.subprocess.run", counted)
+    first = frame_stats(video)
+    second = frame_stats(video)
+    assert counter_box[0] == 1
+    # Both calls return equivalent stats from the same cached decode.
+    assert first.frame_count == second.frame_count == 2
+    assert first.luma_avg_mean == second.luma_avg_mean == pytest.approx(150.0)
+    # The cache file landed next to the video, atomically.
+    assert (tmp_path / "wrist_cam.instrument.txt").is_file()
+
+
+def test_frame_stats_does_not_cache_for_non_mp4_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A ``.h264`` source (no workdir remux in the way) disables caching:
+    every call re-decodes. A file with a sibling name we cannot guarantee
+    belongs to us should not be silently shadowed.
+    """
+    video = tmp_path / "raw.h264"
+    video.write_bytes(b"")
+    instrument_stdout = _synthetic_frames({"lavfi.signalstats.YAVG": 100})
+    counter_box: list[int] = [0]
+
+    def counted(*arguments: object, **keywords: object) -> subprocess.CompletedProcess[str]:
+        command = arguments[0] if arguments else keywords.get("args", [])
+        if isinstance(command, (list, tuple)) and "-vf" in command:
+            counter_box[0] += 1
+        return _fake_completed_process(instrument_stdout)
+
+    monkeypatch.setattr("hflow.ffmpeg._instrument.subprocess.run", counted)
+    frame_stats(video)
+    frame_stats(video)
+    assert counter_box[0] == 2
+    # No ``.instrument.txt`` was written beside the source.
+    assert not list(tmp_path.glob("*.instrument.txt"))
+
+
+def test_frame_stats_decodes_per_video(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A second camera's video gets its own decode. The cache key is the
+    video path, so per-camera footage still costs one decode per camera
+    per episode -- the fix collapses the doubled cost without merging
+    per-camera readings.
+    """
+    wrist = tmp_path / "wrist_cam.mp4"
+    overhead = tmp_path / "overhead_cam.mp4"
+    wrist.write_bytes(b"")
+    overhead.write_bytes(b"")
+    instrument_stdout = _synthetic_frames({"lavfi.signalstats.YAVG": 100})
+    counter_box: list[int] = [0]
+
+    def counted(*arguments: object, **keywords: object) -> subprocess.CompletedProcess[str]:
+        command = arguments[0] if arguments else keywords.get("args", [])
+        if isinstance(command, (list, tuple)) and "-vf" in command:
+            counter_box[0] += 1
+        return _fake_completed_process(instrument_stdout)
+
+    monkeypatch.setattr("hflow.ffmpeg._instrument.subprocess.run", counted)
+    frame_stats(wrist)
+    frame_stats(overhead)
+    frame_stats(wrist)  # hits the wrist cache
+    frame_stats(overhead)  # hits the overhead cache
+    assert counter_box[0] == 2
+
+
+def test_frame_stats_threshold_change_re_aggregates_from_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A different ``bright_luma_threshold`` on the second call must reuse
+    the cached decode and re-aggregate, not re-decode. The cache is keyed
+    on the video path only -- thresholds are not part of the key because
+    changing one is a free no-decode re-aggregation.
+    """
+    video = tmp_path / "wrist_cam.mp4"
+    video.write_bytes(b"")
+    # Frame luma values: 100 (fine), 200 (fine at 235, fine at 150),
+    # 230 (fine at 235, overexposed at 150). The two thresholds must
+    # produce different overexposed_frame_count on the same decode.
+    instrument_stdout = _synthetic_frames(
+        {"lavfi.signalstats.YAVG": 100},
+        {"lavfi.signalstats.YAVG": 200},
+        {"lavfi.signalstats.YAVG": 230},
+    )
+    counter_box: list[int] = [0]
+
+    def counted(*arguments: object, **keywords: object) -> subprocess.CompletedProcess[str]:
+        command = arguments[0] if arguments else keywords.get("args", [])
+        if isinstance(command, (list, tuple)) and "-vf" in command:
+            counter_box[0] += 1
+        return _fake_completed_process(instrument_stdout)
+
+    monkeypatch.setattr("hflow.ffmpeg._instrument.subprocess.run", counted)
+    default = frame_stats(video)  # bright_luma_threshold=235.0 default
+    tightened = frame_stats(video, bright_luma_threshold=150.0)
+    assert counter_box[0] == 1
+    # Same decode, different aggregation: 230 is overexposed at 150 but not
+    # at 235; 200 is the other way around (it is now overexposed too).
+    assert default.overexposed_frame_count == 0
+    assert tightened.overexposed_frame_count == 2
+
+
+def test_frame_stats_corrupt_cache_self_heals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A cache file that parses to ``InstrumentParseError`` is deleted and
+    the call re-decodes. The instrument must never invent a number from a
+    corrupt cache -- exactly the rule the parser already enforces on live
+    ffmpeg output.
+    """
+    video = tmp_path / "wrist_cam.mp4"
+    video.write_bytes(b"")
+    cache_path = tmp_path / "wrist_cam.instrument.txt"
+    cache_path.write_text("this is not valid instrument output\n", encoding="utf-8")
+    instrument_stdout = _synthetic_frames({"lavfi.signalstats.YAVG": 100})
+    counter_box: list[int] = [0]
+
+    def counted(*arguments: object, **keywords: object) -> subprocess.CompletedProcess[str]:
+        command = arguments[0] if arguments else keywords.get("args", [])
+        if isinstance(command, (list, tuple)) and "-vf" in command:
+            counter_box[0] += 1
+        return _fake_completed_process(instrument_stdout)
+
+    monkeypatch.setattr("hflow.ffmpeg._instrument.subprocess.run", counted)
+    stats = frame_stats(video)
+    assert counter_box[0] == 1
+    assert stats.frame_count == 1
+    # The corrupt file is gone, replaced by a valid one.
+    valid = cache_path.read_text(encoding="utf-8")
+    assert "YAVG" in valid
+
+
+def test_frame_stats_cache_survives_to_a_second_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The cache is a real file in the workdir, so a second ``frame_stats``
+    call from a new process hits it without any ffmpeg work. The MP4 remux
+    cache is the same shape, and that persistence is what makes the fix
+    worth landing. We pre-write a valid cache by hand (no subprocess), then
+    call ``frame_stats`` and assert subprocess is never invoked.
+    """
+    video = tmp_path / "wrist_cam.mp4"
+    video.write_bytes(b"")
+    cache_path = tmp_path / "wrist_cam.instrument.txt"
+    cache_path.write_text(_synthetic_frames({"lavfi.signalstats.YAVG": 100}), encoding="utf-8")
+    counter_box: list[int] = [0]
+
+    def counted(*arguments: object, **keywords: object) -> subprocess.CompletedProcess[str]:
+        command = arguments[0] if arguments else keywords.get("args", [])
+        if isinstance(command, (list, tuple)) and "-vf" in command:
+            counter_box[0] += 1
+        return _fake_completed_process("")
+
+    monkeypatch.setattr("hflow.ffmpeg._instrument.subprocess.run", counted)
+    stats = frame_stats(video)
+    assert counter_box[0] == 0
+    assert stats.frame_count == 1

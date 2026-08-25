@@ -130,7 +130,7 @@ query later rather than pass/fail decisions baked into your corpus.
 | `camera_frame_stats` | Blackout, freeze, exposure, and stored frame count versus the rate the stream claims -- all from one decode pass. |
 | `joint_discontinuity` | Does any joint move faster than a limit you set? |
 | `idle_fraction` | How much of the episode had nothing moving? |
-| `camera_signal_quality` | Coding range, range-gated exposure, impulse noise, and stillness -- from the same decode pass. |
+| `camera_signal_quality` | Coding range, range-gated exposure, impulse noise, and stillness. Shares the same one ffmpeg decode pass per camera per episode as `camera_frame_stats` -- the instrument's raw output is cached in the workdir, so registering both checks against one episode pays a single decode, not two. |
 | `camera_stability` | How much footage is shaky rather than deliberately moving. Needs the `motion` extra. |
 | `action_integrity` | Are the recorded values sound -- no NaNs, no publisher stalls repeating a sample, no dimension that never moves? |
 | `trajectory_metrics` | How far and fast did it move, how much stood still, was it still settling when recording stopped? |

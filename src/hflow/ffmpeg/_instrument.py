@@ -362,6 +362,68 @@ def instrument_filter_graph(
     )
 
 
+# The instrument's raw ``metadata=print`` stdout for one video, cached as a
+# text file beside the video. The cache key is the video path itself -- the
+# same ``Episode.video(topic)`` workdir-MP4 path is the same underlying
+# footage, so any caller reaching for the instrument over that MP4 gets the
+# same decode output. Aggregation thresholds (``bright_luma_threshold``,
+# ``freeze_min_duration_s``, ``black_frame_amount_pct``) re-run from the
+# cached text on every call, so a threshold change is free rather than
+# invalidating the cache.
+_INSTRUMENT_CACHE_SUFFIX = ".instrument.txt"
+
+
+def _instrument_cache_path(video: Path) -> Path | None:
+    """Where the cached instrument stdout for ``video`` lives, or None if
+    caching is disabled for this path.
+
+    A sibling of the video, named after its stem. Caching is disabled when
+    the video is not an ``.mp4`` -- the cache file would otherwise live at
+    the same path on case-insensitive filesystems, and writing a
+    ``.instrument.txt`` next to a ``.h264`` source would not match the
+    convention the workdir uses for the remux cache.
+    """
+    if video.suffix.lower() != ".mp4":
+        return None
+    return video.with_name(f"{video.stem}{_INSTRUMENT_CACHE_SUFFIX}")
+
+
+def _write_instrument_cache(cache_path: Path, output_text: str) -> None:
+    """Atomically replace the cache file with ``output_text``.
+
+    Same shape as the MP4 remux write: a partial file at the final path
+    would be read as a complete cache, so we always go through a ``.tmp``
+    sibling and ``Path.replace`` into place. On any failure the temp file
+    is removed so a half-written cache cannot masquerade as a complete one.
+    """
+    temporary = cache_path.with_name(cache_path.name + ".tmp")
+    try:
+        temporary.write_text(output_text, encoding="utf-8")
+        temporary.replace(cache_path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _read_instrument_cache(cache_path: Path) -> str | None:
+    """Return the cached stdout, or None if the cache is missing.
+
+    A parse failure deletes the file and returns None, so the next call
+    re-decodes -- the same self-healing shape as a corrupt MP4 would
+    trigger a re-remux. A read error other than missing (permission) or
+    non-UTF-8 propagates: the caller will treat it the same as any other
+    I/O error and the user will see a real message rather than a silently
+    wrong instrument reading.
+    """
+    if not cache_path.is_file():
+        return None
+    try:
+        return cache_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        cache_path.unlink(missing_ok=True)
+        return None
+
+
 def frame_stats(
     video: Path,
     *,
@@ -373,7 +435,16 @@ def frame_stats(
 ) -> FrameStats:
     """Run the instrument over ``video`` and aggregate.
 
-    One decode pass, one filter graph, one shared frame denominator.
+    One decode pass, one filter graph, one shared frame denominator. The
+    raw instrument stdout is cached in a ``.instrument.txt`` file beside
+    ``video`` (the workdir MP4 ``Episode.video()`` produces), so a second
+    call over the same video with the same footage skips the ffmpeg
+    decode and re-aggregates with whatever threshold parameters the
+    caller passed this time. A pipeline that registers both
+    :func:`hflow.checks.camera_frame_stats` and
+    :func:`hflow.checks.camera_signal_quality` therefore pays one decode
+    per camera per episode rather than two; a wrapper that reaches for
+    ``frame_stats`` directly gets the same benefit.
 
     - ``blackframe`` yields each frame's black-pixel share; frames at or above
       ``black_frame_amount_pct`` are counted black. ``black_pixel_threshold``
@@ -387,6 +458,30 @@ def frame_stats(
     - Frames with average luma at or above ``bright_luma_threshold`` are
       counted as overexposed, on the same frame-count denominator.
     """
+    cache_path = _instrument_cache_path(video)
+
+    if cache_path is not None:
+        cached_output = _read_instrument_cache(cache_path)
+        if cached_output is not None:
+            try:
+                stats = _stats_from_instrument_output(
+                    cached_output,
+                    bright_luma_threshold=bright_luma_threshold,
+                    black_frame_amount_pct=black_frame_amount_pct,
+                )
+            except InstrumentParseError:
+                # Corrupt or truncated cache: drop it and re-decode. A
+                # check that caught a wrong number from a stale cache
+                # would be the one answer this instrument must never
+                # invent.
+                cache_path.unlink(missing_ok=True)
+            else:
+                # Stamped here rather than read by callers: a check that
+                # reached for ``ffmpeg_version`` itself would capture an
+                # lru_cache wrapper, which step identity cannot
+                # content-hash, and registering that check would fail.
+                return replace(stats, instrument_version=ffmpeg_version())
+
     graph = instrument_filter_graph(
         black_pixel_threshold=black_pixel_threshold,
         freeze_noise_db=freeze_noise_db,
@@ -408,6 +503,12 @@ def frame_stats(
     if completed.returncode != 0:
         stderr_tail = "\n".join(completed.stderr.strip().splitlines()[-5:])
         raise RuntimeError(f"ffmpeg instrument pass failed for {video}: {stderr_tail}")
+    # Write the raw stdout before aggregating so the next caller (or a
+    # future process) can read the cache even if aggregation itself
+    # raised -- a real ffmpeg output the parser rejected is still a
+    # valid decode worth keeping for debugging.
+    if cache_path is not None:
+        _write_instrument_cache(cache_path, completed.stdout)
     stats = _stats_from_instrument_output(
         completed.stdout,
         bright_luma_threshold=bright_luma_threshold,
