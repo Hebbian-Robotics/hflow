@@ -26,6 +26,7 @@ import time
 import traceback
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import cache
 from pathlib import Path
 from types import MappingProxyType, ModuleType
 from typing import TYPE_CHECKING
@@ -324,6 +325,25 @@ def _render_contact_sheets(canonical_episode: Episode, media_directory: Path) ->
         contact_sheet(frames, sheet_path)
         sheet_artifacts[camera_topic] = sheet_path
     return EnrichmentResult(artifacts=sheet_artifacts)
+
+
+@cache
+def media_contact_sheet_step_version() -> str:
+    """The content-hash version of the engine's contact-sheet step.
+
+    One owner, because two things now need it: :meth:`App.process` stamps the
+    step's catalog rows with it, and :mod:`hflow.stage_planning` asks whether a
+    row at this version already exists before spending a decode pass. A planner
+    that recomputed it its own way would schedule the media stage forever the
+    first time the two spellings drifted.
+
+    Cached because the inputs are module constants -- the step's name and the
+    renderer's own source -- so the answer cannot change within a process, and
+    hashing a function's transitive source is not free.
+    """
+    return compute_check_version(
+        MEDIA_CONTACT_SHEET_STEP_NAME, _render_contact_sheets, False, frozenset(), None
+    )
 
 
 def _resolve_stages(stages: Iterable[Stage] | str | None) -> frozenset[Stage]:
@@ -1010,6 +1030,23 @@ class App:
             self.transform_config,
             {channel.topic: channel.version for channel in self.derived},
         )
+
+    def source_identity(self, episode: "Path | str") -> str:
+        """The ``source_uri`` this App would record for one episode reference.
+
+        The catalog's key for a source RECORDING, as opposed to a canonical
+        episode's content-addressed ``episode_id``. References under the data
+        root reduce to their root-relative key, so the same recording named
+        from a host path, a container mount, or a full bucket URL yields one
+        identity and therefore one run directory, one sync-completion lineage,
+        and one row in ``episodes_latest``.
+
+        Public because asking "what will this be called in the catalog?"
+        without processing anything is exactly what a planner does
+        (:mod:`hflow.stage_planning`), and computing it a second way is how a
+        planner ends up querying for rows that were filed under another name.
+        """
+        return _source_identity(episode, self.storage_root)
 
     def manifest(self) -> PipelineManifest:
         """This pipeline's JSON-able description: step names, content-hash
@@ -1731,13 +1768,7 @@ class App:
                     uses=None,
                     # Versioned by the implementation function, so a changed
                     # renderer is a new measurement identity.
-                    version=compute_check_version(
-                        MEDIA_CONTACT_SHEET_STEP_NAME,
-                        _render_contact_sheets,
-                        False,
-                        frozenset(),
-                        None,
-                    ),
+                    version=media_contact_sheet_step_version(),
                 )
                 report.enrichments.append(
                     _execute_enrichment(media_step, canonical_episode, quarantine_skip_reason)

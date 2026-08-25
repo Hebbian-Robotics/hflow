@@ -511,6 +511,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="run profile: which stage sub-DAGs the master enables (default: full)",
     )
     ingest_parser.add_argument(
+        "--all-stages",
+        action="store_true",
+        help=(
+            "run every stage of --profile on every episode, instead of only the "
+            "stages whose steps the catalog does not already record at their "
+            "current versions. Use it when an artifact was deleted out from "
+            "under a recorded step -- that is the one thing the catalog cannot "
+            "see. Applies only when the episodes are processed in this process"
+        ),
+    )
+    ingest_parser.add_argument(
         "--online",
         action="store_true",
         help=(
@@ -891,9 +902,12 @@ def _ingest_in_process(arguments: argparse.Namespace) -> int:
 
     ``--online`` and ``--bundle-dir`` have nothing to answer here: there is
     one process, so there are no lanes to pick between and no bundle to
-    address. ``--profile`` still selects which stages run.
+    address. ``--profile`` still selects which stages run, and ``--all-stages``
+    turns off the per-episode planning that would otherwise skip the ones the
+    catalog already records as current.
     """
     from hflow.stage_execution import run_stages_directly
+    from hflow.stage_planning import StageSelection
     from hflow.steps import stages_for_profile
 
     try:
@@ -902,25 +916,33 @@ def _ingest_in_process(arguments: argparse.Namespace) -> int:
         print(f"ingest: {error}", file=sys.stderr)
         return 2
     stages = stages_for_profile(arguments.profile)
+    selection = StageSelection.EVERY_STAGE if arguments.all_stages else StageSelection.OUTSTANDING
     print(
         f"ingest: no runtime addressed; processing {len(arguments.uris)} episode(s) "
         f"in this process against {app.data_root}",
         file=sys.stderr,
     )
     try:
-        counts_by_stage = run_stages_directly(app, list(arguments.uris), stages)
+        outcomes = run_stages_directly(app, list(arguments.uris), stages, selection=selection)
     except RuntimeError as error:
         # The mass-failure gates, verbatim: the same budgets a scheduled run
         # applies, so a corpus that would fail there fails here too.
         print(f"ingest: {error}", file=sys.stderr)
         _print_ingest_failure_hint()
         return 1
-    for stage, counts in counts_by_stage.items():
-        print(
-            f"{stage.value}: {counts['processed']} processed, "
-            f"{counts['quarantined']} quarantined, {counts['errors']} errors"
+    for outcome in outcomes:
+        counts = outcome.counts
+        # The skipped count is printed beside the processed one, never folded
+        # into it: "0 processed" on a corpus that is entirely up to date should
+        # read as nothing left to do, not as nothing having happened.
+        already_current = (
+            f", {outcome.skipped_as_current} already current" if outcome.skipped_as_current else ""
         )
-    if any(counts["errors"] for counts in counts_by_stage.values()):
+        print(
+            f"{outcome.stage.value}: {counts['processed']} processed, "
+            f"{counts['quarantined']} quarantined, {counts['errors']} errors{already_current}"
+        )
+    if any(outcome.counts["errors"] for outcome in outcomes):
         _print_ingest_failure_hint()
     return 0
 

@@ -133,14 +133,18 @@ def test_stages_run_in_graph_order_whatever_order_they_are_asked_for(project: Pa
     from hflow.stage_execution import run_stages_directly
 
     app = hflow.App("in-process", data_root=project / "data")
-    counts_by_stage = run_stages_directly(
+    outcomes = run_stages_directly(
         app,
         ["episodes-in/episode_0001.mcap"],
         {hflow.Stage.LABELS, hflow.Stage.META, hflow.Stage.SYNC},
     )
 
-    assert list(counts_by_stage) == [hflow.Stage.SYNC, hflow.Stage.META, hflow.Stage.LABELS]
-    assert all(counts["errors"] == 0 for counts in counts_by_stage.values())
+    assert [outcome.stage for outcome in outcomes] == [
+        hflow.Stage.SYNC,
+        hflow.Stage.META,
+        hflow.Stage.LABELS,
+    ]
+    assert all(outcome.counts["errors"] == 0 for outcome in outcomes)
 
 
 def test_a_failed_source_is_recorded_where_it_can_be_found(

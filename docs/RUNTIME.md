@@ -11,6 +11,63 @@ Nothing here is required for development. Iterate with `app.test()`; come here
 when you want a scheduler doing the running (mapped batches, retries, a UI
 with per-task logs) instead of your terminal.
 
+## `hflow ingest` without a runtime
+
+`hflow ingest` addresses a rendered bundle or a remote Airflow when either is
+there. When neither is -- no `data/runtime`, no `--bundle-dir`, no
+`--airflow-url`, no `HFLOW_AIRFLOW_URL` -- it is not an error: the pipeline is
+imported and the stages run **in this process**, with the same stage-graph
+order and the same mass-failure budgets a scheduled run applies.
+
+```bash
+hflow ingest episodes-in/*.mcap        # no `up` first, nothing to provision
+```
+
+That is the whole third executor. It has no scheduler, so it has no retries,
+no per-task logs, and no UI: an episode that produced no catalog row is
+recorded in the [`ingest_failures`](./CATALOG.md) table instead, and the
+command says so. `--profile` still selects which stages run; `--online` and
+`--bundle-dir` have nothing to answer here, since there is one process and no
+bundle to address. Nothing starts Airflow on your behalf -- pulling several GB
+of images is far too much to do inside an ordinary ingest -- so `hflow up`
+stays an explicit step for when you want one.
+
+### Re-ingesting costs only what is not already current
+
+Ingesting the same episodes again does not redo work the catalog can already
+account for. Per episode, each stage after `sync` runs only when one of its
+steps has no outcome recorded against **this episode's content id at that
+step's current version** -- so a corpus that has not changed and a pipeline
+whose checks have not changed cost one source hash apiece, not a decode pass
+and a contact sheet apiece. Add a check, retune a threshold, or replace a
+source file, and the affected stages come back on their own, for exactly the
+episodes affected.
+
+```text
+sync: 400 processed, 0 quarantined, 0 errors
+meta: 3 processed, 0 quarantined, 0 errors, 397 already current
+```
+
+`sync` is deliberately never skipped: it produces the canonical file every
+later stage reads, and it is already its own cache (it reuses a canonical
+episode whose source bytes, pipeline version, format version and ffmpeg build
+all match what its last completed run recorded). Leaving it in means the
+planning only ever reasons about whether *work* is current, never about
+whether a *file* still exists.
+
+The one thing the catalog cannot see is an artifact deleted out from under a
+step whose rows still say it ran -- a cleaned `media/` directory keeps its
+`media/contact_sheet` rows. `--all-stages` is the escape hatch:
+
+```bash
+hflow ingest --all-stages episodes-in/*.mcap
+```
+
+This applies to the in-process executor only. The Airflow lane runs the whole
+profile on every episode it is handed, because a stage set that varies per
+episode is not something a trigger conf can express without re-rendering every
+bundle.
+
 ## Prerequisites
 
 - **Docker with Compose v2** (the `docker compose` subcommand). That is the

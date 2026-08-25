@@ -129,9 +129,10 @@ RAN_STATUSES: tuple[CheckStatus, ...] = (
 
 # The statuses that mean "this step has had its turn on this exact episode, and
 # running it again would reach the same outcome". A different question from
-# RAN_STATUSES, asked where the answer decides whether there is WORK LEFT TO DO
-# rather than whether evidence exists: dataset membership
-# (:func:`hflow.dataset.default_dataset_sql`).
+# RAN_STATUSES, asked by the two places where the answer decides whether there
+# is WORK LEFT TO DO rather than whether evidence exists: dataset membership
+# (:func:`hflow.dataset.default_dataset_sql`) and stage planning
+# (:mod:`hflow.stage_planning`).
 #
 # SKIPPED is the difference, and it is why this set has to exist separately.
 # The engine records SKIPPED for exactly two reasons, and both are settled:

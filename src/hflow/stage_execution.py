@@ -21,11 +21,13 @@ import os
 import traceback
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 
 from hflow.batching import plan_batches
 from hflow.catalog import QuarantineHistory
+from hflow.stage_planning import EpisodeStagePlan, StageSelection
 from hflow.steps import IngestMode, Stage
 from hflow.storage import is_bucket_url, parse_storage_root
 
@@ -231,13 +233,28 @@ def process_stage_batch(
     return counts
 
 
+@dataclass(frozen=True)
+class StageOutcome:
+    """What one stage of a direct run did, and what it did not have to do."""
+
+    stage: Stage
+    counts: StageBatchCounts
+    # Episodes the planner left out because the catalog already records this
+    # stage's steps as settled at their current versions. Reported rather than
+    # merely subtracted: a stage that quietly processed 3 of 400 episodes looks
+    # identical to a stage that was handed 3 episodes, and the difference is
+    # the whole reason to trust the number.
+    skipped_as_current: int = 0
+
+
 def run_stages_directly(
     application: "App",
     uris: Sequence[str],
     stages: Iterable[Stage],
     *,
+    selection: StageSelection = StageSelection.OUTSTANDING,
     orchestrator_run_id: str | None = None,
-) -> dict[Stage, StageBatchCounts]:
+) -> list[StageOutcome]:
     """Run the stage graph in this process, with the runtime's own semantics.
 
     The no-scheduler backend: the same per-episode accounting and the same
@@ -257,21 +274,86 @@ def run_stages_directly(
     decode pass on ``meta``. The budgets themselves are per-stage exactly as
     in the sub-DAGs: the quarantine budget only in ``meta``, because checks
     are what decide quarantine.
+
+    Under the default :attr:`StageSelection.OUTSTANDING`, every stage after
+    ``sync`` runs on only the episodes whose steps the catalog does not already
+    record as settled at their current versions -- so re-ingesting an unchanged
+    corpus costs one source hash per episode instead of a decode pass and a
+    contact sheet. The plan is built from what ``sync`` just recorded, which is
+    why it is computed here between the stages rather than by the caller before
+    them; :mod:`hflow.stage_planning` explains why the ordering is what makes
+    it sound. Planning is skipped entirely when ``sync`` is not among the
+    stages, because then nothing has re-established which episode each
+    recording currently is, and a stale answer would skip real work.
+
+    The per-stage budgets apply to what each stage actually ran. That is the
+    honest denominator: a stage handed four outstanding episodes out of four
+    hundred should fail loudly when all four error, and it does.
     """
     enabled_stages = set(stages)
-    counts_by_stage: dict[Stage, StageBatchCounts] = {}
-    for stage in Stage:
-        if stage not in enabled_stages:
-            continue
-        counts = process_stage_batch(
-            application, uris, stage.value, orchestrator_run_id=orchestrator_run_id
+    ordered_stages = [stage for stage in Stage if stage in enabled_stages]
+    plan_against_catalog = selection is StageSelection.OUTSTANDING and Stage.SYNC in enabled_stages
+
+    outcomes: list[StageOutcome] = []
+    plans: dict[str, EpisodeStagePlan] | None = None
+    for stage in ordered_stages:
+        skipped_as_current = 0
+        if stage is Stage.SYNC or not plan_against_catalog:
+            stage_uris = list(uris)
+        else:
+            if plans is None:
+                plans = _plan_after_sync(
+                    application,
+                    uris,
+                    [later for later in ordered_stages if later is not Stage.SYNC],
+                )
+            stage_uris = [uri for uri in uris if stage in plans[uri].stages]
+            skipped_as_current = len(uris) - len(stage_uris)
+        # A stage with nothing to do is skipped outright rather than handed an
+        # empty batch: the batch path opens a catalog reader for its quarantine
+        # gate, which on a bucket workspace means syncing the catalog mirror to
+        # answer a question about no episodes.
+        counts: StageBatchCounts = (
+            process_stage_batch(
+                application, stage_uris, stage.value, orchestrator_run_id=orchestrator_run_id
+            )
+            if stage_uris
+            else {"processed": 0, "quarantined": 0, "errors": 0}
         )
-        counts_by_stage[stage] = counts
+        outcomes.append(
+            StageOutcome(stage=stage, counts=counts, skipped_as_current=skipped_as_current)
+        )
         if stage is Stage.META:
             summarize_quarantine_budget([counts])
         else:
             summarize_error_budget([counts])
-    return counts_by_stage
+    return outcomes
+
+
+def _plan_after_sync(
+    application: "App", uris: Sequence[str], later_stages: Sequence[Stage]
+) -> "dict[str, EpisodeStagePlan]":
+    """The post-sync plan, keyed by the caller's own uri spelling.
+
+    Two vocabularies meet here. The caller names episodes by data-root-relative
+    uri; the catalog files them under the App's ``source_uri``, which is what
+    ``App.process`` recorded. Resolving each uri through the same two functions
+    the processing path used -- ``resolve_episode_reference`` then
+    ``App.source_identity`` -- is what keeps the planner asking about the rows
+    that were actually written, and re-keying the answer back to the uri is
+    what keeps the caller from having to know any of that.
+    """
+    from hflow.stage_planning import plan_outstanding_stages
+
+    data_root = str(application.data_root)
+    identity_by_uri = {
+        str(uri): application.source_identity(resolve_episode_reference(data_root, str(uri)))
+        for uri in uris
+    }
+    plans = plan_outstanding_stages(
+        application, sorted(set(identity_by_uri.values())), later_stages
+    )
+    return {uri: plans[identity] for uri, identity in identity_by_uri.items()}
 
 
 def _record_failure_quietly(
