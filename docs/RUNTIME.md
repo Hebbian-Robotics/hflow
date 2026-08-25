@@ -207,7 +207,7 @@ under the data root, the same files whether the run came from `app.test(...,
 record=True)` or the DAG:
 
 ```bash
-hflow curate "SELECT episode_id, uri FROM episodes WHERE status != 'quarantined'" \
+hflow curate "SELECT episode_id, uri FROM episodes WHERE status = 'ok'" \
     -o manifest.parquet
 ```
 
