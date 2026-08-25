@@ -328,14 +328,18 @@ def _normalized_intervals(check_name: str, intervals: list[Interval]) -> list[In
             bounds[bound_name] = value
         start_ns = bounds["start_ns"]
         end_ns = bounds["end_ns"]
+        # The label, because a check emitting many intervals is otherwise a
+        # needle in a haystack: the bounds alone do not say which one is wrong.
+        # end_ns == start_ns is allowed on purpose -- an instant is a real thing
+        # to record, and only end_ns < start_ns is nonsense.
         if start_ns < 0 or end_ns < 0:
             raise ValueError(
-                f"check {check_name!r} set a negative interval bound "
+                f"check {check_name!r} set a negative bound on interval {interval.label!r} "
                 f"(start_ns={start_ns}, end_ns={end_ns}): bounds are non-negative nanoseconds"
             )
         if end_ns < start_ns:
             raise ValueError(
-                f"check {check_name!r} set inverted interval "
+                f"check {check_name!r} set an inverted interval {interval.label!r} "
                 f"(start_ns={start_ns}, end_ns={end_ns}): end must be >= start"
             )
         normalized.append(replace(interval, **bounds))

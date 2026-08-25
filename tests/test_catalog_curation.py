@@ -1008,6 +1008,66 @@ def test_a_bool_interval_bound_is_refused_rather_than_stored_as_one_nanosecond(
         )
 
 
+def _appended_with_interval(tmp_path: Path, interval: hflow.Interval) -> None:
+    """Append one episode carrying ``interval``, for the bound-rule tests."""
+    canonical = tmp_path / "e.canonical.mcap"
+    canonical.write_bytes(b"episode-bytes")
+    Catalog(tmp_path / "catalog").append_episode(
+        canonical_path=canonical,
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[
+            CheckRunRow(
+                check_name="segment_check",
+                check_version="v1",
+                critical=False,
+                status=hflow.CheckStatus.MEASURED,
+                duration_s=0.1,
+                intervals=[interval],
+            )
+        ],
+    )
+
+
+def test_an_inverted_interval_is_refused_naming_the_check_and_the_label(
+    tmp_path: Path,
+) -> None:
+    """An end before its start is a negative duration to everything downstream.
+
+    The label is in the message because a check emitting many intervals gives
+    the reader no other way to tell which one is wrong (#161).
+    """
+    with pytest.raises(ValueError, match=r"segment_check.*'peak_velocity'.*end must be >= start"):
+        _appended_with_interval(
+            tmp_path, hflow.Interval(start_ns=10, end_ns=5, label="peak_velocity")
+        )
+    assert list((tmp_path / "catalog" / "episodes").glob("*.parquet")) == []
+
+
+def test_a_negative_interval_bound_is_refused(tmp_path: Path) -> None:
+    """Log time is nanoseconds since the epoch, so a negative bound is a bug."""
+    with pytest.raises(ValueError, match=r"segment_check.*'gap'.*non-negative"):
+        _appended_with_interval(tmp_path, hflow.Interval(start_ns=-5, end_ns=-1, label="gap"))
+
+
+def test_a_zero_length_interval_is_allowed(tmp_path: Path) -> None:
+    """An instant is a real thing to record, so only end < start is refused.
+
+    Pinned rather than left implicit: the ordering rule is one ``<`` away from
+    rejecting every event with no duration.
+    """
+    _appended_with_interval(tmp_path, hflow.Interval(start_ns=5, end_ns=5, label="touchdown"))
+
+    connection = open_catalog_connection(tmp_path / "catalog")
+    try:
+        stored = connection.execute(
+            "SELECT start_ns, end_ns, label FROM intervals WHERE label = 'touchdown'"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert stored == [(5, 5, "touchdown")]
+
+
 def test_same_interval_bound_in_a_numpy_or_python_scalar_replays_as_one_run(
     tmp_path: Path,
 ) -> None:
