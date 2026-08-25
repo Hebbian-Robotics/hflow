@@ -254,9 +254,23 @@ def create_dataset(
         created_at=stamped_at,
         workspace=workspace,
     )
-    workspace.manifests_root.write_bytes_if_absent(
+    # The pair is two publishes and cannot be made one, so the failure worth
+    # ruling out is the SILENT one: a manifest that landed beside a provenance
+    # record that did not, reported as a complete dataset. Manifests are never
+    # overwritten, so the same name cannot be retried into the same stem --
+    # naming both files is what makes the half-written pair recoverable by
+    # hand. store_file_if_absent returning False means the key was taken
+    # between the manifest publish and this one, which is a collision on a
+    # microsecond-stamped stem and means someone is racing this command.
+    if not workspace.manifests_root.write_bytes_if_absent(
         sidecar_name, (json.dumps(sidecar_payload, indent=2, sort_keys=True) + "\n").encode()
-    )
+    ):
+        raise ManifestAlreadyExistsError(
+            f"the manifest {written.uri} was written, but its provenance record "
+            f"{workspace.manifests_root.uri_for(sidecar_name)} already existed, so "
+            "the pair is incomplete; the manifest is still valid and readable, and "
+            "`hflow dataset create` under another name will produce a complete pair"
+        )
     return DatasetManifest(
         manifest_path=written.uri,
         sidecar_path=workspace.manifests_root.uri_for(sidecar_name),

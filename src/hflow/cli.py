@@ -983,8 +983,10 @@ def _command_ingest(arguments: argparse.Namespace) -> int:
         if uri.startswith("/") or normpath(uri).startswith(".."):
             print(
                 f"ingest: {uri!r} is not relative to the data root -- URIs are "
-                "resolved against the runtime's configured data root "
-                "(e.g. `episodes-in/run_0001.mcap`)",
+                f"resolved against the workspace this project uses ({_environment_data_root()}), "
+                "so name them from there (e.g. `episodes-in/run_0001.mcap`). "
+                f"Set $HFLOW_DATA_ROOT or {PROJECT_CONFIG_FILE_NAME}'s data_root "
+                "to point at another workspace",
                 file=sys.stderr,
             )
             return 2

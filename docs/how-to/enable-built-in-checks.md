@@ -99,6 +99,23 @@ copies would record the same measurement keys and the catalog would keep only
 one of them. A default is the exception: registering or wrapping one of those
 supersedes it, as above.
 
+One cost worth knowing before you wrap `camera_frame_stats` specifically.
+Supersession is decided from what a check actually measured, which is only
+knowable after it runs, so the automatic copy runs in full and its result is
+then discarded: **that is two ffmpeg decode passes per camera per episode**,
+forever. Every other built-in is cheap enough not to care. If you are wrapping
+that one, drop the automatic copy instead and the second pass goes away:
+
+```python
+app = hflow.App(
+    "my-pipeline",
+    default_checks=[c for c in hflow.checks.DEFAULT_CHECKS if c is not camera_frame_stats],
+)
+```
+
+`functools.partial` costs the same, and so does registering it bare under its
+own name -- that is a replacement, not a wrapper, so nothing runs twice.
+
 [`examples/stress/synthetic.py`](../../examples/stress/synthetic.py) registers
 several this way over a generated corpus, if you want a running reference.
 
