@@ -187,7 +187,7 @@ task running in your venv, and each runs exactly its own stage via
 
 | sub-DAG | stage | gate |
 |---|---|---|
-| `<stem>_sync` | Transform & sync: the canonical transform (critical path) | error budget |
+| `<stem>_sync` | Transform & sync: the canonical transform (critical path). Idempotent per source content -- an unchanged recording keeps the canonical episode it already produced instead of transcoding it again | error budget |
 | `<stem>_meta` | Metadata: checks + catalog registration | **quarantine budget** + error budget |
 | `<stem>_labels` | Labels & artifacts: enrichments (non-critical) | error budget |
 | `<stem>_media` | Media: derived media (contact sheets) | error budget |

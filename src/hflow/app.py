@@ -42,11 +42,17 @@ from hflow.catalog import (
 )
 from hflow.episode import Episode, _sanitize_topic
 from hflow.ffmpeg import contact_sheet
+from hflow.format import (
+    EPISODE_FORMAT_VERSION,
+    FFMPEG_VERSION_NOT_USED,
+    METADATA_RECORD_PROVENANCE,
+)
 from hflow.manifest import (
     DerivedChannelManifest,
     PipelineManifest,
     StepManifest,
 )
+from hflow.reader import open_reader
 from hflow.resample import DerivedSeries
 from hflow.steps import (
     GATE_UNEVALUATED_TAG_PREFIX,
@@ -142,11 +148,32 @@ _SYNC_COMPLETION_MARKER_NAME = ".sync-complete.json"
 
 @dataclass(frozen=True)
 class _SyncCompletion:
-    """Proof that sync completed for one source path and canonical version."""
+    """Proof that sync completed for one source path and canonical version.
+
+    The last three fields are the *reuse witness*: enough to decide that
+    re-running sync would rewrite byte-identical output, so it can be skipped.
+    They are optional because markers written before they existed are still
+    valid proof for the non-sync stages, which is all those stages ever asked
+    of them. A witness-less marker simply never satisfies the reuse gate: one
+    re-transcode rewrites it in the current shape, and that is the whole
+    migration.
+    """
 
     source_path: str
     schema_version: str
     pipeline_version: str
+    # Which source BYTES produced the canonical. Content, never size+mtime:
+    # this repo identifies by content everywhere, and a same-length rewrite
+    # or a preserved mtime would defeat the weaker test silently.
+    source_digest: str | None = None
+    # The transform is stamped with an ffmpeg version that does NOT reach
+    # pipeline_version, and different builds genuinely encode differently.
+    ffmpeg_version: str | None = None
+    # "default" or "override". An @app.transform override is contractually
+    # required to end in write_canonical_episode, so it stamps the SAME
+    # pipeline_version the default transform would: without this, REMOVING an
+    # override would reuse a canonical the current pipeline cannot produce.
+    transform_kind: str | None = None
 
 
 def _source_identity(source_reference: Path | str, storage_root: StorageRoot) -> str:
@@ -202,6 +229,10 @@ def _write_sync_completion_marker(marker_path: Path, completion: _SyncCompletion
         "schema_version": completion.schema_version,
         "pipeline_version": completion.pipeline_version,
     }
+    for witness_field in ("source_digest", "ffmpeg_version", "transform_kind"):
+        witness_value = getattr(completion, witness_field)
+        if witness_value is not None:
+            marker_payload[witness_field] = witness_value
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
@@ -241,7 +272,31 @@ def _read_sync_completion_marker(marker_path: Path) -> _SyncCompletion:
                 f"{field_name!r} must be a non-empty string"
             )
         required_values[field_name] = field_value
-    return _SyncCompletion(**required_values)
+    # Parsed leniently, on purpose: a missing or malformed witness field means
+    # "cannot prove reuse is safe", which the gate already treats as a miss.
+    # Requiring them would make every pre-witness marker unreadable and break
+    # the non-sync stages, which never needed a witness at all.
+    optional_values = {
+        field_name: value
+        for field_name in ("source_digest", "ffmpeg_version", "transform_kind")
+        if isinstance(value := marker_payload.get(field_name), str) and value
+    }
+    return _SyncCompletion(**required_values, **optional_values)
+
+
+def _file_digest(path: Path) -> str:
+    """A content witness for one file, streamed rather than read whole.
+
+    The same instrument ``content_episode_id`` uses on the canonical, kept at
+    full length here because this one gates correctness rather than naming a
+    row. Roughly 2% of the work it guards: a 512 MB source hashes in under
+    half a second against the ~20 s that same recording takes to transform.
+    """
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while block := stream.read(8 * 1024 * 1024):
+            digest.update(block)
+    return f"sha256:{digest.hexdigest()}"
 
 
 def _render_contact_sheets(canonical_episode: Episode, media_directory: Path) -> EnrichmentResult:
@@ -605,6 +660,10 @@ class TestReport:
     enrichments: list[EnrichmentRunReport] = field(default_factory=list)
     quarantine_tags: list[str] = field(default_factory=list)
     catalog_entry: AppendResult | None = None
+    # Whether sync kept the canonical episode it already had. Reported because
+    # a reused run and a transcoded run are otherwise indistinguishable
+    # without comparing file timestamps.
+    sync_reused: bool = False
 
     @property
     def quarantined(self) -> bool:
@@ -638,6 +697,8 @@ class TestReport:
             f"pipeline_version={self.stamps.pipeline_version} "
             f"ffmpeg={self.stamps.ffmpeg_version}",
         ]
+        if self.sync_reused:
+            lines.append("sync: reused the existing canonical episode (source unchanged)")
         if self.catalog_entry is not None:
             record_verb = "recorded" if self.catalog_entry.written else "already recorded"
             lines.append(
@@ -807,6 +868,92 @@ class App:
                 "hflow.App(default_checks=...) to change the automatic set"
             )
             run.result = None
+
+    def _reusable_canonical_episode(
+        self,
+        run_storage_root: StorageRoot,
+        canonical_file_name: str,
+        source_identifier: str,
+        source_digest: str,
+    ) -> "tuple[_SyncCompletion, Path] | None":
+        """The existing canonical episode, when re-running sync would rewrite
+        it byte for byte. ``None`` on any doubt whatsoever.
+
+        Transcoding is by far the most expensive thing HFlow does, and a
+        re-ingest of an unchanged recording did all of it again for output it
+        already had. Skipping is safe exactly when the inputs to the transform
+        are provably the same: the same source bytes, the same configuration,
+        and the same instrument.
+
+        Everything is read through the storage root rather than off the run
+        directory. On a bucket workspace that directory is a local mirror, so
+        a file being there proves nothing about the store: it can survive a
+        failed publish, a lifecycle deletion, or a stale worker. Fetching is
+        what checks. This is the same reasoning behind clearing the marker
+        before a rewrite, which is why reuse never reaches that path.
+
+        Returns ``None`` rather than raising, always. A canonical whose
+        provenance disagrees with its marker is a hard error for a relabel
+        run, which reads what sync left behind; for a sync run the answer is
+        simply to transcode it again.
+        """
+        if self.transform_override is not None:
+            # An override's own code is in no version hash, so nothing here
+            # could tell an edited override from an unchanged one.
+            return None
+        try:
+            marker_path = run_storage_root.fetch(_SYNC_COMPLETION_MARKER_NAME)
+            completion = _read_sync_completion_marker(marker_path)
+        except (FileNotFoundError, ValueError, OSError):
+            return None
+        if completion.transform_kind != "default":
+            return None
+        if completion.source_path != source_identifier:
+            # Two sources can share a run directory when output_dir= names one.
+            return None
+        if completion.source_digest != source_digest:
+            return None
+        if completion.schema_version != EPISODE_FORMAT_VERSION:
+            return None
+        if completion.pipeline_version != self.pipeline_version:
+            return None
+        try:
+            canonical_path = run_storage_root.fetch(canonical_file_name)
+        except (FileNotFoundError, OSError):
+            return None
+        canonical_reader = None
+        try:
+            canonical_reader = open_reader(canonical_path)
+            # The provenance record alone: stamps_from_provenance wants the
+            # flat mapping, and reading only this record avoids opening a full
+            # Episode (and its scratch workdir) just to read four strings.
+            canonical_stamps = stamps_from_provenance(
+                dict(canonical_reader.metadata().get(METADATA_RECORD_PROVENANCE, {}))
+            )
+        except Exception:
+            return None
+        finally:
+            if canonical_reader is not None:
+                canonical_reader.close()
+        if (
+            canonical_stamps.schema_version != completion.schema_version
+            or canonical_stamps.pipeline_version != completion.pipeline_version
+        ):
+            return None
+        if canonical_stamps.ffmpeg_version != completion.ffmpeg_version:
+            return None
+        if canonical_stamps.ffmpeg_version != FFMPEG_VERSION_NOT_USED:
+            # Only now, when the recording demonstrably has video, is it worth
+            # resolving ffmpeg: doing it unconditionally would force the
+            # pinned-build download on camera-less episodes that never need it.
+            from hflow.ffmpeg import ffmpeg_version
+
+            try:
+                if canonical_stamps.ffmpeg_version != ffmpeg_version():
+                    return None
+            except Exception:
+                return None
+        return completion, canonical_path
 
     def _register_default_checks(self, default_checks: "Iterable[CheckFunction] | None") -> None:
         """Register the baseline every episode gets without anyone opting in.
@@ -1315,6 +1462,14 @@ class App:
         whole batch so a stage does not re-sync and re-open the catalog once
         per episode; omit it and this call opens one for itself.
 
+        ``sync`` reuses the canonical episode it already produced when the
+        source bytes, the pipeline version, the format version and the ffmpeg
+        build all match what the last completed sync recorded -- transcoding
+        the same recording twice cannot produce different output, and it is
+        the most expensive thing here. Any doubt transcodes again. Deleting
+        the run directory's ``.sync-complete.json`` forces that, and is the
+        supported way to ask for it.
+
         ``orchestrator_run_id`` records which orchestrated run produced the
         row, so "which run wrote this" is answerable from the catalog alone.
         Named for the role rather than for a scheduler: the generated Airflow
@@ -1353,10 +1508,24 @@ class App:
 
         stamps: EpisodeStamps | None = None
         sync_completion: _SyncCompletion | None = None
+        source_digest: str | None = None
+        reused_canonical = False
         if Stage.SYNC in enabled_stages:
+            # Hashed once, serving both the reuse decision and the marker the
+            # transcode path writes.
+            source_digest = _file_digest(source_path)
+            reusable = self._reusable_canonical_episode(
+                run_storage_root, canonical_file_name, source_identifier, source_digest
+            )
+            if reusable is not None:
+                sync_completion, canonical_path = reusable
+                reused_canonical = True
+        if Stage.SYNC in enabled_stages and not reused_canonical:
             # File existence is not proof of a successful rewrite. Clear the
             # durable proof before starting so a tolerated sync failure cannot
             # let a later sub-DAG consume a previous canonical episode.
+            # Reuse is the one path that never gets here: it proved the marker
+            # good rather than assuming a file on disk was.
             run_storage_root.delete(_SYNC_COMPLETION_MARKER_NAME)
             if self.transform_override is not None:
                 # Derived signals are the override's own responsibility (see
@@ -1443,7 +1612,12 @@ class App:
                     "provenance record"
                 )
 
-            if Stage.SYNC in enabled_stages:
+            # Keyed on whether sync actually TRANSCODED, not on whether it was
+            # enabled. Publishing is an unconditional overwrite on a bucket
+            # root, so republishing an untouched canonical would re-upload the
+            # whole file (hundreds of megabytes) to store the bytes already
+            # there -- and rewrite a marker that is still true.
+            if Stage.SYNC in enabled_stages and not reused_canonical:
                 canonical_uri = run_storage_root.publish(canonical_path, canonical_file_name)
                 _write_sync_completion_marker(
                     sync_completion_marker_path,
@@ -1451,6 +1625,11 @@ class App:
                         source_path=source_identifier,
                         schema_version=stamps.schema_version,
                         pipeline_version=stamps.pipeline_version,
+                        source_digest=source_digest,
+                        ffmpeg_version=stamps.ffmpeg_version,
+                        transform_kind=(
+                            "override" if self.transform_override is not None else "default"
+                        ),
                     ),
                 )
                 run_storage_root.publish(sync_completion_marker_path, _SYNC_COMPLETION_MARKER_NAME)
@@ -1462,6 +1641,7 @@ class App:
                 canonical_path=canonical_path,
                 stamps=stamps,
                 stages_run=enabled_stages,
+                sync_reused=reused_canonical,
             )
 
             checks_to_run = self._ordered_checks() if Stage.META in enabled_stages else []

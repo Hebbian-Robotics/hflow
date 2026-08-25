@@ -302,8 +302,14 @@ targets rather than current guarantees:
   create a parallel artifact directory, never a migration.
 - **Completion markers (implemented narrowly)**: the sync stage publishes a
   completion marker after the canonical episode, so a later stage or run can
-  prove the canonical it consumes was fully written for this source. Extending
-  the same create-if-absent checkpoint contract to every user step is deferred.
+  prove the canonical it consumes was fully written for this source. The
+  marker records which source *bytes* produced that canonical, plus the
+  pipeline version, the format version and the ffmpeg build, which is enough
+  for sync itself to prove that re-running would rewrite byte-identical output
+  and skip it. Any doubt transcodes again; deleting the marker forces it.
+  Extending the same create-if-absent checkpoint contract to every user step
+  is deferred, and would be what lets `meta` skip unchanged checks the way
+  `sync` now skips an unchanged transform.
 - **Manifest-last publication (target)**: a build directory is sealed by
   writing its manifest once, last, so partial builds are unreachable by
   construction.
