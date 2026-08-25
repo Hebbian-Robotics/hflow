@@ -161,7 +161,13 @@ episode-scoped, prefix it with the check instead.
 
 **Name keys `<topic>/<metric>_<unit>`.** The topic prefix is what keeps two
 cameras (or two checks) from colliding, and it also keeps a key from clashing
-with an episode column like `task` or `uri`, which makes the wide view error.
+with an episode column like `task` or `uri`. If a measurement key shadows an
+episode column, the append is refused, naming the check, the key, and the
+column (`catalog.py:301`). Additionally, a measurement key or enrichment label
+must not start with `artifact/`; that prefix is reserved for URIs published by
+the framework, and user keys in that namespace would be treated as fake media
+– such keys are refused at `app.py`
+(`_raise_if_measurement_keys_claim_artifact_namespace`).
 Keys containing `/` need double quotes in SQL:
 
 ```sql
