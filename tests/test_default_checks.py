@@ -355,8 +355,9 @@ def test_partial_camera_coverage_drops_the_uncovered_camera_too(tmp_path: Path) 
     assert default.result is None
 
 
+@pytest.mark.parametrize("cameras", [(), ("wrist_cam",), ("wrist_cam", "overhead_cam")])
 def test_every_default_in_the_pattern_registry_is_drift_free(
-    source_episode: Path, tmp_path: Path
+    cameras: tuple[str, ...], tmp_path: Path
 ) -> None:
     """The pre-execution short-circuit trusts ``_DEFAULT_KEY_PATTERNS`` to
     predict the keys each default will emit. If a future change to a
@@ -370,7 +371,19 @@ def test_every_default_in_the_pattern_registry_is_drift_free(
     it actually emitted, and asserts the pattern is exact. A drift here
     fails the build rather than waiting for a missed supersession in
     production.
+
+    Parametrized over the camera count on purpose. Three of the six
+    mirrors (``camera_frame_stats``, ``keyframe_interval``,
+    ``media_digest``) emit nothing at all on a camera-less episode, so a
+    guard that only ever saw one would pass while predicting a stale key
+    set for exactly the default this whole short-circuit exists to skip.
+    Two cameras as well as one, because a per-topic mirror that
+    accidentally hardcodes the first camera reads correct at one.
     """
+    source_episode = synthesize_episode(
+        tmp_path / "drift_source.mcap",
+        SyntheticEpisodeSpec(duration_s=1.0, cameras=cameras),
+    )
     app = hflow.App("drift-guard", data_root=tmp_path / "data")
     report = app.test(source_episode, verbose=False)
     actual = {
@@ -385,7 +398,7 @@ def test_every_default_in_the_pattern_registry_is_drift_free(
     # does not vary between the test path and the short-circuit's.
     from hflow.episode import Episode
 
-    canonical = Episode(source_episode)
+    canonical = Episode(report.canonical_path)
     for default, pattern in _DEFAULT_KEY_PATTERNS.items():
         predicted = pattern(canonical)
         # ``CheckFunction`` is ``Callable`` in the type system, so the
