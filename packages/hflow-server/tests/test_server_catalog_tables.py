@@ -11,6 +11,8 @@ EXPECTED_TABLE_NAMES = [
     "measurements_latest",
     "tags",
     "intervals",
+    # The complement of `episodes`: sources that produced no row there.
+    "ingest_failures",
 ]
 
 

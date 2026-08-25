@@ -54,6 +54,7 @@ import duckdb
 
 from hflow.catalog import EPISODES_VIEW_STATUS_COLUMN, TABLE_COLUMN_DDL
 from hflow.format import CATALOG_FORMAT_VERSION
+from hflow.ingest_ledger import INGEST_FAILURES_COLUMN_DDL, INGEST_FAILURES_TABLE_NAME
 from hflow.steps import RAN_STATUSES
 from hflow.storage import (
     BucketStorageRoot,
@@ -63,18 +64,42 @@ from hflow.storage import (
     parse_storage_root,
 )
 
-_LONG_TABLE_NAMES = ("episodes_raw", "check_runs", "measurements", "tags", "intervals")
+_LONG_TABLE_NAMES = (
+    "episodes_raw",
+    "check_runs",
+    "measurements",
+    "tags",
+    "intervals",
+    INGEST_FAILURES_TABLE_NAME,
+)
 _TABLE_DIRECTORIES = {
     "episodes_raw": "episodes",
     "check_runs": "check_runs",
     "measurements": "measurements",
     "tags": "tags",
     "intervals": "intervals",
+    # The complement of `episodes`: attempts that produced no row there. Not a
+    # member of catalog.TABLE_COLUMN_DDL, whose machinery assumes every table
+    # is keyed by (episode_id, run_fingerprint), so it is registered for
+    # reading here and written by its own module.
+    INGEST_FAILURES_TABLE_NAME: INGEST_FAILURES_TABLE_NAME,
 }
 
 # "The check actually ran on this episode", owned by hflow.steps because
 # dataset membership asks the same question and the two answers must agree.
 _RAN_STATUSES = tuple(status.value for status in RAN_STATUSES)
+
+
+def _column_ddl_for(directory_name: str) -> str:
+    """The stored columns of one catalog directory, for an EMPTY relation.
+
+    An empty table still has to be definable, or every downstream view breaks
+    on a workspace that has not recorded that kind of row yet. The episode
+    tables' shapes are the catalog's; the failure ledger's is its own.
+    """
+    if directory_name == INGEST_FAILURES_TABLE_NAME:
+        return INGEST_FAILURES_COLUMN_DDL
+    return TABLE_COLUMN_DDL[directory_name]
 
 
 @dataclass(frozen=True)
@@ -266,7 +291,7 @@ def _open_connection_over_root(
         else:
             # An empty catalog table: an empty relation with the real schema
             # keeps every downstream view and query definable.
-            connection.execute(f"CREATE TABLE {view_name} ({TABLE_COLUMN_DDL[directory_name]})")
+            connection.execute(f"CREATE TABLE {view_name} ({_column_ddl_for(directory_name)})")
 
     if constrained:
         _apply_connection_constraints(connection, list(writable_directories))

@@ -313,7 +313,7 @@ targets rather than current guarantees:
 - **Manifest-last publication (target)**: a build directory is sealed by
   writing its manifest once, last, so partial builds are unreachable by
   construction.
-- **Two-axis failure taxonomy**: (data-scoped vs infrastructure) × (transient vs terminal). Transients retry in place; terminal data errors quarantine the episode within a budget (mass failure fails the run loudly); infrastructure trouble is never recorded as bad data.
+- **Two-axis failure taxonomy**: (data-scoped vs infrastructure) × (transient vs terminal). Transients retry in place; infrastructure trouble is never recorded as bad data. Where a terminal data error lands depends on whether the recording became an episode at all. A valid canonical episode rejected by a critical check is **quarantined**: a tag on a row that exists. A source that never canonicalized has no row to tag -- `episode_id` is a hash of canonical bytes that were never written -- so it is recorded in the append-only `ingest_failures` table instead, with the classification (`source-missing`, `source-unreadable`, `infrastructure`) beside the verbatim error. Mass failure of either kind fails the run loudly within the same budget.
 
 ## Language choice
 

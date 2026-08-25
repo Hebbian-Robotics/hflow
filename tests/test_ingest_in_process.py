@@ -141,3 +141,92 @@ def test_stages_run_in_graph_order_whatever_order_they_are_asked_for(project: Pa
 
     assert list(counts_by_stage) == [hflow.Stage.SYNC, hflow.Stage.META, hflow.Stage.LABELS]
     assert all(counts["errors"] == 0 for counts in counts_by_stage.values())
+
+
+def test_a_failed_source_is_recorded_where_it_can_be_found(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A source that never canonicalized has no catalog row to be, and this
+    executor has no task log behind it, so without the ledger the only trace
+    of a failure is a traceback nobody kept."""
+    from hflow.curation import open_catalog_connection
+
+    monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
+    monkeypatch.delenv("HFLOW_AIRFLOW_URL", raising=False)
+    (project / "data" / "episodes-in" / "corrupt.mcap").write_bytes(b"not an mcap file")
+    monkeypatch.chdir(project)
+
+    assert cli_main(["ingest", "episodes-in/corrupt.mcap"]) == 1
+    assert "ingest_failures" in capsys.readouterr().err
+
+    connection = open_catalog_connection(project / "data" / "catalog")
+    try:
+        rows = connection.execute(
+            "SELECT source_uri, stage, failure_kind, error_type FROM ingest_failures"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert rows == [("episodes-in/corrupt.mcap", "sync", "source-unreadable", "InvalidMagic")]
+
+
+def test_a_source_that_is_not_there_is_not_blamed_on_the_data(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ "Your file is bad" and "your file is missing" send people to different
+    places, so they are different kinds."""
+    from hflow.curation import open_catalog_connection
+
+    monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
+    monkeypatch.delenv("HFLOW_AIRFLOW_URL", raising=False)
+    monkeypatch.chdir(project)
+
+    assert cli_main(["ingest", "episodes-in/never-uploaded.mcap"]) == 1
+
+    connection = open_catalog_connection(project / "data" / "catalog")
+    try:
+        kinds = connection.execute("SELECT failure_kind FROM ingest_failures").fetchall()
+    finally:
+        connection.close()
+    assert kinds == [("source-missing",)]
+
+
+def test_replaying_the_same_failure_records_one_row(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hflow.curation import open_catalog_connection
+
+    monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
+    monkeypatch.delenv("HFLOW_AIRFLOW_URL", raising=False)
+    (project / "data" / "episodes-in" / "corrupt.mcap").write_bytes(b"not an mcap file")
+    monkeypatch.chdir(project)
+
+    cli_main(["ingest", "episodes-in/corrupt.mcap"])
+    cli_main(["ingest", "episodes-in/corrupt.mcap"])
+
+    connection = open_catalog_connection(project / "data" / "catalog")
+    try:
+        assert connection.execute("SELECT count(*) FROM ingest_failures").fetchone() == (1,)
+    finally:
+        connection.close()
+
+
+def test_a_workspace_where_everything_failed_still_opens(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ledger writes the catalog's format marker first: otherwise a corpus
+    whose every episode failed would hold a table no reader would open."""
+    from hflow.curation import open_catalog_connection
+
+    monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
+    monkeypatch.delenv("HFLOW_AIRFLOW_URL", raising=False)
+    (project / "data" / "episodes-in" / "corrupt.mcap").write_bytes(b"not an mcap file")
+    monkeypatch.chdir(project)
+
+    cli_main(["ingest", "episodes-in/corrupt.mcap"])
+
+    connection = open_catalog_connection(project / "data" / "catalog")
+    try:
+        assert connection.execute("SELECT count(*) FROM episodes").fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM ingest_failures").fetchone() == (1,)
+    finally:
+        connection.close()

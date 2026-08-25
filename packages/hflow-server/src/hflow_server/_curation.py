@@ -64,6 +64,7 @@ CATALOG_TABLE_BROWSING_ORDER = (
     "measurements_latest",
     "tags",
     "intervals",
+    "ingest_failures",
 )
 
 _TIMESTAMPTZ_TYPE = "TIMESTAMP WITH TIME ZONE"

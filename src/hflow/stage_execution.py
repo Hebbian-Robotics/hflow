@@ -203,8 +203,19 @@ def process_stage_batch(
                     quarantine_history=quarantine_history,
                     orchestrator_run_id=orchestrator_run_id,
                 )
-            except Exception:
+            except Exception as error:
                 traceback.print_exc()
+                # A source that never canonicalized has no catalog row to be,
+                # so without this the only trace of it is this traceback in
+                # whatever log happened to be watching -- and the in-process
+                # executor has no Airflow task log behind it at all.
+                _record_failure_quietly(
+                    application,
+                    source_uri=str(uri),
+                    stage=stage,
+                    error=error,
+                    orchestrator_run_id=orchestrator_run_id,
+                )
                 counts["errors"] += 1
                 continue
             if report.has_errors:
@@ -261,6 +272,36 @@ def run_stages_directly(
         else:
             summarize_error_budget([counts])
     return counts_by_stage
+
+
+def _record_failure_quietly(
+    application: "App",
+    *,
+    source_uri: str,
+    stage: Stage,
+    error: Exception,
+    orchestrator_run_id: str | None,
+) -> None:
+    """Write one ledger row, and never let that write fail the run.
+
+    The ledger exists to explain a failure, so it must not be able to cause
+    one: an episode that failed has already been counted, and losing the
+    explanation is strictly better than turning one bad recording into a dead
+    batch.
+    """
+    from hflow.ingest_ledger import record_ingest_failure
+
+    try:
+        record_ingest_failure(
+            application.workspace.catalog_root,
+            source_uri=source_uri,
+            stage=stage.value,
+            pipeline_version=application.pipeline_version,
+            error=error,
+            orchestrator_run_id=orchestrator_run_id,
+        )
+    except Exception:  # pragma: no cover - defensive
+        traceback.print_exc()
 
 
 @contextmanager

@@ -913,13 +913,31 @@ def _ingest_in_process(arguments: argparse.Namespace) -> int:
         # The mass-failure gates, verbatim: the same budgets a scheduled run
         # applies, so a corpus that would fail there fails here too.
         print(f"ingest: {error}", file=sys.stderr)
+        _print_ingest_failure_hint()
         return 1
     for stage, counts in counts_by_stage.items():
         print(
             f"{stage.value}: {counts['processed']} processed, "
             f"{counts['quarantined']} quarantined, {counts['errors']} errors"
         )
+    if any(counts["errors"] for counts in counts_by_stage.values()):
+        _print_ingest_failure_hint()
     return 0
+
+
+def _print_ingest_failure_hint() -> None:
+    """Where the record of a failed episode lives.
+
+    Worth saying every time on this path: an episode that produced no catalog
+    row leaves nothing in the catalog to find, and unlike a scheduled run
+    there is no task log behind this executor to go and read.
+    """
+    print(
+        "ingest: episodes that produced no catalog row are recorded in the "
+        "ingest_failures table -- "
+        '`hflow curate "SELECT source_uri, failure_kind, message FROM ingest_failures"`',
+        file=sys.stderr,
+    )
 
 
 def _command_ingest(arguments: argparse.Namespace) -> int:

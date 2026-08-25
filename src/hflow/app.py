@@ -95,6 +95,17 @@ from hflow.workspace import RUNTIME_BUNDLE_DIRECTORY_NAME, Workspace
 # -> the stamps it wrote. See :meth:`App.transform`.
 TransformFunction = Callable[[Path, Path, TransformConfig], EpisodeStamps]
 
+
+class SourceNotFound(FileNotFoundError):
+    """The recording an ingest names is not where it was named.
+
+    A ``FileNotFoundError`` subclass so every existing handler keeps catching
+    it; the distinct type exists so the ingest ledger can tell "the file is
+    not there" (a fact about the request) from "this machine could not read
+    it" (a fact about the machine) without matching on message text.
+    """
+
+
 # The environment override for an App constructed without an explicit data
 # root: the runtime (or a control plane provisioning a hosted workspace)
 # exports it, and the same pipeline file runs unedited at every vantage --
@@ -1241,7 +1252,7 @@ class App:
                     candidate = root_path / episode_path
                     if candidate.is_file():
                         return candidate
-        raise FileNotFoundError(
+        raise SourceNotFound(
             f"episode {str(episode)!r} not found: not an existing local file, and not "
             f"a key under the data root {self.storage_root}"
         )
