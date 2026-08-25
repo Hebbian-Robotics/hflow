@@ -405,3 +405,80 @@ def test_default_library_identifier_names_project_and_format() -> None:
         pass
     explicit_stream.seek(0)
     assert make_reader(explicit_stream).get_header().library == "custom-writer/9"
+
+
+class TestPerGroupChunkTargets:
+    """`chunk_size` as a mapping: the layout half of derived chunk targets.
+
+    Groups are written at wildly different byte rates -- six cameras produce
+    megabytes a second while a proprio channel produces kilobytes -- so
+    hflow.format.derived_chunk_size_bytes computes a target per group and the
+    transform passes them here. Nothing asserted that the writer APPLIED them,
+    so the whole feature could go inert while provenance kept advertising
+    targets the bytes did not honor: the 9.18-against-3.79 chunk fetches per
+    training sample docs/BENCHMARKS.md measures.
+    """
+
+    @staticmethod
+    def _chunks_per_group(written: bytes) -> dict[str, int]:
+        """How many chunks each group's stream was split into."""
+        stream = BytesIO(written)
+        summary = make_reader(stream).get_summary()
+        assert summary is not None
+        group_by_channel_id = {
+            channel_id: channel.metadata["group"]
+            for channel_id, channel in summary.channels.items()
+        }
+        counts: dict[str, int] = {}
+        for chunk_index in summary.chunk_indexes:
+            groups = {
+                group_by_channel_id[channel_id] for channel_id in chunk_index.message_index_offsets
+            }
+            assert len(groups) == 1, "chunk purity is the invariant every group relies on"
+            group = groups.pop()
+            counts[group] = counts.get(group, 0) + 1
+        return counts
+
+    @staticmethod
+    def _write(chunk_size: int | dict[str, int]) -> bytes:
+        stream = BytesIO()
+        with CanonicalMcapWriter(stream, chunk_size=chunk_size) as writer:
+            schema_id = writer.register_schema("s", "jsonschema", b"{}")
+            for topic, group in (("/cam/left", CAMERA_GROUP), ("/state/joint", STATE_GROUP)):
+                writer.register_channel(
+                    topic, "protobuf", schema_id, group=group, metadata={"group": group}
+                )
+            for index in range(200):
+                writer.write_message(1, index * 1000, _camera_payload("/cam/left", index))
+                writer.write_message(2, index * 1000 + 1, _state_payload("/state/joint", index))
+        return stream.getvalue()
+
+    def test_each_group_is_split_at_its_own_target(self) -> None:
+        """The cameras target is 8x the state target over a camera stream ~16x
+        the state stream, so the two must NOT come out with the same shape."""
+        per_group = self._chunks_per_group(
+            self._write({CAMERA_GROUP: 256 * 1024, STATE_GROUP: 32 * 1024})
+        )
+
+        assert per_group[CAMERA_GROUP] > 1
+        assert per_group[STATE_GROUP] > 1
+        # ~600 KB of camera bytes at 256 KB against ~36 KB of state at 32 KB.
+        assert per_group[CAMERA_GROUP] != per_group[STATE_GROUP]
+
+    def test_a_group_the_mapping_omits_falls_back_to_the_default(self) -> None:
+        """`chunk_size` names the groups it has an opinion about; the rest keep
+        DEFAULT_CHUNK_SIZE_BYTES rather than becoming unbounded."""
+        from hflow.mcap_writer import DEFAULT_CHUNK_SIZE_BYTES
+
+        omitted = self._chunks_per_group(self._write({CAMERA_GROUP: 32 * 1024}))
+        pinned = self._chunks_per_group(self._write(DEFAULT_CHUNK_SIZE_BYTES))
+
+        assert omitted[STATE_GROUP] == pinned[STATE_GROUP]
+        assert omitted[CAMERA_GROUP] > pinned[CAMERA_GROUP]
+
+    def test_a_plain_int_still_targets_every_group(self) -> None:
+        """The public contract callers already pass."""
+        per_group = self._chunks_per_group(self._write(32 * 1024))
+
+        assert per_group[CAMERA_GROUP] > 1
+        assert per_group[STATE_GROUP] > 1
