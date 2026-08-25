@@ -13,9 +13,15 @@ from pathlib import Path
 import pytest
 
 import hflow
+from hflow._video_measurement_toolchain import resolved_video_measurement_toolchain
+from hflow._video_measurements import (
+    CameraMotionMeasurements,
+    CameraMotionSettings,
+    InsufficientVideoFrames,
+    measure_camera_motion,
+)
 from hflow.checks import camera_stability
 from hflow.ffmpeg import ffmpeg_path
-from hflow.motion import CameraMotion, measure_camera_motion
 
 pytest.importorskip("cv2", reason="camera-motion measurement needs the 'motion' extra")
 
@@ -90,17 +96,36 @@ def _shake(amplitude_px: int) -> tuple[str, str]:
     )
 
 
-def _measure(video: Path) -> CameraMotion:
-    motion = measure_camera_motion(video, frames_per_second=_FRAMES_PER_SECOND)
-    assert motion is not None, "the fixture must be measurable"
-    return motion
+def _measure(video: Path) -> CameraMotionMeasurements:
+    camera_motion_result = measure_camera_motion(
+        video,
+        toolchain=resolved_video_measurement_toolchain(),
+        settings=CameraMotionSettings(frames_per_second=_FRAMES_PER_SECOND),
+    )
+    assert isinstance(camera_motion_result, CameraMotionMeasurements), (
+        "the fixture must contain an adjacent frame pair"
+    )
+    return camera_motion_result
+
+
+def test_a_single_frame_is_an_explicit_recoverable_result(
+    still_texture: Path,
+) -> None:
+    camera_motion_result = measure_camera_motion(
+        still_texture,
+        toolchain=resolved_video_measurement_toolchain(),
+        settings=CameraMotionSettings(frames_per_second=_FRAMES_PER_SECOND),
+    )
+    assert isinstance(camera_motion_result, InsufficientVideoFrames)
+    assert camera_motion_result.observed_frame_count == 1
+    assert camera_motion_result.minimum_required_frame_count == 2
 
 
 def test_a_static_camera_reports_no_unstable_footage(still_texture: Path, tmp_path: Path) -> None:
     motion = _measure(_render_camera_path(still_texture, tmp_path / "static.mp4", "160", "120"))
     assert motion.unstable_share == 0.0
     # Well under the instrument's own resolution: nothing moved.
-    assert motion.shake_rate_p50_deg_per_s < motion.resolution_floor_deg_per_s
+    assert motion.shake_rate_p50_degrees_per_second < motion.resolution_floor_degrees_per_second
 
 
 def test_a_smooth_pan_is_not_reported_as_unstable(still_texture: Path, tmp_path: Path) -> None:
@@ -125,7 +150,7 @@ def test_measured_shake_is_linear_in_its_amplitude(still_texture: Path, tmp_path
             )
         )
         assert motion.unstable_share > 0.5, f"{amplitude_px}px of wobble is shake"
-        rates_per_pixel.append(motion.shake_rate_p50_deg_per_s / amplitude_px)
+        rates_per_pixel.append(motion.shake_rate_p50_degrees_per_second / amplitude_px)
 
     # Across a 12x range of amplitude the rate per pixel must stay put.
     assert max(rates_per_pixel) / min(rates_per_pixel) < 1.3, rates_per_pixel
@@ -145,8 +170,8 @@ def test_shake_below_the_resolution_floor_is_not_called_unstable(
             f"120+0.25*cos(2*PI*{_SHAKE_HZ}*t)",
         )
     )
-    assert motion.resolution_floor_deg_per_s > 0.0
-    assert motion.shake_rate_p50_deg_per_s < motion.resolution_floor_deg_per_s
+    assert motion.resolution_floor_degrees_per_second > 0.0
+    assert motion.shake_rate_p50_degrees_per_second < motion.resolution_floor_degrees_per_second
     assert motion.unstable_share == 0.0
 
 
@@ -156,9 +181,9 @@ def test_every_pair_is_accounted_for_as_measured_or_unclassified(
     """A share over an unstated denominator is not a measurement."""
     motion = _measure(_render_camera_path(still_texture, tmp_path / "pan.mp4", "160+30*t", "120"))
     pair_count = _FRAMES_PER_SECOND * _DURATION_S - 1
-    accounted_s = motion.measured_s + motion.unclassified_s
+    accounted_s = motion.measured_seconds + motion.unclassified_seconds
     assert accounted_s == pytest.approx(pair_count / _FRAMES_PER_SECOND, abs=0.05)
-    assert motion.unstable_s <= motion.measured_s
+    assert motion.unstable_seconds <= motion.measured_seconds
 
 
 def test_footage_with_nothing_to_track_reports_no_coverage_not_steadiness(
@@ -201,9 +226,9 @@ def test_footage_with_nothing_to_track_reports_no_coverage_not_steadiness(
     motion = _measure(flat)
 
     pair_count = _FRAMES_PER_SECOND * _DURATION_S - 1
-    assert motion.measured_s == 0.0
-    assert motion.unclassified_s == pytest.approx(pair_count / _FRAMES_PER_SECOND, abs=0.05)
-    assert motion.unstable_s == 0.0
+    assert motion.measured_seconds == 0.0
+    assert motion.unclassified_seconds == pytest.approx(pair_count / _FRAMES_PER_SECOND, abs=0.05)
+    assert motion.unstable_seconds == 0.0
     # Zero over nothing measured, which the coverage beside it qualifies.
     assert motion.unstable_share == 0.0
 

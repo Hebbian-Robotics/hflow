@@ -21,14 +21,22 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from hflow._video_measurement_toolchain import (
+    measure_video_frame_statistics_for_hflow,
+    resolved_video_measurement_toolchain,
+)
+from hflow._video_measurements import (
+    CAMERA_MOTION_DEFINITION_VERSION,
+    DEFAULT_HORIZONTAL_FIELD_OF_VIEW_DEGREES,
+    FRAME_STATISTICS_DEFINITION_VERSION,
+    CameraMotionMeasurements,
+    CameraMotionSettings,
+    FrameStatisticsSettings,
+    InsufficientVideoFrames,
+    LumaRangeEvidence,
+    measure_camera_motion,
+)
 from hflow.episode import Episode
-from hflow.ffmpeg import frame_stats
-
-# Imported at module scope, not inside the check: a function referenced as a
-# global has its source folded into the check's content-hash version, so a
-# change to the instrument re-versions the measurements it produced. OpenCV
-# itself stays lazy inside hflow.motion, so this costs the core install nothing.
-from hflow.motion import DEFAULT_HORIZONTAL_FIELD_OF_VIEW_DEGREES, measure_camera_motion
 from hflow.steps import (
     CheckFunction,
     CheckResult,
@@ -249,8 +257,8 @@ def camera_frame_stats(
 ) -> CheckResult:
     """Camera blackout, freeze, exposure, and frame-count evidence per camera.
 
-    Wraps the single-decode ffmpeg instrument (``hflow.ffmpeg.frame_stats``:
-    blackframe + freezedetect + signalstats in one filter graph, one shared
+    Wraps the incubating single-decode video measurement instrument
+    (blackframe + freezedetect + signalstats in one filter graph, one shared
     frame denominator) over each camera's lossless MP4 remux, and compares
     the stored frame count against the rate the stream claims (declared
     ``expected_hz`` when given, else the stream's median delta) -- the
@@ -286,38 +294,41 @@ def camera_frame_stats(
                 100.0 * (expected_frame_count - message_count) / expected_frame_count
             )
 
-        stats = frame_stats(
+        frame_statistics = measure_video_frame_statistics_for_hflow(
             episode.video(topic),
-            black_frame_amount_pct=black_frame_amount_pct,
-            black_pixel_threshold=black_pixel_threshold,
-            freeze_noise_db=freeze_noise_db,
-            freeze_min_duration_s=freeze_min_duration_s,
-            bright_luma_threshold=bright_luma_threshold,
+            settings=FrameStatisticsSettings(
+                black_frame_minimum_pixel_share_percent=black_frame_amount_pct,
+                black_pixel_luma_threshold=black_pixel_threshold,
+                freeze_noise_tolerance_decibels=freeze_noise_db,
+                freeze_minimum_duration_seconds=freeze_min_duration_s,
+                overexposed_average_luma_threshold=bright_luma_threshold,
+            ),
         )
-        measurements[f"{topic}/decoded_frame_count"] = stats.frame_count
-        measurements[f"{topic}/black_frame_pct"] = stats.black_frame_pct
-        measurements[f"{topic}/overexposed_frame_pct"] = stats.overexposed_frame_pct
-        measurements[f"{topic}/freeze_total_s"] = stats.freeze_total_s
-        measurements[f"{topic}/luma_avg_mean"] = stats.luma_avg_mean
-        measurements[f"{topic}/luma_avg_min"] = stats.luma_avg_min
-        measurements[f"{topic}/luma_avg_max"] = stats.luma_avg_max
+        measurements[f"{topic}/decoded_frame_count"] = frame_statistics.decoded_frame_count
+        measurements[f"{topic}/black_frame_pct"] = frame_statistics.black_frame_percent
+        measurements[f"{topic}/overexposed_frame_pct"] = frame_statistics.overexposed_frame_percent
+        measurements[f"{topic}/freeze_total_s"] = frame_statistics.freeze_total_seconds
+        measurements[f"{topic}/luma_avg_mean"] = frame_statistics.average_luma_mean
+        measurements[f"{topic}/luma_avg_min"] = frame_statistics.average_luma_minimum
+        measurements[f"{topic}/luma_avg_max"] = frame_statistics.average_luma_maximum
         # Which binary produced these readings. The check's version covers its
         # source and thresholds but not the instrument, and builds genuinely
         # measure differently -- so a pin bump would otherwise move every camera
         # measurement in a corpus with nothing recording that it had. Text, so
         # it stays out of the wide view's numeric columns.
-        measurements["camera_instrument"] = stats.instrument_version
+        measurements["camera_instrument"] = frame_statistics.provenance.ffmpeg_version
+        measurements["camera_measurement_definition"] = FRAME_STATISTICS_DEFINITION_VERSION
         if message_count:
             # Instrument times are seconds from the MP4 start, which is the
             # camera's first message; map freezes back onto the log clock.
             stream_start_ns = int(stamps_ns[0])
             intervals.extend(
                 Interval(
-                    start_ns=stream_start_ns + int(freeze_start_s * 1e9),
-                    end_ns=stream_start_ns + int(freeze_end_s * 1e9),
+                    start_ns=stream_start_ns + int(freeze_interval.start_seconds * 1e9),
+                    end_ns=stream_start_ns + int(freeze_interval.end_seconds * 1e9),
                     label=f"freeze:{topic}",
                 )
-                for freeze_start_s, freeze_end_s in stats.freeze_intervals
+                for freeze_interval in frame_statistics.freeze_intervals
             )
     return CheckResult(measurements=measurements, intervals=intervals)
 
@@ -552,31 +563,41 @@ def camera_stability(
         if median_interval_s <= 0:
             measurements[f"{topic}/stability_sample_count"] = len(stamps_ns)
             continue
-        motion = measure_camera_motion(
+        camera_motion_result = measure_camera_motion(
             episode.video(topic),
-            frames_per_second=1.0 / median_interval_s,
-            horizontal_field_of_view_degrees=horizontal_field_of_view_degrees,
+            toolchain=resolved_video_measurement_toolchain(),
+            settings=CameraMotionSettings(
+                frames_per_second=1.0 / median_interval_s,
+                horizontal_field_of_view_degrees=horizontal_field_of_view_degrees,
+            ),
         )
-        if motion is None:
+        if isinstance(camera_motion_result, InsufficientVideoFrames):
             measurements[f"{topic}/stability_sample_count"] = len(stamps_ns)
             continue
-        observed_s = motion.measured_s + motion.unclassified_s
+        assert isinstance(camera_motion_result, CameraMotionMeasurements)
+        motion = camera_motion_result
+        observed_s = motion.measured_seconds + motion.unclassified_seconds
         measurements.update(
             {
                 f"{topic}/stability_sample_count": len(stamps_ns),
                 f"{topic}/unstable_share": motion.unstable_share,
-                f"{topic}/unstable_s": motion.unstable_s,
-                f"{topic}/measured_s": motion.measured_s,
-                f"{topic}/unclassified_s": motion.unclassified_s,
+                f"{topic}/unstable_s": motion.unstable_seconds,
+                f"{topic}/measured_s": motion.measured_seconds,
+                f"{topic}/unclassified_s": motion.unclassified_seconds,
                 f"{topic}/coverage_share": (
-                    motion.measured_s / observed_s if observed_s > 0 else 0.0
+                    motion.measured_seconds / observed_s if observed_s > 0 else 0.0
                 ),
-                f"{topic}/shake_rate_p50_dps": motion.shake_rate_p50_deg_per_s,
-                f"{topic}/shake_rate_p95_dps": motion.shake_rate_p95_deg_per_s,
-                f"{topic}/intentional_rate_p50_dps": motion.intentional_rate_p50_deg_per_s,
-                f"{topic}/resolution_floor_dps": motion.resolution_floor_deg_per_s,
+                f"{topic}/shake_rate_p50_dps": motion.shake_rate_p50_degrees_per_second,
+                f"{topic}/shake_rate_p95_dps": motion.shake_rate_p95_degrees_per_second,
+                f"{topic}/intentional_rate_p50_dps": (
+                    motion.intentional_rate_p50_degrees_per_second
+                ),
+                f"{topic}/resolution_floor_dps": motion.resolution_floor_degrees_per_second,
                 f"{topic}/median_inlier_ratio": motion.median_inlier_ratio,
                 f"{topic}/horizontal_fov_degrees": horizontal_field_of_view_degrees,
+                "camera_motion_measurement_definition": CAMERA_MOTION_DEFINITION_VERSION,
+                "camera_motion_ffmpeg": motion.provenance.ffmpeg_version,
+                "camera_motion_opencv": motion.provenance.opencv_version,
             }
         )
         # Pair i spans frame i to frame i + 1, and canonical episodes carry one
@@ -831,14 +852,13 @@ def camera_signal_quality(
     a check is the unit of three things at once -- one gate decision, one
     coverage denominator, and one content-hash version. Twenty-odd measurements
     under one name would mean a threshold on any of them gating all of them, and
-    one changed constant re-versioning the lot. The instrument is memoized in
-    the workdir (``hflow.ffmpeg.frame_stats`` caches its raw output beside the
-    workdir MP4 it reads, keyed on the filter graph), so registering both
-    checks against the same episode pays one ffmpeg decode per camera per
-    episode, not two. Both checks default the three graph parameters
-    identically, which is what makes them share the decode; override one on
-    only one of the checks and you are back to two decodes, correctly, because
-    you have asked ffmpeg for two different measurements.
+    one changed constant re-versioning the lot. HFlow's adapter caches the
+    instrument's raw output beside the workdir MP4, keyed on the measurement
+    definition, FFmpeg version, and filter graph. Registering both checks
+    against the same episode therefore pays one FFmpeg decode per camera, not
+    two. Both checks default the graph parameters identically, which lets them
+    share the decode. Override a graph parameter on only one check and HFlow
+    decodes again because you asked FFmpeg for a different measurement.
 
     The coding range is measured from the pixels, never read from the
     container's declared range. That tag lies in practice -- a corpus can
@@ -863,39 +883,48 @@ def camera_signal_quality(
     selected_cameras = list(cameras) if cameras is not None else episode.cameras
     measurements: dict[str, MeasurementValue] = {}
     for topic in selected_cameras:
-        stats = frame_stats(
+        frame_statistics = measure_video_frame_statistics_for_hflow(
             episode.video(topic),
-            black_pixel_threshold=black_pixel_threshold,
-            freeze_noise_db=freeze_noise_db,
-            freeze_min_duration_s=freeze_min_duration_s,
+            settings=FrameStatisticsSettings(
+                black_pixel_luma_threshold=black_pixel_threshold,
+                freeze_noise_tolerance_decibels=freeze_noise_db,
+                freeze_minimum_duration_seconds=freeze_min_duration_s,
+            ),
         )
         measurements.update(
             {
-                f"{topic}/signal_frame_count": stats.frame_count,
+                f"{topic}/signal_frame_count": frame_statistics.decoded_frame_count,
                 # Coding range, and the whole-scale extremes behind the verdict,
                 # so a borderline call is auditable rather than asserted.
-                f"{topic}/full_range_detected": int(stats.full_range_detected),
-                f"{topic}/luma_min": stats.luma_min,
-                f"{topic}/luma_max": stats.luma_max,
+                f"{topic}/full_range_detected": int(
+                    frame_statistics.luma_range_evidence
+                    is LumaRangeEvidence.EXTENDS_BEYOND_NOMINAL_LIMITED_RANGE
+                ),
+                f"{topic}/luma_min": frame_statistics.minimum_luma,
+                f"{topic}/luma_max": frame_statistics.maximum_luma,
                 # Robust exposure: the 10th/90th luma percentiles, so one hot or
                 # dead pixel cannot manufacture a defect.
-                f"{topic}/luma_p10_mean": stats.luma_p10_mean,
-                f"{topic}/luma_p90_mean": stats.luma_p90_mean,
-                f"{topic}/clipped_highlight_pct": stats.clipped_highlight_pct,
-                f"{topic}/crushed_shadow_pct": stats.crushed_shadow_pct,
+                f"{topic}/luma_p10_mean": frame_statistics.tenth_percentile_luma_mean,
+                f"{topic}/luma_p90_mean": frame_statistics.ninetieth_percentile_luma_mean,
+                f"{topic}/clipped_highlight_pct": (
+                    frame_statistics.clipped_highlight_frame_percent
+                ),
+                f"{topic}/crushed_shadow_pct": frame_statistics.crushed_shadow_frame_percent,
                 # Black-pixel share over every frame, not only flagged frames.
-                f"{topic}/black_pixel_share_mean": stats.black_pixel_share_mean,
-                f"{topic}/black_pixel_share_max": stats.black_pixel_share_max,
+                f"{topic}/black_pixel_share_mean": frame_statistics.black_pixel_share_mean,
+                f"{topic}/black_pixel_share_max": frame_statistics.black_pixel_share_maximum,
                 # Stillness, which is a different fact from a frozen feed: a
                 # motionless scene reads near zero while freeze detection stays
                 # silent.
-                f"{topic}/frame_difference_mean": stats.frame_difference_mean,
-                f"{topic}/frame_difference_max": stats.frame_difference_max,
+                f"{topic}/frame_difference_mean": frame_statistics.frame_difference_mean,
+                f"{topic}/frame_difference_max": frame_statistics.frame_difference_maximum,
                 # Impulse noise and dropout streaks.
-                f"{topic}/temporal_outlier_mean": stats.temporal_outlier_mean,
-                f"{topic}/temporal_outlier_max": stats.temporal_outlier_max,
-                f"{topic}/out_of_legal_range_mean": stats.out_of_legal_range_mean,
-                f"{topic}/out_of_legal_range_max": stats.out_of_legal_range_max,
+                f"{topic}/temporal_outlier_mean": frame_statistics.temporal_outlier_mean,
+                f"{topic}/temporal_outlier_max": frame_statistics.temporal_outlier_maximum,
+                f"{topic}/out_of_legal_range_mean": frame_statistics.out_of_legal_range_mean,
+                f"{topic}/out_of_legal_range_max": frame_statistics.out_of_legal_range_maximum,
+                "camera_signal_instrument": frame_statistics.provenance.ffmpeg_version,
+                "camera_signal_measurement_definition": FRAME_STATISTICS_DEFINITION_VERSION,
             }
         )
     return CheckResult(measurements=measurements)

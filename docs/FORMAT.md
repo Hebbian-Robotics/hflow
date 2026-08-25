@@ -89,7 +89,7 @@ it to how the data is read:
 | `vla` | 1.0 s | Short sparse windows (a keyframe seek per sample, so keep it cheap) |
 | `world_model` | 6.0 s | Long contiguous sequences (keyframe cost amortizes, so favor compression) |
 
-`gop_frames = max(1, round(gop_seconds × fps))`, with `fps` measured from the source stream (`1e9 / median(Δ log_time)`). The seconds values are configurable defaults pending the benchmark report; the provenance record (below) stamps what was used.
+`gop_frames = max(1, round(gop_seconds × fps))`, with `fps` measured from the source stream (`1e9 / median(Δ log_time)`). The seconds values are configurable defaults, now with measured results in [the benchmark report](./BENCHMARKS.md); the provenance record (below) stamps what was used.
 
 ## State channels
 

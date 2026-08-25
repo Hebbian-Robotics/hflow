@@ -591,8 +591,8 @@ def test_step_version_includes_referenced_global_configuration(
 
 
 # Composition in HFlow runs through shared library code, not through edges
-# between checks: two built-ins share one ffmpeg pass by both calling
-# ``frame_stats``, and the motion checks share ``hflow.motion``. That only
+# between checks: two built-ins share the video-measurements package's frame
+# statistics, and the motion checks share its camera-motion definition. That only
 # keeps its integrity if a step version follows the code the step calls, all
 # the way down. Otherwise editing a parser or a constant one level below the
 # step changes what it measures while its version stands still, and the new
@@ -726,7 +726,7 @@ def test_step_version_follows_a_parsing_pattern_below_the_step(
     """
     before = _version_of(hflow.checks.camera_signal_quality)
     monkeypatch.setattr(
-        "hflow.ffmpeg._instrument._METADATA_LINE_PATTERN",
+        "hflow._video_measurements._frame_statistics._METADATA_LINE_PATTERN",
         re.compile(r"^(?P<key>never_matches)=(?P<value>.*)$"),
     )
 

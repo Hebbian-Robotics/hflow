@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 import hflow
+from hflow.checks import camera_frame_stats
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
 
@@ -62,10 +63,13 @@ def report_and_app(
 
     @app.check(critical=True)
     def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
-        stats = hflow.ffmpeg.frame_stats(ep.video("wrist_cam"))
+        camera_topic = next(topic for topic in ep.cameras if "wrist_cam" in topic)
+        camera_evidence = camera_frame_stats(ep, cameras=[camera_topic])
+        black_frame_percent = camera_evidence.measurements[f"{camera_topic}/black_frame_pct"]
+        assert isinstance(black_frame_percent, float)
         return hflow.CheckResult(
-            measurements={"black_pct": stats.black_frame_pct},
-            verdict=stats.black_frame_pct < 50.0,
+            measurements={"black_pct": black_frame_percent},
+            verdict=black_frame_percent < 50.0,
         )
 
     report = app.test(source_episode, verbose=False)
@@ -189,10 +193,13 @@ def test_failed_critical_verdict_quarantines_and_skips_downstream(
 
     @app.check(critical=True)
     def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
-        stats = hflow.ffmpeg.frame_stats(ep.video("wrist_cam"))
+        camera_topic = next(topic for topic in ep.cameras if "wrist_cam" in topic)
+        camera_evidence = camera_frame_stats(ep, cameras=[camera_topic])
+        black_frame_percent = camera_evidence.measurements[f"{camera_topic}/black_frame_pct"]
+        assert isinstance(black_frame_percent, float)
         return hflow.CheckResult(
-            measurements={"black_pct": stats.black_frame_pct},
-            verdict=stats.black_frame_pct < 1.0,  # fixture blackout exceeds this
+            measurements={"black_pct": black_frame_percent},
+            verdict=black_frame_percent < 1.0,  # fixture blackout exceeds this
         )
 
     @app.check()

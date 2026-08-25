@@ -156,6 +156,7 @@ and other physical-AI recordings.
 
 ```python
 import hflow
+from hflow.checks import camera_frame_stats
 from your_existing_qc import check_joint_smoothness  # use your existing checks
 
 app = hflow.App("kitchen-pipeline")  # data root: $HFLOW_DATA_ROOT, hflow.toml, else ./data
@@ -170,10 +171,13 @@ def joint_smoothness(ep: hflow.Episode) -> hflow.CheckResult:
 
 @app.check(critical=True)
 def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
-    stats = hflow.ffmpeg.frame_stats(ep.video("wrist_cam"))  # one decode pass
+    camera_topic = next(topic for topic in ep.cameras if "wrist_cam" in topic)
+    evidence = camera_frame_stats(ep, cameras=[camera_topic])
+    black_frame_percent = evidence.measurements[f"{camera_topic}/black_frame_pct"]
+    assert isinstance(black_frame_percent, float)
     return hflow.CheckResult(
-        measurements={"black_pct": stats.black_frame_pct},
-        verdict=stats.black_frame_pct < 50.0,  # percent; your threshold
+        measurements={"black_pct": black_frame_percent},
+        verdict=black_frame_percent < 50.0,  # percent; your threshold
     )
 
 

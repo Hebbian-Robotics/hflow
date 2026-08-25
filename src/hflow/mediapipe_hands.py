@@ -44,8 +44,9 @@ from hflow._pinned_asset import (
     sha256_hex_of_file,
     user_cache_dir,
 )
+from hflow._video_measurement_toolchain import resolved_video_measurement_toolchain
+from hflow._video_measurements._raw_frames import rgb_frames
 from hflow.episode import Episode
-from hflow.ffmpeg import rgb_frames
 from hflow.steps import CheckResult, Interval, MeasurementValue
 from hflow.video import source_log_times_for_sampled_frames
 
@@ -227,8 +228,9 @@ def _import_mediapipe() -> ModuleType:
     registered without the instrument installed.
     """
     # Imported by name rather than with an import statement, which
-    # hflow.motion does not need to do for OpenCV: that extra is mirrored into
-    # the dev group, so the typechecker can resolve it, while this one is
+    # The video-measurements package does not need this indirection for OpenCV:
+    # that extra is mirrored into the dev group, so the typechecker can resolve
+    # it, while this one is
     # deliberately absent (~430 MB and a second OpenCV distribution). A plain
     # import here would be unresolvable in a default environment and resolvable
     # in an opted-in one, so any suppression for it would itself be flagged as
@@ -442,7 +444,8 @@ def mediapipe_hand_detection(
 
         with rgb_frames(
             episode.video(topic),
-            fps=sample_fps,
+            toolchain=resolved_video_measurement_toolchain(),
+            frames_per_second=sample_fps,
             long_edge_pixels=inference_long_edge_pixels,
         ) as frames:
             detections = detect_hands_in_frames(

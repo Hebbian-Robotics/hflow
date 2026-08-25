@@ -35,7 +35,7 @@ NAMES and then keeps descending through first-party code: the helpers those
 functions call, and the constants they read, down to the leaves (see
 ``_IdentityScope`` in :mod:`hflow.steps`). That is what keeps composition
 honest here. Checks compose by sharing library code (two built-ins reading one
-ffmpeg pass, the motion checks sharing :mod:`hflow.motion`) rather than by
+video-measurement definition, including camera motion) rather than by
 depending on each other's results. Without the descent, tuning a threshold
 inside the shared instrument changed what every one of them measured while
 their versions stood still.

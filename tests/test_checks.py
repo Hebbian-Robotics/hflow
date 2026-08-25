@@ -1,6 +1,5 @@
 """Direct unit tests for the built-in checks (paths e2e only grazes)."""
 
-import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -26,8 +25,6 @@ from hflow.checks import (
     trajectory_metrics,
     trajectory_segments,
 )
-from hflow.episode import _sanitize_topic
-from hflow.ffmpeg import _instrument
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import TransformConfig, write_canonical_episode
 
@@ -606,9 +603,7 @@ def test_camera_signal_quality_sees_a_blacked_out_segment(tmp_path: Path) -> Non
     assert luma_p10_mean < luma_p90_mean / 2.0
 
 
-def test_registering_both_camera_checks_caches_the_instrument(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_registering_both_camera_checks_caches_the_instrument(tmp_path: Path) -> None:
     """Issue #173: registering ``camera_frame_stats`` AND
     ``camera_signal_quality`` against the same episode must run the ffmpeg
     instrument pass once per camera, not twice. The cache lives beside the
@@ -624,63 +619,21 @@ def test_registering_both_camera_checks_caches_the_instrument(
     write_canonical_episode(source, canonical, TransformConfig())
     workdir = tmp_path / "workdir"
 
-    # Minimal valid instrument stdout: one frame, all signals inside the
-    # 8-bit range. ``_stats_from_instrument_output`` hard-validates every
-    # signal, so the fake must produce a parseable document.
-    valid_instrument_stdout = (
-        "frame:0    pts:0    pts_time:0\n"
-        "lavfi.blackframe.pblack=0\n"
-        "lavfi.signalstats.YMIN=16\n"
-        "lavfi.signalstats.YLOW=32\n"
-        "lavfi.signalstats.YAVG=100\n"
-        "lavfi.signalstats.YHIGH=200\n"
-        "lavfi.signalstats.YMAX=235\n"
-        "lavfi.signalstats.YDIF=0\n"
-        "lavfi.signalstats.TOUT=0\n"
-        "lavfi.signalstats.BRNG=0\n"
-    )
-
-    decode_calls: list[int] = []
-
-    def fake_run(
-        command: object,
-        /,
-        *arguments: object,
-        **keywords: object,
-    ) -> subprocess.CompletedProcess[str]:
-        # The instrument pass is the only ``subprocess.run`` call from
-        # ``_instrument`` that has ``-vf`` (the measuring filter graph);
-        # ``ffmpeg_version`` is cached after the first call, so it does
-        # not show up here.
-        if isinstance(command, (list, tuple)) and "-vf" in command:
-            decode_calls.append(1)
-        return subprocess.CompletedProcess(
-            args=[], returncode=0, stdout=valid_instrument_stdout, stderr=""
-        )
-
     with hflow.Episode(canonical, workdir=workdir) as episode:
         camera_topic = episode.cameras[0]
-        # Force the workdir MP4 remux with the real ``subprocess.run`` before
-        # installing the fake. ``_instrument.subprocess`` is the shared
-        # ``subprocess`` module, so any patch here would also intercept the
-        # remux's own ``subprocess.run`` and turn the workdir MP4 into a
-        # zero-byte file. Once the MP4 is on disk, ``Episode.video()`` will
-        # hit its own ``.exists()`` cache and never call ``subprocess.run``
-        # again, so the patch below only sees the instrument pass.
-        episode.video(camera_topic)
-        monkeypatch.setattr(_instrument.subprocess, "run", fake_run)
         first = camera_frame_stats(episode)
+        video_path = episode.video(camera_topic)
+        cache_files_after_first_check = list(workdir.glob(f"{video_path.stem}.instrument.*.txt"))
+        assert len(cache_files_after_first_check) == 1
+
+        # If the second check attempts another decode, this no longer-valid MP4
+        # makes it fail. A successful result proves it read the cached stream.
+        video_path.write_bytes(b"not a video anymore")
         second = camera_signal_quality(episode)
 
-    # The cache file landed next to the workdir MP4 (``<sanitized>.mp4``),
-    # using the same ``_sanitize_topic`` rule as ``Episode.video()``. Matched
-    # by glob rather than by full name: the graph digest in the middle is an
-    # implementation detail, and exactly one file is the fact worth pinning.
-    # Two would mean the checks disagreed on the graph and each decoded.
-    cache_files = list(workdir.glob(f"{_sanitize_topic(camera_topic)}.instrument.*.txt"))
-    assert len(cache_files) == 1, f"expected one cache file, got {cache_files}"
-    # Exactly one ffmpeg decode for the one camera -- the doubled cost is gone.
-    assert sum(decode_calls) == 1, f"got {decode_calls}"
+    assert list(workdir.glob(f"{video_path.stem}.instrument.*.txt")) == (
+        cache_files_after_first_check
+    )
     # Both checks produced measurements for the same camera.
     assert f"{camera_topic}/decoded_frame_count" in first.measurements
     assert f"{camera_topic}/signal_frame_count" in second.measurements

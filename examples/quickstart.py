@@ -22,8 +22,7 @@ import hflow
 # code they call), while a module contributes only its name. Spelling it this
 # way is what makes "the built-in changed" show up as a new step version rather
 # than as new rows under the old one.
-from hflow.checks import timestamp_regularity
-from hflow.ffmpeg import frame_stats
+from hflow.checks import camera_frame_stats, timestamp_regularity
 
 
 def check_joint_smoothness(joints: np.ndarray, rate_hz: float) -> dict[str, float]:
@@ -51,10 +50,13 @@ def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
 
 @app.check(critical=True)
 def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
-    stats = frame_stats(ep.video("wrist_cam"))
+    camera_topic = next(topic for topic in ep.cameras if "wrist_cam" in topic)
+    evidence = camera_frame_stats(ep, cameras=[camera_topic])
+    black_frame_percent = evidence.measurements[f"{camera_topic}/black_frame_pct"]
+    assert isinstance(black_frame_percent, float)
     return hflow.CheckResult(
-        measurements={"black_pct": stats.black_frame_pct},
-        verdict=stats.black_frame_pct < 50.0,
+        measurements={"black_pct": black_frame_percent},
+        verdict=black_frame_percent < 50.0,
     )
 
 

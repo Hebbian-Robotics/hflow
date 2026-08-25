@@ -18,6 +18,30 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from hflow._video_measurement_toolchain import (
+    _frame_statistics_cache_path,
+    measure_video_frame_statistics_for_hflow,
+    resolved_video_measurement_toolchain,
+)
+from hflow._video_measurements import (
+    FrameStatisticsExecutionError,
+    FrameStatisticsParseError,
+    FrameStatisticsSettings,
+    LumaRangeEvidence,
+    VideoFrameStatistics,
+    VideoMeasurementToolchain,
+    measure_video_frame_statistics,
+)
+from hflow._video_measurements._frame_statistics import (
+    _FILTER_LIST_ENTRY_PATTERN,
+    _aggregate_frame_statistics_output,
+)
+from hflow._video_measurements._raw_frames import (
+    RawFrameError,
+    _scaled_frame_shape,
+    luma_frames,
+    rgb_frames,
+)
 from hflow.episode import ExtractedFrame
 from hflow.ffmpeg import _binary, _contact_sheet
 from hflow.ffmpeg._binary import (
@@ -39,25 +63,26 @@ from hflow.ffmpeg._contact_sheet import (
     _find_usable_font_file,
     contact_sheet,
 )
-from hflow.ffmpeg._instrument import (
-    InstrumentParseError,
-    _instrument_cache_path,
-    _read_instrument_cache,
-    _stats_from_instrument_output,
-    _write_instrument_cache,
-    frame_stats,
-    instrument_filter_graph,
-)
-from hflow.ffmpeg._raw_frames import (
-    RawFrameError,
-    _scaled_frame_shape,
-    luma_frames,
-    rgb_frames,
-)
 
 
 def _system_ffmpeg() -> str:
     return os.environ[FFMPEG_ENV_VAR]
+
+
+def _measure_frame_statistics(
+    video: Path,
+    *,
+    freeze_minimum_duration_seconds: float = 2.0,
+    overexposed_average_luma_threshold: float = 235.0,
+) -> VideoFrameStatistics:
+    return measure_video_frame_statistics(
+        video,
+        toolchain=resolved_video_measurement_toolchain(),
+        settings=FrameStatisticsSettings(
+            freeze_minimum_duration_seconds=freeze_minimum_duration_seconds,
+            overexposed_average_luma_threshold=overexposed_average_luma_threshold,
+        ),
+    )
 
 
 def _clear_all_binary_caches() -> None:
@@ -336,19 +361,19 @@ _SYNTHETIC_OUTPUT = _synthetic_frames(
 
 
 def test_synthetic_output_aggregates_exactly() -> None:
-    stats = _stats_from_instrument_output(_SYNTHETIC_OUTPUT)
-    assert stats.frame_count == 3
-    assert stats.duration_s == pytest.approx(1.5)  # last pts + median interval
+    stats = _aggregate_frame_statistics_output(_SYNTHETIC_OUTPUT)
+    assert stats.decoded_frame_count == 3
+    assert stats.duration_seconds == pytest.approx(1.5)  # last pts + median interval
     assert stats.black_frame_count == 1
-    assert stats.black_frame_pct == pytest.approx(100.0 / 3.0)
-    assert stats.luma_avg_mean == pytest.approx(50.0)
-    assert stats.luma_avg_min == pytest.approx(10.0)
-    assert stats.luma_avg_max == pytest.approx(100.0)
-    assert stats.freeze_intervals == []
-    assert stats.freeze_total_s == 0.0
+    assert stats.black_frame_percent == pytest.approx(100.0 / 3.0)
+    assert stats.average_luma_mean == pytest.approx(50.0)
+    assert stats.average_luma_minimum == pytest.approx(10.0)
+    assert stats.average_luma_maximum == pytest.approx(100.0)
+    assert stats.freeze_intervals == ()
+    assert stats.freeze_total_seconds == 0.0
     # Default threshold 235.0: none of 100, 10, 40 are >= 235
     assert stats.overexposed_frame_count == 0
-    assert stats.overexposed_frame_pct == 0.0
+    assert stats.overexposed_frame_percent == 0.0
 
 
 def test_synthetic_overexposed_aggregates_exactly() -> None:
@@ -358,12 +383,12 @@ def test_synthetic_overexposed_aggregates_exactly() -> None:
         {"lavfi.signalstats.YAVG": 240},
         {"lavfi.signalstats.YAVG": 250},
     )
-    stats = _stats_from_instrument_output(output)
-    assert stats.frame_count == 3
+    stats = _aggregate_frame_statistics_output(output)
+    assert stats.decoded_frame_count == 3
     assert stats.overexposed_frame_count == 2
-    assert stats.overexposed_frame_pct == pytest.approx(66.666, abs=0.1)
-    assert stats.luma_avg_min == pytest.approx(100.0)
-    assert stats.luma_avg_max == pytest.approx(250.0)
+    assert stats.overexposed_frame_percent == pytest.approx(66.666, abs=0.1)
+    assert stats.average_luma_minimum == pytest.approx(100.0)
+    assert stats.average_luma_maximum == pytest.approx(250.0)
 
 
 def test_synthetic_freeze_intervals_including_unterminated() -> None:
@@ -378,34 +403,60 @@ def test_synthetic_freeze_intervals_including_unterminated() -> None:
         {"lavfi.signalstats.YAVG": 1, "lavfi.freezedetect.freeze_start": 2.5},
         interval_s=1.0,
     )
-    stats = _stats_from_instrument_output(output_text)
+    stats = _aggregate_frame_statistics_output(output_text)
     # Unterminated freeze closes at the duration (3.0 + 1.0 median interval).
-    assert stats.duration_s == pytest.approx(4.0)
-    assert stats.freeze_intervals == [(0.5, 2.0), (2.5, 4.0)]
-    assert stats.freeze_total_s == pytest.approx(3.0)
+    assert stats.duration_seconds == pytest.approx(4.0)
+    assert [
+        (interval.start_seconds, interval.end_seconds) for interval in stats.freeze_intervals
+    ] == [(0.5, 2.0), (2.5, 4.0)]
+    assert stats.freeze_total_seconds == pytest.approx(3.0)
 
 
 def test_truncated_output_missing_yavg_raises() -> None:
-    truncated = "frame:0    pts:0    pts_time:0\nlavfi.signalstats.YAVG=100\nframe:1    pts:512    pts_time:0.5\n"
-    with pytest.raises(InstrumentParseError, match="YAVG"):
-        _stats_from_instrument_output(truncated)
+    truncated = _synthetic_frames({}, {}).replace("lavfi.signalstats.YAVG=100\n", "", 1)
+    with pytest.raises(FrameStatisticsParseError, match="YAVG"):
+        _aggregate_frame_statistics_output(truncated)
 
 
 def test_unparsable_line_raises() -> None:
     garbled = "frame:0    pts:0    pts_time:0\nlavfi.signalstats.YA\n"
-    with pytest.raises(InstrumentParseError, match="unparsable"):
-        _stats_from_instrument_output(garbled)
+    with pytest.raises(FrameStatisticsParseError, match="unparsable"):
+        _aggregate_frame_statistics_output(garbled)
 
 
 def test_nan_yavg_raises() -> None:
     nan_output = "frame:0    pts:0    pts_time:0\nlavfi.signalstats.YAVG=nan\n"
-    with pytest.raises(InstrumentParseError, match="non-finite"):
-        _stats_from_instrument_output(nan_output)
+    with pytest.raises(FrameStatisticsParseError, match="non-finite"):
+        _aggregate_frame_statistics_output(nan_output)
 
 
 def test_empty_output_raises() -> None:
-    with pytest.raises(InstrumentParseError, match="no frames"):
-        _stats_from_instrument_output("")
+    with pytest.raises(FrameStatisticsParseError, match="no frames"):
+        _aggregate_frame_statistics_output("")
+
+
+@pytest.mark.parametrize(
+    ("filter_listing_line", "expected_filter_name"),
+    [
+        (" T.. freezedetect      V->V       Detects frozen video input.", "freezedetect"),
+        (" T. freezedetect       V->V      Detects frozen video input.", "freezedetect"),
+    ],
+)
+def test_filter_listing_parser_accepts_supported_ffmpeg_layouts(
+    filter_listing_line: str, expected_filter_name: str
+) -> None:
+    match = _FILTER_LIST_ENTRY_PATTERN.match(filter_listing_line)
+    assert match is not None
+    assert match.group("filter_name") == expected_filter_name
+
+
+def test_invalid_freeze_interval_is_a_parse_error() -> None:
+    output_text = _synthetic_frames(
+        {"lavfi.freezedetect.freeze_start": 2.0},
+        {"lavfi.freezedetect.freeze_end": 1.0},
+    )
+    with pytest.raises(FrameStatisticsParseError, match="invalid freeze interval"):
+        _aggregate_frame_statistics_output(output_text)
 
 
 @pytest.fixture(scope="module")
@@ -503,59 +554,66 @@ def frozen_tail_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 def test_frame_stats_black_segment(black_tail_video: Path) -> None:
     # freeze_min_duration_s > the 2s black segment so no freeze fires here.
-    stats = frame_stats(black_tail_video, freeze_min_duration_s=3.0)
-    assert stats.frame_count == 60
-    assert stats.duration_s == pytest.approx(6.0, abs=0.3)
+    stats = _measure_frame_statistics(black_tail_video, freeze_minimum_duration_seconds=3.0)
+    assert stats.decoded_frame_count == 60
+    assert stats.duration_seconds == pytest.approx(6.0, abs=0.3)
     # 20 of 60 frames are black; allow encoder edge effects.
-    assert stats.black_frame_pct == pytest.approx(100.0 * 20 / 60, abs=7.0)
+    assert stats.black_frame_percent == pytest.approx(100.0 * 20 / 60, abs=7.0)
     # Encoded limited-range black lands around YAVG=16.
-    assert stats.luma_avg_min < 32.0
-    assert stats.luma_avg_min <= stats.luma_avg_mean <= stats.luma_avg_max
-    assert stats.luma_avg_max > 64.0
-    assert stats.freeze_intervals == []
+    assert stats.average_luma_minimum < 32.0
+    assert stats.average_luma_minimum <= stats.average_luma_mean <= stats.average_luma_maximum
+    assert stats.average_luma_maximum > 64.0
+    assert stats.freeze_intervals == ()
     # Default threshold 235.0: testsrc2 max YAVG is well below.
     assert stats.overexposed_frame_count == 0
-    assert stats.overexposed_frame_pct == 0.0
+    assert stats.overexposed_frame_percent == 0.0
+    assert stats.provenance.measurement_definition_version == "video-frame-statistics/v1"
+    assert "blackframe=amount=0" in stats.provenance.filter_graph
+    assert stats.provenance.settings.freeze_minimum_duration_seconds == 3.0
 
 
 def test_frame_stats_bright_segment(bright_tail_video: Path) -> None:
     # freeze_min_duration_s > the 2s white segment so no freeze fires here.
     # Use a lower threshold to catch the white segment (limited-range white ~235).
-    stats = frame_stats(bright_tail_video, freeze_min_duration_s=3.0, bright_luma_threshold=200.0)
-    assert stats.frame_count == 60
-    assert stats.duration_s == pytest.approx(6.0, abs=0.3)
+    stats = _measure_frame_statistics(
+        bright_tail_video,
+        freeze_minimum_duration_seconds=3.0,
+        overexposed_average_luma_threshold=200.0,
+    )
+    assert stats.decoded_frame_count == 60
+    assert stats.duration_seconds == pytest.approx(6.0, abs=0.3)
     # 20 of 60 frames are white/overexposed; allow encoder edge effects.
-    assert 10.0 < stats.overexposed_frame_pct < 50.0
+    assert 10.0 < stats.overexposed_frame_percent < 50.0
     # Encoded limited-range white lands near YAVG=235.
-    assert stats.luma_avg_max > 200.0
-    assert stats.luma_avg_min <= stats.luma_avg_mean <= stats.luma_avg_max
-    assert stats.freeze_intervals == []
+    assert stats.average_luma_maximum > 200.0
+    assert stats.average_luma_minimum <= stats.average_luma_mean <= stats.average_luma_maximum
+    assert stats.freeze_intervals == ()
 
 
 def test_frame_stats_freeze_interval(frozen_tail_video: Path) -> None:
-    stats = frame_stats(frozen_tail_video, freeze_min_duration_s=1.0)
-    assert stats.frame_count == 50
-    assert stats.duration_s == pytest.approx(5.0, abs=0.3)
+    stats = _measure_frame_statistics(frozen_tail_video, freeze_minimum_duration_seconds=1.0)
+    assert stats.decoded_frame_count == 50
+    assert stats.duration_seconds == pytest.approx(5.0, abs=0.3)
     assert len(stats.freeze_intervals) == 1
-    freeze_start_s, freeze_end_s = stats.freeze_intervals[0]
+    freeze_interval = stats.freeze_intervals[0]
     # The still segment spans roughly 2s..5s (the held frame displays from 1.9s).
-    assert 1.5 <= freeze_start_s <= 2.6
-    assert 4.4 <= freeze_end_s <= 5.4
-    assert 2.0 <= stats.freeze_total_s <= 3.6
+    assert 1.5 <= freeze_interval.start_seconds <= 2.6
+    assert 4.4 <= freeze_interval.end_seconds <= 5.4
+    assert 2.0 <= stats.freeze_total_seconds <= 3.6
 
 
 def test_frame_stats_truncated_video_file_raises(tmp_path: Path) -> None:
     not_a_video = tmp_path / "garbage.mp4"
     not_a_video.write_bytes(b"\x00\x01\x02not a video")
     with pytest.raises(RuntimeError):
-        frame_stats(not_a_video)
+        _measure_frame_statistics(not_a_video)
 
 
 def test_luma_frames_streams_every_frame_at_the_coded_size(black_tail_video: Path) -> None:
     """Full rate and no re-encode, which is what a frame-to-frame measurement
     needs and what ``Episode.frames()`` deliberately does not give.
     """
-    with luma_frames(black_tail_video) as frames:
+    with luma_frames(black_tail_video, toolchain=resolved_video_measurement_toolchain()) as frames:
         shapes = [frame.shape for frame in frames]
     assert len(shapes) == 60
     assert set(shapes) == {(120, 160)}
@@ -569,7 +627,7 @@ def test_luma_frames_reaps_ffmpeg_when_the_caller_stops_early(
     exit code cannot tell the two apart, so the helper tracks whether the stream
     was drained instead.
     """
-    with luma_frames(black_tail_video) as frames:
+    with luma_frames(black_tail_video, toolchain=resolved_video_measurement_toolchain()) as frames:
         first_frame = next(iter(frames))
     assert first_frame.shape == (120, 160)
 
@@ -577,12 +635,15 @@ def test_luma_frames_reaps_ffmpeg_when_the_caller_stops_early(
 def test_luma_frames_on_a_non_video_raises(tmp_path: Path) -> None:
     not_a_video = tmp_path / "garbage.mp4"
     not_a_video.write_bytes(b"\x00\x01\x02not a video")
-    with pytest.raises(RawFrameError), luma_frames(not_a_video) as frames:
+    with (
+        pytest.raises(RawFrameError),
+        luma_frames(not_a_video, toolchain=resolved_video_measurement_toolchain()) as frames,
+    ):
         list(frames)
 
 
 def test_rgb_frames_streams_three_channels_at_the_coded_size(black_tail_video: Path) -> None:
-    with rgb_frames(black_tail_video) as frames:
+    with rgb_frames(black_tail_video, toolchain=resolved_video_measurement_toolchain()) as frames:
         shapes = [frame.shape for frame in frames]
     assert len(shapes) == 60
     assert set(shapes) == {(120, 160, 3)}
@@ -593,7 +654,12 @@ def test_rgb_frames_resamples_and_resizes_in_one_decode(black_tail_video: Path) 
     graph converts one frame's pixels per output tick rather than every
     frame's.
     """
-    with rgb_frames(black_tail_video, fps=1.0, long_edge_pixels=80) as frames:
+    with rgb_frames(
+        black_tail_video,
+        toolchain=resolved_video_measurement_toolchain(),
+        frames_per_second=1.0,
+        long_edge_pixels=80,
+    ) as frames:
         shapes = [frame.shape for frame in frames]
     # 6 seconds at 10 fps sampled to 1 fps, and 160x120 scaled to an 80 long edge.
     assert len(shapes) == 6
@@ -604,7 +670,7 @@ def test_rgb_frames_are_contiguous_uint8(black_tail_video: Path) -> None:
     """The layout a local vision model takes directly; a non-contiguous or
     wider dtype would have to be copied and converted at every call site.
     """
-    with rgb_frames(black_tail_video) as frames:
+    with rgb_frames(black_tail_video, toolchain=resolved_video_measurement_toolchain()) as frames:
         frame = next(iter(frames))
     assert frame.dtype == np.uint8
     assert frame.flags["C_CONTIGUOUS"]
@@ -612,8 +678,12 @@ def test_rgb_frames_are_contiguous_uint8(black_tail_video: Path) -> None:
 
 def test_rgb_frames_reject_a_non_positive_rate(black_tail_video: Path) -> None:
     with (
-        pytest.raises(ValueError, match="fps must be positive"),
-        rgb_frames(black_tail_video, fps=0.0),
+        pytest.raises(ValueError, match="frames_per_second must be positive"),
+        rgb_frames(
+            black_tail_video,
+            toolchain=resolved_video_measurement_toolchain(),
+            frames_per_second=0.0,
+        ),
     ):
         pass
 
@@ -650,7 +720,8 @@ def test_missing_motion_extra_names_the_install_command(
     """
     import builtins
 
-    from hflow.motion import MotionExtraNotInstalledError, _import_cv2
+    from hflow._video_measurements import MotionExtraNotInstalledError
+    from hflow._video_measurements._camera_motion import _import_cv2
 
     real_import = builtins.__import__
 
@@ -818,54 +889,54 @@ def test_coding_range_is_derived_from_luma_and_selects_the_exposure_gates() -> N
     A frame leaving 16-235 proves the stream is full-range, which moves the
     clipping gate from 246 to 254 -- and a p90 of 250 flips from defect to fine.
     """
-    limited = _stats_from_instrument_output(
+    limited = _aggregate_frame_statistics_output(
         _synthetic_frames({"lavfi.signalstats.YHIGH": 250}, {"lavfi.signalstats.YHIGH": 250})
     )
-    assert limited.full_range_detected is False
-    assert limited.clipped_highlight_pct == pytest.approx(100.0)
+    assert limited.luma_range_evidence is LumaRangeEvidence.NOMINAL_LIMITED_RANGE_COMPATIBLE
+    assert limited.clipped_highlight_frame_percent == pytest.approx(100.0)
 
-    full = _stats_from_instrument_output(
+    full = _aggregate_frame_statistics_output(
         _synthetic_frames(
             {"lavfi.signalstats.YHIGH": 250, "lavfi.signalstats.YMAX": 255},
             {"lavfi.signalstats.YHIGH": 250, "lavfi.signalstats.YMAX": 255},
         )
     )
-    assert full.full_range_detected is True
-    assert full.clipped_highlight_pct == 0.0
+    assert full.luma_range_evidence is LumaRangeEvidence.EXTENDS_BEYOND_NOMINAL_LIMITED_RANGE
+    assert full.clipped_highlight_frame_percent == 0.0
 
 
 def test_the_nominal_range_bounds_are_inclusive() -> None:
     """16 and 235 are themselves limited-range legal; only leaving them counts."""
-    at_bounds = _stats_from_instrument_output(
+    at_bounds = _aggregate_frame_statistics_output(
         _synthetic_frames({"lavfi.signalstats.YMIN": 16, "lavfi.signalstats.YMAX": 235})
     )
-    assert at_bounds.full_range_detected is False
-    below = _stats_from_instrument_output(
+    assert at_bounds.luma_range_evidence is LumaRangeEvidence.NOMINAL_LIMITED_RANGE_COMPATIBLE
+    below = _aggregate_frame_statistics_output(
         _synthetic_frames({"lavfi.signalstats.YMIN": 15, "lavfi.signalstats.YMAX": 235})
     )
-    assert below.full_range_detected is True
+    assert below.luma_range_evidence is LumaRangeEvidence.EXTENDS_BEYOND_NOMINAL_LIMITED_RANGE
 
 
 def test_crushed_shadows_use_the_range_selected_gate() -> None:
-    limited = _stats_from_instrument_output(
+    limited = _aggregate_frame_statistics_output(
         _synthetic_frames({"lavfi.signalstats.YLOW": 3}, {"lavfi.signalstats.YLOW": 200})
     )
-    assert limited.crushed_shadow_pct == pytest.approx(50.0)
+    assert limited.crushed_shadow_frame_percent == pytest.approx(50.0)
     # The same p10 in a full-range stream is well inside the wider gate of 1.0.
-    full = _stats_from_instrument_output(
+    full = _aggregate_frame_statistics_output(
         _synthetic_frames(
             {"lavfi.signalstats.YLOW": 3, "lavfi.signalstats.YMAX": 255},
             {"lavfi.signalstats.YLOW": 200, "lavfi.signalstats.YMAX": 255},
         )
     )
-    assert full.crushed_shadow_pct == 0.0
+    assert full.crushed_shadow_frame_percent == 0.0
 
 
 def test_black_pixel_share_is_reported_over_every_frame() -> None:
     """Asking the filter for every frame's share, not just the flagged ones, is
     what keeps a half-covered lens visible instead of rounding to "not black".
     """
-    stats = _stats_from_instrument_output(
+    stats = _aggregate_frame_statistics_output(
         _synthetic_frames(
             {"lavfi.blackframe.pblack": 50},
             {"lavfi.blackframe.pblack": 99},
@@ -874,7 +945,7 @@ def test_black_pixel_share_is_reported_over_every_frame() -> None:
     )
     # Only the 99% frame clears the 98% flag, but the 50% frame is still evidence.
     assert stats.black_frame_count == 1
-    assert stats.black_pixel_share_max == pytest.approx(99.0)
+    assert stats.black_pixel_share_maximum == pytest.approx(99.0)
     assert stats.black_pixel_share_mean == pytest.approx(149.0 / 3.0)
 
 
@@ -883,15 +954,15 @@ def test_luma_above_the_eight_bit_scale_raises() -> None:
     every threshold here is off by a factor of four. Fail loudly instead.
     """
     ten_bit = _synthetic_frames({"lavfi.signalstats.YMAX": 1023})
-    with pytest.raises(InstrumentParseError, match="outside the 8-bit range"):
-        _stats_from_instrument_output(ten_bit)
+    with pytest.raises(FrameStatisticsParseError, match="outside the 8-bit range"):
+        _aggregate_frame_statistics_output(ten_bit)
 
 
 def test_first_frame_frame_difference_is_excluded_by_position() -> None:
     """The opening frame has no predecessor, so its YDIF is a sentinel zero.
     Dropping zeros by value would delete the real stillness this measures.
     """
-    stats = _stats_from_instrument_output(
+    stats = _aggregate_frame_statistics_output(
         _synthetic_frames(
             {"lavfi.signalstats.YDIF": 0},
             {"lavfi.signalstats.YDIF": 4},
@@ -900,9 +971,9 @@ def test_first_frame_frame_difference_is_excluded_by_position() -> None:
     )
     # Mean over the two real observations, not three.
     assert stats.frame_difference_mean == pytest.approx(5.0)
-    assert stats.frame_difference_max == pytest.approx(6.0)
+    assert stats.frame_difference_maximum == pytest.approx(6.0)
 
-    still = _stats_from_instrument_output(
+    still = _aggregate_frame_statistics_output(
         _synthetic_frames({"lavfi.signalstats.YDIF": 0}, {"lavfi.signalstats.YDIF": 0})
     )
     assert still.frame_difference_mean == 0.0
@@ -914,343 +985,89 @@ def test_a_missing_required_signal_raises_instead_of_shrinking_a_denominator() -
     """
     missing_tout = _synthetic_frames({"lavfi.signalstats.YAVG": 100})
     missing_tout = missing_tout.replace("lavfi.signalstats.TOUT=0\n", "")
-    with pytest.raises(InstrumentParseError, match="TOUT"):
-        _stats_from_instrument_output(missing_tout)
+    with pytest.raises(FrameStatisticsParseError, match="TOUT"):
+        _aggregate_frame_statistics_output(missing_tout)
 
 
-# --- frame_stats workdir cache ------------------------------------------------
-#
-# Tests for the issue #173 fix: the raw instrument stdout is cached in a text
-# file beside the video, so two callers reaching for the same video (the
-# camera_frame_stats + camera_signal_quality built-in pair, or a wrapper that
-# calls frame_stats directly) share one ffmpeg decode pass.
-#
-# The key is the video path plus the filter graph. That split is the thing
-# these tests are mostly about: the post-decode thresholds re-aggregate from
-# the cached text for free, while the three parameters baked into the graph
-# ask ffmpeg to measure something else and so must decode again.
-
-
-def _fake_completed_process(stdout: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
-
-
-def _graph(**overrides: float) -> str:
-    """The default instrument graph, with any parameter overridden."""
-    parameters: dict[str, float] = {
-        "black_pixel_threshold": 17,
-        "freeze_noise_db": -60.0,
-        "freeze_min_duration_s": 2.0,
-    }
-    parameters.update(overrides)
-    return instrument_filter_graph(
-        black_pixel_threshold=int(parameters["black_pixel_threshold"]),
-        freeze_noise_db=parameters["freeze_noise_db"],
-        freeze_min_duration_s=parameters["freeze_min_duration_s"],
-    )
-
-
-def test_instrument_cache_path_lives_next_to_the_mp4() -> None:
-    """A workdir-MP4 path gets a sibling ``.instrument.<digest>.txt``. A
-    non-MP4 path returns None so the caller knows caching is off for that path
-    -- a ``.h264`` source has no canonical sibling name in the workdir
-    convention.
-    """
-    cache_path = _instrument_cache_path(Path("/work/wrist_cam.mp4"), _graph())
-    assert cache_path is not None
-    assert cache_path.parent == Path("/work")
-    assert cache_path.name.startswith("wrist_cam.instrument.")
-    assert cache_path.suffix == ".txt"
-    assert _instrument_cache_path(Path("/work/WRIST_CAM.MP4"), _graph()) == Path(
-        "/work"
-    ) / cache_path.name.replace("wrist_cam", "WRIST_CAM")
-    assert _instrument_cache_path(Path("/work/raw.h264"), _graph()) is None
-
-
-def test_a_graph_parameter_change_takes_a_different_cache_path() -> None:
-    """``black_pixel_threshold``, ``freeze_noise_db``, and
-    ``freeze_min_duration_s`` are baked into the filter graph, so each one
-    changes what ffmpeg measures. Serving a cached decode across a change to
-    any of them would answer with numbers for thresholds the caller did not
-    ask for, so each gets its own cache path.
-    """
+def test_hflow_cache_key_covers_graph_toolchain_and_video() -> None:
     video = Path("/work/wrist_cam.mp4")
-    baseline = _instrument_cache_path(video, _graph())
-    for parameter, value in (
-        ("black_pixel_threshold", 200),
-        ("freeze_noise_db", -10.0),
-        ("freeze_min_duration_s", 0.25),
-    ):
-        changed = _instrument_cache_path(video, _graph(**{parameter: value}))
-        assert changed != baseline, f"{parameter} did not change the cache path"
-    # Same parameters, same path: the cache still hits on a repeat call.
-    assert _instrument_cache_path(video, _graph()) == baseline
+    settings = FrameStatisticsSettings()
+    toolchain = resolved_video_measurement_toolchain()
+    baseline_cache_path = _frame_statistics_cache_path(video, settings, toolchain)
+    assert baseline_cache_path is not None
+    assert baseline_cache_path.parent == video.parent
+    assert baseline_cache_path.name.startswith("wrist_cam.instrument.")
 
-
-def test_write_and_read_round_trip(tmp_path: Path) -> None:
-    """A cache write followed by a read returns the same text. The write
-    uses an atomic ``.tmp`` rename so a partial file cannot masquerade as a
-    complete cache, the same shape the MP4 remux uses (``video.py:259,295``).
-    """
-    cache_path = tmp_path / "video.instrument.txt"
-    payload = _synthetic_frames({"lavfi.signalstats.YAVG": 100})
-    _write_instrument_cache(cache_path, payload)
-    assert _read_instrument_cache(cache_path) == payload
-    # No leftover ``.tmp`` from a clean write.
-    assert not (tmp_path / "video.instrument.txt.tmp").exists()
-
-
-def test_write_cleans_up_temp_on_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A failure inside the write path removes the ``.tmp`` so a half-written
-    file cannot be read as a complete cache by the next call.
-    """
-    cache_path = tmp_path / "video.instrument.txt"
-
-    def explode(*arguments: object, **keywords: object) -> None:
-        raise OSError("disk full")
-
-    monkeypatch.setattr("os.replace", explode)
-    with pytest.raises(OSError, match="disk full"):
-        _write_instrument_cache(cache_path, "anything\n")
-    assert not (tmp_path / "video.instrument.txt.tmp").exists()
-    assert not cache_path.exists()
-
-
-def test_read_returns_none_when_cache_missing(tmp_path: Path) -> None:
-    cache_path = tmp_path / "video.instrument.txt"
-    assert _read_instrument_cache(cache_path) is None
-
-
-def test_read_deletes_corrupt_cache_and_returns_none(tmp_path: Path) -> None:
-    """A cache file that is not valid UTF-8 is deleted and treated as a
-    miss, so the next call re-decodes. Same self-healing shape as a corrupt
-    MP4 triggering a re-remux.
-    """
-    cache_path = tmp_path / "video.instrument.txt"
-    cache_path.write_bytes(b"\xff\xfe\xff invalid utf-8")
-    assert _read_instrument_cache(cache_path) is None
-    assert not cache_path.exists()
-
-
-def test_frame_stats_caches_subsequent_calls(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Two ``frame_stats`` calls on the same video shell out to ffmpeg once.
-    A pipeline that calls ``frame_stats`` twice -- the camera_frame_stats +
-    camera_signal_quality built-in pair, or a wrapper that re-reaches for
-    the instrument -- pays the decode cost the first time only.
-    """
-    video = tmp_path / "wrist_cam.mp4"
-    video.write_bytes(b"")  # file existence is all the cache key needs.
-    instrument_stdout = _synthetic_frames(
-        {"lavfi.signalstats.YAVG": 100},
-        {"lavfi.signalstats.YAVG": 200},
+    changed_graph_cache_path = _frame_statistics_cache_path(
+        video,
+        FrameStatisticsSettings(black_pixel_luma_threshold=200),
+        toolchain,
     )
-    counter_box: list[int] = [0]
+    changed_toolchain_cache_path = _frame_statistics_cache_path(
+        video,
+        settings,
+        VideoMeasurementToolchain(
+            ffmpeg_executable=toolchain.ffmpeg_executable,
+            ffprobe_executable=toolchain.ffprobe_executable,
+            ffmpeg_version=toolchain.ffmpeg_version + "-different",
+            ffprobe_version=toolchain.ffprobe_version,
+        ),
+    )
+    assert changed_graph_cache_path != baseline_cache_path
+    assert changed_toolchain_cache_path != baseline_cache_path
+    assert _frame_statistics_cache_path(Path("/work/raw.h264"), settings, toolchain) is None
 
-    def counted(*arguments: object, **keywords: object) -> subprocess.CompletedProcess[str]:
-        # ``frame_stats`` invokes subprocess.run for the instrument pass;
-        # ``ffmpeg_version`` separately shells out to read the version line.
-        # We count only the instrument pass: its argv has ``-vf`` (the
-        # measuring filter graph), which the version probe does not.
-        command = arguments[0] if arguments else keywords.get("args", [])
-        if isinstance(command, (list, tuple)) and "-vf" in command:
-            counter_box[0] += 1
-        return _fake_completed_process(instrument_stdout)
 
-    monkeypatch.setattr("hflow.ffmpeg._instrument.subprocess.run", counted)
-    first = frame_stats(video)
-    second = frame_stats(video)
-    assert counter_box[0] == 1
-    # Both calls return equivalent stats from the same cached decode.
-    assert first.frame_count == second.frame_count == 2
-    assert first.luma_avg_mean == second.luma_avg_mean == pytest.approx(150.0)
-    # The cache file landed next to the video, atomically.
-    cache_path = _instrument_cache_path(video, _graph())
+def test_cached_output_reaggregates_without_decoding_again(
+    black_tail_video: Path, tmp_path: Path
+) -> None:
+    cached_video = tmp_path / "cached.mp4"
+    shutil.copyfile(black_tail_video, cached_video)
+    default_settings = FrameStatisticsSettings()
+    first = measure_video_frame_statistics_for_hflow(cached_video, settings=default_settings)
+    toolchain = resolved_video_measurement_toolchain()
+    cache_path = _frame_statistics_cache_path(cached_video, default_settings, toolchain)
     assert cache_path is not None and cache_path.is_file()
 
+    # A cache hit must remain usable even when another decode is impossible.
+    cached_video.write_bytes(b"not a video anymore")
+    tightened_settings = FrameStatisticsSettings(overexposed_average_luma_threshold=0.0)
+    tightened = measure_video_frame_statistics_for_hflow(cached_video, settings=tightened_settings)
+    assert tightened.decoded_frame_count == first.decoded_frame_count
+    assert tightened.overexposed_frame_count == tightened.decoded_frame_count
+    assert _frame_statistics_cache_path(cached_video, tightened_settings, toolchain) == cache_path
+    assert not list(tmp_path.glob(".*.tmp"))
 
-def test_frame_stats_does_not_cache_for_non_mp4_paths(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+
+def test_graph_change_does_not_reuse_an_incompatible_cache(
+    black_tail_video: Path, tmp_path: Path
 ) -> None:
-    """A ``.h264`` source (no workdir remux in the way) disables caching:
-    every call re-decodes. A file with a sibling name we cannot guarantee
-    belongs to us should not be silently shadowed.
-    """
-    video = tmp_path / "raw.h264"
-    video.write_bytes(b"")
-    instrument_stdout = _synthetic_frames({"lavfi.signalstats.YAVG": 100})
-    counter_box: list[int] = [0]
+    cached_video = tmp_path / "cached.mp4"
+    shutil.copyfile(black_tail_video, cached_video)
+    measure_video_frame_statistics_for_hflow(cached_video, settings=FrameStatisticsSettings())
+    cached_video.write_bytes(b"not a video anymore")
 
-    def counted(*arguments: object, **keywords: object) -> subprocess.CompletedProcess[str]:
-        command = arguments[0] if arguments else keywords.get("args", [])
-        if isinstance(command, (list, tuple)) and "-vf" in command:
-            counter_box[0] += 1
-        return _fake_completed_process(instrument_stdout)
-
-    monkeypatch.setattr("hflow.ffmpeg._instrument.subprocess.run", counted)
-    frame_stats(video)
-    frame_stats(video)
-    assert counter_box[0] == 2
-    # No cache file was written beside the source.
-    assert not list(tmp_path.glob("*.instrument.*.txt"))
+    with pytest.raises(FrameStatisticsExecutionError):
+        measure_video_frame_statistics_for_hflow(
+            cached_video,
+            settings=FrameStatisticsSettings(black_pixel_luma_threshold=200),
+        )
 
 
-def test_frame_stats_decodes_per_video(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """A second camera's video gets its own decode. The cache key is the
-    video path, so per-camera footage still costs one decode per camera
-    per episode -- the fix collapses the doubled cost without merging
-    per-camera readings.
-    """
-    wrist = tmp_path / "wrist_cam.mp4"
-    overhead = tmp_path / "overhead_cam.mp4"
-    wrist.write_bytes(b"")
-    overhead.write_bytes(b"")
-    instrument_stdout = _synthetic_frames({"lavfi.signalstats.YAVG": 100})
-    counter_box: list[int] = [0]
-
-    def counted(*arguments: object, **keywords: object) -> subprocess.CompletedProcess[str]:
-        command = arguments[0] if arguments else keywords.get("args", [])
-        if isinstance(command, (list, tuple)) and "-vf" in command:
-            counter_box[0] += 1
-        return _fake_completed_process(instrument_stdout)
-
-    monkeypatch.setattr("hflow.ffmpeg._instrument.subprocess.run", counted)
-    frame_stats(wrist)
-    frame_stats(overhead)
-    frame_stats(wrist)  # hits the wrist cache
-    frame_stats(overhead)  # hits the overhead cache
-    assert counter_box[0] == 2
-
-
-def test_frame_stats_threshold_change_re_aggregates_from_cache(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_corrupt_cache_is_replaced_from_a_fresh_decode(
+    black_tail_video: Path, tmp_path: Path
 ) -> None:
-    """A different ``bright_luma_threshold`` on the second call must reuse
-    the cached decode and re-aggregate, not re-decode. The cache is keyed
-    on the video path only -- thresholds are not part of the key because
-    changing one is a free no-decode re-aggregation.
-    """
-    video = tmp_path / "wrist_cam.mp4"
-    video.write_bytes(b"")
-    # Frame luma values: 100 (fine), 200 (fine at 235, fine at 150),
-    # 230 (fine at 235, overexposed at 150). The two thresholds must
-    # produce different overexposed_frame_count on the same decode.
-    instrument_stdout = _synthetic_frames(
-        {"lavfi.signalstats.YAVG": 100},
-        {"lavfi.signalstats.YAVG": 200},
-        {"lavfi.signalstats.YAVG": 230},
+    cached_video = tmp_path / "cached.mp4"
+    shutil.copyfile(black_tail_video, cached_video)
+    settings = FrameStatisticsSettings()
+    first = measure_video_frame_statistics_for_hflow(cached_video, settings=settings)
+    cache_path = _frame_statistics_cache_path(
+        cached_video, settings, resolved_video_measurement_toolchain()
     )
-    counter_box: list[int] = [0]
-
-    def counted(*arguments: object, **keywords: object) -> subprocess.CompletedProcess[str]:
-        command = arguments[0] if arguments else keywords.get("args", [])
-        if isinstance(command, (list, tuple)) and "-vf" in command:
-            counter_box[0] += 1
-        return _fake_completed_process(instrument_stdout)
-
-    monkeypatch.setattr("hflow.ffmpeg._instrument.subprocess.run", counted)
-    default = frame_stats(video)  # bright_luma_threshold=235.0 default
-    tightened = frame_stats(video, bright_luma_threshold=150.0)
-    assert counter_box[0] == 1
-    # Same decode, different aggregation: 230 is overexposed at 150 but not
-    # at 235; 200 is the other way around (it is now overexposed too).
-    assert default.overexposed_frame_count == 0
-    assert tightened.overexposed_frame_count == 2
-
-
-def test_frame_stats_re_decodes_when_a_graph_parameter_changes(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Each distinct filter graph gets its own decode, and each is then
-    cached in its own right.
-
-    The companion to the re-aggregation test above, and the one that keeps
-    the two kinds of parameter apart. The documented way to configure a
-    built-in check is to wrap it under your own name with your own
-    thresholds, so two wrappers over one camera with different
-    ``freeze_min_duration_s`` values is the ordinary case, not an exotic
-    one. Serving the first wrapper's decode to the second would report
-    freeze numbers for a duration nobody asked for.
-    """
-    video = tmp_path / "wrist_cam.mp4"
-    video.write_bytes(b"")
-    observed_graphs: list[str] = []
-
-    def counted(*arguments: object, **keywords: object) -> subprocess.CompletedProcess[str]:
-        command = arguments[0] if arguments else keywords.get("args", [])
-        if isinstance(command, (list, tuple)) and "-vf" in command:
-            observed_graphs.append(str(command[list(command).index("-vf") + 1]))
-        return _fake_completed_process(_synthetic_frames({"lavfi.signalstats.YAVG": 100}))
-
-    monkeypatch.setattr("hflow.ffmpeg._instrument.subprocess.run", counted)
-    frame_stats(video, black_pixel_threshold=17)
-    frame_stats(video, black_pixel_threshold=200)
-    frame_stats(video, freeze_noise_db=-10.0)
-    frame_stats(video, freeze_min_duration_s=0.25)
-    assert len(observed_graphs) == 4
-    assert len(set(observed_graphs)) == 4
-    # Every graph now has a cache, and repeating any of them decodes nothing.
-    assert len(list(tmp_path.glob("*.instrument.*.txt"))) == 4
-    frame_stats(video, black_pixel_threshold=200)
-    frame_stats(video, freeze_min_duration_s=0.25)
-    assert len(observed_graphs) == 4
-
-
-def test_frame_stats_corrupt_cache_self_heals(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A cache file that parses to ``InstrumentParseError`` is deleted and
-    the call re-decodes. The instrument must never invent a number from a
-    corrupt cache -- exactly the rule the parser already enforces on live
-    ffmpeg output.
-    """
-    video = tmp_path / "wrist_cam.mp4"
-    video.write_bytes(b"")
-    cache_path = _instrument_cache_path(video, _graph())
     assert cache_path is not None
-    cache_path.write_text("this is not valid instrument output\n", encoding="utf-8")
-    instrument_stdout = _synthetic_frames({"lavfi.signalstats.YAVG": 100})
-    counter_box: list[int] = [0]
+    cache_path.write_text("not valid instrument output\n", encoding="utf-8")
 
-    def counted(*arguments: object, **keywords: object) -> subprocess.CompletedProcess[str]:
-        command = arguments[0] if arguments else keywords.get("args", [])
-        if isinstance(command, (list, tuple)) and "-vf" in command:
-            counter_box[0] += 1
-        return _fake_completed_process(instrument_stdout)
-
-    monkeypatch.setattr("hflow.ffmpeg._instrument.subprocess.run", counted)
-    stats = frame_stats(video)
-    assert counter_box[0] == 1
-    assert stats.frame_count == 1
-    # The corrupt file is gone, replaced by a valid one.
-    valid = cache_path.read_text(encoding="utf-8")
-    assert "YAVG" in valid
-
-
-def test_frame_stats_cache_survives_to_a_second_process(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The cache is a real file in the workdir, so a second ``frame_stats``
-    call from a new process hits it without any ffmpeg work. The MP4 remux
-    cache is the same shape, and that persistence is what makes the fix
-    worth landing. We pre-write a valid cache by hand (no subprocess), then
-    call ``frame_stats`` and assert subprocess is never invoked.
-    """
-    video = tmp_path / "wrist_cam.mp4"
-    video.write_bytes(b"")
-    cache_path = _instrument_cache_path(video, _graph())
-    assert cache_path is not None
-    cache_path.write_text(_synthetic_frames({"lavfi.signalstats.YAVG": 100}), encoding="utf-8")
-    counter_box: list[int] = [0]
-
-    def counted(*arguments: object, **keywords: object) -> subprocess.CompletedProcess[str]:
-        command = arguments[0] if arguments else keywords.get("args", [])
-        if isinstance(command, (list, tuple)) and "-vf" in command:
-            counter_box[0] += 1
-        return _fake_completed_process("")
-
-    monkeypatch.setattr("hflow.ffmpeg._instrument.subprocess.run", counted)
-    stats = frame_stats(video)
-    assert counter_box[0] == 0
-    assert stats.frame_count == 1
+    repaired = measure_video_frame_statistics_for_hflow(cached_video, settings=settings)
+    assert repaired.decoded_frame_count == first.decoded_frame_count
+    assert "lavfi.signalstats.YAVG" in cache_path.read_text(encoding="utf-8")
+    assert not list(tmp_path.glob(".*.tmp"))

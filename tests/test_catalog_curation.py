@@ -16,6 +16,7 @@ from hflow.catalog import (
     content_episode_id,
     episode_status_case_sql,
 )
+from hflow.checks import camera_frame_stats
 from hflow.cli import main as cli_main
 from hflow.curation import CurationReport, curate, open_catalog_connection
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
@@ -358,10 +359,13 @@ def recorded_data_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
     @app.check(critical=True)
     def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
-        stats = hflow.ffmpeg.frame_stats(ep.video("wrist_cam"))
+        camera_topic = next(topic for topic in ep.cameras if "wrist_cam" in topic)
+        camera_evidence = camera_frame_stats(ep, cameras=[camera_topic])
+        black_frame_percent = camera_evidence.measurements[f"{camera_topic}/black_frame_pct"]
+        assert isinstance(black_frame_percent, float)
         return hflow.CheckResult(
-            measurements={"black_pct": stats.black_frame_pct},
-            verdict=stats.black_frame_pct < 50.0,
+            measurements={"black_pct": black_frame_percent},
+            verdict=black_frame_percent < 50.0,
         )
 
     @app.check()

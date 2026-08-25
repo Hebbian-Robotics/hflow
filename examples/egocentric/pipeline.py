@@ -14,8 +14,8 @@ import hflow
 # version content-hashes the functions it NAMES (and, transitively, the hflow
 # code they call), while a module contributes only its name. Aliased because
 # the wrapper below takes the built-in's name.
+from hflow.checks import camera_frame_stats as measure_camera_frame_stats
 from hflow.checks import timestamp_regularity as measure_timestamp_regularity
-from hflow.ffmpeg import frame_stats
 
 # Inside the runtime's containers the data root is always mounted at
 # /opt/airflow/data; on the host the corpus lives where prepare.py wrote it.
@@ -34,25 +34,30 @@ def timestamp_regularity(episode: hflow.Episode) -> hflow.CheckResult:
 
 @app.check(critical=True)
 def camera_health(episode: hflow.Episode) -> hflow.CheckResult:
-    stats = frame_stats(episode.video())
-    camera_start_ns = int(episode.channel(episode.cameras[0]).timestamps[0])
-    freeze_intervals = [
-        hflow.Interval(
-            start_ns=camera_start_ns + round(freeze_start_s * 1_000_000_000),
-            end_ns=camera_start_ns + round(freeze_end_s * 1_000_000_000),
-            label="camera_freeze",
-        )
-        for freeze_start_s, freeze_end_s in stats.freeze_intervals
-    ]
+    camera_topic = episode.cameras[0]
+    evidence = measure_camera_frame_stats(episode, cameras=[camera_topic])
+    black_frame_percent = evidence.measurements[f"{camera_topic}/black_frame_pct"]
+    freeze_total_seconds = evidence.measurements[f"{camera_topic}/freeze_total_s"]
+    average_luma_mean = evidence.measurements[f"{camera_topic}/luma_avg_mean"]
+    decoded_frame_count = evidence.measurements[f"{camera_topic}/decoded_frame_count"]
+    assert isinstance(black_frame_percent, float)
+    assert isinstance(freeze_total_seconds, float)
     return hflow.CheckResult(
         measurements={
-            "black_frame_pct": stats.black_frame_pct,
-            "freeze_total_s": stats.freeze_total_s,
-            "luma_avg_mean": stats.luma_avg_mean,
-            "frame_count": stats.frame_count,
+            "black_frame_pct": black_frame_percent,
+            "freeze_total_s": freeze_total_seconds,
+            "luma_avg_mean": average_luma_mean,
+            "frame_count": decoded_frame_count,
         },
-        intervals=freeze_intervals,
-        verdict=stats.black_frame_pct < 5.0 and stats.freeze_total_s < 2.0,
+        intervals=[
+            hflow.Interval(
+                start_ns=interval.start_ns,
+                end_ns=interval.end_ns,
+                label="camera_freeze",
+            )
+            for interval in evidence.intervals
+        ],
+        verdict=black_frame_percent < 5.0 and freeze_total_seconds < 2.0,
     )
 
 

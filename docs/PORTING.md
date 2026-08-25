@@ -110,14 +110,20 @@ Gating that way keeps the evidence: a verdict computed inside the check and
 returned as a fresh `CheckResult(verdict=...)` throws away the measurements the
 instrument already produced.
 
-Below the packaged check are the raw instrument and plain ffmpeg, for the
-questions it does not answer. Both are endorsed usage, not workarounds:
+The format-independent instrument is incubating behind a private package while
+its result model settles. Use the built-in check when you want a stable HFlow
+API. If you are helping develop the measurement package, call the private API
+with an explicit toolchain:
 
 ```python
-stats = hflow.ffmpeg.frame_stats(ep.video("wrist_cam"))  # one decode pass
-# stats.black_frame_pct, stats.freeze_intervals, stats.luma_avg_mean, ...
+from hflow._video_measurement_toolchain import resolved_video_measurement_toolchain
+from hflow._video_measurements import measure_video_frame_statistics
 
-subprocess.run(["ffmpeg", "-i", str(ep.video("wrist_cam")), ...], check=True)
+statistics = measure_video_frame_statistics(
+    ep.video("wrist_cam"),
+    toolchain=resolved_video_measurement_toolchain(),
+)
+# statistics.black_frame_percent, statistics.freeze_intervals, ...
 ```
 
 ## Dialect 3: JPEG frames and your own VLM client
