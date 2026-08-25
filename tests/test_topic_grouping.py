@@ -148,23 +148,10 @@ class TestDerivedChunkTargets:
 
         assert derived_chunk_size_bytes(0.0, 1.0) == MINIMUM_DERIVED_CHUNK_SIZE_BYTES
 
-    def test_the_default_still_writes_one_target_for_every_group(self, tmp_path: Path) -> None:
-        """Opt-in means opt-in: nobody's bytes move until they ask."""
-        source = _source_with_a_bulk_channel(tmp_path / "source.mcap")
-        canonical = tmp_path / "default.canonical.mcap"
-        write_canonical_episode(source, canonical, TransformConfig())
-
-        with hflow.Episode(canonical) as episode:
-            assert not [
-                key
-                for key in episode.metadata
-                if key.startswith(PROVENANCE_KEY_CHUNK_TARGET_PREFIX)
-            ]
-
-    def test_deriving_records_a_target_per_group(self, tmp_path: Path) -> None:
+    def test_the_default_derives_and_records_a_target_per_group(self, tmp_path: Path) -> None:
         source = _source_with_a_bulk_channel(tmp_path / "source.mcap")
         canonical = tmp_path / "derived.canonical.mcap"
-        write_canonical_episode(source, canonical, TransformConfig(chunk_size_bytes=None))
+        write_canonical_episode(source, canonical, TransformConfig())
 
         with hflow.Episode(canonical) as episode:
             targets = {
@@ -177,3 +164,17 @@ class TestDerivedChunkTargets:
         # exists nowhere else, unlike a configured one.
         assert set(targets) == {DEFAULT_STATE_GROUP, DEFAULT_BULK_GROUP}
         assert all(target >= 800_000 for target in targets.values())
+
+    def test_pinning_a_target_records_none_because_the_config_already_has_it(
+        self, tmp_path: Path
+    ) -> None:
+        source = _source_with_a_bulk_channel(tmp_path / "source.mcap")
+        canonical = tmp_path / "pinned.canonical.mcap"
+        write_canonical_episode(source, canonical, TransformConfig(chunk_size_bytes=2_000_000))
+
+        with hflow.Episode(canonical) as episode:
+            assert not [
+                key
+                for key in episode.metadata
+                if key.startswith(PROVENANCE_KEY_CHUNK_TARGET_PREFIX)
+            ]

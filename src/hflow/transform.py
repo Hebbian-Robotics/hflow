@@ -63,7 +63,6 @@ from hflow.format import (
     CANONICAL_VIDEO_SCHEMA_NAME,
     DEFAULT_BULK_GROUP,
     DEFAULT_CAMERA_GROUP,
-    DEFAULT_CHUNK_SIZE_BYTES,
     DEFAULT_STATE_GROUP,
     DERIVED_SCHEMA_NAME,
     EPISODE_FORMAT_VERSION,
@@ -109,13 +108,13 @@ class TransformConfig:
     gop_preset: GopPreset = GopPreset.VLA
     gop_seconds: float | None = None  # overrides the preset's default when set
     crf: int = 23
-    # One target for every group, or ``None`` to derive one PER GROUP from the
-    # rate that group is written at and the preset's read window (see
-    # ``hflow.format.derived_chunk_size_bytes``). Deriving is opt-in rather
-    # than the default because the balance point it computes has not been
-    # measured on real footage: docs/BENCHMARKS.md has rows at 800 KB and
-    # 8 MB, and the derived target for that recording falls between them.
-    chunk_size_bytes: int | None = DEFAULT_CHUNK_SIZE_BYTES
+    # ``None`` (the default) derives a target PER GROUP from the rate that
+    # group is written at and the preset's read window; an int pins one target
+    # for every group. Deriving is the default because it is measured: on the
+    # reference recording it fetches 3.08 chunks per sample against 9.18 at a
+    # flat 800 KB and 2.69 at a flat 8 MB, and it is the minimum of
+    # fetches x bytes across all three (docs/BENCHMARKS.md).
+    chunk_size_bytes: int | None = None
     compression: Literal["zstd", "none"] = "zstd"
     # topic -> group name, beating the defaults; topics not listed go to
     # ``cameras`` by schema, ``bulk`` by mean message size, else ``state``.

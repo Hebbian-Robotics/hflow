@@ -331,10 +331,15 @@ def _tally_batch_counts(batch_counts: Sequence[StageBatchCounts]) -> tuple[int, 
 def _raise_if_error_budget_exceeded(total: int, errors: int, budget: int) -> None:
     """The error gate both summaries share: over budget, or every episode errored."""
     if errors > budget or (errors and errors == total):
+        # Deliberately does NOT assert a cause. It used to say "infrastructure,
+        # not data", which the ingest ledger can now contradict directly: a
+        # corrupt recording fails here and is classified `source-unreadable`
+        # there. The ledger carries the classification per source; this
+        # sentence carries the count, and points at the table that knows.
         raise RuntimeError(
             f"{errors} of {total} episodes had processing errors "
-            f"(budget {budget}) -- infrastructure, not data; see the "
-            "process_batch task logs"
+            f"(budget {budget}); each is recorded in the ingest_failures table "
+            "with its classification"
         )
 
 

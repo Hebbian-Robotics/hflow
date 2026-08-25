@@ -196,6 +196,33 @@ cameras + `/imu`):
 | 800 KB | topic-group (read-pattern) | **9.17** | **6.65** |
 | 8 MB | per-topic (Dyna's baseline) | 7.56 | 49.26 |
 | 8 MB | topic-group (read-pattern) | **2.69** | **15.34** |
+| 5.41 MB, derived | topic-group (read-pattern) | **3.08** | **12.32** |
+
+### Why 5.41 MB, and why it is now the default
+
+Chunk size stopped being a flat tuned constant. Each group's target is derived
+from the rate *that group* is written at and the read window its workload
+implies (`hflow.format.derived_chunk_size_bytes`): a read covering `W` seconds
+of a group written at `R` costs about `1 + R*W/C` fetches and `C + R*W` bytes,
+so with `x = C/(R*W)` their product is `R*W*(2 + x + 1/x)` -- minimized exactly
+at `C = R*W`. For this recording's camera group that is 5.4 MB/s x 1 s.
+
+The row above is that prediction measured. It sits between the two flat sizes
+on both axes and is the minimum of the product they trade off:
+
+| chunk size | fetches x MB |
+|---|---|
+| 800 KB | 61.0 |
+| **5.41 MB, derived** | **37.9** |
+| 8 MB | 41.3 |
+
+Concretely: the derived target captures 94% of the fetch reduction that 8 MB
+buys, while fetching 20% fewer bytes than 8 MB. Groups whose rate falls below
+the 800 KB floor -- every state group here -- keep the old layout exactly, so
+this changes the layout of high-rate groups and nothing else.
+
+Reproduce with `--chunk-size-bytes 5411000` against the same input; the two
+flat rows above reproduce at `800000` and `8000000`.
 
 Observations:
 

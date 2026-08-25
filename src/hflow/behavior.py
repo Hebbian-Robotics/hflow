@@ -93,4 +93,12 @@ notes and not only here.
 # an /imu scan because /imu shared chunks with lidar, against 4 MB grouped by
 # read pattern; a recording with no bulk channels is laid out exactly as
 # before and only re-versions because this constant moved.
-TRANSFORM_BEHAVIOR_VERSION: str = "3"
+#
+# "4": chunk targets are now derived per group from that group's own byte rate
+# and the preset's read window, instead of one flat 800 KB for every group.
+# Measured on the reference recording (docs/BENCHMARKS.md): 3.08 chunk fetches
+# per training sample against 9.18 at a flat 800 KB and 2.69 at a flat 8 MB,
+# and the minimum of fetches x bytes across all three. Groups whose rate falls
+# below the floor -- every state group, every synthetic fixture -- keep their
+# previous layout and re-version only because this constant moved.
+TRANSFORM_BEHAVIOR_VERSION: str = "4"
