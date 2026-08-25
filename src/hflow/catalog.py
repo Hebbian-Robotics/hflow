@@ -326,6 +326,18 @@ def _normalized_intervals(check_name: str, intervals: list[Interval]) -> list[In
                     f"{type(value).__name__}: interval bounds are int nanoseconds"
                 )
             bounds[bound_name] = value
+        start_ns = bounds["start_ns"]
+        end_ns = bounds["end_ns"]
+        if start_ns < 0 or end_ns < 0:
+            raise ValueError(
+                f"check {check_name!r} set a negative interval bound "
+                f"(start_ns={start_ns}, end_ns={end_ns}): bounds are non-negative nanoseconds"
+            )
+        if end_ns < start_ns:
+            raise ValueError(
+                f"check {check_name!r} set inverted interval "
+                f"(start_ns={start_ns}, end_ns={end_ns}): end must be >= start"
+            )
         normalized.append(replace(interval, **bounds))
     return normalized
 
