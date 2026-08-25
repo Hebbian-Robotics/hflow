@@ -6,8 +6,11 @@ repository's root test conftest.
 """
 
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -29,6 +32,25 @@ STAMPS = EpisodeStamps(
     ffmpeg_version="ffmpeg version test",
     robot_software_version="sim-0.1.0",
 )
+
+
+@contextmanager
+def _appending_like_an_older_hflow() -> "Iterator[None]":
+    """Let one append write the JSON-illegal doubles a legacy catalog holds.
+
+    ``_normalized_measurements`` refuses a non-finite float at append time, so
+    no catalog written by this version can contain one. A catalog written
+    before that rule can, and the server reads catalogs rather than writing
+    them: it must still answer over one instead of returning a JSON body no
+    client can parse. Suspending the guard for this one append is how the
+    fixture states that, and it keeps the three tests that pin the API's
+    null-not-crash behaviour testing something reachable.
+    """
+    with mock.patch(
+        "hflow.catalog._normalized_measurements",
+        lambda check_name, measurements: dict(measurements),
+    ):
+        yield
 
 
 @dataclass(frozen=True)
@@ -69,6 +91,9 @@ def build_populated_workspace(tmp_path_factory: pytest.TempPathFactory) -> Popul
             measurements={
                 "max_velocity": max_velocity,
                 # JSON-illegal doubles: the API must null these, not crash.
+                # Appending one is refused as of #176, so these reach the
+                # parquet only under _appending_like_an_older_hflow(), which
+                # is what a catalog written before that rule looks like.
                 "nan_metric": float("nan"),
                 "inf_metric": float("inf"),
             },
@@ -93,22 +118,24 @@ def build_populated_workspace(tmp_path_factory: pytest.TempPathFactory) -> Popul
         "success": "true",
         "embodiment": "arm-1",
     }
-    first_append = catalog.append_episode(
-        canonical_path=canonical_file,
-        stamps=STAMPS,
-        episode_metadata=ok_metadata,
-        check_rows=[joint_check_row(1.5), contact_sheet_row],
-        orchestrator_run_id=SUPERSEDED_ORCHESTRATOR_RUN_ID,
-    )
-    # Distinct recorded_at so "latest run" ordering stays deterministic.
-    time.sleep(0.01)
-    second_append = catalog.append_episode(
-        canonical_path=canonical_file,
-        stamps=STAMPS,
-        episode_metadata=ok_metadata,
-        check_rows=[joint_check_row(2.0), contact_sheet_row],
-        orchestrator_run_id=LATEST_ORCHESTRATOR_RUN_ID,
-    )
+    # Only these two appends carry the JSON-illegal doubles.
+    with _appending_like_an_older_hflow():
+        first_append = catalog.append_episode(
+            canonical_path=canonical_file,
+            stamps=STAMPS,
+            episode_metadata=ok_metadata,
+            check_rows=[joint_check_row(1.5), contact_sheet_row],
+            orchestrator_run_id=SUPERSEDED_ORCHESTRATOR_RUN_ID,
+        )
+        # Distinct recorded_at so "latest run" ordering stays deterministic.
+        time.sleep(0.01)
+        second_append = catalog.append_episode(
+            canonical_path=canonical_file,
+            stamps=STAMPS,
+            episode_metadata=ok_metadata,
+            check_rows=[joint_check_row(2.0), contact_sheet_row],
+            orchestrator_run_id=LATEST_ORCHESTRATOR_RUN_ID,
+        )
     assert first_append.written and second_append.written
     assert first_append.episode_id == second_append.episode_id
     time.sleep(0.01)

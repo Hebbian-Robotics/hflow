@@ -279,6 +279,11 @@ def _normalized_measurements(
 ) -> dict[str, MeasurementValue]:
     """Coerce NumPy scalars to Python scalars; refuse anything else loudly.
 
+    A non-finite float is refused here too, after the coercion so that
+    ``np.float64("nan")`` is caught as well: NaN compares false against every
+    threshold and its complement at once, so storing one drops the episode
+    from both sides of a cut while the key still claims to be measured.
+
     Real check code returns NumPy scalars (np.mean(), indexing, np.bool_
     verdicts), and only np.float64 subclasses a Python type -- the rest used
     to fall through every storage branch into all-NULL value columns while

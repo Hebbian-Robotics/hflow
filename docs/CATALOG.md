@@ -186,6 +186,13 @@ SELECT episode_id, "/wrist_cam/compressed/black_frame_pct" AS black_pct
 FROM episodes WHERE black_pct < 5.0
 ```
 
+**Omit the key rather than measuring NaN or infinity.** A non-finite float is
+refused at append time, naming the check and the key. NaN compares false against
+everything, so an episode carrying one falls out of both a threshold and its
+complement: it is in neither `black_pct < 1.0` nor `black_pct >= 1.0`, and it
+poisons any `avg()` over the corpus. A check with nothing to say about an episode
+says nothing, and the coverage denominator already records that it ran.
+
 **End the key with a unit the tooling knows.** The workspace UI labels a value
 by the token after the key's last `_`, so `_s`, `_ms`, `_ns`, `_hz`, `_pct`,
 `_ratio`, `_count`, `_bytes`, `_deg`, `_rad`, and `_m` render with their unit
