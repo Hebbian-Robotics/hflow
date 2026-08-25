@@ -33,6 +33,7 @@ mirror (see ``hflow.storage``) -- the idioms above carry over unchanged.
 
 import hashlib
 import json
+import math
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
@@ -293,6 +294,11 @@ def _normalized_measurements(
             raise ValueError(
                 f"check {check_name!r} measured {key!r} as {type(value).__name__}: "
                 "measurements hold one int/float/str/bool per key"
+            )
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(
+                f"check {check_name!r} measured {key!r} as {value!r}: "
+                "omit the key when a check has no finite value for this episode"
             )
         normalized[key] = value
     return normalized

@@ -834,6 +834,72 @@ def test_numpy_scalar_measurements_round_trip(tmp_path: Path) -> None:
     assert wide == pytest.approx((np.float32(0.4).item(), 3.0))
 
 
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_float_measurements_are_refused(tmp_path: Path, bad_value: float) -> None:
+    canonical = tmp_path / "e.canonical.mcap"
+    canonical.write_bytes(b"episode-bytes")
+    row = CheckRunRow(
+        check_name="camera_blackout",
+        check_version="v1",
+        critical=False,
+        status=hflow.CheckStatus.MEASURED,
+        duration_s=0.1,
+        measurements={"black_pct": bad_value},
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"camera_blackout.*black_pct.*omit the key.*no finite value",
+    ):
+        Catalog(tmp_path / "catalog").append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[row],
+        )
+
+
+def test_numpy_nan_measurements_are_refused(tmp_path: Path) -> None:
+    import numpy as np
+
+    canonical = tmp_path / "e.canonical.mcap"
+    canonical.write_bytes(b"episode-bytes")
+    row = CheckRunRow(
+        check_name="numpy_check",
+        check_version="v1",
+        critical=False,
+        status=hflow.CheckStatus.MEASURED,
+        duration_s=0.1,
+        measurements=cast(dict, {"ratio": np.float64("nan")}),
+    )
+    with pytest.raises(ValueError, match=r"numpy_check.*ratio.*omit the key"):
+        Catalog(tmp_path / "catalog").append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[row],
+        )
+
+
+def test_zero_and_non_float_measurements_are_still_accepted(tmp_path: Path) -> None:
+    canonical = tmp_path / "e.canonical.mcap"
+    canonical.write_bytes(b"episode-bytes")
+    row = CheckRunRow(
+        check_name="mixed_check",
+        check_version="v1",
+        critical=False,
+        status=hflow.CheckStatus.MEASURED,
+        duration_s=0.1,
+        measurements={"zero": 0.0, "count": 0, "label": "ok", "flag": False},
+    )
+    result = Catalog(tmp_path / "catalog").append_episode(
+        canonical_path=canonical,
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[row],
+    )
+    assert result.written is True
+
+
 def test_numpy_measured_episode_survives_a_manifest_filter(tmp_path: Path) -> None:
     """A NumPy-measured episode must not vanish from a threshold-filtered manifest."""
     import numpy as np
