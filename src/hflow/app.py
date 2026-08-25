@@ -1943,10 +1943,95 @@ def parse_pipeline_spec(pipeline_spec: str) -> tuple[Path, str]:
 
     For the callers that must commit to a NAME rather than resolve an App:
     the bundle renderers bake the variable into generated DAG source without
-    ever importing the pipeline, so they cannot discover it.
+    ever importing the pipeline, so they cannot discover it. Prefer
+    :func:`resolve_pipeline_spec_for_rendering`, which reads the name out of
+    the pipeline instead of assuming it.
     """
     pipeline_file, app_variable = parse_pipeline_address(pipeline_spec)
     return pipeline_file, app_variable if app_variable is not None else DEFAULT_APP_VARIABLE
+
+
+def application_variables_in_source(pipeline_source: str) -> tuple[str, ...]:
+    """Module-level names a pipeline file binds to an ``hflow.App(...)`` call.
+
+    A STATIC read, deliberately, and the counterpart to
+    :func:`discover_pipeline_application` rather than a competitor: that one
+    knows everything but has to import the pipeline, which means having the
+    pipeline's dependencies installed. The bundle renderers have neither -- the
+    user's dependencies live in the venv the bundle is about to build -- so
+    this reads the source instead and settles for what a reader of that file
+    would see.
+
+    Matches ``name = hflow.App(...)`` and ``name = App(...)`` at module scope
+    and nothing cleverer. An App returned by a factory is invisible here, which
+    is why an empty result means "could not tell", never "there is none": the
+    caller falls back rather than refusing something that works.
+    """
+    import ast
+
+    try:
+        module = ast.parse(pipeline_source)
+    except SyntaxError:
+        # Not this function's error to report: the renderers copy the file and
+        # the tasks import it, and both produce a better message than a scan.
+        return ()
+
+    def constructs_an_application(value: ast.expr) -> bool:
+        match value:
+            case ast.Call(func=ast.Attribute(attr="App")) | ast.Call(func=ast.Name(id="App")):
+                return True
+            case _:
+                return False
+
+    found: list[str] = []
+    for statement in module.body:
+        match statement:
+            case ast.Assign(targets=[ast.Name(id=name)], value=value) if constructs_an_application(
+                value
+            ):
+                found.append(name)
+            case ast.AnnAssign(target=ast.Name(id=name), value=value) if (
+                value is not None and constructs_an_application(value)
+            ):
+                found.append(name)
+    return tuple(found)
+
+
+def resolve_pipeline_spec_for_rendering(pipeline_spec: str) -> tuple[Path, str]:
+    """``(pipeline_file, app_variable)`` for a bundle renderer, read not assumed.
+
+    A rendered bundle bakes the variable name into DAG source that runs
+    somewhere else, days later. Defaulting it to ``app`` made a pipeline that
+    binds ``robot_app`` render and exit 0, then fail every stage task inside a
+    container with ``has no hflow.App named 'app'`` -- while every other
+    command discovered the name and worked. Reading the source closes that gap
+    without importing anything.
+
+    An explicit ``:name`` in the address always wins, unread. Otherwise: one
+    App in the source is used, several is refused (the caller must say which),
+    and none found falls back to ``app``, because a factory-built App is
+    invisible to a static scan and refusing it would break a working setup.
+    """
+    pipeline_file, addressed_variable = parse_pipeline_address(pipeline_spec)
+    if addressed_variable is not None:
+        return pipeline_file, addressed_variable
+    try:
+        source = pipeline_file.read_text()
+    except OSError:
+        # A missing or unreadable pipeline file is the renderer's error to
+        # report, with its own message; do not pre-empt it with a worse one.
+        return pipeline_file, DEFAULT_APP_VARIABLE
+    match application_variables_in_source(source):
+        case (sole_variable,):
+            return pipeline_file, sole_variable
+        case (_, _, *_) as several:
+            raise ValueError(
+                f"{pipeline_file} defines more than one hflow.App "
+                f"({', '.join(sorted(several))}); a rendered bundle has to name one, "
+                f"so address it as {pipeline_file}:{sorted(several)[0]}"
+            )
+        case _:
+            return pipeline_file, DEFAULT_APP_VARIABLE
 
 
 @dataclass(frozen=True)

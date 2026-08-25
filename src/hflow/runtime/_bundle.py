@@ -22,8 +22,9 @@ Bundle contents:
   ``ingest.py`` plus the four sub-DAGs ``ingest_sync.py`` / ``ingest_meta.py``
   / ``ingest_labels.py`` / ``ingest_media.py`` (see below).
 - ``user/`` -- a copy of the pipeline file's DIRECTORY (minus environments,
-  caches, version-control metadata and ``data/``), mounted into the
-  containers, so a pipeline that imports a module beside it works.
+  caches, version-control metadata, and the workspace, which is mounted rather
+  than shipped), mounted into the containers, so a pipeline that imports a
+  module beside it works.
 - ``user-venv`` named volume + an init service that builds the user's venv
   with ``uv`` inside the Airflow image, which ships it on PATH (the
   external-python pattern: user dependencies never meet Airflow's pins). A
@@ -814,8 +815,15 @@ def _dag_id_from_bundle_manifest(bundle_directory: Path) -> str | None:
 
 # Never copied into a bundle: environments and caches are the host's and would
 # be wrong (or enormous) inside a container, version-control metadata is not
-# input, and data directories are mounted rather than shipped. Matched on the
-# directory name at any depth.
+# input, and a conventionally-named `data/` is a workspace, which is mounted
+# rather than shipped. Matched on the directory name at any depth.
+#
+# `data` alone was never enough, and that is what `data_root=` below is for.
+# A name excludes exactly one SPELLING of a configurable thing, so a project
+# whose hflow.toml said `data_root = "./workspace"` copied its whole corpus
+# into the bundle on every render. The name stays because it costs nothing and
+# still covers the case where the caller has no local path to resolve --
+# `hflow deploy`, whose data root is a URI naming someone else's filesystem.
 EXCLUDED_PROJECT_DIRECTORY_NAMES = frozenset(
     {
         ".venv",
@@ -834,7 +842,13 @@ EXCLUDED_PROJECT_DIRECTORY_NAMES = frozenset(
 )
 
 
-def copy_user_project(pipeline_file: Path, user_dir: Path, *, bundle_directory: Path) -> None:
+def copy_user_project(
+    pipeline_file: Path,
+    user_dir: Path,
+    *,
+    bundle_directory: Path,
+    data_root: Path | str | None = None,
+) -> None:
     """Copy the pipeline and the modules beside it into the bundle's ``user/``.
 
     A pipeline is an ordinary Python project, so shipping only the file it
@@ -845,18 +859,26 @@ def copy_user_project(pipeline_file: Path, user_dir: Path, *, bundle_directory: 
     project, so copying a discovered root would copy the bundle into itself
     and grow on every render.
 
-    The bundle directory is excluded explicitly for the same reason, as are
-    environments, caches, version-control metadata, and ``data/``.
+    Two directories are excluded by resolved PATH rather than by name, because
+    both are configurable and neither is reliably called anything: the bundle
+    directory, for the reason above, and ``data_root`` -- the workspace is
+    MOUNTED into the containers, never shipped, so copying it duplicates the
+    whole corpus onto the same disk on every render. Pass it whenever the
+    caller knows it; a bucket root, or one outside the pipeline's directory,
+    matches nothing here and costs nothing to pass.
+
+    Environments, caches, version-control metadata and a conventional ``data/``
+    are excluded by name (:data:`EXCLUDED_PROJECT_DIRECTORY_NAMES`).
     """
     project_directory = pipeline_file.parent.resolve()
-    resolved_bundle_directory = bundle_directory.resolve()
+    excluded_paths = {bundle_directory.resolve()}
+    if data_root is not None and not is_bucket_url(str(data_root)):
+        excluded_paths.add(Path(data_root).expanduser().resolve())
 
     def ignored_names(directory: str, names: list[str]) -> set[str]:
         current = Path(directory).resolve()
         ignored = {name for name in names if name in EXCLUDED_PROJECT_DIRECTORY_NAMES}
-        ignored.update(
-            name for name in names if (current / name).resolve() == resolved_bundle_directory
-        )
+        ignored.update(name for name in names if (current / name).resolve() in excluded_paths)
         return ignored
 
     if user_dir.exists():
@@ -977,7 +999,12 @@ def render_bundle(config: RuntimeConfig, bundle_dir: Path | str) -> BundlePaths:
             dag_data_root = parsed_data_root.url
 
     # user/ contents are derived from config, so they are always refreshed.
-    copy_user_project(pipeline_source, user_dir, bundle_directory=bundle_directory)
+    copy_user_project(
+        pipeline_source,
+        user_dir,
+        bundle_directory=bundle_directory,
+        data_root=config.data_root,
+    )
     warn_if_pipeline_data_root_differs(
         (user_dir / pipeline_source.name).read_text(), pipeline_source.name, dag_data_root
     )

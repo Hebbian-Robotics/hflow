@@ -176,7 +176,12 @@ def render_deploy_bundle(config: DeployConfig, output_dir: Path | str) -> Deploy
     for directory in (dags_dir, user_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
-    copy_user_project(pipeline_source, user_dir, bundle_directory=output_directory)
+    copy_user_project(
+        pipeline_source,
+        user_dir,
+        bundle_directory=output_directory,
+        data_root=config.data_root_uri,
+    )
     warn_if_pipeline_data_root_differs(
         (user_dir / pipeline_source.name).read_text(), pipeline_source.name, config.data_root_uri
     )

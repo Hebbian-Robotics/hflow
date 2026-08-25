@@ -29,7 +29,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from hflow import __version__
-from hflow.app import DEFAULT_DATA_ROOT, default_data_root, parse_pipeline_spec
+from hflow.app import (
+    DEFAULT_DATA_ROOT,
+    default_data_root,
+    resolve_pipeline_spec_for_rendering,
+)
 from hflow.curation import curate, stale_episodes
 from hflow.doctor import diagnose
 from hflow.project import (
@@ -745,7 +749,7 @@ def _command_up(arguments: argparse.Namespace) -> int:
     )
 
     try:
-        pipeline_file, app_variable = parse_pipeline_spec(
+        pipeline_file, app_variable = resolve_pipeline_spec_for_rendering(
             _require_pipeline_spec(arguments.pipeline)
         )
     except ValueError as error:
@@ -834,7 +838,7 @@ def _command_deploy(arguments: argparse.Namespace) -> int:
     from hflow.runtime._deploy import DeployConfig, render_deploy_bundle
 
     try:
-        pipeline_file, app_variable = parse_pipeline_spec(
+        pipeline_file, app_variable = resolve_pipeline_spec_for_rendering(
             _require_pipeline_spec(arguments.pipeline)
         )
     except ValueError as error:

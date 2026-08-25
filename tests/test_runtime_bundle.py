@@ -706,6 +706,35 @@ def test_pipeline_and_requirements_copied(config: RuntimeConfig, tmp_path: Path)
     assert (paths.user_dir / "requirements.txt").read_text() == "numpy>=2\n"
 
 
+def test_modules_beside_the_pipeline_are_copied(config: RuntimeConfig, tmp_path: Path) -> None:
+    """A pipeline is an ordinary Python project: `import rig_constants` has to
+    resolve inside every task, not only on the author's machine."""
+    (tmp_path / "rig_constants.py").write_text("EXPECTED_CAMERA_HZ = 30.0\n")
+
+    paths, _ = _render(config, tmp_path / "bundle")
+
+    assert (paths.user_dir / "rig_constants.py").is_file()
+
+
+def test_the_workspace_is_never_copied_whatever_it_is_called(
+    config: RuntimeConfig, tmp_path: Path
+) -> None:
+    """The corpus is MOUNTED into the containers, never shipped. Excluding the
+    literal name `data` excluded exactly one spelling of a configurable thing,
+    so a project whose hflow.toml said `data_root = "./workspace"` duplicated
+    its whole corpus into the bundle on every `hflow up`."""
+    from dataclasses import replace
+
+    workspace = tmp_path / "workspace"
+    (workspace / "episodes-in").mkdir(parents=True)
+    (workspace / "episodes-in" / "big.mcap").write_bytes(b"x" * 4096)
+
+    paths, _ = _render(replace(config, data_root=workspace), tmp_path / "bundle")
+
+    assert not (paths.user_dir / "workspace").exists()
+    assert (paths.user_dir / "my_pipeline.py").is_file()
+
+
 def test_missing_pipeline_file_raises(config: RuntimeConfig, tmp_path: Path) -> None:
     from dataclasses import replace
 
