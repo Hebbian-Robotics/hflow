@@ -243,6 +243,75 @@ def test_a_superseded_default_does_not_schedule_meta_forever(project: Path) -> N
     assert _stage(second, hflow.Stage.META).skipped_as_current == 1
 
 
+def _pipeline_with_a_gate_at(minimum_duration_s: float) -> str:
+    """A critical gate whose threshold is part of its content-hash version."""
+    return f"""
+import hflow
+from hflow.checks import episode_duration
+
+app = hflow.App("planning-demo", default_checks=())
+
+
+@app.check(critical=True)
+def long_enough(ep: hflow.Episode) -> hflow.CheckResult:
+    seconds = float(episode_duration(ep).measurements["duration_s"])
+    return hflow.CheckResult(
+        measurements={{"seconds": seconds}}, verdict=seconds >= {minimum_duration_s}
+    )
+
+
+@app.enrich()
+def labeller(ep: hflow.Episode) -> hflow.EnrichmentResult:
+    return hflow.EnrichmentResult(labels={{"reviewed": 1.0}})
+"""
+
+
+class TestUnQuarantiningAnEpisode:
+    """Retuning a critical check is the ordinary way to let an episode back in.
+
+    Every step downstream of the failing gate recorded `skipped` on the
+    quarantined pass. Reading that as settled work meant the episode came back
+    with no labels, on that pass and on every later one, while the dataset
+    policy -- whose quarantine rule now passed too -- shipped it as complete.
+    """
+
+    def test_the_enrichment_that_stood_aside_runs_afterwards(self, project: Path) -> None:
+        (project / "pipeline.py").write_text(_pipeline_with_a_gate_at(99.0))
+        quarantined = _ingest(project)
+        assert _stage(quarantined, hflow.Stage.META).counts["quarantined"] == 1
+
+        (project / "pipeline.py").write_text(_pipeline_with_a_gate_at(0.1))
+        released = _ingest(project)
+
+        assert _stage(released, hflow.Stage.META).counts["processed"] == 1
+        assert _stage(released, hflow.Stage.LABELS).counts["processed"] == 1
+        connection = open_catalog_connection(project / "data" / "catalog")
+        try:
+            labels = connection.execute(
+                "SELECT value_double FROM measurements_latest WHERE key = 'reviewed'"
+            ).fetchall()
+        finally:
+            connection.close()
+        assert labels == [(1.0,)]
+
+    def test_the_dataset_does_not_ship_it_until_the_labels_are_there(self, project: Path) -> None:
+        """Both dataset rules turn green the moment the gate is retuned, so
+        without the distinction the un-labelled episode is selected."""
+        from hflow.dataset import create_dataset
+
+        (project / "pipeline.py").write_text(_pipeline_with_a_gate_at(99.0))
+        _ingest(project)
+        (project / "pipeline.py").write_text(_pipeline_with_a_gate_at(0.1))
+        app = hflow.import_pipeline_application(str(project / "pipeline.py"))
+        run_stages_directly(app, [EPISODE_URI], {hflow.Stage.SYNC, hflow.Stage.META})
+
+        # meta cleared the quarantine; labels has not run yet.
+        assert create_dataset(app, "too-early").row_count == 0
+
+        _ingest(project)
+        assert create_dataset(app, "complete").row_count == 1
+
+
 class TestARecordingSyncCouldNotCanonicalize:
     """Sync appends a row for everything it canonicalizes, so after it has run,
     "no episode in the catalog" means it failed on that recording."""

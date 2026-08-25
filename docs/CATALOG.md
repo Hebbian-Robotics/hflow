@@ -225,10 +225,12 @@ decision:
 - The policy asks whether each step **ran**, not whether it passed.
   Evidence-only checks offer no verdict and record `measured`, so a
   `status = 'passed'` filter selects nothing at all.
-- It counts `skipped` as settled too, not only `passed`/`failed`/`measured`. A
-  built-in you wrapped under a name of your own supersedes the automatic copy,
-  which then records `skipped` on every episode by design -- reading that as an
-  unfilled hole excludes the whole corpus. `error` stays excluded: a crash is
+- It counts `superseded` as settled too, not only `passed`/`failed`/`measured`.
+  A built-in you wrapped under a name of your own supersedes the automatic copy,
+  which then records `superseded` on every episode by design -- reading that as
+  an unfilled hole excludes the whole corpus. `skipped` is different and stays
+  excluded: a step skipped because a critical check quarantined the episode has
+  real work to do the moment that check is retuned. So does `error`: a crash is
   infrastructure, so it is a retry.
 
 Pinning a check version by hand (the mixed-version-corpus reality).

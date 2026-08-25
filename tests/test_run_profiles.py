@@ -130,8 +130,9 @@ def test_quarantine_is_honored_across_invocations_via_the_catalog(
     relabel_report = app.process(source_episode, stages="relabel")
     assert not enrichment_ran
     assert relabel_report.enrichments[0].status == hflow.CheckStatus.SKIPPED
-    assert relabel_report.enrichments[0].skipped_reason is not None
-    assert "quarantined:dead_camera" in relabel_report.enrichments[0].skipped_reason
+    not_run = relabel_report.enrichments[0].not_run
+    assert isinstance(not_run, hflow.SkippedByQuarantine)
+    assert "quarantined:dead_camera" in not_run.reason
 
 
 def test_no_catalog_means_no_known_quarantine(source_episode: Path, tmp_path: Path) -> None:

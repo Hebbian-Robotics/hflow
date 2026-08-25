@@ -355,6 +355,52 @@ def _resolve_stages(stages: Iterable[Stage] | str | None) -> frozenset[Stage]:
     return frozenset(Stage(stage) for stage in stages)
 
 
+@dataclass(frozen=True)
+class SupersededByPipeline:
+    """An auto-registered default that stood down: the pipeline measures this.
+
+    Permanent, and that is the whole difference from
+    :class:`SkippedByQuarantine`. The pipeline's own step emits these keys on
+    every episode, so this default will stand down on every episode forever,
+    and anything asking "is there work left here?" must read it as no.
+    """
+
+    superseded_keys: tuple[str, ...]
+
+    @property
+    def reason(self) -> str:
+        shown = ", ".join(repr(key) for key in self.superseded_keys[:3])
+        return (
+            f"superseded by this pipeline's own steps, which measure {shown}"
+            f"{' and more' if len(self.superseded_keys) > 3 else ''}; pass "
+            "hflow.App(default_checks=...) to change the automatic set"
+        )
+
+
+@dataclass(frozen=True)
+class SkippedByQuarantine:
+    """Not run because a critical check had already quarantined the episode.
+
+    CONDITIONAL, unlike :class:`SupersededByPipeline`: retuning the critical
+    check is the ordinary way to un-quarantine an episode, and the moment that
+    happens this step has real work to do again. Anything asking "is there work
+    left here?" must read it as yes, or an un-quarantined episode never gets
+    its labels and its contact sheets and no later pass ever notices.
+    """
+
+    quarantine_tags: tuple[str, ...]
+
+    @property
+    def reason(self) -> str:
+        return f"episode quarantined ({', '.join(self.quarantine_tags)})"
+
+
+# Why a registered step produced no result without failing. Two variants
+# because the two answers differ on the one question that matters downstream:
+# whether running it again could produce anything new.
+StepNotRun = SupersededByPipeline | SkippedByQuarantine
+
+
 @dataclass
 class CheckRunReport:
     """Outcome of one check invocation inside a test run."""
@@ -362,13 +408,18 @@ class CheckRunReport:
     check: RegisteredCheck
     result: CheckResult | None = None
     error: str | None = None
-    skipped_reason: str | None = None
+    not_run: StepNotRun | None = None
     duration_s: float = 0.0
 
     @property
     def status(self) -> CheckStatus:
-        if self.skipped_reason is not None:
-            return CheckStatus.SKIPPED
+        match self.not_run:
+            case SupersededByPipeline():
+                return CheckStatus.SUPERSEDED
+            case SkippedByQuarantine():
+                return CheckStatus.SKIPPED
+            case None:
+                pass
         if self.error is not None:
             return CheckStatus.ERROR
         if self.result is not None and self.result.verdict is False:
@@ -385,15 +436,22 @@ class EnrichmentRunReport:
     enrichment: RegisteredEnrichment
     result: EnrichmentResult | None = None
     error: str | None = None
-    skipped_reason: str | None = None
+    not_run: StepNotRun | None = None
     duration_s: float = 0.0
     artifact_uris: dict[str, str] = field(default_factory=dict)
 
     @property
     def status(self) -> CheckStatus:
-        # Enrichments have no verdicts, so only three statuses apply.
-        if self.skipped_reason is not None:
-            return CheckStatus.SKIPPED
+        # Enrichments have no verdicts, so the verdict statuses never apply;
+        # supersession does not either, since only auto-registered CHECKS have
+        # an automatic copy to stand down.
+        match self.not_run:
+            case SkippedByQuarantine():
+                return CheckStatus.SKIPPED
+            case SupersededByPipeline():
+                return CheckStatus.SUPERSEDED
+            case None:
+                pass
         if self.error is not None:
             return CheckStatus.ERROR
         return CheckStatus.MEASURED
@@ -512,13 +570,13 @@ def _raise_if_step_cannot_take_only_an_episode(
 def _execute_enrichment(
     registered_enrichment: RegisteredEnrichment,
     canonical_episode: Episode,
-    skipped_reason: str | None,
+    not_run: StepNotRun | None,
 ) -> EnrichmentRunReport:
     """Run one enrichment-shaped step (user enrichment or the built-in media
     step) with the shared timing/boundary/error mechanics."""
     enrichment_run = EnrichmentRunReport(enrichment=registered_enrichment)
-    if skipped_reason is not None:
-        enrichment_run.skipped_reason = skipped_reason
+    if not_run is not None:
+        enrichment_run.not_run = not_run
         return enrichment_run
     started = time.perf_counter()
     try:
@@ -673,7 +731,7 @@ def _status_mark(status: CheckStatus) -> str:
             return "x"
         case CheckStatus.MEASURED:
             return "*"
-        case CheckStatus.SKIPPED:
+        case CheckStatus.SKIPPED | CheckStatus.SUPERSEDED:
             return "-"
         case CheckStatus.ERROR:
             return "!"
@@ -742,8 +800,8 @@ class TestReport:
         for run in self.checks:
             mark = _status_mark(run.status)
             headline = f"  {mark} {run.check.name} [{run.status}] ({run.duration_s * 1000:.0f}ms)"
-            if run.skipped_reason is not None:
-                lines.append(f"  {mark} {run.check.name} [skipped] {run.skipped_reason}")
+            if run.not_run is not None:
+                lines.append(f"  {mark} {run.check.name} [{run.status}] {run.not_run.reason}")
                 continue
             if run.error is not None:
                 lines.append(f"{headline} {run.error}")
@@ -763,8 +821,10 @@ class TestReport:
             for enrichment_run in self.enrichments:
                 mark = _status_mark(enrichment_run.status)
                 name = enrichment_run.enrichment.name
-                if enrichment_run.skipped_reason is not None:
-                    lines.append(f"  {mark} {name} [skipped] {enrichment_run.skipped_reason}")
+                if enrichment_run.not_run is not None:
+                    lines.append(
+                        f"  {mark} {name} [{enrichment_run.status}] {enrichment_run.not_run.reason}"
+                    )
                     continue
                 headline = (
                     f"  {mark} {name} [{enrichment_run.status}] "
@@ -867,9 +927,15 @@ class App:
         the user is not worth holding.
 
         So the default yields: it contributed nothing this pipeline did not
-        already measure, and it is recorded as skipped with the reason rather
-        than silently dropped, so the catalog never shows a check version that
-        claims measurements it did not supply.
+        already measure, and it is recorded as ``superseded`` with the reason
+        rather than silently dropped, so the catalog never shows a check
+        version that claims measurements it did not supply.
+
+        A status of its own, not ``skipped``, because the two are opposite
+        answers to the question a planner asks. This supersession is permanent
+        -- the pipeline's step emits those keys on every episode -- while a
+        quarantine skip lifts the moment its critical check is retuned. See
+        :data:`hflow.steps.SETTLED_STATUSES`.
 
         Only a DEFAULT ever yields. Two of the pipeline's own steps sharing a
         key is still refused, because there the engine has no basis to pick a
@@ -892,12 +958,7 @@ class App:
             superseded_keys = sorted(set(run.result.measurements) & pipeline_measurement_keys)
             if not superseded_keys:
                 continue
-            run.skipped_reason = (
-                f"superseded by this pipeline's own steps, which measure "
-                f"{', '.join(repr(key) for key in superseded_keys[:3])}"
-                f"{' and more' if len(superseded_keys) > 3 else ''}; pass "
-                "hflow.App(default_checks=...) to change the automatic set"
-            )
+            run.not_run = SupersededByPipeline(superseded_keys=tuple(superseded_keys))
             run.result = None
 
     def _reusable_canonical_episode(
@@ -1697,9 +1758,7 @@ class App:
                 run = CheckRunReport(check=registered)
                 report.checks.append(run)
                 if report.quarantined:
-                    run.skipped_reason = (
-                        f"episode quarantined ({', '.join(report.quarantine_tags)})"
-                    )
+                    run.not_run = SkippedByQuarantine(tuple(report.quarantine_tags))
                     continue
                 started = time.perf_counter()
                 try:
@@ -1739,17 +1798,15 @@ class App:
                         carried_tags = history.quarantine_tags(episode_id)
                 if carried_tags is not None:
                     report.quarantine_tags.extend(carried_tags)
-            quarantine_skip_reason = (
-                f"episode quarantined ({', '.join(report.quarantine_tags)})"
-                if report.quarantined
-                else None
+            quarantine_skip = (
+                SkippedByQuarantine(tuple(report.quarantine_tags)) if report.quarantined else None
             )
 
             if Stage.LABELS in enabled_stages:
                 for registered_enrichment in self._ordered_enrichments():
                     report.enrichments.append(
                         _execute_enrichment(
-                            registered_enrichment, canonical_episode, quarantine_skip_reason
+                            registered_enrichment, canonical_episode, quarantine_skip
                         )
                     )
 
@@ -1771,7 +1828,7 @@ class App:
                     version=media_contact_sheet_step_version(),
                 )
                 report.enrichments.append(
-                    _execute_enrichment(media_step, canonical_episode, quarantine_skip_reason)
+                    _execute_enrichment(media_step, canonical_episode, quarantine_skip)
                 )
 
             episode_metadata = dict(canonical_episode.metadata)

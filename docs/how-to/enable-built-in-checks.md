@@ -38,8 +38,12 @@ app = hflow.App(  # everything except one you configure yourself, below
 Registering one of them yourself replaces the automatic copy rather than
 colliding with it, which is how a default gets a gate or `critical=True`. And
 if you wrap one under a name of your own, the automatic copy stands down: it
-is recorded as skipped, naming the step that superseded it, so the catalog
-never shows a check version claiming measurements it did not supply.
+is recorded as `superseded`, naming the step that superseded it, so the catalog
+never shows a check version claiming measurements it did not supply. That is a
+status of its own rather than `skipped`, because standing down this way is
+permanent while a quarantine skip lifts as soon as its critical check is
+retuned -- and `hflow dataset create` and re-ingest planning both have to tell
+those apart.
 
 ## Register the rest
 

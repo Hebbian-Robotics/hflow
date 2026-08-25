@@ -110,10 +110,14 @@ def test_a_default_yields_to_a_pipeline_step_measuring_the_same_thing(
     by_name = {run.check.name: run for run in report.checks}
     assert by_name["timestamps"].result is not None
     superseded = by_name["timestamp_regularity"]
-    assert superseded.status is hflow.CheckStatus.SKIPPED
+    # A status of its own, not `skipped`: this default will stand down on every
+    # episode forever, where a quarantine skip lifts the moment the critical
+    # check is retuned, and the planner and the dataset policy have to be able
+    # to tell those apart (hflow.steps.SETTLED_STATUSES).
+    assert superseded.status is hflow.CheckStatus.SUPERSEDED
     assert superseded.result is None
-    assert superseded.skipped_reason is not None
-    assert "default_checks" in superseded.skipped_reason
+    assert isinstance(superseded.not_run, hflow.SupersededByPipeline)
+    assert "default_checks" in superseded.not_run.reason
     # The pipeline's own measurements survive intact.
     assert any(key.endswith("/median_dt_s") for key in by_name["timestamps"].result.measurements)
 
@@ -131,6 +135,6 @@ def test_a_default_that_does_not_overlap_keeps_running(
     report = app.test(source_episode, verbose=False)
 
     by_name = {run.check.name: run for run in report.checks}
-    assert by_name["timestamp_regularity"].status is hflow.CheckStatus.SKIPPED
+    assert by_name["timestamp_regularity"].status is hflow.CheckStatus.SUPERSEDED
     assert by_name["episode_duration"].result is not None
     assert by_name["content_digest"].result is not None

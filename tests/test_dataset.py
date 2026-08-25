@@ -106,9 +106,9 @@ class TestDefaultPolicy:
 
         Wrapping a built-in under a name of your own is how
         docs/how-to/enable-built-in-checks.md says to configure one, and the
-        auto-registered copy then stands down and records `skipped` -- on every
-        episode, forever, by design. Read as an unfilled hole it excluded every
-        episode, so `hflow dataset create` returned an empty dataset that
+        auto-registered copy then stands down and records `superseded` -- on
+        every episode, forever, by design. Read as an unfilled hole it excluded
+        every episode, so `hflow dataset create` returned an empty dataset that
         looked like a policy decision.
         """
         data_root = tmp_path / "data"
@@ -133,7 +133,7 @@ def my_duration(ep: hflow.Episode) -> hflow.CheckResult:
 
         report = app.test(data_root / "episodes-in" / "episode_0001.mcap")
         superseded = next(run for run in report.checks if run.check.name == "episode_duration")
-        assert superseded.status is hflow.CheckStatus.SKIPPED
+        assert superseded.status is hflow.CheckStatus.SUPERSEDED
 
         assert create_dataset(app, "with-a-wrapper").row_count == 1
 

@@ -89,7 +89,7 @@ def test_whole_pipeline_runs_without_quarantine(
     # ...except where the pipeline already measures the same thing: `timestamps`
     # wraps timestamp_regularity, so the automatic copy yields rather than
     # colliding with it.
-    assert status_by_check["timestamp_regularity"] == "skipped"
+    assert status_by_check["timestamp_regularity"] == "superseded"
     summary_text = report.summary()
     assert "pipeline_version=" in summary_text
     assert "camera_blackout" in summary_text
