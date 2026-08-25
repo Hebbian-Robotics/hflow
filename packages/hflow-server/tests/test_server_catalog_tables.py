@@ -7,6 +7,10 @@ EXPECTED_TABLE_NAMES = [
     "episodes_latest",
     "episodes_raw",
     "check_runs",
+    # One row per (episode, check) for the latest run, ranked the way
+    # measurements_latest is. The status rule reads it to tell a crashed
+    # critical check apart from one that passed.
+    "check_runs_latest",
     "measurements",
     "measurements_latest",
     "tags",

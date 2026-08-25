@@ -60,6 +60,7 @@ CATALOG_TABLE_BROWSING_ORDER = (
     "episodes_latest",
     "episodes_raw",
     "check_runs",
+    "check_runs_latest",
     "measurements",
     "measurements_latest",
     "tags",

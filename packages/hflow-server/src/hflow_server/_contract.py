@@ -50,13 +50,16 @@ from hflow.steps import Stage
 # adapters below stop unwrapping with ``.value``. The aliases here are for
 # vocabularies no module owns as a type.
 #
-# hflow.curation owns the canonical ok/quarantined rule in SQL (the wide
-# ``episodes`` view's ``CASE WHEN quarantined THEN 'quarantined' ELSE 'ok'
-# END``). This alias is this API's one restatement of that vocabulary: the
-# status filter, the facet values, and the dossier's derived status all use
-# it, and _catalog.episode_status_for_quarantine_flag is the one place that
-# derives a value of it from a raw flag.
-EpisodeStatus = Literal["ok", "quarantined"]
+# hflow.catalog owns the canonical rule as SQL (episode_status_case_sql, which
+# both curation views and the snapshot export render). This alias is this API's
+# one restatement of that vocabulary: the status filter, the facet values, and
+# the dossier's derived status all use it, and _catalog.episode_status_for_flags
+# is the one place that derives a value of it without the SQL.
+#
+# 'unverified' means a critical check crashed, so the episode was never actually
+# checked. It is not a milder 'quarantined': nothing said this episode is bad,
+# only that nobody knows.
+EpisodeStatus = Literal["ok", "quarantined", "unverified"]
 
 # Stored ``success`` is a stringified boolean whose casing varies by producer,
 # so the filter matches case-insensitively on these two spellings.

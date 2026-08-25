@@ -517,3 +517,43 @@ def test_exporting_without_a_manifest_takes_one_row_per_source(tmp_path: Path) -
         [str(tmp_path / "dataset-snapshot" / "samples.parquet")],
     ).fetchall()
     assert sample_rows == [("fold_napkin", 2.0)]
+
+
+def test_snapshot_samples_report_unverified_for_a_crashed_critical_check(
+    tmp_path: Path,
+) -> None:
+    """#164: the exported samples render the same status rule as the views.
+
+    The snapshot builds its own query over its own check-runs view, so a
+    revert of that half would leave crashed-critical episodes spelled 'ok' in
+    every exported dataset with nothing red.
+    """
+    working_directory = tmp_path / "work"
+    working_directory.mkdir()
+    catalog = Catalog(tmp_path / "catalog")
+    canonical_episode = working_directory / "crashed.canonical.mcap"
+    canonical_episode.write_bytes(b"canonical bytes for a crashed critical check")
+    append_result = catalog.append_episode(
+        canonical_path=canonical_episode,
+        stamps=TEST_EPISODE_STAMPS,
+        episode_metadata={"task": "fold-shirt", "operator": "robot-01"},
+        check_rows=[
+            CheckRunRow(
+                check_name="camera_blackout",
+                check_version="blackout-v1",
+                critical=True,
+                status=hflow.CheckStatus.ERROR,
+                duration_s=0.1,
+                error="ffmpeg exited 1",
+            )
+        ],
+    )
+
+    output_directory = tmp_path / "snapshot"
+    hflow.export_dataset_snapshot(catalog.location, output_directory)
+
+    sample_row = duckdb.execute(
+        "SELECT episode_id, status FROM read_parquet(?)",
+        [str(output_directory / "samples.parquet")],
+    ).fetchone()
+    assert sample_row == (append_result.episode_id, "unverified")

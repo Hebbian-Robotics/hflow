@@ -234,7 +234,7 @@ need double quotes in SQL:
 
 ```sql
 SELECT episode_id, "/wrist_cam/compressed/black_frame_pct" AS black_pct
-FROM episodes WHERE status != 'quarantined' AND black_pct < 5.0
+FROM episodes WHERE status = 'ok' AND black_pct < 5.0
 ```
 
 ## One packaged check that is not in this list

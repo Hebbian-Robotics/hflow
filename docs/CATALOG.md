@@ -90,7 +90,7 @@ import hflow
 
 report = hflow.curate(
     "data/catalog",
-    "SELECT episode_id, uri FROM episodes WHERE status != 'quarantined'",
+    "SELECT episode_id, uri FROM episodes WHERE status = 'ok'",
     output="data/manifest.parquet",
 )
 print(report.summary())
@@ -150,7 +150,7 @@ unrestricted for your own exploration.
 these views registered (it is what `curate()` uses; take it and explore):
 
 - `episodes`: the wide view for everyday cuts. It has the latest row per
-  episode, a `status` column (`'quarantined'` / `'ok'`), and **one numeric
+  episode, a `status` column (`'quarantined'` / `'unverified'` / `'ok'`), and **one numeric
   column per measurement key** (latest value; booleans as 0/1).
 - `episodes_raw`, `check_runs`, `measurements`, `tags`, `intervals`,
   `ingest_failures`: the long tables, exactly as stored.
@@ -208,7 +208,7 @@ The everyday cut (this is the README example, running for real):
 ```sql
 SELECT episode_id, uri FROM episodes
 WHERE task = 'fold_napkin'
-  AND status != 'quarantined'
+  AND status = 'ok'            -- not just un-quarantined; see the status table below
   AND black_pct < 1.0          -- measurement keys are columns; units are yours
 ```
 
@@ -244,6 +244,53 @@ decision:
   excluded: a step skipped because a critical check quarantined the episode has
   real work to do the moment that check is retuned. So does `error`: a crash is
   infrastructure, so it is a retry.
+
+An episode inherits a term of its own from that last case. A crash is a retry
+for the *check*, but the episode it was supposed to check is left in a third
+state, and the `status` column on the `episodes` view names it:
+
+| `status` | what it means |
+|---|---|
+| `quarantined` | a critical check ran and returned a False verdict |
+| `unverified` | a critical check crashed, so no verdict was ever produced |
+| `ok` | every critical check that ran answered |
+
+`unverified` is not a milder `quarantined`. Nothing has said this episode is
+bad; the point is that nobody knows, because the check that would have said so
+never finished. That distinction is why the value exists at all. Before it,
+`status = 'ok'` meant "not quarantined", which covered *verified clean* and
+*never verified* alike, so a filter meaning "episodes I have checked for blur"
+silently included the ones where the blur check crashed.
+
+Only `error` earns it. A critical check can also record `skipped` (the episode
+was already quarantined upstream) or `superseded` (your pipeline measures the
+same thing itself); neither is a crash, and neither leaves the episode
+unchecked, so both still read `ok`. A non-critical check that crashes does not
+change the episode's status either, for the same reason it cannot quarantine
+one.
+
+Two consequences worth stating, because both are easy to trip over:
+
+```sql
+-- Keeps episodes nobody checked: their critical check crashed, so the
+-- verdict this filter is standing in for was never produced.
+SELECT episode_id FROM episodes WHERE status != 'quarantined'
+
+-- What you almost always mean.
+SELECT episode_id FROM episodes WHERE status = 'ok'
+```
+
+`hflow dataset create` is mostly already strict here, but by a different rule.
+Its default policy keeps `status != 'quarantined'` *and* requires every
+registered step to have a settled `check_runs` row, and `error` is not settled
+(see `SETTLED_STATUSES`). An episode whose critical check only ever crashed has
+no settled row for it and is excluded by that second rule, not the first.
+
+The gap is narrower than it looks, and it is worth knowing. If a settled run of
+that check version exists anywhere in the episode's history and a *later* run
+crashed, the step requirement is satisfied by the old row while the status
+column reads `unverified`, so the episode lands in the dataset. Filter on
+`status = 'ok'` in your selection SQL when you want the stricter reading.
 
 Pinning a check version by hand (the mixed-version-corpus reality).
 `check_version` is a content hash, not ordered, so pin exact values (or filter

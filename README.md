@@ -193,7 +193,7 @@ denominators alongside the manifest:
 ```sql
 SELECT episode_id, uri FROM episodes
 WHERE task = 'fold_napkin'
-  AND status != 'quarantined'
+  AND status = 'ok'
   AND black_pct < 1.0                      -- percent, user-owned threshold
   AND pipeline_version = 'a41c9f27b3d8'    -- pin one reprocessing generation
 ```

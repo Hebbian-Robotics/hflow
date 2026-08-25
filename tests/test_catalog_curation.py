@@ -14,6 +14,7 @@ from hflow.catalog import (
     Catalog,
     CheckRunRow,
     content_episode_id,
+    episode_status_case_sql,
 )
 from hflow.checks import camera_frame_stats
 from hflow.cli import main as cli_main
@@ -1614,3 +1615,224 @@ def test_curate_accepts_file_url_output(tmp_path: Path) -> None:
     assert report.row_count == 1
     assert manifest_target.is_file()
     assert not manifest_target.with_name(manifest_target.name + ".tmp").exists()
+
+
+def _episode_with_check(
+    tmp_path: Path,
+    *,
+    critical: bool,
+    status: hflow.CheckStatus,
+    quarantined: bool = False,
+) -> Path:
+    """Append one episode carrying a single check run with the given shape."""
+    catalog_root = tmp_path / "catalog"
+    catalog = Catalog(catalog_root)
+    check_row = CheckRunRow(
+        check_name="blur",
+        check_version="v1",
+        critical=critical,
+        status=status,
+        duration_s=0.1,
+        error="boom" if status is hflow.CheckStatus.ERROR else None,
+    )
+    catalog.append_episode(
+        canonical_path=_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[check_row],
+        quarantine_tags=["quarantined:blur"] if quarantined else [],
+    )
+    return catalog_root
+
+
+def _status_of_only_episode(catalog_root: Path, *, constrained: bool = False) -> str:
+    connection = open_catalog_connection(catalog_root, constrained=constrained)
+    try:
+        row = connection.execute("SELECT status FROM episodes").fetchone()
+    finally:
+        connection.close()
+    assert row is not None
+    return str(row[0])
+
+
+def test_errored_critical_check_reports_unverified(tmp_path: Path) -> None:
+    """#164 item 1: a crashed critical check no longer reads as a pass."""
+    catalog_root = _episode_with_check(tmp_path, critical=True, status=hflow.CheckStatus.ERROR)
+    assert _status_of_only_episode(catalog_root) == "unverified"
+
+
+def test_passing_critical_check_still_reports_ok(tmp_path: Path) -> None:
+    catalog_root = _episode_with_check(tmp_path, critical=True, status=hflow.CheckStatus.PASSED)
+    assert _status_of_only_episode(catalog_root) == "ok"
+
+
+def test_quarantine_outranks_a_critical_error(tmp_path: Path) -> None:
+    """#164 item 2: quarantined wins when an episode is both."""
+    catalog_root = tmp_path / "catalog"
+    catalog = Catalog(catalog_root)
+    catalog.append_episode(
+        canonical_path=_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[
+            CheckRunRow(
+                check_name="blur",
+                check_version="v1",
+                critical=True,
+                status=hflow.CheckStatus.FAILED,
+                duration_s=0.1,
+            ),
+            CheckRunRow(
+                check_name="exposure",
+                check_version="v1",
+                critical=True,
+                status=hflow.CheckStatus.ERROR,
+                duration_s=0.1,
+                error="boom",
+            ),
+        ],
+        quarantine_tags=["quarantined:blur"],
+    )
+    assert _status_of_only_episode(catalog_root) == "quarantined"
+
+
+def test_non_critical_error_still_reports_ok(tmp_path: Path) -> None:
+    """#164 item 3: only a CRITICAL crash leaves an episode unverified."""
+    catalog_root = _episode_with_check(tmp_path, critical=False, status=hflow.CheckStatus.ERROR)
+    assert _status_of_only_episode(catalog_root) == "ok"
+
+
+@pytest.mark.parametrize("status", [hflow.CheckStatus.SKIPPED, hflow.CheckStatus.SUPERSEDED])
+def test_critical_check_that_did_not_crash_reports_ok(
+    tmp_path: Path, status: hflow.CheckStatus
+) -> None:
+    """Skipped and superseded are not crashes, so neither reads unverified."""
+    catalog_root = _episode_with_check(tmp_path, critical=True, status=status)
+    assert _status_of_only_episode(catalog_root) == "ok"
+
+
+def test_successful_rerun_clears_unverified(tmp_path: Path) -> None:
+    """#164 item 4: a later good run of the same check reports ok again."""
+    catalog_root = tmp_path / "catalog"
+    catalog = Catalog(catalog_root)
+    canonical = _fake_canonical(tmp_path)
+    errored = CheckRunRow(
+        check_name="blur",
+        check_version="v1",
+        critical=True,
+        status=hflow.CheckStatus.ERROR,
+        duration_s=0.1,
+        error="boom",
+    )
+    catalog.append_episode(
+        canonical_path=canonical,
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[errored],
+    )
+    assert _status_of_only_episode(catalog_root) == "unverified"
+
+    passed = CheckRunRow(
+        check_name="blur",
+        check_version="v1",
+        critical=True,
+        status=hflow.CheckStatus.PASSED,
+        duration_s=0.1,
+    )
+    catalog.append_episode(
+        canonical_path=canonical,
+        stamps=FAKE_STAMPS,
+        episode_metadata={"attempt": "2"},
+        check_rows=[passed],
+    )
+    assert _status_of_only_episode(catalog_root) == "ok"
+
+
+def test_both_view_definitions_agree_on_unverified(tmp_path: Path) -> None:
+    """#164 item 5: the narrow and wide paths answer identically.
+
+    The wide path exists only once a measurement key is recorded, so this
+    appends an episode with a measurement and one without, and reads both
+    through a plain and a constrained connection.
+    """
+    narrow_root = _episode_with_check(
+        tmp_path / "narrow", critical=True, status=hflow.CheckStatus.ERROR
+    )
+
+    wide_base = tmp_path / "wide"
+    wide_base.mkdir()
+    wide_root = wide_base / "catalog"
+    catalog = Catalog(wide_root)
+    catalog.append_episode(
+        canonical_path=_fake_canonical(wide_base),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[
+            CheckRunRow(
+                check_name="blur",
+                check_version="v1",
+                critical=True,
+                status=hflow.CheckStatus.ERROR,
+                duration_s=0.1,
+                error="boom",
+                measurements={"example_metric": 1.0},
+            )
+        ],
+    )
+
+    for root in (narrow_root, wide_root):
+        assert _status_of_only_episode(root) == "unverified"
+        assert _status_of_only_episode(root, constrained=True) == "unverified"
+
+
+def test_one_errored_episode_does_not_mark_its_neighbours_unverified(
+    tmp_path: Path,
+) -> None:
+    """The status subquery correlates per episode, not across the catalog.
+
+    Every other test here uses a single-episode catalog, which cannot tell a
+    correctly correlated EXISTS apart from one that binds to its own relation
+    and is therefore true for every row.
+    """
+    catalog_root = tmp_path / "catalog"
+    catalog = Catalog(catalog_root)
+    canonicals = {}
+    for name, status in (
+        ("crashed", hflow.CheckStatus.ERROR),
+        ("healthy", hflow.CheckStatus.PASSED),
+    ):
+        canonical = tmp_path / f"{name}.canonical.mcap"
+        canonical.write_bytes(f"canonical for {name}".encode())
+        append = catalog.append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={"task": name},
+            check_rows=[
+                CheckRunRow(
+                    check_name="blur",
+                    check_version="v1",
+                    critical=True,
+                    status=status,
+                    duration_s=0.1,
+                    error="boom" if status is hflow.CheckStatus.ERROR else None,
+                )
+            ],
+        )
+        canonicals[name] = append.episode_id
+
+    connection = open_catalog_connection(catalog_root)
+    try:
+        statuses = dict(connection.execute("SELECT episode_id, status FROM episodes").fetchall())
+    finally:
+        connection.close()
+
+    assert statuses[canonicals["crashed"]] == "unverified"
+    assert statuses[canonicals["healthy"]] == "ok"
+
+
+def test_status_builder_refuses_an_unqualified_column() -> None:
+    """An unqualified column would correlate the subquery against itself."""
+    with pytest.raises(ValueError, match="qualified"):
+        episode_status_case_sql(
+            quarantined_column="quarantined", check_runs_relation="check_runs_latest"
+        )
