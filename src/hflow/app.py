@@ -467,12 +467,18 @@ def _check_run_rows(report: "TestReport") -> list[CheckRunRow]:
         )
         for run in report.checks
     ]
+    _raise_if_measurement_keys_claim_artifact_namespace(
+        (row.check_name, key) for row in check_rows for key in row.measurements
+    )
     for enrichment_run in report.enrichments:
         enrichment_result = enrichment_run.result
         labels: dict[str, float | int | str | bool] = (
             dict(enrichment_result.labels) if enrichment_result is not None else {}
         )
         if enrichment_result is not None:
+            _raise_if_measurement_keys_claim_artifact_namespace(
+                (enrichment_run.enrichment.name, key) for key in labels
+            )
             labels.update(
                 {
                     f"{ARTIFACT_MEASUREMENT_KEY_PREFIX}{artifact_name}": artifact_uri
@@ -492,6 +498,37 @@ def _check_run_rows(report: "TestReport") -> list[CheckRunRow]:
             )
         )
     return check_rows
+
+
+def _raise_if_measurement_keys_claim_artifact_namespace(
+    claimed: Iterable[tuple[str, str]],
+) -> None:
+    """Refuse a key that claims the framework's ``artifact/`` namespace.
+
+    ``ARTIFACT_MEASUREMENT_KEY_PREFIX`` is reserved for URIs the framework
+    itself publishes: this module packs them into the same measurements dict
+    under that prefix, and snapshot.py exports every key under it as media.
+    A user label reaching that dict under the prefix is indistinguishable
+    from a real published artifact, and the ``labels.update`` merge below
+    would let a real artifact of the same name silently overwrite the label.
+    The enrichment call site runs before that merge, while the two are still
+    told apart; the check call site runs on rows whose measurements never
+    carry framework keys at all.
+    """
+    claimed_names = [
+        f"{key!r} from {check_name!r}"
+        for check_name, key in claimed
+        if key.startswith(ARTIFACT_MEASUREMENT_KEY_PREFIX)
+    ]
+    if not claimed_names:
+        return
+    raise ValueError(
+        f"measurement keys claim the framework's artifact/ namespace: "
+        f"{'; '.join(claimed_names)}. Keys under artifact/ are reserved for the "
+        "URIs the framework publishes (snapshot.py exports every such key as "
+        "media), so a real artifact of the same name would silently overwrite "
+        "the label. Rename the key."
+    )
 
 
 def _raise_if_measurement_keys_collide(check_rows: Sequence[CheckRunRow]) -> None:

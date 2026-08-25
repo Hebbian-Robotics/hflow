@@ -166,3 +166,75 @@ def test_enrichment_uses_alias_is_preflighted(source_episode: Path, tmp_path: Pa
 
     with pytest.raises(ValueError, match="captioner"):
         app.test(source_episode, verbose=False)
+
+
+def test_enrichment_label_claiming_the_artifact_namespace_is_refused(
+    source_episode: Path, tmp_path: Path
+) -> None:
+    """A user label under `artifact/` is indistinguishable from a published
+    artifact in the catalog, and snapshot.py ships every such key as media."""
+    data_root = tmp_path / "data"
+    app = hflow.App("artifact-claim", data_root=data_root)
+
+    @app.enrich()
+    def labeling(ep: hflow.Episode) -> hflow.EnrichmentResult:
+        return hflow.EnrichmentResult(
+            labels=cast(
+                dict,
+                {"artifact/notes": "s3://bucket/notes", "caption": "legit label"},
+            )
+        )
+
+    with pytest.raises(ValueError, match=r"'artifact/notes'.*'labeling'"):
+        app.test(source_episode, verbose=False, record=True)
+    assert list((data_root / "catalog" / "episodes").glob("*.parquet")) == []
+
+
+def test_check_measurement_claiming_the_artifact_namespace_is_refused(
+    source_episode: Path, tmp_path: Path
+) -> None:
+    """A check measurement key under `artifact/` is refused the same way."""
+    data_root = tmp_path / "data"
+    app = hflow.App("artifact-claim-check", data_root=data_root)
+
+    @app.check()
+    def labeled(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"artifact/frames": 1.0})
+
+    with pytest.raises(ValueError, match=r"'artifact/frames'.*'labeled'"):
+        app.test(source_episode, verbose=False, record=True)
+    assert list((data_root / "catalog" / "episodes").glob("*.parquet")) == []
+
+
+def test_labels_near_the_artifact_namespace_still_land_with_real_artifacts(
+    source_episode: Path, tmp_path: Path
+) -> None:
+    """Only the exact `artifact/` prefix is reserved; real artifacts land unchanged."""
+    data_root = tmp_path / "data"
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    app = hflow.App("artifact-boundary", data_root=data_root)
+
+    @app.enrich()
+    def labeling(ep: hflow.Episode) -> hflow.EnrichmentResult:
+        artifact_path = artifact_dir / "segments.json"
+        artifact_path.write_text(json.dumps({"segments": []}))
+        return hflow.EnrichmentResult(
+            labels=cast(dict, {"artifact_notes": "s3://bucket/notes"}),
+            artifacts={"segments": artifact_path},
+        )
+
+    app.test(source_episode, verbose=False, record=True)
+    connection = open_catalog_connection(data_root / "catalog")
+    try:
+        label_row = connection.execute(
+            "SELECT value_text FROM measurements WHERE key = 'artifact_notes'"
+        ).fetchone()
+        assert label_row == ("s3://bucket/notes",)
+        artifact_row = connection.execute(
+            "SELECT value_text FROM measurements WHERE key = 'artifact/segments'"
+        ).fetchone()
+        assert artifact_row is not None
+        assert str(artifact_row[0]).endswith("segments.json")
+    finally:
+        connection.close()
