@@ -27,7 +27,12 @@ from typing import TYPE_CHECKING, TypedDict
 
 from hflow.batching import plan_batches
 from hflow.catalog import QuarantineHistory
-from hflow.stage_planning import EpisodeStagePlan, StageSelection
+from hflow.stage_planning import (
+    EpisodeStagePlan,
+    NoCanonicalEpisode,
+    OutstandingStages,
+    StageSelection,
+)
 from hflow.steps import IngestMode, Stage
 from hflow.storage import is_bucket_url, parse_storage_root
 
@@ -307,8 +312,19 @@ def run_stages_directly(
                     uris,
                     [later for later in ordered_stages if later is not Stage.SYNC],
                 )
-            stage_uris = [uri for uri in uris if stage in plans[uri].stages]
-            skipped_as_current = len(uris) - len(stage_uris)
+            stage_uris = []
+            for uri in uris:
+                match plans[str(uri)]:
+                    case OutstandingStages(stages=planned_stages):
+                        if stage in planned_stages:
+                            stage_uris.append(str(uri))
+                        else:
+                            skipped_as_current += 1
+                    case NoCanonicalEpisode():
+                        # Sync failed on this recording. It is already counted
+                        # and classified as that stage's failure, so it is
+                        # neither run here nor reported as up to date.
+                        pass
         # A stage with nothing to do is skipped outright rather than handed an
         # empty batch: the batch path opens a catalog reader for its quarantine
         # gate, which on a bucket workspace means syncing the catalog mirror to

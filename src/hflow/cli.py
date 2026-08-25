@@ -942,22 +942,34 @@ def _ingest_in_process(arguments: argparse.Namespace) -> int:
             f"{outcome.stage.value}: {counts['processed']} processed, "
             f"{counts['quarantined']} quarantined, {counts['errors']} errors{already_current}"
         )
-    if any(outcome.counts["errors"] for outcome in outcomes):
-        _print_ingest_failure_hint()
-    return 0
+    if not any(outcome.counts["errors"] for outcome in outcomes):
+        return 0
+    _print_ingest_failure_hint()
+    # Exit 1, per the convention in docs/FORMAT.md: the command ran and found
+    # something to report. Under the mass-failure budget an episode that failed
+    # is not fatal to the RUN, but it is still a failure, and a `hflow ingest
+    # ... && next-step` script has to be able to see it. The budget decides
+    # whether to keep going, never whether to report.
+    return 1
 
 
 def _print_ingest_failure_hint() -> None:
-    """Where the record of a failed episode lives.
+    """Where the record of a failed episode lives -- both places it can be.
 
-    Worth saying every time on this path: an episode that produced no catalog
-    row leaves nothing in the catalog to find, and unlike a scheduled run
-    there is no task log behind this executor to go and read.
+    Worth spelling out on this path: unlike a scheduled run there is no task
+    log behind this executor to go and read, and the two kinds of failure are
+    recorded in two different tables. A recording that never canonicalized has
+    no catalog row to be, so it lands in the failure ledger; a CHECK that
+    crashed leaves an ordinary episode whose step recorded `error`, and
+    pointing only at the ledger would send that user looking in an empty table.
     """
     print(
-        "ingest: episodes that produced no catalog row are recorded in the "
-        "ingest_failures table -- "
-        '`hflow curate "SELECT source_uri, failure_kind, message FROM ingest_failures"`',
+        "ingest: a recording that produced no episode is recorded in "
+        "ingest_failures, and a step that crashed on one that did is recorded "
+        "on the episode --\n"
+        '  hflow curate "SELECT source_uri, failure_kind, message FROM ingest_failures"\n'
+        '  hflow curate "SELECT episode_id, check_name, error FROM check_runs '
+        "WHERE status = 'error'\"",
         file=sys.stderr,
     )
 

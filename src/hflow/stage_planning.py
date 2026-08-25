@@ -69,8 +69,13 @@ class StageSelection(StrEnum):
 
 
 @dataclass(frozen=True)
-class EpisodeStagePlan:
-    """The stages one source recording still needs, and the steps that ask for them."""
+class OutstandingStages:
+    """A recording with a canonical episode, and which stages still owe work on it.
+
+    ``stages`` empty means every candidate stage's steps are settled -- the
+    recording is up to date, which is a different fact from having nothing to
+    run it against.
+    """
 
     source_identity: str
     stages: frozenset[Stage]
@@ -78,6 +83,24 @@ class EpisodeStagePlan:
     # `stages` is: one fact, one owner, and the caller never has to reconcile
     # a stage set against a step list that disagrees with it.
     outstanding_steps: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class NoCanonicalEpisode:
+    """Sync produced no episode for this recording, so no later stage can run.
+
+    Deliberately carries no stage set rather than an empty one. The two ways a
+    recording ends up running nothing -- up to date, and nothing to run against
+    -- are different enough that a report must not add them together, and a
+    single type with a ``stages`` field plus a flag would leave "failed sync,
+    but here are three stages to run" representable.
+    """
+
+    source_identity: str
+
+
+# Which of the two a recording got is the whole output of planning.
+EpisodeStagePlan = OutstandingStages | NoCanonicalEpisode
 
 
 def _required_steps_by_stage(
@@ -159,15 +182,22 @@ def plan_outstanding_stages(
 ) -> dict[str, EpisodeStagePlan]:
     """Per source recording, which of ``candidate_stages`` still has work to do.
 
+    **Call this only after ``sync`` has run in the same invocation.** Everything
+    below reads the catalog as this run's own output, and that is only true then.
+
     ``source_identities`` are catalog ``source_uri`` values -- ask
     :meth:`hflow.App.source_identity` for one rather than spelling it, or the
     query looks for rows filed under another name and every episode reads as
     outstanding.
 
-    A source the catalog has never seen gets every candidate stage: that is the
-    ordinary first-ingest case and also the honest answer for a corpus whose
-    catalog was rebuilt. So does a source whose latest episode is one this run
-    just minted, since nothing has been recorded against those bytes yet.
+    A source with **no** episode in the catalog gets **no** stages, which is the
+    post-sync contract doing real work rather than a degenerate case. Sync
+    appends an episodes row for every recording it canonicalizes, so after it
+    has run, "no row" means it failed on that recording: there is no canonical
+    file for a later stage to open, and running one anyway earns a second
+    failure that says ``FileNotFoundError`` where the first already said
+    ``source-unreadable``. The real failure is counted and classified in
+    ``ingest_failures`` by the stage that hit it.
 
     Known limitation, stated because it costs work rather than correctness: the
     media stage records nothing at all on a camera-less episode (there is no
@@ -180,27 +210,26 @@ def plan_outstanding_stages(
     from hflow.curation import open_catalog_connection
 
     required_by_stage = _required_steps_by_stage(application, candidate_stages)
-    every_candidate = frozenset(required_by_stage)
-    all_outstanding = {
-        source: EpisodeStagePlan(
-            source_identity=source,
-            stages=every_candidate,
-            outstanding_steps=tuple(
-                sorted(name for pairs in required_by_stage.values() for name, _ in pairs)
-            ),
-        )
-        for source in source_identities
-    }
-    if not source_identities or not every_candidate:
-        return all_outstanding
+    if not source_identities or not required_by_stage:
+        # No stage among the candidates records anything, so every recording is
+        # trivially up to date rather than un-runnable.
+        return {
+            source: OutstandingStages(
+                source_identity=source, stages=frozenset(), outstanding_steps=()
+            )
+            for source in source_identities
+        }
 
     try:
         connection = open_catalog_connection(application.workspace.catalog_root)
-    except (FileNotFoundError, ValueError):
-        # No catalog to plan against -- every episode of this run failed before
-        # anything was appended, or the workspace has none yet. Plan everything
-        # and let the stages report their own failures.
-        return all_outstanding
+    except FileNotFoundError:
+        # No catalog at all, so nothing was appended, so sync canonicalized
+        # nothing -- the same answer a per-source miss gets, for the same
+        # reason. A catalog that exists but cannot be READ (a format-version
+        # mismatch, which raises ValueError) is deliberately NOT caught: it
+        # would have failed this run's appends already, and swallowing it here
+        # would report every stage as up to date when nothing had run.
+        return {source: NoCanonicalEpisode(source_identity=source) for source in source_identities}
     try:
         source_placeholders = ", ".join("?" for _ in source_identities)
         episode_by_source = {
@@ -222,7 +251,7 @@ def plan_outstanding_stages(
     for source in source_identities:
         episode_id = episode_by_source.get(source)
         if episode_id is None:
-            plans[source] = all_outstanding[source]
+            plans[source] = NoCanonicalEpisode(source_identity=source)
             continue
         settled = settled_by_episode.get(episode_id, set())
         outstanding_stages: set[Stage] = set()
@@ -232,7 +261,7 @@ def plan_outstanding_stages(
             if missing:
                 outstanding_stages.add(stage)
                 outstanding_steps.extend(missing)
-        plans[source] = EpisodeStagePlan(
+        plans[source] = OutstandingStages(
             source_identity=source,
             stages=frozenset(outstanding_stages),
             outstanding_steps=tuple(sorted(outstanding_steps)),

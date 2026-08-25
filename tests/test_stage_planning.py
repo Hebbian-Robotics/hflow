@@ -243,14 +243,79 @@ def test_a_superseded_default_does_not_schedule_meta_forever(project: Path) -> N
     assert _stage(second, hflow.Stage.META).skipped_as_current == 1
 
 
-def test_the_budget_applies_to_what_the_stage_actually_ran(project: Path) -> None:
-    """A stage handed four outstanding episodes out of four hundred must fail
-    when all four error; a budget over the whole corpus would swallow it."""
-    _ingest(project)
-    (project / "data" / "episodes-in" / "corrupt.mcap").write_bytes(b"not an mcap file")
+class TestARecordingSyncCouldNotCanonicalize:
+    """Sync appends a row for everything it canonicalizes, so after it has run,
+    "no episode in the catalog" means it failed on that recording."""
 
-    with pytest.raises(RuntimeError, match="processing errors"):
-        _ingest(project, EPISODE_URI, "episodes-in/corrupt.mcap")
+    def test_the_later_stages_do_not_pile_a_second_failure_on_it(self, project: Path) -> None:
+        """Handing it on to meta earns a FileNotFoundError classified
+        `infrastructure`, next to the `source-unreadable` row that already told
+        the truth about the same file. One failure, one row."""
+        (project / "data" / "episodes-in" / "corrupt.mcap").write_bytes(b"not an mcap file")
+
+        outcomes = _ingest(project, EPISODE_URI, "episodes-in/corrupt.mcap")
+
+        assert _stage(outcomes, hflow.Stage.SYNC).counts["errors"] == 1
+        assert _stage(outcomes, hflow.Stage.META).counts["errors"] == 0
+        connection = open_catalog_connection(project / "data" / "catalog")
+        try:
+            rows = connection.execute(
+                "SELECT stage, failure_kind FROM ingest_failures "
+                "WHERE source_uri = 'episodes-in/corrupt.mcap'"
+            ).fetchall()
+        finally:
+            connection.close()
+        assert rows == [("sync", "source-unreadable")]
+
+    def test_it_is_not_counted_as_already_current(self, project: Path) -> None:
+        """It ran nothing and it is not up to date. Folding it into the
+        already-current count would report a corrupt recording as done."""
+        (project / "data" / "episodes-in" / "corrupt.mcap").write_bytes(b"not an mcap file")
+
+        outcomes = _ingest(project, EPISODE_URI, "episodes-in/corrupt.mcap")
+
+        assert _stage(outcomes, hflow.Stage.META).skipped_as_current == 0
+
+    def test_the_command_exits_one_even_under_budget(
+        self, project: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The budget decides whether the RUN keeps going, never whether a
+        failure is reported: `hflow ingest ... && next-step` has to see it."""
+        (project / "data" / "episodes-in" / "corrupt.mcap").write_bytes(b"not an mcap file")
+
+        assert cli_main(["ingest", EPISODE_URI, "episodes-in/corrupt.mcap"]) == 1
+
+        printed = capsys.readouterr()
+        assert "sync: 1 processed, 0 quarantined, 1 errors" in printed.out
+        assert "ingest_failures" in printed.err
+
+    def test_a_crashed_check_is_reported_where_it_actually_is(
+        self, project: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A check that crashes leaves an ordinary catalogued episode with an
+        `error` step on it -- nothing in the failure ledger. Pointing only at
+        the ledger sends that user looking in an empty table."""
+        (project / "pipeline.py").write_text(
+            PIPELINE_SOURCE
+            + """
+
+@app.check()
+def explodes(ep: hflow.Episode) -> hflow.CheckResult:
+    raise RuntimeError("boom")
+"""
+        )
+
+        assert cli_main(["ingest", EPISODE_URI]) == 1
+
+        assert "check_runs" in capsys.readouterr().err
+        connection = open_catalog_connection(project / "data" / "catalog")
+        try:
+            assert connection.execute("SELECT count(*) FROM ingest_failures").fetchone() == (0,)
+            assert connection.execute(
+                "SELECT check_name FROM check_runs WHERE status = 'error'"
+            ).fetchall() == [("explodes",)]
+        finally:
+            connection.close()
 
 
 class TestMediaPlanning:
