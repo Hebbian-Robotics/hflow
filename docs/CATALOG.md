@@ -218,10 +218,18 @@ coverage). Nothing is hidden -- `--print-sql` gives you the query to edit into
 a sharper one, and `--sql` runs yours instead while keeping the artifact and
 the provenance record.
 
-One subtlety worth knowing if you write the equivalent yourself: the policy
-asks whether each check **ran**, not whether it passed. Evidence-only checks
-offer no verdict and record `measured`, so a `status = 'passed'` filter
-selects nothing at all.
+Two subtleties worth knowing if you write the equivalent yourself, because
+both of them silently return an empty dataset that reads like a policy
+decision:
+
+- The policy asks whether each step **ran**, not whether it passed.
+  Evidence-only checks offer no verdict and record `measured`, so a
+  `status = 'passed'` filter selects nothing at all.
+- It counts `skipped` as settled too, not only `passed`/`failed`/`measured`. A
+  built-in you wrapped under a name of your own supersedes the automatic copy,
+  which then records `skipped` on every episode by design -- reading that as an
+  unfilled hole excludes the whole corpus. `error` stays excluded: a crash is
+  infrastructure, so it is a retry.
 
 Pinning a check version by hand (the mixed-version-corpus reality).
 `check_version` is a content hash, not ordered, so pin exact values (or filter

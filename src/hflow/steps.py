@@ -107,10 +107,9 @@ class CheckStatus(StrEnum):
     ERROR = "error"  # crashed: infrastructure, not data
 
 
-# The statuses that mean "this check actually ran on this episode". One owner,
-# because more than one thing asks: coverage denominators and dataset
-# membership both turn on it, and two private copies of "ran" is how those two
-# answers drift apart.
+# The statuses that mean "this check actually ran on this episode, and here is
+# its evidence". One owner, because coverage denominators ask it and two
+# private copies of "ran" is how two answers to one question drift apart.
 #
 # PASSED is deliberately not the whole set, and assuming it is yields an EMPTY
 # answer: an evidence-only check offers no verdict, so it records MEASURED, and
@@ -127,6 +126,30 @@ RAN_STATUSES: tuple[CheckStatus, ...] = (
     CheckStatus.FAILED,
     CheckStatus.MEASURED,
 )
+
+# The statuses that mean "this step has had its turn on this exact episode, and
+# running it again would reach the same outcome". A different question from
+# RAN_STATUSES, asked where the answer decides whether there is WORK LEFT TO DO
+# rather than whether evidence exists: dataset membership
+# (:func:`hflow.dataset.default_dataset_sql`).
+#
+# SKIPPED is the difference, and it is why this set has to exist separately.
+# The engine records SKIPPED for exactly two reasons, and both are settled:
+#
+# - An auto-registered default check that the pipeline's own step SUPERSEDES,
+#   which is the configuration docs/how-to/enable-built-in-checks.md teaches
+#   (wrap a built-in under a name of your own to configure it). The default
+#   stands down every time, on every episode, forever. Reading that as
+#   unfinished work made `hflow dataset create` select nothing at all on such
+#   a pipeline and would make a planner schedule the meta stage on every pass.
+# - Every remaining check on an episode a critical check already quarantined.
+#   Membership excludes quarantined episodes on its own, so this cannot admit
+#   one; a planner re-running those checks would quarantine it again and skip
+#   them again.
+#
+# ERROR stays excluded here for the same reason it is excluded above: a crash
+# is infrastructure, so it is a retry, and a retry is work left to do.
+SETTLED_STATUSES: tuple[CheckStatus, ...] = (*RAN_STATUSES, CheckStatus.SKIPPED)
 
 
 @dataclass(frozen=True)

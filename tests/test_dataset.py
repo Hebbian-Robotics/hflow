@@ -99,6 +99,44 @@ class TestDefaultPolicy:
         sql = default_dataset_sql(app)
         assert "status != 'quarantined'" in sql
 
+    def test_a_default_check_the_pipeline_supersedes_is_not_a_hole(
+        self, tmp_path: Path, source_episode: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other empty-dataset trap, and the one the docs walk users into.
+
+        Wrapping a built-in under a name of your own is how
+        docs/how-to/enable-built-in-checks.md says to configure one, and the
+        auto-registered copy then stands down and records `skipped` -- on every
+        episode, forever, by design. Read as an unfilled hole it excluded every
+        episode, so `hflow dataset create` returned an empty dataset that
+        looked like a policy decision.
+        """
+        data_root = tmp_path / "data"
+        (data_root / "episodes-in").mkdir(parents=True)
+        (data_root / "episodes-in" / "episode_0001.mcap").write_bytes(source_episode.read_bytes())
+        (tmp_path / "hflow.toml").write_text('data_root = "./data"\n')
+        (tmp_path / "pipeline.py").write_text(
+            """
+import hflow
+from hflow.checks import episode_duration
+
+app = hflow.App("wrapper-demo")
+
+
+@app.check()
+def my_duration(ep: hflow.Episode) -> hflow.CheckResult:
+    return episode_duration(ep)
+"""
+        )
+        _ingest(tmp_path, monkeypatch)
+        app = hflow.import_pipeline_application(str(tmp_path / "pipeline.py"))
+
+        report = app.test(data_root / "episodes-in" / "episode_0001.mcap")
+        superseded = next(run for run in report.checks if run.check.name == "episode_duration")
+        assert superseded.status is hflow.CheckStatus.SKIPPED
+
+        assert create_dataset(app, "with-a-wrapper").row_count == 1
+
 
 class TestArtifacts:
     def test_the_manifest_and_its_provenance_land_together(

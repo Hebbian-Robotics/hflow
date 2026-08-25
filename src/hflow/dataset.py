@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING
 from hflow.catalog import EPISODES_VIEW_STATUS_COLUMN
 from hflow.curation import CheckCoverage, CurationReport, curate
 from hflow.format import EPISODE_FORMAT_VERSION
-from hflow.steps import RAN_STATUSES
+from hflow.steps import SETTLED_STATUSES
 from hflow.workspace import MANIFESTS_DIRECTORY_NAME, Workspace
 
 if TYPE_CHECKING:
@@ -178,19 +178,27 @@ def default_dataset_sql(application: "App") -> str:
        match what this App produces now, so a corpus half-reprocessed after a
        transform change does not mix two canonical behaviors in one dataset.
     2. **Not quarantined.** The pipeline's own critical checks rejected it.
-    3. **Every registered check ran, at its current version.** A check added
+    3. **Every registered step settled, at its current version.** A check added
        last week that has not been backfilled leaves its episodes out rather
        than silently reporting a dataset with a hole in it.
     4. **One row per source recording**, which the ``episodes`` view already
        guarantees, so a reprocessed recording contributes its current
        generation and not both.
 
-    Rule 3 asks whether the check RAN, not whether it passed: the entire
-    built-in library is evidence-only and records ``measured``, so a
-    ``status = 'passed'`` reading would select nothing at all. See
-    :data:`hflow.steps.RAN_STATUSES`.
+    Rule 3 has two traps in it, and both of them yield an EMPTY dataset that
+    looks like a policy decision:
+
+    - It asks whether the step settled, never whether it PASSED. The entire
+      built-in library is evidence-only and records ``measured``, so a
+      ``status = 'passed'`` reading selects nothing at all.
+    - "Settled" is wider than "ran", because a default check the pipeline
+      supersedes records ``skipped`` on every episode forever -- and wrapping
+      a built-in to configure it is the documented way to configure one, so
+      reading ``skipped`` as an unfilled hole empties the dataset of the
+      pipelines most likely to want it. See :data:`hflow.steps.SETTLED_STATUSES`
+      for why that is safe here and where the two differ.
     """
-    ran_statuses = ", ".join(_quote_sql_string(status.value) for status in RAN_STATUSES)
+    settled_statuses = ", ".join(_quote_sql_string(status.value) for status in SETTLED_STATUSES)
     predicates = [
         f"{EPISODES_VIEW_STATUS_COLUMN} != 'quarantined'",
         f"pipeline_version = {_quote_sql_string(application.pipeline_version)}",
@@ -209,7 +217,7 @@ def default_dataset_sql(application: "App") -> str:
         predicates.append(
             "episode_id IN (\n"
             "        SELECT episode_id FROM check_runs\n"
-            f"        WHERE status IN ({ran_statuses})\n"
+            f"        WHERE status IN ({settled_statuses})\n"
             f"          AND ({identity_clauses})\n"
             "        GROUP BY episode_id\n"
             f"        HAVING count(DISTINCT check_name) = {len(required_steps)}\n"
