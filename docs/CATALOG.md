@@ -90,7 +90,7 @@ import hflow
 
 report = hflow.curate(
     "data/catalog",
-    "SELECT episode_id, uri FROM episodes WHERE status != 'quarantined'",
+    "SELECT episode_id, uri FROM episodes WHERE status = 'ok'",
     output="data/manifest.parquet",
 )
 print(report.summary())
@@ -208,7 +208,7 @@ The everyday cut (this is the README example, running for real):
 ```sql
 SELECT episode_id, uri FROM episodes
 WHERE task = 'fold_napkin'
-  AND status != 'quarantined'
+  AND status = 'ok'            -- not just un-quarantined; see the status table below
   AND black_pct < 1.0          -- measurement keys are columns; units are yours
 ```
 
@@ -272,17 +272,25 @@ one.
 Two consequences worth stating, because both are easy to trip over:
 
 ```sql
--- Wrong once unverified exists: this keeps episodes nobody checked.
+-- Keeps episodes nobody checked: their critical check crashed, so the
+-- verdict this filter is standing in for was never produced.
 SELECT episode_id FROM episodes WHERE status != 'quarantined'
 
 -- What you almost always mean.
 SELECT episode_id FROM episodes WHERE status = 'ok'
 ```
 
-`hflow dataset create` still excludes only `quarantined`, so an unverified
-episode does land in an exported dataset. That is deliberate for now: changing
-it would silently shrink existing datasets. Filter on `status = 'ok'` in your
-selection SQL when you want the stricter reading.
+`hflow dataset create` is mostly already strict here, but by a different rule.
+Its default policy keeps `status != 'quarantined'` *and* requires every
+registered step to have a settled `check_runs` row, and `error` is not settled
+(see `SETTLED_STATUSES`). An episode whose critical check only ever crashed has
+no settled row for it and is excluded by that second rule, not the first.
+
+The gap is narrower than it looks, and it is worth knowing. If a settled run of
+that check version exists anywhere in the episode's history and a *later* run
+crashed, the step requirement is satisfied by the old row while the status
+column reads `unverified`, so the episode lands in the dataset. Filter on
+`status = 'ok'` in your selection SQL when you want the stricter reading.
 
 Pinning a check version by hand (the mixed-version-corpus reality).
 `check_version` is a content hash, not ordered, so pin exact values (or filter

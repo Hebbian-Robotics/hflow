@@ -147,9 +147,22 @@ def episode_status_case_sql(*, quarantined_column: str, check_runs_relation: str
 
 
 def _episode_id_scope(quarantined_column: str) -> str:
-    """``episode_id`` qualified by the same alias the caller used for the flag."""
+    """``episode_id`` qualified by the same alias the caller used for the flag.
+
+    The alias is required. An unqualified ``episode_id`` inside the correlated
+    subquery would bind to the check-runs relation instead of the episode row,
+    making the comparison a tautology and every non-quarantined episode
+    unverified. That failure is silent and total, so it is refused here rather
+    than left for a caller to discover.
+    """
     alias, separator, _column = quarantined_column.rpartition(".")
-    return f"{alias}{separator}episode_id" if separator else "episode_id"
+    if not separator:
+        raise ValueError(
+            "quarantined_column must be qualified by the episode relation's alias "
+            f"(got {quarantined_column!r}); an unqualified column would correlate "
+            "the status subquery against itself"
+        )
+    return f"{alias}{separator}episode_id"
 
 
 # Lowercased name -> canonical spelling of every column a measurement key

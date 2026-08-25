@@ -14,6 +14,7 @@ from hflow.catalog import (
     Catalog,
     CheckRunRow,
     content_episode_id,
+    episode_status_case_sql,
 )
 from hflow.cli import main as cli_main
 from hflow.curation import CurationReport, curate, open_catalog_connection
@@ -1778,3 +1779,56 @@ def test_both_view_definitions_agree_on_unverified(tmp_path: Path) -> None:
     for root in (narrow_root, wide_root):
         assert _status_of_only_episode(root) == "unverified"
         assert _status_of_only_episode(root, constrained=True) == "unverified"
+
+
+def test_one_errored_episode_does_not_mark_its_neighbours_unverified(
+    tmp_path: Path,
+) -> None:
+    """The status subquery correlates per episode, not across the catalog.
+
+    Every other test here uses a single-episode catalog, which cannot tell a
+    correctly correlated EXISTS apart from one that binds to its own relation
+    and is therefore true for every row.
+    """
+    catalog_root = tmp_path / "catalog"
+    catalog = Catalog(catalog_root)
+    canonicals = {}
+    for name, status in (
+        ("crashed", hflow.CheckStatus.ERROR),
+        ("healthy", hflow.CheckStatus.PASSED),
+    ):
+        canonical = tmp_path / f"{name}.canonical.mcap"
+        canonical.write_bytes(f"canonical for {name}".encode())
+        append = catalog.append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={"task": name},
+            check_rows=[
+                CheckRunRow(
+                    check_name="blur",
+                    check_version="v1",
+                    critical=True,
+                    status=status,
+                    duration_s=0.1,
+                    error="boom" if status is hflow.CheckStatus.ERROR else None,
+                )
+            ],
+        )
+        canonicals[name] = append.episode_id
+
+    connection = open_catalog_connection(catalog_root)
+    try:
+        statuses = dict(connection.execute("SELECT episode_id, status FROM episodes").fetchall())
+    finally:
+        connection.close()
+
+    assert statuses[canonicals["crashed"]] == "unverified"
+    assert statuses[canonicals["healthy"]] == "ok"
+
+
+def test_status_builder_refuses_an_unqualified_column() -> None:
+    """An unqualified column would correlate the subquery against itself."""
+    with pytest.raises(ValueError, match="qualified"):
+        episode_status_case_sql(
+            quarantined_column="quarantined", check_runs_relation="check_runs_latest"
+        )

@@ -31,7 +31,7 @@ Views registered on the connection:
   the OWNING episode's recorded_at (joined in), not the measurement row's
   own -- the latter can go stale independently of the episode it belongs to.
 - ``episodes`` -- the wide view for everyday queries: latest episode rows,
-  a ``status`` column (``'quarantined'``/``'ok'``), and one numeric column
+  a ``status`` column (``'quarantined'``/``'unverified'``/``'ok'``), and one numeric column
   per measurement key (booleans as 0/1; text-valued measurements stay in the
   long table). A measurement key claiming an episode column -- or this
   derived ``status`` -- is refused at append time: pivoted beside the real
