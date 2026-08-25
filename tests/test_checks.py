@@ -673,9 +673,12 @@ def test_registering_both_camera_checks_caches_the_instrument(
         second = camera_signal_quality(episode)
 
     # The cache file landed next to the workdir MP4 (``<sanitized>.mp4``),
-    # using the same ``_sanitize_topic`` rule as ``Episode.video()``.
-    cache_path = workdir / f"{_sanitize_topic(camera_topic)}.instrument.txt"
-    assert cache_path.is_file(), f"expected {cache_path} to exist after both checks ran"
+    # using the same ``_sanitize_topic`` rule as ``Episode.video()``. Matched
+    # by glob rather than by full name: the graph digest in the middle is an
+    # implementation detail, and exactly one file is the fact worth pinning.
+    # Two would mean the checks disagreed on the graph and each decoded.
+    cache_files = list(workdir.glob(f"{_sanitize_topic(camera_topic)}.instrument.*.txt"))
+    assert len(cache_files) == 1, f"expected one cache file, got {cache_files}"
     # Exactly one ffmpeg decode for the one camera -- the doubled cost is gone.
     assert sum(decode_calls) == 1, f"got {decode_calls}"
     # Both checks produced measurements for the same camera.

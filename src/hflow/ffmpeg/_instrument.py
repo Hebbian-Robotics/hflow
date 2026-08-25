@@ -16,6 +16,7 @@ article. Deliberately no blurdetect: it inverts on motion smear (fast, good
 manipulation looks "blurry"). Thresholds are exposed and user-owned.
 """
 
+import hashlib
 import itertools
 import math
 import re
@@ -363,29 +364,39 @@ def instrument_filter_graph(
 
 
 # The instrument's raw ``metadata=print`` stdout for one video, cached as a
-# text file beside the video. The cache key is the video path itself -- the
-# same ``Episode.video(topic)`` workdir-MP4 path is the same underlying
-# footage, so any caller reaching for the instrument over that MP4 gets the
-# same decode output. Aggregation thresholds (``bright_luma_threshold``,
-# ``freeze_min_duration_s``, ``black_frame_amount_pct``) re-run from the
-# cached text on every call, so a threshold change is free rather than
-# invalidating the cache.
-_INSTRUMENT_CACHE_SUFFIX = ".instrument.txt"
+# text file beside the video. The cache key is the video path plus the exact
+# filter graph that produced the output: the same ``Episode.video(topic)``
+# workdir-MP4 path is the same underlying footage, so any caller reaching for
+# the instrument over that MP4 with the same graph gets the same decode.
+#
+# The graph belongs in the key because three of ``frame_stats``' parameters
+# are baked into it (``black_pixel_threshold``, ``freeze_noise_db``,
+# ``freeze_min_duration_s``): they change what ffmpeg measures, not how the
+# numbers are read afterwards, so serving one graph's decode to another
+# would answer with numbers for thresholds the caller did not ask for.
+# Hashing the graph rather than listing the parameters means a parameter
+# added to the graph later is covered with no edit here.
+#
+# The genuinely post-decode thresholds (``bright_luma_threshold``,
+# ``black_frame_amount_pct``) are absent from the key on purpose: they
+# re-aggregate from the cached text, so changing one stays free.
+_INSTRUMENT_CACHE_SUFFIX = ".txt"
 
 
-def _instrument_cache_path(video: Path) -> Path | None:
-    """Where the cached instrument stdout for ``video`` lives, or None if
-    caching is disabled for this path.
+def _instrument_cache_path(video: Path, graph: str) -> Path | None:
+    """Where the cached instrument stdout for ``video`` under ``graph`` lives,
+    or None if caching is disabled for this path.
 
-    A sibling of the video, named after its stem. Caching is disabled when
-    the video is not an ``.mp4`` -- the cache file would otherwise live at
-    the same path on case-insensitive filesystems, and writing a
-    ``.instrument.txt`` next to a ``.h264`` source would not match the
-    convention the workdir uses for the remux cache.
+    A sibling of the video, named after its stem and a short digest of the
+    graph. Caching is disabled when the video is not an ``.mp4`` -- the cache
+    file would otherwise live at the same path on case-insensitive
+    filesystems, and writing a sibling next to a ``.h264`` source would not
+    match the convention the workdir uses for the remux cache.
     """
     if video.suffix.lower() != ".mp4":
         return None
-    return video.with_name(f"{video.stem}{_INSTRUMENT_CACHE_SUFFIX}")
+    graph_digest = hashlib.sha256(graph.encode("utf-8")).hexdigest()[:16]
+    return video.with_name(f"{video.stem}.instrument.{graph_digest}{_INSTRUMENT_CACHE_SUFFIX}")
 
 
 def _write_instrument_cache(cache_path: Path, output_text: str) -> None:
@@ -436,11 +447,15 @@ def frame_stats(
     """Run the instrument over ``video`` and aggregate.
 
     One decode pass, one filter graph, one shared frame denominator. The
-    raw instrument stdout is cached in a ``.instrument.txt`` file beside
-    ``video`` (the workdir MP4 ``Episode.video()`` produces), so a second
-    call over the same video with the same footage skips the ffmpeg
-    decode and re-aggregates with whatever threshold parameters the
-    caller passed this time. A pipeline that registers both
+    raw instrument stdout is cached in a text file beside ``video`` (the
+    workdir MP4 ``Episode.video()`` produces), keyed on the filter graph
+    that produced it. A second call over the same video that measures the
+    same way skips the ffmpeg decode and re-aggregates from the cached
+    text, so changing ``bright_luma_threshold`` or
+    ``black_frame_amount_pct`` costs nothing. Changing
+    ``black_pixel_threshold``, ``freeze_noise_db``, or
+    ``freeze_min_duration_s`` changes the graph and so decodes again:
+    those ask ffmpeg to measure something else. A pipeline that registers both
     :func:`hflow.checks.camera_frame_stats` and
     :func:`hflow.checks.camera_signal_quality` therefore pays one decode
     per camera per episode rather than two; a wrapper that reaches for
@@ -458,7 +473,12 @@ def frame_stats(
     - Frames with average luma at or above ``bright_luma_threshold`` are
       counted as overexposed, on the same frame-count denominator.
     """
-    cache_path = _instrument_cache_path(video)
+    graph = instrument_filter_graph(
+        black_pixel_threshold=black_pixel_threshold,
+        freeze_noise_db=freeze_noise_db,
+        freeze_min_duration_s=freeze_min_duration_s,
+    )
+    cache_path = _instrument_cache_path(video, graph)
 
     if cache_path is not None:
         cached_output = _read_instrument_cache(cache_path)
@@ -482,11 +502,6 @@ def frame_stats(
                 # content-hash, and registering that check would fail.
                 return replace(stats, instrument_version=ffmpeg_version())
 
-    graph = instrument_filter_graph(
-        black_pixel_threshold=black_pixel_threshold,
-        freeze_noise_db=freeze_noise_db,
-        freeze_min_duration_s=freeze_min_duration_s,
-    )
     command = [
         str(ffmpeg_path()),
         "-hide_banner",

@@ -46,6 +46,7 @@ from hflow.ffmpeg._instrument import (
     _stats_from_instrument_output,
     _write_instrument_cache,
     frame_stats,
+    instrument_filter_graph,
 )
 from hflow.ffmpeg._raw_frames import (
     RawFrameError,
@@ -919,30 +920,71 @@ def test_a_missing_required_signal_raises_instead_of_shrinking_a_denominator() -
 
 # --- frame_stats workdir cache ------------------------------------------------
 #
-# Tests for the issue #173 fix: the raw instrument stdout is cached in a
-# ``.instrument.txt`` file beside the video, so two callers reaching for the
-# same video (the camera_frame_stats + camera_signal_quality built-in pair, or
-# a wrapper that calls frame_stats directly) share one ffmpeg decode pass.
-# Aggregation thresholds re-run from the cached text on every call, so the
-# cache is keyed on the video path only.
+# Tests for the issue #173 fix: the raw instrument stdout is cached in a text
+# file beside the video, so two callers reaching for the same video (the
+# camera_frame_stats + camera_signal_quality built-in pair, or a wrapper that
+# calls frame_stats directly) share one ffmpeg decode pass.
+#
+# The key is the video path plus the filter graph. That split is the thing
+# these tests are mostly about: the post-decode thresholds re-aggregate from
+# the cached text for free, while the three parameters baked into the graph
+# ask ffmpeg to measure something else and so must decode again.
 
 
 def _fake_completed_process(stdout: str) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
 
 
+def _graph(**overrides: float) -> str:
+    """The default instrument graph, with any parameter overridden."""
+    parameters: dict[str, float] = {
+        "black_pixel_threshold": 17,
+        "freeze_noise_db": -60.0,
+        "freeze_min_duration_s": 2.0,
+    }
+    parameters.update(overrides)
+    return instrument_filter_graph(
+        black_pixel_threshold=int(parameters["black_pixel_threshold"]),
+        freeze_noise_db=parameters["freeze_noise_db"],
+        freeze_min_duration_s=parameters["freeze_min_duration_s"],
+    )
+
+
 def test_instrument_cache_path_lives_next_to_the_mp4() -> None:
-    """A workdir-MP4 path gets a sibling ``.instrument.txt``. A non-MP4 path
-    returns None so the caller knows caching is off for that path -- a
-    ``.h264`` source has no canonical sibling name in the workdir convention.
+    """A workdir-MP4 path gets a sibling ``.instrument.<digest>.txt``. A
+    non-MP4 path returns None so the caller knows caching is off for that path
+    -- a ``.h264`` source has no canonical sibling name in the workdir
+    convention.
     """
-    assert _instrument_cache_path(Path("/work/wrist_cam.mp4")) == Path(
-        "/work/wrist_cam.instrument.txt"
-    )
-    assert _instrument_cache_path(Path("/work/WRIST_CAM.MP4")) == Path(
-        "/work/WRIST_CAM.instrument.txt"
-    )
-    assert _instrument_cache_path(Path("/work/raw.h264")) is None
+    cache_path = _instrument_cache_path(Path("/work/wrist_cam.mp4"), _graph())
+    assert cache_path is not None
+    assert cache_path.parent == Path("/work")
+    assert cache_path.name.startswith("wrist_cam.instrument.")
+    assert cache_path.suffix == ".txt"
+    assert _instrument_cache_path(Path("/work/WRIST_CAM.MP4"), _graph()) == Path(
+        "/work"
+    ) / cache_path.name.replace("wrist_cam", "WRIST_CAM")
+    assert _instrument_cache_path(Path("/work/raw.h264"), _graph()) is None
+
+
+def test_a_graph_parameter_change_takes_a_different_cache_path() -> None:
+    """``black_pixel_threshold``, ``freeze_noise_db``, and
+    ``freeze_min_duration_s`` are baked into the filter graph, so each one
+    changes what ffmpeg measures. Serving a cached decode across a change to
+    any of them would answer with numbers for thresholds the caller did not
+    ask for, so each gets its own cache path.
+    """
+    video = Path("/work/wrist_cam.mp4")
+    baseline = _instrument_cache_path(video, _graph())
+    for parameter, value in (
+        ("black_pixel_threshold", 200),
+        ("freeze_noise_db", -10.0),
+        ("freeze_min_duration_s", 0.25),
+    ):
+        changed = _instrument_cache_path(video, _graph(**{parameter: value}))
+        assert changed != baseline, f"{parameter} did not change the cache path"
+    # Same parameters, same path: the cache still hits on a repeat call.
+    assert _instrument_cache_path(video, _graph()) == baseline
 
 
 def test_write_and_read_round_trip(tmp_path: Path) -> None:
@@ -1024,7 +1066,8 @@ def test_frame_stats_caches_subsequent_calls(
     assert first.frame_count == second.frame_count == 2
     assert first.luma_avg_mean == second.luma_avg_mean == pytest.approx(150.0)
     # The cache file landed next to the video, atomically.
-    assert (tmp_path / "wrist_cam.instrument.txt").is_file()
+    cache_path = _instrument_cache_path(video, _graph())
+    assert cache_path is not None and cache_path.is_file()
 
 
 def test_frame_stats_does_not_cache_for_non_mp4_paths(
@@ -1049,8 +1092,8 @@ def test_frame_stats_does_not_cache_for_non_mp4_paths(
     frame_stats(video)
     frame_stats(video)
     assert counter_box[0] == 2
-    # No ``.instrument.txt`` was written beside the source.
-    assert not list(tmp_path.glob("*.instrument.txt"))
+    # No cache file was written beside the source.
+    assert not list(tmp_path.glob("*.instrument.*.txt"))
 
 
 def test_frame_stats_decodes_per_video(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1116,6 +1159,44 @@ def test_frame_stats_threshold_change_re_aggregates_from_cache(
     assert tightened.overexposed_frame_count == 2
 
 
+def test_frame_stats_re_decodes_when_a_graph_parameter_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Each distinct filter graph gets its own decode, and each is then
+    cached in its own right.
+
+    The companion to the re-aggregation test above, and the one that keeps
+    the two kinds of parameter apart. The documented way to configure a
+    built-in check is to wrap it under your own name with your own
+    thresholds, so two wrappers over one camera with different
+    ``freeze_min_duration_s`` values is the ordinary case, not an exotic
+    one. Serving the first wrapper's decode to the second would report
+    freeze numbers for a duration nobody asked for.
+    """
+    video = tmp_path / "wrist_cam.mp4"
+    video.write_bytes(b"")
+    observed_graphs: list[str] = []
+
+    def counted(*arguments: object, **keywords: object) -> subprocess.CompletedProcess[str]:
+        command = arguments[0] if arguments else keywords.get("args", [])
+        if isinstance(command, (list, tuple)) and "-vf" in command:
+            observed_graphs.append(str(command[list(command).index("-vf") + 1]))
+        return _fake_completed_process(_synthetic_frames({"lavfi.signalstats.YAVG": 100}))
+
+    monkeypatch.setattr("hflow.ffmpeg._instrument.subprocess.run", counted)
+    frame_stats(video, black_pixel_threshold=17)
+    frame_stats(video, black_pixel_threshold=200)
+    frame_stats(video, freeze_noise_db=-10.0)
+    frame_stats(video, freeze_min_duration_s=0.25)
+    assert len(observed_graphs) == 4
+    assert len(set(observed_graphs)) == 4
+    # Every graph now has a cache, and repeating any of them decodes nothing.
+    assert len(list(tmp_path.glob("*.instrument.*.txt"))) == 4
+    frame_stats(video, black_pixel_threshold=200)
+    frame_stats(video, freeze_min_duration_s=0.25)
+    assert len(observed_graphs) == 4
+
+
 def test_frame_stats_corrupt_cache_self_heals(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1126,7 +1207,8 @@ def test_frame_stats_corrupt_cache_self_heals(
     """
     video = tmp_path / "wrist_cam.mp4"
     video.write_bytes(b"")
-    cache_path = tmp_path / "wrist_cam.instrument.txt"
+    cache_path = _instrument_cache_path(video, _graph())
+    assert cache_path is not None
     cache_path.write_text("this is not valid instrument output\n", encoding="utf-8")
     instrument_stdout = _synthetic_frames({"lavfi.signalstats.YAVG": 100})
     counter_box: list[int] = [0]
@@ -1157,7 +1239,8 @@ def test_frame_stats_cache_survives_to_a_second_process(
     """
     video = tmp_path / "wrist_cam.mp4"
     video.write_bytes(b"")
-    cache_path = tmp_path / "wrist_cam.instrument.txt"
+    cache_path = _instrument_cache_path(video, _graph())
+    assert cache_path is not None
     cache_path.write_text(_synthetic_frames({"lavfi.signalstats.YAVG": 100}), encoding="utf-8")
     counter_box: list[int] = [0]
 
