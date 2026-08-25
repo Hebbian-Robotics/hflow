@@ -280,17 +280,20 @@ SELECT episode_id FROM episodes WHERE status != 'quarantined'
 SELECT episode_id FROM episodes WHERE status = 'ok'
 ```
 
-`hflow dataset create` is mostly already strict here, but by a different rule.
-Its default policy keeps `status != 'quarantined'` *and* requires every
-registered step to have a settled `check_runs` row, and `error` is not settled
-(see `SETTLED_STATUSES`). An episode whose critical check only ever crashed has
-no settled row for it and is excluded by that second rule, not the first.
+`hflow dataset create` applies `status = 'ok'` for you, so its default policy
+does not need this filter written by hand. It also requires every registered
+step to have a settled `check_runs` row, and `error` is not settled (see
+`SETTLED_STATUSES`).
 
-The gap is narrower than it looks, and it is worth knowing. If a settled run of
-that check version exists anywhere in the episode's history and a *later* run
-crashed, the step requirement is satisfied by the old row while the status
-column reads `unverified`, so the episode lands in the dataset. Filter on
-`status = 'ok'` in your selection SQL when you want the stricter reading.
+Those two rules overlap, and neither replaces the other. An episode whose
+critical check *only ever* crashed has no settled row at all, so the step
+requirement excludes it on its own. An episode that settled once and crashed on
+a later run is different: the step requirement is satisfied by the older row,
+and only the status column still reads `unverified`. That case is why the
+default policy filters on status rather than leaning on the step rule alone.
+
+Your own selection SQL gets neither rule for free. `status = 'ok'` is the one
+worth carrying over.
 
 Pinning a check version by hand (the mixed-version-corpus reality).
 `check_version` is a content hash, not ordered, so pin exact values (or filter

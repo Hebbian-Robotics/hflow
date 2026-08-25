@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from hflow.catalog import EPISODES_VIEW_STATUS_COLUMN
+from hflow.catalog import EPISODE_STATUS_OK, EPISODES_VIEW_STATUS_COLUMN
 from hflow.curation import CheckCoverage, CurationReport, curate
 from hflow.format import EPISODE_FORMAT_VERSION
 from hflow.steps import SETTLED_STATUSES
@@ -177,13 +177,25 @@ def default_dataset_sql(application: "App") -> str:
     1. **Current transform.** ``pipeline_version`` and ``schema_version`` must
        match what this App produces now, so a corpus half-reprocessed after a
        transform change does not mix two canonical behaviors in one dataset.
-    2. **Not quarantined.** The pipeline's own critical checks rejected it.
+    2. **Status is ``ok``.** Excludes two different things. ``quarantined`` is
+       the pipeline's own critical checks rejecting the episode. ``unverified``
+       is a critical check that crashed, so nobody actually checked it, and
+       that is the half rule 3 cannot see: a crash leaves no settled row, but
+       an EARLIER settled run of the same check satisfies rule 3 on its own,
+       and the episode would otherwise land in the dataset on the strength of
+       a result that a later run withdrew.
     3. **Every registered step settled, at its current version.** A check added
        last week that has not been backfilled leaves its episodes out rather
        than silently reporting a dataset with a hole in it.
     4. **One row per source recording**, which the ``episodes`` view already
        guarantees, so a reprocessed recording contributes its current
        generation and not both.
+
+    Rules 2 and 3 overlap without either being redundant. An episode whose
+    critical check ONLY ever crashed is dropped by rule 3, which needs a
+    settled row and never gets one, and rule 2 agrees. An episode that settled
+    once and crashed later is dropped by rule 2 alone. Neither rule subsumes
+    the other, so both stay.
 
     Rule 3 has two traps in it, and both of them yield an EMPTY dataset that
     looks like a policy decision:
@@ -200,7 +212,7 @@ def default_dataset_sql(application: "App") -> str:
     """
     settled_statuses = ", ".join(_quote_sql_string(status.value) for status in SETTLED_STATUSES)
     predicates = [
-        f"{EPISODES_VIEW_STATUS_COLUMN} != 'quarantined'",
+        f"{EPISODES_VIEW_STATUS_COLUMN} = '{EPISODE_STATUS_OK}'",
         f"pipeline_version = {_quote_sql_string(application.pipeline_version)}",
         f"schema_version = {_quote_sql_string(EPISODE_FORMAT_VERSION)}",
     ]

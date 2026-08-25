@@ -97,7 +97,7 @@ class TestDefaultPolicy:
         _ingest(ingested_project, monkeypatch)
         app = hflow.import_pipeline_application(str(ingested_project / "pipeline.py"))
         sql = default_dataset_sql(app)
-        assert "status != 'quarantined'" in sql
+        assert "status = 'ok'" in sql
 
     def test_a_default_check_the_pipeline_supersedes_is_not_a_hole(
         self, tmp_path: Path, source_episode: Path, monkeypatch: pytest.MonkeyPatch
@@ -282,3 +282,59 @@ def test_a_manifest_is_never_overwritten(tmp_path: Path, monkeypatch: pytest.Mon
         write_dataset_manifest(
             workspace, name="clean", sql="SELECT episode_id FROM episodes", file_stem="pinned"
         )
+
+
+CRASHING_PIPELINE_SOURCE = """
+import os
+import hflow
+
+app = hflow.App("dataset-demo", default_checks=())
+
+
+@app.check(critical=True)
+def duration(ep: hflow.Episode) -> hflow.CheckResult:
+    if os.environ.get("CRASH_DURATION"):
+        raise RuntimeError("boom")
+    return hflow.CheckResult(measurements={"seconds": 1.0})
+"""
+
+
+class TestSettledThenCrashed:
+    """The one case the settled-steps rule cannot see on its own."""
+
+    @pytest.fixture
+    def project(self, tmp_path: Path, source_episode: Path) -> Path:
+        data_root = tmp_path / "data"
+        episodes_in = data_root / "episodes-in"
+        episodes_in.mkdir(parents=True)
+        (episodes_in / "episode_0001.mcap").write_bytes(source_episode.read_bytes())
+        (tmp_path / "pipeline.py").write_text(CRASHING_PIPELINE_SOURCE)
+        (tmp_path / "hflow.toml").write_text('data_root = "./data"\n')
+        return tmp_path
+
+    def test_a_later_crash_withdraws_an_earlier_settled_result(
+        self, project: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("CRASH_DURATION", raising=False)
+        _ingest(project, monkeypatch)
+
+        app = hflow.import_pipeline_application(str(project / "pipeline.py"))
+        assert create_dataset(app, "before-the-crash").row_count == 1
+
+        monkeypatch.setenv("CRASH_DURATION", "1")
+        # Exit 1: the crash is a processing error and ingest says so. --all-stages
+        # is what re-runs a step the catalog already records at its current
+        # version, which is what keeps this the same check_version as the
+        # settled run above rather than a version bump rule 3 would catch.
+        assert cli_main(["ingest", "--all-stages", "episodes-in/episode_0001.mcap"]) == 1
+
+        connection = duckdb.connect()
+        try:
+            statuses = connection.execute(
+                f"SELECT status FROM read_parquet('{project}/data/catalog/check_runs/**/*.parquet')"
+            ).fetchall()
+        finally:
+            connection.close()
+        assert sorted(str(row[0]) for row in statuses) == ["error", "measured"]
+
+        assert create_dataset(app, "after-the-crash").row_count == 0
