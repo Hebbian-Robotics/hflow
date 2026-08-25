@@ -52,7 +52,11 @@ from pathlib import Path
 
 import duckdb
 
-from hflow.catalog import EPISODES_VIEW_STATUS_COLUMN, TABLE_COLUMN_DDL
+from hflow.catalog import (
+    EPISODES_VIEW_STATUS_COLUMN,
+    TABLE_COLUMN_DDL,
+    episode_status_case_sql,
+)
 from hflow.format import CATALOG_FORMAT_VERSION
 from hflow.ingest_ledger import INGEST_FAILURES_COLUMN_DDL, INGEST_FAILURES_TABLE_NAME
 from hflow.steps import RAN_STATUSES
@@ -71,6 +75,13 @@ _LONG_TABLE_NAMES = (
     "tags",
     "intervals",
     INGEST_FAILURES_TABLE_NAME,
+)
+
+# The status rule rendered for each of the two episodes view shapes. Both come
+# from the one builder, so item 5 of #164 -- the wide and narrow paths agreeing
+# -- holds by construction rather than by two edits staying in step.
+_STATUS_CASE_ALIASED = episode_status_case_sql(
+    quarantined_column="e.quarantined", check_runs_relation="check_runs_latest"
 )
 _TABLE_DIRECTORIES = {
     "episodes_raw": "episodes",
@@ -340,6 +351,27 @@ def _open_connection_over_root(
         ) WHERE row_rank = 1
         """
     )
+    connection.execute(
+        """
+        CREATE VIEW check_runs_latest AS
+        SELECT * EXCLUDE (row_rank) FROM (
+            SELECT
+                c.* EXCLUDE (recorded_at),
+                -- Ranked by the EPISODE's recorded_at for the same reason
+                -- measurements_latest is: episodes is the only table whose
+                -- single writer is guaranteed, so ranking off this table's own
+                -- recorded_at could pick a different run_fingerprint than
+                -- episodes_latest did and stitch two runs together.
+                e.recorded_at,
+                row_number() OVER (
+                    PARTITION BY c.episode_id, c.check_name
+                    ORDER BY e.recorded_at DESC, c.run_fingerprint DESC
+                ) AS row_rank
+            FROM check_runs c
+            JOIN episodes_raw e USING (episode_id, run_fingerprint)
+        ) WHERE row_rank = 1
+        """
+    )
     measurement_keys = [
         str(row[0])
         for row in connection.execute(
@@ -356,7 +388,7 @@ def _open_connection_over_root(
             CREATE VIEW episodes AS
             SELECT
                 e.* EXCLUDE (quarantined),
-                CASE WHEN e.quarantined THEN 'quarantined' ELSE 'ok' END AS {EPISODES_VIEW_STATUS_COLUMN},
+                {_STATUS_CASE_ALIASED} AS {EPISODES_VIEW_STATUS_COLUMN},
                 m.* EXCLUDE (episode_id)
             FROM episodes_latest e
             LEFT JOIN (
@@ -381,9 +413,9 @@ def _open_connection_over_root(
             f"""
             CREATE VIEW episodes AS
             SELECT
-                * EXCLUDE (quarantined),
-                CASE WHEN quarantined THEN 'quarantined' ELSE 'ok' END AS {EPISODES_VIEW_STATUS_COLUMN}
-            FROM episodes_latest
+                e.* EXCLUDE (quarantined),
+                {_STATUS_CASE_ALIASED} AS {EPISODES_VIEW_STATUS_COLUMN}
+            FROM episodes_latest e
             """
         )
     return connection

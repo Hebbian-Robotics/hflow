@@ -168,16 +168,39 @@ class EpisodeListFilters:
     search: str | None = None
 
 
-def episode_status_for_quarantine_flag(quarantined: object) -> EpisodeStatus:
-    """One episode's status derived from its stored ``quarantined`` flag.
+def episode_status_for_flags(quarantined: object, *, critical_check_errored: bool) -> EpisodeStatus:
+    """One episode's status derived from its stored flags.
 
-    hflow.curation owns the CANONICAL rule as SQL -- the wide ``episodes``
-    view's ``CASE WHEN quarantined THEN 'quarantined' ELSE 'ok' END``. The
-    dossier reads ``episodes_latest``, which carries the raw flag instead of
-    that derived column, so this is the server's single Python restatement of the
-    rule; every path that needs a status from a flag calls here.
+    hflow.catalog owns the CANONICAL rule as SQL (``episode_status_case_sql``).
+    The dossier reads ``episodes_latest``, which carries the raw quarantine flag
+    instead of the derived column, so this is the server's single Python
+    restatement of the rule; every path that needs a status without the SQL
+    calls here, and the precedence matches the SQL exactly.
+
+    ``critical_check_errored`` is the second fact the flag alone cannot carry:
+    whether any critical check for this episode CRASHED, which is what makes an
+    episode unverified rather than checked-and-fine.
     """
-    return "quarantined" if quarantined else "ok"
+    if quarantined:
+        return "quarantined"
+    if critical_check_errored:
+        return "unverified"
+    return "ok"
+
+
+def _has_errored_critical_check(connection: duckdb.DuckDBPyConnection, episode_id: str) -> bool:
+    """Whether any critical check for this episode crashed in its latest run.
+
+    The same predicate the SQL rule uses, over the same ``check_runs_latest``
+    view, so the dossier's status and the ``episodes`` view's status cannot
+    disagree about one episode.
+    """
+    row = connection.execute(
+        "SELECT 1 FROM check_runs_latest "
+        "WHERE episode_id = ? AND critical AND status = 'error' LIMIT 1",
+        [episode_id],
+    ).fetchone()
+    return row is not None
 
 
 def quoted_identifier(column_name: str) -> str:
@@ -627,7 +650,10 @@ def query_episode_dossier(
     episode = DossierEpisode.model_validate(
         {
             **episode_row,
-            "status": episode_status_for_quarantine_flag(episode_row.get("quarantined")),
+            "status": episode_status_for_flags(
+                episode_row.get("quarantined"),
+                critical_check_errored=_has_errored_critical_check(connection, episode_id),
+            ),
             "quarantine_tags": quarantine_tags,
         }
     )

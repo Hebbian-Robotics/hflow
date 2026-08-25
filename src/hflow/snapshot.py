@@ -20,6 +20,7 @@ from uuid import uuid4
 import duckdb
 
 from hflow.app import ARTIFACT_MEASUREMENT_KEY_PREFIX, MEDIA_CONTACT_SHEET_STEP_NAME
+from hflow.catalog import episode_status_case_sql
 from hflow.curation import open_catalog_connection
 from hflow.storage import StorageRoot, fetch_uri
 
@@ -184,10 +185,10 @@ def _samples_snapshot_query(connection: duckdb.DuckDBPyConnection) -> str:
         ).fetchall()
     ]
     if not numeric_measurement_keys:
-        return """
+        return f"""
             SELECT
                 episodes.* EXCLUDE (quarantined),
-                CASE WHEN episodes.quarantined THEN 'quarantined' ELSE 'ok' END AS status,
+                {_SNAPSHOT_STATUS_CASE} AS status,
                 primary_media.uri AS media_uri,
                 primary_media.media_kind,
                 primary_media.mime_type AS media_mime_type,
@@ -205,7 +206,7 @@ def _samples_snapshot_query(connection: duckdb.DuckDBPyConnection) -> str:
     return f"""
         SELECT
             episodes.* EXCLUDE (quarantined),
-            CASE WHEN episodes.quarantined THEN 'quarantined' ELSE 'ok' END AS status,
+            {_SNAPSHOT_STATUS_CASE} AS status,
             measurements.* EXCLUDE (episode_id),
             primary_media.uri AS media_uri,
             primary_media.media_kind,
@@ -468,6 +469,13 @@ class _ReplaceableDatasetSnapshotDestination:
 
 _DatasetSnapshotDestination = (
     _NewDatasetSnapshotDestination | _ReplaceableDatasetSnapshotDestination
+)
+
+# The snapshot export renders the same status vocabulary as the curation views,
+# from the same builder, over its own selected-episode check-runs view.
+_SNAPSHOT_STATUS_CASE = episode_status_case_sql(
+    quarantined_column="episodes.quarantined",
+    check_runs_relation="snapshot_check_runs_latest",
 )
 
 

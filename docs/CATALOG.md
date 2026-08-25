@@ -150,7 +150,7 @@ unrestricted for your own exploration.
 these views registered (it is what `curate()` uses; take it and explore):
 
 - `episodes`: the wide view for everyday cuts. It has the latest row per
-  episode, a `status` column (`'quarantined'` / `'ok'`), and **one numeric
+  episode, a `status` column (`'quarantined'` / `'unverified'` / `'ok'`), and **one numeric
   column per measurement key** (latest value; booleans as 0/1).
 - `episodes_raw`, `check_runs`, `measurements`, `tags`, `intervals`,
   `ingest_failures`: the long tables, exactly as stored.
@@ -244,6 +244,45 @@ decision:
   excluded: a step skipped because a critical check quarantined the episode has
   real work to do the moment that check is retuned. So does `error`: a crash is
   infrastructure, so it is a retry.
+
+An episode inherits a term of its own from that last case. A crash is a retry
+for the *check*, but the episode it was supposed to check is left in a third
+state, and the `status` column on the `episodes` view names it:
+
+| `status` | what it means |
+|---|---|
+| `quarantined` | a critical check ran and returned a False verdict |
+| `unverified` | a critical check crashed, so no verdict was ever produced |
+| `ok` | every critical check that ran answered |
+
+`unverified` is not a milder `quarantined`. Nothing has said this episode is
+bad; the point is that nobody knows, because the check that would have said so
+never finished. That distinction is why the value exists at all. Before it,
+`status = 'ok'` meant "not quarantined", which covered *verified clean* and
+*never verified* alike, so a filter meaning "episodes I have checked for blur"
+silently included the ones where the blur check crashed.
+
+Only `error` earns it. A critical check can also record `skipped` (the episode
+was already quarantined upstream) or `superseded` (your pipeline measures the
+same thing itself); neither is a crash, and neither leaves the episode
+unchecked, so both still read `ok`. A non-critical check that crashes does not
+change the episode's status either, for the same reason it cannot quarantine
+one.
+
+Two consequences worth stating, because both are easy to trip over:
+
+```sql
+-- Wrong once unverified exists: this keeps episodes nobody checked.
+SELECT episode_id FROM episodes WHERE status != 'quarantined'
+
+-- What you almost always mean.
+SELECT episode_id FROM episodes WHERE status = 'ok'
+```
+
+`hflow dataset create` still excludes only `quarantined`, so an unverified
+episode does land in an exported dataset. That is deliberate for now: changing
+it would silently shrink existing datasets. Filter on `status = 'ok'` in your
+selection SQL when you want the stricter reading.
 
 Pinning a check version by hand (the mixed-version-corpus reality).
 `check_version` is a content hash, not ordered, so pin exact values (or filter

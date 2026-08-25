@@ -110,6 +110,48 @@ _FORMAT_MARKER_NAME = "format_version"
 # column list -- the table's columns plus this derived one.
 EPISODES_VIEW_STATUS_COLUMN = "status"
 
+# The three values that derived column takes. An episode is 'quarantined' when
+# a critical check returned a False verdict, 'unverified' when a critical check
+# CRASHED and so never produced one, and 'ok' when every critical check that ran
+# answered. The middle value exists because the absence of a verdict used to be
+# spelled the same way as a good one, which made "episodes I have checked for
+# blur" silently include episodes where the blur check never finished (#164).
+#
+# 'unverified' is specifically the ERROR status and not "anything that is not
+# passed". A critical check can also be SKIPPED (the episode was already
+# quarantined upstream) or SUPERSEDED (the pipeline measures the same thing
+# itself); neither is a crash and neither leaves the episode unchecked.
+EPISODE_STATUS_OK = "ok"
+EPISODE_STATUS_QUARANTINED = "quarantined"
+EPISODE_STATUS_UNVERIFIED = "unverified"
+
+
+def episode_status_case_sql(*, quarantined_column: str, check_runs_relation: str) -> str:
+    """The canonical status rule as SQL, for one episode relation.
+
+    Every SQL site that renders the status column builds it here, so the wide
+    and narrow curation views and the snapshot export cannot drift apart.
+    ``quarantined_column`` is the stored flag as spelled in the caller's scope
+    (aliased or bare); ``check_runs_relation`` is a check-runs relation already
+    narrowed to one row per (episode, check).
+    """
+    return (
+        f"CASE WHEN {quarantined_column} THEN '{EPISODE_STATUS_QUARANTINED}' "
+        f"WHEN EXISTS (SELECT 1 FROM {check_runs_relation} status_check_runs "
+        f"WHERE status_check_runs.episode_id = {_episode_id_scope(quarantined_column)} "
+        f"AND status_check_runs.critical "
+        f"AND status_check_runs.status = '{CheckStatus.ERROR}') "
+        f"THEN '{EPISODE_STATUS_UNVERIFIED}' "
+        f"ELSE '{EPISODE_STATUS_OK}' END"
+    )
+
+
+def _episode_id_scope(quarantined_column: str) -> str:
+    """``episode_id`` qualified by the same alias the caller used for the flag."""
+    alias, separator, _column = quarantined_column.rpartition(".")
+    return f"{alias}{separator}episode_id" if separator else "episode_id"
+
+
 # Lowercased name -> canonical spelling of every column a measurement key
 # must not claim. Derived from the episodes DDL plus the derived column
 # above, so a new episode column is guarded without touching the check.
