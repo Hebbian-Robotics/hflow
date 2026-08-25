@@ -32,7 +32,7 @@ import struct
 import tempfile
 import zlib
 from collections import OrderedDict, defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import TracebackType
 from typing import IO, Literal
@@ -151,10 +151,18 @@ class CanonicalMcapWriter:
         self,
         output: Path | str | IO[bytes],
         *,
-        chunk_size: int = DEFAULT_CHUNK_SIZE_BYTES,
+        chunk_size: int | Mapping[str, int] = DEFAULT_CHUNK_SIZE_BYTES,
         compression: Literal["zstd", "none"] = "zstd",
         library: str | None = None,
     ) -> None:
+        """``chunk_size`` is one target for every group, or a per-group
+        mapping with :data:`DEFAULT_CHUNK_SIZE_BYTES` for groups it omits.
+
+        Per-group targets exist because groups are written at wildly different
+        byte rates: six cameras produce megabytes a second while a proprio
+        channel produces kilobytes, and one threshold cannot be right for both
+        (see :func:`hflow.format.derived_chunk_size_bytes`). A plain int stays
+        accepted because it is the public contract callers already pass."""
         if isinstance(output, str | Path):
             # Path outputs publish atomically: all bytes go to a sibling temp
             # file, and finish() replaces the destination only after the
@@ -177,7 +185,12 @@ class CanonicalMcapWriter:
             self._stream = output
             self._owns_stream = False
 
-        self._chunk_size = chunk_size
+        self._chunk_size_by_group: Mapping[str, int] = (
+            {} if isinstance(chunk_size, int) else dict(chunk_size)
+        )
+        self._default_chunk_size = (
+            chunk_size if isinstance(chunk_size, int) else (DEFAULT_CHUNK_SIZE_BYTES)
+        )
         self._compression: Literal["zstd", "none"] = compression
         self._finished = False
 
@@ -285,7 +298,8 @@ class CanonicalMcapWriter:
 
         chunk_builder = self._chunk_builders_by_group[group_name]
         chunk_builder.add_message(message)
-        if chunk_builder.uncompressed_size > self._chunk_size:
+        group_chunk_size = self._chunk_size_by_group.get(group_name, self._default_chunk_size)
+        if chunk_builder.uncompressed_size > group_chunk_size:
             self._finalize_group_chunk(group_name)
 
     def add_metadata(self, name: str, data: dict[str, str]) -> None:

@@ -20,6 +20,7 @@ from hflow.format import (
     DEFAULT_CAMERA_GROUP,
     DEFAULT_STATE_GROUP,
     METADATA_RECORD_EPISODE,
+    PROVENANCE_KEY_CHUNK_TARGET_PREFIX,
     PROVENANCE_KEY_TOPIC_GROUP_PREFIX,
 )
 from hflow.transform import TransformConfig, write_canonical_episode
@@ -117,3 +118,62 @@ def test_a_manipulation_recording_is_laid_out_exactly_as_before(tmp_path: Path) 
     assert DEFAULT_BULK_GROUP not in groups.values()
     assert groups["/joint_states"] == DEFAULT_STATE_GROUP
     assert any(group == DEFAULT_CAMERA_GROUP for group in groups.values())
+
+
+class TestDerivedChunkTargets:
+    """Per-group chunk sizing, opt-in via `chunk_size_bytes=None`."""
+
+    def test_the_formula_balances_fetches_against_bytes(self) -> None:
+        """C = R*W is where fetches x bytes is minimized. Checked at the
+        measured camera rate from docs/BENCHMARKS.md (~5.4 MB/s over a 1 s
+        VLA window), which lands between the two published chunk sizes."""
+        from hflow.format import derived_chunk_size_bytes
+
+        assert derived_chunk_size_bytes(5_411_000, 1.0) == 5_411_000
+
+    def test_it_is_clamped_to_the_range_that_has_measurements(self) -> None:
+        from hflow.format import (
+            MAXIMUM_DERIVED_CHUNK_SIZE_BYTES,
+            MINIMUM_DERIVED_CHUNK_SIZE_BYTES,
+            derived_chunk_size_bytes,
+        )
+
+        # A proprio channel: far below the floor, so it keeps today's layout.
+        assert derived_chunk_size_bytes(1_000, 1.0) == MINIMUM_DERIVED_CHUNK_SIZE_BYTES
+        # Six cameras over a 6 s world-model window: the ceiling does the work.
+        assert derived_chunk_size_bytes(5_411_000, 6.0) == MAXIMUM_DERIVED_CHUNK_SIZE_BYTES
+
+    def test_a_zero_span_group_falls_back_rather_than_dividing_by_zero(self) -> None:
+        from hflow.format import MINIMUM_DERIVED_CHUNK_SIZE_BYTES, derived_chunk_size_bytes
+
+        assert derived_chunk_size_bytes(0.0, 1.0) == MINIMUM_DERIVED_CHUNK_SIZE_BYTES
+
+    def test_the_default_still_writes_one_target_for_every_group(self, tmp_path: Path) -> None:
+        """Opt-in means opt-in: nobody's bytes move until they ask."""
+        source = _source_with_a_bulk_channel(tmp_path / "source.mcap")
+        canonical = tmp_path / "default.canonical.mcap"
+        write_canonical_episode(source, canonical, TransformConfig())
+
+        with hflow.Episode(canonical) as episode:
+            assert not [
+                key
+                for key in episode.metadata
+                if key.startswith(PROVENANCE_KEY_CHUNK_TARGET_PREFIX)
+            ]
+
+    def test_deriving_records_a_target_per_group(self, tmp_path: Path) -> None:
+        source = _source_with_a_bulk_channel(tmp_path / "source.mcap")
+        canonical = tmp_path / "derived.canonical.mcap"
+        write_canonical_episode(source, canonical, TransformConfig(chunk_size_bytes=None))
+
+        with hflow.Episode(canonical) as episode:
+            targets = {
+                key.removeprefix(PROVENANCE_KEY_CHUNK_TARGET_PREFIX): int(value)
+                for key, value in episode.metadata.items()
+                if key.startswith(PROVENANCE_KEY_CHUNK_TARGET_PREFIX)
+            }
+
+        # A derived target is a fact about this episode's own byte rates and
+        # exists nowhere else, unlike a configured one.
+        assert set(targets) == {DEFAULT_STATE_GROUP, DEFAULT_BULK_GROUP}
+        assert all(target >= 800_000 for target in targets.values())
