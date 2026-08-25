@@ -298,6 +298,35 @@ def _normalized_measurements(
     return normalized
 
 
+def _normalized_intervals(check_name: str, intervals: list[Interval]) -> list[Interval]:
+    """Coerce NumPy scalar interval bounds to Python ints; refuse the rest.
+
+    A user check computing segment boundaries from ``channel.to_numpy()``
+    gets ``np.int64`` bounds from plain indexing, and those reach the run
+    fingerprint without the by-hand ``int(...)`` every built-in applies. Like
+    measurements, they are coerced here, before the fingerprint, so
+    ``np.int64(5)`` and ``5`` describe one interval and hash to one outcome
+    instead of splitting the run. A bound is nanoseconds and an ``int``: a
+    float bound (``np.float64(5.0).item()`` included) is not a timestamp and
+    is refused, naming the check and which bound.
+    """
+    normalized: list[Interval] = []
+    for interval in intervals:
+        bounds: dict[str, int] = {}
+        for bound_name in ("start_ns", "end_ns"):
+            value = getattr(interval, bound_name)
+            if isinstance(value, np.generic):
+                value = value.item()
+            if not isinstance(value, int):
+                raise ValueError(
+                    f"check {check_name!r} set interval {bound_name} as "
+                    f"{type(value).__name__}: interval bounds are int nanoseconds"
+                )
+            bounds[bound_name] = value
+        normalized.append(replace(interval, **bounds))
+    return normalized
+
+
 def _raise_if_measurement_keys_shadow_episode_columns(
     check_rows: Sequence[CheckRunRow],
 ) -> None:
@@ -546,7 +575,11 @@ class Catalog:
         # inserts. Normalizing any later would let np.float32(0.4) and
         # float(0.4) hash as two outcomes while storing NULL columns.
         check_rows = [
-            replace(row, measurements=_normalized_measurements(row.check_name, row.measurements))
+            replace(
+                row,
+                measurements=_normalized_measurements(row.check_name, row.measurements),
+                intervals=_normalized_intervals(row.check_name, row.intervals),
+            )
             for row in check_rows
         ]
         _raise_if_measurement_keys_shadow_episode_columns(check_rows)
