@@ -317,7 +317,10 @@ def _normalized_intervals(check_name: str, intervals: list[Interval]) -> list[In
             value = getattr(interval, bound_name)
             if isinstance(value, np.generic):
                 value = value.item()
-            if not isinstance(value, int):
+            # bool subclasses int, so True satisfies the test below and would
+            # store as 1 nanosecond. Excluded explicitly, the same way the port
+            # and measurement boundaries do it.
+            if not isinstance(value, int) or isinstance(value, bool):
                 raise ValueError(
                     f"check {check_name!r} set interval {bound_name} as "
                     f"{type(value).__name__}: interval bounds are int nanoseconds"

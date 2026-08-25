@@ -928,6 +928,31 @@ def test_a_float_interval_bound_is_refused_naming_the_check_and_bound(
         )
 
 
+def test_a_bool_interval_bound_is_refused_rather_than_stored_as_one_nanosecond(
+    tmp_path: Path,
+) -> None:
+    """``bool`` subclasses ``int``, so ``True`` passes an isinstance test and
+    would store as 1 ns. It is a mistake, not a timestamp."""
+    canonical = tmp_path / "e.canonical.mcap"
+    canonical.write_bytes(b"episode-bytes")
+    row = CheckRunRow(
+        check_name="segment_check",
+        check_version="v1",
+        critical=False,
+        status=hflow.CheckStatus.MEASURED,
+        duration_s=0.1,
+        # cast: the misuse this test exists to refuse.
+        intervals=[hflow.Interval(start_ns=cast(int, True), end_ns=10)],
+    )
+    with pytest.raises(ValueError, match=r"segment_check.*start_ns.*bool"):
+        Catalog(tmp_path / "catalog").append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[row],
+        )
+
+
 def test_same_interval_bound_in_a_numpy_or_python_scalar_replays_as_one_run(
     tmp_path: Path,
 ) -> None:
