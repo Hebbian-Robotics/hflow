@@ -99,13 +99,19 @@ copies would record the same measurement keys and the catalog would keep only
 one of them. A default is the exception: registering or wrapping one of those
 supersedes it, as above.
 
-Supersession is decided from what a check actually measured, which is only
-knowable after it runs. The automatic copy therefore runs before HFlow discards
-its result. Camera frame measurements cache their raw instrument output in the
-workdir, so a wrapper with the same graph still pays one FFmpeg decode per
-camera. A wrapper that changes a graph parameter correctly causes another
-decode because it requested a different measurement. You can still remove the
-automatic copy when you do not want it to run:
+One cost worth knowing before you wrap `camera_frame_stats` specifically.
+Supersession of a default happens before the default runs when the pipeline's
+wrapper is registered in the same run: HFlow knows the keys each default would
+emit, and any default whose predicted key set overlaps the wrapper's emitted
+keys is recorded as `superseded` without ever calling ffmpeg. The wrapper
+alone decodes the video, the default does no work, and the catalog records
+both rows -- the wrapper's measurements and the `superseded` notice on the
+default, naming the keys the wrapper covered. Every other built-in is cheap
+enough that this never mattered; the doc only called `camera_frame_stats` out
+because it is the one whose cost is ffmpeg.
+
+If you prefer to drop the default and own the measurement yourself, that works
+the same as before:
 
 ```python
 app = hflow.App(
@@ -115,7 +121,8 @@ app = hflow.App(
 ```
 
 `functools.partial` costs the same, and so does registering it bare under its
-own name -- that is a replacement, not a wrapper, so nothing runs twice.
+own name -- that is a replacement, not a wrapper, so the default does not
+exist to be superseded in the first place.
 
 [`examples/stress/synthetic.py`](../../examples/stress/synthetic.py) registers
 several this way over a generated corpus, if you want a running reference.

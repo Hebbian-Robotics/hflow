@@ -1486,10 +1486,19 @@ class App:
 
     def _ordered_checks(self) -> list[RegisteredCheck]:
         # Cheap-first: steps that need no special resources run before steps
-        # declaring requires/uses. Stable within each class.
+        # declaring requires/uses. Within each class, the pipeline's own
+        # steps run before the automatic defaults -- so a wrapper registered
+        # under its own name with non-default parameters has a chance to
+        # emit its measurement keys before the default would run, and the
+        # pre-execution short-circuit at the top of the check loop can
+        # supersede the default without paying its ffmpeg decode.
+        # Stable within each class.
         return sorted(
             self.checks,
-            key=lambda registered: bool(registered.requires) or registered.uses is not None,
+            key=lambda registered: (
+                bool(registered.requires) or registered.uses is not None,
+                registered.name in self._default_check_names,
+            ),
         )
 
     def _ordered_enrichments(self) -> list[RegisteredEnrichment]:
@@ -1823,12 +1832,41 @@ class App:
             )
 
             checks_to_run = self._ordered_checks() if Stage.META in enabled_stages else []
+            # Keys already emitted by the pipeline's own steps in this run.
+            # A default that has any key in common with what is here can be
+            # superseded at the top of the loop, before paying its ffmpeg
+            # decode; the same default that ran with no pipeline cover
+            # (first episode, or no overlapping user step) falls through to
+            # the regular path and runs as before.
+            pipeline_emitted_keys: set[str] = set()
+            from hflow.checks import _DEFAULT_KEY_PATTERNS
+
             for registered in checks_to_run:
                 run = CheckRunReport(check=registered)
                 report.checks.append(run)
                 if report.quarantined:
                     run.not_run = SkippedByQuarantine(tuple(report.quarantine_tags))
                     continue
+                # A default with a registered key pattern: if any pipeline
+                # step has already emitted a key the default would emit,
+                # the default's measurement would be a duplicate and would
+                # be thrown away by ``_yield_defaults_superseded_by_the_…``
+                # anyway. Skip the ffmpeg work entirely and record the same
+                # superseded reason, with the same key list, as the
+                # post-execution path. Same-parameter wrappers and steps
+                # that emit no pipeline keys are unaffected: the pattern
+                # only fires when both the wrapper has run and the key sets
+                # actually overlap.
+                if registered.name in self._default_check_names and pipeline_emitted_keys:
+                    pattern = _DEFAULT_KEY_PATTERNS.get(registered.function)
+                    if pattern is not None:
+                        predicted = pattern(canonical_episode)
+                        superseded_keys = sorted(predicted & pipeline_emitted_keys)
+                        if superseded_keys:
+                            run.not_run = SupersededByPipeline(
+                                superseded_keys=tuple(superseded_keys)
+                            )
+                            continue
                 started = time.perf_counter()
                 try:
                     returned = registered.function(canonical_episode)
@@ -1847,6 +1885,13 @@ class App:
                 finally:
                     run.duration_s = time.perf_counter() - started
                 _apply_gate(registered, run)
+                if run.result is not None and registered.name not in self._default_check_names:
+                    # User steps feed the supersede-overlap test for any
+                    # default that comes later in the order. Defaults do
+                    # not feed back: a superseded default never ran, so its
+                    # keys were not emitted, and a default that did run is
+                    # itself a target of supersession, not a source.
+                    pipeline_emitted_keys.update(run.result.measurements)
                 if run.result is not None and run.result.verdict is False:
                     if registered.critical:
                         report.quarantine_tags.append(f"quarantined:{registered.name}")

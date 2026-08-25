@@ -16,7 +16,7 @@ rather than a shared ``message_count``.
 """
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -1378,3 +1378,138 @@ DEFAULT_CHECKS: tuple[CheckFunction, ...] = (
     content_digest,
     media_digest,
 )
+
+
+# Key-set predictor for every default: what ``measurements`` keys would this
+# function emit for a given episode, without actually running it.
+#
+# Used by ``hflow.app.App`` to decide whether a pipeline step has already
+# covered a default's keys, so the default can be short-circuited before the
+# ffmpeg decode it would otherwise pay for. The patterns mirror the
+# ``measurements[...] = ...`` writes in the function bodies above, line for
+# line -- a separate, internal contract that the drift-guard test in
+# ``tests/test_default_checks.py`` enforces: a default whose actual key set
+# diverges from its pattern is a regression in this engine, not in the
+# default itself.
+#
+# The contract is between this registry and the function bodies in this file.
+# It is not a public API: there is no ``keys=`` parameter to ``@app.check()``,
+# no ``__emitted_keys__`` convention, no way for user code to register a
+# pattern. A user-registered check has no pattern, so a user check that
+# happens to overlap a default's keys falls back to the post-execution
+# comparison in ``_yield_defaults_superseded_by_the_pipeline`` -- the same
+# path the same-parameter wrapper case has always taken.
+def _camera_frame_stats_keys(episode: Episode) -> set[str]:
+    """Mirror of ``camera_frame_stats``: one set of per-topic keys per camera.
+
+    ``expected_frame_count`` and ``frame_deficit_pct`` only appear when the
+    topic carries at least two messages (the function uses them to compute a
+    frame deficit). Every camera the episode declares contributes the same
+    eight luma/black/freeze keys plus ``message_count`` and, when applicable,
+    the frame-deficit pair; ``camera_instrument`` is the single non-topic
+    key the ffmpeg version stamp produces, and the function only writes it
+    once it has run the instrument over at least one camera -- an episode
+    with no declared cameras does not get the stamp.
+    """
+    keys: set[str] = set()
+    for topic in episode.cameras:
+        keys.add(f"{topic}/message_count")
+        if episode.channel(topic).timestamps.size >= 2:
+            keys.add(f"{topic}/expected_frame_count")
+            keys.add(f"{topic}/frame_deficit_pct")
+        keys.add(f"{topic}/decoded_frame_count")
+        keys.add(f"{topic}/black_frame_pct")
+        keys.add(f"{topic}/overexposed_frame_pct")
+        keys.add(f"{topic}/freeze_total_s")
+        keys.add(f"{topic}/luma_avg_mean")
+        keys.add(f"{topic}/luma_avg_min")
+        keys.add(f"{topic}/luma_avg_max")
+    if episode.cameras:
+        keys.add("camera_instrument")
+    return keys
+
+
+def _timestamp_regularity_keys(episode: Episode) -> set[str]:
+    """Mirror of ``timestamp_regularity``: per-topic period/gap keys plus
+    cross-stream sync offsets when both a camera and a state stream exist.
+    """
+    infos = episode.topics
+    selected = sorted(topic for topic, info in infos.items() if info.message_count >= 2)
+    keys: set[str] = set()
+    for topic in selected:
+        if episode.channel(topic).timestamps.size < 2:
+            keys.add(f"{topic}/period_sample_count")
+            continue
+        keys.add(f"{topic}/median_dt_s")
+        keys.add(f"{topic}/period_violation_pct")
+        keys.add(f"{topic}/max_gap_s")
+    camera_topics = [topic for topic in episode.cameras if topic in selected]
+    state_topics = [
+        topic
+        for topic in selected
+        if topic not in episode.cameras and infos[topic].message_count >= 2
+    ]
+    if camera_topics and state_topics:
+        reference = max(state_topics, key=lambda topic: infos[topic].message_count)
+        for camera in camera_topics:
+            keys.add(f"sync/{camera}~{reference}/start_offset_s")
+            keys.add(f"sync/{camera}~{reference}/end_offset_s")
+    return keys
+
+
+def _episode_duration_keys(_episode: Episode) -> set[str]:
+    """Three fixed keys, independent of which topics the episode carries."""
+    return {"duration_s", "message_count_total", "topic_count"}
+
+
+def _content_digest_keys(_episode: Episode) -> set[str]:
+    return {"content_digest"}
+
+
+def _media_digest_keys(episode: Episode) -> set[str]:
+    keys: set[str] = set()
+    for topic in episode.cameras:
+        keys.add(f"{topic}/media_digest")
+        keys.add(f"{topic}/media_bytes")
+    return keys
+
+
+def _keyframe_interval_keys(episode: Episode) -> set[str]:
+    """Mirror of ``keyframe_interval``: per-camera keys, with
+    ``max_keyframe_gap_s`` and ``median_keyframe_interval_s`` conditional on
+    whether the camera carried at least one (or two) keyframes.
+    """
+    keys: set[str] = set()
+    for topic in episode.cameras:
+        channel = episode.channel(topic)
+        stamps = channel.timestamps
+        keys.add(f"{topic}/scanned_frame_count")
+        if stamps.size == 0:
+            continue
+        keyframe_indices = [
+            index
+            for index, payload in enumerate(channel.raw)
+            if _payload_starts_a_keyframe(payload)
+        ]
+        keys.add(f"{topic}/keyframe_count")
+        keys.add(f"{topic}/first_frame_is_keyframe")
+        if not keyframe_indices:
+            continue
+        if len(keyframe_indices) >= 2:
+            keys.add(f"{topic}/median_keyframe_interval_s")
+        keys.add(f"{topic}/max_keyframe_gap_s")
+    return keys
+
+
+# Internal: maps a default function to its key-set predictor. ``App`` reads
+# this once at default-skip time; the function bodies above and the keys in
+# this dict are kept in lockstep by the drift-guard test in
+# ``tests/test_default_checks.py``.
+_DEFAULT_KEY_PATTERNS: dict[CheckFunction, Callable[[Episode], set[str]]] = {
+    episode_duration: _episode_duration_keys,
+    timestamp_regularity: _timestamp_regularity_keys,
+    camera_frame_stats: _camera_frame_stats_keys,
+    keyframe_interval: _keyframe_interval_keys,
+    content_digest: _content_digest_keys,
+    media_digest: _media_digest_keys,
+}
