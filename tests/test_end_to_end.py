@@ -162,6 +162,20 @@ def test_arrow_export(report_and_app: tuple[hflow.TestReport, hflow.App]) -> Non
     assert "position" in table.column_names
 
 
+def test_channel_exposes_publish_times(
+    report_and_app: tuple[hflow.TestReport, hflow.App],
+) -> None:
+    report, _app = report_and_app
+    with hflow.Episode(report.canonical_path) as episode:
+        channel = episode.channel("/joint_states")
+        publish_times = channel.publish_times
+
+    assert publish_times.shape == (len(channel),)
+    # Same length as the log times they pair with, so the two can be
+    # subtracted to get per-message recording latency.
+    assert publish_times.shape == channel.timestamps.shape
+
+
 def test_failed_critical_verdict_quarantines_and_skips_downstream(
     source_episode: Path, tmp_path: Path
 ) -> None:
