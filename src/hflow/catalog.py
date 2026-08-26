@@ -354,6 +354,15 @@ def _normalized_measurements(
     """
     normalized: dict[str, MeasurementValue] = {}
     for key, value in measurements.items():
+        # Before the value checks: the key is wrong independently of what it
+        # holds, and reporting the value first would send a check author to
+        # fix a NaN only to hit the real problem on the next run.
+        if not key.strip():
+            raise ValueError(
+                f"check {check_name!r} measured {key!r}: measurement keys must "
+                "not be empty or whitespace-only (an empty key becomes a "
+                "wide-view column named after the SQL that made it)"
+            )
         if isinstance(value, np.generic):
             value = value.item()
         if not isinstance(value, MeasurementValue):
@@ -365,12 +374,6 @@ def _normalized_measurements(
             raise ValueError(
                 f"check {check_name!r} measured {key!r} as {value!r}: "
                 "omit the key when a check has no finite value for this episode"
-            )
-        if not key.strip():
-            raise ValueError(
-                f"check {check_name!r} measured {key!r}: measurement keys must "
-                "not be empty or whitespace-only (an empty key becomes a "
-                "wide-view column named after the SQL that made it)"
             )
         normalized[key] = value
     return normalized
