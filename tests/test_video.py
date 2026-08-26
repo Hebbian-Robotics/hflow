@@ -136,7 +136,10 @@ def test_split_rejects_garbage_without_aud() -> None:
 
 def test_ensure_aud_is_lossless_and_idempotent() -> None:
     undelimited_keyframe = b"".join(
-        b"\x00\x00\x00\x01" + bytes([nal_type]) + b"payload" for nal_type in (0x67, 0x68, 0x65)
+        b"\x00\x00\x00\x01"
+        + bytes([nal_type])
+        + (b"\x80payload" if nal_type == 0x65 else b"payload")
+        for nal_type in (0x67, 0x68, 0x65)
     )
 
     repaired = ensure_access_unit_delimiter(undelimited_keyframe)
@@ -147,6 +150,33 @@ def test_ensure_aud_is_lossless_and_idempotent() -> None:
     assert split_annex_b_stream(repaired) == [
         AccessUnit(data=repaired, is_keyframe=True, has_parameter_sets=True)
     ]
+
+
+def test_ensure_aud_accepts_multiple_slices_for_one_picture() -> None:
+    multi_slice_keyframe = b"".join(
+        [
+            b"\x00\x00\x00\x01\x67payload",
+            b"\x00\x00\x00\x01\x68payload",
+            b"\x00\x00\x00\x01\x65\x80first-slice",
+            b"\x00\x00\x00\x01\x65\x40second-slice",
+        ]
+    )
+
+    repaired = ensure_access_unit_delimiter(multi_slice_keyframe)
+
+    assert repaired.endswith(multi_slice_keyframe)
+
+
+def test_ensure_aud_rejects_multiple_pictures_without_auds() -> None:
+    two_pictures = b"".join(
+        [
+            b"\x00\x00\x00\x01\x65\x80first-picture",
+            b"\x00\x00\x00\x01\x41\x80second-picture",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="message contains 2 pictures"):
+        ensure_access_unit_delimiter(two_pictures)
 
 
 def test_ensure_aud_rejects_payload_without_coded_slice_data() -> None:

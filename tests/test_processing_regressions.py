@@ -34,15 +34,18 @@ from hflow.video import estimate_fps_from_log_times
 
 ANNEX_B_START_CODE = b"\x00\x00\x00\x01"
 KEYFRAME_ACCESS_UNIT = b"".join(
-    ANNEX_B_START_CODE + bytes([nal_type]) + b"payload" for nal_type in (0x09, 0x67, 0x68, 0x65)
+    ANNEX_B_START_CODE + bytes([nal_type]) + (b"\x80payload" if nal_type == 0x65 else b"payload")
+    for nal_type in (0x09, 0x67, 0x68, 0x65)
 )
 NON_KEYFRAME_ACCESS_UNIT = b"".join(
-    ANNEX_B_START_CODE + bytes([nal_type]) + b"payload" for nal_type in (0x09, 0x41)
+    ANNEX_B_START_CODE + bytes([nal_type]) + (b"\x80payload" if nal_type == 0x41 else b"payload")
+    for nal_type in (0x09, 0x41)
 )
 KEYFRAME_WITHOUT_AUD = b"".join(
-    ANNEX_B_START_CODE + bytes([nal_type]) + b"payload" for nal_type in (0x67, 0x68, 0x65)
+    ANNEX_B_START_CODE + bytes([nal_type]) + (b"\x80payload" if nal_type == 0x65 else b"payload")
+    for nal_type in (0x67, 0x68, 0x65)
 )
-NON_KEYFRAME_WITHOUT_AUD = ANNEX_B_START_CODE + b"\x41payload"
+NON_KEYFRAME_WITHOUT_AUD = ANNEX_B_START_CODE + b"\x41\x80payload"
 ROS2_COMPRESSED_VIDEO_SCHEMA = "\n".join(
     [
         "builtin_interfaces/Time timestamp",
@@ -242,6 +245,19 @@ def test_transform_still_rejects_undelimited_video_starting_mid_gop(tmp_path: Pa
 
     with pytest.raises(ValueError, match="starts mid-GOP"):
         write_canonical_episode(source, tmp_path / "out.mcap")
+
+
+def test_transform_and_doctor_reject_multiple_pictures_without_auds(tmp_path: Path) -> None:
+    source = tmp_path / "two-pictures-without-auds.mcap"
+    _write_passthrough_video_source(
+        source, [("/cam", 1, KEYFRAME_WITHOUT_AUD + NON_KEYFRAME_WITHOUT_AUD)]
+    )
+
+    with pytest.raises(ValueError, match="message contains 2 pictures"):
+        write_canonical_episode(source, tmp_path / "out.mcap")
+
+    report = diagnose(source)
+    assert "video-multiple-access-units" in {finding.code for finding in report.findings}
 
 
 def test_transform_inserts_missing_aud_into_ros2_video(tmp_path: Path) -> None:

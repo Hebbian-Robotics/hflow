@@ -107,6 +107,23 @@ def _check_video_payload(
         )
         return
     try:
+        picture_count = video_module.count_h264_pictures(payload)
+    except ValueError as error:
+        collector.add(
+            DiagnosticLevel.ERROR,
+            "video-invalid-slice-header",
+            f"{topic} message {message_index}: {error}",
+        )
+        return
+    if picture_count > 1:
+        collector.add(
+            DiagnosticLevel.ERROR,
+            "video-multiple-access-units",
+            f"{topic} message {message_index}: {picture_count} pictures, "
+            "convention requires exactly one decodable frame per message",
+        )
+        return
+    try:
         access_units = video_module.split_annex_b_stream(payload)
     except ValueError as error:
         collector.add(
