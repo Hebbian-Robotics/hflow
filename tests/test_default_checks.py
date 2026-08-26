@@ -1,16 +1,29 @@
 """The baseline every episode gets without anyone registering it."""
 
+from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 
 import hflow
-from hflow._video_measurements import _frame_statistics
+from hflow._video_measurements import (
+    FRAME_STATISTICS_DEFINITION_VERSION,
+    FrameStatisticsProvenance,
+    FrameStatisticsSettings,
+    LumaRangeEvidence,
+    VideoFrameStatistics,
+    _frame_statistics,
+)
 from hflow.checks import (
     _DEFAULT_KEY_PATTERNS,
     DEFAULT_CHECKS,
+    _camera_value,
+    _CameraIntermediates,
     camera_frame_stats,
+    camera_frame_stats_keys,
     episode_duration,
 )
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
@@ -485,3 +498,384 @@ def test_quarantined_episode_still_carries_default_measurements(
     # available alongside the user's own evidence.
     camera = by_name["camera_frame_stats"]
     assert camera.result is not None
+
+
+def _assert_measurements_match_pinned(measurements: dict[str, object], pinned: dict) -> None:
+    """Full-dict comparison for the #182 value fixtures: keys AND values.
+
+    A plain number pins exact equality (counts and the frame-deficit
+    arithmetic are deterministic); a ``(low, high)`` tuple pins an inclusive
+    range for the ffmpeg-rendered quantities whose exact values track the
+    runner's build (the convention ``test_checks.py`` already uses); a
+    callable is an arbitrary predicate. Tight enough that a dispatcher
+    branch reading the wrong field fails here instead of writing a
+    plausible number into the catalog.
+    """
+    assert set(measurements) == set(pinned), sorted(set(measurements) ^ set(pinned))
+    for key, expected in pinned.items():
+        actual = measurements[key]
+        if callable(expected):
+            assert expected(actual), f"{key}: {actual!r} failed its predicate pin"
+        elif isinstance(expected, tuple):
+            low, high = expected
+            assert low <= actual <= high, f"{key}: {actual!r} outside [{low}, {high}]"
+        else:
+            assert actual == pytest.approx(expected), f"{key}: {actual!r} != {expected!r}"
+
+
+def _pinned_camera_measurements(
+    topic: str,
+    *,
+    frames: int,
+    expected_frame_count: int | None = None,
+    frame_deficit_pct: float | None = None,
+    black_frame_pct: tuple[float, float] | float = (0.0, 50.0),
+    overexposed_frame_pct: tuple[float, float] | float = (0.0, 50.0),
+) -> dict[str, object]:
+    """Hand-written expectation for one camera topic, from the fact's
+    docstring -- ground truth independent of both fact and dispatcher.
+
+    ``frame_deficit_pct`` is a hardcoded float literal for the fixture, not
+    a formula restatement: if the dispatcher's arithmetic is wrong, the
+    formula would agree with the bug and the test would pass on a wrong
+    answer. ``black_frame_pct`` and ``overexposed_frame_pct`` accept either
+    a tight range or an exact float so a black<->overexposed swap cannot
+    pass when the fixture has one and not the other.
+    """
+    pinned: dict[str, object] = {
+        f"{topic}/message_count": frames,
+        f"{topic}/decoded_frame_count": frames,
+        f"{topic}/freeze_total_s": 0.0,
+        f"{topic}/black_frame_pct": black_frame_pct,
+        f"{topic}/overexposed_frame_pct": overexposed_frame_pct,
+        f"{topic}/luma_avg_min": (0.0, 255.0),
+        f"{topic}/luma_avg_mean": (0.0, 255.0),
+        f"{topic}/luma_avg_max": (0.0, 255.0),
+    }
+    if expected_frame_count is not None:
+        pinned[f"{topic}/expected_frame_count"] = expected_frame_count
+        assert frame_deficit_pct is not None
+        pinned[f"{topic}/frame_deficit_pct"] = frame_deficit_pct
+    return pinned
+
+
+# ``black_segment=(0.2, 0.5)`` puts a black run inside the 1-second window
+# (the spec's default of (2.0, 3.0) misses it), so ``black_frame_pct`` is
+# non-zero. testsrc2 (the first camera) renders no blown highlights, so
+# ``overexposed_frame_pct`` is exactly 0.0. A black<->overexposed swap
+# would try to satisfy the wrong pin on each side and fail.
+_ONE_CAMERA_PIN = {
+    "frames": 15,
+    "expected_frame_count": 15,
+    # 15 stamps over 1s at 15Hz, expected 15: literal 0.0, NOT the formula.
+    "frame_deficit_pct": 0.0,
+    "black_frame_pct": (30.0, 40.0),  # measured 33.33 in the inside-segment fixture
+    "overexposed_frame_pct": 0.0,  # testsrc2 never blows highlights
+}
+# The second camera renders an inverted smptebars pattern (no black run), so
+# the discriminator goes the other way: a tight range for overexposed, an
+# exact 0.0 for black. Same shape, opposite polarity -- the swap-test logic
+# reads the polarity, not the camera name.
+_OTHER_CAMERA_PIN = {
+    "frames": 15,
+    "expected_frame_count": 15,
+    "frame_deficit_pct": 0.0,
+    "black_frame_pct": 0.0,  # smptebars never produces blackframes
+    "overexposed_frame_pct": (0.0, 5.0),  # smptebars has luma but not blowouts
+}
+_TWO_STAMP_PIN = {
+    "frames": 2,
+    "expected_frame_count": 2,
+    "frame_deficit_pct": 0.0,
+    # A 2-frame, 2-second fixture has no chance to grow black or overexposed
+    # runs; both stay at 0.0. The strict pin catches a swap that lands 0.0
+    # on the wrong side when the wrist_cam fixture above has 33.33 / 0.0.
+    "black_frame_pct": 0.0,
+    "overexposed_frame_pct": 0.0,
+}
+
+
+CAMERA_VALUE_FIXTURE_CASES = [
+    pytest.param(SyntheticEpisodeSpec(duration_s=1.0, cameras=()), {}, id="zero-cameras"),
+    pytest.param(
+        SyntheticEpisodeSpec(duration_s=1.0, cameras=("wrist_cam",), black_segment=(0.2, 0.5)),
+        {"wrist_cam": _ONE_CAMERA_PIN},
+        id="one-camera",
+    ),
+    pytest.param(
+        SyntheticEpisodeSpec(
+            duration_s=1.0, cameras=("wrist_cam", "overhead_cam"), black_segment=(0.2, 0.5)
+        ),
+        {
+            "wrist_cam": _ONE_CAMERA_PIN,
+            "overhead_cam": _OTHER_CAMERA_PIN,
+        },
+        id="two-cameras",
+    ),
+    pytest.param(
+        SyntheticEpisodeSpec(duration_s=2.0, image_hz=1.0, cameras=("wrist_cam",)),
+        {"wrist_cam": _TWO_STAMP_PIN},
+        id="two-stamp-topic",
+    ),
+]
+
+
+@pytest.mark.parametrize(("spec", "camera_pins"), CAMERA_VALUE_FIXTURE_CASES)
+def test_camera_frame_stats_emits_exactly_the_documented_measurements(
+    spec: SyntheticEpisodeSpec, camera_pins: dict[str, dict[str, int]], tmp_path: Path
+) -> None:
+    """The #182 condition: the fixture asserts the full measurement dict,
+    values included, against ground truth written by hand -- so a mismapped
+    dispatcher branch (luma_avg_min reading average_luma_maximum) fails in
+    CI instead of recording a plausible wrong number."""
+    source = synthesize_episode(tmp_path / "value_source.mcap", spec)
+    report = hflow.App("value-fixture", data_root=tmp_path / "data").test(source, verbose=False)
+    run = next(r for r in report.checks if r.check.name == "camera_frame_stats")
+    assert run.result is not None
+
+    pinned: dict[str, object] = {}
+    if camera_pins:
+        pinned["camera_instrument"] = lambda value: (
+            isinstance(value, str) and value.startswith("ffmpeg")
+        )
+        pinned["camera_measurement_definition"] = FRAME_STATISTICS_DEFINITION_VERSION
+
+    from hflow.episode import Episode
+
+    canonical_cameras = Episode(report.canonical_path).cameras
+    topic_by_name = {
+        name: next(topic for topic in canonical_cameras if name in topic) for name in camera_pins
+    }
+    for name, fixture in camera_pins.items():
+        pinned.update(_pinned_camera_measurements(topic_by_name[name], **fixture))
+
+    _assert_measurements_match_pinned(dict(run.result.measurements), pinned)
+
+    if not camera_pins:
+        # Zero cameras emits nothing at all, intervals included: every write,
+        # even the bare instrument keys, lives inside the per-topic selection.
+        assert run.result.intervals == []
+
+    for name in camera_pins:
+        topic = topic_by_name[name]
+        minimum = float(run.result.measurements[f"{topic}/luma_avg_min"])
+        mean = float(run.result.measurements[f"{topic}/luma_avg_mean"])
+        maximum = float(run.result.measurements[f"{topic}/luma_avg_max"])
+        if "wrist_cam" in topic:
+            # testsrc2 changes every frame, so the statistics are strictly
+            # ordered and a swapped dispatcher branch cannot satisfy this.
+            assert minimum < mean < maximum
+        else:
+            # smptebars renders one still pattern: per-frame luma differs only
+            # by encoder noise, far tighter than a field mismap could hide.
+            assert maximum - minimum < 0.5
+
+
+def test_a_single_stamp_camera_topic_errors_before_any_measurement(
+    tmp_path: Path,
+) -> None:
+    """Pre-existing upstream contract, pinned so the refactor cannot be
+    blamed for it: ``Episode.video`` needs at least two timestamps to infer
+    a frame rate, so a one-stamp camera errors before any measurement
+    exists. What the refactor owns is the fact's prediction for such a
+    topic -- no rate pair -- which is what the supersession gate consults."""
+    source = synthesize_episode(
+        tmp_path / "sparse_source.mcap",
+        SyntheticEpisodeSpec(duration_s=1.0, image_hz=1.0, cameras=("wrist_cam",)),
+    )
+    report = hflow.App("single-stamp", data_root=tmp_path / "data").test(source, verbose=False)
+    run = next(r for r in report.checks if r.check.name == "camera_frame_stats")
+    assert run.result is None
+    assert "at least 2" in (run.error or "")
+
+    from hflow.episode import Episode
+
+    topic = Episode(report.canonical_path).cameras[0]
+    assert camera_frame_stats_keys(Episode(report.canonical_path), cameras=[topic]) == {
+        f"{topic}/message_count",
+        f"{topic}/decoded_frame_count",
+        f"{topic}/black_frame_pct",
+        f"{topic}/overexposed_frame_pct",
+        f"{topic}/freeze_total_s",
+        f"{topic}/luma_avg_mean",
+        f"{topic}/luma_avg_min",
+        f"{topic}/luma_avg_max",
+        "camera_instrument",
+        "camera_measurement_definition",
+    }
+
+
+def test_the_body_emits_what_the_fact_names_even_when_the_fact_withdraws_one(
+    camera_source: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Delegation guard for #182: the body must walk the fact's output. If
+    withdrawing one named key does not withdraw it from the emitted
+    measurements, the body is carrying its own key list again and the
+    refactor is void."""
+    real_fact = hflow.checks.camera_frame_stats_keys
+
+    def poisoned(episode: hflow.Episode, *, cameras: Sequence[str] | None = None) -> set[str]:
+        selected = list(cameras) if cameras is not None else episode.cameras
+        return real_fact(episode, cameras=cameras) - {f"{selected[0]}/black_frame_pct"}
+
+    monkeypatch.setattr(hflow.checks, "camera_frame_stats_keys", poisoned)
+
+    report = hflow.App("poison", data_root=tmp_path / "data").test(camera_source, verbose=False)
+    run = next(r for r in report.checks if r.check.name == "camera_frame_stats")
+    assert run.result is not None
+
+    from hflow.episode import Episode
+
+    topic = Episode(report.canonical_path).cameras[0]
+    assert set(run.result.measurements) == {
+        f"{topic}/message_count",
+        f"{topic}/expected_frame_count",
+        f"{topic}/frame_deficit_pct",
+        f"{topic}/decoded_frame_count",
+        f"{topic}/overexposed_frame_pct",
+        f"{topic}/freeze_total_s",
+        f"{topic}/luma_avg_mean",
+        f"{topic}/luma_avg_min",
+        f"{topic}/luma_avg_max",
+        "camera_instrument",
+        "camera_measurement_definition",
+    }
+
+
+def test_a_key_nobody_branches_on_raises_instead_of_appending_null(
+    camera_source: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dispatcher's explicit failure: match-with-no-branch returning None
+    would surface only as a null measurement under record=True (#182). A key
+    the fact names and the dispatcher forgot must raise where it happens."""
+    real_fact = hflow.checks.camera_frame_stats_keys
+
+    def haunted(episode: hflow.Episode, *, cameras: Sequence[str] | None = None) -> set[str]:
+        return real_fact(episode, cameras=cameras) | {"ghost/mystery"}
+
+    monkeypatch.setattr(hflow.checks, "camera_frame_stats_keys", haunted)
+
+    report = hflow.App("unknown-key", data_root=tmp_path / "data").test(
+        camera_source, verbose=False
+    )
+    run = next(r for r in report.checks if r.check.name == "camera_frame_stats")
+    assert run.result is None
+    assert run.error is not None
+    assert "no branch" in run.error
+
+
+def test_a_bare_key_nobody_branches_on_raises_too() -> None:
+    with pytest.raises(ValueError, match="no branch"):
+        _camera_value("not_a_camera_thing", {})
+
+
+def test_declared_expected_hz_wins_and_median_delta_fills_in(tmp_path: Path) -> None:
+    """The precedence the intermediates copy verbatim: the parameter wins per
+    topic; the median inter-message delta is the only fallback; two-way, no
+    metadata step in the chain."""
+    source = synthesize_episode(
+        tmp_path / "hz_source.mcap",
+        SyntheticEpisodeSpec(duration_s=1.0, cameras=("wrist_cam",)),
+    )
+
+    from hflow.episode import Episode
+
+    baseline_report = hflow.App("hz-fallback", data_root=tmp_path / "data-a").test(
+        source, verbose=False
+    )
+
+    # Parameters ride a wrapper -- the documented way to configure a built-in.
+    # Its emitted keys overlap the default's, so the default stands down and
+    # the wrapper's own run carries the declared-hz measurements.
+    declared_app = hflow.App("hz-declared", data_root=tmp_path / "data-b")
+
+    @declared_app.check(version="1")
+    def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.checks.camera_frame_stats(ep, expected_hz=dict.fromkeys(ep.cameras, 30.0))
+
+    declared_report = declared_app.test(source, verbose=False)
+
+    baseline_run = next(r for r in baseline_report.checks if r.check.name == "camera_frame_stats")
+    declared_run = next(r for r in declared_report.checks if r.check.name == "camera_health")
+    assert baseline_run.result is not None
+    assert declared_run.result is not None
+
+    topic = Episode(baseline_report.canonical_path).cameras[0]
+    # 15 stamps at exactly one fifteenth of a second: the median delta rate
+    # reproduces exactly 15 frames over the observed span, deficit zero.
+    assert baseline_run.result.measurements[f"{topic}/expected_frame_count"] == 15
+    assert baseline_run.result.measurements[f"{topic}/frame_deficit_pct"] == pytest.approx(0.0)
+    # Declaring 30 Hz doubles the expectation over the same span:
+    # round((14/15) * 30) + 1 == 29, and 15 delivered frames miss by that much.
+    assert declared_run.result.measurements[f"{topic}/expected_frame_count"] == 29
+    assert declared_run.result.measurements[f"{topic}/frame_deficit_pct"] == pytest.approx(
+        100.0 * (29 - 15) / 29
+    )
+
+
+def test_dispatcher_message_count_and_decoded_frame_count_read_distinct_sources() -> None:
+    """The two branches are sourced from different fields: the channel
+    stamp array (one entry per MCAP message) and the ffmpeg filter graph's
+    decoded frame count (one per MP4 frame). A branch swap that reads
+    ``inter.stamps_ns.size`` for ``decoded_frame_count`` -- or vice versa
+    -- produces a plausible number and cannot crash; this is the unit-level
+    guard for that failure class, no App, no video, no ffmpeg.
+
+    The integration fixtures (above) hold the two equal at 15 by
+    construction (one access unit per message), which is why this
+    dispatcher-level test is the load-bearing one for the swap case.
+    """
+
+    # ``VideoFrameStatistics`` is a frozen dataclass with 28 required fields.
+    # Build a real instance with zeros for the fields the dispatcher does
+    # NOT read, then ``dataclasses.replace`` the one the test pins. Only
+    # the ``decoded_frame_count`` branch reads ``stats.decoded_frame_count``;
+    # the dispatcher never touches the rest in this test, so zero defaults
+    # do not contaminate the assertion.
+    stub_provenance = FrameStatisticsProvenance(
+        measurement_definition_version="video-frame-statistics/v1",
+        ffmpeg_version="unit-test-stub",
+        filter_graph="stub",
+        settings=FrameStatisticsSettings(),
+    )
+    base_stats = VideoFrameStatistics(
+        decoded_frame_count=0,
+        duration_seconds=0.0,
+        black_frame_count=0,
+        black_frame_percent=0.0,
+        overexposed_frame_count=0,
+        overexposed_frame_percent=0.0,
+        freeze_intervals=(),
+        freeze_total_seconds=0.0,
+        average_luma_mean=0.0,
+        average_luma_minimum=0.0,
+        average_luma_maximum=0.0,
+        black_pixel_share_mean=0.0,
+        black_pixel_share_maximum=0.0,
+        minimum_luma=0.0,
+        maximum_luma=0.0,
+        luma_range_evidence=LumaRangeEvidence.NOMINAL_LIMITED_RANGE_COMPATIBLE,
+        tenth_percentile_luma_mean=0.0,
+        ninetieth_percentile_luma_mean=0.0,
+        clipped_highlight_frame_percent=0.0,
+        crushed_shadow_frame_percent=0.0,
+        frame_difference_mean=0.0,
+        frame_difference_maximum=0.0,
+        temporal_outlier_mean=0.0,
+        temporal_outlier_maximum=0.0,
+        out_of_legal_range_mean=0.0,
+        out_of_legal_range_maximum=0.0,
+        provenance=stub_provenance,
+    )
+    stats = replace(base_stats, decoded_frame_count=15)
+    inter = _CameraIntermediates(
+        stamps_ns=np.arange(13),
+        stats=stats,
+        expected_frame_count=None,
+    )
+    by_topic = {"/cam0": inter}
+
+    assert _camera_value("/cam0/message_count", by_topic) == 13
+    assert _camera_value("/cam0/decoded_frame_count", by_topic) == 15
+    # A swap that returns 15 for message_count -- or 13 for decoded_frame_count
+    # -- would have to break both asserts, not just one.
