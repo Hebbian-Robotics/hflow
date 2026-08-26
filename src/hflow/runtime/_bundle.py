@@ -81,6 +81,7 @@ from hflow.runtime._templates import (
     EXTERNAL_PYTHON_BOOTSTRAP_REQUIREMENT,
     MASTER_DAG_TEMPLATE,
     MEDIA_PLAN_FILTER_TEMPLATE,
+    OUTSTANDING_PLAN_FILTER_TEMPLATE,
     SUB_DAG_ERROR_GATE_TEMPLATE,
     SUB_DAG_QUARANTINE_GATE_TEMPLATE,
 )
@@ -673,15 +674,30 @@ def render_sub_dag_source(
     # source; neutralize that one sequence for the prose slot.
     venv_python_documentation_text = venv_python_literal.replace('"""', '\\"\\"\\"')
     # Substituted separately because Template.substitute never re-expands
-    # variables inside substituted VALUES -- the filter's own $data_root must
-    # be resolved before injection. Local roots only: probing a BUCKET
-    # episode's channel list would download the whole file at plan time,
-    # costing more than the skipped camera-less cycle saves.
-    stage_plan_filter = (
-        MEDIA_PLAN_FILTER_TEMPLATE.substitute(data_root=data_root_literal)
-        if stage is Stage.MEDIA and not is_bucket_url(data_root)
-        else ""
-    )
+    # variables inside substituted VALUES -- a filter's own $data_root must be
+    # resolved before injection.
+    #
+    # The outstanding filter runs on every stage but sync, bucket roots
+    # included: it queries the catalog and never opens an episode, so the
+    # media filter's reason for skipping buckets does not transfer. It comes
+    # first, so the media probe only opens files that are going to be
+    # processed.
+    plan_filters = []
+    if stage is not Stage.SYNC:
+        plan_filters.append(
+            OUTSTANDING_PLAN_FILTER_TEMPLATE.substitute(
+                data_root=data_root_literal,
+                pipeline_filename=pipeline_filename_literal,
+                app_variable=app_variable,
+                stage_name=stage.value,
+            )
+        )
+    # Local roots only: probing a BUCKET episode's channel list would download
+    # the whole file at plan time, costing more than the skipped camera-less
+    # cycle saves.
+    if stage is Stage.MEDIA and not is_bucket_url(data_root):
+        plan_filters.append(MEDIA_PLAN_FILTER_TEMPLATE.substitute(data_root=data_root_literal))
+    stage_plan_filter = "".join(plan_filters)
     return template.substitute(
         dag_id=sub_dag_id,
         master_dag_id=master_dag_id,

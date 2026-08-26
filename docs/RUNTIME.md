@@ -63,10 +63,15 @@ step whose rows still say it ran -- a cleaned `media/` directory keeps its
 hflow ingest --all-stages episodes-in/*.mcap
 ```
 
-This applies to the in-process executor only. The Airflow lane runs the whole
-profile on every episode it is handed, because a stage set that varies per
-episode is not something a trigger conf can express without re-rendering every
-bundle.
+The Airflow lane plans too, and asks the same question in the same place. Each
+stage sub-DAG filters its own `uris` at plan time, after the sync sub-DAG has
+finished, so it reads the catalog state the in-process plan would read. A stage
+left with nothing outstanding skips rather than reporting a hollow success.
+
+`--all-stages` has a counterpart there: pass `all_stages: true` in the trigger
+conf and every stage runs over everything it was handed, whatever the catalog
+says. The master passes it down to every sub-DAG it triggers, and a directly
+triggered sub-DAG takes it in its own conf.
 
 ## Prerequisites
 

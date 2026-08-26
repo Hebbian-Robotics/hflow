@@ -53,9 +53,13 @@ class StageSelection(StrEnum):
 
     A run's own vocabulary rather than a flag, because the two modes are
     genuinely different requests and a caller should have to name which one it
-    means. It is deliberately NOT conf vocabulary like :class:`hflow.steps.Stage`
-    -- the planner is direct-executor only (see :func:`plan_outstanding_stages`),
-    so nothing crosses into a rendered DAG.
+    means. It stays a direct-run type even though the scheduled lane now plans
+    too: what crosses the conf boundary there is one boolean per sub-DAG run
+    (``all_stages``), not a selection between named modes, and widening this
+    enum into conf vocabulary would oblige every rendered bundle to be
+    re-rendered whenever a member was added. :func:`outstanding_stage_uris` is
+    the scheduled lane's entry point and takes no selection at all -- the
+    caller decides whether to ask.
     """
 
     # Per episode, run only the stages whose steps the catalog does not already
@@ -267,3 +271,65 @@ def plan_outstanding_stages(
             outstanding_steps=tuple(sorted(outstanding_steps)),
         )
     return plans
+
+
+def outstanding_stage_uris(
+    application: "App",
+    uris: Sequence[str],
+    stage: Stage,
+    *,
+    data_root: str,
+) -> list[str]:
+    """Which of ``uris`` still owe ``stage`` work, in the order given.
+
+    The same question :func:`plan_outstanding_stages` answers for a direct
+    run, asked for one stage and answered in the caller's own vocabulary:
+    conf ``uris`` are data-root-relative strings, and the catalog files rows
+    under ``source_uri``. Translating between the two is the whole reason this
+    is not a bare call at the call site -- computing the identity a second way
+    is how a planner ends up querying for rows filed under another name, which
+    reads as "everything is outstanding" and quietly does nothing.
+
+    **Call this only after ``sync`` has completed for the same recordings**,
+    for the reason in the module docstring: before then the catalog names the
+    PREVIOUS generation. The scheduled lane satisfies that by running inside a
+    stage sub-DAG, which the master triggers after the sync sub-DAG finished.
+    Triggering a stage sub-DAG directly, without a sync pass over recordings
+    whose bytes changed, is the one case where this reads a stale id -- the
+    same exposure the direct executor has, and what the escape hatch is for.
+
+    ``Stage.SYNC`` is refused rather than answered. It records no step rows and
+    is its own cache, so "outstanding" is not a question the catalog can answer
+    about it, and an empty answer would filter away the stage that produces the
+    canonical file every later stage reads.
+
+    A recording with no episode in the catalog is KEPT, which is the one place
+    this deliberately differs from :func:`plan_outstanding_stages`. That
+    function drops it, and can, because the direct executor ran sync in the
+    same invocation and therefore knows a missing row means sync failed. A
+    stage sub-DAG knows no such thing: a directly triggered ``meta`` pass over
+    a corpus that was never synced looks identical from the catalog, and
+    dropping it would turn the loud ``FileNotFoundError`` that ``hflow ingest
+    --profile metadata_backfill`` raises today into a silent skip. Filtering
+    exists to stop paying for work that is already done, not to suppress
+    failures, so a recording the catalog cannot vouch for is handed on and
+    fails exactly as it does now.
+    """
+    if stage is Stage.SYNC:
+        message = "sync records no steps and is never planned away; it cannot be filtered"
+        raise ValueError(message)
+    if not uris:
+        return []
+    from hflow.stage_execution import resolve_episode_reference
+
+    identity_by_uri = {
+        uri: application.source_identity(resolve_episode_reference(data_root, str(uri)))
+        for uri in uris
+    }
+    plans = plan_outstanding_stages(application, list(identity_by_uri.values()), (stage,))
+    return [
+        uri
+        for uri in uris
+        if not isinstance(plan := plans.get(identity_by_uri[uri]), OutstandingStages)
+        or stage in plan.stages
+    ]

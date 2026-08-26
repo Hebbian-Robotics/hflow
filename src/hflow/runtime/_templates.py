@@ -301,7 +301,8 @@ enabled stage set, then trigger only those sub-DAGs, chained sequentially
 -- no user venv, no hflow import.
 
 Trigger conf: {"uris": [...], "profile": "full", "mode": "batch"|"online",
-"batch_count": optional int}. "uris"/"mode"/"batch_count" pass through to
+"batch_count": optional int, "all_stages": optional bool}.
+"uris"/"mode"/"batch_count"/"all_stages" pass through to
 every triggered sub-DAG; mode "online" is the latency-first lane (one run per
 episode as it lands): each sub-DAG processes the conf's uris as one immediate
 batch, no bin-packing, no stagger.
@@ -354,7 +355,9 @@ $profile_table_rows
 **Trigger conf** -- `uris`: episode files relative to the data root;
 `profile`: a row above (default `full`); `mode`: `batch` bin-packs uris into
 staggered near-equal-byte shards, `online` is the latency-first lane (one
-immediate run, no batching, no stagger); `batch_count`: optional override.
+immediate run, no batching, no stagger); `batch_count`: optional override;
+`all_stages`: run every stage over everything it is handed instead of only
+what the catalog does not already record as current.
 
 Each sub-DAG (`$sync_dag_id`, `$meta_dag_id`, `$labels_dag_id`,
 `$media_dag_id`) is also directly triggerable with the same conf for
@@ -370,7 +373,13 @@ per-stage reruns -- e.g. a re-label pass over already-canonical episodes.
     tags=["$pipeline_tag", "master"],
     schedule=None,
     render_template_as_native_obj=True,
-    params={"uris": [], "profile": "full", "mode": "batch", "batch_count": None},
+    params={
+        "uris": [],
+        "profile": "full",
+        "mode": "batch",
+        "batch_count": None,
+        "all_stages": False,
+    },
 )
 def master_ingest():
     @task
@@ -421,6 +430,7 @@ def master_ingest():
                 "uris": "{{ params.uris }}",
                 "mode": "{{ params.mode }}",
                 "batch_count": "{{ params.batch_count }}",
+                "all_stages": "{{ params.all_stages }}",
             },
             wait_for_completion=True,
             deferrable=True,
@@ -463,7 +473,7 @@ plan -> process_batch (dynamically mapped) -> $gate_name, all via
 never meet Airflow's pins). Imports live inside the function bodies because
 the operator extracts each body to a temp file; only JSON-able data crosses
 task borders. Trigger conf: {"uris": [...], "mode": "batch"|"online",
-"batch_count": optional int}.
+"batch_count": optional int, "all_stages": optional bool}.
 """
 
 from airflow.sdk import dag, task
@@ -481,7 +491,8 @@ user dependencies never meet Airflow's pins.
 
 **Trigger conf** -- `uris`: episode files relative to the data root;
 `mode`: `batch` (bin-packed, staggered shards) or `online` (one immediate
-latency-first run); `batch_count`: optional override.
+latency-first run); `batch_count`: optional override; `all_stages`: run every
+uri handed over instead of only the ones this stage still owes work on.
 """
 
 
@@ -493,20 +504,33 @@ latency-first run); `batch_count`: optional override.
     tags=["$pipeline_tag", "stage:$stage_name"],
     schedule=None,
     render_template_as_native_obj=True,
-    params={"uris": [], "mode": "batch", "batch_count": None},
+    params={"uris": [], "mode": "batch", "batch_count": None, "all_stages": False},
 )
 def ingest_stage():
     @task.external_python(python=$venv_python, expect_airflow=False, skip_on_exit_code=99$task_queue_argument)
-    def plan(uris, mode, batch_count):
-        """Bin-pack uris into staggered batches; online is one immediate batch.
+    def plan(uris, mode, batch_count, all_stages):
+        """Narrow uris to what this stage still owes, then bin-pack them.
 
         The lane semantics live in hflow.stage_execution (one owner for every
-        execution backend); this task only feeds it the trigger conf.
+        execution backend); this task only feeds it the trigger conf. Any
+        narrowing happens first, so the bin-packer only ever sees work that
+        is going to run.
+
+        all_stages is the conf escape hatch: true runs every uri handed over,
+        whatever the catalog already records. It is the scheduled counterpart
+        of `hflow ingest --all-stages`, and exists for the one thing the
+        catalog cannot see -- an artifact deleted out from under a step whose
+        rows still say it ran.
         """
         from hflow.stage_execution import plan_stage_batches
 
         if not uris:
             return []
+        # Conf values arrive rendered; a native bool passes straight through
+        # and a hand-typed string is read the way every other flag in the
+        # project reads one.
+        if isinstance(all_stages, str):
+            all_stages = all_stages.strip().lower() in {"1", "true", "yes", "on"}
 $stage_plan_filter        return plan_stage_batches(
             [str(uri) for uri in uris],
             mode=mode,
@@ -587,6 +611,7 @@ _SUB_DAG_FOOTER = """\
         uris="{{ params.uris }}",
         mode="{{ params.mode }}",
         batch_count="{{ params.batch_count }}",
+        all_stages="{{ params.all_stages }}",
     )
     # partial() binds the run id once for every mapped instance: it is the
     # same value for the whole fan-out, and only expand()'s argument varies.
@@ -645,5 +670,61 @@ MEDIA_PLAN_FILTER_TEMPLATE = Template(
         uris = [uri for uri in uris if has_camera(uri)]
         if not uris:
             raise SystemExit(99)  # skip_on_exit_code: whole stage SKIPPED
+"""
+)
+
+
+# Injected into every stage sub-DAG's plan EXCEPT sync's (sync records no
+# steps and is its own cache, so it is never planned away). Asks the catalog
+# which of this run's uris still owe this stage work at the steps' current
+# versions, and drops the rest -- the same question `hflow ingest` asks
+# in-process, in the same place relative to sync, so the two lanes cost the
+# same for the same command.
+#
+# Placed BEFORE the media filter when a stage has both: this one is a catalog
+# query, the media one opens episodes, and narrowing first means fewer files
+# to open.
+#
+# Loading the user pipeline here is what the question costs. plan already runs
+# in the user venv (@task.external_python), and these are the same three
+# helpers process_batch calls, so nothing new is introduced -- but a pipeline
+# that will not import now fails at plan rather than at process_batch, which
+# is earlier and cheaper to read.
+#
+# When nothing is left the plan exits 99, which skip_on_exit_code turns into a
+# SKIPPED task (the UI shows a stage that had nothing to do, not a hollow
+# success); downstream tasks skip with it.
+OUTSTANDING_PLAN_FILTER_TEMPLATE = Template(
+    """\
+        if not all_stages:
+            import os
+
+            from hflow.app import DATA_ROOT_ENVIRONMENT_VARIABLE
+            from hflow.stage_execution import (
+                load_pipeline_application,
+                require_application_data_root,
+                resolve_user_pipeline_path,
+            )
+            from hflow.stage_planning import outstanding_stage_uris
+            from hflow.steps import Stage
+
+            expected_data_root = $data_root
+            # Same guard process_batch applies: an environment-portable
+            # pipeline resolves its root from this variable, and one that
+            # hardcodes a different literal is refused rather than planned
+            # against the wrong catalog.
+            os.environ[DATA_ROOT_ENVIRONMENT_VARIABLE] = expected_data_root
+            planning_app = load_pipeline_application(
+                resolve_user_pipeline_path($pipeline_filename), "$app_variable"
+            )
+            require_application_data_root(planning_app, expected_data_root)
+            uris = outstanding_stage_uris(
+                planning_app,
+                [str(uri) for uri in uris],
+                Stage("$stage_name"),
+                data_root=expected_data_root,
+            )
+            if not uris:
+                raise SystemExit(99)  # skip_on_exit_code: whole stage SKIPPED
 """
 )

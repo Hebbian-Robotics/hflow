@@ -382,9 +382,14 @@ def test_master_dag_source_compiles_and_encodes_contract(
 
     assert 'dag_id="my_pipeline_ingest"' in dag_source
     assert "schedule=None" in dag_source
-    assert (
-        'params={"uris": [], "profile": "full", "mode": "batch", "batch_count": None}' in dag_source
-    )
+    assert '"uris": [],' in dag_source
+    assert '"profile": "full",' in dag_source
+    assert '"batch_count": None,' in dag_source
+    # The escape hatch is conf vocabulary on the master too, and it is passed
+    # down: a sub-DAG the master triggered must not plan work away when the
+    # operator asked for every stage.
+    assert '"all_stages": False,' in dag_source
+    assert '"all_stages": "{{ params.all_stages }}",' in dag_source
     # The master runs ENTIRELY in Airflow's environment: no user venv, no
     # hflow import -- the profile vocabulary is baked in as a literal.
     assert "external_python" not in dag_source
@@ -436,7 +441,10 @@ def test_sub_dag_sources_compile_and_encode_contract(config: RuntimeConfig, tmp_
 
         assert f'dag_id="my_pipeline_{stage.value}"' in dag_source
         assert "schedule=None" in dag_source
-        assert 'params={"uris": [], "mode": "batch", "batch_count": None}' in dag_source
+        assert (
+            'params={"uris": [], "mode": "batch", "batch_count": None, "all_stages": False}'
+            in dag_source
+        )
         # All three tasks run in the user venv via external python.
         assert dag_source.count("@task.external_python(python='/opt/venvs/user/bin/python'") == 3
         # Imports live inside the (indented) function bodies -- the operator
@@ -994,3 +1002,81 @@ def test_requirements_directory_says_is_a_directory(config: RuntimeConfig, tmp_p
     assert excinfo.value.errno == errno.EISDIR
     assert excinfo.value.filename == str(a_directory)
     assert "Is a directory" in str(excinfo.value)
+
+
+class TestScheduledStagePlanning:
+    """The plan-time filter that makes a scheduled re-ingest cost what a direct
+    one costs.
+
+    The predicate itself is covered by tests/test_stage_planning.py, which runs
+    it. What can only be checked here is the wiring: which sub-DAGs carry it,
+    which stage name each one asks about, and that the conf escape hatch
+    reaches it.
+    """
+
+    @staticmethod
+    def _sub_dag_sources(config: RuntimeConfig, bundle_dir: Path) -> dict[str, str]:
+        paths = render_bundle(config, bundle_dir)
+        return {
+            sub_dag_file.stem.removeprefix("ingest_"): sub_dag_file.read_text()
+            for sub_dag_file in paths.sub_dag_files
+        }
+
+    def test_every_stage_but_sync_filters_its_own_uris(
+        self, config: RuntimeConfig, tmp_path: Path
+    ) -> None:
+        sources = self._sub_dag_sources(config, tmp_path / "bundle")
+
+        # Sync is its own cache and records no steps, so it is never planned
+        # away -- filtering it would drop the stage that produces the canonical
+        # file every later stage reads.
+        assert "outstanding_stage_uris" not in sources["sync"]
+        for stage_name in ("meta", "labels", "media"):
+            source = sources[stage_name]
+            assert "outstanding_stage_uris" in source
+            # Each sub-DAG asks about ITS OWN stage. Asking about another one
+            # would filter on work that stage never records.
+            assert f'Stage("{stage_name}")' in source
+            # Ahead of plan_stage_batches: the bin-packer should only ever see
+            # work that is going to run.
+            assert source.index("outstanding_stage_uris") < source.index("plan_stage_batches(")
+            # Nothing outstanding is a SKIPPED stage, not a hollow success.
+            assert "raise SystemExit(99)" in source
+
+    def test_the_filter_precedes_the_camera_probe(
+        self, config: RuntimeConfig, tmp_path: Path
+    ) -> None:
+        """Media carries both. The catalog query is cheaper than opening
+        episodes, so narrowing first means fewer files opened for nothing."""
+        media_source = self._sub_dag_sources(config, tmp_path / "bundle")["media"]
+
+        assert media_source.index("outstanding_stage_uris") < media_source.index("has_camera")
+
+    def test_a_bucket_root_keeps_the_filter(self, config: RuntimeConfig, tmp_path: Path) -> None:
+        """The media probe is omitted on buckets because reading an episode's
+        channel list downloads the whole file. This one never opens an episode:
+        it syncs catalog parquet through the mirror, so the reason does not
+        transfer and a bucket deployment gets the saving too."""
+        from dataclasses import replace
+
+        sources = self._sub_dag_sources(
+            replace(config, data_root="gs://bucket/robot-data"), tmp_path / "bucket-bundle"
+        )
+
+        assert "has_camera" not in sources["media"]
+        for stage_name in ("meta", "labels", "media"):
+            assert "outstanding_stage_uris" in sources[stage_name]
+
+    def test_the_escape_hatch_reaches_the_filter(
+        self, config: RuntimeConfig, tmp_path: Path
+    ) -> None:
+        """`--all-stages` has no meaning to a DAG, so the scheduled lane needs
+        its own vocabulary for it. Without the conf reaching the filter there
+        would be no way to re-run a stage whose artifacts were deleted out from
+        under rows that still say it ran."""
+        sources = self._sub_dag_sources(config, tmp_path / "bundle")
+
+        for stage_name in ("meta", "labels", "media"):
+            source = sources[stage_name]
+            assert "if not all_stages:" in source
+            assert 'all_stages="{{ params.all_stages }}"' in source

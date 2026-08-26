@@ -7,7 +7,9 @@ which is about ordering: it exists because a planner that ran before `sync`
 instead of after it would pass every other test in this file.
 """
 
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -421,3 +423,182 @@ class TestMediaPlanning:
         second = _ingest(project)
 
         assert _stage(second, hflow.Stage.MEDIA).skipped_as_current == 0
+
+
+class TestFilteringAScheduledStagesUris:
+    """The scheduled lane asks the same question, in conf vocabulary.
+
+    ``outstanding_stage_uris`` is what a rendered stage sub-DAG calls at plan
+    time. It takes the data-root-relative strings a trigger conf carries and
+    answers with the subset of them that stage still owes work on, so these
+    tests pin the translation as much as the planning: a conf uri that does not
+    reduce to the identity the catalog filed under reads as "everything is
+    outstanding" and quietly costs a full re-run.
+    """
+
+    @staticmethod
+    def _application(project: Path) -> hflow.App:
+        return hflow.import_pipeline_application(str(project / "pipeline.py"))
+
+    @staticmethod
+    def _filter(project: Path, stage: hflow.Stage, *uris: str) -> list[str]:
+        from hflow.stage_planning import outstanding_stage_uris
+
+        application = TestFilteringAScheduledStagesUris._application(project)
+        return outstanding_stage_uris(
+            application,
+            list(uris) or [EPISODE_URI],
+            stage,
+            data_root=str(project / "data"),
+        )
+
+    def test_an_unchanged_corpus_leaves_the_stage_nothing_to_do(self, project: Path) -> None:
+        """The whole point of the issue: the scheduled lane stops paying for a
+        decode pass the catalog already records."""
+        _ingest(project)
+
+        assert self._filter(project, hflow.Stage.META) == []
+
+    def test_a_synced_but_unchecked_recording_is_still_owed(self, project: Path) -> None:
+        """Sync alone leaves meta outstanding, which is the case the filter has
+        to keep: dropping it would silently never run the checks."""
+        application = self._application(project)
+        run_stages_directly(application, [EPISODE_URI], frozenset({hflow.Stage.SYNC}))
+
+        assert self._filter(project, hflow.Stage.META) == [EPISODE_URI]
+
+    def test_a_check_added_afterwards_makes_it_outstanding_again(self, project: Path) -> None:
+        _ingest(project)
+        (project / "pipeline.py").write_text(
+            PIPELINE_SOURCE
+            + """
+
+@app.check(version="1")
+def added_later(ep: hflow.Episode) -> hflow.CheckResult:
+    return hflow.CheckResult(evidence={})
+"""
+        )
+
+        assert self._filter(project, hflow.Stage.META) == [EPISODE_URI]
+
+    def test_a_recording_the_catalog_cannot_vouch_for_is_handed_on(self, project: Path) -> None:
+        """The one place this differs from the direct planner, which drops such
+        a recording because it ran sync itself and so knows the row is missing
+        because sync failed. A stage sub-DAG cannot tell that apart from a
+        corpus nobody has synced yet, and dropping it would turn the loud
+        FileNotFoundError that a meta-only run raises today into a silent skip.
+        Filtering is here to stop paying for finished work, not to swallow
+        failures."""
+        _ingest(project)
+        (project / "data" / "episodes-in" / "unreadable.mcap").write_bytes(b"not an mcap")
+
+        assert self._filter(
+            project, hflow.Stage.META, EPISODE_URI, "episodes-in/unreadable.mcap"
+        ) == ["episodes-in/unreadable.mcap"]
+
+    def test_the_conf_spelling_reaches_the_rows_the_catalog_filed(self, project: Path) -> None:
+        """A conf uri is relative to the DATA ROOT, not to the working
+        directory, and the two differ in every deployment: a task process runs
+        wherever the operator put it. Resolving the wrong one queries for rows
+        filed under another name, which reads as "outstanding" for a corpus
+        that is entirely up to date."""
+        _ingest(project)
+        elsewhere = project / "not-the-data-root"
+        elsewhere.mkdir()
+
+        with pytest.MonkeyPatch.context() as patched:
+            patched.chdir(elsewhere)
+
+            assert self._filter(project, hflow.Stage.META) == []
+
+    def test_sync_is_refused_rather_than_answered(self, project: Path) -> None:
+        """Sync records no steps and is its own cache, so an empty answer would
+        filter away the stage that produces the file every later stage reads."""
+        with pytest.raises(ValueError, match="never planned away"):
+            self._filter(project, hflow.Stage.SYNC)
+
+
+# What a rendered `plan` task is once its Airflow decorator is stripped: conf
+# values in, JSON-able batches out.
+RenderedPlan = Callable[[list[str], str, int | None, bool | str], list[dict[str, Any]]]
+
+
+class TestTheRenderedPlanTask:
+    """The filter as a stage sub-DAG actually runs it.
+
+    Everything above calls ``outstanding_stage_uris`` directly. What that
+    cannot catch is the injected snippet being wrong: it reaches the bundle as
+    a string, so a bad name or a missed substitution compiles and only fails
+    when a task runs, which needs Airflow and Docker. Extracting the rendered
+    ``plan`` body and calling it closes that gap without either, because the
+    body's whole contract is that it runs under plain CPython in the user venv.
+    """
+
+    @staticmethod
+    def _rendered_plan(project: Path, stage: hflow.Stage) -> RenderedPlan:
+        import ast
+
+        from hflow.runtime._bundle import render_dag_sources
+
+        sources = render_dag_sources(
+            master_dag_id="rendered",
+            pipeline_filename="pipeline.py",
+            app_variable="app",
+            data_root=str(project / "data"),
+            venv_python="/unused/python",
+        )
+        module = ast.parse(sources[f"rendered_{stage.value}"])
+        dag_function = next(
+            node
+            for node in ast.walk(module)
+            if isinstance(node, ast.FunctionDef) and node.name == "ingest_stage"
+        )
+        plan_function = next(
+            node
+            for node in dag_function.body
+            if isinstance(node, ast.FunctionDef) and node.name == "plan"
+        )
+        # The decorator is Airflow's; the body underneath it is plain Python
+        # and is the only part this test is about.
+        plan_function.decorator_list = []
+        extracted = ast.Module(body=[plan_function], type_ignores=[])
+        ast.fix_missing_locations(extracted)
+        namespace: dict[str, RenderedPlan] = {}
+        exec(compile(extracted, "<rendered plan>", "exec"), namespace)
+        return namespace["plan"]
+
+    @pytest.fixture
+    def plan(self, project: Path, monkeypatch: pytest.MonkeyPatch) -> RenderedPlan:
+        monkeypatch.setenv("HFLOW_USER_DIR", str(project))
+        return self._rendered_plan(project, hflow.Stage.META)
+
+    def test_an_unchanged_corpus_skips_the_whole_stage(
+        self, project: Path, plan: RenderedPlan
+    ) -> None:
+        """Exit 99 is what skip_on_exit_code turns into a SKIPPED task, so the
+        UI shows a stage that had nothing to do rather than a hollow success."""
+        _ingest(project)
+
+        with pytest.raises(SystemExit) as excinfo:
+            plan([EPISODE_URI], "batch", None, False)
+
+        assert excinfo.value.code == 99
+
+    def test_all_stages_hands_the_whole_batch_over(self, project: Path, plan: RenderedPlan) -> None:
+        _ingest(project)
+
+        batches = plan([EPISODE_URI], "batch", None, True)
+
+        assert [item for batch in batches for item in batch["items"]] == [EPISODE_URI]
+
+    def test_a_conf_string_reads_as_the_flag_it_spells(
+        self, project: Path, plan: RenderedPlan
+    ) -> None:
+        """Airflow renders params into the call, and a hand-typed conf value
+        arrives as text. Reading "true" as a true value is what keeps the
+        escape hatch usable from the trigger form."""
+        _ingest(project)
+
+        batches = plan([EPISODE_URI], "batch", None, "true")
+
+        assert [item for batch in batches for item in batch["items"]] == [EPISODE_URI]
