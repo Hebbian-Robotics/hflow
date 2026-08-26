@@ -7,7 +7,7 @@ import re
 import textwrap
 from collections.abc import Callable
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import cast
 
 import pytest
@@ -16,6 +16,8 @@ from mcap.exceptions import InvalidMagic
 from mcap.reader import make_reader
 from mcap.writer import Writer as StockWriter
 from mcap_protobuf.schema import build_file_descriptor_set
+from mcap_ros2.decoder import DecoderFactory as Ros2DecoderFactory
+from mcap_ros2.writer import Writer as Ros2Writer
 
 import hflow
 from hflow._grouped_mcap_writer import NO_SCHEMA_ID, GroupedMcapWriter
@@ -36,6 +38,22 @@ KEYFRAME_ACCESS_UNIT = b"".join(
 )
 NON_KEYFRAME_ACCESS_UNIT = b"".join(
     ANNEX_B_START_CODE + bytes([nal_type]) + b"payload" for nal_type in (0x09, 0x41)
+)
+KEYFRAME_WITHOUT_AUD = b"".join(
+    ANNEX_B_START_CODE + bytes([nal_type]) + b"payload" for nal_type in (0x67, 0x68, 0x65)
+)
+NON_KEYFRAME_WITHOUT_AUD = ANNEX_B_START_CODE + b"\x41payload"
+ROS2_COMPRESSED_VIDEO_SCHEMA = "\n".join(
+    [
+        "builtin_interfaces/Time timestamp",
+        "string frame_id",
+        "uint8[] data",
+        "string format",
+        "=" * 80,
+        "MSG: builtin_interfaces/Time",
+        "int32 sec",
+        "uint32 nanosec",
+    ]
 )
 
 
@@ -187,6 +205,79 @@ def test_transform_accepts_independent_interleaved_passthrough_video_channels(
     assert actual_payloads == expected_payloads
     report = diagnose(output)
     assert report.conforming, report.summary()
+
+
+def test_transform_losslessly_inserts_missing_passthrough_video_auds(tmp_path: Path) -> None:
+    source = tmp_path / "missing-auds.mcap"
+    original_payloads = _write_passthrough_video_source(
+        source,
+        [
+            ("/cam", 1, KEYFRAME_WITHOUT_AUD),
+            ("/cam", 2, NON_KEYFRAME_WITHOUT_AUD),
+        ],
+    )["/cam"]
+    output = tmp_path / "out.mcap"
+
+    write_canonical_episode(source, output)
+
+    with output.open("rb") as stream:
+        output_payloads = [
+            message.data for _schema, _channel, message in make_reader(stream).iter_messages()
+        ]
+    original_messages = [CompressedVideo.FromString(payload) for payload in original_payloads]
+    output_messages = [CompressedVideo.FromString(payload) for payload in output_payloads]
+    for original, repaired in zip(original_messages, output_messages, strict=True):
+        assert bytes(repaired.data).endswith(bytes(original.data))
+        assert len(repaired.data) == len(original.data) + 6
+        assert repaired.timestamp == original.timestamp
+        assert repaired.frame_id == original.frame_id
+        assert repaired.format == original.format
+    report = diagnose(output)
+    assert report.conforming, report.summary()
+
+
+def test_transform_still_rejects_undelimited_video_starting_mid_gop(tmp_path: Path) -> None:
+    source = tmp_path / "undelimited-mid-gop.mcap"
+    _write_passthrough_video_source(source, [("/cam", 1, NON_KEYFRAME_WITHOUT_AUD)])
+
+    with pytest.raises(ValueError, match="starts mid-GOP"):
+        write_canonical_episode(source, tmp_path / "out.mcap")
+
+
+def test_transform_inserts_missing_aud_into_ros2_video(tmp_path: Path) -> None:
+    source = tmp_path / "ros2-missing-aud.mcap"
+    writer = Ros2Writer(str(source))
+    schema = writer.register_msgdef(
+        "foxglove_msgs/msg/CompressedVideo", ROS2_COMPRESSED_VIDEO_SCHEMA
+    )
+    writer.write_message(
+        "/cam",
+        schema,
+        SimpleNamespace(
+            timestamp=SimpleNamespace(sec=0, nanosec=1),
+            frame_id="cam",
+            data=KEYFRAME_WITHOUT_AUD,
+            format="h264",
+        ),
+        log_time=1,
+        publish_time=1,
+    )
+    writer.finish()
+    output = tmp_path / "out.mcap"
+
+    write_canonical_episode(source, output)
+
+    with output.open("rb") as stream:
+        schema, channel, message = next(make_reader(stream).iter_messages())
+        assert schema is not None
+        decode = Ros2DecoderFactory().decoder_for(channel.message_encoding, schema)
+        assert decode is not None
+        repaired = decode(message.data)
+    assert channel.message_encoding == "cdr"
+    assert bytes(repaired.data).endswith(KEYFRAME_WITHOUT_AUD)
+    assert len(repaired.data) == len(KEYFRAME_WITHOUT_AUD) + 6
+    assert repaired.frame_id == "cam"
+    assert repaired.format == "h264"
 
 
 def test_aborted_writer_does_not_publish_partial_file(tmp_path: Path) -> None:

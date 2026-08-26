@@ -11,6 +11,7 @@ from hflow.video import (
     AccessUnit,
     VideoEncodeError,
     encode_images_to_h264,
+    ensure_access_unit_delimiter,
     split_annex_b_stream,
     write_access_units_to_mp4,
 )
@@ -131,6 +132,29 @@ def test_split_rejects_garbage_without_aud() -> None:
     idr_before_any_aud = b"\x00\x00\x00\x01\x65" + bytes(16)
     with pytest.raises(ValueError, match="aud=1"):
         split_annex_b_stream(idr_before_any_aud)
+
+
+def test_ensure_aud_is_lossless_and_idempotent() -> None:
+    undelimited_keyframe = b"".join(
+        b"\x00\x00\x00\x01" + bytes([nal_type]) + b"payload" for nal_type in (0x67, 0x68, 0x65)
+    )
+
+    repaired = ensure_access_unit_delimiter(undelimited_keyframe)
+
+    assert repaired.endswith(undelimited_keyframe)
+    assert len(repaired) == len(undelimited_keyframe) + 6
+    assert ensure_access_unit_delimiter(repaired) == repaired
+    assert split_annex_b_stream(repaired) == [
+        AccessUnit(data=repaired, is_keyframe=True, has_parameter_sets=True)
+    ]
+
+
+def test_ensure_aud_rejects_payload_without_coded_slice_data() -> None:
+    parameter_sets_only = b"".join(
+        b"\x00\x00\x00\x01" + bytes([nal_type]) + b"payload" for nal_type in (0x67, 0x68)
+    )
+    with pytest.raises(ValueError, match="no VCL NAL"):
+        ensure_access_unit_delimiter(parameter_sets_only)
 
 
 def test_encode_failure_raises_with_ffmpeg_stderr(jpeg_frames: list[bytes]) -> None:

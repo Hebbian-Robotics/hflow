@@ -110,4 +110,9 @@ notes and not only here.
 # and now stamps its own neutral library identifier. Canonical episodes are
 # pre-1.0 derived artifacts, so the old bytes are intentionally not preserved;
 # regenerate them from their source recordings when upgrading.
-TRANSFORM_BEHAVIOR_VERSION: str = "5"
+#
+# "6": pass-through H.264 video messages that lack an access-unit delimiter
+# now receive one losslessly. Existing slice data stays byte-identical, but the
+# canonical MCAP bytes change, so old and new transforms must not share a
+# pipeline identity.
+TRANSFORM_BEHAVIOR_VERSION: str = "6"

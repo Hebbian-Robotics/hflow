@@ -56,7 +56,7 @@ episode.
 
 | | HFlow's boundary |
 | --- | --- |
-| **Input** | One multimodal episode per standard MCAP file (`hflow doctor` says whether yours qualifies) |
+| **Input** | One multimodal episode per supported standard MCAP file (`hflow doctor` reports canonical gaps) |
 | **Processing** | Your Python transforms, checks, labels, and enrichments |
 | **Execution** | In-process for development; generated Airflow 3 DAGs for scheduled runs |
 | **Durable output** | Canonical MCAP episodes, provenance, artifacts, and a Parquet catalog |

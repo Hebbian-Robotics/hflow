@@ -40,6 +40,10 @@ _NAL_TYPE_PPS = 8
 _NAL_TYPE_ACCESS_UNIT_DELIMITER = 9
 # VCL NAL types (coded slice data); an access unit must be delimited before these.
 _VCL_NAL_TYPES = frozenset({1, 2, 3, 4, 5})
+# Annex B AUD with primary_pic_type 7 (any I/P/B picture), followed by the
+# required RBSP stop bit. It describes the following access unit without
+# changing any slice data.
+_ACCESS_UNIT_DELIMITER_NAL = b"\x00\x00\x00\x01\x09\xf0"
 
 
 @dataclass(frozen=True)
@@ -196,16 +200,8 @@ def encode_images_to_h264(
     return access_units
 
 
-def split_annex_b_stream(stream: bytes) -> list[AccessUnit]:
-    """Split a raw Annex B H.264 byte stream into access units.
-
-    Requires the stream to contain access-unit delimiter NALs (type 9), as
-    produced by ``aud=1``; splits on them. Each unit's ``is_keyframe`` /
-    ``has_parameter_sets`` are derived from the NAL types present (5 = IDR,
-    7 = SPS, 8 = PPS). NAL types are read from the byte after each start code
-    (``00 00 01`` / ``00 00 00 01``); emulation-prevention bytes cannot
-    produce false start codes mid-NAL for the type scan.
-    """
+def _annex_b_nal_offsets_and_types(stream: bytes) -> list[tuple[int, int]]:
+    """Return ``(start offset, NAL type)`` pairs from an Annex B stream."""
     # Every (start_offset_including_start_code, nal_type) in stream order.
     # This naive byte scan is sound: inside a NAL payload the encoder inserts
     # an emulation-prevention byte (0x03) after any 00 00 pair that would
@@ -226,6 +222,37 @@ def split_annex_b_stream(stream: bytes) -> list[AccessUnit]:
         nal_start_offset = code_offset - 1 if has_four_byte_start_code else code_offset
         nal_offsets_and_types.append((nal_start_offset, stream[type_byte_offset] & 0x1F))
         search_offset = type_byte_offset
+    return nal_offsets_and_types
+
+
+def ensure_access_unit_delimiter(access_unit: bytes) -> bytes:
+    """Prepend an H.264 AUD when one access unit has none.
+
+    The caller owns the access-unit boundary (for example, one
+    ``foxglove.CompressedVideo`` message is one frame). This function does not
+    re-encode or inspect slice headers: every existing byte is retained after
+    the six-byte delimiter. A payload without coded slice data is rejected
+    instead of being made to look valid by adding an AUD to garbage.
+    """
+    nal_types = [nal_type for _, nal_type in _annex_b_nal_offsets_and_types(access_unit)]
+    if _NAL_TYPE_ACCESS_UNIT_DELIMITER in nal_types:
+        return access_unit
+    if not any(nal_type in _VCL_NAL_TYPES for nal_type in nal_types):
+        raise ValueError("cannot insert an access-unit delimiter: no VCL NAL found")
+    return _ACCESS_UNIT_DELIMITER_NAL + access_unit
+
+
+def split_annex_b_stream(stream: bytes) -> list[AccessUnit]:
+    """Split a raw Annex B H.264 byte stream into access units.
+
+    Requires the stream to contain access-unit delimiter NALs (type 9), as
+    produced by ``aud=1``; splits on them. Each unit's ``is_keyframe`` /
+    ``has_parameter_sets`` are derived from the NAL types present (5 = IDR,
+    7 = SPS, 8 = PPS). NAL types are read from the byte after each start code
+    (``00 00 01`` / ``00 00 00 01``); emulation-prevention bytes cannot
+    produce false start codes mid-NAL for the type scan.
+    """
+    nal_offsets_and_types = _annex_b_nal_offsets_and_types(stream)
 
     aud_nal_indices = [
         nal_index

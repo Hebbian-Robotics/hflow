@@ -34,12 +34,15 @@ camera video, state streams, metadata, and provenance remain together while
 common readers still work unmodified.
 
 Accepting standard MCAP is not the same as accepting every standard MCAP. v1
-transcodes JPEG and PNG camera images, but video already encoded as
-`foxglove.CompressedVideo` has to arrive meeting the canonical video
-constraints, because it passes through byte for byte and the provenance stamp
-asserts it conforms. A file that misses one of them is refused with the reason
-rather than repaired. Run `hflow doctor` against a source file to find out
-before you ingest it.
+transcodes JPEG and PNG camera images. For H.264 already encoded as
+`foxglove.CompressedVideo`, it can also prepend a missing access-unit delimiter
+(AUD) without re-encoding: one message already supplies one access-unit
+boundary, and every existing video byte stays untouched after the six-byte
+delimiter. Messages that already contain an AUD still pass through byte for
+byte. Other canonical-video violations are refused with the reason because the
+provenance stamp asserts the output conforms. Run `hflow doctor` against a
+source file to see the gaps before you ingest it; a missing-AUD finding is the
+one video constraint the built-in transform repairs.
 
 The convention is not a proprietary file format. Non-camera messages retain
 their original schemas, encodings, payloads, and timestamps. Camera streams

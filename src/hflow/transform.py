@@ -1,12 +1,10 @@
 """The built-in transform: one MCAP in, one canonical episode out.
 
-Not any MCAP. v1 transcodes JPEG/PNG camera images and passes already-encoded
-H.264 video through unchanged, but only if that video already meets the
-canonical constraints below. A standard ``foxglove.CompressedVideo`` file that
-does not (no access-unit delimiters, say) is refused rather than repaired, and
-raw image channels are refused outright. Both fail loudly and name what is
-wrong; neither is transcoded into shape. Run ``hflow doctor`` on a source file
-to see where it stands before ingesting it.
+Not any MCAP. v1 transcodes JPEG/PNG camera images and losslessly inserts a
+missing access-unit delimiter into already-encoded H.264 video. Other video
+violations are refused rather than transcoded into shape, and raw image
+channels are refused outright. Both fail loudly and name what is wrong. Run
+``hflow doctor`` on a source file to see what the transform may need to bridge.
 
 v1 behavior:
 
@@ -14,12 +12,13 @@ v1 behavior:
   ``foxglove.CompressedImage``, JPEG or PNG payloads) are transcoded to
   in-band H.264 ``foxglove.CompressedVideo`` (protobuf) on the same topic,
   GOP length from the preset and the stream's measured frame rate.
-- Channels already carrying ``foxglove.CompressedVideo`` pass through
-  byte-for-byte, but only after every message is validated against the
-  canonical video constraints (``format="h264"``, one AUD-delimited access
-  unit per message, SPS+PPS on keyframes, each channel starts on a keyframe) --
-  the provenance stamp asserts conformance, so nonconforming video must fail
-  loudly, never pass silently.
+- Channels already carrying ``foxglove.CompressedVideo`` pass through after
+  every message is validated against the canonical video constraints
+  (``format="h264"``, one AUD-delimited access unit per message, SPS+PPS on
+  keyframes, each channel starts on a keyframe). A missing AUD is prepended
+  losslessly because the message already supplies the access-unit boundary;
+  conforming messages remain byte-for-byte identical. Other violations fail
+  loudly because the provenance stamp asserts conformance.
   Raw ``sensor_msgs/msg/Image``/``foxglove.RawImage`` is not supported in v1
   (explicit error).
 - Every other channel passes through byte-for-byte with its original schema.
@@ -358,6 +357,50 @@ def _resolve_decoder(topic: str, info: TopicInfo) -> Callable[[bytes], Any]:
     )
 
 
+def _resolve_encoder(topic: str, info: TopicInfo) -> Callable[[Any], bytes]:
+    """An encoder matching a decoded pass-through video message."""
+    if info.message_encoding == "protobuf":
+
+        def encode_protobuf(message: Any) -> bytes:
+            serialize = getattr(message, "SerializeToString", None)
+            if not callable(serialize):
+                raise ValueError(
+                    f"camera topic {topic!r} decoded a protobuf message that cannot "
+                    "be serialized after inserting an AUD"
+                )
+            return bytes(serialize())
+
+        return encode_protobuf
+    if info.message_encoding == "cdr" and info.schema_encoding == "ros2msg":
+        from mcap_ros2.writer import serialize_dynamic
+
+        encoders = serialize_dynamic(info.schema_name, info.schema_data.decode())
+        encoder = encoders.get(info.schema_name)
+        if encoder is not None:
+            return encoder
+    raise ValueError(
+        f"camera topic {topic!r} has message encoding {info.message_encoding!r} "
+        "that cannot be serialized after inserting an AUD"
+    )
+
+
+def _insert_missing_passthrough_video_aud(topic: str, decoded_message: Any) -> bool:
+    """Repair the one canonical constraint that is lossless to bridge."""
+    if decoded_message.format != "h264":
+        return False
+    original_data = bytes(decoded_message.data)
+    try:
+        canonical_data = video_module.ensure_access_unit_delimiter(original_data)
+    except ValueError as error:
+        raise ValueError(
+            f"pass-through video topic {topic!r} violates the canonical convention: {error}"
+        ) from error
+    if canonical_data == original_data:
+        return False
+    decoded_message.data = canonical_data
+    return True
+
+
 def _validate_passthrough_video_payload(
     topic: str, decoded_message: Any, *, is_first_message: bool
 ) -> None:
@@ -427,7 +470,7 @@ def write_canonical_episode(
     source_uri: str | None = None,
     derived: Sequence[tuple[str, DerivedSeries, str]] | None = None,
 ) -> EpisodeStamps:
-    """Transform ``source`` (any standard MCAP) into a canonical episode at
+    """Transform one supported MCAP ``source`` into a canonical episode at
     ``output`` and return the stamps written into its provenance record.
 
     ``derived`` entries are ``(topic, series, version)``: each series is
@@ -503,6 +546,7 @@ def write_canonical_episode(
             if info.schema_name in _PASSTHROUGH_VIDEO_SCHEMAS
         }
         passthrough_video_decoders: dict[int, Callable[[bytes], Any]] = {}
+        passthrough_video_encoders: dict[int, Callable[[Any], bytes]] = {}
         passthrough_video_channels_with_messages: set[int] = set()
         for batch in reader.iter_batches():
             if batch.channel_id in camera_payloads:
@@ -516,16 +560,30 @@ def write_canonical_episode(
                             batch.topic, infos[batch.channel_id]
                         )
                     decode = passthrough_video_decoders[batch.channel_id]
+                    canonical_payloads: list[bytes] = []
                     for payload in batch.data:
                         is_first_message = (
                             batch.channel_id not in passthrough_video_channels_with_messages
                         )
+                        decoded_message = decode(payload)
+                        inserted_aud = _insert_missing_passthrough_video_aud(
+                            batch.topic, decoded_message
+                        )
                         _validate_passthrough_video_payload(
                             batch.topic,
-                            decode(payload),
+                            decoded_message,
                             is_first_message=is_first_message,
                         )
+                        if inserted_aud:
+                            if batch.channel_id not in passthrough_video_encoders:
+                                passthrough_video_encoders[batch.channel_id] = _resolve_encoder(
+                                    batch.topic, infos[batch.channel_id]
+                                )
+                            payload = passthrough_video_encoders[batch.channel_id](decoded_message)
+                        canonical_payloads.append(payload)
                         passthrough_video_channels_with_messages.add(batch.channel_id)
+                else:
+                    canonical_payloads = batch.data
                 outgoing.extend(
                     _OutgoingMessage(
                         log_time=int(batch.log_times[index]),
@@ -533,7 +591,7 @@ def write_canonical_episode(
                         source_channel_id=batch.channel_id,
                         data=payload,
                     )
-                    for index, payload in enumerate(batch.data)
+                    for index, payload in enumerate(canonical_payloads)
                 )
 
         from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
