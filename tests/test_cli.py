@@ -8,6 +8,24 @@ from hflow import __version__
 from hflow.cli import _build_parser, main
 
 
+@pytest.mark.parametrize(
+    ("command", "expected_description"),
+    [
+        ("down", "Stop the local Docker Compose runtime rendered by `hflow up`"),
+        ("ingest", "Submit one or more episode URIs to the master ingest DAG"),
+        ("status", "Inspect the health of the local or remote Airflow runtime"),
+    ],
+)
+def test_runtime_command_help_has_a_description(
+    command: str, expected_description: str, capsys: CaptureFixture
+) -> None:
+    with pytest.raises(SystemExit) as exception:
+        _build_parser().parse_args([command, "--help"])
+
+    assert exception.value.code == 0
+    assert expected_description in capsys.readouterr().out
+
+
 def test_cli_version(capsys: CaptureFixture) -> None:
     with pytest.raises(SystemExit) as exception:
         _build_parser().parse_args(["--version"])

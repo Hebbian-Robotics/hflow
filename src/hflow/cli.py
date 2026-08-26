@@ -462,6 +462,11 @@ def _build_parser() -> argparse.ArgumentParser:
     down_parser = subparsers.add_parser(
         "down",
         help="stop the Compose runtime (containers only; volumes survive)",
+        description=(
+            "Stop the local Docker Compose runtime rendered by `hflow up`. "
+            "Containers are removed while volumes survive unless `--volumes` is "
+            "passed for a full reset."
+        ),
     )
     down_parser.add_argument(
         "--bundle-dir",
@@ -481,6 +486,12 @@ def _build_parser() -> argparse.ArgumentParser:
     ingest_parser = subparsers.add_parser(
         "ingest",
         help="trigger the master ingest DAG over episode URIs (relative to the data root)",
+        description=(
+            "Submit one or more episode URIs to the master ingest DAG, or process "
+            "them in-process when no runtime is addressed. URIs are relative to the "
+            "configured data root; the command prints the triggered run or processing "
+            "summary."
+        ),
     )
     ingest_parser.add_argument(
         "uris",
@@ -536,6 +547,11 @@ def _build_parser() -> argparse.ArgumentParser:
     status_parser = subparsers.add_parser(
         "status",
         help="runtime health summary with plain-language diagnostics",
+        description=(
+            "Inspect the health of the local or remote Airflow runtime addressed by "
+            "the bundle and endpoint options. Prints a plain-language health summary "
+            "and diagnostics for operators."
+        ),
     )
     status_parser.add_argument(
         "--bundle-dir",
