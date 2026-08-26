@@ -75,4 +75,9 @@ across these changes.
 # now receive one losslessly. Existing slice data stays byte-identical, but the
 # canonical MCAP bytes change, so old and new transforms must not share a
 # pipeline identity.
-TRANSFORM_BEHAVIOR_VERSION: str = "6"
+#
+# "7": a bare data-root-relative source key now records the same root-relative
+# source_uri as the data-root-prefixed and absolute spellings. The corrected
+# provenance changes canonical bytes for recordings previously processed under
+# the cwd-relative absolute identity, so they must not share a pipeline identity.
+TRANSFORM_BEHAVIOR_VERSION: str = "7"

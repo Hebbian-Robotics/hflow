@@ -68,6 +68,34 @@ def test_ingest_without_a_runtime_processes_and_records(
     assert duration_s == pytest.approx(1.0, abs=0.2)
 
 
+def test_cli_and_app_process_share_one_bare_key_identity(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The public CLI and library path cannot double-count one recording."""
+    monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
+    monkeypatch.delenv("HFLOW_AIRFLOW_URL", raising=False)
+    monkeypatch.chdir(project)
+
+    source_key = "episodes-in/episode_0001.mcap"
+    assert cli_main(["ingest", source_key]) == 0
+    capsys.readouterr()
+
+    app = hflow.App("in-process", data_root=Path("data"), default_checks=())
+    direct_report = app.process(source_key, record=True, verbose=False)
+
+    connection = open_catalog_connection(project / "data" / "catalog")
+    try:
+        latest_sources = connection.execute("SELECT source_uri FROM episodes_latest").fetchall()
+    finally:
+        connection.close()
+    run_directories = [path for path in (project / "data" / "episodes").iterdir() if path.is_dir()]
+
+    assert latest_sources == [(source_key,)]
+    assert [path.resolve() for path in run_directories] == [
+        direct_report.canonical_path.parent.resolve()
+    ]
+
+
 def test_a_pipeline_that_cannot_be_found_says_so_before_processing(
     project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

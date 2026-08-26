@@ -702,10 +702,11 @@ def test_missing_artifact_is_the_steps_error_not_the_runs(tmp_path: Path) -> Non
 def test_source_identity_is_stable_across_vantage_points(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The same episode named absolutely and root-relatively shares one run dir.
+    """Every spelling of one data-root episode shares one identity and run dir.
 
     This is the host-vs-container case: /opt/airflow/data/landing/e.mcap in
-    the runtime and ./data/landing/e.mcap on the host are the same episode.
+    the runtime, ./data/landing/e.mcap on the host, and the bare key accepted
+    by ingest are the same episode.
     """
     from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
@@ -715,11 +716,38 @@ def test_source_identity_is_stable_across_vantage_points(
         SyntheticEpisodeSpec(cameras=(), black_segment=None, duration_s=2.0),
     )
     app = hflow.App("vantage", data_root=data_root, default_checks=())
+    monkeypatch.chdir(tmp_path)
+
+    assert {
+        app.source_identity("landing/e.mcap"),
+        app.source_identity(Path("data") / "landing/e.mcap"),
+        app.source_identity(episode_file.resolve()),
+    } == {"landing/e.mcap"}
+
     full_report = app.process(episode_file.resolve(), record=True)
 
-    monkeypatch.chdir(tmp_path)
     relative_app = hflow.App("vantage", data_root=Path("data"), default_checks=())
-    relabel_report = relative_app.process(
+    prefixed_report = relative_app.process(
         "data/landing/e.mcap", record=True, stages={hflow.Stage.LABELS}
     )
-    assert relabel_report.canonical_path.resolve() == full_report.canonical_path.resolve()
+    bare_report = relative_app.process("landing/e.mcap", record=True, stages={hflow.Stage.LABELS})
+
+    assert prefixed_report.canonical_path.resolve() == full_report.canonical_path.resolve()
+    assert bare_report.canonical_path.resolve() == full_report.canonical_path.resolve()
+
+
+def test_source_identity_refuses_two_different_relative_local_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root_source = tmp_path / "data" / "landing" / "e.mcap"
+    cwd_source = tmp_path / "landing" / "e.mcap"
+    data_root_source.parent.mkdir(parents=True)
+    cwd_source.parent.mkdir(parents=True)
+    data_root_source.write_bytes(b"data-root recording")
+    cwd_source.write_bytes(b"working-directory recording")
+    monkeypatch.chdir(tmp_path)
+
+    app = hflow.App("ambiguous", data_root=tmp_path / "data", default_checks=())
+
+    with pytest.raises(ValueError, match=r"relative source reference.*is ambiguous"):
+        app.source_identity("landing/e.mcap")
