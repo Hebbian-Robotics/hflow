@@ -656,6 +656,62 @@ def test_cli_stale_reports_a_broken_pipeline_file_instead_of_crashing(
     assert "boom at import time" in capsys.readouterr().err
 
 
+def test_cli_stale_reports_an_explicitly_named_missing_app(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    Catalog(tmp_path / "catalog")
+    pipeline = tmp_path / "pipeline.py"
+    pipeline.write_text("value = 42\n")
+
+    exit_code = cli_main(
+        [
+            "stale",
+            "--catalog",
+            str(tmp_path / "catalog"),
+            "--pipeline",
+            f"{pipeline}:custom_name",
+        ]
+    )
+
+    assert exit_code == 2
+    assert "has no hflow.App named 'custom_name'" in capsys.readouterr().err
+
+
+def test_cli_stale_reports_a_pipeline_with_no_apps(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    Catalog(tmp_path / "catalog")
+    pipeline = tmp_path / "pipeline.py"
+    pipeline.write_text("value = 42\n")
+
+    exit_code = cli_main(
+        ["stale", "--catalog", str(tmp_path / "catalog"), "--pipeline", str(pipeline)]
+    )
+
+    assert exit_code == 2
+    assert "defines no hflow.App" in capsys.readouterr().err
+
+
+def test_cli_stale_reports_every_app_when_a_pipeline_is_ambiguous(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    Catalog(tmp_path / "catalog")
+    pipeline = tmp_path / "pipeline.py"
+    pipeline.write_text(
+        "import hflow\n\nkitchen = hflow.App('kitchen')\ngarage = hflow.App('garage')\n"
+    )
+
+    exit_code = cli_main(
+        ["stale", "--catalog", str(tmp_path / "catalog"), "--pipeline", str(pipeline)]
+    )
+
+    assert exit_code == 2
+    stderr = capsys.readouterr().err
+    assert "defines 2 hflow.App objects" in stderr
+    assert "'kitchen'" in stderr
+    assert "'garage'" in stderr
+
+
 def test_cli_stale_exit_code_returns_one_when_episodes_are_behind(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
