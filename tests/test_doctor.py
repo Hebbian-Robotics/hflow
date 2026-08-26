@@ -2,16 +2,31 @@
 
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
 from mcap.writer import Writer as StockWriter
 from mcap_protobuf.schema import build_file_descriptor_set
+from mcap_ros2.writer import Writer as Ros2Writer
 
 from hflow.cli import main as cli_main
 from hflow.doctor import DiagnosticLevel, diagnose
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import write_canonical_episode
+
+ROS2_COMPRESSED_VIDEO_SCHEMA = "\n".join(
+    [
+        "builtin_interfaces/Time timestamp",
+        "string frame_id",
+        "uint8[] data",
+        "string format",
+        "=" * 80,
+        "MSG: builtin_interfaces/Time",
+        "int32 sec",
+        "uint32 nanosec",
+    ]
+)
 
 
 @pytest.fixture(scope="module")
@@ -60,6 +75,33 @@ def test_nonconforming_video_is_reported(tmp_path: Path) -> None:
         )
         writer.finish()
     report = diagnose(path)
+    assert not report.conforming
+    codes = {finding.code for finding in report.findings}
+    assert "video-not-aud-delimited" in codes
+
+
+def test_nonconforming_ros2_video_is_reported(tmp_path: Path) -> None:
+    path = tmp_path / "bad_ros2_video.mcap"
+    writer = Ros2Writer(str(path))
+    schema = writer.register_msgdef(
+        "foxglove_msgs/msg/CompressedVideo", ROS2_COMPRESSED_VIDEO_SCHEMA
+    )
+    writer.write_message(
+        "/cam",
+        schema,
+        SimpleNamespace(
+            timestamp=SimpleNamespace(sec=1, nanosec=0),
+            frame_id="cam",
+            data=b"\x00\x00\x00\x01\x41not-aud-delimited",
+            format="h264",
+        ),
+        log_time=10**9,
+        publish_time=10**9,
+    )
+    writer.finish()
+
+    report = diagnose(path)
+
     assert not report.conforming
     codes = {finding.code for finding in report.findings}
     assert "video-not-aud-delimited" in codes

@@ -120,6 +120,13 @@ CAMERA_SCHEMA_NAMES = frozenset(
 
 CANONICAL_VIDEO_SCHEMA_NAME = "foxglove.CompressedVideo"
 
+# Already-encoded video schemas whose payload contract the built-in transform
+# and doctor both understand. The ROS 2 spelling remains a source schema; the
+# canonical writer emits the protobuf spelling above.
+PASSTHROUGH_VIDEO_SCHEMA_NAMES = frozenset(
+    {CANONICAL_VIDEO_SCHEMA_NAME, "foxglove_msgs/msg/CompressedVideo"}
+)
+
 
 class GopPreset(StrEnum):
     """GOP-length preset keyed to how the data will be read.

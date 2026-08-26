@@ -85,6 +85,7 @@ from hflow.format import (
     METADATA_RECORD_EPISODE,
     METADATA_RECORD_PROVENANCE,
     MINIMUM_DERIVED_CHUNK_SIZE_BYTES,
+    PASSTHROUGH_VIDEO_SCHEMA_NAMES,
     PROVENANCE_KEY_CHUNK_TARGET_PREFIX,
     PROVENANCE_KEY_DERIVED_PREFIX,
     PROVENANCE_KEY_PIPELINE_VERSION,
@@ -106,10 +107,6 @@ _TRANSCODABLE_IMAGE_SCHEMAS = frozenset(
     {"sensor_msgs/msg/CompressedImage", "foxglove.CompressedImage"}
 )
 _RAW_IMAGE_SCHEMAS = frozenset({"sensor_msgs/msg/Image", "foxglove.RawImage"})
-# Already-encoded video schemas that pass through (validated, not transcoded).
-_PASSTHROUGH_VIDEO_SCHEMAS = frozenset(
-    {CANONICAL_VIDEO_SCHEMA_NAME, "foxglove_msgs/msg/CompressedVideo"}
-)
 
 
 @dataclass(frozen=True)
@@ -543,7 +540,7 @@ def write_canonical_episode(
         passthrough_video_channel_ids = {
             channel_id
             for channel_id, info in infos.items()
-            if info.schema_name in _PASSTHROUGH_VIDEO_SCHEMAS
+            if info.schema_name in PASSTHROUGH_VIDEO_SCHEMA_NAMES
         }
         passthrough_video_decoders: dict[int, Callable[[bytes], Any]] = {}
         passthrough_video_encoders: dict[int, Callable[[Any], bytes]] = {}
