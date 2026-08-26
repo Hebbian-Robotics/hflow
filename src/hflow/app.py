@@ -107,6 +107,17 @@ class SourceNotFound(FileNotFoundError):
     """
 
 
+def _local_source_candidate_paths(
+    source_reference: Path | str, root_path: Path
+) -> tuple[Path, Path]:
+    """The cwd and data-root interpretations of one local reference."""
+    source_path = Path(source_reference)
+    if source_path.is_absolute():
+        resolved_path = source_path.resolve()
+        return resolved_path, resolved_path
+    return source_path.resolve(), (root_path / source_path).resolve()
+
+
 def _resolve_local_source_reference(source_reference: Path | str, root_path: Path) -> Path:
     """Resolve one local reference without choosing between two recordings.
 
@@ -115,12 +126,9 @@ def _resolve_local_source_reference(source_reference: Path | str, root_path: Pat
     both files exist; choosing silently in that case could make identity and
     input refer to different recordings, so the caller must disambiguate.
     """
-    source_path = Path(source_reference)
-    if source_path.is_absolute():
-        return source_path.resolve()
-
-    cwd_candidate = source_path.resolve()
-    root_candidate = (root_path / source_path).resolve()
+    cwd_candidate, root_candidate = _local_source_candidate_paths(source_reference, root_path)
+    if cwd_candidate == root_candidate:
+        return cwd_candidate
     cwd_candidate_exists = cwd_candidate.is_file()
     root_candidate_exists = root_candidate.is_file()
 
@@ -134,6 +142,14 @@ def _resolve_local_source_reference(source_reference: Path | str, root_path: Pat
     if root_candidate_exists:
         return root_candidate
     return cwd_candidate
+
+
+def _local_source_identity(resolved_source_path: Path, root_path: Path) -> str:
+    """Root-relative identity inside a local root, absolute identity outside."""
+    try:
+        return resolved_source_path.relative_to(root_path.resolve()).as_posix()
+    except ValueError:
+        return str(resolved_source_path)
 
 
 # The environment override for an App constructed without an explicit data
@@ -276,13 +292,15 @@ def _source_identity(source_reference: Path | str, storage_root: StorageRoot) ->
             return str(source_path.resolve())
         case LocalStorageRoot(path=root_path):
             resolved_source_path = _resolve_local_source_reference(source_path, root_path)
-            try:
-                return resolved_source_path.relative_to(root_path.resolve()).as_posix()
-            except ValueError:
-                return str(resolved_source_path)
+            return _local_source_identity(resolved_source_path, root_path)
 
 
-def _source_artifact_directory_name(source_reference: Path | str, storage_root: StorageRoot) -> str:
+def _source_artifact_directory_name(
+    source_reference: Path | str,
+    storage_root: StorageRoot,
+    *,
+    source_identifier: str | None = None,
+) -> str:
     """A readable, collision-resistant directory name for one source.
 
     Source basenames are not identities: independent robots commonly produce
@@ -291,7 +309,8 @@ def _source_artifact_directory_name(source_reference: Path | str, storage_root: 
     outputs disjoint without leaking the entire source hierarchy into the
     data root.
     """
-    source_identifier = _source_identity(source_reference, storage_root)
+    if source_identifier is None:
+        source_identifier = _source_identity(source_reference, storage_root)
     source_path_digest = hashlib.sha256(source_identifier.encode()).hexdigest()[:12]
     source_stem = Path(str(source_reference).rstrip("/")).stem
     return f"{source_stem}-{source_path_digest}"
@@ -1192,6 +1211,70 @@ class App:
             {channel.topic: channel.version for channel in self.derived},
         )
 
+    def _persisted_local_source_identity(
+        self,
+        episode: Path | str,
+        candidate_identities: tuple[str, ...],
+        output_dir: Path | str | StorageRoot | None,
+    ) -> str | None:
+        """Recover the identity already stored in a sync-completion marker."""
+        if output_dir is not None:
+            candidate_run_roots = (parse_storage_root(output_dir),)
+        else:
+            candidate_run_roots = tuple(
+                self.workspace.episodes_root.child(
+                    _source_artifact_directory_name(
+                        episode,
+                        self.storage_root,
+                        source_identifier=candidate_identity,
+                    )
+                )
+                for candidate_identity in candidate_identities
+            )
+
+        for candidate_run_root in candidate_run_roots:
+            try:
+                marker_path = candidate_run_root.fetch(_SYNC_COMPLETION_MARKER_NAME)
+                completion = _read_sync_completion_marker(marker_path)
+            except (FileNotFoundError, ValueError, OSError):
+                continue
+            if completion.source_path in candidate_identities:
+                return completion.source_path
+        return None
+
+    def _resolve_source_identity(
+        self,
+        episode: Path | str,
+        *,
+        output_dir: Path | str | StorageRoot | None = None,
+    ) -> str:
+        """Resolve identity, retaining it after a relative local source vanishes."""
+        resolved_identity = _source_identity(episode, self.storage_root)
+        if (
+            not isinstance(self.storage_root, LocalStorageRoot)
+            or Path(episode).is_absolute()
+            or (isinstance(episode, str) and is_bucket_url(episode))
+        ):
+            return resolved_identity
+
+        cwd_candidate, root_candidate = _local_source_candidate_paths(
+            episode, self.storage_root.path
+        )
+        if cwd_candidate.is_file() or root_candidate.is_file():
+            return resolved_identity
+
+        root_identity = _local_source_identity(root_candidate, self.storage_root.path)
+        cwd_identity = _local_source_identity(cwd_candidate, self.storage_root.path)
+        candidate_identities = tuple(dict.fromkeys((root_identity, cwd_identity)))
+        persisted_identity = self._persisted_local_source_identity(
+            episode, candidate_identities, output_dir
+        )
+        # With no file and no prior run, a relative reference has no evidence
+        # for the historical cwd interpretation. Treat it as the same
+        # data-root key ingest accepts; a sync attempt will then report that
+        # exact root-relative source as missing.
+        return persisted_identity or root_identity
+
     def source_identity(self, episode: "Path | str") -> str:
         """The ``source_uri`` this App would record for one episode reference.
 
@@ -1207,14 +1290,17 @@ class App:
         root-relative key when only the data-root file exists. If both
         candidates exist and resolve to different files, the reference is
         ambiguous and raises :class:`ValueError` rather than silently naming
-        one recording while processing the other.
+        one recording while processing the other. Once processed, its durable
+        sync marker preserves that choice even if the raw file later
+        disappears; without either a file or a prior marker, a relative
+        reference is treated as a data-root key.
 
         Public because asking "what will this be called in the catalog?"
         without processing anything is exactly what a planner does
         (:mod:`hflow.stage_planning`), and computing it a second way is how a
         planner ends up querying for rows that were filed under another name.
         """
-        return _source_identity(episode, self.storage_root)
+        return self._resolve_source_identity(episode)
 
     def manifest(self) -> PipelineManifest:
         """This pipeline's JSON-able description: step names, explicit
@@ -1691,7 +1777,7 @@ class App:
         :meth:`hflow.catalog.Catalog.append_episode`).
         """
         enabled_stages = _resolve_stages(stages)
-        source_identifier = _source_identity(episode, self.storage_root)
+        source_identifier = self._resolve_source_identity(episode, output_dir=output_dir)
         self._preflight()
         if Stage.SYNC in enabled_stages:
             source_path = self._fetch_source(episode)  # the transform reads it
@@ -1707,7 +1793,11 @@ class App:
             parse_storage_root(output_dir)
             if output_dir is not None
             else self.workspace.episodes_root.child(
-                _source_artifact_directory_name(episode, self.storage_root)
+                _source_artifact_directory_name(
+                    episode,
+                    self.storage_root,
+                    source_identifier=source_identifier,
+                )
             )
         )
         run_dir = run_storage_root.workspace

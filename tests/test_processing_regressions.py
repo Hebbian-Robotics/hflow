@@ -730,6 +730,9 @@ def test_source_identity_is_stable_across_vantage_points(
     prefixed_report = relative_app.process(
         "data/landing/e.mcap", record=True, stages={hflow.Stage.LABELS}
     )
+    episode_file.unlink()
+
+    assert relative_app.source_identity("landing/e.mcap") == "landing/e.mcap"
     bare_report = relative_app.process("landing/e.mcap", record=True, stages={hflow.Stage.LABELS})
 
     assert prefixed_report.canonical_path.resolve() == full_report.canonical_path.resolve()
@@ -751,3 +754,24 @@ def test_source_identity_refuses_two_different_relative_local_sources(
 
     with pytest.raises(ValueError, match=r"relative source reference.*is ambiguous"):
         app.source_identity("landing/e.mcap")
+
+
+def test_vanished_cwd_relative_source_keeps_its_persisted_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The root-key fallback must not rename a prior outside-root source."""
+    from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
+
+    source = synthesize_episode(
+        tmp_path / "external" / "e.mcap",
+        SyntheticEpisodeSpec(cameras=(), black_segment=None, duration_s=2.0),
+    )
+    monkeypatch.chdir(tmp_path)
+    app = hflow.App("outside-root", data_root=tmp_path / "data", default_checks=())
+    full_report = app.process("external/e.mcap", record=True)
+    expected_identity = str(source.resolve())
+    source.unlink()
+
+    assert app.source_identity("external/e.mcap") == expected_identity
+    relabel_report = app.process("external/e.mcap", record=True, stages={hflow.Stage.LABELS})
+    assert relabel_report.canonical_path.resolve() == full_report.canonical_path.resolve()
