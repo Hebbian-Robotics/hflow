@@ -179,6 +179,11 @@ def _build_parser() -> argparse.ArgumentParser:
     dataset_parser = subparsers.add_parser(
         "dataset",
         help="create version-pinned dataset manifests from the pipeline's own policy",
+        description=(
+            "Group commands that turn the pipeline's policy into version-pinned "
+            "dataset manifests. Use `create` to select episodes and write a "
+            "Parquet manifest plus its provenance sidecar."
+        ),
     )
     dataset_subparsers = dataset_parser.add_subparsers(dest="dataset_command", required=True)
     dataset_create_parser = dataset_subparsers.add_parser(
@@ -223,6 +228,11 @@ def _build_parser() -> argparse.ArgumentParser:
     export_parser = subparsers.add_parser(
         "export",
         help="export catalog selections in portable downstream formats",
+        description=(
+            "Group commands for exporting catalog selections in portable downstream "
+            "formats. Use `snapshot` to write a tool-neutral directory of Parquet "
+            "tables and optional media assets."
+        ),
     )
     export_subparsers = export_parser.add_subparsers(dest="export_command", required=True)
     snapshot_export_parser = export_subparsers.add_parser(
@@ -571,6 +581,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "UI assets installed (requires the hflow-server package). Distinct from "
             "`up`, which starts the runtime that PROCESSES episodes -- this only "
             "reads the data root, and can trigger a run on a runtime that exists."
+        ),
+        description=(
+            "Serve this workspace over HTTP with REST endpoints over the catalog, "
+            "episodes, artifacts, and optional UI assets. The server reads the data "
+            "root and can trigger an existing runtime, but it does not process "
+            "episodes itself; use `hflow up` for that."
         ),
     )
     serve_parser.add_argument(

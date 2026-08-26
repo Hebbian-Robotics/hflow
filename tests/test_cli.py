@@ -26,6 +26,24 @@ def test_runtime_command_help_has_a_description(
     assert expected_description in capsys.readouterr().out
 
 
+@pytest.mark.parametrize(
+    ("command", "expected_description"),
+    [
+        ("dataset", "Group commands that turn the pipeline's policy into version-pinned"),
+        ("export", "Group commands for exporting catalog selections in portable downstream"),
+        ("serve", "Serve this workspace over HTTP with REST endpoints over the catalog"),
+    ],
+)
+def test_top_level_command_help_has_a_description(
+    command: str, expected_description: str, capsys: CaptureFixture
+) -> None:
+    with pytest.raises(SystemExit) as exception:
+        _build_parser().parse_args([command, "--help"])
+
+    assert exception.value.code == 0
+    assert expected_description in capsys.readouterr().out
+
+
 def test_cli_version(capsys: CaptureFixture) -> None:
     with pytest.raises(SystemExit) as exception:
         _build_parser().parse_args(["--version"])
