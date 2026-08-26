@@ -1,7 +1,7 @@
 """Built-in checks, shipped in the same shape users write (evidence, not
 verdicts; thresholds user-owned). Wrap them to register::
 
-    @app.check()
+    @app.check(version="1")
     def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.checks.timestamp_regularity(ep, tolerance_s=0.010)
 
@@ -50,7 +50,7 @@ from hflow.video import split_annex_b_stream
 
 # Recommended camera-integrity thresholds over the keys `camera_frame_stats`
 # emits. Shipped as a VALUE, not a default: nothing gates until a pipeline
-# passes it to `@app.check(gate=...)`. Copy it with your own numbers to tune,
+# passes it to `@app.check(version="1", gate=...)`. Copy it with your own numbers to tune,
 # or build a Gate of your own.
 #
 # Deliberately no motion-smoothness clause. Smoothness metrics ship as flags
@@ -311,11 +311,10 @@ def camera_frame_stats(
         measurements[f"{topic}/luma_avg_mean"] = frame_statistics.average_luma_mean
         measurements[f"{topic}/luma_avg_min"] = frame_statistics.average_luma_minimum
         measurements[f"{topic}/luma_avg_max"] = frame_statistics.average_luma_maximum
-        # Which binary produced these readings. The check's version covers its
-        # source and thresholds but not the instrument, and builds genuinely
-        # measure differently -- so a pin bump would otherwise move every camera
-        # measurement in a corpus with nothing recording that it had. Text, so
-        # it stays out of the wide view's numeric columns.
+        # An explicit check version does not identify the measuring instrument,
+        # and FFmpeg builds can produce different readings. Record the pinned
+        # build so measurements remain interpretable across upgrades. Text keeps
+        # it out of the wide view's numeric columns.
         measurements["camera_instrument"] = frame_statistics.provenance.ffmpeg_version
         measurements["camera_measurement_definition"] = FRAME_STATISTICS_DEFINITION_VERSION
         if message_count:
@@ -850,15 +849,16 @@ def camera_signal_quality(
 
     Separate from :func:`camera_frame_stats` rather than folded into it, because
     a check is the unit of three things at once -- one gate decision, one
-    coverage denominator, and one content-hash version. Twenty-odd measurements
+    coverage denominator, and one explicit version. Twenty-odd measurements
     under one name would mean a threshold on any of them gating all of them, and
-    one changed constant re-versioning the lot. HFlow's adapter caches the
-    instrument's raw output beside the workdir MP4, keyed on the measurement
-    definition, FFmpeg version, and filter graph. Registering both checks
-    against the same episode therefore pays one FFmpeg decode per camera, not
-    two. Both checks default the graph parameters identically, which lets them
-    share the decode. Override a graph parameter on only one check and HFlow
-    decodes again because you asked FFmpeg for a different measurement.
+    a deliberate version bump for one definition changing every measurement's
+    version. HFlow's adapter caches the instrument's raw output beside the
+    workdir MP4, keyed on the measurement definition, FFmpeg version, and filter
+    graph. Registering both checks against the same episode therefore pays one
+    FFmpeg decode per camera, not two. Both checks use identical graph parameters
+    by default, so they share the decode. Override a graph parameter on only one
+    check and HFlow decodes again because you asked FFmpeg for a different
+    measurement.
 
     The coding range is measured from the pixels, never read from the
     container's declared range. That tag lies in practice -- a corpus can
@@ -1368,16 +1368,35 @@ def keyframe_interval(episode: Episode, *, cameras: Sequence[str] | None = None)
 #   the same footage, so it stays opt-in, as does `camera_stability`, which
 #   needs the `motion` extra the core install does not carry.
 #
+# Automatic defaults are still explicitly versioned; HFlow is their author,
+# so it owns these promises on behalf of pipelines that accept the baseline.
+# A pipeline-authored check always declares its version at registration.
+_DEFAULT_CHECK_VERSION_BY_FUNCTION: dict[CheckFunction, str] = {
+    episode_duration: "1",
+    timestamp_regularity: "1",
+    camera_frame_stats: "1",
+    keyframe_interval: "1",
+    content_digest: "1",
+    media_digest: "1",
+}
+
 # Pass `hflow.App(default_checks=...)` to change the set; registering one of
 # these yourself replaces the automatic copy rather than colliding with it.
-DEFAULT_CHECKS: tuple[CheckFunction, ...] = (
-    episode_duration,
-    timestamp_regularity,
-    camera_frame_stats,
-    keyframe_interval,
-    content_digest,
-    media_digest,
-)
+# Derive the tuple from the version mapping so adding an automatic check cannot
+# create an unversioned registration.
+DEFAULT_CHECKS: tuple[CheckFunction, ...] = tuple(_DEFAULT_CHECK_VERSION_BY_FUNCTION)
+
+
+def _default_check_version_for_automatic_registration(check_function: CheckFunction) -> str:
+    """Return HFlow's explicit version for one automatic built-in check."""
+    try:
+        return _DEFAULT_CHECK_VERSION_BY_FUNCTION[check_function]
+    except KeyError:
+        check_name = getattr(check_function, "__name__", repr(check_function))
+        raise ValueError(
+            f"default_checks contains {check_name!r}, which has no HFlow-owned version; "
+            "register pipeline-authored checks with app.check(version=...)"
+        ) from None
 
 
 # Key-set predictor for every default: what ``measurements`` keys would this
@@ -1393,7 +1412,8 @@ DEFAULT_CHECKS: tuple[CheckFunction, ...] = (
 # default itself.
 #
 # The contract is between this registry and the function bodies in this file.
-# It is not a public API: there is no ``keys=`` parameter to ``@app.check()``,
+# It is not a public API: there is no ``keys=`` parameter to
+# ``@app.check(version=...)``,
 # no ``__emitted_keys__`` convention, no way for user code to register a
 # pattern. A user-registered check has no pattern, so a user check that
 # happens to overlap a default's keys falls back to the post-execution

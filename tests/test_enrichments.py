@@ -23,12 +23,12 @@ def test_enrichments_run_after_all_checks(source_episode: Path, tmp_path: Path) 
     app = hflow.App("enrich-order", data_root=tmp_path / "data")
     execution_order: list[str] = []
 
-    @app.enrich()
+    @app.enrich(version="1")
     def caption(ep: hflow.Episode) -> hflow.EnrichmentResult:
         execution_order.append("caption")
         return hflow.EnrichmentResult(labels={"caption": "a robot arm moves"})
 
-    @app.check()
+    @app.check(version="1")
     def joints(ep: hflow.Episode) -> hflow.CheckResult:
         execution_order.append("joints")
         return hflow.CheckResult()
@@ -43,11 +43,11 @@ def test_quarantine_skips_enrichments(source_episode: Path, tmp_path: Path) -> N
     app = hflow.App("enrich-gate", data_root=tmp_path / "data")
     enrichment_ran = False
 
-    @app.check(critical=True)
+    @app.check(version="1", critical=True)
     def always_fails(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(verdict=False)
 
-    @app.enrich()
+    @app.enrich(version="1")
     def expensive_labeling(ep: hflow.Episode) -> hflow.EnrichmentResult:
         nonlocal enrichment_ran
         enrichment_ran = True
@@ -62,7 +62,7 @@ def test_quarantine_skips_enrichments(source_episode: Path, tmp_path: Path) -> N
 def test_enrichment_wrong_return_type_is_an_error(source_episode: Path, tmp_path: Path) -> None:
     app = hflow.App("enrich-boundary", data_root=tmp_path / "data")
 
-    @app.enrich()
+    @app.enrich(version="1")
     def returns_a_string(ep: hflow.Episode) -> hflow.EnrichmentResult:
         return cast(hflow.EnrichmentResult, "a caption")  # deliberate misuse
 
@@ -82,7 +82,7 @@ def test_enrichment_labels_and_artifacts_land_in_the_catalog(
     artifact_dir.mkdir()
     app = hflow.App("enrich-catalog", data_root=data_root)
 
-    @app.enrich()
+    @app.enrich(version="1")
     def labeling(ep: hflow.Episode) -> hflow.EnrichmentResult:
         artifact_path = artifact_dir / "segments.json"
         artifact_path.write_text(json.dumps({"segments": []}))
@@ -130,13 +130,13 @@ def test_enrichment_labels_and_artifacts_land_in_the_catalog(
 def test_step_names_are_unique_across_checks_and_enrichments(tmp_path: Path) -> None:
     app = hflow.App("enrich-names", data_root=tmp_path)
 
-    @app.check()
+    @app.check(version="1")
     def labeling(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult()
 
     with pytest.raises(ValueError, match="already registered"):
 
-        @app.enrich(name="labeling")
+        @app.enrich(version="1", name="labeling")
         def another(ep: hflow.Episode) -> hflow.EnrichmentResult:
             return hflow.EnrichmentResult()
 
@@ -151,16 +151,16 @@ def test_built_in_media_step_name_is_reserved_for_user_steps(tmp_path: Path) -> 
         return hflow.EnrichmentResult()
 
     with pytest.raises(ValueError, match=r"media/contact_sheet.*already registered"):
-        app.check(name=MEDIA_CONTACT_SHEET_STEP_NAME)(check)
+        app.check(version="1", name=MEDIA_CONTACT_SHEET_STEP_NAME)(check)
 
     with pytest.raises(ValueError, match=r"media/contact_sheet.*already registered"):
-        app.enrich(name=MEDIA_CONTACT_SHEET_STEP_NAME)(enrichment)
+        app.enrich(version="1", name=MEDIA_CONTACT_SHEET_STEP_NAME)(enrichment)
 
 
 def test_enrichment_uses_alias_is_preflighted(source_episode: Path, tmp_path: Path) -> None:
     app = hflow.App("enrich-preflight", data_root=tmp_path)
 
-    @app.enrich(uses="captioner")
+    @app.enrich(version="1", uses="captioner")
     def needs_endpoint(ep: hflow.Episode) -> hflow.EnrichmentResult:
         return hflow.EnrichmentResult()
 
@@ -176,7 +176,7 @@ def test_enrichment_label_claiming_the_artifact_namespace_is_refused(
     data_root = tmp_path / "data"
     app = hflow.App("artifact-claim", data_root=data_root)
 
-    @app.enrich()
+    @app.enrich(version="1")
     def labeling(ep: hflow.Episode) -> hflow.EnrichmentResult:
         return hflow.EnrichmentResult(
             labels=cast(
@@ -197,7 +197,7 @@ def test_check_measurement_claiming_the_artifact_namespace_is_refused(
     data_root = tmp_path / "data"
     app = hflow.App("artifact-claim-check", data_root=data_root)
 
-    @app.check()
+    @app.check(version="1")
     def labeled(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"artifact/frames": 1.0})
 
@@ -215,7 +215,7 @@ def test_labels_near_the_artifact_namespace_still_land_with_real_artifacts(
     artifact_dir.mkdir()
     app = hflow.App("artifact-boundary", data_root=data_root)
 
-    @app.enrich()
+    @app.enrich(version="1")
     def labeling(ep: hflow.Episode) -> hflow.EnrichmentResult:
         artifact_path = artifact_dir / "segments.json"
         artifact_path.write_text(json.dumps({"segments": []}))

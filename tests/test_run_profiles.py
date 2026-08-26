@@ -21,11 +21,11 @@ def source_episode(tmp_path: Path) -> Path:
 def _app_with_check_and_enrichment(data_root: Path) -> hflow.App:
     app = hflow.App("profiles", data_root=data_root, default_checks=())
 
-    @app.check()
+    @app.check(version="1")
     def joints(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"joint_count": 7})
 
-    @app.enrich()
+    @app.enrich(version="1")
     def caption(ep: hflow.Episode) -> hflow.EnrichmentResult:
         return hflow.EnrichmentResult(labels={"caption": "a robot arm moves"})
 
@@ -114,11 +114,11 @@ def test_quarantine_is_honored_across_invocations_via_the_catalog(
     app = hflow.App("profiles-quarantine", data_root=data_root, default_checks=())
     enrichment_ran = False
 
-    @app.check(critical=True)
+    @app.check(version="1", critical=True)
     def dead_camera(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(verdict=False)
 
-    @app.enrich()
+    @app.enrich(version="1")
     def expensive_labeling(ep: hflow.Episode) -> hflow.EnrichmentResult:
         nonlocal enrichment_ran
         enrichment_ran = True

@@ -353,11 +353,11 @@ def recorded_data_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
     app = hflow.App("catalog-pipeline", data_root=data_root)
 
-    @app.check()
+    @app.check(version="1")
     def joints(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.checks.joint_discontinuity(ep)
 
-    @app.check(critical=True)
+    @app.check(version="1", critical=True)
     def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
         camera_topic = next(topic for topic in ep.cameras if "wrist_cam" in topic)
         camera_evidence = camera_frame_stats(ep, cameras=[camera_topic])
@@ -368,7 +368,7 @@ def recorded_data_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
             verdict=black_frame_percent < 50.0,
         )
 
-    @app.check()
+    @app.check(version="1")
     def late_check(ep: hflow.Episode) -> hflow.CheckResult:
         # Registered after the gate: skipped on quarantined episodes, so its
         # coverage must come out below 100%.

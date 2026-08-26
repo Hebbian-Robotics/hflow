@@ -61,12 +61,12 @@ import hflow
 app = hflow.App("itest", data_root="/opt/airflow/data")
 
 
-@app.check()
+@app.check(version="1")
 def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
     return hflow.checks.timestamp_regularity(ep, tolerance_s=0.010)
 
 
-@app.enrich()
+@app.enrich(version="1")
 def caption(ep: hflow.Episode) -> hflow.EnrichmentResult:
     return hflow.EnrichmentResult(labels={"caption": "a robot arm moves"})
 """

@@ -337,11 +337,11 @@ class TestBucketPipeline:
         )
         app = hflow.App("bucket-pipeline", data_root=data_root)
 
-        @app.check(name="always-good")
+        @app.check(version="1", name="always-good")
         def always_good(_episode: hflow.Episode) -> hflow.CheckResult:
             return hflow.CheckResult(verdict=True, measurements={"score": 1.0})
 
-        @app.enrich(name="write-mask")
+        @app.enrich(version="1", name="write-mask")
         def write_mask(_episode: hflow.Episode) -> hflow.EnrichmentResult:
             artifact_path = tmp_path / "mask.bin"
             artifact_path.write_bytes(b"mask")

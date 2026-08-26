@@ -74,7 +74,7 @@ from hflow.mediapipe_hands import mediapipe_hand_detection
 
 app = hflow.App("my-pipeline")
 
-app.check()(mediapipe_hand_detection)
+app.check(version="hands-v1")(mediapipe_hand_detection)
 ```
 
 To bind configuration, use `functools.partial` or a wrapper, exactly as with
@@ -83,7 +83,7 @@ the built-ins:
 ```python
 import functools
 
-app.check(name="hands")(
+app.check(version="hands-v2", name="hands")(
     functools.partial(
         mediapipe_hand_detection,
         sample_fps=2.0,
@@ -92,16 +92,19 @@ app.check(name="hands")(
 )
 ```
 
+The configured form uses a new version because its sampling and resize policy
+produce results that are not interchangeable with the first registration.
+
 `sample_fps` defaults to 1.0, which is what makes the answer comparable to a
 frames-only VLM reading the same footage, and costs about 11 ms of CPU
 inference per frame. `inference_long_edge_pixels` resizes each frame before
 inference; it changes which hands are found at all on small footage, so it is
 part of the question rather than a performance knob.
 
-Re-tuning either one appends new-version rows rather than mixing two
-behaviours under one version, and so does a change of model weights. Upgrading
-MediaPipe itself does not, which is why every row also carries
-`mediapipe_version`.
+When re-tuning either setting or changing model weights, bump the explicit
+version so the new rows aren't mixed with incompatible old results. Do the
+same after a MediaPipe upgrade if its outputs are no longer comparable. Every
+row also records `mediapipe_version` so you can audit that decision later.
 
 ## Limitations you are accepting
 
@@ -155,8 +158,8 @@ it is exactly the mistake the glove limitation sets up.
 
 One more, from the instrument rather than the card: float16 inference on CPU
 can differ slightly between architectures, so the same version on different
-hardware may not produce identical numbers. The version covers the weights and
-the settings, not the arithmetic of the host.
+hardware may not produce identical numbers. Treat the declared version as a
+promise about the weights and settings, not the arithmetic of the host.
 
 ## Sanity-check it on your own footage
 

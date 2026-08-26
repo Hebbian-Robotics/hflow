@@ -52,10 +52,9 @@ from hflow.video import source_log_times_for_sampled_frames
 
 logger = logging.getLogger(__name__)
 
-# COORDINATE: this digest is the model's identity, and it is also part of the
-# check's identity -- hand_landmarker_model_path reads it, so the version walk
-# folds it into every measurement row. Bumping the pin is therefore a
-# deliberate re-versioning of every hand measurement, never a silent one.
+# COORDINATE: this digest is the model's identity. If this pin changes, the
+# built-in's maintainer notes that change and pipeline authors decide whether
+# to bump the explicit version on their registered hand-detection check.
 PINNED_HAND_MODEL_FILENAME = "hand_landmarker_float16_v1.task"
 PINNED_HAND_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
@@ -418,8 +417,8 @@ def mediapipe_hand_detection(
 
     ``inference_long_edge_pixels`` resizes each frame before inference. It
     changes which hands are found at all on small footage, so it is part of
-    the question rather than a performance knob, and it is folded into this
-    check's version like any other captured setting.
+    the question rather than a performance knob. Include it when deciding
+    whether to bump the registration's explicit version.
     """
     if not 0.0 < sample_fps <= _MAXIMUM_SAMPLE_FPS:
         raise ValueError(
@@ -474,10 +473,8 @@ def mediapipe_hand_detection(
                 f"{topic}/two_hand_detected_frame_share": two_hand_share,
                 f"{topic}/left_hand_detected_frame_count": summary.frames_with_a_left_hand,
                 f"{topic}/right_hand_detected_frame_count": summary.frames_with_a_right_hand,
-                # The instrument, recorded as evidence: the model digest is in
-                # this check's version, but the MediaPipe build is not (a
-                # library version is a poor proxy for "does this compute
-                # differently"), so a run's own row is where it is auditable.
+                # Record the instrument in the row so results remain auditable
+                # independently of the pipeline author's explicit version.
                 f"{topic}/mediapipe_version": _import_mediapipe().__version__,
                 f"{topic}/hand_model_digest": _resolved_hand_model_digest(),
             }

@@ -4,11 +4,11 @@
 imports -- EXECUTES -- exactly once at startup via the shared
 :func:`hflow.import_pipeline_application` seam (the one owner of the "address
 a pipeline by file" contract, used by the CLI too; producing a manifest
-requires the live functions, because step versions are content hashes of
-them). The operator opts into running their own pipeline code by passing the
-flag; an import failure never crashes the server -- the error string is
-remembered, the config capability reports false, and /api/v1/pipeline answers
-409 with the stored reason.
+requires the registered steps and their author-declared versions). The
+operator opts into running their own pipeline code by passing the flag; an
+import failure never crashes the server -- the error string is remembered,
+the config capability reports false, and /api/v1/pipeline answers 409 with the
+stored reason.
 """
 
 import sys

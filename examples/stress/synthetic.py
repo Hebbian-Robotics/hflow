@@ -140,13 +140,13 @@ def generate_corpus(output_dir: Path, plans: list[EpisodePlan]) -> None:
 def run_ingest(corpus_dir: Path, data_root: Path) -> list[dict]:
     """Process every episode in the corpus, timing each one."""
     app = hflow.App("stress-test", data_root=data_root)
-    app.check()(timestamp_regularity)
-    app.check()(joint_discontinuity)
-    app.check()(camera_frame_stats)
-    app.check()(idle_fraction)
-    app.check()(episode_duration)
+    app.check(version="1")(timestamp_regularity)
+    app.check(version="1")(joint_discontinuity)
+    app.check(version="1")(camera_frame_stats)
+    app.check(version="1")(idle_fraction)
+    app.check(version="1")(episode_duration)
 
-    @app.check(name="action_rate_check")
+    @app.check(version="1", name="action_rate_check")
     def action_rate_check(episode: hflow.Episode) -> hflow.CheckResult:
         return action_rate(episode, topics=[JOINT_STATES_TOPIC])
 

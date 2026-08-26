@@ -81,7 +81,7 @@ import hflow
 from hflow.providers import discover_providers
 
 
-@app.check(uses="judge")
+@app.check(version="1", uses="judge")
 def grasp_succeeded(ep: hflow.Episode) -> hflow.CheckResult:
     provider = discover_providers()["vllm"]
     payload = provider.prepare_video_request(

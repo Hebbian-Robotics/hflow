@@ -71,12 +71,10 @@ def test_no_two_builtin_checks_claim_the_same_measurement_key(tmp_path: Path) ->
 
 
 def test_every_builtin_check_registers_bare_and_runs(tmp_path: Path) -> None:
-    """``app.check()(builtin)`` with no wrapper is the documented shortest path
-    (docs/how-to/enable-built-in-checks.md, examples/stress/synthetic.py), and
-    registration content-hashes everything a check references. A built-in that
-    reaches for something unhashable -- an lru_cache-wrapped helper, a client
-    object -- therefore breaks that path at registration while still passing
-    every test that calls it as a plain function.
+    """A built-in registers without HFlow inspecting its implementation.
+
+    The pipeline owns the version, and the check name scopes it, so several
+    checks may intentionally use the same simple revision string.
     """
     app = hflow.App("bare-registration", data_root=tmp_path / "data")
     for builtin in (
@@ -95,7 +93,7 @@ def test_every_builtin_check_registers_bare_and_runs(tmp_path: Path) -> None:
         camera_signal_quality,
         camera_stability,
     ):
-        app.check()(builtin)
+        app.check(version="1")(builtin)
 
     source = synthesize_episode(
         tmp_path / "episode.mcap",
@@ -103,7 +101,7 @@ def test_every_builtin_check_registers_bare_and_runs(tmp_path: Path) -> None:
     )
     report = app.test(source, verbose=False)
     assert not report.has_errors, [run.error for run in report.checks if run.error]
-    assert len({run.check.version for run in report.checks}) == len(app.checks)
+    assert {run.check.version for run in report.checks} == {"1"}
     # Every built-in is evidence-only. Asserted across the whole set, so a
     # built-in that starts returning a verdict is caught even where no
     # per-check test pins it.

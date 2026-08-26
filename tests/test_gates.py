@@ -15,7 +15,7 @@ from hflow.checks import (
     trajectory_metrics,
     trajectory_segments,
 )
-from hflow.steps import compute_check_version, evaluate_gate
+from hflow.steps import evaluate_gate
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
 
@@ -40,7 +40,7 @@ def test_a_gate_fires_only_when_the_pipeline_opts_in(tmp_path: Path) -> None:
 
     ungated = hflow.App("ungated", data_root=tmp_path / "ungated", default_checks=())
 
-    @ungated.check(critical=True)
+    @ungated.check(version="1", critical=True)
     def blackout(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"black_frame_pct": 99.0})
 
@@ -52,7 +52,7 @@ def test_a_gate_fires_only_when_the_pipeline_opts_in(tmp_path: Path) -> None:
 
     gated = hflow.App("gated", data_root=tmp_path / "gated", default_checks=())
 
-    @gated.check(critical=True, gate=RECOMMENDED_CAMERA_INTEGRITY)
+    @gated.check(version="1", critical=True, gate=RECOMMENDED_CAMERA_INTEGRITY)
     def blackout_gated(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"black_frame_pct": 99.0})
 
@@ -64,7 +64,7 @@ def test_a_gate_fires_only_when_the_pipeline_opts_in(tmp_path: Path) -> None:
 def test_a_shipped_gate_accepts_healthy_evidence(tmp_path: Path) -> None:
     app = hflow.App("healthy", data_root=tmp_path / "data", default_checks=())
 
-    @app.check(critical=True, gate=RECOMMENDED_CAMERA_INTEGRITY)
+    @app.check(version="1", critical=True, gate=RECOMMENDED_CAMERA_INTEGRITY)
     def camera(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"black_frame_pct": 0.0, "freeze_total_s": 0.0})
 
@@ -115,7 +115,11 @@ def test_a_clause_matching_no_key_abstains_instead_of_passing(tmp_path: Path) ->
 
     app = hflow.App("abstain", data_root=tmp_path / "data", default_checks=())
 
-    @app.check(critical=True, gate=_gate(hflow.Threshold("*/nope", hflow.Comparison.AT_MOST, 1.0)))
+    @app.check(
+        version="1",
+        critical=True,
+        gate=_gate(hflow.Threshold("*/nope", hflow.Comparison.AT_MOST, 1.0)),
+    )
     def measures(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"present": 5.0})
 
@@ -174,7 +178,7 @@ def test_a_gate_can_only_tighten_a_checks_own_verdict(tmp_path: Path) -> None:
     app = hflow.App("compose", data_root=tmp_path / "data", default_checks=())
     permissive = _gate(hflow.Threshold("v", hflow.Comparison.AT_MOST, 100.0))
 
-    @app.check(critical=True, gate=permissive)
+    @app.check(version="1", critical=True, gate=permissive)
     def rejects_itself(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"v": 1.0}, verdict=False)
 
@@ -186,11 +190,11 @@ def test_a_gate_can_only_tighten_a_checks_own_verdict(tmp_path: Path) -> None:
 def test_a_gate_on_a_noncritical_check_tags_and_the_run_proceeds(tmp_path: Path) -> None:
     app = hflow.App("flags-only", data_root=tmp_path / "data", default_checks=())
 
-    @app.check(gate=_gate(hflow.Threshold("v", hflow.Comparison.AT_MOST, 1.0)))
+    @app.check(version="1", gate=_gate(hflow.Threshold("v", hflow.Comparison.AT_MOST, 1.0)))
     def flags(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"v": 99.0})
 
-    @app.check()
+    @app.check(version="1")
     def runs_after(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"ran": 1})
 
@@ -202,39 +206,40 @@ def test_a_gate_on_a_noncritical_check_tags_and_the_run_proceeds(tmp_path: Path)
     assert report.checks[1].status is hflow.CheckStatus.MEASURED
 
 
-def test_tuning_a_threshold_moves_the_check_version() -> None:
-    """Two policies must never share one version, or curation cannot pin either."""
-
+def test_a_gate_uses_the_version_the_pipeline_author_declares() -> None:
     def probe(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult()
 
-    arguments = ("probe", probe, False, frozenset[str](), None, None)
-    ungated = compute_check_version(*arguments)
-    strict = compute_check_version(
-        *arguments, gate=_gate(hflow.Threshold("v", hflow.Comparison.AT_MOST, 30.0))
-    )
-    loose = compute_check_version(
-        *arguments, gate=_gate(hflow.Threshold("v", hflow.Comparison.AT_MOST, 50.0))
-    )
-    assert len({ungated, strict, loose}) == 3
+    strict = hflow.App("strict", default_checks=())
+    strict.check(
+        version="quality-v2",
+        gate=_gate(hflow.Threshold("v", hflow.Comparison.AT_MOST, 30.0)),
+    )(probe)
+    retuned_without_a_bump = hflow.App("retuned", default_checks=())
+    retuned_without_a_bump.check(
+        version="quality-v2",
+        gate=_gate(hflow.Threshold("v", hflow.Comparison.AT_MOST, 50.0)),
+    )(probe)
+    bumped = hflow.App("bumped", default_checks=())
+    bumped.check(
+        version="quality-v3",
+        gate=_gate(hflow.Threshold("v", hflow.Comparison.AT_MOST, 50.0)),
+    )(probe)
+
+    assert strict.checks[0].version == retuned_without_a_bump.checks[0].version
+    assert bumped.checks[0].version != strict.checks[0].version
 
 
-def test_a_gateless_step_hashes_as_if_gates_did_not_exist() -> None:
-    """A golden hash over inputs carrying no source text: it moves if and only
-    if the identity dict's SHAPE changed. An unconditional new key there would
-    re-version every check, every derived channel, and through
-    pipeline_version every episode_id in every existing corpus.
+def test_a_non_gate_argument_is_refused_at_registration() -> None:
+    app = hflow.App("bad-gate", data_root=Path("/tmp"), default_checks=())
 
-    Last moved when a declared version stopped being an override laid over the
-    introspected identity and became the whole of it. ``implementation`` and
-    ``configuration`` are absent under ``version='...'`` now, which is what
-    lets an author refactor without re-versioning.
-    """
-    identity = compute_check_version("probe", len, False, frozenset(), None, "v1")
-    assert identity == "fec021d42dba"
-    assert (
-        compute_check_version("probe", len, False, frozenset(), None, "v1", gate=None) == identity
-    )
+    with pytest.raises(ValueError, match=re.escape("expected an hflow.Gate")):
+
+        @app.check(version="1", gate=cast(hflow.Gate, "black_frame_pct < 50"))
+        def wrong(ep: hflow.Episode) -> hflow.CheckResult:
+            return hflow.CheckResult()
+
+    assert app.checks == []
 
 
 def test_an_empty_gate_is_refused_at_construction() -> None:
@@ -245,15 +250,3 @@ def test_an_empty_gate_is_refused_at_construction() -> None:
 def test_a_nan_threshold_is_refused_at_construction() -> None:
     with pytest.raises(ValueError, match="not NaN"):
         hflow.Threshold("v", hflow.Comparison.AT_MOST, math.nan)
-
-
-def test_a_non_gate_argument_is_refused_at_registration() -> None:
-    app = hflow.App("bad-gate", data_root=Path("/tmp"), default_checks=())
-
-    with pytest.raises(ValueError, match=re.escape("expected an hflow.Gate")):
-
-        @app.check(gate=cast(hflow.Gate, "black_frame_pct < 50"))
-        def wrong(ep: hflow.Episode) -> hflow.CheckResult:
-            return hflow.CheckResult()
-
-    assert app.checks == []

@@ -162,14 +162,14 @@ from your_existing_qc import check_joint_smoothness  # use your existing checks
 app = hflow.App("kitchen-pipeline")  # data root: $HFLOW_DATA_ROOT, hflow.toml, else ./data
 
 
-@app.check()
+@app.check(version="1")
 def joint_smoothness(ep: hflow.Episode) -> hflow.CheckResult:
     joints = ep.channel("/joint_states").to_numpy()  # our line: extract
     result = check_joint_smoothness(joints, rate_hz=100)  # your line: unchanged
     return hflow.CheckResult(measurements=result)  # our line: record
 
 
-@app.check(critical=True)
+@app.check(version="1", critical=True)
 def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
     camera_topic = next(topic for topic in ep.cameras if "wrist_cam" in topic)
     evidence = camera_frame_stats(ep, cameras=[camera_topic])
@@ -185,6 +185,10 @@ if __name__ == "__main__":
     app.test("episode_0001.mcap")  # whole pipeline, in-process, no infra
     # Or call app.run() here to start the Compose runtime, then use `hflow ingest`.
 ```
+
+Every check, enrichment, and derived channel declares a version. HFlow stores
+that value exactly as written: keep it for behavior-preserving refactors, and
+bump it when old and new results should no longer be treated as comparable.
 
 Curation comes afterwards, via `hflow.curate(data_root / "catalog", sql, output="manifest.parquet")`
 or `hflow curate "<sql>"` on the command line, either way reporting coverage

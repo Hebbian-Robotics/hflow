@@ -198,9 +198,8 @@ def compute_pipeline_version(
             # Only when the episode HAS derived channels: the policy decides
             # their samples, so a bump must make them stale -- but folding it
             # unconditionally would re-version corpora that never resampled
-            # anything. A step's own version cannot cover this, because the
-            # taught idiom reaches ``hflow.resample.to_grid`` through the
-            # module and a module contributes only its name to a step hash.
+            # anything. The pipeline author owns each derived-channel version;
+            # this HFlow-owned policy therefore needs its own identity here.
             **({"resample_policy": RESAMPLE_POLICY_VERSION} if derived_versions else {}),
         },
         sort_keys=True,

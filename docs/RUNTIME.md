@@ -38,10 +38,10 @@ Ingesting the same episodes again does not redo work the catalog can already
 account for. Per episode, each stage after `sync` runs only when one of its
 steps has no outcome recorded against **this episode's content id at that
 step's current version** -- so a corpus that has not changed and a pipeline
-whose checks have not changed cost one source hash apiece, not a decode pass
-and a contact sheet apiece. Add a check, retune a threshold, or replace a
-source file, and the affected stages come back on their own, for exactly the
-episodes affected.
+whose step versions have not changed cost one source hash apiece, not a decode
+pass and a contact sheet apiece. Add a check, bump a check's version after
+retuning a threshold, or replace an episode source file, and the affected
+stages come back on their own for exactly the episodes affected.
 
 ```text
 sync: 400 processed, 0 quarantined, 0 errors
@@ -183,10 +183,9 @@ Two flags select what runs and how:
   checks + catalog registration; `relabel` re-runs only enrichments (the
   canonical files are never rewritten). Same graph, different toggles. Note
   the catalog stays idempotent per episode content and step versions: a
-  backfill or relabel pass appends rows when something actually changed (an
-  updated check or enrichment is a new content-hash version); re-running
-  identical steps over identical episodes is a recorded no-op, not duplicate
-  evidence.
+  backfill or relabel pass appends rows when the pipeline declares a new check
+  or enrichment version; re-running the same declared versions over identical
+  episodes is a recorded no-op, not duplicate evidence.
 - **`--online`** selects the latency-first trigger lane: the sub-DAGs process
   the URIs as **one immediate batch**, no bin-packing, no stagger delays.
   Meant for one run per episode as it lands (a collection rig posting each

@@ -337,7 +337,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="print the pipeline's manifest (steps, versions, endpoints) as JSON",
         description=(
             "Import the pipeline file and print its manifest -- step names, "
-            "content-hash versions, gate flags, endpoint aliases, and version "
+            "explicit versions, gate flags, endpoint aliases, and version "
             "stamps -- as JSON on stdout. This is the metadata a pipeline "
             "crosses a control boundary as. Importing EXECUTES the pipeline "
             "file, so run this in the pipeline's own environment."

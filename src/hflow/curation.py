@@ -491,7 +491,7 @@ def stale_episodes(
     says. That is exactly what ``episodes_latest`` selects, so this reads the
     view instead of carrying its own copy of the ranking.
 
-    Versions are content hashes: "stale" means *different*, never ordered
+    Versions are opaque identities: "stale" means *different*, never ordered
     comparison. Feed each result's ``source_uri`` back into ingestion
     (``hflow ingest`` / ``app.process``) to reprocess it.
     """

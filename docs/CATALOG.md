@@ -64,9 +64,10 @@ Three durability rules govern writes:
   already exists is a no-op (`written=False`). The fingerprint includes the
   observable outcome: exact retries deduplicate, while a successful retry
   after an error appends the repaired result.
-- **Append, never overwrite**: change a check's source or config and its
-  `check_version` changes, so re-running adds *new-version* rows next to the
-  old ones. The corpus is assumed permanently mixed-version; curation picks.
+- **Append, never overwrite**: when a check's results are no longer comparable,
+  bump its explicit version. Re-running then adds rows under the new
+  `check_version` next to the old ones. The corpus is assumed permanently
+  mixed-version; curation picks.
 - **Provenance, not identity**: `orchestrator_run_id` records which
   orchestrated run recorded the row (the generated Airflow DAGs pass their
   stage sub-DAG's own run id; a local run records NULL). It is deliberately
@@ -296,14 +297,15 @@ Your own selection SQL gets neither rule for free. `status = 'ok'` is the one
 worth carrying over.
 
 Pinning a check version by hand (the mixed-version-corpus reality).
-`check_version` is a content hash, not ordered, so pin exact values (or filter
+`check_version` is an opaque identifier declared by the pipeline, not an
+ordered number, so pin exact values (or filter
 `recorded_at`), never compare with `>=`:
 
 ```sql
 SELECT episode_id, value_double AS max_velocity
 FROM measurements
 WHERE key = '/joint_states/max_abs_velocity'
-  AND check_version = '1a2b3c4d5e6f'   -- from check_runs or a previous query
+  AND check_version = 'joint-motion-v2'   -- from the pipeline or check_runs
 ```
 
 Tags: e.g. every episode a non-critical check failed (`failed:<check>` is

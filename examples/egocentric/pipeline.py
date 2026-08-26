@@ -10,10 +10,8 @@ from pathlib import Path
 
 import hflow
 
-# Imported as functions, not reached as ``hflow.checks.x`` attributes: a step's
-# version content-hashes the functions it NAMES (and, transitively, the hflow
-# code they call), while a module contributes only its name. Aliased because
-# the wrapper below takes the built-in's name.
+# Aliased because the wrappers below take the built-ins' names. Their explicit
+# versions belong to this pipeline and must be bumped when behavior changes.
 from hflow.checks import camera_frame_stats as measure_camera_frame_stats
 from hflow.checks import timestamp_regularity as measure_timestamp_regularity
 
@@ -27,12 +25,12 @@ DATA_ROOT = CONTAINER_DATA_ROOT if CONTAINER_DATA_ROOT.is_dir() else Path("data/
 app = hflow.App("egocentric", data_root=DATA_ROOT)
 
 
-@app.check()
+@app.check(version="1")
 def timestamp_regularity(episode: hflow.Episode) -> hflow.CheckResult:
     return measure_timestamp_regularity(episode, expected_hz={episode.cameras[0]: 10.0})
 
 
-@app.check(critical=True)
+@app.check(version="1", critical=True)
 def camera_health(episode: hflow.Episode) -> hflow.CheckResult:
     camera_topic = episode.cameras[0]
     evidence = measure_camera_frame_stats(episode, cameras=[camera_topic])
@@ -61,7 +59,7 @@ def camera_health(episode: hflow.Episode) -> hflow.CheckResult:
     )
 
 
-@app.enrich()
+@app.enrich(version="1")
 def contact_sheet(episode: hflow.Episode) -> hflow.EnrichmentResult:
     artifact_path = DATA_ROOT / "artifacts" / f"{episode.path.stem}-contact-sheet.jpg"
     sheet = hflow.ffmpeg.contact_sheet(

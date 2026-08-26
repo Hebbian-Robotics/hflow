@@ -54,7 +54,7 @@ NANOSECONDS_PER_SECOND = 1_000_000_000
 RESAMPLE_POLICY_VERSION: str = "2"
 
 # ``provenance/v1`` keys written when derived channels are present:
-# ``derived/<topic>`` holds each derived channel's content-hash version, and
+# ``derived/<topic>`` holds each derived channel's author-declared version, and
 # ``resample_policy_version`` names the alignment semantics they used.
 PROVENANCE_KEY_RESAMPLE_POLICY_VERSION = "resample_policy_version"
 PROVENANCE_KEY_DERIVED_PREFIX = "derived/"

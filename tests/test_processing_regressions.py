@@ -2,12 +2,9 @@
 
 import functools
 import json
-import logging
-import re
 import textwrap
-from collections.abc import Callable
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -23,11 +20,6 @@ import hflow
 from hflow._grouped_mcap_writer import NO_SCHEMA_ID, GroupedMcapWriter
 from hflow.doctor import diagnose
 from hflow.format import METADATA_RECORD_EPISODE
-from hflow.steps import (
-    UNDESCRIBED_CONFIGURATION_KEY,
-    compute_check_version,
-    step_identity_payload,
-)
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import write_canonical_episode
 from hflow.video import estimate_fps_from_log_times
@@ -361,13 +353,13 @@ def test_check_returning_wrong_type_is_an_error_not_a_crash(tmp_path: Path) -> N
     )
     app = hflow.App("boundary", data_root=tmp_path / "data", default_checks=())
 
-    @app.check()
+    @app.check(version="1")
     def returns_a_dict(ep: hflow.Episode) -> hflow.CheckResult:
         # Deliberate misuse: the cast smuggles a dict past the type checker,
         # which is exactly what un-typechecked user code would do.
         return cast(hflow.CheckResult, {"black_pct": 1.0})
 
-    @app.check()
+    @app.check(version="1")
     def well_behaved(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"ran": True})
 
@@ -378,23 +370,6 @@ def test_check_returning_wrong_type_is_an_error_not_a_crash(tmp_path: Path) -> N
     assert "expected hflow.CheckResult" in by_name["returns_a_dict"].error
     assert by_name["well_behaved"].status == hflow.CheckStatus.MEASURED
     assert report.has_errors
-
-
-def test_step_version_includes_captured_configuration() -> None:
-    def make_threshold_check(threshold: float) -> Callable[[hflow.Episode], hflow.CheckResult]:
-        def threshold_check(_episode: hflow.Episode) -> hflow.CheckResult:
-            return hflow.CheckResult(verdict=threshold > 0.5)
-
-        return threshold_check
-
-    low_threshold_version = compute_check_version(
-        "threshold", make_threshold_check(0.1), False, frozenset(), None
-    )
-    high_threshold_version = compute_check_version(
-        "threshold", make_threshold_check(0.9), False, frozenset(), None
-    )
-
-    assert low_threshold_version != high_threshold_version
 
 
 def _state_only_episode(tmp_path: Path) -> Path:
@@ -412,11 +387,11 @@ def test_two_checks_recording_one_measurement_key_are_refused(tmp_path: Path) ->
     """
     app = hflow.App("key-collision", data_root=tmp_path / "data", default_checks=())
 
-    @app.check()
+    @app.check(version="1")
     def first(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"shared_count": 1})
 
-    @app.check()
+    @app.check(version="1")
     def second(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"shared_count": 2})
 
@@ -435,11 +410,11 @@ def test_a_check_and_an_enrichment_label_collision_is_refused(tmp_path: Path) ->
     """Checks and enrichment labels share one measurement-key namespace."""
     app = hflow.App("key-collision-enrich", data_root=tmp_path / "data", default_checks=())
 
-    @app.check()
+    @app.check(version="1")
     def measures(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"overlap": 1})
 
-    @app.enrich()
+    @app.enrich(version="1")
     def labels(ep: hflow.Episode) -> hflow.EnrichmentResult:
         return hflow.EnrichmentResult(labels={"overlap": 2})
 
@@ -456,11 +431,11 @@ def test_a_refused_collision_records_nothing(tmp_path: Path) -> None:
     """
     app = hflow.App("key-collision-record", data_root=tmp_path / "data", default_checks=())
 
-    @app.check()
+    @app.check(version="1")
     def left(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"same": 1.0})
 
-    @app.check()
+    @app.check(version="1")
     def right(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"same": 2.0})
 
@@ -477,11 +452,11 @@ def test_two_steps_may_share_a_tag(tmp_path: Path) -> None:
     """
     app = hflow.App("shared-tag", data_root=tmp_path / "data", default_checks=())
 
-    @app.check()
+    @app.check(version="1")
     def first(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"first_count": 1}, tags=["reviewed"])
 
-    @app.check()
+    @app.check(version="1")
     def second(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"second_count": 2}, tags=["reviewed"])
 
@@ -496,7 +471,7 @@ def test_check_with_required_extra_parameter_fails_at_registration() -> None:
         return hflow.CheckResult(measurements={"n": len(topics)})
 
     with pytest.raises(ValueError, match="topics"):
-        app.check()(cast(hflow.steps.CheckFunction, requires_topics))
+        app.check(version="1")(cast(hflow.steps.CheckFunction, requires_topics))
 
     assert app.checks == []
 
@@ -504,7 +479,7 @@ def test_check_with_required_extra_parameter_fails_at_registration() -> None:
 def test_check_with_optional_extra_parameter_registers() -> None:
     app = hflow.App("signature-optional", data_root=Path("/tmp"), default_checks=())
 
-    @app.check()
+    @app.check(version="1")
     def optional_topic(
         ep: hflow.Episode, *, topics: tuple[str, ...] = ("/joint_states",)
     ) -> hflow.CheckResult:
@@ -520,7 +495,7 @@ def test_check_without_episode_parameter_fails_at_registration() -> None:
         return hflow.CheckResult(measurements={"n": 1})
 
     with pytest.raises(ValueError, match="cannot accept the episode"):
-        app.check()(cast(hflow.steps.CheckFunction, no_episode))
+        app.check(version="1")(cast(hflow.steps.CheckFunction, no_episode))
 
     assert app.checks == []
 
@@ -532,7 +507,7 @@ def test_check_with_only_kwargs_fails_at_registration() -> None:
         return hflow.CheckResult(measurements={"n": len(kwargs)})
 
     with pytest.raises(ValueError, match="cannot accept the episode"):
-        app.check()(cast(hflow.steps.CheckFunction, kwargs_only))
+        app.check(version="1")(cast(hflow.steps.CheckFunction, kwargs_only))
 
     assert app.checks == []
 
@@ -540,7 +515,7 @@ def test_check_with_only_kwargs_fails_at_registration() -> None:
 def test_check_with_varargs_registers() -> None:
     app = hflow.App("signature-varargs", data_root=Path("/tmp"), default_checks=())
 
-    @app.check()
+    @app.check(version="1")
     def varargs_check(*args: object) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"n": len(args)})
 
@@ -558,7 +533,7 @@ def test_check_whose_episode_parameter_has_a_default_registers_and_runs() -> Non
     """
     app = hflow.App("signature-defaulted-episode", data_root=Path("/tmp"), default_checks=())
 
-    @app.check()
+    @app.check(version="1")
     def defaulted_episode(episode: hflow.Episode | None = None) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"episode_arrived": episode is not None})
 
@@ -574,7 +549,7 @@ def test_check_whose_episode_parameter_has_a_default_registers_and_runs() -> Non
 def test_enrichments_and_derives_reject_unsatisfiable_signatures(step_kind: str) -> None:
     """The same guard as checks: all three are called with one Episode.
 
-    #86 and #93 fixed this for ``app.check()`` only, leaving the two
+    #86 and #93 fixed this for ``app.check(version="1")`` only, leaving the two
     structurally identical registration paths accepting a signature the
     runtime could never call.
     """
@@ -588,9 +563,9 @@ def test_enrichments_and_derives_reject_unsatisfiable_signatures(step_kind: str)
 
     def register(function: object) -> None:
         if step_kind == "enrichment":
-            app.enrich(name="guarded")(cast(hflow.steps.EnrichmentFunction, function))
+            app.enrich(version="1", name="guarded")(cast(hflow.steps.EnrichmentFunction, function))
         else:
-            app.derive("/derived")(cast(hflow.steps.DerivedFunction, function))
+            app.derive("/derived", version="1")(cast(hflow.steps.DerivedFunction, function))
 
     with pytest.raises(ValueError, match="topics"):
         register(needs_topics)
@@ -614,397 +589,65 @@ def test_wrapper_example_binds_every_missing_parameter() -> None:
         return hflow.CheckResult(measurements={"n": len(topics) + threshold})
 
     with pytest.raises(ValueError) as raised:
-        app.check()(cast(hflow.steps.CheckFunction, two_missing))
+        app.check(version="1")(cast(hflow.steps.CheckFunction, two_missing))
     message = str(raised.value)
     assert "threshold=..." in message
     assert "topics=..." in message
 
 
-def test_step_version_accepts_functools_partial_with_bound_args() -> None:
+def test_registration_accepts_a_partial_with_an_explicit_version() -> None:
+    app = hflow.App("partial-registration", data_root=Path("/tmp"), default_checks=())
     bound = functools.partial(hflow.checks.action_rate, topics=["/joint_states"])
-    version = compute_check_version("bound", bound, False, frozenset(), None)
 
-    assert version
+    app.check(version="action-rate-v2", name="bound")(bound)
 
-
-def test_step_version_differs_when_partial_bindings_change() -> None:
-    """Hold the name fixed, so only the binding can move the version.
-
-    The step name is part of the identity, so naming these differently would
-    pass whether or not the bound arguments were read at all.
-    """
-    topics_a = functools.partial(hflow.checks.action_rate, topics=["/joint_states"])
-    topics_b = functools.partial(hflow.checks.action_rate, topics=["/other_stream"])
-    version_a = compute_check_version("same_name", topics_a, False, frozenset(), None)
-    version_b = compute_check_version("same_name", topics_b, False, frozenset(), None)
-
-    assert version_a != version_b
-    # Stable across construction, so the identity cannot be address-derived.
-    rebuilt_a = functools.partial(hflow.checks.action_rate, topics=["/joint_states"])
-    assert compute_check_version("same_name", rebuilt_a, False, frozenset(), None) == version_a
+    assert {check.name for check in app.checks} == {"bound"}
+    assert app.checks[0].version == "action-rate-v2"
 
 
-def test_step_version_still_refuses_a_partial_bound_to_an_opaque_value() -> None:
-    """Transparency of the wrapper does not make its contents transparent.
-
-    A partial is identifiable only because its bound values are. Bind
-    something the identity machinery cannot describe and it must keep
-    refusing, or the version silently stops tracking that value.
-    """
-
+def test_explicit_version_supports_opaque_callable_configuration() -> None:
     class OpaqueClient:
         pass
 
     def scored_by_client(episode: hflow.Episode, *, client: object) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"ok": client is not None})
 
+    app = hflow.App("opaque-registration", data_root=Path("/tmp"), default_checks=())
     bound = functools.partial(scored_by_client, client=OpaqueClient())
-    with pytest.raises(ValueError, match="cannot derive a stable version identity"):
-        compute_check_version("opaque", bound, False, frozenset(), None)
 
+    app.check(version="vendor-model-v2", name="opaque")(bound)
 
-def test_check_registration_accepts_functools_partial() -> None:
-    app = hflow.App("partial-registration", data_root=Path("/tmp"), default_checks=())
-    bound = functools.partial(hflow.checks.action_rate, topics=["/joint_states"])
+    assert app.checks[0].version == "vendor-model-v2"
 
-    app.check(name="bound")(bound)
 
-    assert {check.name for check in app.checks} == {"bound"}
-    assert app.checks[0].version
+def test_step_version_changes_only_when_the_author_bumps_it() -> None:
+    def before_refactor(_episode: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"n": 0})
 
+    def after_refactor(_episode: hflow.Episode) -> hflow.CheckResult:
+        running_total = 0
+        return hflow.CheckResult(measurements={"n": running_total})
 
-_STEP_VERSION_GLOBAL_THRESHOLD = 0.1
+    before = hflow.App("before", data_root=Path("/tmp"), default_checks=())
+    before.check(version="3", name="owned")(before_refactor)
+    after = hflow.App("after", data_root=Path("/tmp"), default_checks=())
+    after.check(version="3", name="owned")(after_refactor)
+    bumped = hflow.App("bumped", data_root=Path("/tmp"), default_checks=())
+    bumped.check(version="4", name="owned")(after_refactor)
 
+    assert before.checks[0].version == after.checks[0].version
+    assert bumped.checks[0].version != before.checks[0].version
 
-def _global_threshold_check(_episode: hflow.Episode) -> hflow.CheckResult:
-    return hflow.CheckResult(verdict=_STEP_VERSION_GLOBAL_THRESHOLD > 0.5)
 
+def test_all_step_registration_surfaces_reject_invalid_versions() -> None:
+    app = hflow.App("versions", data_root=Path("/tmp"), default_checks=())
 
-def test_step_version_includes_referenced_global_configuration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    low_threshold_version = compute_check_version(
-        "global-threshold", _global_threshold_check, False, frozenset(), None
-    )
-    monkeypatch.setattr(
-        f"{__name__}._STEP_VERSION_GLOBAL_THRESHOLD",
-        0.9,
-    )
-    high_threshold_version = compute_check_version(
-        "global-threshold", _global_threshold_check, False, frozenset(), None
-    )
-
-    assert low_threshold_version != high_threshold_version
-
-
-# Composition in HFlow runs through shared library code, not through edges
-# between checks: two built-ins share the video-measurements package's frame
-# statistics, and the motion checks share its camera-motion definition. That only
-# keeps its integrity if a step version follows the code the step calls, all
-# the way down. Otherwise editing a parser or a constant one level below the
-# step changes what it measures while its version stands still, and the new
-# rows append under the old version.
-#
-# These helpers are module level on purpose: a step hash follows GLOBAL names,
-# so a helper defined inside a test body would be invisible to the walk under
-# test and every assertion below would pass vacuously.
-
-_TRANSITIVE_TOLERANCE = 0.25
-_MEMOISED_TOLERANCE = 0.5
-
-
-def _two_levels_below_the_step(value: float) -> bool:
-    return value > _TRANSITIVE_TOLERANCE
-
-
-def _named_directly_by_the_step(value: float) -> bool:
-    return _two_levels_below_the_step(value)
-
-
-def _check_over_a_helper_chain(_episode: hflow.Episode) -> hflow.CheckResult:
-    return hflow.CheckResult(verdict=_named_directly_by_the_step(1.0))
-
-
-@functools.lru_cache(maxsize=1)
-def _memoised_helper() -> bool:
-    return _MEMOISED_TOLERANCE > 0.1
-
-
-def _check_over_a_memoised_helper(_episode: hflow.Episode) -> hflow.CheckResult:
-    return hflow.CheckResult(verdict=_memoised_helper())
-
-
-class _OpaqueHelperState:
-    """Something the identity machinery cannot describe, held by a helper."""
-
-
-_OPAQUE_HELPER_STATE = _OpaqueHelperState()
-
-
-def _helper_holding_opaque_state() -> bool:
-    return _OPAQUE_HELPER_STATE is not None
-
-
-def _check_over_an_opaque_helper(_episode: hflow.Episode) -> hflow.CheckResult:
-    return hflow.CheckResult(verdict=_helper_holding_opaque_state())
-
-
-def _mutually_recursive_even(remaining: int) -> bool:
-    return True if remaining == 0 else _mutually_recursive_odd(remaining - 1)
-
-
-def _mutually_recursive_odd(remaining: int) -> bool:
-    return False if remaining == 0 else _mutually_recursive_even(remaining - 1)
-
-
-def _check_over_mutual_recursion(_episode: hflow.Episode) -> hflow.CheckResult:
-    return hflow.CheckResult(verdict=_mutually_recursive_even(2))
-
-
-_NONE: frozenset[str] = frozenset()
-
-
-def _version_of(function: Callable[..., object], name: str = "probe") -> str:
-    return compute_check_version(name, function, False, _NONE, None)
-
-
-def test_step_version_follows_a_helper_the_step_does_not_name(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The step names one helper; the behavior lives in the one below it."""
-    before = _version_of(_check_over_a_helper_chain)
-    monkeypatch.setattr(
-        f"{__name__}._two_levels_below_the_step",
-        lambda value: value > 99.0,
-    )
-
-    assert _version_of(_check_over_a_helper_chain) != before
-
-
-def test_step_version_follows_a_constant_read_below_the_step(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A tuned constant is a behavior change wherever it is defined.
-
-    Distinct from the helper test above: swapping a function changes a source
-    the walk already read, while a constant is only reachable by descending
-    into that helper's own captured globals.
-    """
-    before = _version_of(_check_over_a_helper_chain)
-    monkeypatch.setattr(f"{__name__}._TRANSITIVE_TOLERANCE", 0.75)
-
-    assert _version_of(_check_over_a_helper_chain) != before
-
-
-def test_step_version_reads_through_a_memoised_helper(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A cache is not behavior, so the walk unwraps it and keeps going.
-
-    Registration used to refuse a step that reached a memoised helper at all
-    (``hflow.ffmpeg._binary`` memoises the probes the instrument calls), which
-    made "cannot version this" indistinguishable from "nothing to version".
-    """
-    before = _version_of(_check_over_a_memoised_helper)
-    monkeypatch.setattr(f"{__name__}._MEMOISED_TOLERANCE", 0.9)
-
-    assert _version_of(_check_over_a_memoised_helper) != before
-
-
-def test_step_version_terminates_on_mutually_recursive_helpers() -> None:
-    """Cycles are cut by the visited set, not by a depth limit.
-
-    Completing at all is most of the assertion; the repeat pins that the cut
-    is taken at the same place every time, since a cycle broken by traversal
-    order rather than by identity would hash differently per call.
-    """
-    assert _version_of(_check_over_mutual_recursion) == _version_of(_check_over_mutual_recursion)
-
-
-def test_step_version_follows_a_parsing_pattern_below_the_step(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A compiled regex is behavior when it is how output is read.
-
-    ``_METADATA_LINE_PATTERN`` is how the ffmpeg instrument turns a pass over
-    the pixels into the measurements every camera check reports, two calls
-    below the check. Recompiling it differently changes those numbers, so it
-    has to change their versions.
-    """
-    before = _version_of(hflow.checks.camera_signal_quality)
-    monkeypatch.setattr(
-        "hflow._video_measurements._frame_statistics._METADATA_LINE_PATTERN",
-        re.compile(r"^(?P<key>never_matches)=(?P<value>.*)$"),
-    )
-
-    assert _version_of(hflow.checks.camera_signal_quality) != before
-
-
-def test_step_version_ignores_a_logger_a_helper_happens_to_hold() -> None:
-    """Runtime logging configuration is not part of what a step computes.
-
-    A logger is reachable from real built-ins (``hflow.ffmpeg._binary`` warns
-    about an unpinned binary), so it must be describable or the walk stops
-    there. Describing its handlers or level would instead hash the same code
-    differently under different logging setups.
-    """
-    logger = logging.getLogger("hflow.test.identity")
-
-    def check_holding_a_logger(_episode: hflow.Episode) -> hflow.CheckResult:
-        logger.debug("measuring")
-        return hflow.CheckResult(measurements={"ok": True})
-
-    before = _version_of(check_holding_a_logger)
-    logger.setLevel(logging.CRITICAL)
-    logger.addHandler(logging.NullHandler())
-
-    assert _version_of(check_holding_a_logger) == before
-
-
-def _builtin_check_names() -> list[str]:
-    """Every check function hflow.checks defines, discovered rather than
-    listed, so a newly added built-in is guarded without editing this file."""
-    return sorted(
-        name
-        for name in dir(hflow.checks)
-        if not name.startswith("_")
-        and callable(getattr(hflow.checks, name))
-        and getattr(getattr(hflow.checks, name), "__module__", "") == "hflow.checks"
-    )
-
-
-@pytest.mark.parametrize("builtin_name", _builtin_check_names())
-def test_no_builtin_check_leaves_part_of_itself_undescribed(builtin_name: str) -> None:
-    """Every built-in's version must cover ALL the code it reaches.
-
-    The walk degrades rather than refusing when it meets state it cannot
-    describe, which is right for a user's pipeline and wrong for hflow's own
-    code: a marker here means someone can edit the helper below it and no
-    version will move. That gap is invisible in a hash, which is why this
-    asserts over the payload. It is the regression this whole change is
-    about, one level further down.
-    """
-    builtin = getattr(hflow.checks, builtin_name)
-    payload = step_identity_payload(builtin_name, builtin, False, frozenset(), None)
-
-    assert UNDESCRIBED_CONFIGURATION_KEY not in json.dumps(payload)
-
-
-def test_step_version_degrades_instead_of_refusing_over_a_helpers_private_state() -> None:
-    """A user's helper may hold anything; registration must still work.
-
-    The step's OWN captured state stays strict (see the opaque-partial test
-    below). This is only about state one call further down, where refusing
-    would make an unrelated helper's internals fatal to registering a step
-    that is perfectly describable itself.
-    """
-    payload = step_identity_payload(
-        "over-opaque-helper", _check_over_an_opaque_helper, False, frozenset(), None
-    )
-
-    assert UNDESCRIBED_CONFIGURATION_KEY in json.dumps(payload)
-    assert _version_of(_check_over_an_opaque_helper)
-
-
-def test_step_version_does_not_descend_into_a_dependency() -> None:
-    """A step is not re-versioned by an unrelated release of what it imports.
-
-    The walk stops at the first-party boundary. Following a dependency's
-    internals would restore exactly the coupling ``hflow.behavior`` removed:
-    a numpy or scipy upgrade that changed nothing a step observes would still
-    invalidate every corpus. The dependency's own source is still read, so
-    swapping which function is called is caught. Only its private internals
-    are out of scope.
-    """
-    dependency = ModuleType("vendor_analytics")
-    exec(
-        "def _private_internal(value):\n"
-        "    return value + 1\n"
-        "def public_entry_point(value):\n"
-        "    return _private_internal(value)\n",
-        dependency.__dict__,
-    )
-    public_entry_point = dependency.public_entry_point
-
-    def check_over_a_dependency(_episode: hflow.Episode) -> hflow.CheckResult:
-        return hflow.CheckResult(verdict=public_entry_point(1) > 0)
-
-    assert public_entry_point.__module__ == "vendor_analytics"
-    before = _version_of(check_over_a_dependency)
-    exec(
-        "def _private_internal(value):\n    return value * 1000\n",
-        dependency.__dict__,
-    )
-
-    assert _version_of(check_over_a_dependency) == before
-
-
-def _declared_check_before_refactor(_episode: hflow.Episode) -> hflow.CheckResult:
-    total = 0
-    return hflow.CheckResult(measurements={"n": total})
-
-
-def _declared_check_after_refactor(_episode: hflow.Episode) -> hflow.CheckResult:
-    # Renamed local, added comment, reads the shared constant the same way.
-    running_total = 0
-    return hflow.CheckResult(measurements={"n": running_total})
-
-
-def test_a_declared_version_survives_a_refactor_of_the_step() -> None:
-    """The point of declaring: the author judges two spellings equivalent.
-
-    Without this the declaration was advisory: the source hash leaked back
-    in, so refactoring a step that had opted out of derived versioning still
-    split its rows, which is the one thing declaring exists to prevent.
-    """
-    before = compute_check_version(
-        "owned", _declared_check_before_refactor, False, _NONE, None, "3"
-    )
-    after = compute_check_version("owned", _declared_check_after_refactor, False, _NONE, None, "3")
-
-    assert before == after
-    assert _version_of(_declared_check_before_refactor) != _version_of(
-        _declared_check_after_refactor
-    ), "the same refactor must still move a DERIVED version"
-
-
-def test_a_declared_version_still_tracks_what_was_declared_beside_it() -> None:
-    """Declaring owns the implementation, never the registration.
-
-    ``critical`` and a gate are written at the decorator, not refactored into
-    existence: changing one is a deliberate policy edit with a visible diff,
-    and a gate especially must keep moving the version or two thresholds share
-    one and curation can pin neither.
-    """
-    owned = ("owned", _declared_check_before_refactor, False, _NONE, None, "3")
-    baseline = compute_check_version(*owned)
-    gate = hflow.Gate(accept_when=(hflow.Threshold("n", hflow.Comparison.AT_MOST, 1.0),))
-    looser = hflow.Gate(accept_when=(hflow.Threshold("n", hflow.Comparison.AT_MOST, 9.0),))
-
-    assert compute_check_version(*owned, gate=gate) != baseline
-    assert compute_check_version(*owned, gate=looser) != compute_check_version(*owned, gate=gate)
-    critical_owned = ("owned", _declared_check_before_refactor, True, _NONE, None, "3")
-    assert compute_check_version(*critical_owned) != baseline
-
-
-def test_bumping_a_declared_version_is_what_moves_it() -> None:
-    """The author's promise is the whole identity, so the promise must count."""
-    arguments = ("owned", _declared_check_before_refactor, False, _NONE, None)
-
-    assert compute_check_version(*arguments, "3") != compute_check_version(*arguments, "4")
-
-
-def test_declared_step_version_supports_opaque_callable() -> None:
-    opaque_callable = cast(Callable[..., object], len)
-    version = compute_check_version(
-        "opaque",
-        opaque_callable,
-        False,
-        frozenset(),
-        None,
-        declared_version="vendor-model-v2",
-    )
-    assert len(version) == 12
+    with pytest.raises(ValueError, match="must not be empty"):
+        app.check(version="")
+    with pytest.raises(ValueError, match="leading or trailing whitespace"):
+        app.enrich(version=" 1")
+    with pytest.raises(ValueError, match="leading or trailing whitespace"):
+        app.derive("/derived", version="1 ")
 
 
 def test_non_sync_stages_never_fetch_the_raw_source(tmp_path: Path) -> None:
@@ -1045,7 +688,7 @@ def test_missing_artifact_is_the_steps_error_not_the_runs(tmp_path: Path) -> Non
     )
     app = hflow.App("artifact-crash", data_root=tmp_path / "data", default_checks=())
 
-    @app.enrich()
+    @app.enrich(version="1")
     def declares_a_ghost(ep: hflow.Episode) -> hflow.EnrichmentResult:
         return hflow.EnrichmentResult(artifacts={"ghost": tmp_path / "never-written.png"})
 

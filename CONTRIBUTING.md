@@ -152,9 +152,12 @@ canonical outputs after a behavior bump. The behavior version exists to make
 that rewrite explicit and detectable, not to require adapters for every old
 layout.
 
-Changes to checks, enrichments, or anything a step merely calls do not need a
-bump: a step's own content hash already covers its source and captured
-configuration. `tests/test_identity_stability.py` pins these rules.
+Changes to checks and enrichments do not require a transform behavior bump.
+Instead, bump the step's explicit version when its new results are no longer
+comparable with the old ones. Derived channels follow the same author-owned
+rule, but their versions feed `pipeline_version` because their samples are
+written into canonical episode bytes. `tests/test_identity_stability.py` pins
+the transform rules.
 
 ## Quality checks
 

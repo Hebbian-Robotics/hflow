@@ -19,16 +19,16 @@ from your_existing_qc import your_function  # untouched
 app = hflow.App("my-pipeline")
 
 
-@app.check()
+@app.check(version="1")
 def my_check(ep: hflow.Episode) -> hflow.CheckResult:
     inputs = ep.<accessor>(...)          # our line: extract the dialect
     result = your_function(inputs, ...)  # your line: unchanged
     return hflow.CheckResult(measurements=result)  # our line: record
 ```
 
-`@app.check()` takes `name=` (defaults to the function name), `critical=`, `requires={...}` (capability set, e.g. `{"gpu"}`), `uses="alias"` (a named endpoint; see the VLM section), `gate=` (a declarative accept policy the runner evaluates over what the check returned), and optional `version=`. By default a step's identity is derived: its source, its defaults and captured stable configuration such as numeric thresholds, and then transitively the helpers it calls and the constants those read, across your own package and hflow's but never into a dependency. Passing `version=` takes the identity over instead. The function is then not inspected at all, so you can refactor freely and your rows stay comparable, at the cost of remembering to bump the number when behaviour really changes; what you declared beside it (`critical`, `requires`, `uses`, `gate`) still counts. Use it for an opaque client object the SDK cannot inspect deterministically, or for a step you would rather promise about than have measured. Checks that declare no resources run before checks that do, so cheap integrity checks gate expensive model calls. Today `requires`/`uses` record intent, order steps, and let preflight verify named endpoints are configured; they do **not** route the step to a particular worker or GPU pool (per-step compute routing is [deferred](./ARCHITECTURE.md#implementation-status)); a bring-your-own Airflow deployment arranges those resources itself.
+`@app.check(version="1")` takes a required `version=` plus `name=` (defaults to the function name), `critical=`, `requires={...}` (capability set, e.g. `{"gpu"}`), `uses="alias"` (a named endpoint; see the VLM section), and `gate=` (a declarative accept policy the runner evaluates over what the check returned). The version is your compatibility promise: keep it when a refactor preserves the meaning of the results, and bump it when code, configuration, a gate, or a dependency changes that meaning. HFlow stores the value exactly as declared and never inspects the function to derive another identity. Checks that declare no resources run before checks that do, so cheap integrity checks gate expensive model calls. Today `requires`/`uses` record intent, order steps, and let preflight verify named endpoints are configured; they do **not** route the step to a particular worker or GPU pool (per-step compute routing is [deferred](./ARCHITECTURE.md#implementation-status)); a bring-your-own Airflow deployment arranges those resources itself.
 
-Every step is called with exactly one argument, an `Episode`, so `@app.check()`, `@app.enrich()`, and `@app.derive()` refuse a function the runtime could never call: one with a required parameter beyond the episode, or with no positional slot to receive it. That refusal happens at registration, not once per episode, and the error shows the wrapper form to use instead. To pass configuration, bind it in a wrapper (`return action_rate(ep, topics=[...])`) rather than adding a parameter.
+Every step is called with exactly one argument, an `Episode`, so `@app.check(version="1")`, `@app.enrich(version="1")`, and `@app.derive("/topic", version="1")` refuse a function the runtime could never call: one with a required parameter beyond the episode, or with no positional slot to receive it. That refusal happens at registration, not once per episode, and the error shows the wrapper form to use instead. To pass configuration, bind it in a wrapper (`return action_rate(ep, topics=[...])`) rather than adding a parameter.
 
 ## Dialect 1: numpy arrays
 
@@ -44,7 +44,7 @@ def check_joint_smoothness(joints: np.ndarray, rate_hz: float) -> dict[str, floa
 The wrapper:
 
 ```python
-@app.check()
+@app.check(version="1")
 def joint_smoothness(ep: hflow.Episode) -> hflow.CheckResult:
     joints = ep.channel("/joint_states").to_numpy()
     result = check_joint_smoothness(joints, rate_hz=100)
@@ -76,7 +76,7 @@ def measure_sharpness(video_path: str) -> dict[str, float]:
 The wrapper:
 
 ```python
-@app.check()
+@app.check(version="1")
 def sharpness(ep: hflow.Episode) -> hflow.CheckResult:
     mp4 = ep.video("wrist_cam")  # lossless remux of the in-band H.264, cached
     return hflow.CheckResult(measurements=measure_sharpness(str(mp4)))
@@ -92,15 +92,12 @@ spans as `freeze:<topic>` intervals, so registering it is the whole job:
 ```python
 from hflow.checks import camera_frame_stats
 
-app.check()(camera_frame_stats)
+app.check(version="1")(camera_frame_stats)
 ```
 
-Import the built-in as a function rather than reaching it as
-`hflow.checks.camera_frame_stats` inside a wrapper. A step's version
-content-hashes the functions it *names*, and transitively the hflow code those
-call, so an import by name means a change to what the check measures shows up
-as a new step version. A module reached by attribute contributes only its name,
-and the change would append rows under the old version instead.
+The version belongs to this pipeline registration. If you later configure the
+check differently or upgrade to an implementation whose results are no longer
+comparable, change `version="1"` to a new value.
 
 To make it *reject* episodes rather than only measure them, attach a gate at
 registration instead of computing a verdict inside the check --
@@ -147,7 +144,7 @@ app = hflow.App(
 )
 
 
-@app.check(uses="judge")
+@app.check(version="1", uses="judge")
 def gripper_reached_target(ep: hflow.Episode) -> hflow.CheckResult:
     from openai import OpenAI  # your client, your dependency
 
@@ -205,7 +202,7 @@ def validate_labels(meta: dict[str, str]) -> dict[str, bool]:
 The wrapper:
 
 ```python
-@app.check()
+@app.check(version="1")
 def labels(ep: hflow.Episode) -> hflow.CheckResult:
     return hflow.CheckResult(measurements=validate_labels(ep.metadata))
 ```
@@ -221,7 +218,7 @@ The episode is standard MCAP; the accessors are conveniences, not a lock-in laye
 from mcap.reader import make_reader
 
 
-@app.check()
+@app.check(version="1")
 def my_raw_check(ep: hflow.Episode) -> hflow.CheckResult:
     with ep.path.open("rb") as stream:
         reader = make_reader(stream)
@@ -238,14 +235,14 @@ The same is true outside checks entirely: canonical episodes open in Foxglove, R
 | `measurements` | `dict[str, float \| int \| str \| bool]` | Named facts that become catalog columns (record a run with `app.test(..., record=True)`, then query with `hflow.curate()` or any Parquet reader). Name them `<topic>/<metric>_<unit>`: the topic prefix keeps two steps from claiming one key, and the unit suffix lets downstream tools label the value without guessing. |
 | `intervals` | `list[hflow.Interval]` | Labeled time spans; `Interval(start_ns, end_ns, label)` in nanoseconds of log time (the same clock as `ChannelData.timestamps`). |
 | `tags` | `list[str]` | Free-form labels routed to the catalog. |
-| `verdict` | `bool \| None` | Optional, user-owned. `None` means evidence only. `False` on a `critical` check quarantines the episode. Prefer `@app.check(gate=...)` over computing this inline: a gate is evaluated over the measurements you already returned, so a threshold aimed at a missing key cannot cost you the evidence. |
+| `verdict` | `bool \| None` | Optional, user-owned. `None` means evidence only. `False` on a `critical` check quarantines the episode. Prefer `@app.check(version="1", gate=...)` over computing this inline: a gate is evaluated over the measurements you already returned, so a threshold aimed at a missing key cannot cost you the evidence. |
 
 One measurement key may have only one owner, and the runner refuses a run where
 two steps claim the same one --
 [the naming rules](./CATALOG.md#naming-measurement-keys) explain why a shared
 key is unrecoverable rather than merely untidy.
 
-Every recorded result also carries the check's version: a content hash of its source and configuration, of the first-party code it calls, and of any gate you attached. Re-running a changed check, or one whose threshold you retuned, appends new-version rows instead of silently overwriting old ones.
+Every recorded result also carries the version the pipeline declared. Bump it when a changed check or retuned threshold should append new-version rows instead of being treated as comparable with the old results.
 
 ## The dev loop
 
@@ -275,7 +272,7 @@ print(result.verdict)
 ```
 
 The decorator returns the original function, so a check defined with
-`@app.check()` remains directly callable. Use a canonical episode when you want
+`@app.check(version="1")` remains directly callable. Use a canonical episode when you want
 the same input shape the pipeline supplies at run time.
 
 This tests the check function only. It does not apply its registered gate,

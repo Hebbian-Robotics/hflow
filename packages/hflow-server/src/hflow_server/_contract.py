@@ -571,7 +571,7 @@ class PipelineStepManifest(BaseModel):
 
     name: str
     kind: StepKind
-    version: str = Field(description="Content hash of the live function.")
+    version: str = Field(description="Author-declared version of the step.")
     critical: bool
     requires: list[str]
     uses: str | None

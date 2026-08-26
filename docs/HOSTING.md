@@ -42,7 +42,7 @@ Two rules a hosted workspace must follow:
 
 | artifact | producer | contents |
 |---|---|---|
-| Pipeline manifest (`hflow manifest`, `App.manifest()`) | pipeline author's environment | step names, content-hash versions, gate flags, endpoint aliases, pipeline/schema versions -- what a service displays, diffs, and validates without holding the code. Producing it imports (executes) the pipeline, so treat it as the author's claims; the execution environment re-derives the same facts when it imports the code anyway. |
+| Pipeline manifest (`hflow manifest`, `App.manifest()`) | pipeline author's environment | step names, explicit versions, gate flags, endpoint aliases, pipeline/schema versions -- what a service displays, diffs, and validates without holding the code. Producing it imports (executes) the pipeline declarations, so treat the result as the author's claims. |
 | Bundle manifest (`hflow-bundle.json`) | `hflow up` / `hflow deploy` | the rendered bundle as data: manifest version, kind, hflow version, DAG ids, data root, pipeline filename, app variable, requirements flag, task queue, venv interpreter path. The provisioning/upload contract. |
 | Trigger conf | any REST caller | `{"uris": [...], "profile": ..., "mode": "batch"\|"online", "batch_count": ...}` on Airflow's `dagRuns` endpoint -- already the wire shape a control plane calls. |
 | Run states | Airflow REST | `hflow status --airflow-url ...` (and `hflow.runtime.describe_remote_status`) report health, registration, and recent run states with no local files. |
@@ -173,7 +173,7 @@ deployment against facts:
   folds in `hflow.behavior.TRANSFORM_BEHAVIOR_VERSION` (bumped deliberately,
   only when the transform would write different bytes) instead of the release
   number, the canonical file's header carries no release number, and step
-  versions record the modules they reference by name rather than by version.
+  versions change only when their authors bump them.
   A byte-identical input therefore keeps its `episode_id` across upgrades, so
   content-addressed dedupe holds. The flip side is a real one: an engine
   change that alters processing without a behavior bump is invisible to

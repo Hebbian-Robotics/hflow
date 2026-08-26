@@ -44,6 +44,7 @@ def test_a_pipeline_that_registers_nothing_still_records_evidence(
         "media_digest",
     }
     assert len(DEFAULT_CHECKS) == len(measured)
+    assert {run.check.version for run in report.checks} == {"1"}
     duration = next(run for run in report.checks if run.check.name == "episode_duration")
     assert duration.result is not None
     assert duration.result.measurements["duration_s"] == pytest.approx(1.0, abs=0.2)
@@ -71,12 +72,23 @@ def test_a_subset_is_expressible_because_that_is_the_real_need(
     assert "episode_duration" in registered
 
 
+def test_pipeline_authored_checks_require_explicit_registration_versions() -> None:
+    def pipeline_authored_check(episode: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"episode_path": str(episode.path)})
+
+    with pytest.raises(
+        ValueError,
+        match=r"register pipeline-authored checks with app\.check\(version=\.\.\.\)",
+    ):
+        hflow.App("custom-default", default_checks=(pipeline_authored_check,))
+
+
 def test_registering_a_default_yourself_configures_it_rather_than_colliding(
     tmp_path: Path,
 ) -> None:
     app = hflow.App("configured", data_root=tmp_path / "data")
 
-    app.check(critical=True)(episode_duration)
+    app.check(version="1", critical=True)(episode_duration)
 
     registrations = [
         registered for registered in app.checks if registered.name == "episode_duration"
@@ -90,13 +102,13 @@ def test_two_pipeline_steps_sharing_a_name_are_still_refused(tmp_path: Path) -> 
     steps the engine has no basis to pick a winner."""
     app = hflow.App("clash", data_root=tmp_path / "data")
 
-    @app.check(name="mine")
+    @app.check(version="1", name="mine")
     def first(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult()
 
     with pytest.raises(ValueError, match="already registered"):
 
-        @app.check(name="mine")
+        @app.check(version="1", name="mine")
         def second(ep: hflow.Episode) -> hflow.CheckResult:
             return hflow.CheckResult()
 
@@ -108,7 +120,7 @@ def test_a_default_yields_to_a_pipeline_step_measuring_the_same_thing(
     name, which emits the built-in's keys. That must not be a collision."""
     app = hflow.App("wrapping", data_root=tmp_path / "data")
 
-    @app.check()
+    @app.check(version="1")
     def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.checks.timestamp_regularity(ep, tolerance_s=0.001)
 
@@ -135,7 +147,7 @@ def test_a_default_that_does_not_overlap_keeps_running(
     """Only the overlapping default yields; the rest of the baseline stands."""
     app = hflow.App("partial-overlap", data_root=tmp_path / "data")
 
-    @app.check()
+    @app.check(version="1")
     def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.checks.timestamp_regularity(ep)
 
@@ -196,7 +208,7 @@ def test_a_wrapper_with_non_default_parameters_supersedes_the_default_without_ru
     """
     app = hflow.App("non-default-wrap", data_root=tmp_path / "data")
 
-    @app.check()
+    @app.check(version="1")
     def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
         # Non-default parameter: a different freeze_min_duration_s builds a
         # different filter graph inside frame_stats.
@@ -259,7 +271,7 @@ def test_a_wrapper_with_default_parameters_uses_the_post_execution_backstop(
     """
     app = hflow.App("default-params", data_root=tmp_path / "data")
 
-    @app.check()
+    @app.check(version="1")
     def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.checks.camera_frame_stats(ep)
 
@@ -285,7 +297,7 @@ def test_a_non_overlapping_user_step_does_not_supersede(
     complementary."""
     app = hflow.App("non-overlap", data_root=tmp_path / "data")
 
-    @app.check()
+    @app.check(version="1")
     def unrelated(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"my/custom/key": 1.0})
 
@@ -304,7 +316,7 @@ def test_superseded_default_reports_the_overlapping_keys(
     "superseded by the pipeline" regardless of which path fired."""
     app = hflow.App("keys-listed", data_root=tmp_path / "data")
 
-    @app.check()
+    @app.check(version="1")
     def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.checks.camera_frame_stats(ep, freeze_min_duration_s=2.0)
 
@@ -344,7 +356,7 @@ def test_partial_camera_coverage_drops_the_uncovered_camera_too(tmp_path: Path) 
     )
     app = hflow.App("partial", data_root=tmp_path / "data")
 
-    @app.check()
+    @app.check(version="1")
     def only_wrist(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.checks.camera_frame_stats(ep)
 
@@ -437,6 +449,7 @@ def test_quarantined_episode_still_carries_default_measurements(
     app = hflow.App("quarantining", data_root=tmp_path / "data")
 
     @app.check(
+        version="1",
         critical=True,
         gate=hflow.checks.RECOMMENDED_CAMERA_INTEGRITY,
     )

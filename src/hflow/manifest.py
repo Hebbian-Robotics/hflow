@@ -4,30 +4,30 @@ The manifest is the metadata a pipeline submission crosses a control
 boundary as (docs/ARCHITECTURE.md "Tenancy": only metadata, states, and
 pointers cross -- never episode bytes, and a service should not need to
 execute customer code just to display or diff a pipeline). It carries the
-pipeline's identity facts: step names and content-hash versions, gate
+pipeline's identity facts: step names and author-declared versions, gate
 configuration, endpoint aliases, and the pipeline/schema versions the
 catalog will stamp.
 
 Honesty boundary: producing a manifest REQUIRES importing the pipeline file,
-because step versions are content hashes of the live functions
-(``hflow.steps.compute_check_version``). ``hflow manifest`` therefore runs
-in the pipeline author's own environment (or a sandbox the operator trusts),
-and a consumer treats the result as the author's claims -- verified, if
-needed, by re-deriving it inside the execution environment, where the same
-code must be imported anyway.
+because registrations are executable SDK calls even though their versions are
+explicit. ``hflow manifest`` therefore runs in the pipeline author's own
+environment (or a sandbox the operator trusts), and a consumer treats the
+result as the author's claims.
 """
 
 import json
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 
-from hflow.steps import Gate, RegisteredCheck, RegisteredEnrichment
+from hflow.steps import Gate, RegisteredCheck, RegisteredEnrichment, StepVersion
 
 # Versions the manifest's own JSON shape; bump on any change so consumers
 # can refuse loudly instead of misreading.
 # 2: steps carry their declarative gate, so a service can show WHICH policy
 #    rejected an episode rather than only that some critical check did.
-PIPELINE_MANIFEST_VERSION = 2
+# 3: step versions are explicit pipeline-author promises rather than
+#    engine-derived identifiers.
+PIPELINE_MANIFEST_VERSION = 3
 
 
 class StepKind(StrEnum):
@@ -46,7 +46,7 @@ class StepManifest:
     # so a serialized step stays self-describing when consumers flatten or
     # diff entries out of their list context.
     kind: StepKind
-    version: str
+    version: StepVersion
     critical: bool
     requires: tuple[str, ...]
     uses: str | None
@@ -107,7 +107,7 @@ class DerivedChannelManifest:
     """One registered derived channel's identity."""
 
     topic: str
-    version: str
+    version: StepVersion
 
     def to_json_dict(self) -> dict[str, object]:
         return {"topic": self.topic, "version": self.version}
@@ -116,7 +116,7 @@ class DerivedChannelManifest:
 @dataclass(frozen=True)
 class PipelineManifest:
     """Everything a service needs to display, diff, and validate a pipeline
-    without holding the code: names, content-hash versions, gate flags, and
+    without holding the code: names, explicit versions, gate flags, and
     the endpoint aliases the steps declare."""
 
     pipeline_name: str

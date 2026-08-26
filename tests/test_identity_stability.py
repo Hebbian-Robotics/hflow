@@ -1,23 +1,12 @@
-"""A release must not re-version a corpus that processed nothing differently.
-
-Until the identity epoch in :mod:`hflow.behavior`, ``hflow.__version__`` was
-folded into ``pipeline_version`` and into any step version whose function
-referenced a module. A CLI-only patch release therefore invalidated an entire
-corpus: ``hflow stale`` listed everything even though processing behavior had
-not changed.
-
-These tests fail if any of those couplings comes back.
-"""
+"""A release must not re-version a corpus that processed nothing differently."""
 
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 
-import numpy
 from mcap.reader import make_reader
 
 import hflow
-from hflow.steps import CheckResult, compute_check_version
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import (
     TransformConfig,
@@ -26,16 +15,6 @@ from hflow.transform import (
 )
 
 FAKE_RELEASE = "9.9.9"
-
-
-def _step_version(function: Callable[..., object]) -> str:
-    return compute_check_version(
-        name="probe",
-        function=function,
-        critical=False,
-        requires=frozenset(),
-        uses=None,
-    )
 
 
 def _with_faked_release(compute: Callable[[], str]) -> tuple[str, str]:
@@ -77,11 +56,11 @@ def test_pipeline_version_tracks_the_transform_behavior_version() -> None:
 
 
 def test_pipeline_version_tracks_the_resample_policy_only_when_derived_channels_exist() -> None:
-    """The resample policy decides derived samples and no step hash sees it.
+    """The HFlow-owned resample policy has its own pipeline identity input.
 
-    A step version folds in a referenced MODULE's name only, so a pipeline
-    whose derive function calls ``hflow.resample.to_grid`` cannot notice the
-    policy changing. ``compute_pipeline_version`` folds it in instead -- but
+    Pipeline authors own derived-channel versions, so HFlow cannot silently
+    change those values when its resampling policy changes.
+    ``compute_pipeline_version`` therefore folds the policy in itself -- but
     only for episodes that actually have derived channels, so bumping the
     policy never churns a corpus that resampled nothing.
     """
@@ -102,51 +81,6 @@ def test_pipeline_version_tracks_the_resample_policy_only_when_derived_channels_
         )
     finally:
         transform_module.RESAMPLE_POLICY_VERSION = original
-
-
-def test_step_referencing_the_hflow_module_survives_a_release() -> None:
-    def check_via_module(episode: object) -> object:
-        return hflow.CheckResult(measurements={"ok": 1.0})
-
-    before, after = _with_faked_release(lambda: _step_version(check_via_module))
-    assert before == after
-
-
-def test_step_referencing_a_third_party_module_survives_its_upgrade() -> None:
-    """The defect was never hflow-specific: numpy upgrades churned too."""
-
-    def check_via_numpy(values: list[float]) -> float:
-        return float(numpy.mean(values))
-
-    before = _step_version(check_via_numpy)
-    original = numpy.__version__
-    numpy.__version__ = "99.0.0"
-    try:
-        after = _step_version(check_via_numpy)
-    finally:
-        numpy.__version__ = original
-    assert before == after
-
-
-def test_step_version_still_tracks_what_the_author_wrote() -> None:
-    """Author-owned facts must still re-version -- that is the point."""
-
-    def original_threshold(episode: object) -> CheckResult:
-        return CheckResult(measurements={"limit": 1.0})
-
-    def changed_threshold(episode: object) -> CheckResult:
-        return CheckResult(measurements={"limit": 2.0})
-
-    assert _step_version(original_threshold) != _step_version(changed_threshold)
-
-    captured_limit = 1.0
-
-    def uses_closure(episode: object) -> CheckResult:
-        return CheckResult(measurements={"limit": captured_limit})
-
-    with_first_capture = _step_version(uses_closure)
-    captured_limit = 2.0
-    assert _step_version(uses_closure) != with_first_capture
 
 
 def test_canonical_write_order_is_total_so_identity_cannot_ride_on_append_order(

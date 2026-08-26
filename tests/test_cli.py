@@ -23,7 +23,7 @@ def test_cli_manifest_prints_the_pipeline_manifest_json(
     pipeline_file.write_text(
         "import hflow\n\n"
         "my_app = hflow.App('kitchen', data_root='./data', default_checks=())\n\n"
-        "@my_app.check(critical=True)\n"
+        '@my_app.check(version="1", critical=True)\n'
         "def blackout(ep: hflow.Episode) -> hflow.CheckResult:\n"
         "    return hflow.CheckResult()\n"
     )
@@ -34,6 +34,7 @@ def test_cli_manifest_prints_the_pipeline_manifest_json(
     assert manifest_payload["hflow_version"] == __version__
     (check_entry,) = manifest_payload["checks"]
     assert check_entry["name"] == "blackout"
+    assert check_entry["version"] == "1"
     assert check_entry["critical"] is True
 
 

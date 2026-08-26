@@ -15,7 +15,6 @@ file.
 
 import functools
 import hashlib
-import json
 import os
 from collections.abc import Iterator
 from pathlib import Path
@@ -34,11 +33,6 @@ from hflow.mediapipe_hands import (
     mediapipe_hand_detection,
     summarize_hand_detections,
 )
-from hflow.steps import (
-    UNDESCRIBED_CONFIGURATION_KEY,
-    compute_check_version,
-    step_identity_payload,
-)
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import TransformConfig, write_canonical_episode
 
@@ -47,10 +41,6 @@ MEDIAPIPE_TESTS_ENABLED = os.environ.get("HFLOW_MEDIAPIPE_TESTS") == "1"
 
 def _frame(hand_count: int, left: int = 0, right: int = 0) -> FrameHandCounts:
     return FrameHandCounts(hand_count=hand_count, left_hand_count=left, right_hand_count=right)
-
-
-def _check_version() -> str:
-    return compute_check_version("hands", mediapipe_hand_detection, False, frozenset(), None)
 
 
 @pytest.fixture
@@ -212,48 +202,27 @@ class TestRegistrationWithoutTheModel:
     ) -> None:
         """The documented shortest path, on a machine that has neither.
 
-        Registration computes a content hash, and anything it touched that
-        reached for the instrument would make the check impossible to register
-        until the instrument was installed -- exactly the regression that
-        ``camera_frame_stats`` shipped with when it read the ffmpeg version at
-        registration.
+        Registration records the explicit version without touching the model
+        or inspecting the implementation.
         """
         app = hflow.App("hands", data_root=tmp_path, default_checks=())
-        app.check()(mediapipe_hand_detection)
+        app.check(version="hands-v1")(mediapipe_hand_detection)
         (registered,) = app.checks
         assert registered.name == "mediapipe_hand_detection"
-        assert registered.version
+        assert registered.version == "hands-v1"
 
-    def test_changing_the_model_pin_moves_the_version(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Different weights cannot share one identity: they are what produced
-        the numbers, so a re-pin has to append new-version rows rather than
-        mixing two models' measurements under one version.
-        """
-        version_on_the_pinned_model = _check_version()
-        monkeypatch.setattr("hflow.mediapipe_hands.PINNED_HAND_MODEL_SHA256", "0" * 64)
-        assert _check_version() != version_on_the_pinned_model
-
-    def test_the_version_leaves_nothing_undescribed(self) -> None:
-        """Same bar as the built-ins: a marker here means someone can edit the
-        code below it and no version will move.
-        """
-        payload = step_identity_payload(
-            "mediapipe_hand_detection", mediapipe_hand_detection, False, frozenset(), None
+    def test_a_retuned_registration_can_declare_a_new_version(self) -> None:
+        default = hflow.App("default-hands", default_checks=())
+        default.check(version="hands-v1")(mediapipe_hand_detection)
+        retuned = hflow.App("retuned-hands", default_checks=())
+        retuned.check(version="hands-v2", name="mediapipe_hand_detection")(
+            functools.partial(
+                mediapipe_hand_detection,
+                minimum_hand_detection_confidence=0.8,
+            )
         )
-        assert UNDESCRIBED_CONFIGURATION_KEY not in json.dumps(payload)
 
-    def test_retuning_a_confidence_moves_the_version(self) -> None:
-        default_version = _check_version()
-        retuned_version = compute_check_version(
-            "hands",
-            functools.partial(mediapipe_hand_detection, minimum_hand_detection_confidence=0.8),
-            False,
-            frozenset(),
-            None,
-        )
-        assert retuned_version != default_version
+        assert default.checks[0].version != retuned.checks[0].version
 
     def test_a_sampling_rate_finer_than_the_model_clock_is_refused(self, tmp_path: Path) -> None:
         """MediaPipe timestamps video frames in whole milliseconds, so two
@@ -311,7 +280,7 @@ class TestEndToEnd:
         assert result.measurements[f"{topic}/hand_detected_frame_share"] == 0.0
         assert result.measurements[f"{topic}/two_hand_detected_frame_share"] == 0.0
         assert result.measurements[f"{topic}/hand_sample_fps"] == 1.0
-        # The instrument, recorded as evidence rather than hashed into the version.
+        # The instrument remains auditable independently of the explicit version.
         assert result.measurements[f"{topic}/mediapipe_version"]
         assert result.measurements[f"{topic}/hand_model_digest"] == PINNED_HAND_MODEL_SHA256
         # No detection anywhere is one absence interval over the sampled span.

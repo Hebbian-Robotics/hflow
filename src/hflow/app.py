@@ -26,7 +26,6 @@ import time
 import traceback
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from functools import cache
 from pathlib import Path
 from types import MappingProxyType, ModuleType
 from typing import TYPE_CHECKING
@@ -71,8 +70,9 @@ from hflow.steps import (
     RegisteredCheck,
     RegisteredEnrichment,
     Stage,
-    compute_check_version,
+    StepVersion,
     evaluate_gate,
+    parse_step_version,
     stages_for_profile,
 )
 from hflow.storage import (
@@ -183,6 +183,7 @@ def _resolve_data_root(data_root: "Path | str | StorageRoot | None") -> "Path | 
 # contact sheet per camera topic, recorded exactly like an enrichment so its
 # catalog rows flow through CheckRunRow like everything else.
 MEDIA_CONTACT_SHEET_STEP_NAME = "media/contact_sheet"
+MEDIA_CONTACT_SHEET_STEP_VERSION = parse_step_version("1")
 # Published artifacts are recorded as measurements under this prefix, so a
 # reader can tell "here is where the file went" from an ordinary label.
 ARTIFACT_MEASUREMENT_KEY_PREFIX = "artifact/"
@@ -359,9 +360,8 @@ def _render_contact_sheets(canonical_episode: Episode, media_directory: Path) ->
     return EnrichmentResult(artifacts=sheet_artifacts)
 
 
-@cache
-def media_contact_sheet_step_version() -> str:
-    """The content-hash version of the engine's contact-sheet step.
+def media_contact_sheet_step_version() -> StepVersion:
+    """The explicit version of the engine's contact-sheet step.
 
     One owner, because two things now need it: :meth:`App.process` stamps the
     step's catalog rows with it, and :mod:`hflow.stage_planning` asks whether a
@@ -369,13 +369,8 @@ def media_contact_sheet_step_version() -> str:
     that recomputed it its own way would schedule the media stage forever the
     first time the two spellings drifted.
 
-    Cached because the inputs are module constants -- the step's name and the
-    renderer's own source -- so the answer cannot change within a process, and
-    hashing a function's transitive source is not free.
     """
-    return compute_check_version(
-        MEDIA_CONTACT_SHEET_STEP_NAME, _render_contact_sheets, False, frozenset(), None
-    )
+    return MEDIA_CONTACT_SHEET_STEP_VERSION
 
 
 def _resolve_stages(stages: Iterable[Stage] | str | None) -> frozenset[Stage]:
@@ -756,7 +751,7 @@ def _raise_if_measurement_keys_collide(check_rows: Sequence[CheckRunRow]) -> Non
         "measurements_latest and from the wide episodes view. If both steps are "
         "meant to run, give one its own key namespace; if one is a duplicate "
         "registration, drop it. Namespacing looks like:\n\n"
-        f"@app.check(name={example_step!r})\n"
+        f'@app.check(version="1", name={example_step!r})\n'
         f"def {example_function}(ep: hflow.Episode) -> hflow.CheckResult:\n"
         f"    result = ...  # what {example_step!r} computes today\n"
         "    return hflow.CheckResult(\n"
@@ -932,6 +927,10 @@ class App:
         file runs unedited on a laptop, inside the runtime containers, and
         in a hosted workspace whose root the deployment injects.
     :param transform: Canonical-transform configuration.
+    :param default_checks: Optional subset of ``hflow.checks.DEFAULT_CHECKS``.
+        ``None`` enables the whole automatic baseline; an empty iterable
+        disables it. Register pipeline-authored checks with
+        ``app.check(version=...)`` instead.
     :param endpoints: Named endpoint aliases (e.g. ``{"judge": "http://..."}``)
         that checks declare with ``uses="judge"`` and resolve via
         ``app.endpoints["judge"]`` in their own client code. At run start,
@@ -1059,8 +1058,8 @@ class App:
         simply to transcode it again.
         """
         if self.transform_override is not None:
-            # An override's own code is in no version hash, so nothing here
-            # could tell an edited override from an unchanged one.
+            # Transform overrides have no explicit version, so nothing here
+            # can tell an edited override from an unchanged one.
             return None
         try:
             marker_path = run_storage_root.fetch(_SYNC_COMPLETION_MARKER_NAME)
@@ -1126,10 +1125,12 @@ class App:
         switch cannot say -- it would force opting out of every default to
         change one.
         """
-        from hflow.checks import DEFAULT_CHECKS
+        from hflow.checks import DEFAULT_CHECKS, _default_check_version_for_automatic_registration
 
         for check_function in DEFAULT_CHECKS if default_checks is None else default_checks:
-            self.check()(check_function)
+            self.check(version=_default_check_version_for_automatic_registration(check_function))(
+                check_function
+            )
             self._default_check_names.add(getattr(check_function, "__name__", ""))
 
     def _remove_registered_check(self, check_name: str) -> None:
@@ -1179,15 +1180,14 @@ class App:
         return _source_identity(episode, self.storage_root)
 
     def manifest(self) -> PipelineManifest:
-        """This pipeline's JSON-able description: step names, content-hash
+        """This pipeline's JSON-able description: step names, explicit
         versions, gate flags, endpoint aliases, and version stamps.
 
         The metadata a pipeline crosses a control boundary as (`hflow
         manifest` on the CLI): a service can display, diff, and validate
-        pipelines from it without holding the code. Producing it requires
-        importing the pipeline (versions hash the live functions), so
-        generate it in the pipeline author's own environment and treat the
-        result as the author's claims.
+        pipelines from it without holding the code. Producing it still imports
+        the executable pipeline declarations, so generate it in the pipeline
+        author's own environment and treat the result as the author's claims.
         """
         from hflow import __version__
         from hflow.format import EPISODE_FORMAT_VERSION
@@ -1217,12 +1217,12 @@ class App:
     def check(
         self,
         *,
+        version: str,
         name: str | None = None,
         critical: bool = False,
         requires: Iterable[str] | None = None,
         uses: str | None = None,
         gate: Gate | None = None,
-        version: str | None = None,
     ) -> Callable[[CheckFunction], CheckFunction]:
         """Register a check function. See ``hflow.steps.CheckResult``.
 
@@ -1233,9 +1233,11 @@ class App:
         a copy with your own numbers. Combined with ``critical=True`` a failing
         gate quarantines; without it, the run proceeds with a ``failed:`` tag.
 
-        ``version`` explicitly identifies opaque configuration that cannot be
-        derived from function source, defaults, or captured stable values.
+        ``version`` is the author's compatibility promise for the check's
+        behavior. Bump it whenever code or configuration changes in a way that
+        makes old and new results no longer comparable.
         """
+        step_version = parse_step_version(version)
 
         def register(function: CheckFunction) -> CheckFunction:
             check_name = name if name is not None else getattr(function, "__name__", "")
@@ -1250,14 +1252,17 @@ class App:
             if check_name in self._registered_step_names():
                 raise ValueError(f"a step named {check_name!r} is already registered")
             _raise_if_step_cannot_take_only_an_episode(
-                function, step_kind="check", step_name=check_name, decorator="@app.check()"
+                function,
+                step_kind="check",
+                step_name=check_name,
+                decorator='@app.check(version="1")',
             )
             if gate is not None and not isinstance(gate, Gate):
                 raise ValueError(
                     f"check {check_name!r} was registered with gate="
                     f"{type(gate).__name__}, expected an hflow.Gate -- a gate is a value "
                     "you build once and pass in, e.g.\n\n"
-                    "    @app.check(critical=True, "
+                    '    @app.check(version="1", critical=True, '
                     "gate=hflow.checks.RECOMMENDED_CAMERA_INTEGRITY)\n"
                     f"    def {check_name}(ep: hflow.Episode) -> hflow.CheckResult:\n"
                     "        return hflow.checks.camera_frame_stats(ep)\n"
@@ -1270,15 +1275,7 @@ class App:
                     critical=critical,
                     requires=requires_set,
                     uses=uses,
-                    version=compute_check_version(
-                        check_name,
-                        function,
-                        critical,
-                        requires_set,
-                        uses,
-                        version,
-                        gate=gate,
-                    ),
+                    version=step_version,
                     gate=gate,
                 )
             )
@@ -1289,16 +1286,18 @@ class App:
     def enrich(
         self,
         *,
+        version: str,
         name: str | None = None,
         requires: Iterable[str] | None = None,
         uses: str | None = None,
-        version: str | None = None,
     ) -> Callable[[EnrichmentFunction], EnrichmentFunction]:
         """Register an enrichment. See ``hflow.steps.EnrichmentResult``.
 
         Enrichments run after every check and never on a quarantined episode
-        (the gate semantics: no enrichment spend on bad data).
+        (the gate semantics: no enrichment spend on bad data). ``version`` is
+        the author's compatibility promise for the enrichment's outputs.
         """
+        step_version = parse_step_version(version)
 
         def register(function: EnrichmentFunction) -> EnrichmentFunction:
             enrichment_name = name if name is not None else getattr(function, "__name__", "")
@@ -1310,7 +1309,7 @@ class App:
                 function,
                 step_kind="enrichment",
                 step_name=enrichment_name,
-                decorator="@app.enrich()",
+                decorator='@app.enrich(version="1")',
             )
             requires_set = frozenset(requires) if requires is not None else frozenset()
             self.enrichments.append(
@@ -1319,33 +1318,27 @@ class App:
                     function=function,
                     requires=requires_set,
                     uses=uses,
-                    version=compute_check_version(
-                        enrichment_name,
-                        function,
-                        False,
-                        requires_set,
-                        uses,
-                        version,
-                    ),
+                    version=step_version,
                 )
             )
             return function
 
         return register
 
-    def derive(
-        self, topic: str, *, version: str | None = None
-    ) -> Callable[[DerivedFunction], DerivedFunction]:
+    def derive(self, topic: str, *, version: str) -> Callable[[DerivedFunction], DerivedFunction]:
         """Register a derived-signal function: ``(Episode) -> DerivedSeries``.
 
         The function is computed over the SOURCE episode during
         :meth:`process` (before the canonical transform; ``Episode`` works on
         pre-canonical files for state channels) and its series is written as a
         new JSON channel on ``topic`` in the canonical file. Build series with
-        ``hflow.to_grid`` or construct a ``DerivedSeries`` directly.
+        ``hflow.to_grid`` or construct a ``DerivedSeries`` directly. Bump the
+        explicit ``version`` when old and new derived samples are no longer
+        compatible.
         """
         if not topic:
             raise ValueError(f"derived channel topic must not be empty, got {topic!r}")
+        step_version = parse_step_version(version)
 
         def register(function: DerivedFunction) -> DerivedFunction:
             if any(registered.topic == topic for registered in self.derived):
@@ -1354,20 +1347,13 @@ class App:
                 function,
                 step_kind="derived channel",
                 step_name=topic,
-                decorator=f'@app.derive("{topic}")',
+                decorator=f'@app.derive("{topic}", version="1")',
             )
             self.derived.append(
                 DerivedChannel(
                     topic=topic,
                     function=function,
-                    version=compute_check_version(
-                        topic,
-                        function,
-                        False,
-                        frozenset(),
-                        None,
-                        version,
-                    ),
+                    version=step_version,
                 )
             )
             return function
@@ -1951,8 +1937,8 @@ class App:
                     function=render_contact_sheets,
                     requires=frozenset(),
                     uses=None,
-                    # Versioned by the implementation function, so a changed
-                    # renderer is a new measurement identity.
+                    # HFlow owns this built-in, so a renderer behavior change
+                    # must bump the explicit constant above.
                     version=media_contact_sheet_step_version(),
                 )
                 report.enrichments.append(

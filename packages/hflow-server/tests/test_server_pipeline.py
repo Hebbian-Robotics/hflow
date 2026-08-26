@@ -17,12 +17,12 @@ WORKING_PIPELINE_SOURCE = """import hflow
 app = hflow.App("ui-demo", default_checks=())
 
 
-@app.check(name="joint_check", critical=True)
+@app.check(version="1", name="joint_check", critical=True)
 def joint_check(episode):
     return hflow.CheckResult(measurements={"max_velocity": 1.0}, verdict=True)
 
 
-@app.enrich(name="caption")
+@app.enrich(version="1", name="caption")
 def caption(episode):
     return hflow.EnrichmentResult(labels={"caption": "hello"})
 """

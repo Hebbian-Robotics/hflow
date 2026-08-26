@@ -17,11 +17,9 @@ import numpy as np
 
 import hflow
 
-# Imported as functions, not reached as ``hflow.checks.x`` attributes: a step's
-# version content-hashes the functions it NAMES (and, transitively, the hflow
-# code they call), while a module contributes only its name. Spelling it this
-# way is what makes "the built-in changed" show up as a new step version rather
-# than as new rows under the old one.
+# Imported as functions because the pipeline calls them directly. The versions
+# below are explicit compatibility promises; bump them when an implementation
+# or configuration change makes old and new results no longer comparable.
 from hflow.checks import camera_frame_stats, timestamp_regularity
 
 
@@ -36,19 +34,19 @@ def check_joint_smoothness(joints: np.ndarray, rate_hz: float) -> dict[str, floa
 app = hflow.App("kitchen-pipeline")
 
 
-@app.check()
+@app.check(version="1")
 def joint_smoothness(ep: hflow.Episode) -> hflow.CheckResult:
     joints = ep.channel("/joint_states").to_numpy()
     measurements = check_joint_smoothness(joints, rate_hz=100)
     return hflow.CheckResult(measurements=dict(measurements))
 
 
-@app.check()
+@app.check(version="1")
 def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
     return timestamp_regularity(ep, tolerance_s=0.005)
 
 
-@app.check(critical=True)
+@app.check(version="1", critical=True)
 def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
     camera_topic = next(topic for topic in ep.cameras if "wrist_cam" in topic)
     evidence = camera_frame_stats(ep, cameras=[camera_topic])

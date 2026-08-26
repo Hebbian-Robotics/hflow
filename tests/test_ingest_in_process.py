@@ -19,7 +19,7 @@ import hflow
 from hflow.checks import episode_duration
 
 app = hflow.App("in-process")
-app.check()(episode_duration)
+app.check(version="1")(episode_duration)
 """
 
 

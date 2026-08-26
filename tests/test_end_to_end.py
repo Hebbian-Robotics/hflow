@@ -47,21 +47,21 @@ def report_and_app(
 ) -> tuple[hflow.TestReport, hflow.App]:
     app = hflow.App("kitchen-pipeline", data_root=tmp_path_factory.mktemp("e2e-data"))
 
-    @app.check()
+    @app.check(version="1")
     def joint_smoothness(ep: hflow.Episode) -> hflow.CheckResult:
         joints = ep.channel("/joint_states").to_numpy()
         result = check_joint_smoothness(joints, rate_hz=100)
         return hflow.CheckResult(measurements=dict(result))
 
-    @app.check()
+    @app.check(version="1")
     def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.checks.timestamp_regularity(ep, tolerance_s=0.001)
 
-    @app.check()
+    @app.check(version="1")
     def joint_jumps(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.checks.joint_discontinuity(ep, velocity_limit=3.0)
 
-    @app.check(critical=True)
+    @app.check(version="1", critical=True)
     def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
         camera_topic = next(topic for topic in ep.cameras if "wrist_cam" in topic)
         camera_evidence = camera_frame_stats(ep, cameras=[camera_topic])
@@ -191,7 +191,7 @@ def test_failed_critical_verdict_quarantines_and_skips_downstream(
 ) -> None:
     app = hflow.App("strict-pipeline", data_root=tmp_path)
 
-    @app.check(critical=True)
+    @app.check(version="1", critical=True)
     def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
         camera_topic = next(topic for topic in ep.cameras if "wrist_cam" in topic)
         camera_evidence = camera_frame_stats(ep, cameras=[camera_topic])
@@ -202,7 +202,7 @@ def test_failed_critical_verdict_quarantines_and_skips_downstream(
             verdict=black_frame_percent < 1.0,  # fixture blackout exceeds this
         )
 
-    @app.check()
+    @app.check(version="1")
     def never_reached(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"ran": True})
 
@@ -219,11 +219,11 @@ def test_crashing_check_is_infrastructure_not_data(
 ) -> None:
     app = hflow.App("crashy-pipeline", data_root=tmp_path)
 
-    @app.check()
+    @app.check(version="1")
     def exploding(ep: hflow.Episode) -> hflow.CheckResult:
         raise RuntimeError("boom")
 
-    @app.check()
+    @app.check(version="1")
     def still_runs(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"ran": True})
 
@@ -243,12 +243,12 @@ def test_resource_declaring_checks_run_after_plain_ones(
     )
     execution_order: list[str] = []
 
-    @app.check(uses="judge")
+    @app.check(version="1", uses="judge")
     def expensive(ep: hflow.Episode) -> hflow.CheckResult:
         execution_order.append("expensive")
         return hflow.CheckResult()
 
-    @app.check()
+    @app.check(version="1")
     def cheap(ep: hflow.Episode) -> hflow.CheckResult:
         execution_order.append("cheap")
         return hflow.CheckResult()
@@ -262,7 +262,7 @@ def test_missing_provider_alias_fails_preflight(
 ) -> None:
     app = hflow.App("misconfigured", data_root=tmp_path)
 
-    @app.check(uses="judge")
+    @app.check(version="1", uses="judge")
     def needs_endpoint(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult()
 
@@ -282,8 +282,8 @@ def test_endpoint_alias_satisfied_by_environment_only(
     app = hflow.App("env-endpoints", data_root=tmp_path)
     endpoint_values_seen_by_step: list[str] = []
 
-    # version=: steps that read app.endpoints capture the App, which is
-    # opaque to version hashing -- the documented pattern declares a version.
+    # Endpoint configuration affects behavior, so its compatibility is part
+    # of the version the pipeline author declares.
     @app.check(uses="judge", version="v1")
     def needs_endpoint(ep: hflow.Episode) -> hflow.CheckResult:
         endpoint_values_seen_by_step.append(app.endpoints["judge"])
@@ -356,7 +356,7 @@ def test_check_claiming_an_episode_column_refuses_the_append(
     'fold_napkin') and never the measurement. The append now refuses."""
     app = hflow.App("reserved-key", data_root=tmp_path / "data")
 
-    @app.check()
+    @app.check(version="1")
     def claims_task(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"task": 99.0})
 

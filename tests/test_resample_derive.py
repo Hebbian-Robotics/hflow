@@ -309,7 +309,7 @@ def test_cameraless_transform_never_resolves_ffmpeg(
 def test_app_derive_end_to_end(cameraless_source: Path, tmp_path: Path) -> None:
     app = App("derive-test", data_root=tmp_path / "data")
 
-    @app.derive("/joints_5hz")
+    @app.derive("/joints_5hz", version="1")
     def joints_5hz(ep: Episode) -> DerivedSeries:
         return to_grid(ep.channel("/joint_states"), 5.0, policy="nearest", field="position")
 
@@ -326,7 +326,7 @@ def test_app_derive_end_to_end(cameraless_source: Path, tmp_path: Path) -> None:
         derived_provenance_version = canonical_episode.metadata[
             f"{PROVENANCE_KEY_DERIVED_PREFIX}/joints_5hz"
         ]
-        assert len(derived_provenance_version) == 12
+        assert derived_provenance_version == "1"
         assert (
             canonical_episode.metadata[PROVENANCE_KEY_RESAMPLE_POLICY_VERSION]
             == RESAMPLE_POLICY_VERSION
@@ -336,13 +336,13 @@ def test_app_derive_end_to_end(cameraless_source: Path, tmp_path: Path) -> None:
 def test_derive_topic_collision_errors(tmp_path: Path) -> None:
     app = App("collision-test", data_root=tmp_path / "data")
 
-    @app.derive("/gripper_open")
+    @app.derive("/gripper_open", version="1")
     def first_derivation(ep: Episode) -> DerivedSeries:
         return to_grid(ep.channel("/joint_states"), 5.0, policy="nearest")
 
     with pytest.raises(ValueError, match="already registered"):
 
-        @app.derive("/gripper_open")
+        @app.derive("/gripper_open", version="1")
         def second_derivation(ep: Episode) -> DerivedSeries:
             return to_grid(ep.channel("/joint_states"), 10.0, policy="nearest")
 
@@ -353,7 +353,7 @@ def test_transform_override_invoked_and_stamps_propagate(
     app = App("override-test", data_root=tmp_path / "data")
     override_calls: list[tuple[Path, Path]] = []
 
-    @app.derive("/never_computed")
+    @app.derive("/never_computed", version="1")
     def never_computed(ep: Episode) -> DerivedSeries:
         raise AssertionError("derive functions must not run under a transform override")
 

@@ -1,7 +1,7 @@
 """The default dataset: the corpus a pipeline would stand behind, as a query.
 
 ``hflow curate`` takes any SQL, which is the right primitive and the wrong
-default. Writing the everyday cut by hand means pasting content-hash versions
+default. Writing the everyday cut by hand means pasting explicit step versions
 into a WHERE clause and remembering four separate rules -- current generation,
 current transform, not quarantined, checks actually ran -- and getting any one
 of them wrong yields a dataset that looks fine and is not.

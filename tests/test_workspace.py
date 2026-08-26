@@ -80,15 +80,15 @@ class TestPipelineManifest:
             default_checks=(),
         )
 
-        @app.check(critical=True)
+        @app.check(version="1", critical=True)
         def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
             return hflow.CheckResult()
 
-        @app.enrich(uses="judge", requires=("gpu",))
+        @app.enrich(version="1", uses="judge", requires=("gpu",))
         def caption(ep: hflow.Episode) -> hflow.EnrichmentResult:
             return hflow.EnrichmentResult()
 
-        @app.derive("/derived/speed")
+        @app.derive("/derived/speed", version="1")
         def speed(ep: hflow.Episode) -> hflow.DerivedSeries:
             raise NotImplementedError  # registration only; never executed here
 
@@ -125,11 +125,11 @@ class TestPipelineManifest:
         """
         app = hflow.App("kitchen", data_root=tmp_path, default_checks=())
 
-        @app.check(critical=True, gate=hflow.checks.RECOMMENDED_CAMERA_INTEGRITY)
+        @app.check(version="1", critical=True, gate=hflow.checks.RECOMMENDED_CAMERA_INTEGRITY)
         def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
             return hflow.CheckResult()
 
-        @app.check()
+        @app.check(version="1")
         def ungated(ep: hflow.Episode) -> hflow.CheckResult:
             return hflow.CheckResult()
 

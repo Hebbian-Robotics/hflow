@@ -17,7 +17,7 @@ import hflow
 app = hflow.App("dataset-demo", default_checks=())
 
 
-@app.check()
+@app.check(version="1")
 def duration(ep: hflow.Episode) -> hflow.CheckResult:
     return hflow.CheckResult(measurements={"seconds": 1.0})
 """
@@ -70,7 +70,7 @@ class TestDefaultPolicy:
         _ingest(ingested_project, monkeypatch)
         app = hflow.import_pipeline_application(str(ingested_project / "pipeline.py"))
 
-        @app.check()
+        @app.check(version="1")
         def added_later(ep: hflow.Episode) -> hflow.CheckResult:
             return hflow.CheckResult()
 
@@ -123,7 +123,7 @@ from hflow.checks import episode_duration
 app = hflow.App("wrapper-demo")
 
 
-@app.check()
+@app.check(version="1")
 def my_duration(ep: hflow.Episode) -> hflow.CheckResult:
     return episode_duration(ep)
 """
@@ -291,7 +291,7 @@ import hflow
 app = hflow.App("dataset-demo", default_checks=())
 
 
-@app.check(critical=True)
+@app.check(version="1", critical=True)
 def duration(ep: hflow.Episode) -> hflow.CheckResult:
     if os.environ.get("CRASH_DURATION"):
         raise RuntimeError("boom")

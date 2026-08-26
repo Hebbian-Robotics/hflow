@@ -23,6 +23,9 @@ That set is `hflow.checks.DEFAULT_CHECKS`: `episode_duration`,
 on any corpus (a recording with no cameras simply gets fewer keys), and cheap
 enough not to think about -- `camera_frame_stats` is one ffmpeg decode per
 camera and blackout, freeze, exposure and the frame count all come out of it.
+HFlow owns explicit versions for these automatic registrations. Once you
+register or wrap a check yourself, the version in your pipeline is the one
+that controls compatibility.
 
 To change the set, pass it:
 
@@ -47,7 +50,7 @@ those apart.
 
 ## Register the rest
 
-A check is registered by calling `app.check()` with the function. No wrapper is
+A check is registered by calling `app.check(version="1")` with the function. No wrapper is
 needed when the defaults suit you:
 
 ```python
@@ -65,31 +68,33 @@ app = hflow.App("my-pipeline")
 
 # timestamp_regularity, camera_frame_stats, episode_duration, keyframe_interval
 # and media_digest already run; these are the ones that do not.
-app.check()(joint_discontinuity)
-app.check()(idle_fraction)
-app.check()(action_integrity)
+app.check(version="1")(joint_discontinuity)
+app.check(version="1")(idle_fraction)
+app.check(version="1")(action_integrity)
 ```
 
 To pass configuration, bind it -- either with `functools.partial` or a wrapper,
-whichever reads better to you. Both land the configuration inside the check's
-content-hash version, so a retuned number appends new-version rows rather than
-silently overwriting the old ones. These replace the bare registration of the
-same check rather than adding to it:
+whichever reads better to you. The version is explicit, so bump it when a
+retuned number makes the new measurements or verdicts incompatible with the
+old ones. These replace the bare registration of the same check rather than
+adding to it:
 
 ```python
 import functools
 
-# Instead of `app.check()(timestamp_regularity)` above:
-app.check(name="timestamps")(functools.partial(timestamp_regularity, tolerance_s=0.005))
+# Instead of `app.check(version="1")(timestamp_regularity)` above:
+app.check(version="1", name="timestamps")(
+    functools.partial(timestamp_regularity, tolerance_s=0.005)
+)
 
 
-# Instead of `app.check()(camera_frame_stats)`:
-@app.check()
+# Instead of `app.check(version="1")(camera_frame_stats)`:
+@app.check(version="1")
 def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
     return camera_frame_stats(ep, expected_hz={"/wrist_cam/compressed": 30.0})
 
 
-@app.check()
+@app.check(version="1")
 def topic_inventory(ep: hflow.Episode) -> hflow.CheckResult:
     return required_topics(ep, topics=["/joint_states", "/imu"])
 ```
@@ -179,7 +184,7 @@ different policies later. When you do want an episode *rejected*, attach a gate
 at registration rather than rewriting the check. HFlow ships a recommended one:
 
 ```python
-@app.check(critical=True, gate=hflow.checks.RECOMMENDED_CAMERA_INTEGRITY)
+@app.check(version="1", critical=True, gate=hflow.checks.RECOMMENDED_CAMERA_INTEGRITY)
 def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
     return camera_frame_stats(ep)
 ```
@@ -212,8 +217,8 @@ Three things worth knowing before you gate:
   measurement, the gate abstains rather than passing, and records a
   `gate-unevaluated:<pattern>` tag so the mistake is one query away. A threshold
   that *does* fail still rejects, even if another could not be read.
-- **Retuning a threshold is a new check version.** That is deliberate: two
-  policies must never share one version, or curation cannot pin either.
+- **Bump the check version when you retune a threshold.** Two policies must
+  never share one version, or curation cannot pin either.
 
 ## Confirm it ran
 
@@ -241,7 +246,7 @@ FROM episodes WHERE status = 'ok' AND black_pct < 5.0
 
 `hflow.mediapipe_hands.mediapipe_hand_detection` also ships with HFlow, and is
 deliberately not one of them: it runs a model rather than computing a
-signal statistic. Everything above -- evidence-only results, content-hash
+signal statistic. Everything above -- evidence-only results, explicit
 versions, gates you attach -- works the same way for it, but it needs an opt-in
 extra and a downloaded model asset, and what it records is what MediaPipe
 *detected*, which is a weaker claim than what was in the frame. See

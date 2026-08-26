@@ -9,12 +9,12 @@ graph.
 
 It is one question, asked per episode and per step: **has this step already
 recorded an outcome against this exact episode content, at the version the
-step has now?** Both halves are content hashes and neither is an ordered
-comparison. ``episode_id`` hashes the canonical bytes, so an episode the
-transform would now produce differently is a different id and nothing filed
-under the old one counts. ``check_version`` hashes the step and the
-first-party code it reaches, so a retuned threshold is a different version and
-its old rows stop counting. A step is current or it is not.
+step has now?** Neither identity is ordered. ``episode_id`` hashes the
+canonical bytes, so an episode the transform would now produce differently is
+a different id and nothing filed under the old one counts. ``check_version``
+is the pipeline author's explicit compatibility promise, so bumping it after a
+retuned threshold makes the old rows stop counting. A step is current or it is
+not.
 
 Two design decisions carry the correctness of the whole module.
 

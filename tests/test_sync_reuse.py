@@ -148,8 +148,7 @@ def test_a_missing_canonical_transcodes_rather_than_raising(tmp_path: Path) -> N
 
 
 def test_a_registered_transform_override_never_reuses(tmp_path: Path) -> None:
-    """An override's own code reaches no version hash, so nothing here could
-    tell an edited override from an unchanged one."""
+    """An override has no explicit version, so reuse cannot prove it is unchanged."""
     source = _episode(tmp_path / "episode_0001.mcap")
     app = hflow.App("override", data_root=tmp_path / "data", default_checks=())
 

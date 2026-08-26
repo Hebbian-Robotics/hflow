@@ -25,7 +25,7 @@ import hflow
 from hflow.checks import episode_duration
 
 app = hflow.App("planning-demo")
-app.check()(episode_duration)
+app.check(version="1")(episode_duration)
 """
 
 # The configuration docs/how-to/enable-built-in-checks.md teaches: wrap a
@@ -38,7 +38,7 @@ from hflow.checks import episode_duration
 app = hflow.App("planning-demo")
 
 
-@app.check()
+@app.check(version="1")
 def my_duration(ep: hflow.Episode) -> hflow.CheckResult:
     return episode_duration(ep)
 """
@@ -131,7 +131,7 @@ class TestWhatSchedulesWorkAgain:
             PIPELINE_SOURCE
             + """
 
-@app.check()
+@app.check(version="1")
 def added_later(ep: hflow.Episode) -> hflow.CheckResult:
     return hflow.CheckResult(measurements={"added": 1.0})
 """
@@ -243,8 +243,8 @@ def test_a_superseded_default_does_not_schedule_meta_forever(project: Path) -> N
     assert _stage(second, hflow.Stage.META).skipped_as_current == 1
 
 
-def _pipeline_with_a_gate_at(minimum_duration_s: float) -> str:
-    """A critical gate whose threshold is part of its content-hash version."""
+def _pipeline_with_a_gate_at(minimum_duration_s: float, *, version: str) -> str:
+    """A critical gate whose author bumps its explicit version when retuned."""
     return f"""
 import hflow
 from hflow.checks import episode_duration
@@ -252,7 +252,7 @@ from hflow.checks import episode_duration
 app = hflow.App("planning-demo", default_checks=())
 
 
-@app.check(critical=True)
+@app.check(version={version!r}, critical=True)
 def long_enough(ep: hflow.Episode) -> hflow.CheckResult:
     seconds = float(episode_duration(ep).measurements["duration_s"])
     return hflow.CheckResult(
@@ -260,7 +260,7 @@ def long_enough(ep: hflow.Episode) -> hflow.CheckResult:
     )
 
 
-@app.enrich()
+@app.enrich(version="1")
 def labeller(ep: hflow.Episode) -> hflow.EnrichmentResult:
     return hflow.EnrichmentResult(labels={{"reviewed": 1.0}})
 """
@@ -276,11 +276,11 @@ class TestUnQuarantiningAnEpisode:
     """
 
     def test_the_enrichment_that_stood_aside_runs_afterwards(self, project: Path) -> None:
-        (project / "pipeline.py").write_text(_pipeline_with_a_gate_at(99.0))
+        (project / "pipeline.py").write_text(_pipeline_with_a_gate_at(99.0, version="1"))
         quarantined = _ingest(project)
         assert _stage(quarantined, hflow.Stage.META).counts["quarantined"] == 1
 
-        (project / "pipeline.py").write_text(_pipeline_with_a_gate_at(0.1))
+        (project / "pipeline.py").write_text(_pipeline_with_a_gate_at(0.1, version="2"))
         released = _ingest(project)
 
         assert _stage(released, hflow.Stage.META).counts["processed"] == 1
@@ -299,9 +299,9 @@ class TestUnQuarantiningAnEpisode:
         without the distinction the un-labelled episode is selected."""
         from hflow.dataset import create_dataset
 
-        (project / "pipeline.py").write_text(_pipeline_with_a_gate_at(99.0))
+        (project / "pipeline.py").write_text(_pipeline_with_a_gate_at(99.0, version="1"))
         _ingest(project)
-        (project / "pipeline.py").write_text(_pipeline_with_a_gate_at(0.1))
+        (project / "pipeline.py").write_text(_pipeline_with_a_gate_at(0.1, version="2"))
         app = hflow.import_pipeline_application(str(project / "pipeline.py"))
         run_stages_directly(app, [EPISODE_URI], {hflow.Stage.SYNC, hflow.Stage.META})
 
@@ -368,7 +368,7 @@ class TestARecordingSyncCouldNotCanonicalize:
             PIPELINE_SOURCE
             + """
 
-@app.check()
+@app.check(version="1")
 def explodes(ep: hflow.Episode) -> hflow.CheckResult:
     raise RuntimeError("boom")
 """

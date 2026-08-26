@@ -24,27 +24,27 @@ TIERED_PIPELINE_SOURCE = """import hflow
 app = hflow.App("tiered-demo", endpoints={"vlm": "http://vlm.invalid"}, default_checks=())
 
 
-@app.check(name="needs_channel", requires=["/camera/wrist"], critical=True)
+@app.check(version="1", name="needs_channel", requires=["/camera/wrist"], critical=True)
 def needs_channel(episode):
     return hflow.CheckResult(measurements={"frames": 1.0})
 
 
-@app.check(name="needs_endpoint", uses="vlm")
+@app.check(version="1", name="needs_endpoint", uses="vlm")
 def needs_endpoint(episode):
     return hflow.CheckResult(measurements={"score": 1.0})
 
 
-@app.check(name="cheap_check", critical=True)
+@app.check(version="1", name="cheap_check", critical=True)
 def cheap_check(episode):
     return hflow.CheckResult(verdict=True)
 
 
-@app.enrich(name="rich_caption", uses="vlm")
+@app.enrich(version="1", name="rich_caption", uses="vlm")
 def rich_caption(episode):
     return hflow.EnrichmentResult(labels={"caption": "x"})
 
 
-@app.enrich(name="cheap_label")
+@app.enrich(version="1", name="cheap_label")
 def cheap_label(episode):
     return hflow.EnrichmentResult(labels={"ok": True})
 """
@@ -54,7 +54,7 @@ NO_CRITICAL_PIPELINE_SOURCE = """import hflow
 app = hflow.App("no-critical-demo", default_checks=())
 
 
-@app.check(name="just_evidence")
+@app.check(version="1", name="just_evidence")
 def just_evidence(episode):
     return hflow.CheckResult(measurements={"value": 1.0})
 """
@@ -359,7 +359,7 @@ def transform(source_path, destination_path, config):
     raise NotImplementedError
 
 
-@app.derive("/derived/speed")
+@app.derive("/derived/speed", version="1")
 def speed(episode):
     raise NotImplementedError
 """,
