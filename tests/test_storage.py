@@ -30,14 +30,6 @@ from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 pytest.importorskip("obstore", reason="bucket tests need the hflow[bucket] extra")
 
 
-def bucket_over_tmp(tmp_path: Path, name: str = "bucket") -> tuple[BucketStorageRoot, Path]:
-    """A BucketStorageRoot backed by a local directory, plus that directory."""
-    remote_dir = tmp_path / name
-    remote_dir.mkdir(parents=True, exist_ok=True)
-    root = BucketStorageRoot(f"file://{remote_dir}", mirror=tmp_path / f"{name}-mirror")
-    return root, remote_dir
-
-
 class TestParseStorageRoot:
     def test_path_and_plain_string_are_local(self) -> None:
         assert parse_storage_root(Path("/tmp/x")) == LocalStorageRoot(Path("/tmp/x"))
@@ -157,8 +149,8 @@ class TestLocalStorageRoot:
 
 
 class TestBucketStorageRoot:
-    def test_round_trip_and_listing(self, tmp_path: Path) -> None:
-        root, remote_dir = bucket_over_tmp(tmp_path)
+    def test_round_trip_and_listing(self, bucket_over_tmp: tuple[BucketStorageRoot, Path]) -> None:
+        root, remote_dir = bucket_over_tmp
         root.write_bytes("catalog/episodes/a.parquet", b"aa")
         assert (remote_dir / "catalog" / "episodes" / "a.parquet").read_bytes() == b"aa"
         assert root.exists("catalog/episodes/a.parquet")
@@ -168,22 +160,28 @@ class TestBucketStorageRoot:
         assert root.list_names("catalog") == ["catalog/episodes/a.parquet"]
         assert root.list_names() == ["catalog/episodes/a.parquet"]
 
-    def test_write_bytes_if_absent_is_store_native(self, tmp_path: Path) -> None:
-        root, _ = bucket_over_tmp(tmp_path)
+    def test_write_bytes_if_absent_is_store_native(
+        self, bucket_over_tmp: tuple[BucketStorageRoot, Path]
+    ) -> None:
+        root, _ = bucket_over_tmp
         assert root.write_bytes_if_absent("marker", b"v1") is True
         assert root.write_bytes_if_absent("marker", b"v2") is False
         assert root.read_bytes("marker") == b"v1"
 
-    def test_store_file_if_absent_warms_the_mirror(self, tmp_path: Path) -> None:
-        root, _ = bucket_over_tmp(tmp_path)
+    def test_store_file_if_absent_warms_the_mirror(
+        self, tmp_path: Path, bucket_over_tmp: tuple[BucketStorageRoot, Path]
+    ) -> None:
+        root, _ = bucket_over_tmp
         source_file = tmp_path / "row.parquet"
         source_file.write_bytes(b"rows")
         assert root.store_file_if_absent(source_file, "catalog/tags/x.parquet") is True
         assert (root.mirror / "catalog" / "tags" / "x.parquet").read_bytes() == b"rows"
         assert root.store_file_if_absent(source_file, "catalog/tags/x.parquet") is False
 
-    def test_fetch_downloads_once_then_reuses_etag(self, tmp_path: Path) -> None:
-        root, _ = bucket_over_tmp(tmp_path)
+    def test_fetch_downloads_once_then_reuses_etag(
+        self, bucket_over_tmp: tuple[BucketStorageRoot, Path]
+    ) -> None:
+        root, _ = bucket_over_tmp
         root.write_bytes("landing/e.mcap", b"episode-bytes")
         first = root.fetch("landing/e.mcap")
         assert first == root.mirror / "landing" / "e.mcap"
@@ -194,15 +192,19 @@ class TestBucketStorageRoot:
         first.write_bytes(b"locally-poisoned")
         assert root.fetch("landing/e.mcap").read_bytes() == b"locally-poisoned"
 
-    def test_fetch_redownloads_when_remote_changed(self, tmp_path: Path) -> None:
-        root, _ = bucket_over_tmp(tmp_path)
+    def test_fetch_redownloads_when_remote_changed(
+        self, bucket_over_tmp: tuple[BucketStorageRoot, Path]
+    ) -> None:
+        root, _ = bucket_over_tmp
         root.write_bytes("landing/e.mcap", b"version-one")
         assert root.fetch("landing/e.mcap").read_bytes() == b"version-one"
         root.write_bytes("landing/e.mcap", b"version-two!")  # changed size => changed etag
         assert root.fetch("landing/e.mcap").read_bytes() == b"version-two!"
 
-    def test_fetch_missing_raises_file_not_found(self, tmp_path: Path) -> None:
-        root, _ = bucket_over_tmp(tmp_path)
+    def test_fetch_missing_raises_file_not_found(
+        self, bucket_over_tmp: tuple[BucketStorageRoot, Path]
+    ) -> None:
+        root, _ = bucket_over_tmp
         with pytest.raises(FileNotFoundError):
             root.fetch("landing/missing.mcap")
 
@@ -224,8 +226,10 @@ class TestBucketStorageRoot:
         assert excinfo.value.filename == str(a_directory)
         assert "Is a directory" in str(excinfo.value)
 
-    def test_publish_uploads_and_warms_mirror(self, tmp_path: Path) -> None:
-        root, remote_dir = bucket_over_tmp(tmp_path)
+    def test_publish_uploads_and_warms_mirror(
+        self, tmp_path: Path, bucket_over_tmp: tuple[BucketStorageRoot, Path]
+    ) -> None:
+        root, remote_dir = bucket_over_tmp
         produced_file = tmp_path / "out.mcap"
         produced_file.write_bytes(b"canonical")
         uri = root.publish(produced_file, "episodes/e/e.canonical.mcap")
@@ -234,16 +238,20 @@ class TestBucketStorageRoot:
         # A fetch right after a publish is served from the warmed mirror.
         assert root.fetch("episodes/e/e.canonical.mcap").read_bytes() == b"canonical"
 
-    def test_publish_from_inside_mirror(self, tmp_path: Path) -> None:
-        root, remote_dir = bucket_over_tmp(tmp_path)
+    def test_publish_from_inside_mirror(
+        self, bucket_over_tmp: tuple[BucketStorageRoot, Path]
+    ) -> None:
+        root, remote_dir = bucket_over_tmp
         staged_file = root.workspace / "episodes" / "e" / "e.canonical.mcap"
         staged_file.parent.mkdir(parents=True)
         staged_file.write_bytes(b"staged")
         root.publish(staged_file, "episodes/e/e.canonical.mcap")
         assert (remote_dir / "episodes" / "e" / "e.canonical.mcap").read_bytes() == b"staged"
 
-    def test_sync_into_mirror_downloads_only_missing(self, tmp_path: Path) -> None:
-        root, _ = bucket_over_tmp(tmp_path)
+    def test_sync_into_mirror_downloads_only_missing(
+        self, bucket_over_tmp: tuple[BucketStorageRoot, Path]
+    ) -> None:
+        root, _ = bucket_over_tmp
         root.write_bytes("catalog/episodes/a.parquet", b"aa")
         root.write_bytes("catalog/tags/t.parquet", b"tt")
         mirror = root.sync_into_mirror(("catalog/episodes", "catalog/tags"))
@@ -253,19 +261,23 @@ class TestBucketStorageRoot:
         root.sync_into_mirror(("catalog/tags",))
         assert (mirror / "catalog" / "tags" / "t.parquet").read_bytes() == b"local-final"
 
-    def test_child_shares_the_mirror_subtree(self, tmp_path: Path) -> None:
-        root, _ = bucket_over_tmp(tmp_path)
+    def test_child_shares_the_mirror_subtree(
+        self, bucket_over_tmp: tuple[BucketStorageRoot, Path]
+    ) -> None:
+        root, _ = bucket_over_tmp
         catalog_child = root.child("catalog")
         assert catalog_child.url == f"{root.url}/catalog"
         assert catalog_child.mirror == root.mirror / "catalog"
 
-    def test_workspace_writes_breadcrumb(self, tmp_path: Path) -> None:
-        root, _ = bucket_over_tmp(tmp_path)
+    def test_workspace_writes_breadcrumb(
+        self, bucket_over_tmp: tuple[BucketStorageRoot, Path]
+    ) -> None:
+        root, _ = bucket_over_tmp
         workspace = root.workspace
         assert (workspace / ".mirror-of").read_text().strip() == root.url
 
-    def test_uri_for(self, tmp_path: Path) -> None:
-        root, _ = bucket_over_tmp(tmp_path)
+    def test_uri_for(self, bucket_over_tmp: tuple[BucketStorageRoot, Path]) -> None:
+        root, _ = bucket_over_tmp
         assert root.uri_for("episodes/e.mcap") == f"{root.url}/episodes/e.mcap"
 
     def test_store_options_configure_the_store_and_survive_child(
@@ -329,8 +341,10 @@ class TestFetchUri:
 
 
 class TestBucketPipeline:
-    def test_process_publishes_episode_marker_and_catalog(self, tmp_path: Path) -> None:
-        data_root, remote_directory = bucket_over_tmp(tmp_path, "pipeline-bucket")
+    def test_process_publishes_episode_marker_and_catalog(
+        self, tmp_path: Path, bucket_over_tmp: tuple[BucketStorageRoot, Path]
+    ) -> None:
+        data_root, remote_directory = bucket_over_tmp
         source_path = synthesize_episode(
             tmp_path / "source.mcap",
             SyntheticEpisodeSpec(duration_s=1.0, cameras=()),
@@ -378,8 +392,10 @@ class TestBucketPipeline:
         assert repeated_report.catalog_entry is not None
         assert repeated_report.catalog_entry.written is False
 
-    def test_failed_bucket_sync_removes_remote_completion_proof(self, tmp_path: Path) -> None:
-        data_root, remote_directory = bucket_over_tmp(tmp_path, "failed-sync-bucket")
+    def test_failed_bucket_sync_removes_remote_completion_proof(
+        self, tmp_path: Path, bucket_over_tmp: tuple[BucketStorageRoot, Path]
+    ) -> None:
+        data_root, remote_directory = bucket_over_tmp
         source_path = synthesize_episode(
             tmp_path / "source.mcap",
             SyntheticEpisodeSpec(duration_s=1.0, cameras=()),
@@ -425,10 +441,12 @@ class TestLiveBucket:
 class TestHardening:
     """Regressions from the adversarial review of the bucket feature."""
 
-    def test_reserved_suffix_keys_are_refused(self, tmp_path: Path) -> None:
+    def test_reserved_suffix_keys_are_refused(
+        self, tmp_path: Path, bucket_over_tmp: tuple[BucketStorageRoot, Path]
+    ) -> None:
         # A real object named like a sidecar would collide with mirror
         # bookkeeping (fetch would overwrite it with etag text).
-        root, _ = bucket_over_tmp(tmp_path)
+        root, _ = bucket_over_tmp
         with pytest.raises(ValueError, match="reserved"):
             root.write_bytes("landing/e.mcap.remote-etag", b"x")
         with pytest.raises(ValueError, match="reserved"):
@@ -475,11 +493,13 @@ class TestHardening:
         assert "AWS_ACCESS_KEY_ID" not in os.environ
         assert os.environ["AWS_SECRET_ACCESS_KEY"] == "real-looking-value"
 
-    def test_fetch_and_publish_share_a_mirror_entry_lock(self, tmp_path: Path) -> None:
+    def test_fetch_and_publish_share_a_mirror_entry_lock(
+        self, tmp_path: Path, bucket_over_tmp: tuple[BucketStorageRoot, Path]
+    ) -> None:
         # Smoke-level: the lock file appears next to the entry and repeated
         # fetch/publish cycles stay correct (the interleaving itself needs
         # multiple processes; the lock's existence is the observable seam).
-        root, _ = bucket_over_tmp(tmp_path)
+        root, _ = bucket_over_tmp
         produced = tmp_path / "canonical.mcap"
         produced.write_bytes(b"v1")
         root.publish(produced, "episodes/e/e.canonical.mcap")
