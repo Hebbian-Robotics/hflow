@@ -339,6 +339,12 @@ def _normalized_measurements(
     threshold and its complement at once, so storing one drops the episode
     from both sides of a cut while the key still claims to be measured.
 
+    An empty or whitespace-only key is refused as well: the wide view pivots
+    every key into a column, so an empty key becomes a column whose name is
+    the SQL expression that produced it -- a queryable surface with no name
+    a person would write and no rename path (docs/CATALOG.md, "Naming
+    measurement keys"). Refusing it here means nothing has been written yet.
+
     Real check code returns NumPy scalars (np.mean(), indexing, np.bool_
     verdicts), and only np.float64 subclasses a Python type -- the rest used
     to fall through every storage branch into all-NULL value columns while
@@ -359,6 +365,12 @@ def _normalized_measurements(
             raise ValueError(
                 f"check {check_name!r} measured {key!r} as {value!r}: "
                 "omit the key when a check has no finite value for this episode"
+            )
+        if not key.strip():
+            raise ValueError(
+                f"check {check_name!r} measured {key!r}: measurement keys must "
+                "not be empty or whitespace-only (an empty key becomes a "
+                "wide-view column named after the SQL that made it)"
             )
         normalized[key] = value
     return normalized
