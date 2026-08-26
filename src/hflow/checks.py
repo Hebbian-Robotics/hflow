@@ -34,6 +34,7 @@ from hflow._video_measurements import (
     FrameStatisticsSettings,
     InsufficientVideoFrames,
     LumaRangeEvidence,
+    VideoFrameStatistics,
     measure_camera_motion,
 )
 from hflow.episode import Episode
@@ -244,6 +245,160 @@ def joint_discontinuity(
     )
 
 
+def camera_frame_stats_keys(episode: Episode, *, cameras: Sequence[str] | None = None) -> set[str]:
+    """The one statement of ``camera_frame_stats``' measurement key set.
+
+    The check's body iterates this function's output, so a key is emitted
+    exactly when it is named here -- there is no second list in production
+    code to fall out of sync with (#182). ``cameras=None`` resolves to
+    ``episode.cameras`` here exactly as it does in the body, so the fact and
+    the body can never disagree about what was selected. ``App``'s
+    pre-decode supersession consults this function through
+    ``_DEFAULT_KEY_PATTERNS``, which only ever sees the automatic bare
+    registration (a configured variant is a different function object and
+    takes the post-execution path), so the fact is always called with
+    default parameters.
+
+    Per topic: ``message_count`` always; ``expected_frame_count`` and
+    ``frame_deficit_pct`` only when the topic carries at least two messages;
+    the seven decoded-evidence keys always. ``camera_instrument`` and
+    ``camera_measurement_definition`` are the two non-topic keys; they ride
+    inside the per-topic selection, so an episode with no cameras emits
+    nothing at all.
+    """
+    selected = list(cameras) if cameras is not None else episode.cameras
+    keys: set[str] = set()
+    for topic in selected:
+        keys.add(f"{topic}/message_count")
+        if episode.channel(topic).timestamps.size >= 2:
+            keys.add(f"{topic}/expected_frame_count")
+            keys.add(f"{topic}/frame_deficit_pct")
+        keys.update(
+            f"{topic}/{name}"
+            for name in (
+                "decoded_frame_count",
+                "black_frame_pct",
+                "overexposed_frame_pct",
+                "freeze_total_s",
+                "luma_avg_mean",
+                "luma_avg_min",
+                "luma_avg_max",
+            )
+        )
+    if selected:
+        keys.add("camera_instrument")
+        keys.add("camera_measurement_definition")
+    return keys
+
+
+@dataclass(frozen=True)
+class _CameraIntermediates:
+    """Everything one camera key's value needs from its topic, computed once.
+
+    The instrument call is the expensive step (one ffmpeg decode per topic,
+    cached on disk across runs); one instance per topic keeps the key
+    dispatch at dict-lookup cost instead of re-decoding per key.
+    """
+
+    stamps_ns: np.ndarray
+    stats: VideoFrameStatistics
+    # None below two messages, mirroring the branches that need a rate.
+    expected_frame_count: int | None
+
+
+def _camera_intermediates(
+    episode: Episode,
+    topic: str,
+    *,
+    expected_hz: dict[str, float] | None = None,
+    black_frame_amount_pct: int = 98,
+    black_pixel_threshold: int = 17,
+    freeze_noise_db: float = -60.0,
+    freeze_min_duration_s: float = 2.0,
+    bright_luma_threshold: float = 235.0,
+) -> _CameraIntermediates:
+    stamps_ns = episode.channel(topic).timestamps
+    stats = measure_video_frame_statistics_for_hflow(
+        episode.video(topic),
+        settings=FrameStatisticsSettings(
+            black_frame_minimum_pixel_share_percent=black_frame_amount_pct,
+            black_pixel_luma_threshold=black_pixel_threshold,
+            freeze_noise_tolerance_decibels=freeze_noise_db,
+            freeze_minimum_duration_seconds=freeze_min_duration_s,
+            overexposed_average_luma_threshold=bright_luma_threshold,
+        ),
+    )
+    expected_frame_count = None
+    if stamps_ns.size >= 2:
+        deltas_s = np.diff(stamps_ns) / 1e9
+        declared_hz = (expected_hz or {}).get(topic)
+        expected_period_s = 1.0 / declared_hz if declared_hz else float(np.median(deltas_s))
+        span_s = float((stamps_ns[-1] - stamps_ns[0]) / 1e9)
+        expected_frame_count = round(span_s / expected_period_s) + 1
+    return _CameraIntermediates(stamps_ns, stats, expected_frame_count)
+
+
+def _camera_value(
+    key: str, intermediates_by_topic: dict[str, _CameraIntermediates]
+) -> MeasurementValue:
+    """The value of one measurement key from its topic's intermediates.
+
+    Raises on any key it does not recognise. The fact names the keys, so an
+    unbranched name means the fact and the dispatcher disagree, and letting
+    ``match`` fall through to ``None`` would surface only as a null value in
+    a run that used ``record=True`` (#182). A mismapped *field* returns a
+    plausible number and cannot crash -- the full-measurement fixtures in
+    ``tests/test_default_checks.py`` are what catch those.
+    """
+    # Parse from the right: topics are paths (``/wrist_cam/compressed``), so
+    # the topic prefix itself contains slashes and only the LAST separator
+    # divides topic from measurement name. A bare key has no slash at all.
+    topic, sep, name = key.rpartition("/")
+    if sep:
+        if topic not in intermediates_by_topic:
+            raise ValueError(f"camera_frame_stats has no branch for the key {key!r}")
+        inter = intermediates_by_topic[topic]
+        match name:
+            case "message_count":
+                return inter.stamps_ns.size
+            case "expected_frame_count":
+                # The fact names this key only for topics carrying at least
+                # two stamps, which is exactly when intermediates hold a rate.
+                assert inter.expected_frame_count is not None
+                return inter.expected_frame_count
+            case "frame_deficit_pct":
+                expected_frame_count = inter.expected_frame_count
+                assert expected_frame_count is not None
+                return float(
+                    100.0 * (expected_frame_count - inter.stamps_ns.size) / expected_frame_count
+                )
+            case "decoded_frame_count":
+                return inter.stats.decoded_frame_count
+            case "black_frame_pct":
+                return inter.stats.black_frame_percent
+            case "overexposed_frame_pct":
+                return inter.stats.overexposed_frame_percent
+            case "freeze_total_s":
+                return inter.stats.freeze_total_seconds
+            case "luma_avg_mean":
+                return inter.stats.average_luma_mean
+            case "luma_avg_min":
+                return inter.stats.average_luma_minimum
+            case "luma_avg_max":
+                return inter.stats.average_luma_maximum
+        raise ValueError(f"camera_frame_stats has no branch for the key {key!r}")
+    if name == "camera_instrument":
+        # An explicit check version does not identify the measuring instrument,
+        # and FFmpeg builds can produce different readings. Record the pinned
+        # build so measurements remain interpretable across upgrades. One build
+        # measures every topic in a run, so any computed topic's provenance
+        # answers it.
+        return next(iter(intermediates_by_topic.values())).stats.provenance.ffmpeg_version
+    if name == "camera_measurement_definition":
+        return FRAME_STATISTICS_DEFINITION_VERSION
+    raise ValueError(f"camera_frame_stats has no branch for the key {key!r}")
+
+
 def camera_frame_stats(
     episode: Episode,
     *,
@@ -275,59 +430,45 @@ def camera_frame_stats(
     dark. Signal-quality measurements from the same decode pass -- coding
     range, exposure, impulse noise -- live in
     :func:`camera_signal_quality`.
+
+    The emitted key set is owned by :func:`camera_frame_stats_keys`: this
+    body iterates that function's output and routes each key through
+    ``_camera_value``, so a key the fact does not name cannot be emitted.
+    The trade is one right-to-left key parse (``rpartition``) plus one dict
+    lookup per key on top of the ffmpeg decode each topic already pays (#182).
     """
     selected_cameras = list(cameras) if cameras is not None else episode.cameras
-    measurements: dict[str, MeasurementValue] = {}
+    intermediates_by_topic = {
+        topic: _camera_intermediates(
+            episode,
+            topic,
+            expected_hz=expected_hz,
+            black_frame_amount_pct=black_frame_amount_pct,
+            black_pixel_threshold=black_pixel_threshold,
+            freeze_noise_db=freeze_noise_db,
+            freeze_min_duration_s=freeze_min_duration_s,
+            bright_luma_threshold=bright_luma_threshold,
+        )
+        for topic in selected_cameras
+    }
+    measurements: dict[str, MeasurementValue] = {
+        key: _camera_value(key, intermediates_by_topic)
+        for key in sorted(camera_frame_stats_keys(episode, cameras=selected_cameras))
+    }
     intervals: list[Interval] = []
     for topic in selected_cameras:
-        stamps_ns = episode.channel(topic).timestamps
-        message_count = len(stamps_ns)
-        measurements[f"{topic}/message_count"] = message_count
-        if message_count >= 2:
-            deltas_s = np.diff(stamps_ns) / 1e9
-            declared_hz = (expected_hz or {}).get(topic)
-            expected_period_s = 1.0 / declared_hz if declared_hz else float(np.median(deltas_s))
-            span_s = float((stamps_ns[-1] - stamps_ns[0]) / 1e9)
-            expected_frame_count = round(span_s / expected_period_s) + 1
-            measurements[f"{topic}/expected_frame_count"] = expected_frame_count
-            measurements[f"{topic}/frame_deficit_pct"] = float(
-                100.0 * (expected_frame_count - message_count) / expected_frame_count
-            )
-
-        frame_statistics = measure_video_frame_statistics_for_hflow(
-            episode.video(topic),
-            settings=FrameStatisticsSettings(
-                black_frame_minimum_pixel_share_percent=black_frame_amount_pct,
-                black_pixel_luma_threshold=black_pixel_threshold,
-                freeze_noise_tolerance_decibels=freeze_noise_db,
-                freeze_minimum_duration_seconds=freeze_min_duration_s,
-                overexposed_average_luma_threshold=bright_luma_threshold,
-            ),
-        )
-        measurements[f"{topic}/decoded_frame_count"] = frame_statistics.decoded_frame_count
-        measurements[f"{topic}/black_frame_pct"] = frame_statistics.black_frame_percent
-        measurements[f"{topic}/overexposed_frame_pct"] = frame_statistics.overexposed_frame_percent
-        measurements[f"{topic}/freeze_total_s"] = frame_statistics.freeze_total_seconds
-        measurements[f"{topic}/luma_avg_mean"] = frame_statistics.average_luma_mean
-        measurements[f"{topic}/luma_avg_min"] = frame_statistics.average_luma_minimum
-        measurements[f"{topic}/luma_avg_max"] = frame_statistics.average_luma_maximum
-        # An explicit check version does not identify the measuring instrument,
-        # and FFmpeg builds can produce different readings. Record the pinned
-        # build so measurements remain interpretable across upgrades. Text keeps
-        # it out of the wide view's numeric columns.
-        measurements["camera_instrument"] = frame_statistics.provenance.ffmpeg_version
-        measurements["camera_measurement_definition"] = FRAME_STATISTICS_DEFINITION_VERSION
-        if message_count:
+        inter = intermediates_by_topic[topic]
+        if inter.stamps_ns.size:
             # Instrument times are seconds from the MP4 start, which is the
             # camera's first message; map freezes back onto the log clock.
-            stream_start_ns = int(stamps_ns[0])
+            stream_start_ns = int(inter.stamps_ns[0])
             intervals.extend(
                 Interval(
                     start_ns=stream_start_ns + int(freeze_interval.start_seconds * 1e9),
                     end_ns=stream_start_ns + int(freeze_interval.end_seconds * 1e9),
                     label=f"freeze:{topic}",
                 )
-                for freeze_interval in frame_statistics.freeze_intervals
+                for freeze_interval in inter.stats.freeze_intervals
             )
     return CheckResult(measurements=measurements, intervals=intervals)
 
@@ -1419,39 +1560,6 @@ def _default_check_version_for_automatic_registration(check_function: CheckFunct
 # happens to overlap a default's keys falls back to the post-execution
 # comparison in ``_yield_defaults_superseded_by_the_pipeline`` -- the same
 # path the same-parameter wrapper case has always taken.
-def _camera_frame_stats_keys(episode: Episode) -> set[str]:
-    """Mirror of ``camera_frame_stats``: one set of per-topic keys per camera.
-
-    ``expected_frame_count`` and ``frame_deficit_pct`` only appear when the
-    topic carries at least two messages (the function uses them to compute a
-    frame deficit). Every camera the episode declares contributes the same
-    eight luma/black/freeze keys plus ``message_count`` and, when applicable,
-    the frame-deficit pair. ``camera_instrument`` and
-    ``camera_measurement_definition`` are the two non-topic keys: the
-    function writes them inside the per-topic loop, so a multi-camera
-    episode overwrites the value but never adds a new key, and an episode
-    with no declared cameras records neither -- the loop body never runs
-    and so does not stamp the definition version or the ffmpeg binary.
-    """
-    keys: set[str] = set()
-    for topic in episode.cameras:
-        keys.add(f"{topic}/message_count")
-        if episode.channel(topic).timestamps.size >= 2:
-            keys.add(f"{topic}/expected_frame_count")
-            keys.add(f"{topic}/frame_deficit_pct")
-        keys.add(f"{topic}/decoded_frame_count")
-        keys.add(f"{topic}/black_frame_pct")
-        keys.add(f"{topic}/overexposed_frame_pct")
-        keys.add(f"{topic}/freeze_total_s")
-        keys.add(f"{topic}/luma_avg_mean")
-        keys.add(f"{topic}/luma_avg_min")
-        keys.add(f"{topic}/luma_avg_max")
-    if episode.cameras:
-        keys.add("camera_instrument")
-        keys.add("camera_measurement_definition")
-    return keys
-
-
 def _timestamp_regularity_keys(episode: Episode) -> set[str]:
     """Mirror of ``timestamp_regularity``: per-topic period/gap keys plus
     cross-stream sync offsets when both a camera and a state stream exist.
@@ -1543,13 +1651,16 @@ def _keyframe_interval_keys(episode: Episode) -> set[str]:
 
 
 # Internal: maps a default function to its key-set predictor. ``App`` reads
-# this once at default-skip time; the function bodies above and the keys in
-# this dict are kept in lockstep by the drift-guard test in
-# ``tests/test_default_checks.py``.
+# this once at default-skip time. For the five still-mirrored defaults the
+# predictor restates its body's writes, and the drift-guard test in
+# ``tests/test_default_checks.py`` keeps the two in lockstep.
+# ``camera_frame_stats`` maps to its own fact function
+# (:func:`camera_frame_stats_keys`), whose output that body itself iterates --
+# prediction and emission are the same statement there (#182).
 _DEFAULT_KEY_PATTERNS: dict[CheckFunction, Callable[[Episode], set[str]]] = {
     episode_duration: _episode_duration_keys,
     timestamp_regularity: _timestamp_regularity_keys,
-    camera_frame_stats: _camera_frame_stats_keys,
+    camera_frame_stats: camera_frame_stats_keys,
     keyframe_interval: _keyframe_interval_keys,
     content_digest: _content_digest_keys,
     media_digest: _media_digest_keys,
