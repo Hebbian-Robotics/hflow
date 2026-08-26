@@ -602,3 +602,23 @@ class TestTheRenderedPlanTask:
         batches = plan([EPISODE_URI], "batch", None, "true")
 
         assert [item for batch in batches for item in batch["items"]] == [EPISODE_URI]
+
+    @pytest.mark.parametrize("spelling", ["false", "no", "off", "0", "", "   "])
+    def test_a_conf_string_that_spells_no_leaves_the_filter_on(
+        self, project: Path, plan: RenderedPlan, spelling: str
+    ) -> None:
+        """The direction where a regression is silent.
+
+        Reading a false spelling as true does not fail anything: the stage
+        simply processes everything, which is what it did before this filter
+        existed. So the corpus stays correct and the run just costs what #172
+        was about, forever, with nothing saying so. Truthiness on the raw
+        string (``bool(all_stages)``) is the obvious wrong implementation and
+        every spelling here survives it.
+        """
+        _ingest(project)
+
+        with pytest.raises(SystemExit) as excinfo:
+            plan([EPISODE_URI], "batch", None, spelling)
+
+        assert excinfo.value.code == 99
