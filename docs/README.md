@@ -67,6 +67,7 @@ contracts.
 
 - [Canonical episode format](./FORMAT.md)
 - [Catalog tables and curation API](./CATALOG.md)
+- [Environment variables](./ENVIRONMENT.md)
 - [Portable dataset snapshot](./how-to/export-dataset-snapshot.md#format-contract)
 - [Runtime commands and configuration](./RUNTIME.md)
 - [Native-video provider protocol](./PROVIDERS.md)
