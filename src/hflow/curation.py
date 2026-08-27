@@ -131,8 +131,9 @@ class CheckCoverage:
 class CurationReport:
     """Outcome of a curation SQL query and manifest generation.
 
-    manifest_path is a Path for local manifests, a str object URL for bucket
-    manifests, or None when curate() ran with dry_run=True.
+    ``manifest_path`` is a Path for local manifests, a str object URL for
+    bucket manifests, and None when ``curate()`` ran with ``output=None``,
+    which reports row count and coverage without writing anything.
     """
 
     manifest_path: Path | str | None
