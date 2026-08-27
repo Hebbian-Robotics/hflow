@@ -142,6 +142,160 @@ def _mask_run_intervals(
     return intervals
 
 
+@dataclass(frozen=True)
+class _TimestampRegularityPerTopic:
+    """One selected topic's stamps and the rate the dispatcher needs.
+
+    ``sparse`` is True when the topic has fewer than two messages: the
+    body writes only ``period_sample_count`` in that case and the
+    dispatcher must not produce any of the three period keys.
+    """
+
+    stamps_ns: np.ndarray
+    deltas_s: np.ndarray | None
+    expected_period_s: float
+    sparse: bool
+
+
+@dataclass(frozen=True)
+class _TimestampRegularitySync:
+    """The global sync-edge decision: which cameras pair with which
+    state reference, and the reference stamps the offsets need."""
+
+    camera_topics: tuple[str, ...]
+    reference_topic: str | None
+    reference_stamps_ns: np.ndarray | None
+
+
+def _timestamp_regularity_resolve_selected(
+    episode: Episode, topics: Sequence[str] | None
+) -> tuple[list[str], list[str]]:
+    """Return ``(selected_topics, candidate_state_topics)``.
+
+    The two pieces both the fact and the body walk; the fact only needs
+    the selected list, the body also needs the state topics to pick the
+    densest non-camera reference. Same selection rule, same partition --
+    one statement of "which topics the check ran over".
+    """
+    infos = episode.topics
+    selected = (
+        list(topics)
+        if topics is not None
+        else sorted(topic for topic, info in infos.items() if info.message_count >= 2)
+    )
+    state_topics = [
+        topic
+        for topic in selected
+        if topic not in episode.cameras and infos[topic].message_count >= 2
+    ]
+    return selected, state_topics
+
+
+def timestamp_regularity_keys(episode: Episode) -> set[str]:
+    """The one statement of ``timestamp_regularity``'s measurement key set.
+
+    Per selected topic: ``period_sample_count`` when the topic has fewer
+    than two messages, else the three period keys
+    (``median_dt_s``/``period_violation_pct``/``max_gap_s``). Across all
+    selected topics: a pair of ``sync/<cam>~<ref>/{start,end}_offset_s``
+    keys per camera when the episode carries both camera and state
+    streams -- the densest non-camera stream is the reference. ``App``'s
+    pre-decode supersession consults this function through the routing
+    map, which only ever sees the automatic bare registration. The
+    selection rule mirrors the body's exactly: ``topics=`` is taken as
+    given, otherwise every topic with at least two messages (#182).
+    """
+    selected, state_topics = _timestamp_regularity_resolve_selected(episode, None)
+    keys: set[str] = set()
+    for topic in selected:
+        if episode.channel(topic).timestamps.size < 2:
+            keys.add(f"{topic}/period_sample_count")
+            continue
+        keys.add(f"{topic}/median_dt_s")
+        keys.add(f"{topic}/period_violation_pct")
+        keys.add(f"{topic}/max_gap_s")
+    camera_topics = [topic for topic in episode.cameras if topic in selected]
+    if camera_topics and state_topics:
+        reference = max(state_topics, key=lambda topic: episode.topics[topic].message_count)
+        for camera in camera_topics:
+            keys.add(f"sync/{camera}~{reference}/start_offset_s")
+            keys.add(f"sync/{camera}~{reference}/end_offset_s")
+    return keys
+
+
+def _timestamp_regularity_value(
+    episode: Episode,
+    key: str,
+    per_topic: dict[str, _TimestampRegularityPerTopic],
+    sync: _TimestampRegularitySync,
+    tolerance_s: float,
+) -> MeasurementValue:
+    """The value of one measurement key from the resolved intermediates.
+
+    Raises on any key it does not recognise: an unbranched name means the
+    fact and the dispatcher disagree, and letting ``match`` fall through
+    to ``None`` would surface only as a null measurement under
+    ``record=True`` (#182). ``episode`` is needed for the sync dispatch
+    because the camera stamps are not on the per-topic struct.
+
+    Two key shapes:
+    - ``<topic>/<name>`` -- per-topic period keys
+    - ``sync/<cam>~<ref>/<name>`` -- cross-stream offsets; the rightmost
+      ``/`` divides the name, the rest is the camera~reference pair.
+    """
+    if key.startswith("sync/"):
+        # ``sync/<cam>~<ref>/<start|end>_offset_s``
+        cam_ref, _, name = key[len("sync/") :].rpartition("/")
+        if name not in {"start_offset_s", "end_offset_s"}:
+            raise ValueError(f"timestamp_regularity has no branch for the key {key!r}")
+        if sync.reference_topic is None or sync.reference_stamps_ns is None:
+            raise ValueError(
+                f"timestamp_regularity has no branch for the key {key!r}: "
+                "no sync reference (no state stream paired with a camera)"
+            )
+        cam_topic, sep, ref_in_key = cam_ref.rpartition("~")
+        if not sep:
+            raise ValueError(f"timestamp_regularity has no branch for the key {key!r}")
+        if ref_in_key != sync.reference_topic or cam_topic not in sync.camera_topics:
+            raise ValueError(f"timestamp_regularity has no branch for the key {key!r}")
+        cam_stamps = episode.channel(cam_topic).timestamps
+        ref_stamps = sync.reference_stamps_ns
+        match name:
+            case "start_offset_s":
+                return float((cam_stamps[0] - ref_stamps[0]) / 1e9)
+            case "end_offset_s":
+                return float((cam_stamps[-1] - ref_stamps[-1]) / 1e9)
+        raise ValueError(f"timestamp_regularity has no branch for the key {key!r}")
+    topic, sep, name = key.rpartition("/")
+    if not sep:
+        raise ValueError(f"timestamp_regularity has no branch for the key {key!r}")
+    if topic not in per_topic:
+        raise ValueError(f"timestamp_regularity has no branch for the key {key!r}")
+    inter = per_topic[topic]
+    match name:
+        case "period_sample_count":
+            if not inter.sparse:
+                raise ValueError(
+                    f"{key!r}: fact named for a non-sparse topic; per-topic is dense"
+                )
+            return inter.stamps_ns.size
+        case "median_dt_s":
+            if inter.sparse or inter.deltas_s is None:
+                raise ValueError(f"{key!r}: fact named for a sparse topic; per-topic is empty")
+            return float(np.median(inter.deltas_s))
+        case "period_violation_pct":
+            if inter.sparse or inter.deltas_s is None:
+                raise ValueError(f"{key!r}: fact named for a sparse topic; per-topic is empty")
+            return float(
+                np.mean(np.abs(inter.deltas_s - inter.expected_period_s) > tolerance_s) * 100.0
+            )
+        case "max_gap_s":
+            if inter.sparse or inter.deltas_s is None:
+                raise ValueError(f"{key!r}: fact named for a sparse topic; per-topic is empty")
+            return float(np.max(inter.deltas_s))
+    raise ValueError(f"timestamp_regularity has no branch for the key {key!r}")
+
+
 def timestamp_regularity(
     episode: Episode,
     *,
@@ -158,29 +312,60 @@ def timestamp_regularity(
     capture needs the looser default here). Deltas beyond ``gap_factor``
     periods become labeled gap intervals. Cross-stream: start/end offsets of
     every camera stream against the densest non-camera stream.
-    """
-    infos = episode.topics
-    selected = (
-        list(topics)
-        if topics is not None
-        else sorted(topic for topic, info in infos.items() if info.message_count >= 2)
-    )
-    measurements: dict[str, MeasurementValue] = {}
-    intervals: list[Interval] = []
 
+    The emitted key set is owned by :func:`timestamp_regularity_keys`: this
+    body iterates that function's output and routes each key through
+    ``_timestamp_regularity_value``, so a key the fact does not name cannot
+    be emitted (#182).
+    """
+    selected, state_topics = _timestamp_regularity_resolve_selected(episode, topics)
+    infos = episode.topics
+
+    per_topic: dict[str, _TimestampRegularityPerTopic] = {}
+    gap_indices_by_topic: dict[str, list[int]] = {}
     for topic in selected:
         stamps_ns = episode.channel(topic).timestamps
         if len(stamps_ns) < 2:
-            measurements[f"{topic}/period_sample_count"] = len(stamps_ns)
+            per_topic[topic] = _TimestampRegularityPerTopic(
+                stamps_ns=stamps_ns, deltas_s=None, expected_period_s=0.0, sparse=True
+            )
             continue
         deltas_s = np.diff(stamps_ns) / 1e9
         declared_hz = (expected_hz or {}).get(topic)
         expected_period_s = 1.0 / declared_hz if declared_hz else float(np.median(deltas_s))
-        violation_mask = np.abs(deltas_s - expected_period_s) > tolerance_s
-        measurements[f"{topic}/median_dt_s"] = float(np.median(deltas_s))
-        measurements[f"{topic}/period_violation_pct"] = float(np.mean(violation_mask) * 100.0)
-        measurements[f"{topic}/max_gap_s"] = float(np.max(deltas_s))
-        gap_indices: list[int] = np.flatnonzero(deltas_s > gap_factor * expected_period_s).tolist()
+        per_topic[topic] = _TimestampRegularityPerTopic(
+            stamps_ns=stamps_ns,
+            deltas_s=deltas_s,
+            expected_period_s=expected_period_s,
+            sparse=False,
+        )
+        gap_indices_by_topic[topic] = np.flatnonzero(
+            deltas_s > gap_factor * expected_period_s
+        ).tolist()
+
+    camera_topics = [topic for topic in episode.cameras if topic in selected]
+    if camera_topics and state_topics:
+        reference = max(state_topics, key=lambda topic: infos[topic].message_count)
+        sync = _TimestampRegularitySync(
+            camera_topics=tuple(camera_topics),
+            reference_topic=reference,
+            reference_stamps_ns=episode.channel(reference).timestamps,
+        )
+    else:
+        sync = _TimestampRegularitySync(
+            camera_topics=tuple(camera_topics),
+            reference_topic=None,
+            reference_stamps_ns=None,
+        )
+
+    measurements: dict[str, MeasurementValue] = {
+        key: _timestamp_regularity_value(episode, key, per_topic, sync, tolerance_s)
+        for key in sorted(timestamp_regularity_keys(episode))
+    }
+
+    intervals: list[Interval] = []
+    for topic, gap_indices in gap_indices_by_topic.items():
+        stamps_ns = per_topic[topic].stamps_ns
         intervals.extend(
             Interval(
                 start_ns=int(stamps_ns[index]),
@@ -189,25 +374,6 @@ def timestamp_regularity(
             )
             for index in gap_indices
         )
-
-    camera_topics = [topic for topic in episode.cameras if topic in selected]
-    state_topics = [
-        topic
-        for topic in selected
-        if topic not in episode.cameras and infos[topic].message_count >= 2
-    ]
-    if camera_topics and state_topics:
-        reference = max(state_topics, key=lambda topic: infos[topic].message_count)
-        reference_stamps = episode.channel(reference).timestamps
-        for camera in camera_topics:
-            camera_stamps = episode.channel(camera).timestamps
-            measurements[f"sync/{camera}~{reference}/start_offset_s"] = float(
-                (camera_stamps[0] - reference_stamps[0]) / 1e9
-            )
-            measurements[f"sync/{camera}~{reference}/end_offset_s"] = float(
-                (camera_stamps[-1] - reference_stamps[-1]) / 1e9
-            )
-
     return CheckResult(measurements=measurements, intervals=intervals)
 
 
@@ -515,6 +681,55 @@ def idle_fraction(
             profile.stamps_ns, idle_mask, f"idle:{topic}", min_duration_s=min_interval_s
         ),
     )
+
+
+@dataclass(frozen=True)
+class _TimestampRegularityPerTopic:
+    """One selected topic's deltas and the rate the dispatcher needs.
+
+    ``sparse`` is True when the topic has fewer than two messages: the
+    body writes only ``period_sample_count`` in that case and the
+    dispatcher must not produce any of the three period keys.
+    """
+
+    stamps_ns: np.ndarray
+    deltas_s: np.ndarray | None
+    expected_period_s: float
+    sparse: bool
+
+
+@dataclass(frozen=True)
+class _TimestampRegularitySync:
+    """The global sync-edge decision: which cameras pair with which
+    state reference, and the reference stamps the offsets need."""
+
+    camera_topics: tuple[str, ...]
+    reference_topic: str | None
+    reference_stamps_ns: np.ndarray | None
+
+
+def _timestamp_regularity_resolve_selected(
+    episode: Episode, topics: Sequence[str] | None
+) -> tuple[list[str], list[str]]:
+    """Return ``(selected_topics, candidate_state_topics)``.
+
+    The two pieces both the fact and the body walk; the fact only needs
+    the selected list, the body also needs the state topics to pick the
+    densest non-camera reference. Same selection rule, same partition --
+    one statement of "which topics the check ran over".
+    """
+    infos = episode.topics
+    selected = (
+        list(topics)
+        if topics is not None
+        else sorted(topic for topic, info in infos.items() if info.message_count >= 2)
+    )
+    state_topics = [
+        topic
+        for topic in selected
+        if topic not in episode.cameras and infos[topic].message_count >= 2
+    ]
+    return selected, state_topics
 
 
 @dataclass(frozen=True)
@@ -1624,34 +1839,6 @@ def _default_check_version_for_automatic_registration(check_function: CheckFunct
 # happens to overlap a default's keys falls back to the post-execution
 # comparison in ``_yield_defaults_superseded_by_the_pipeline`` -- the same
 # path the same-parameter wrapper case has always taken.
-def _timestamp_regularity_keys(episode: Episode) -> set[str]:
-    """Mirror of ``timestamp_regularity``: per-topic period/gap keys plus
-    cross-stream sync offsets when both a camera and a state stream exist.
-    """
-    infos = episode.topics
-    selected = sorted(topic for topic, info in infos.items() if info.message_count >= 2)
-    keys: set[str] = set()
-    for topic in selected:
-        if episode.channel(topic).timestamps.size < 2:
-            keys.add(f"{topic}/period_sample_count")
-            continue
-        keys.add(f"{topic}/median_dt_s")
-        keys.add(f"{topic}/period_violation_pct")
-        keys.add(f"{topic}/max_gap_s")
-    camera_topics = [topic for topic in episode.cameras if topic in selected]
-    state_topics = [
-        topic
-        for topic in selected
-        if topic not in episode.cameras and infos[topic].message_count >= 2
-    ]
-    if camera_topics and state_topics:
-        reference = max(state_topics, key=lambda topic: infos[topic].message_count)
-        for camera in camera_topics:
-            keys.add(f"sync/{camera}~{reference}/start_offset_s")
-            keys.add(f"sync/{camera}~{reference}/end_offset_s")
-    return keys
-
-
 def _content_digest_keys(_episode: Episode) -> set[str]:
     return {"content_digest"}
 
@@ -1718,7 +1905,7 @@ def _keyframe_interval_keys(episode: Episode) -> set[str]:
 # prediction and emission are the same statement there (#182).
 _DEFAULT_KEY_PATTERNS: dict[CheckFunction, Callable[[Episode], set[str]]] = {
     episode_duration: episode_duration_keys,
-    timestamp_regularity: _timestamp_regularity_keys,
+    timestamp_regularity: timestamp_regularity_keys,
     camera_frame_stats: camera_frame_stats_keys,
     keyframe_interval: _keyframe_interval_keys,
     content_digest: _content_digest_keys,

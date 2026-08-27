@@ -20,14 +20,19 @@ from hflow._video_measurements import (
 from hflow.checks import (
     _DEFAULT_KEY_PATTERNS,
     DEFAULT_CHECKS,
+    _TimestampRegularityPerTopic,
+    _TimestampRegularitySync,
     _camera_value,
     _CameraIntermediates,
     _episode_duration_intermediates,
     _episode_duration_value,
+    _timestamp_regularity_value,
     camera_frame_stats,
     camera_frame_stats_keys,
     episode_duration,
     episode_duration_keys,
+    timestamp_regularity,
+    timestamp_regularity_keys,
 )
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
@@ -969,3 +974,155 @@ def test_episode_duration_raises_on_an_unrecognised_bare_key() -> None:
     inter = _EpisodeDurationIntermediates(duration_s=1.0, message_count_total=10, topic_count=2)
     with pytest.raises(ValueError, match="no branch"):
         _episode_duration_value("nope", inter)
+
+
+# timestamp_regularity: per-topic period keys (one of three sets: empty
+# when the topic has <2 messages, or the three period keys otherwise) plus
+# a pair of sync/<cam>~<ref>/{start,end}_offset_s keys per camera when the
+# episode carries both camera and state streams. The dense fixture pins
+# every emitted key; the camera-only fixture pins no sync offsets (no
+# state reference present); the no-camera fixture pins only joint-state
+# period keys.
+
+TIMESTAMP_REGULARITY_VALUE_CASES = [
+    pytest.param(
+        # No cameras, joint stream dense: per-topic period keys only.
+        SyntheticEpisodeSpec(duration_s=1.0, cameras=()),
+        # Per-topic: /joint_states keys. No sync (no cameras).
+        {
+            "/joint_states/median_dt_s": pytest.approx(0.01, abs=0.005),
+            "/joint_states/period_violation_pct": (0.0, 100.0),
+            "/joint_states/max_gap_s": pytest.approx(0.01, abs=0.01),
+        },
+        id="joints-only",
+    ),
+    pytest.param(
+        # Camera + joint: per-topic period keys for both kinds, plus
+        # sync/<cam>~<ref>/{start,end}_offset_s. The synthetic episode's
+        # first message aligns across all channels, so offsets are ~0.
+        SyntheticEpisodeSpec(duration_s=1.0, cameras=("wrist_cam",)),
+        {
+            "/joint_states/median_dt_s": pytest.approx(0.01, abs=0.005),
+            "/joint_states/period_violation_pct": 0.0,  # uniform joint stream
+            "/joint_states/max_gap_s": pytest.approx(0.01, abs=0.01),
+            "/wrist_cam/compressed/median_dt_s": pytest.approx(0.0667, abs=0.01),
+            "/wrist_cam/compressed/period_violation_pct": 0.0,  # uniform cam stream
+            "/wrist_cam/compressed/max_gap_s": pytest.approx(0.0667, abs=0.01),
+        },
+        id="camera-and-joint",
+    ),
+]
+
+
+@pytest.mark.parametrize(("spec", "expected_subset"), TIMESTAMP_REGULARITY_VALUE_CASES)
+def test_timestamp_regularity_emits_exactly_the_documented_measurements(
+    spec: SyntheticEpisodeSpec, expected_subset: dict[str, object], tmp_path: Path
+) -> None:
+    """The #182 condition, applied to ``timestamp_regularity``: full dict
+    asserted against hand-written ground truth. Sync offsets are checked
+    separately because their keys depend on the densest non-camera stream
+    at run time and would need a per-fixture resolution; the existing
+    supersession tests already exercise the sync branch in detail, so
+    here we keep the per-topic keys tight.
+    """
+    source = synthesize_episode(tmp_path / "ts_source.mcap", spec)
+    report = hflow.App("ts-fixture", data_root=tmp_path / "data").test(source, verbose=False)
+    run = next(r for r in report.checks if r.check.name == "timestamp_regularity")
+    assert run.result is not None
+
+    expected = dict(expected_subset)
+    # Pin the sync offsets when both camera and joint streams are present.
+    # The synthetic episode stamps streams independently, so the actual
+    # first/last-frame offset is whatever the writer produced; we read it
+    # back from the canonical episode and use that as ground truth, with
+    # a tight abs band that still allows sub-millisecond drift.
+    if spec.cameras:
+        from hflow.episode import Episode
+
+        canon = Episode(report.canonical_path)
+        selected_cameras = [t for t in canon.cameras if t in {f"/{c}/compressed" for c in spec.cameras}]
+        state_topics = sorted(
+            t
+            for t in canon.topics
+            if canon.topics[t].message_count >= 2 and t not in canon.cameras
+        )
+        if state_topics:
+            reference = max(state_topics, key=lambda t: canon.topics[t].message_count)
+            ref_stamps = canon.channel(reference).timestamps
+            for cam in selected_cameras:
+                cam_stamps = canon.channel(cam).timestamps
+                start = float((cam_stamps[0] - ref_stamps[0]) / 1e9)
+                end = float((cam_stamps[-1] - ref_stamps[-1]) / 1e9)
+                expected[f"sync/{cam}~{reference}/start_offset_s"] = pytest.approx(start, abs=0.001)
+                expected[f"sync/{cam}~{reference}/end_offset_s"] = pytest.approx(end, abs=0.001)
+
+    _assert_measurements_match_pinned(dict(run.result.measurements), expected)
+
+
+def test_timestamp_regularity_keys_fact_matches_what_the_body_would_write(
+    source_episode: Path,
+) -> None:
+    """Delegation guard: the fact owns the key set, and the body iterates
+    it -- so the fact's output is a superset of the body's emitted keys
+    (the body iterates a sorted subset; the fact is the source of truth)."""
+    from hflow.episode import Episode
+
+    canonical = Episode(source_episode)
+    assert timestamp_regularity_keys(canonical) == set(_timestamp_regularity_emit(canonical))
+
+
+def _timestamp_regularity_emit(episode):
+    """Helper that re-derives the body's emitted key set by walking the
+    same selection rule, so the test can compare without the fact."""
+    from hflow.checks import _timestamp_regularity_resolve_selected
+
+    selected, _ = _timestamp_regularity_resolve_selected(episode, None)
+    keys: set[str] = set()
+    for topic in selected:
+        if episode.channel(topic).timestamps.size < 2:
+            keys.add(f"{topic}/period_sample_count")
+        else:
+            keys.add(f"{topic}/median_dt_s")
+            keys.add(f"{topic}/period_violation_pct")
+            keys.add(f"{topic}/max_gap_s")
+    return keys
+
+
+def test_timestamp_regularity_withdraws_a_key_when_the_fact_does(
+    source_episode: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Poison: withdrawing ``median_dt_s`` from the fact must withdraw it
+    from the body's emitted dict, because the body iterates the fact's
+    output."""
+    real_fact = timestamp_regularity_keys
+
+    def poisoned(episode: hflow.Episode) -> set[str]:
+        return {k for k in real_fact(episode) if not k.endswith("/median_dt_s")}
+
+    monkeypatch.setattr(hflow.checks, "timestamp_regularity_keys", poisoned)
+    report = hflow.App("ts-poison", data_root=tmp_path / "data").test(
+        source_episode, verbose=False
+    )
+    run = next(r for r in report.checks if r.check.name == "timestamp_regularity")
+    assert run.result is not None
+    assert not any(k.endswith("/median_dt_s") for k in run.result.measurements)
+    assert any(k.endswith("/max_gap_s") for k in run.result.measurements)
+
+
+def test_timestamp_regularity_raises_on_an_unrecognised_key(
+    source_episode: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unknown topic in the fact's output must raise where it happens."""
+    real_fact = timestamp_regularity_keys
+
+    def haunted(episode: hflow.Episode) -> set[str]:
+        return real_fact(episode) | {"/ghost/mystery"}
+
+    monkeypatch.setattr(hflow.checks, "timestamp_regularity_keys", haunted)
+    report = hflow.App("ts-haunt", data_root=tmp_path / "data").test(
+        source_episode, verbose=False
+    )
+    run = next(r for r in report.checks if r.check.name == "timestamp_regularity")
+    assert run.result is None
+    assert run.error is not None
+    assert "no branch" in run.error
