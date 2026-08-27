@@ -13,6 +13,7 @@ from hflow import stage_execution
 from hflow.stage_execution import (
     StageBatchCounts,
     load_pipeline_application,
+    parse_conf_flag,
     plan_stage_batches,
     process_stage_batch,
     require_application_data_root,
@@ -90,6 +91,28 @@ class TestLanePlanning:
     def test_unknown_mode_is_refused_loudly(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="unknown mode"):
             plan_stage_batches(["a.mcap"], mode="turbo", batch_count=None, data_root=str(tmp_path))
+
+
+class TestConfFlags:
+    """The conf vocabulary's booleans, parsed where mode is parsed."""
+
+    @pytest.mark.parametrize("spelling", ["1", "true", "TRUE", " yes ", "on"])
+    def test_the_spellings_that_mean_yes(self, spelling: str) -> None:
+        assert parse_conf_flag(spelling) is True
+
+    @pytest.mark.parametrize("spelling", ["0", "false", "FALSE", "no", "off", "", "   "])
+    def test_every_other_string_means_no(self, spelling: str) -> None:
+        """The direction where a regression is silent. ``bool()`` on the raw
+        string reads all of these as true, and a flag that gates a filter then
+        turns the filter off without anything failing."""
+        assert parse_conf_flag(spelling) is False
+
+    def test_a_native_value_is_taken_as_it_stands(self) -> None:
+        """render_template_as_native_obj hands a real bool straight through,
+        and an unset param arrives as None."""
+        assert parse_conf_flag(True) is True
+        assert parse_conf_flag(False) is False
+        assert parse_conf_flag(None) is False
 
 
 class TestEpisodeReferences:

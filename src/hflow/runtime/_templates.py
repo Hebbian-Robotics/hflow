@@ -522,15 +522,13 @@ def ingest_stage():
         catalog cannot see -- an artifact deleted out from under a step whose
         rows still say it ran.
         """
-        from hflow.stage_execution import plan_stage_batches
+        from hflow.stage_execution import parse_conf_flag, plan_stage_batches
 
         if not uris:
             return []
-        # Conf values arrive rendered; a native bool passes straight through
-        # and a hand-typed string is read the way every other flag in the
-        # project reads one.
-        if isinstance(all_stages, str):
-            all_stages = all_stages.strip().lower() in {"1", "true", "yes", "on"}
+        # The conf vocabulary is parsed at the library boundary, like mode --
+        # this task only feeds it what Airflow rendered.
+        all_stages = parse_conf_flag(all_stages)
 $stage_plan_filter        return plan_stage_batches(
             [str(uri) for uri in uris],
             mode=mode,

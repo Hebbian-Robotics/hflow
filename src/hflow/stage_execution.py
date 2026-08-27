@@ -128,6 +128,33 @@ def resolve_episode_reference(data_root: str, uri: str) -> "Path | str":
     return Path(data_root) / uri
 
 
+# The spellings a conf flag counts as true. Anything else, including the empty
+# string a cleared trigger-form field sends, is false.
+_TRUE_CONF_SPELLINGS = frozenset({"1", "true", "yes", "on"})
+
+
+def parse_conf_flag(value: object) -> bool:
+    """One trigger-conf boolean, however Airflow happened to render it.
+
+    Lives here for the reason ``mode`` is parsed here: the conf vocabulary has
+    one owner, shared by every execution backend, and a rendered DAG should
+    only be feeding it values. It matters more than it looks, because the two
+    directions fail differently. Reading a true spelling as false costs one
+    wasted run and is obvious. Reading a false spelling as true silently
+    disables whatever the flag was gating, and for ``all_stages`` that means a
+    scheduled re-ingest quietly goes on costing what it cost before there was
+    a filter.
+
+    ``bool()`` on the raw value is the wrong implementation and the reason this
+    is a function: with ``render_template_as_native_obj`` a native bool arrives
+    as itself, but a hand-typed conf value arrives as text, and every non-empty
+    string is truthy -- ``"false"`` included.
+    """
+    if isinstance(value, str):
+        return value.strip().lower() in _TRUE_CONF_SPELLINGS
+    return bool(value)
+
+
 def plan_stage_batches(
     uris: Sequence[str],
     *,

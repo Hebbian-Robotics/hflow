@@ -452,7 +452,10 @@ def test_sub_dag_sources_compile_and_encode_contract(config: RuntimeConfig, tmp_
         # survive. The tasks are thin callers into hflow.stage_execution (one
         # owner of the run semantics; see tests/test_stage_execution.py for
         # the semantics themselves).
-        assert "\n        from hflow.stage_execution import plan_stage_batches" in dag_source
+        assert (
+            "\n        from hflow.stage_execution import parse_conf_flag, plan_stage_batches"
+            in dag_source
+        )
         assert "\n        from hflow.stage_execution import (" in dag_source
         assert "load_pipeline_application" in dag_source
         assert "resolve_user_pipeline_path('my_pipeline.py')" in dag_source
