@@ -517,16 +517,21 @@ def idle_fraction(
     )
 
 
-def episode_duration(episode: Episode, *, topics: Sequence[str] | None = None) -> CheckResult:
-    """Episode span and message volume, recorded for curation-side outlier cuts.
+@dataclass(frozen=True)
+class _EpisodeDurationIntermediates:
+    """Everything one ``episode_duration`` key's value reads, computed once."""
 
-    An outlier is a corpus-relative judgment, so it cannot be decided inside
-    a per-episode check without baking a threshold into the corpus; this
-    check records the evidence and the cut is a curation query, e.g.::
+    duration_s: float
+    message_count_total: int
+    topic_count: int
 
-        SELECT episode_id FROM episodes
-        WHERE duration_s < 2 OR duration_s > 300
-    """
+
+def _episode_duration_intermediates(
+    episode: Episode,
+    topics: Sequence[str] | None,
+) -> _EpisodeDurationIntermediates:
+    """Verbatim aggregation from the pre-fact body: explicit ``topics``
+    select as given, otherwise every topic carrying at least one message."""
     infos = episode.topics
     selected = (
         list(topics)
@@ -546,13 +551,66 @@ def episode_duration(episode: Episode, *, topics: Sequence[str] | None = None) -
     duration_s = (
         (max(end_candidates_ns) - min(start_candidates_ns)) / 1e9 if start_candidates_ns else 0.0
     )
-    return CheckResult(
-        measurements={
-            "duration_s": duration_s,
-            "message_count_total": message_count_total,
-            "topic_count": len(selected),
-        }
+    return _EpisodeDurationIntermediates(
+        duration_s=duration_s,
+        message_count_total=message_count_total,
+        topic_count=len(selected),
     )
+
+
+def _episode_duration_value(
+    key: str, intermediates: _EpisodeDurationIntermediates
+) -> MeasurementValue:
+    """The value of one measurement key from the aggregated intermediates.
+
+    Raises on any key it does not recognise: an unbranched name means the
+    fact and the dispatcher disagree, and letting ``match`` fall through to
+    ``None`` would surface only as a null measurement under ``record=True``
+    (#182).
+    """
+    match key:
+        case "duration_s":
+            return intermediates.duration_s
+        case "message_count_total":
+            return intermediates.message_count_total
+        case "topic_count":
+            return intermediates.topic_count
+    raise ValueError(f"episode_duration has no branch for the key {key!r}")
+
+
+def episode_duration_keys(_episode: Episode) -> set[str]:
+    """The one statement of ``episode_duration``'s measurement key set.
+
+    Three fixed keys, independent of which topics the episode carries --
+    including of the check's own ``topics=`` selection, which changes only
+    which streams' stamps feed the numbers, never their names (#182).
+    ``App``'s pre-decode supersession consults this function through the
+    routing map, which only ever sees the automatic bare registration.
+    """
+    return {"duration_s", "message_count_total", "topic_count"}
+
+
+def episode_duration(episode: Episode, *, topics: Sequence[str] | None = None) -> CheckResult:
+    """Episode span and message volume, recorded for curation-side outlier cuts.
+
+    An outlier is a corpus-relative judgment, so it cannot be decided inside
+    a per-episode check without baking a threshold into the corpus; this
+    check records the evidence and the cut is a curation query, e.g.::
+
+        SELECT episode_id FROM episodes
+        WHERE duration_s < 2 OR duration_s > 300
+
+    The emitted key set is owned by :func:`episode_duration_keys`: this body
+    iterates that function's output and routes each key through
+    ``_episode_duration_value``, so a key the fact does not name cannot be
+    emitted (#182).
+    """
+    intermediates = _episode_duration_intermediates(episode, topics)
+    measurements: dict[str, MeasurementValue] = {
+        key: _episode_duration_value(key, intermediates)
+        for key in sorted(episode_duration_keys(episode))
+    }
+    return CheckResult(measurements=measurements)
 
 
 def required_topics(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
@@ -1594,11 +1652,6 @@ def _timestamp_regularity_keys(episode: Episode) -> set[str]:
     return keys
 
 
-def _episode_duration_keys(_episode: Episode) -> set[str]:
-    """Three fixed keys, independent of which topics the episode carries."""
-    return {"duration_s", "message_count_total", "topic_count"}
-
-
 def _content_digest_keys(_episode: Episode) -> set[str]:
     return {"content_digest"}
 
@@ -1664,7 +1717,7 @@ def _keyframe_interval_keys(episode: Episode) -> set[str]:
 # (:func:`camera_frame_stats_keys`), whose output that body itself iterates --
 # prediction and emission are the same statement there (#182).
 _DEFAULT_KEY_PATTERNS: dict[CheckFunction, Callable[[Episode], set[str]]] = {
-    episode_duration: _episode_duration_keys,
+    episode_duration: episode_duration_keys,
     timestamp_regularity: _timestamp_regularity_keys,
     camera_frame_stats: camera_frame_stats_keys,
     keyframe_interval: _keyframe_interval_keys,

@@ -22,9 +22,12 @@ from hflow.checks import (
     DEFAULT_CHECKS,
     _camera_value,
     _CameraIntermediates,
+    _episode_duration_intermediates,
+    _episode_duration_value,
     camera_frame_stats,
     camera_frame_stats_keys,
     episode_duration,
+    episode_duration_keys,
 )
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
@@ -879,3 +882,90 @@ def test_dispatcher_message_count_and_decoded_frame_count_read_distinct_sources(
     assert _camera_value("/cam0/decoded_frame_count", by_topic) == 15
     # A swap that returns 15 for message_count -- or 13 for decoded_frame_count
     # -- would have to break both asserts, not just one.
+
+
+# episode_duration: three fixed keys, independent of which topics the episode
+# carries. The value fixture asserts the full dict -- including the topic
+# count, which the body derives from its selection -- against a hand-written
+# ground truth so a mismapped dispatcher branch fails in CI instead of writing
+# a plausible wrong number into the catalog.
+
+EPISODE_DURATION_VALUE_CASES = [
+    pytest.param(
+        SyntheticEpisodeSpec(duration_s=1.0, cameras=()),
+        {"duration_s": pytest.approx(1.0, abs=0.05), "message_count_total": 100},
+        id="one-second-joints-only",
+    ),
+    pytest.param(
+        SyntheticEpisodeSpec(duration_s=1.0, cameras=("wrist_cam",)),
+        {
+            "duration_s": pytest.approx(1.0, abs=0.05),
+            "message_count_total": 100 + 15,
+        },
+        id="one-second-with-camera",
+    ),
+]
+
+
+@pytest.mark.parametrize(("spec", "expected_subset"), EPISODE_DURATION_VALUE_CASES)
+def test_episode_duration_emits_exactly_the_documented_measurements(
+    spec: SyntheticEpisodeSpec, expected_subset: dict[str, object], tmp_path: Path
+) -> None:
+    """The #182 condition, applied to ``episode_duration``: full dict
+    asserted against hand-written ground truth. ``topic_count`` is the
+    number of topics in the selection; the camera count is the per-test
+    fixture's ``cameras=`` tuple length plus one (the joint channel), so
+    we pin it by the spec the test parameterises over rather than
+    restating the synthetic topology."""
+    source = synthesize_episode(tmp_path / "duration_source.mcap", spec)
+    report = hflow.App("duration-fixture", data_root=tmp_path / "data").test(source, verbose=False)
+    run = next(r for r in report.checks if r.check.name == "episode_duration")
+    assert run.result is not None
+
+    pinned = dict(expected_subset)
+    pinned["topic_count"] = len(spec.cameras) + 1  # joints + each camera topic
+    _assert_measurements_match_pinned(dict(run.result.measurements), pinned)
+
+
+def test_episode_duration_keys_fact_and_body_emit_the_same_set(
+    source_episode: Path,
+) -> None:
+    """Delegation guard: the body's key set is owned by the fact."""
+    from hflow.episode import Episode
+
+    canonical = Episode(source_episode)
+    assert episode_duration_keys(canonical) == {
+        "duration_s",
+        "message_count_total",
+        "topic_count",
+    }
+
+
+def test_episode_duration_withdraws_a_key_when_the_fact_does(
+    source_episode: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Poison: withdrawing ``message_count_total`` from the fact must
+    withdraw it from the body's emitted dict, because the body iterates
+    the fact's output."""
+    real_fact = episode_duration_keys
+
+    def poisoned(episode: hflow.Episode) -> set[str]:
+        return real_fact(episode) - {"message_count_total"}
+
+    monkeypatch.setattr(hflow.checks, "episode_duration_keys", poisoned)
+    report = hflow.App("duration-poison", data_root=tmp_path / "data").test(
+        source_episode, verbose=False
+    )
+    run = next(r for r in report.checks if r.check.name == "episode_duration")
+    assert run.result is not None
+    assert "message_count_total" not in run.result.measurements
+    assert "duration_s" in run.result.measurements
+    assert "topic_count" in run.result.measurements
+
+
+def test_episode_duration_raises_on_an_unrecognised_bare_key() -> None:
+    from hflow.checks import _EpisodeDurationIntermediates
+
+    inter = _EpisodeDurationIntermediates(duration_s=1.0, message_count_total=10, topic_count=2)
+    with pytest.raises(ValueError, match="no branch"):
+        _episode_duration_value("nope", inter)
