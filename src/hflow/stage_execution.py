@@ -137,18 +137,17 @@ def parse_conf_flag(value: object) -> bool:
     """One trigger-conf boolean, however Airflow happened to render it.
 
     Lives here for the reason ``mode`` is parsed here: the conf vocabulary has
-    one owner, shared by every execution backend, and a rendered DAG should
-    only be feeding it values. It matters more than it looks, because the two
-    directions fail differently. Reading a true spelling as false costs one
-    wasted run and is obvious. Reading a false spelling as true silently
-    disables whatever the flag was gating, and for ``all_stages`` that means a
-    scheduled re-ingest quietly goes on costing what it cost before there was
-    a filter.
+    one owner, shared by every execution backend, and a rendered DAG only
+    feeds it values. The two directions fail differently. Reading a true
+    spelling as false costs one wasted run and is obvious. Reading a false
+    spelling as true silently disables whatever the flag was gating, and for
+    ``all_stages`` that means a scheduled re-ingest goes on costing what it
+    cost before there was a filter.
 
-    ``bool()`` on the raw value is the wrong implementation and the reason this
-    is a function: with ``render_template_as_native_obj`` a native bool arrives
-    as itself, but a hand-typed conf value arrives as text, and every non-empty
-    string is truthy -- ``"false"`` included.
+    ``bool()`` on the raw value gets that wrong, which is why this is a
+    function: with ``render_template_as_native_obj`` a native bool arrives as
+    itself, but a hand-typed conf value arrives as text, and every non-empty
+    string is truthy, ``"false"`` included.
     """
     if isinstance(value, str):
         return value.strip().lower() in _TRUE_CONF_SPELLINGS

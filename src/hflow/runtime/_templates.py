@@ -526,8 +526,8 @@ def ingest_stage():
 
         if not uris:
             return []
-        # The conf vocabulary is parsed at the library boundary, like mode --
-        # this task only feeds it what Airflow rendered.
+        # The conf vocabulary is parsed at the library boundary, like mode.
+        # This task only feeds it what Airflow rendered.
         all_stages = parse_conf_flag(all_stages)
 $stage_plan_filter        return plan_stage_batches(
             [str(uri) for uri in uris],
