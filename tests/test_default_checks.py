@@ -430,8 +430,23 @@ def test_every_default_iterates_its_fact_for_measurements(
         )
         assert emitted_name is not None
         emitted = actual.get(emitted_name, set())
-        assert emitted.issubset(predicted), (
-            f"{emitted_name} emitted {sorted(emitted - predicted)} that its own fact did not list"
+        # Equality, not a subset, because the two directions fail
+        # differently and only one of them is loud.
+        #
+        # A body emitting a key its fact does not list means the body kept
+        # its own list, which is the regression this refactor exists to make
+        # impossible.
+        #
+        # A fact naming a key the body never emits usually crashes: the body
+        # iterates the fact, so the dispatcher meets a key it has no branch
+        # for and raises. The exception is the pre-decode gate, which reads
+        # the FACT and skips the body entirely. There an over-named key that
+        # a pipeline step happens to write supersedes a default that would
+        # never have collided, the body never runs, and the real
+        # measurements are silently gone. That case is why this is `==`.
+        assert emitted == predicted, (
+            f"{emitted_name} emitted {sorted(emitted - predicted)} that its own fact did not "
+            f"list, and its fact named {sorted(predicted - emitted)} that it never emitted"
         )
 
 
