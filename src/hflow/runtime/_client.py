@@ -25,6 +25,8 @@ from typing import Any
 
 
 class AirflowClientError(RuntimeError):
+    """An HTTP request to the Airflow REST API failed or returned an error status."""
+
     def __init__(self, message: str, *, status: int | None = None, body: str = "") -> None:
         super().__init__(message)
         self.status = status

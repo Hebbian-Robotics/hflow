@@ -115,19 +115,26 @@ def _column_ddl_for(directory_name: str) -> str:
 
 @dataclass(frozen=True)
 class CheckCoverage:
+    """Coverage denominator for one check across cataloged episodes."""
+
     check_name: str
     episodes_ran: int
     total_episodes: int
 
     @property
     def fraction(self) -> float:
+        """Fraction of total cataloged episodes this check ran on (0.0 to 1.0)."""
         return self.episodes_ran / self.total_episodes if self.total_episodes else 0.0
 
 
 @dataclass(frozen=True)
 class CurationReport:
-    # A Path for local manifests, the object URL (str) for bucket manifests,
-    # None when curate() ran without writing one.
+    """Outcome of a curation SQL query and manifest generation.
+
+    manifest_path is a Path for local manifests, a str object URL for bucket
+    manifests, or None when curate() ran with dry_run=True.
+    """
+
     manifest_path: Path | str | None
     row_count: int
     total_episodes: int

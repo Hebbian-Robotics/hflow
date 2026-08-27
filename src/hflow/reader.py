@@ -110,7 +110,9 @@ class EpisodeReader(Protocol):
         id, and time range (filters intersect when several are given)."""
         ...
 
-    def close(self) -> None: ...
+    def close(self) -> None:
+        """Release underlying file handles and resources."""
+        ...
 
 
 class PythonMcapEpisodeReader:

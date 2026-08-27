@@ -93,7 +93,7 @@ PINNED_BUILDS_BY_MACHINE: dict[str, PinnedBuild] = {
 
 
 class FfmpegNotFoundError(RuntimeError):
-    pass
+    """ffmpeg or ffprobe binary could not be resolved."""
 
 
 class FfprobeNotFoundError(FfmpegNotFoundError):

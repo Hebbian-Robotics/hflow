@@ -869,6 +869,7 @@ class TestReport:
 
     @property
     def quarantined(self) -> bool:
+        """Whether a critical check verdict marked this run as quarantined."""
         return bool(self.quarantine_tags)
 
     @property
