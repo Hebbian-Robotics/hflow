@@ -37,7 +37,7 @@ from hflow._video_measurements import (
     VideoFrameStatistics,
     measure_camera_motion,
 )
-from hflow.episode import Episode
+from hflow.episode import ChannelData, Episode
 from hflow.steps import (
     CheckFunction,
     CheckResult,
@@ -251,9 +251,7 @@ def _timestamp_regularity_value(
     match name:
         case "period_sample_count":
             if not inter.sparse:
-                raise ValueError(
-                    f"{key!r}: fact named for a non-sparse topic; per-topic is dense"
-                )
+                raise ValueError(f"{key!r}: fact named for a non-sparse topic; per-topic is dense")
             return inter.stamps_ns.size
         case "median_dt_s":
             if inter.sparse or inter.deltas_s is None:
@@ -664,31 +662,6 @@ def idle_fraction(
             profile.stamps_ns, idle_mask, f"idle:{topic}", min_duration_s=min_interval_s
         ),
     )
-
-
-@dataclass(frozen=True)
-class _TimestampRegularityPerTopic:
-    """One selected topic's deltas and the rate the dispatcher needs.
-
-    ``sparse`` is True when the topic has fewer than two messages: the
-    body writes only ``period_sample_count`` in that case and the
-    dispatcher must not produce any of the three period keys.
-    """
-
-    stamps_ns: np.ndarray
-    deltas_s: np.ndarray | None
-    expected_period_s: float
-    sparse: bool
-
-
-@dataclass(frozen=True)
-class _TimestampRegularitySync:
-    """The global sync-edge decision: which cameras pair with which
-    state reference, and the reference stamps the offsets need."""
-
-    camera_topics: tuple[str, ...]
-    reference_topic: str | None
-    reference_stamps_ns: np.ndarray | None
 
 
 def _timestamp_regularity_resolve_selected(
@@ -1726,9 +1699,7 @@ def media_digest_keys(episode: Episode, *, cameras: Sequence[str] | None = None)
     return keys
 
 
-def _media_digest_value(
-    topic: str, name: str, inter: _MediaDigestPerCamera
-) -> MeasurementValue:
+def _media_digest_value(topic: str, name: str, inter: _MediaDigestPerCamera) -> MeasurementValue:
     """Dispatcher for one ``media_digest`` key."""
     if name == "media_digest":
         return inter.digest_hex
@@ -1788,7 +1759,7 @@ class _KeyframeIntervalPerCamera:
     keyframe_indices: tuple[int, ...]
 
 
-def _keyframe_indices(channel) -> tuple[int, ...]:
+def _keyframe_indices(channel: ChannelData) -> tuple[int, ...]:
     """Shared payload-scan helper for ``keyframe_interval``: which message
     indices in ``channel.raw`` are keyframes. The fact and the body call
     this; the cost is one Annex B scan per camera per call, which is the
@@ -1800,9 +1771,7 @@ def _keyframe_indices(channel) -> tuple[int, ...]:
     the pre-decode check the hot path for this default.
     """
     return tuple(
-        index
-        for index, payload in enumerate(channel.raw)
-        if _payload_starts_a_keyframe(payload)
+        index for index, payload in enumerate(channel.raw) if _payload_starts_a_keyframe(payload)
     )
 
 
