@@ -77,7 +77,6 @@ def plan_batches(
         if batch_count < 1:
             raise ValueError(f"batch_count must be >= 1, got {batch_count}")
     else:
-        assert target_batch_bytes is not None
         if not isinstance(target_batch_bytes, int) or isinstance(target_batch_bytes, bool):
             raise ValueError(
                 f"target_batch_bytes must be an int, got {type(target_batch_bytes).__name__}"
