@@ -6,14 +6,18 @@ content". Both benchmark scripts accept ``--input <mcap>`` and use the
 helpers here to discover the camera and state topics of an arbitrary
 recording instead of assuming the synthetic fixture's layout.
 
-The reference real input (not redistributed -- fetch it yourself):
+The reference real inputs are not redistributed. Fetch the nuScenes sample:
 
-    curl -fLo nuscenes-mini-sample.mcap \\
+    curl -fLo nuscenes-mini-sample.mcap \
         https://mcap-proxy.lichtblick.workers.dev/NuScenes-v1.0-mini-scene-sample.mcap
 
 nuScenes v1.0-mini scene sample as converted by nuscenes2mcap and hosted by
 the Lichtblick project. License: CC BY-NC-SA 4.0 (non-commercial research).
 Attribution: "Adapted from nuScenes dataset. Copyright 2020 nuScenes."
+
+Issue #170 also uses one manipulation episode from RobotisAI's public MCAP
+corpus, pinned to an immutable repository revision. The URL and checksum are
+constants below so the exact camera + proprio recording can be reproduced.
 """
 
 from dataclasses import dataclass
@@ -29,6 +33,15 @@ NUSCENES_SAMPLE_URL = (
 )
 NUSCENES_SAMPLE_SHA256 = "089b5be708d2536a8c7e341f4d2b62dc618a581525e4db8d15c93ec5ce446547"
 NUSCENES_ATTRIBUTION = "Adapted from nuScenes dataset. Copyright 2020 nuScenes."
+
+ROBOTIS_BUTTON_PUSH_SAMPLE_REVISION = "93a0ba73c6b82689696d9c4909b3b48af0294cf8"
+ROBOTIS_BUTTON_PUSH_SAMPLE_URL = (
+    "https://huggingface.co/datasets/RobotisAI/evButtonPush-260615-0-MCAP/"
+    f"resolve/{ROBOTIS_BUTTON_PUSH_SAMPLE_REVISION}/107/107_0.mcap?download=true"
+)
+ROBOTIS_BUTTON_PUSH_SAMPLE_SHA256 = (
+    "51bec431162844b2bb239f65ea158ea1030bb3fce5312ad81768978dc68f82c3"
+)
 
 # The training-sample "state" analog, in preference order: proprioception-like
 # telemetry first, densest non-camera topic as the fallback.

@@ -16,14 +16,15 @@ alongside the million-hour results Dyna published in
 | Four-camera synthetic training windows | **2.42x fewer chunk fetches** than per-topic chunking | Shows how grouping topics by read pattern reduces sample assembly work |
 | Six-camera real footage with 8 MB chunks | **2.81x fewer fetches and 3.21x fewer bytes fetched** than per-topic chunking | Demonstrates that chunk size and grouping policy must be tuned together |
 | Selective state scans | Naive schema grouping fetched **230 MB** for a 0.2 MB `/imu` stream | Shows why HFlow exposes per-topic group overrides instead of treating grouping as a fixed schema rule |
+| Three-camera manipulation footage | A 400 KB candidate improves training fetches x MB by **15.3%**, but raises state-scan fetches from **7 to 13** and regresses the nuScenes cross-check | Measures the 800 KB derived-target floor on the camera + compact state/proprio workload it is meant to serve |
 
 These are measurements of specific workloads, not universal performance
-claims. The methodology, caveats, input recording, and reproduction commands
+claims. The methodology, caveats, input recordings, and reproduction commands
 are included below.
 
 **How to rerun** (each script prints these tables; `--quick` for a fast pass;
 `--input <recording.mcap>` measures a real recording; see the real-footage
-section for the reference dataset):
+sections for the reference datasets):
 
 ```bash
 uv run python benchmarks/storage_benchmark.py
@@ -31,20 +32,23 @@ uv run python benchmarks/read_benchmark.py
 uv run python benchmarks/storage_benchmark.py --input nuscenes-mini-sample.mcap
 uv run python benchmarks/read_benchmark.py --input nuscenes-mini-sample.mcap \
     --grouping read-pattern --chunk-size-bytes 8000000
+uv run python benchmarks/read_benchmark.py --input robotis-button-push-107.mcap \
+    --grouping schema-default --chunk-size-bytes derived
 ```
 
 **Method caveats, up front.**
 
-- Two content sources: the synthetic fixture
+- Three content sources: the synthetic fixture
   (`hflow.testing.synthesize_episode`, ffmpeg test patterns at 320x240,
-  defect injections disabled) and a real six-camera recording (the
-  real-footage section below). Synthetic patterns are unrealistically
-  compressible; the two storage results quantify exactly how much.
+  defect injections disabled), a real six-camera driving recording, and a
+  real three-camera manipulation recording. Synthetic patterns are
+  unrealistically compressible; the two storage results quantify exactly how
+  much.
 - Reads run against local disk, where a "fetch" costs a chunk decompression,
   not an object-storage round trip. Wall-clock ratios here therefore
   *understate* the benefit that matters on S3/GCS; the fetch and
   bytes-fetched counts are layout facts and transfer directly.
-- Scale: 19-60 s episodes, not the forty-three million of Dyna's corpus. The
+- Scale: 11.6-60 s episodes, not the forty-three million of Dyna's corpus. The
   point is that the mechanisms behave as Dyna's article describes, not that
   the ratios match.
 - Storage reductions compare **video payload bytes** (the codec effect, the
@@ -236,11 +240,12 @@ number does not. If your workload is one recording you can measure, pin
 `TransformConfig(chunk_size_bytes=...)` and beat the default -- that is what
 the knob is for.
 
-The floor is the part with the least evidence behind it. 800 KB is where the
-measurements start, not a measured optimum, and this table is the first
-evidence that it is too low for a busy state group. Worth revisiting with a
-recording whose state group is proprio-rate rather than 20 topics of vehicle
-telemetry.
+The floor now has a second real measurement on a manipulation workload with a
+proprio-rate state stream. That result points lower than 800 KB on the
+fetches-times-bytes balance, while the nuScenes state group points higher; the
+same-run cross-check below shows that moving the global floor to 400 KB would
+trade one corpus's result for the other's rather than establish a better
+default.
 
 Reproduce the default with `--chunk-size-bytes derived` against the same
 input; the flat rows reproduce at `800000`, `5411000` and `8000000`. A flat
@@ -268,13 +273,100 @@ Observations:
   column is the least transferable number in this report, on real data as on
   synthetic.
 
+## Manipulation footage for the chunk floor
+
+**Dataset**: episode 107 (`107/107_0.mcap`) from
+`RobotisAI/evButtonPush-260615-0-MCAP`, a public button-push manipulation
+corpus hosted on Hugging Face. The pinned MCAP is 75,946,038 bytes (75.9 MB)
+and records 11.6167 s with three compressed camera streams. Its schema-default
+state group contains `/arm/tactile_broadcaster/gpio_states`, `/joint_states`,
+`/leader/joint_states`, and `/tf`: 4,769,296 payload bytes, or **410.6 kB/s**
+over the episode. That is the low-rate camera + state/proprio workload missing
+from the original floor measurement, and directly satisfies #170's requirement
+that the state group be in the kilobytes-per-second range rather than
+megabytes-per-second.
+
+The recording is not redistributed here. Fetch the exact bytes used below:
+
+```bash
+curl -fLo robotis-button-push-107.mcap \
+    'https://huggingface.co/datasets/RobotisAI/evButtonPush-260615-0-MCAP/resolve/93a0ba73c6b82689696d9c4909b3b48af0294cf8/107/107_0.mcap?download=true'
+# sha256 51bec431162844b2bb239f65ea158ea1030bb3fce5312ad81768978dc68f82c3
+```
+
+Repository revision:
+`93a0ba73c6b82689696d9c4909b3b48af0294cf8`.
+
+To reproduce the floor sweep, rerun the manipulation benchmark above with
+`--chunk-size-bytes` set in turn to `200000`, `400000`, `800000`, `1600000`,
+`3200000`, and `derived`.
+
+### Floor sweep
+
+The sweep varies only the flat chunk target. The input episode, VLA GOP preset
+(1 s), schema-default grouping (cameras vs state), 200 seeded 1 s training
+windows, and state-only scan are held fixed. The derived row uses the shipped
+800 KB floor; on this recording it produces the same grouped layout as the
+flat 800 KB row.
+
+| chunk target | topic-group fetches/sample | compressed MB/sample | fetches x MB |
+|---|---:|---:|---:|
+| 200 KB flat | 5.58 | 0.550 | 3.07 |
+| 400 KB flat | 3.80 | 0.729 | **2.77** |
+| 800 KB flat | 2.88 | 1.128 | 3.25 |
+| 1.6 MB flat | 2.48 | 1.937 | 4.80 |
+| 3.2 MB flat | 2.23 | 3.360 | 7.49 |
+| **derived per group** (800 KB floor) | **2.88** | **1.128** | **3.25** |
+
+The 400 KB point is the best measured flat target on the balanced
+fetches-times-bytes product, but it is not a free improvement: training fetches
+rise from 2.88 to 3.80 and the full `/joint_states` scan rises from 7 to 13
+chunk fetches. Because round trips are the expensive term on object storage,
+that trade needs a cross-workload check before it can become a default.
+
+### Same-run floor comparison
+
+To isolate the floor itself, both recordings were rerun in one GitHub Actions
+Ubuntu 24.04 job with Python 3.14, the same source commit, VLA GOP preset, 200
+seeded 1 s windows, and unchanged grouping for each corpus. The candidate run
+changed only `MINIMUM_DERIVED_CHUNK_SIZE_BYTES`: shipped 800 KB versus 400 KB.
+nuScenes keeps its documented read-pattern grouping; the manipulation episode
+keeps schema-default camera + state grouping.
+
+| corpus | derived floor | fetches/sample | compressed MB/sample | fetches x MB | state-scan fetches |
+|---|---:|---:|---:|---:|---:|
+| manipulation | **800 KB (shipped)** | **2.88** | 1.128 | 3.25 | **7** |
+| manipulation | 400 KB candidate | 3.77 | **0.730** | **2.75** | 13 |
+| nuScenes | **800 KB (shipped)** | **3.77** | 11.169 | **42.11** | **16** |
+| nuScenes | 400 KB candidate | 4.01 | **11.101** | 44.52 | 21 |
+
+**Conclusion: keep the 800 KB floor.** Lowering it to 400 KB improves the
+balanced training product by about 15.3% on this manipulation episode, but
+increases its training round trips by about 31% and nearly doubles selective
+state-scan fetches. The same change also regresses both the balanced product
+and fetch counts on the nuScenes cross-check. Neither fixed value dominates
+across the two measured corpus shapes and access patterns.
+
+Replacing the floor with a new adaptive rule would need another measured
+signal beyond the group byte rate and read window already used by the derived
+formula. Two recordings do not justify inventing that signal. Keeping 800 KB
+preserves the current behavior and leaves `TransformConfig(chunk_size_bytes=...)`
+as the explicit tuning path for a corpus whose workload has been measured.
+`TRANSFORM_BEHAVIOR_VERSION` therefore does not change.
+
 ## Provenance
 
-Machine: the development box (local NVMe, Linux); ffmpeg: the pinned build
-recorded in each episode's `provenance/v1`; seeds and fixture parameters are
-constants at the top of each script. These results were included in the
-initial public repository snapshot (`6ab6ef9`). Rerunning reproduces the
-storage tables byte-for-byte
-(deterministic fixtures and encoder settings) and the read tables up to
-wall-clock noise. The real recording is fetched, never vendored; its sha256
-is pinned above.
+The synthetic tables and the original nuScenes tables were recorded on the
+development box (local NVMe, Linux) and were included in the initial public
+repository snapshot (`6ab6ef9`). The issue #170 manipulation sweep and the
+same-run 800 KB versus 400 KB comparison were measured on GitHub Actions
+Ubuntu 24.04 with Python 3.14. Those new rows compare fetch counts and
+compressed bytes; wall-clock values are deliberately not compared across
+machines.
+
+ffmpeg is the build recorded in each transformed episode's `provenance/v1`;
+seeds and fixture parameters are constants at the top of each script.
+Deterministic fixture and encoder settings make the storage tables
+reproducible byte-for-byte, while read wall-clock values remain subject to
+machine noise. The real recordings are fetched, never vendored; their sha256
+values are pinned above.
