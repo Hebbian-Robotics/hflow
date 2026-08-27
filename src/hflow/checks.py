@@ -903,6 +903,45 @@ def action_rate(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
     return CheckResult(measurements=measurements)
 
 
+@dataclass(frozen=True)
+class _ContentDigestIntermediates:
+    """The single 32-byte SHA-256 state for ``content_digest``.
+
+    Channels are walked in ``(topic, channel_id)`` order so the digest is
+    stable across container layouts, and the body composes the same way
+    the fact's single key advertises.
+    """
+
+    digest_hex: str
+
+
+def _content_digest_intermediates(episode: Episode) -> _ContentDigestIntermediates:
+    digest = hashlib.sha256()
+    ordered_channels = sorted(
+        episode.channels.values(), key=lambda info: (info.topic, info.channel_id)
+    )
+    for info in ordered_channels:
+        channel = episode.channel(info.channel_id)
+        digest.update(info.topic.encode())
+        digest.update(len(channel.raw).to_bytes(8, "big"))
+        for log_time_ns, payload in zip(channel.timestamps, channel.raw, strict=True):
+            digest.update(int(log_time_ns).to_bytes(8, "big", signed=True))
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+    return _ContentDigestIntermediates(digest_hex=digest.hexdigest())
+
+
+def content_digest_keys(_episode: Episode) -> set[str]:
+    """The one statement of ``content_digest``'s measurement key set."""
+    return {"content_digest"}
+
+
+def _content_digest_value(key: str, inter: _ContentDigestIntermediates) -> MeasurementValue:
+    if key == "content_digest":
+        return inter.digest_hex
+    raise ValueError(f"content_digest has no branch for the key {key!r}")
+
+
 def content_digest(episode: Episode) -> CheckResult:
     """A stable digest of the episode's message content, for duplicate hunts.
 
@@ -920,19 +959,12 @@ def content_digest(episode: Episode) -> CheckResult:
     dedupes byte-identical re-ingests on its own; this digest additionally
     catches the same recording landed under different names or provenance.
     """
-    digest = hashlib.sha256()
-    ordered_channels = sorted(
-        episode.channels.values(), key=lambda info: (info.topic, info.channel_id)
+    inter = _content_digest_intermediates(episode)
+    return CheckResult(
+        measurements={
+            key: _content_digest_value(key, inter) for key in sorted(content_digest_keys(episode))
+        }
     )
-    for info in ordered_channels:
-        channel = episode.channel(info.channel_id)
-        digest.update(info.topic.encode())
-        digest.update(len(channel.raw).to_bytes(8, "big"))
-        for log_time_ns, payload in zip(channel.timestamps, channel.raw, strict=True):
-            digest.update(int(log_time_ns).to_bytes(8, "big", signed=True))
-            digest.update(len(payload).to_bytes(8, "big"))
-            digest.update(payload)
-    return CheckResult(measurements={"content_digest": digest.hexdigest()})
 
 
 def camera_stability(
@@ -1921,10 +1953,6 @@ def _default_check_version_for_automatic_registration(check_function: CheckFunct
 # happens to overlap a default's keys falls back to the post-execution
 # comparison in ``_yield_defaults_superseded_by_the_pipeline`` -- the same
 # path the same-parameter wrapper case has always taken.
-def _content_digest_keys(_episode: Episode) -> set[str]:
-    return {"content_digest"}
-
-
 def _media_digest_keys(episode: Episode) -> set[str]:
     keys: set[str] = set()
     for topic in episode.cameras:
@@ -1945,6 +1973,6 @@ _DEFAULT_KEY_PATTERNS: dict[CheckFunction, Callable[[Episode], set[str]]] = {
     timestamp_regularity: timestamp_regularity_keys,
     camera_frame_stats: camera_frame_stats_keys,
     keyframe_interval: keyframe_interval_keys,
-    content_digest: _content_digest_keys,
+    content_digest: content_digest_keys,
     media_digest: _media_digest_keys,
 }

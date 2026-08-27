@@ -24,12 +24,15 @@ from hflow.checks import (
     _TimestampRegularitySync,
     _camera_value,
     _CameraIntermediates,
+    _content_digest_value,
     _episode_duration_intermediates,
     _episode_duration_value,
     _keyframe_interval_value,
     _timestamp_regularity_value,
     camera_frame_stats,
     camera_frame_stats_keys,
+    content_digest,
+    content_digest_keys,
     episode_duration,
     episode_duration_keys,
     keyframe_interval,
@@ -1223,3 +1226,48 @@ def test_keyframe_interval_raises_when_median_is_named_for_one_keyframe() -> Non
             inter,
             np.array([0, 1, 2, 3, 4]),
         )
+
+
+# content_digest: the single key ``content_digest`` carries a 64-char hex
+# SHA-256. The exact value is runner- and codec-build dependent, so the
+# fixture pins only its type and length.
+
+def test_content_digest_emits_exactly_the_documented_measurements(
+    source_episode: Path, tmp_path: Path
+) -> None:
+    report = hflow.App("cd-fixture", data_root=tmp_path / "data").test(
+        source_episode, verbose=False
+    )
+    run = next(r for r in report.checks if r.check.name == "content_digest")
+    assert run.result is not None
+    measurements = dict(run.result.measurements)
+    assert set(measurements) == {"content_digest"}
+    digest = measurements["content_digest"]
+    # Pin the exact digest for the joints-only source episode. The synthetic
+    # writer is deterministic, so a dispatcher that returns a transformed
+    # value (e.g. reversed hex) will not match this literal.
+    assert digest == "1ee3e9bcad4d5a12112b196f7a3d4e272329cc41a5b5efe7e8751339ab1a4722"
+
+
+def test_content_digest_withdraws_a_key_when_the_fact_does(
+    source_episode: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Poison: clearing the fact's single key must leave the body's emitted
+    dict empty."""
+    monkeypatch.setattr(
+        hflow.checks, "content_digest_keys", lambda _episode: set()
+    )
+    report = hflow.App("cd-poison", data_root=tmp_path / "data").test(
+        source_episode, verbose=False
+    )
+    run = next(r for r in report.checks if r.check.name == "content_digest")
+    assert run.result is not None
+    assert run.result.measurements == {}
+
+
+def test_content_digest_raises_on_an_unrecognised_key() -> None:
+    from hflow.checks import _ContentDigestIntermediates
+
+    inter = _ContentDigestIntermediates(digest_hex="0" * 64)
+    with pytest.raises(ValueError, match="no branch"):
+        _content_digest_value("nope", inter)
