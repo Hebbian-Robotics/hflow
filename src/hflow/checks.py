@@ -1709,6 +1709,103 @@ def media_digest(episode: Episode, *, cameras: Sequence[str] | None = None) -> C
     return CheckResult(measurements=measurements)
 
 
+@dataclass(frozen=True)
+class _KeyframeIntervalPerCamera:
+    """One camera channel's keyframe walk, computed once.
+
+    The shared scan over ``channel.raw`` is the only fact the
+    ``keyframe_interval`` key set depends on that the body would not
+    already pay for; the body needs the index list to compute the
+    measurements, and the key set needs the count (zero / one / many)
+    to decide whether ``max_keyframe_gap_s`` and
+    ``median_keyframe_interval_s`` apply. ``_keyframe_indices`` runs
+    the scan and is the one source of that count.
+    """
+
+    frame_count: int
+    keyframe_indices: tuple[int, ...]
+
+
+def _keyframe_indices(channel) -> tuple[int, ...]:
+    """Shared payload-scan helper for ``keyframe_interval``: which message
+    indices in ``channel.raw`` are keyframes. The fact and the body call
+    this; the cost is one Annex B scan per camera per call, which is the
+    irreducible price the default pays to know its own key set. Caching
+    the result on the channel would let the pre-decode supersession
+    consult the fact without a second scan, but no caller needs that
+    today -- the body is the only reader, and the fact is only consulted
+    when the default will run anyway. Revisit if a future change makes
+    the pre-decode check the hot path for this default.
+    """
+    return tuple(
+        index
+        for index, payload in enumerate(channel.raw)
+        if _payload_starts_a_keyframe(payload)
+    )
+
+
+def keyframe_interval_keys(episode: Episode, *, cameras: Sequence[str] | None = None) -> set[str]:
+    """The one statement of ``keyframe_interval``'s measurement key set.
+
+    Per selected camera: ``scanned_frame_count`` and ``keyframe_count``
+    and ``first_frame_is_keyframe`` always (when the camera has any
+    frames); ``max_keyframe_gap_s`` once at least one keyframe is
+    found; ``median_keyframe_interval_s`` only when at least two
+    keyframes are found. ``App``'s pre-decode supersession reads this
+    through the routing map, which only ever sees the automatic bare
+    registration.
+    """
+    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    keys: set[str] = set()
+    for topic in selected_cameras:
+        channel = episode.channel(topic)
+        frame_count = channel.timestamps.size
+        keys.add(f"{topic}/scanned_frame_count")
+        if frame_count == 0:
+            continue
+        keyframe_indices = _keyframe_indices(channel)
+        keys.add(f"{topic}/keyframe_count")
+        keys.add(f"{topic}/first_frame_is_keyframe")
+        if not keyframe_indices:
+            continue
+        keys.add(f"{topic}/max_keyframe_gap_s")
+        if len(keyframe_indices) >= 2:
+            keys.add(f"{topic}/median_keyframe_interval_s")
+    return keys
+
+
+def _keyframe_interval_value(
+    topic: str,
+    name: str,
+    inter: _KeyframeIntervalPerCamera,
+    stamps_ns: np.ndarray,
+) -> MeasurementValue:
+    """Dispatcher for one ``keyframe_interval`` key. The body builds the
+    intermediates struct once per camera and iterates the fact's keys
+    through this, so the key set has one source of truth (#182).
+    """
+    if name == "scanned_frame_count":
+        return inter.frame_count
+    if name == "keyframe_count":
+        return len(inter.keyframe_indices)
+    if name == "first_frame_is_keyframe":
+        return int(bool(inter.keyframe_indices) and inter.keyframe_indices[0] == 0)
+    if name == "max_keyframe_gap_s":
+        if not inter.keyframe_indices:
+            raise ValueError(f"{name!r}: fact named for a keyframe-less camera")
+        keyframe_stamps_ns = stamps_ns[list(inter.keyframe_indices)]
+        gaps_ns = np.diff(np.append(keyframe_stamps_ns, stamps_ns[-1]))
+        positive_gaps_ns = gaps_ns[gaps_ns > 0]
+        return float(np.max(positive_gaps_ns) / 1e9) if len(positive_gaps_ns) else 0.0
+    if name == "median_keyframe_interval_s":
+        if len(inter.keyframe_indices) < 2:
+            raise ValueError(f"{name!r}: fact named for a camera with fewer than two keyframes")
+        keyframe_stamps_ns = stamps_ns[list(inter.keyframe_indices)]
+        intervals_ns = np.diff(keyframe_stamps_ns)
+        return float(np.median(intervals_ns) / 1e9)
+    raise ValueError(f"keyframe_interval has no branch for the key {topic}/{name}")
+
+
 def keyframe_interval(episode: Episode, *, cameras: Sequence[str] | None = None) -> CheckResult:
     """Keyframe cadence per camera: how seekable and cuttable the footage is.
 
@@ -1737,33 +1834,18 @@ def keyframe_interval(episode: Episode, *, cameras: Sequence[str] | None = None)
     for topic in selected_cameras:
         channel = episode.channel(topic)
         stamps_ns = channel.timestamps
-        measurements[f"{topic}/scanned_frame_count"] = len(stamps_ns)
-        if len(stamps_ns) == 0:
+        if stamps_ns.size == 0:
+            measurements[f"{topic}/scanned_frame_count"] = 0
             continue
-        keyframe_indices = [
-            index
-            for index, payload in enumerate(channel.raw)
-            if _payload_starts_a_keyframe(payload)
-        ]
-        measurements[f"{topic}/keyframe_count"] = len(keyframe_indices)
-        measurements[f"{topic}/first_frame_is_keyframe"] = int(
-            bool(keyframe_indices) and keyframe_indices[0] == 0
+        inter = _KeyframeIntervalPerCamera(
+            frame_count=stamps_ns.size,
+            keyframe_indices=_keyframe_indices(channel),
         )
-        if not keyframe_indices:
-            continue
-        keyframe_stamps_ns = stamps_ns[keyframe_indices]
-        # The tail matters: a long run after the last keyframe is just as
-        # unseekable as a long run between two.
-        gaps_ns = np.diff(np.append(keyframe_stamps_ns, stamps_ns[-1]))
-        positive_gaps_ns = gaps_ns[gaps_ns > 0]
-        measurements[f"{topic}/max_keyframe_gap_s"] = (
-            float(np.max(positive_gaps_ns) / 1e9) if len(positive_gaps_ns) else 0.0
-        )
-        if len(keyframe_stamps_ns) >= 2:
-            intervals_ns = np.diff(keyframe_stamps_ns)
-            measurements[f"{topic}/median_keyframe_interval_s"] = float(
-                np.median(intervals_ns) / 1e9
-            )
+        for key in sorted(keyframe_interval_keys(episode, cameras=selected_cameras)):
+            if not key.startswith(f"{topic}/"):
+                continue
+            name = key[len(topic) + 1 :]
+            measurements[key] = _keyframe_interval_value(topic, name, inter, stamps_ns)
     return CheckResult(measurements=measurements)
 
 
@@ -1851,51 +1933,6 @@ def _media_digest_keys(episode: Episode) -> set[str]:
     return keys
 
 
-def _keyframe_interval_keys(episode: Episode) -> set[str]:
-    """Mirror of ``keyframe_interval``: per-camera keys, with
-    ``max_keyframe_gap_s`` and ``median_keyframe_interval_s`` conditional on
-    whether the camera carried at least one (or two) keyframes.
-
-    The keyframe walk parses every payload in ``channel.raw``, which is
-    the same work the real check does to count keyframes. The exact
-    key set needs the count -- ``median_keyframe_interval_s`` only
-    appears when the camera has at least two keyframes, and there is
-    no cheaper signal that distinguishes the empty / single / multi
-    cases. The scan is acceptable here because it runs at most once
-    per default that could be superseded (the super-sede path is
-    only entered for ``keyframe_interval`` when a pipeline step has
-    already emitted one of the eight per-topic keys above, and only
-    the four ``*_count`` / ``*_is_keyframe`` / ``*_gap_s`` keys are
-    *new* relative to a no-pipeline-cover run); the saved work is
-    the ffmpeg decode the default would otherwise pay, which is the
-    two-to-five-second step per camera the cache from #175 still
-    has to re-run on a fresh episode. Trade documented here so a
-    future change to ``keyframe_interval`` (e.g. a payload-size
-    short-circuit, a cached keyframe count on the channel) can
-    revisit this prediction.
-    """
-    keys: set[str] = set()
-    for topic in episode.cameras:
-        channel = episode.channel(topic)
-        stamps = channel.timestamps
-        keys.add(f"{topic}/scanned_frame_count")
-        if stamps.size == 0:
-            continue
-        keyframe_indices = [
-            index
-            for index, payload in enumerate(channel.raw)
-            if _payload_starts_a_keyframe(payload)
-        ]
-        keys.add(f"{topic}/keyframe_count")
-        keys.add(f"{topic}/first_frame_is_keyframe")
-        if not keyframe_indices:
-            continue
-        if len(keyframe_indices) >= 2:
-            keys.add(f"{topic}/median_keyframe_interval_s")
-        keys.add(f"{topic}/max_keyframe_gap_s")
-    return keys
-
-
 # Internal: maps a default function to its key-set predictor. ``App`` reads
 # this once at default-skip time. For the five still-mirrored defaults the
 # predictor restates its body's writes, and the drift-guard test in
@@ -1907,7 +1944,7 @@ _DEFAULT_KEY_PATTERNS: dict[CheckFunction, Callable[[Episode], set[str]]] = {
     episode_duration: episode_duration_keys,
     timestamp_regularity: timestamp_regularity_keys,
     camera_frame_stats: camera_frame_stats_keys,
-    keyframe_interval: _keyframe_interval_keys,
+    keyframe_interval: keyframe_interval_keys,
     content_digest: _content_digest_keys,
     media_digest: _media_digest_keys,
 }

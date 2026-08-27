@@ -26,11 +26,14 @@ from hflow.checks import (
     _CameraIntermediates,
     _episode_duration_intermediates,
     _episode_duration_value,
+    _keyframe_interval_value,
     _timestamp_regularity_value,
     camera_frame_stats,
     camera_frame_stats_keys,
     episode_duration,
     episode_duration_keys,
+    keyframe_interval,
+    keyframe_interval_keys,
     timestamp_regularity,
     timestamp_regularity_keys,
 )
@@ -1126,3 +1129,97 @@ def test_timestamp_regularity_raises_on_an_unrecognised_key(
     assert run.result is None
     assert run.error is not None
     assert "no branch" in run.error
+
+
+# keyframe_interval: per-camera keys. With no camera, the key set is empty.
+# With one camera carrying the synthetic smptebars + black frame mix, the
+# body writes scanned_frame_count / keyframe_count / first_frame_is_keyframe
+# and the keyframe-gap / median-interval keys when at least one / two
+# keyframes are present. The synthetic encoder's GOP places a keyframe at
+# the head of every second of footage, so the one-second fixture should
+# always have at least one keyframe.
+
+KEYFRAME_INTERVAL_VALUE_CASES = [
+    pytest.param(
+        SyntheticEpisodeSpec(duration_s=1.0, cameras=()),
+        {},
+        id="no-camera",
+    ),
+    pytest.param(
+        # The synthetic encoder places a keyframe at the head of every GOP,
+        # and a 1.0 s episode fits one GOP exactly: the first frame is the
+        # only keyframe. ``median_keyframe_interval_s`` therefore does not
+        # appear (needs at least two keyframes), and ``max_keyframe_gap_s``
+        # equals the tail from frame 0 to the last frame.
+        SyntheticEpisodeSpec(duration_s=1.0, cameras=("wrist_cam",)),
+        {
+            "/wrist_cam/compressed/scanned_frame_count": 15,
+            "/wrist_cam/compressed/keyframe_count": 1,
+            "/wrist_cam/compressed/first_frame_is_keyframe": 1,
+            "/wrist_cam/compressed/max_keyframe_gap_s": pytest.approx(0.93, abs=0.05),
+        },
+        id="one-camera",
+    ),
+]
+
+
+@pytest.mark.parametrize(("spec", "expected_subset"), KEYFRAME_INTERVAL_VALUE_CASES)
+def test_keyframe_interval_emits_exactly_the_documented_measurements(
+    spec: SyntheticEpisodeSpec, expected_subset: dict[str, object], tmp_path: Path
+) -> None:
+    """The #182 condition, applied to ``keyframe_interval``: full dict
+    asserted against hand-written ground truth. The synthetic encoder's
+    keyframe placement is GOP-driven, so the keyframe_count and timing
+    keys get ranges / wide bands; the deterministic keys
+    (``scanned_frame_count`` and ``first_frame_is_keyframe``) are pinned
+    tight.
+    """
+    source = synthesize_episode(tmp_path / "kf_source.mcap", spec)
+    report = hflow.App("kf-fixture", data_root=tmp_path / "data").test(source, verbose=False)
+    run = next(r for r in report.checks if r.check.name == "keyframe_interval")
+    assert run.result is not None
+    _assert_measurements_match_pinned(dict(run.result.measurements), expected_subset)
+
+
+def test_keyframe_interval_withdraws_a_key_when_the_fact_does(
+    source_episode: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Poison: withdrawing ``max_keyframe_gap_s`` from the fact must
+    withdraw it from the body's emitted dict."""
+    real_fact = keyframe_interval_keys
+
+    def poisoned(episode: hflow.Episode) -> set[str]:
+        return {k for k in real_fact(episode) if not k.endswith("/max_keyframe_gap_s")}
+
+    monkeypatch.setattr(hflow.checks, "keyframe_interval_keys", poisoned)
+    report = hflow.App("kf-poison", data_root=tmp_path / "data").test(
+        source_episode, verbose=False
+    )
+    run = next(r for r in report.checks if r.check.name == "keyframe_interval")
+    assert run.result is not None
+    assert not any(k.endswith("/max_keyframe_gap_s") for k in run.result.measurements)
+    # source_episode is joints-only, so the camera set is empty and the
+    # fact returned no camera keys; the assertion is that the body matched
+    # the poisoned fact (no gap_s key in the result).
+    assert run.result.measurements == {}
+
+
+def test_keyframe_interval_raises_on_an_unrecognised_camera() -> None:
+    from hflow.checks import _KeyframeIntervalPerCamera
+
+    inter = _KeyframeIntervalPerCamera(frame_count=5, keyframe_indices=(0,))
+    with pytest.raises(ValueError, match="no branch"):
+        _keyframe_interval_value("/wrist_cam/compressed", "mystery", inter, np.array([0, 1, 2, 3, 4]))
+
+
+def test_keyframe_interval_raises_when_median_is_named_for_one_keyframe() -> None:
+    from hflow.checks import _KeyframeIntervalPerCamera
+
+    inter = _KeyframeIntervalPerCamera(frame_count=5, keyframe_indices=(0,))
+    with pytest.raises(ValueError, match="fewer than two keyframes"):
+        _keyframe_interval_value(
+            "/wrist_cam/compressed",
+            "median_keyframe_interval_s",
+            inter,
+            np.array([0, 1, 2, 3, 4]),
+        )
