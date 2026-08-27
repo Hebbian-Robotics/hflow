@@ -14,6 +14,7 @@ from io import StringIO
 from pathlib import Path
 from typing import Protocol
 
+from ._field_guards import require_float, require_int
 from ._toolchain import VideoMeasurementToolchain
 
 FRAME_STATISTICS_DEFINITION_VERSION = "video-frame-statistics/v1"
@@ -54,6 +55,8 @@ class VideoTimeInterval:
     end_seconds: float
 
     def __post_init__(self) -> None:
+        require_float(self.start_seconds, "start_seconds")
+        require_float(self.end_seconds, "end_seconds")
         if not math.isfinite(self.start_seconds) or self.start_seconds < 0:
             raise ValueError(f"start_seconds must be finite and nonnegative: {self.start_seconds}")
         if not math.isfinite(self.end_seconds) or self.end_seconds < self.start_seconds:
@@ -74,6 +77,14 @@ class FrameStatisticsSettings:
     overexposed_average_luma_threshold: float = 235.0
 
     def __post_init__(self) -> None:
+        require_int(
+            self.black_frame_minimum_pixel_share_percent,
+            "black_frame_minimum_pixel_share_percent",
+        )
+        require_int(self.black_pixel_luma_threshold, "black_pixel_luma_threshold")
+        require_float(self.freeze_noise_tolerance_decibels, "freeze_noise_tolerance_decibels")
+        require_float(self.freeze_minimum_duration_seconds, "freeze_minimum_duration_seconds")
+        require_float(self.overexposed_average_luma_threshold, "overexposed_average_luma_threshold")
         if not 0 <= self.black_frame_minimum_pixel_share_percent <= 100:
             raise ValueError("black_frame_minimum_pixel_share_percent must be between 0 and 100")
         if not 0 <= self.black_pixel_luma_threshold <= 255:

@@ -7,6 +7,7 @@ from types import ModuleType
 
 import numpy as np
 
+from ._field_guards import require_float
 from ._raw_frames import LUMA_FRAME_FILTER_GRAPH, luma_frames
 from ._toolchain import VideoMeasurementToolchain
 
@@ -51,6 +52,8 @@ class CameraMotionSettings:
     horizontal_field_of_view_degrees: float = DEFAULT_HORIZONTAL_FIELD_OF_VIEW_DEGREES
 
     def __post_init__(self) -> None:
+        require_float(self.frames_per_second, "frames_per_second")
+        require_float(self.horizontal_field_of_view_degrees, "horizontal_field_of_view_degrees")
         if not math.isfinite(self.frames_per_second) or self.frames_per_second <= 0:
             raise ValueError(
                 f"frames_per_second must be finite and positive, got {self.frames_per_second}"
