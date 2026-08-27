@@ -1932,28 +1932,6 @@ def _default_check_version_for_automatic_registration(check_function: CheckFunct
         ) from None
 
 
-# Key-set predictor for every default: what ``measurements`` keys would this
-# function emit for a given episode, without actually running it.
-#
-# Used by ``hflow.app.App`` to decide whether a pipeline step has already
-# covered a default's keys, so the default can be short-circuited before the
-# ffmpeg decode it would otherwise pay for. The patterns mirror the
-# ``measurements[...] = ...`` writes in the function bodies above, line for
-# line -- a separate, internal contract that the drift-guard test in
-# ``tests/test_default_checks.py`` enforces: a default whose actual key set
-# diverges from its pattern is a regression in this engine, not in the
-# default itself.
-#
-# The contract is between this registry and the function bodies in this file.
-# It is not a public API: there is no ``keys=`` parameter to
-# ``@app.check(version=...)``,
-# no ``__emitted_keys__`` convention, no way for user code to register a
-# pattern. A user-registered check has no pattern, so a user check that
-# happens to overlap a default's keys falls back to the post-execution
-# comparison in ``_yield_defaults_superseded_by_the_pipeline`` -- the same
-# path the same-parameter wrapper case has always taken.
-
-
 # Internal: maps a default function to the fact that owns its key set.
 # ``App`` reads this once at default-skip time to ask the fact "what
 # keys will you emit for this episode?" and use that to decide whether
