@@ -1090,8 +1090,8 @@ def test_timestamp_regularity_withdraws_a_key_when_the_fact_does(
     output."""
     real_fact = timestamp_regularity_keys
 
-    def poisoned(episode: hflow.Episode) -> set[str]:
-        return {k for k in real_fact(episode) if not k.endswith("/median_dt_s")}
+    def poisoned(episode: hflow.Episode, *, topics=None) -> set[str]:
+        return {k for k in real_fact(episode, topics=topics) if not k.endswith("/median_dt_s")}
 
     monkeypatch.setattr(hflow.checks, "timestamp_regularity_keys", poisoned)
     report = hflow.App("ts-poison", data_root=tmp_path / "data").test(
@@ -1109,8 +1109,8 @@ def test_timestamp_regularity_raises_on_an_unrecognised_key(
     """An unknown topic in the fact's output must raise where it happens."""
     real_fact = timestamp_regularity_keys
 
-    def haunted(episode: hflow.Episode) -> set[str]:
-        return real_fact(episode) | {"/ghost/mystery"}
+    def haunted(episode: hflow.Episode, *, topics=None) -> set[str]:
+        return real_fact(episode, topics=topics) | {"/ghost/mystery"}
 
     monkeypatch.setattr(hflow.checks, "timestamp_regularity_keys", haunted)
     report = hflow.App("ts-haunt", data_root=tmp_path / "data").test(

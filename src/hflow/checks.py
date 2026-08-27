@@ -167,31 +167,7 @@ class _TimestampRegularitySync:
     reference_stamps_ns: np.ndarray | None
 
 
-def _timestamp_regularity_resolve_selected(
-    episode: Episode, topics: Sequence[str] | None
-) -> tuple[list[str], list[str]]:
-    """Return ``(selected_topics, candidate_state_topics)``.
-
-    The two pieces both the fact and the body walk; the fact only needs
-    the selected list, the body also needs the state topics to pick the
-    densest non-camera reference. Same selection rule, same partition --
-    one statement of "which topics the check ran over".
-    """
-    infos = episode.topics
-    selected = (
-        list(topics)
-        if topics is not None
-        else sorted(topic for topic, info in infos.items() if info.message_count >= 2)
-    )
-    state_topics = [
-        topic
-        for topic in selected
-        if topic not in episode.cameras and infos[topic].message_count >= 2
-    ]
-    return selected, state_topics
-
-
-def timestamp_regularity_keys(episode: Episode) -> set[str]:
+def timestamp_regularity_keys(episode: Episode, *, topics: Sequence[str] | None = None) -> set[str]:
     """The one statement of ``timestamp_regularity``'s measurement key set.
 
     Per selected topic: ``period_sample_count`` when the topic has fewer
@@ -205,7 +181,7 @@ def timestamp_regularity_keys(episode: Episode) -> set[str]:
     selection rule mirrors the body's exactly: ``topics=`` is taken as
     given, otherwise every topic with at least two messages (#182).
     """
-    selected, state_topics = _timestamp_regularity_resolve_selected(episode, None)
+    selected, state_topics = _timestamp_regularity_resolve_selected(episode, topics)
     keys: set[str] = set()
     for topic in selected:
         if episode.channel(topic).timestamps.size < 2:
@@ -358,9 +334,16 @@ def timestamp_regularity(
             reference_stamps_ns=None,
         )
 
+    # The fact is the single statement of what this default emits; when
+    # the caller passed ``topics=``, the fact runs the same selection
+    # rule and returns the exact key set the body should write. No
+    # post-hoc filter is needed: the fact and the body share selection
+    # and key set, so a key the fact names must have a dispatcher arm
+    # and a key no dispatcher arm handles will not be in the fact's
+    # output (#182).
     measurements: dict[str, MeasurementValue] = {
         key: _timestamp_regularity_value(episode, key, per_topic, sync, tolerance_s)
-        for key in sorted(timestamp_regularity_keys(episode))
+        for key in sorted(timestamp_regularity_keys(episode, topics=topics))
     }
 
     intervals: list[Interval] = []
