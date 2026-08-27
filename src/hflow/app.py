@@ -1953,7 +1953,7 @@ class App:
             # (first episode, or no overlapping user step) falls through to
             # the regular path and runs as before.
             pipeline_emitted_keys: set[str] = set()
-            from hflow.checks import _DEFAULT_KEY_PATTERNS
+            from hflow.checks import _DEFAULT_KEY_FACTS
 
             for registered in checks_to_run:
                 run = CheckRunReport(check=registered)
@@ -1986,7 +1986,7 @@ class App:
                 # only fires when both the wrapper has run and the key sets
                 # actually overlap.
                 if registered.name in self._default_check_names and pipeline_emitted_keys:
-                    pattern = _DEFAULT_KEY_PATTERNS.get(registered.function)
+                    pattern = _DEFAULT_KEY_FACTS.get(registered.function)
                     if pattern is not None:
                         predicted = pattern(canonical_episode)
                         superseded_keys = sorted(predicted & pipeline_emitted_keys)

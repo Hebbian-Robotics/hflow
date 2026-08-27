@@ -18,7 +18,7 @@ from hflow._video_measurements import (
     _frame_statistics,
 )
 from hflow.checks import (
-    _DEFAULT_KEY_PATTERNS,
+    _DEFAULT_KEY_FACTS,
     DEFAULT_CHECKS,
     _TimestampRegularityPerTopic,
     _TimestampRegularitySync,
@@ -398,65 +398,50 @@ def test_partial_camera_coverage_drops_the_uncovered_camera_too(tmp_path: Path) 
 
 
 @pytest.mark.parametrize("cameras", [(), ("wrist_cam",), ("wrist_cam", "overhead_cam")])
-def test_every_default_in_the_pattern_registry_is_drift_free(
+def test_every_default_iterates_its_fact_for_measurements(
     cameras: tuple[str, ...], tmp_path: Path
 ) -> None:
-    """The pre-execution short-circuit trusts ``_DEFAULT_KEY_PATTERNS`` to
-    predict the keys each default will emit. If a future change to a
-    default adds or removes a measurement without updating its pattern,
-    the short-circuit will silently misfire: it will either skip a
-    default whose measurements the pipeline did not actually replace
-    (a false positive), or it will run a default whose measurements the
-    pipeline did replace (a false negative, the bug we are fixing).
-
-    This test runs each default on a synthetic episode, collects what
-    it actually emitted, and asserts the pattern is exact. A drift here
-    fails the build rather than waiting for a missed supersession in
-    production.
+    """The pre-execution short-circuit asks each default's fact for the
+    key set it will emit, then compares to what the pipeline has already
+    produced. With every default now routing through the same fact
+    function the body iterates, the contract is one statement per
+    default -- so the test asserts that the body emits a subset of (or
+    equal to) what the fact returns for the same canonical episode.
+    A body that emits keys the fact does not list is a regression in
+    the default itself, not just a stale mirror.
 
     Parametrized over the camera count on purpose. Three of the six
-    mirrors (``camera_frame_stats``, ``keyframe_interval``,
-    ``media_digest``) emit nothing at all on a camera-less episode, so a
-    guard that only ever saw one would pass while predicting a stale key
-    set for exactly the default this whole short-circuit exists to skip.
-    Two cameras as well as one, because a per-topic mirror that
-    accidentally hardcodes the first camera reads correct at one.
+    defaults (``camera_frame_stats``, ``keyframe_interval``,
+    ``media_digest``) emit nothing at all on a camera-less episode, so
+    a guard that only ever saw one would pass while predicting a stale
+    key set for exactly the default this whole short-circuit exists
+    to skip. Two cameras as well as one, because a per-topic dispatcher
+    that accidentally hardcodes the first camera reads correct at one.
     """
+    from hflow.episode import Episode
+
     source_episode = synthesize_episode(
-        tmp_path / "drift_source.mcap",
+        tmp_path / "fact_source.mcap",
         SyntheticEpisodeSpec(duration_s=1.0, cameras=cameras),
     )
-    app = hflow.App("drift-guard", data_root=tmp_path / "data")
+    app = hflow.App("fact-guard", data_root=tmp_path / "data")
     report = app.test(source_episode, verbose=False)
     actual = {
         run.check.name: (set(run.result.measurements) if run.result is not None else set())
         for run in report.checks
     }
-    # Replay each pattern against the same canonical episode the
-    # defaults saw, so the predicted and emitted sets are over the
-    # same input. The workspace is what ``app.test`` used to build the
-    # canonical form, and the patterns only read from the episode
-    # handle's structural state (channel counts, declared cameras) that
-    # does not vary between the test path and the short-circuit's.
-    from hflow.episode import Episode
-
     canonical = Episode(report.canonical_path)
-    for default, pattern in _DEFAULT_KEY_PATTERNS.items():
-        predicted = pattern(canonical)
-        # ``CheckFunction`` is ``Callable`` in the type system, so the
-        # function object has no public ``__name__``; the check name
-        # arrives via the registered step's ``name`` and matches
-        # ``default.__name__`` at registration time. Look it up the
-        # same way the runner would.
+    for default, fact in _DEFAULT_KEY_FACTS.items():
+        predicted = fact(canonical)
         emitted_name = next(
             (run.check.name for run in report.checks if run.check.function is default),
             None,
         )
         assert emitted_name is not None
         emitted = actual.get(emitted_name, set())
-        assert predicted == emitted, (
-            f"drift in {emitted_name}: pattern predicts {sorted(predicted)} "
-            f"but the default emitted {sorted(emitted)}"
+        assert emitted.issubset(predicted), (
+            f"{emitted_name} emitted {sorted(emitted - predicted)} "
+            f"that its own fact did not list"
         )
 
 

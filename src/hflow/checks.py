@@ -420,7 +420,7 @@ def camera_frame_stats_keys(episode: Episode, *, cameras: Sequence[str] | None =
     ``episode.cameras`` here exactly as it does in the body, so the fact and
     the body can never disagree about what was selected. ``App``'s
     pre-decode supersession consults this function through
-    ``_DEFAULT_KEY_PATTERNS``, which only ever sees the automatic bare
+    ``_DEFAULT_KEY_FACTS``, which only ever sees the automatic bare
     registration (a configured variant is a different function object and
     takes the post-execution path), so the fact is always called with
     default parameters.
@@ -2002,14 +2002,13 @@ def _default_check_version_for_automatic_registration(check_function: CheckFunct
 # path the same-parameter wrapper case has always taken.
 
 
-# Internal: maps a default function to its key-set predictor. ``App`` reads
-# this once at default-skip time. For the five still-mirrored defaults the
-# predictor restates its body's writes, and the drift-guard test in
-# ``tests/test_default_checks.py`` keeps the two in lockstep.
-# ``camera_frame_stats`` maps to its own fact function
-# (:func:`camera_frame_stats_keys`), whose output that body itself iterates --
-# prediction and emission are the same statement there (#182).
-_DEFAULT_KEY_PATTERNS: dict[CheckFunction, Callable[[Episode], set[str]]] = {
+# Internal: maps a default function to the fact that owns its key set.
+# ``App`` reads this once at default-skip time to ask the fact "what
+# keys will you emit for this episode?" and use that to decide whether
+# a pipeline step has already covered them (#182). Every default now
+# routes to the same statement the body iterates, so prediction and
+# emission are the same function -- no separate mirror, no drift.
+_DEFAULT_KEY_FACTS: dict[CheckFunction, Callable[..., set[str]]] = {
     episode_duration: episode_duration_keys,
     timestamp_regularity: timestamp_regularity_keys,
     camera_frame_stats: camera_frame_stats_keys,
