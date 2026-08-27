@@ -143,6 +143,8 @@ Stored-data identifiers (metadata record names, their keys, group names) are **n
 
 ## Conformance
 
+These rules describe the canonical output written by HFlow. A converter should follow the separate [input MCAP contract](./how-to/write-a-converter.md) instead of implementing these guarantees before ingest.
+
 A file claiming this convention must satisfy, in increasing strictness:
 
 1. **It is valid MCAP**: readable by the stock [`mcap` package](https://mcap.dev/docs/python/) with CRC validation on, with a complete summary section.
