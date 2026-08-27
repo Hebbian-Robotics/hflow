@@ -15,13 +15,13 @@ itself, the same way any other non-native-Python value would need to.
 
 
 def require_int(value: object, name: str) -> None:
-    """Refuse anything but a plain ``int`` - ``bool`` included."""
+    """Refuse anything but a plain ``int``, ``bool`` included."""
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be an int, got {type(value).__name__}")
 
 
 def require_float(value: object, name: str) -> None:
-    """Refuse anything but a plain ``int`` or ``float`` - ``bool`` included.
+    """Refuse anything but a plain ``int`` or ``float``, ``bool`` included.
 
     An ``int`` is accepted for a float-declared field: it is a perfectly good
     float value (``0`` is a real, falsy value that must still pass).
