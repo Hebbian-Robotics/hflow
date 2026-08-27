@@ -23,8 +23,10 @@ least as well as random jitter and reproduces exactly.
 """
 
 import heapq
+import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from numbers import Real
 from pathlib import Path
 
 
@@ -53,8 +55,36 @@ def plan_batches(
     if (batch_count is None) == (target_batch_bytes is None):
         raise ValueError("pass exactly one of batch_count or target_batch_bytes")
     for uri, size_bytes in item_sizes.items():
+        if not isinstance(size_bytes, int) or isinstance(size_bytes, bool):
+            raise ValueError(
+                f"item {uri!r} has type {type(size_bytes).__name__}, expected int bytes"
+            )
         if size_bytes < 0:
             raise ValueError(f"item {uri!r} has negative size {size_bytes}")
+
+    if not isinstance(stagger_interval_s, Real) or isinstance(stagger_interval_s, bool):
+        raise ValueError(
+            f"stagger_interval_s must be a number, got {type(stagger_interval_s).__name__}"
+        )
+    if not math.isfinite(stagger_interval_s):
+        raise ValueError(f"stagger_interval_s must be finite, got {stagger_interval_s}")
+    if stagger_interval_s < 0:
+        raise ValueError(f"stagger_interval_s must be nonnegative, got {stagger_interval_s}")
+
+    if batch_count is not None:
+        if not isinstance(batch_count, int) or isinstance(batch_count, bool):
+            raise ValueError(f"batch_count must be an int, got {type(batch_count).__name__}")
+        if batch_count < 1:
+            raise ValueError(f"batch_count must be >= 1, got {batch_count}")
+    else:
+        assert target_batch_bytes is not None
+        if not isinstance(target_batch_bytes, int) or isinstance(target_batch_bytes, bool):
+            raise ValueError(
+                f"target_batch_bytes must be an int, got {type(target_batch_bytes).__name__}"
+            )
+        if target_batch_bytes < 1:
+            raise ValueError(f"target_batch_bytes must be >= 1, got {target_batch_bytes}")
+
     if not item_sizes:
         return []
 
@@ -63,8 +93,6 @@ def plan_batches(
 
     batches: list[tuple[list[str], int]]
     if batch_count is not None:
-        if batch_count < 1:
-            raise ValueError(f"batch_count must be >= 1, got {batch_count}")
         # Least-loaded assignment: push each item onto the currently-lightest
         # batch. Heap entries are (total_bytes, batch_index) so byte ties
         # break on index, deterministically.
@@ -78,8 +106,6 @@ def plan_batches(
             heapq.heappush(heap, (total + size_bytes, index))
     else:
         assert target_batch_bytes is not None
-        if target_batch_bytes < 1:
-            raise ValueError(f"target_batch_bytes must be >= 1, got {target_batch_bytes}")
         # First-fit-decreasing: first open batch with room, else a new one.
         # An item exceeding the capacity still gets (its own) batch.
         batches = []
