@@ -362,13 +362,19 @@ def _camera_value(
             case "message_count":
                 return inter.stamps_ns.size
             case "expected_frame_count":
-                # The fact names this key only for topics carrying at least
-                # two stamps, which is exactly when intermediates hold a rate.
-                assert inter.expected_frame_count is not None
+                if inter.expected_frame_count is None:
+                    raise ValueError(
+                        f"{key!r} named for a topic that does not carry a rate: the fact "
+                        "only emits it for topics with at least two stamps"
+                    )
                 return inter.expected_frame_count
             case "frame_deficit_pct":
                 expected_frame_count = inter.expected_frame_count
-                assert expected_frame_count is not None
+                if expected_frame_count is None:
+                    raise ValueError(
+                        f"{key!r} named for a topic that does not carry a rate: the fact "
+                        "only emits it for topics with at least two stamps"
+                    )
                 return float(
                     100.0 * (expected_frame_count - inter.stamps_ns.size) / expected_frame_count
                 )
