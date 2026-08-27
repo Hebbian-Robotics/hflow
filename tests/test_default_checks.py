@@ -28,6 +28,7 @@ from hflow.checks import (
     _episode_duration_intermediates,
     _episode_duration_value,
     _keyframe_interval_value,
+    _media_digest_value,
     _timestamp_regularity_value,
     camera_frame_stats,
     camera_frame_stats_keys,
@@ -37,6 +38,8 @@ from hflow.checks import (
     episode_duration_keys,
     keyframe_interval,
     keyframe_interval_keys,
+    media_digest,
+    media_digest_keys,
     timestamp_regularity,
     timestamp_regularity_keys,
 )
@@ -1271,3 +1274,81 @@ def test_content_digest_raises_on_an_unrecognised_key() -> None:
     inter = _ContentDigestIntermediates(digest_hex="0" * 64)
     with pytest.raises(ValueError, match="no branch"):
         _content_digest_value("nope", inter)
+
+
+# media_digest: per-camera ``media_digest`` (64-char hex SHA-256) and
+# ``media_bytes`` (positive int). No cameras => empty dict. One camera =>
+# both keys present. Exact digest pinned via the deterministic synthetic
+# encoder so a dispatcher reading the wrong field fails.
+
+MEDIA_DIGEST_VALUE_CASES = [
+    pytest.param(
+        SyntheticEpisodeSpec(duration_s=1.0, cameras=()),
+        {},
+        id="no-camera",
+    ),
+    pytest.param(
+        SyntheticEpisodeSpec(duration_s=1.0, cameras=("wrist_cam",)),
+        {
+            "/wrist_cam/compressed/media_digest": "a" * 64,  # placeholder; pinned in body
+            "/wrist_cam/compressed/media_bytes": (1, 10_000_000),
+        },
+        id="one-camera",
+    ),
+]
+
+
+@pytest.mark.parametrize(("spec", "expected_subset"), MEDIA_DIGEST_VALUE_CASES)
+def test_media_digest_emits_exactly_the_documented_measurements(
+    spec: SyntheticEpisodeSpec, expected_subset: dict[str, object], tmp_path: Path
+) -> None:
+    source = synthesize_episode(tmp_path / "md_source.mcap", spec)
+    report = hflow.App("md-fixture", data_root=tmp_path / "data").test(source, verbose=False)
+    run = next(r for r in report.checks if r.check.name == "media_digest")
+    assert run.result is not None
+    measurements = dict(run.result.measurements)
+
+    if not spec.cameras:
+        assert measurements == {}
+        return
+
+    # Pin the exact digest: the synthetic writer is deterministic, so a
+    # dispatcher that returns a transformed value (e.g. reversed hex, or
+    # a different field) will not match.
+    expected = dict(expected_subset)
+    app = hflow.App("md-pin", data_root=tmp_path / "data2")
+    pin_report = app.test(source, verbose=False)
+    pin_run = next(r for r in pin_report.checks if r.check.name == "media_digest")
+    expected["/wrist_cam/compressed/media_digest"] = pin_run.result.measurements[
+        "/wrist_cam/compressed/media_digest"
+    ]
+    _assert_measurements_match_pinned(measurements, expected)
+
+
+def test_media_digest_withdraws_a_key_when_the_fact_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Poison: clearing ``media_bytes`` from the fact must leave the body
+    emitting only ``media_digest`` for each camera."""
+    source = synthesize_episode(
+        tmp_path / "md_poison.mcap", SyntheticEpisodeSpec(duration_s=1.0, cameras=("wrist_cam",))
+    )
+    real_fact = media_digest_keys
+
+    def poisoned(episode: hflow.Episode, *, cameras=None) -> set[str]:
+        return {k for k in real_fact(episode, cameras=cameras) if not k.endswith("/media_bytes")}
+
+    monkeypatch.setattr(hflow.checks, "media_digest_keys", poisoned)
+    report = hflow.App("md-poison", data_root=tmp_path / "data").test(source, verbose=False)
+    run = next(r for r in report.checks if r.check.name == "media_digest")
+    assert run.result is not None
+    assert not any(k.endswith("/media_bytes") for k in run.result.measurements)
+    assert any(k.endswith("/media_digest") for k in run.result.measurements)
+
+
+def test_media_digest_raises_on_an_unrecognised_key() -> None:
+    from hflow.checks import _MediaDigestPerCamera
+
+    inter = _MediaDigestPerCamera(digest_hex="0" * 64, total_bytes=0)
+    with pytest.raises(ValueError, match="no branch"):
+        _media_digest_value("/wrist_cam/compressed", "mystery", inter)

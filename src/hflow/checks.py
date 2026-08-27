@@ -1704,6 +1704,56 @@ def _payload_starts_a_keyframe(payload: bytes) -> bool:
     return len(access_units) == 1 and access_units[0].is_keyframe
 
 
+@dataclass(frozen=True)
+class _MediaDigestPerCamera:
+    """One camera channel's footage digest and byte count, computed once.
+
+    Reads no pixels and runs no decode; the body just walks the length-
+    framed payload bytes once and the dispatcher hands both numbers out
+    for the two keys the fact advertises.
+    """
+
+    digest_hex: str
+    total_bytes: int
+
+
+def _media_digest_intermediates(episode: Episode, topic: str) -> _MediaDigestPerCamera:
+    payloads = episode.channel(topic).raw
+    digest = hashlib.sha256()
+    total_bytes = 0
+    for payload in payloads:
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+        total_bytes += len(payload)
+    return _MediaDigestPerCamera(digest_hex=digest.hexdigest(), total_bytes=total_bytes)
+
+
+def media_digest_keys(episode: Episode, *, cameras: Sequence[str] | None = None) -> set[str]:
+    """The one statement of ``media_digest``'s measurement key set.
+
+    Per selected camera: ``media_digest`` and ``media_bytes`` always --
+    both are produced in the same byte walk, so the fact's two-key claim
+    holds for every camera the default runs over.
+    """
+    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    keys: set[str] = set()
+    for topic in selected_cameras:
+        keys.add(f"{topic}/media_digest")
+        keys.add(f"{topic}/media_bytes")
+    return keys
+
+
+def _media_digest_value(
+    topic: str, name: str, inter: _MediaDigestPerCamera
+) -> MeasurementValue:
+    """Dispatcher for one ``media_digest`` key."""
+    if name == "media_digest":
+        return inter.digest_hex
+    if name == "media_bytes":
+        return inter.total_bytes
+    raise ValueError(f"media_digest has no branch for the key {topic}/{name}")
+
+
 def media_digest(episode: Episode, *, cameras: Sequence[str] | None = None) -> CheckResult:
     """Per-camera digest of the encoded footage alone, for redundancy hunts.
 
@@ -1729,15 +1779,12 @@ def media_digest(episode: Episode, *, cameras: Sequence[str] | None = None) -> C
     selected_cameras = list(cameras) if cameras is not None else episode.cameras
     measurements: dict[str, MeasurementValue] = {}
     for topic in selected_cameras:
-        payloads = episode.channel(topic).raw
-        digest = hashlib.sha256()
-        total_bytes = 0
-        for payload in payloads:
-            digest.update(len(payload).to_bytes(8, "big"))
-            digest.update(payload)
-            total_bytes += len(payload)
-        measurements[f"{topic}/media_digest"] = digest.hexdigest()
-        measurements[f"{topic}/media_bytes"] = total_bytes
+        inter = _media_digest_intermediates(episode, topic)
+        for key in sorted(media_digest_keys(episode, cameras=selected_cameras)):
+            if not key.startswith(f"{topic}/"):
+                continue
+            name = key[len(topic) + 1 :]
+            measurements[key] = _media_digest_value(topic, name, inter)
     return CheckResult(measurements=measurements)
 
 
@@ -1953,12 +2000,6 @@ def _default_check_version_for_automatic_registration(check_function: CheckFunct
 # happens to overlap a default's keys falls back to the post-execution
 # comparison in ``_yield_defaults_superseded_by_the_pipeline`` -- the same
 # path the same-parameter wrapper case has always taken.
-def _media_digest_keys(episode: Episode) -> set[str]:
-    keys: set[str] = set()
-    for topic in episode.cameras:
-        keys.add(f"{topic}/media_digest")
-        keys.add(f"{topic}/media_bytes")
-    return keys
 
 
 # Internal: maps a default function to its key-set predictor. ``App`` reads
@@ -1974,5 +2015,5 @@ _DEFAULT_KEY_PATTERNS: dict[CheckFunction, Callable[[Episode], set[str]]] = {
     camera_frame_stats: camera_frame_stats_keys,
     keyframe_interval: keyframe_interval_keys,
     content_digest: content_digest_keys,
-    media_digest: _media_digest_keys,
+    media_digest: media_digest_keys,
 }
