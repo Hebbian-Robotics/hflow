@@ -1042,6 +1042,13 @@ def trajectory_metrics(
     dividing by it would inflate its own sensor jitter into apparent motion --
     inverting the metric on exactly the episodes worth catching.
 
+    ``{topic}/final_pose_unsettled_ratio`` is emitted only when
+    ``{topic}/mean_velocity`` is above zero. For a fully motionless episode the
+    ratio is undefined (zero denominator), so only ``{topic}/final_pose_speed``
+    appears. Curation queries joining on ``final_pose_unsettled_ratio`` will
+    silently exclude motionless episodes; use ``final_pose_speed`` when you need
+    all episodes regardless of mean motion.
+
     Evidence only, and this one ships no recommended gate at all: these are
     motion-smoothness metrics, which are known to invert on real defects
     (Voxel51's audit scored an early-gripper-release defect better than clean
@@ -1076,9 +1083,8 @@ def trajectory_metrics(
     valid_velocity_s = float(np.sum(measured_durations_s))
     measurements[f"{topic}/valid_velocity_s"] = valid_velocity_s
     measurements[f"{topic}/peak_velocity"] = float(np.max(measured_speeds))
-    measurements[f"{topic}/mean_velocity"] = float(
-        np.sum(measured_speeds * measured_durations_s) / valid_velocity_s
-    )
+    mean_velocity = float(np.sum(measured_speeds * measured_durations_s) / valid_velocity_s)
+    measurements[f"{topic}/mean_velocity"] = mean_velocity
     if valid_velocity_s > 0:
         motionless_s = float(
             np.sum(measured_durations_s[measured_speeds < motionless_speed_epsilon])
@@ -1100,11 +1106,12 @@ def trajectory_metrics(
         (profile.stamps_ns[-1] - profile.stamps_ns[:-1]) / 1e9 <= final_pose_window_s
     )
     if np.any(final_window_mask):
-        mean_speed = measurements[f"{topic}/mean_velocity"]
         final_speed = float(np.mean(profile.speeds[final_window_mask]))
         measurements[f"{topic}/final_pose_speed"] = final_speed
-        if isinstance(mean_speed, float) and mean_speed > 0:
-            measurements[f"{topic}/final_pose_unsettled_ratio"] = final_speed / mean_speed
+        if mean_velocity > 0:
+            # Omitted when mean_velocity == 0.0: the ratio is undefined for a
+            # fully motionless episode.
+            measurements[f"{topic}/final_pose_unsettled_ratio"] = final_speed / mean_velocity
     return CheckResult(measurements=measurements)
 
 

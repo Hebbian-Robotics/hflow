@@ -761,3 +761,44 @@ def test_trajectory_change_threshold_uses_a_true_weighted_median(tmp_path: Path)
     assert _duration_weighted_median(values, weights) == 2.0
     # Weight concentrated on the smallest value moves the median onto it.
     assert _duration_weighted_median(values, np.array([10.0, 1.0, 1.0])) == 1.0
+
+
+def test_trajectory_metrics_emits_unsettled_ratio_for_a_moving_episode(
+    tmp_path: Path,
+) -> None:
+    """A moving episode has mean_velocity > 0, so the unsettled ratio is
+    defined and must be emitted alongside final_pose_speed.
+    """
+    source = synthesize_episode(
+        tmp_path / "moving.mcap",
+        SyntheticEpisodeSpec(duration_s=3.0, cameras=(), joint_jump_at_s=None),
+    )
+    with hflow.Episode(source) as episode:
+        result = trajectory_metrics(episode)
+
+    assert "/joint_states/final_pose_speed" in result.measurements
+    assert "/joint_states/final_pose_unsettled_ratio" in result.measurements
+    ratio = result.measurements["/joint_states/final_pose_unsettled_ratio"]
+    assert isinstance(ratio, float)
+
+
+def test_trajectory_metrics_omits_unsettled_ratio_for_a_motionless_episode(
+    tmp_path: Path,
+) -> None:
+    """A fully frozen episode has mean_velocity == 0.0, so dividing by it
+    is undefined. final_pose_speed is still recorded; the ratio is not.
+    """
+    source = synthesize_episode(
+        tmp_path / "frozen.mcap",
+        SyntheticEpisodeSpec(
+            duration_s=3.0,
+            cameras=(),
+            joint_jump_at_s=None,
+            joint_freeze_segment=(0.0, 3.0),
+        ),
+    )
+    with hflow.Episode(source) as episode:
+        result = trajectory_metrics(episode)
+
+    assert "/joint_states/final_pose_speed" in result.measurements
+    assert "/joint_states/final_pose_unsettled_ratio" not in result.measurements
