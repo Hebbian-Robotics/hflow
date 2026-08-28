@@ -118,3 +118,19 @@ def test_cli_manifest_does_not_inherit_a_pipeline_that_exits(
     error_output = capsys.readouterr().err
     assert str(pipeline_file) in error_output
     assert "set ROBOT_FLEET" in error_output
+
+
+def test_python_m_hflow_executes_as_module() -> None:
+    """Verify python -m hflow produces the expected help output and exit code."""
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-m", "hflow", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert "usage:" in result.stdout.lower() or "hflow" in result.stdout
+
