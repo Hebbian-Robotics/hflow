@@ -34,7 +34,7 @@ class TestParseStorageRoot:
     def test_path_and_plain_string_are_local(self) -> None:
         assert parse_storage_root(Path("/tmp/x")) == LocalStorageRoot(Path("/tmp/x"))
         assert parse_storage_root("./data") == LocalStorageRoot(Path("./data"))
-        assert parse_storage_root(".") == LocalStorageRoot(Path("."))
+        assert parse_storage_root(".") == LocalStorageRoot(Path())
 
     def test_existing_roots_pass_through(self) -> None:
         local_root = LocalStorageRoot(Path("/tmp/x"))
@@ -68,7 +68,7 @@ class TestParseStorageRoot:
             parse_storage_root("gs:////x")
 
     def test_empty_local_path_is_refused(self) -> None:
-        with pytest.raises(ValueError, match="storage root .* must be a directory path or bucket URL"):
+        with pytest.raises(ValueError, match=r"storage root .* must be a directory path or bucket URL"):
             parse_storage_root("")
         with pytest.raises(ValueError, match="storage root '   ' must be a directory path or bucket URL"):
             parse_storage_root("   ")
