@@ -57,6 +57,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Callable, Mapping, Sequence
+from copy import copy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -353,12 +354,25 @@ def _resolve_decoder(topic: str, info: TopicInfo) -> Callable[[bytes], Any]:
     )
 
 
-def _resolve_encoder(topic: str, info: TopicInfo) -> Callable[[Any], bytes]:
+@dataclass(frozen=True)
+class _Ros2VideoMessageWithData:
+    """Override only the payload while forwarding every other field to its owner."""
+
+    _original: object
+    data: bytes
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._original, name)
+
+
+def _resolve_encoder(topic: str, info: TopicInfo) -> Callable[[Any, bytes], bytes]:
     """An encoder matching a decoded pass-through video message."""
     if info.message_encoding == "protobuf":
 
-        def encode_protobuf(message: Any) -> bytes:
-            serialize = getattr(message, "SerializeToString", None)
+        def encode_protobuf(message: Any, data: bytes) -> bytes:
+            repaired_message = copy(message)
+            repaired_message.data = data
+            serialize = getattr(repaired_message, "SerializeToString", None)
             if not callable(serialize):
                 raise ValueError(
                     f"camera topic {topic!r} decoded a protobuf message that cannot "
@@ -373,32 +387,51 @@ def _resolve_encoder(topic: str, info: TopicInfo) -> Callable[[Any], bytes]:
         encoders = serialize_dynamic(info.schema_name, info.schema_data.decode())
         encoder = encoders.get(info.schema_name)
         if encoder is not None:
-            return encoder
+
+            def encode_cdr(message: Any, data: bytes) -> bytes:
+                # mcap_ros2's slotted SimpleNamespace fields are lost by copy.copy.
+                return encoder(_Ros2VideoMessageWithData(_original=message, data=data))
+
+            return encode_cdr
     raise ValueError(
         f"camera topic {topic!r} has message encoding {info.message_encoding!r} "
         "that cannot be serialized after inserting an AUD"
     )
 
 
-def _insert_missing_passthrough_video_aud(topic: str, decoded_message: Any) -> bool:
-    """Repair the one canonical constraint that is lossless to bridge."""
+@dataclass(frozen=True)
+class PassthroughVideoMessage:
+    """The H.264 payload parsed at the codec boundary, independent of its encoding."""
+
+    format: Literal["h264"]
+    data: bytes
+
+
+def _parse_passthrough_video_message(topic: str, decoded_message: Any) -> PassthroughVideoMessage:
     if decoded_message.format != "h264":
-        return False
-    original_data = bytes(decoded_message.data)
+        raise ValueError(
+            f"pass-through video topic {topic!r} carries format "
+            f"{decoded_message.format!r}; the canonical convention requires 'h264' "
+            "(re-encode upstream -- v1 does not transcode CompressedVideo)"
+        )
+    return PassthroughVideoMessage(format="h264", data=bytes(decoded_message.data))
+
+
+def _insert_missing_passthrough_video_aud(
+    topic: str, message: PassthroughVideoMessage
+) -> PassthroughVideoMessage:
+    """Repair the one canonical constraint that is lossless to bridge."""
     try:
-        canonical_data = video_module.ensure_access_unit_delimiter(original_data)
+        canonical_data = video_module.ensure_access_unit_delimiter(message.data)
     except ValueError as error:
         raise ValueError(
             f"pass-through video topic {topic!r} violates the canonical convention: {error}"
         ) from error
-    if canonical_data == original_data:
-        return False
-    decoded_message.data = canonical_data
-    return True
+    return PassthroughVideoMessage(format=message.format, data=canonical_data)
 
 
 def _validate_passthrough_video_payload(
-    topic: str, decoded_message: Any, *, is_first_message: bool
+    topic: str, message: PassthroughVideoMessage, *, is_first_message: bool
 ) -> None:
     """Enforce the canonical video constraints on a pass-through message.
 
@@ -406,14 +439,8 @@ def _validate_passthrough_video_payload(
     pre-encoded video channel from another recorder must be proven
     conforming, not trusted.
     """
-    if decoded_message.format != "h264":
-        raise ValueError(
-            f"pass-through video topic {topic!r} carries format "
-            f"{decoded_message.format!r}; the canonical convention requires 'h264' "
-            "(re-encode upstream -- v1 does not transcode CompressedVideo)"
-        )
     try:
-        access_units = video_module.split_annex_b_stream(bytes(decoded_message.data))
+        access_units = video_module.split_annex_b_stream(message.data)
     except ValueError as error:
         raise ValueError(
             f"pass-through video topic {topic!r} violates the canonical convention: "
@@ -542,7 +569,7 @@ def write_canonical_episode(
             if info.schema_name in PASSTHROUGH_VIDEO_SCHEMA_NAMES
         }
         passthrough_video_decoders: dict[int, Callable[[bytes], Any]] = {}
-        passthrough_video_encoders: dict[int, Callable[[Any], bytes]] = {}
+        passthrough_video_encoders: dict[int, Callable[[Any, bytes], bytes]] = {}
         passthrough_video_channels_with_messages: set[int] = set()
         for batch in reader.iter_batches():
             if batch.channel_id in camera_payloads:
@@ -562,20 +589,25 @@ def write_canonical_episode(
                             batch.channel_id not in passthrough_video_channels_with_messages
                         )
                         decoded_message = decode(payload)
-                        inserted_aud = _insert_missing_passthrough_video_aud(
+                        video_message = _parse_passthrough_video_message(
                             batch.topic, decoded_message
+                        )
+                        repaired_video_message = _insert_missing_passthrough_video_aud(
+                            batch.topic, video_message
                         )
                         _validate_passthrough_video_payload(
                             batch.topic,
-                            decoded_message,
+                            repaired_video_message,
                             is_first_message=is_first_message,
                         )
-                        if inserted_aud:
+                        if repaired_video_message.data != video_message.data:
                             if batch.channel_id not in passthrough_video_encoders:
                                 passthrough_video_encoders[batch.channel_id] = _resolve_encoder(
                                     batch.topic, infos[batch.channel_id]
                                 )
-                            payload = passthrough_video_encoders[batch.channel_id](decoded_message)
+                            payload = passthrough_video_encoders[batch.channel_id](
+                                decoded_message, repaired_video_message.data
+                            )
                         canonical_payloads.append(payload)
                         passthrough_video_channels_with_messages.add(batch.channel_id)
                 else:

@@ -3,9 +3,10 @@
 import functools
 import json
 import textwrap
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
@@ -17,9 +18,11 @@ from mcap_ros2.decoder import DecoderFactory as Ros2DecoderFactory
 from mcap_ros2.writer import Writer as Ros2Writer
 
 import hflow
+from hflow import transform
 from hflow._grouped_mcap_writer import NO_SCHEMA_ID, GroupedMcapWriter
 from hflow.doctor import diagnose
 from hflow.format import METADATA_RECORD_EPISODE
+from hflow.reader import TopicInfo
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import write_canonical_episode
 from hflow.video import estimate_fps_from_log_times
@@ -286,6 +289,71 @@ def test_transform_inserts_missing_aud_into_ros2_video(tmp_path: Path) -> None:
     assert len(repaired.data) == len(KEYFRAME_WITHOUT_AUD) + 6
     assert repaired.frame_id == "cam"
     assert repaired.format == "h264"
+
+
+@pytest.mark.parametrize("encoding", ["protobuf", "cdr"])
+@pytest.mark.parametrize(
+    "data", [KEYFRAME_ACCESS_UNIT, KEYFRAME_WITHOUT_AUD], ids=["conforming", "repaired"]
+)
+def test_transform_preserves_decoder_owned_video_messages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, encoding: str, data: bytes
+) -> None:
+    source = tmp_path / "decoder-owned-video.mcap"
+    if encoding == "protobuf":
+        _write_passthrough_video_source(source, [("/cam", 1, data)])
+    else:
+        writer = Ros2Writer(str(source))
+        schema = writer.register_msgdef(
+            "foxglove_msgs/msg/CompressedVideo",
+            ROS2_COMPRESSED_VIDEO_SCHEMA.replace(
+                "string frame_id", "string frame_id\nstring original"
+            ),
+        )
+        writer.write_message(
+            "/cam",
+            schema,
+            SimpleNamespace(
+                timestamp=SimpleNamespace(sec=0, nanosec=1),
+                frame_id="cam",
+                original="source-recorder",
+                data=data,
+                format="h264",
+            ),
+            log_time=1,
+            publish_time=1,
+        )
+        writer.finish()
+
+    resolve_decoder = transform._resolve_decoder
+    decoder_owned_messages: list[Any] = []
+
+    def retaining_decoder(topic: str, info: TopicInfo) -> Callable[[bytes], Any]:
+        decode = resolve_decoder(topic, info)
+
+        def decode_and_retain(payload: bytes) -> Any:
+            message = decode(payload)
+            decoder_owned_messages.append(message)
+            return message
+
+        return decode_and_retain
+
+    monkeypatch.setattr(transform, "_resolve_decoder", retaining_decoder)
+    output = tmp_path / "out.mcap"
+    write_canonical_episode(source, output)
+
+    (original,) = decoder_owned_messages
+    assert bytes(original.data) == data
+    assert original.format == "h264"
+    assert original.frame_id == "cam"
+    if encoding == "cdr":
+        with output.open("rb") as stream:
+            schema, channel, message = next(make_reader(stream).iter_messages())
+            assert schema is not None
+            decode = Ros2DecoderFactory().decoder_for(channel.message_encoding, schema)
+            assert decode is not None
+            assert decode(message.data).original == "source-recorder"
+    report = diagnose(output)
+    assert report.conforming, report.summary()
 
 
 def test_aborted_writer_does_not_publish_partial_file(tmp_path: Path) -> None:
