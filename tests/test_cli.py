@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -6,6 +8,8 @@ from pytest import CaptureFixture
 
 from hflow import __version__
 from hflow.cli import _build_parser, main
+from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
+from hflow.transform import write_canonical_episode
 
 
 @pytest.mark.parametrize(
@@ -120,16 +124,49 @@ def test_cli_manifest_does_not_inherit_a_pipeline_that_exits(
     assert "set ROBOT_FLEET" in error_output
 
 
-def test_python_m_hflow_executes_as_module() -> None:
-    """Verify python -m hflow produces the expected help output and exit code."""
-    import subprocess
-    import sys
-
-    result = subprocess.run(
-        [sys.executable, "-m", "hflow", "--help"],
-        capture_output=True,
-        text=True,
-        check=False,
+def _run_module(*args: str) -> "subprocess.CompletedProcess[str]":
+    return subprocess.run(
+        [sys.executable, "-m", "hflow", *args], capture_output=True, text=True, check=False
     )
-    assert result.returncode == 0
-    assert "usage:" in result.stdout.lower() or "hflow" in result.stdout
+
+
+def _run_script(*args: str) -> "subprocess.CompletedProcess[str]":
+    return subprocess.run(["hflow", *args], capture_output=True, text=True, check=False)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        pytest.param(["--help"], id="help"),
+        pytest.param(["doctor", "no-such-file.mcap"], id="missing-file-exit-2"),
+    ],
+)
+def test_the_module_form_matches_the_console_script(args: list[str]) -> None:
+    """``python -m hflow`` is a shim, so it has to agree with the script.
+
+    Asserting the module merely starts would pass on a shim that swallowed the
+    exit code, which is the way this can be wrong without looking wrong. The
+    missing-file case is here for exactly that: it exits 2, so a shim returning
+    ``main()`` instead of raising ``SystemExit(main())`` would report 0.
+    """
+    module = _run_module(*args)
+    script = _run_script(*args)
+
+    assert module.returncode == script.returncode
+    assert module.stdout == script.stdout
+
+
+def test_the_module_form_reports_a_conforming_file(tmp_path: Path) -> None:
+    """The exit-0 path, over a real episode rather than --help."""
+    source = synthesize_episode(
+        tmp_path / "source.mcap", SyntheticEpisodeSpec(duration_s=1.0, cameras=())
+    )
+    canonical = tmp_path / "canonical.mcap"
+    write_canonical_episode(source, canonical)
+
+    module = _run_module("doctor", str(canonical))
+    script = _run_script("doctor", str(canonical))
+
+    assert module.returncode == 0
+    assert module.returncode == script.returncode
+    assert module.stdout == script.stdout
