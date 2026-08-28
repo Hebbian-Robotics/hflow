@@ -408,7 +408,7 @@ class BucketStorageRoot:
     ) -> None:
         normalized_url = url.rstrip("/")
         _scheme, separator, remainder = normalized_url.partition("://")
-        if not separator or not remainder:
+        if not separator or not remainder.partition("/")[0]:
             raise ValueError(
                 f"bucket URL {url!r} names no bucket/container -- expected e.g. gs://bucket/prefix"
             )
@@ -631,6 +631,8 @@ def parse_storage_root(value: "str | Path | StorageRoot") -> StorageRoot:
         return LocalStorageRoot(value)
     scheme, separator, remainder = value.partition("://")
     if not separator:
+        if not value.strip():
+            raise ValueError(f"storage root {value!r} must be a directory path or bucket URL")
         return LocalStorageRoot(Path(value))
     normalized_scheme = scheme.lower()
     if normalized_scheme == "file":
