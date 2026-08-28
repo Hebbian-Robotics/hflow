@@ -884,6 +884,77 @@ def test_contact_sheet_accepts_apostrophes_in_external_paths(
     assert sheet.timestamps_burned is True
 
 
+def _render_with_font(
+    frames: list[ExtractedFrame],
+    font_path: Path,
+    output: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> str:
+    monkeypatch.setattr(_contact_sheet, "_find_usable_font_file", lambda: font_path)
+    contact_sheet(frames, output, columns=2)
+    return hashlib.sha256(output.read_bytes()).hexdigest()
+
+
+def test_an_apostrophe_font_path_reaches_drawtext_as_the_named_file(
+    ten_extracted_frames: list[ExtractedFrame],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The escaping test above cannot fail on a host that quietly substitutes.
+
+    When ffmpeg cannot open the ``fontfile`` it names, drawtext falls back to a
+    default face and still reports ``timestamps_burned``. On this machine a
+    deliberately missing path renders byte-identically to the real one, so every
+    assertion above holds while the font path never arrived. Rendering a face
+    that is visibly not the default is what makes the quoting observable.
+    """
+    if _find_usable_font_file() is None:
+        pytest.skip("requires a usable system font")
+    if not _contact_sheet._ffmpeg_supports_drawtext(ffmpeg_path()):
+        pytest.skip("requires ffmpeg drawtext support")
+    distinctive_font = next(
+        (
+            candidate
+            for candidate in (
+                Path("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"),
+                Path("/usr/share/fonts/dejavu/DejaVuSerif.ttf"),
+                Path("/usr/share/fonts/TTF/DejaVuSerif.ttf"),
+                Path("/System/Library/Fonts/Times.ttc"),
+            )
+            if candidate.is_file()
+        ),
+        None,
+    )
+    if distinctive_font is None:
+        pytest.skip("requires a second font distinguishable from the default")
+
+    plain_directory = tmp_path / "plain assets"
+    plain_directory.mkdir()
+    quoted_directory = tmp_path / "wearer's assets"
+    quoted_directory.mkdir()
+    frames = ten_extracted_frames[:2]
+
+    plain_font = plain_directory / "distinctive.ttf"
+    plain_font.write_bytes(distinctive_font.read_bytes())
+    quoted_font = quoted_directory / "worker's-distinctive.ttf"
+    quoted_font.write_bytes(distinctive_font.read_bytes())
+
+    plain_digest = _render_with_font(frames, plain_font, tmp_path / "plain.jpg", monkeypatch)
+    default_digest = _render_with_font(
+        frames, quoted_directory / "absent'-font.ttf", tmp_path / "absent.jpg", monkeypatch
+    )
+    # Only assert once this host can actually tell the two faces apart.
+    if plain_digest == default_digest:
+        pytest.skip("this host renders the distinctive font identically to its fallback")
+
+    quoted_digest = _render_with_font(frames, quoted_font, tmp_path / "quoted.jpg", monkeypatch)
+
+    assert quoted_digest == plain_digest, (
+        "the apostrophe path rendered a different face than the same font at a plain path, "
+        "so drawtext did not receive the file it was told to open"
+    )
+
+
 def test_contact_sheet_rejects_empty_input(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="at least one frame"):
         contact_sheet([], tmp_path / "never.jpg")
