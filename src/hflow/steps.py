@@ -227,11 +227,23 @@ class Threshold:
                 "threshold key_pattern must not be empty; it is a glob over "
                 "measurement keys, e.g. '*/black_frame_pct'"
             )
+        if isinstance(self.value, bool):
+            raise ValueError(
+                f"threshold value for {self.key_pattern!r} must be a number, not "
+                f"{self.value!r}: bool is accepted by float but silently compares "
+                "against 0.0 or 1.0, not the meaning the author wrote"
+            )
         if math.isnan(self.value):
             raise ValueError(
                 f"threshold value for {self.key_pattern!r} must be a number, not NaN: "
                 "every comparison against NaN is False, so this gate would reject "
                 "every episode it evaluated"
+            )
+        if math.isinf(self.value):
+            raise ValueError(
+                f"threshold value for {self.key_pattern!r} must be finite, not "
+                f"{self.value!r}: an infinite threshold accepts or rejects every "
+                "episode unconditionally, which is the same as not checking at all"
             )
 
     def holds(self, measurement: float) -> bool:
