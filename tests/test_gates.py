@@ -250,3 +250,27 @@ def test_an_empty_gate_is_refused_at_construction() -> None:
 def test_a_nan_threshold_is_refused_at_construction() -> None:
     with pytest.raises(ValueError, match="not NaN"):
         hflow.Threshold("v", hflow.Comparison.AT_MOST, math.nan)
+
+
+@pytest.mark.parametrize(
+    ("comparison", "value", "outcome"),
+    [
+        (hflow.Comparison.AT_MOST, math.inf, "accept every finite measurement"),
+        (hflow.Comparison.AT_LEAST, -math.inf, "accept every finite measurement"),
+        (hflow.Comparison.AT_LEAST, math.inf, "reject every finite measurement"),
+        (hflow.Comparison.AT_MOST, -math.inf, "reject every finite measurement"),
+    ],
+)
+def test_an_infinite_threshold_is_refused_at_construction(
+    comparison: hflow.Comparison, value: float, outcome: str
+) -> None:
+    with pytest.raises(ValueError, match=rf"threshold value.*{outcome}"):
+        hflow.Threshold("v", comparison, value)
+
+
+def test_a_boolean_threshold_is_refused_but_an_integer_is_accepted() -> None:
+    with pytest.raises(ValueError, match=r"threshold value.*not bool"):
+        hflow.Threshold("v", hflow.Comparison.AT_MOST, True)
+
+    assert hflow.Threshold("v", hflow.Comparison.AT_MOST, 0).value == 0
+    assert hflow.Threshold("v", hflow.Comparison.AT_MOST, 2**1024).value == 2**1024
