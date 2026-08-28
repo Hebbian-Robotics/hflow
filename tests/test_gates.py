@@ -276,5 +276,5 @@ def test_an_infinite_threshold_is_refused_at_construction(
 def test_a_bool_threshold_is_refused_at_construction(
     value: bool, desc: str
 ) -> None:
-    with pytest.raises(ValueError, match="not True|not False"):
+    with pytest.raises(ValueError, match=r"not True|not False"):
         hflow.Threshold("v", hflow.Comparison.AT_MOST, value)
