@@ -408,7 +408,7 @@ class BucketStorageRoot:
     ) -> None:
         normalized_url = url.rstrip("/")
         _scheme, separator, remainder = normalized_url.partition("://")
-        if not separator or not remainder.partition("/")[0]:
+        if not separator or (_scheme.lower() != "file" and not remainder.partition("/")[0]):
             raise ValueError(
                 f"bucket URL {url!r} names no bucket/container -- expected e.g. gs://bucket/prefix"
             )
