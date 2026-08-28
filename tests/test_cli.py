@@ -133,4 +133,3 @@ def test_python_m_hflow_executes_as_module() -> None:
     )
     assert result.returncode == 0
     assert "usage:" in result.stdout.lower() or "hflow" in result.stdout
-
