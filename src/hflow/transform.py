@@ -400,26 +400,26 @@ def _resolve_encoder(topic: str, info: TopicInfo) -> Callable[[Any, bytes], byte
 
 
 @dataclass(frozen=True)
-class PassthroughVideoMessage:
+class _PassthroughVideoMessage:
     """The H.264 payload parsed at the codec boundary, independent of its encoding."""
 
     format: Literal["h264"]
     data: bytes
 
 
-def _parse_passthrough_video_message(topic: str, decoded_message: Any) -> PassthroughVideoMessage:
+def _parse_passthrough_video_message(topic: str, decoded_message: Any) -> _PassthroughVideoMessage:
     if decoded_message.format != "h264":
         raise ValueError(
             f"pass-through video topic {topic!r} carries format "
             f"{decoded_message.format!r}; the canonical convention requires 'h264' "
             "(re-encode upstream -- v1 does not transcode CompressedVideo)"
         )
-    return PassthroughVideoMessage(format="h264", data=bytes(decoded_message.data))
+    return _PassthroughVideoMessage(format="h264", data=bytes(decoded_message.data))
 
 
 def _insert_missing_passthrough_video_aud(
-    topic: str, message: PassthroughVideoMessage
-) -> PassthroughVideoMessage:
+    topic: str, message: _PassthroughVideoMessage
+) -> _PassthroughVideoMessage:
     """Repair the one canonical constraint that is lossless to bridge."""
     try:
         canonical_data = video_module.ensure_access_unit_delimiter(message.data)
@@ -427,11 +427,11 @@ def _insert_missing_passthrough_video_aud(
         raise ValueError(
             f"pass-through video topic {topic!r} violates the canonical convention: {error}"
         ) from error
-    return PassthroughVideoMessage(format=message.format, data=canonical_data)
+    return _PassthroughVideoMessage(format=message.format, data=canonical_data)
 
 
 def _validate_passthrough_video_payload(
-    topic: str, message: PassthroughVideoMessage, *, is_first_message: bool
+    topic: str, message: _PassthroughVideoMessage, *, is_first_message: bool
 ) -> None:
     """Enforce the canonical video constraints on a pass-through message.
 
