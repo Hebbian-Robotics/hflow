@@ -337,3 +337,32 @@ def test_synthesize_episode_refuses_invalid_spec(
             tmp_path / "refused.mcap",
             SyntheticEpisodeSpec(cameras=(), **spec_kwargs),  # ty: ignore
         )
+
+
+def test_a_default_fault_segment_past_a_shortened_duration_still_writes(tmp_path: Path) -> None:
+    """The exemption the rest of the suite stands on.
+
+    ``black_segment`` and ``timestamp_offset_segment`` default to spans sized
+    for ``duration_s=8.0``, and most callers shorten the episode without
+    clearing them. Validating defaults the way an explicit segment is validated
+    refuses specs that have always worked: it fails 78 tests and errors 112
+    more. This pins the exemption so tightening it is a deliberate choice with
+    a red test, not a tidy-up.
+    """
+    spec = SyntheticEpisodeSpec(duration_s=1.0, cameras=())
+
+    assert spec.black_segment == (2.0, 3.0)
+    assert spec.timestamp_offset_segment == (6.0, 7.0)
+
+    written = synthesize_episode(tmp_path / "short.mcap", spec)
+
+    assert written.is_file()
+
+
+def test_an_explicit_fault_segment_past_the_end_is_still_refused(tmp_path: Path) -> None:
+    """The exemption is scoped to defaults, so a chosen segment stays checked."""
+    with pytest.raises(ValueError, match=r"black_segment must satisfy"):
+        synthesize_episode(
+            tmp_path / "refused.mcap",
+            SyntheticEpisodeSpec(duration_s=1.0, cameras=(), black_segment=(2.0, 4.0)),
+        )

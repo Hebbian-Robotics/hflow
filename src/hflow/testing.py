@@ -409,6 +409,12 @@ def _validate_synthetic_episode_spec(spec: "SyntheticEpisodeSpec") -> None:
         segment = getattr(spec, segment_name)
         if segment is None:
             continue
+        # A segment still holding its class default is exempt when it runs past
+        # a shortened duration. The defaults are sized for duration_s=8.0, and
+        # most callers shorten the episode without clearing them, so enforcing
+        # this on defaults refuses specs that have always worked: removing this
+        # branch fails 78 tests and errors 112 more. An explicitly chosen
+        # segment is checked, which is the case the caller can act on.
         default = SyntheticEpisodeSpec.__dataclass_fields__[segment_name].default
         if segment == default and segment[1] > spec.duration_s:
             continue
