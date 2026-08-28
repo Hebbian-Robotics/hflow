@@ -854,6 +854,12 @@ def test_contact_sheet_accepts_apostrophes_in_external_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    system_font_path = _find_usable_font_file()
+    if system_font_path is None:
+        pytest.skip("requires a usable system font")
+    if not _contact_sheet._ffmpeg_supports_drawtext(ffmpeg_path()):
+        pytest.skip("requires ffmpeg drawtext support")
+
     external_path_directory = tmp_path / "wearer's assets"
     external_path_directory.mkdir()
     copied_frames: list[ExtractedFrame] = []
@@ -862,21 +868,20 @@ def test_contact_sheet_accepts_apostrophes_in_external_paths(
         copied_path.write_bytes(source_frame.path.read_bytes())
         copied_frames.append(ExtractedFrame(path=copied_path, log_time_ns=source_frame.log_time_ns))
 
-    system_font_path = _find_usable_font_file()
-    if system_font_path is not None:
-        copied_font_path = external_path_directory / "worker's-font.ttf"
-        copied_font_path.write_bytes(system_font_path.read_bytes())
-        monkeypatch.setattr(
-            _contact_sheet,
-            "_find_usable_font_file",
-            lambda: copied_font_path,
-        )
+    copied_font_path = external_path_directory / "worker's-font.ttf"
+    copied_font_path.write_bytes(system_font_path.read_bytes())
+    monkeypatch.setattr(
+        _contact_sheet,
+        "_find_usable_font_file",
+        lambda: copied_font_path,
+    )
 
     output = tmp_path / "quoted-path-sheet.jpg"
-    contact_sheet(copied_frames, output, columns=2)
+    sheet = contact_sheet(copied_frames, output, columns=2)
 
     assert output.is_file()
     assert _probe_dimensions(output) == (640, 240)
+    assert sheet.timestamps_burned is True
 
 
 def test_contact_sheet_rejects_empty_input(tmp_path: Path) -> None:

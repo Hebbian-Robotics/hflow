@@ -96,10 +96,10 @@ def _evenly_sampled_indices(total_count: int, max_count: int) -> list[int]:
 def _quote_filter_value(value: str) -> str:
     """Quote a value for use inside an ffmpeg filtergraph option.
 
-    Inside filtergraph single quotes a backslash is LITERAL (av_get_token),
-    so an embedded apostrophe must close-escape-reopen: ``'`` -> ``'\\''``.
+    ``drawtext`` parses option values after the filtergraph parser, so an
+    embedded apostrophe needs one escaping layer for each parser.
     """
-    return "'" + value.replace("'", "'\\''") + "'"
+    return "'" + value.replace("'", r"'\\\''") + "'"
 
 
 def _drawtext_filters(
