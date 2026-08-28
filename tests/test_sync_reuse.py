@@ -7,6 +7,8 @@ out, because a wrong reuse silently publishes stale bytes under a current
 version stamp.
 """
 
+import hashlib
+import json
 import os
 from pathlib import Path
 
@@ -40,6 +42,27 @@ def test_an_unchanged_source_is_not_transcoded_twice(tmp_path: Path) -> None:
     # The canonical file was not rewritten, which is the whole point.
     assert second.canonical_path.stat().st_mtime_ns == mtime_after_first
     assert first.stamps == second.stamps
+
+
+def test_sync_completion_marker_keeps_its_existing_json_bytes(tmp_path: Path) -> None:
+    """Typing the witness must not change its persisted wire representation."""
+    source = _episode(tmp_path / "episode_0001.mcap")
+    app = hflow.App("marker-bytes", data_root=tmp_path / "data", default_checks=())
+
+    first = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
+    marker_path = first.canonical_path.parent / ".sync-complete.json"
+    expected_payload = {
+        "ffmpeg_version": first.stamps.ffmpeg_version,
+        "pipeline_version": first.stamps.pipeline_version,
+        "schema_version": first.stamps.schema_version,
+        "source_digest": f"sha256:{hashlib.sha256(source.read_bytes()).hexdigest()}",
+        "source_path": str(source.resolve()),
+        "transform_kind": "default",
+    }
+
+    assert (
+        marker_path.read_bytes() == (json.dumps(expected_payload, sort_keys=True) + "\n").encode()
+    )
 
 
 def test_the_reused_run_still_records_the_same_episode(tmp_path: Path) -> None:
@@ -101,8 +124,6 @@ def test_a_changed_transform_config_is_transcoded_again(tmp_path: Path) -> None:
 
 def test_a_marker_without_a_witness_transcodes_once_and_gains_one(tmp_path: Path) -> None:
     """The whole migration for corpora written before the witness existed."""
-    import json
-
     source = _episode(tmp_path / "episode_0001.mcap")
     app = hflow.App("legacy", data_root=tmp_path / "data", default_checks=())
     first = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
@@ -120,6 +141,32 @@ def test_a_marker_without_a_witness_transcodes_once_and_gains_one(tmp_path: Path
 
     third = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
     assert third.sync_reused is True
+
+
+@pytest.mark.parametrize(
+    "raw_transform_kind", [None, "future-transform"], ids=["missing", "unknown"]
+)
+def test_a_marker_without_a_known_transform_kind_stays_readable_but_is_not_reused(
+    tmp_path: Path, raw_transform_kind: str | None
+) -> None:
+    source = _episode(tmp_path / "episode_0001.mcap")
+    app = hflow.App("unknown-kind", data_root=tmp_path / "data", default_checks=())
+    first = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
+    marker_path = first.canonical_path.parent / ".sync-complete.json"
+    marker_payload = json.loads(marker_path.read_text())
+    if raw_transform_kind is None:
+        marker_payload.pop("transform_kind")
+    else:
+        marker_payload["transform_kind"] = raw_transform_kind
+    marker_path.write_text(json.dumps(marker_payload, sort_keys=True) + "\n")
+
+    # Non-sync stages still accept old or future markers: the transform kind
+    # is a reuse witness, not part of the marker's basic readability contract.
+    metadata_only = app.process(source, record=False, stages={hflow.Stage.META}, verbose=False)
+    assert metadata_only.canonical_path == first.canonical_path
+
+    second = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
+    assert second.sync_reused is False
 
 
 def test_deleting_the_marker_is_the_way_to_force_a_retranscode(tmp_path: Path) -> None:
@@ -156,7 +203,9 @@ def test_a_registered_transform_override_never_reuses(tmp_path: Path) -> None:
     def passthrough(source_path: Path, output_path: Path, config: TransformConfig) -> EpisodeStamps:
         return write_canonical_episode(source_path, output_path, config)
 
-    app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
+    first = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
+    marker_path = first.canonical_path.parent / ".sync-complete.json"
+    assert json.loads(marker_path.read_text())["transform_kind"] == "override"
     second = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
 
     assert second.sync_reused is False

@@ -26,6 +26,7 @@ import time
 import traceback
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType, ModuleType
 from typing import TYPE_CHECKING
@@ -236,6 +237,13 @@ _MEDIA_CONTACT_SHEET_FPS = 0.5
 _SYNC_COMPLETION_MARKER_NAME = ".sync-complete.json"
 
 
+class _TransformKind(StrEnum):
+    """Transform implementations recorded in sync-reuse witnesses."""
+
+    DEFAULT = "default"
+    OVERRIDE = "override"
+
+
 @dataclass(frozen=True)
 class _SyncCompletion:
     """Proof that sync completed for one source path and canonical version.
@@ -259,11 +267,11 @@ class _SyncCompletion:
     # The transform is stamped with an ffmpeg version that does NOT reach
     # pipeline_version, and different builds genuinely encode differently.
     ffmpeg_version: str | None = None
-    # "default" or "override". An @app.transform override is contractually
-    # required to end in write_canonical_episode, so it stamps the SAME
-    # pipeline_version the default transform would: without this, REMOVING an
-    # override would reuse a canonical the current pipeline cannot produce.
-    transform_kind: str | None = None
+    # An @app.transform override is contractually required to end in
+    # write_canonical_episode, so it stamps the SAME pipeline_version the
+    # default transform would: without this, REMOVING an override would reuse
+    # a canonical the current pipeline cannot produce.
+    transform_kind: _TransformKind | None = None
 
 
 def _source_identity(source_reference: Path | str, storage_root: StorageRoot) -> str:
@@ -372,10 +380,24 @@ def _read_sync_completion_marker(marker_path: Path) -> _SyncCompletion:
     # the non-sync stages, which never needed a witness at all.
     optional_values = {
         field_name: value
-        for field_name in ("source_digest", "ffmpeg_version", "transform_kind")
+        for field_name in ("source_digest", "ffmpeg_version")
         if isinstance(value := marker_payload.get(field_name), str) and value
     }
-    return _SyncCompletion(**required_values, **optional_values)
+    raw_transform_kind = marker_payload.get("transform_kind")
+    transform_kind: _TransformKind | None = None
+    if isinstance(raw_transform_kind, str) and raw_transform_kind:
+        try:
+            transform_kind = _TransformKind(raw_transform_kind)
+        except ValueError:
+            transform_kind = None
+    return _SyncCompletion(
+        source_path=required_values["source_path"],
+        schema_version=required_values["schema_version"],
+        pipeline_version=required_values["pipeline_version"],
+        source_digest=optional_values.get("source_digest"),
+        ffmpeg_version=optional_values.get("ffmpeg_version"),
+        transform_kind=transform_kind,
+    )
 
 
 def _file_digest(path: Path) -> str:
@@ -588,22 +610,34 @@ def _unsatisfiable_check_parameters(
     return unsatisfiable, seen_episode or sees_varargs
 
 
+class _RegistrationStepKind(StrEnum):
+    """Registration diagnostics vocabulary, separate from manifest step kinds.
+
+    Derived channels appear here but are not manifest steps. Keep this private
+    type distinct from ``manifest.StepKind`` even though two values overlap.
+    """
+
+    CHECK = "check"
+    ENRICHMENT = "enrichment"
+    DERIVED_CHANNEL = "derived channel"
+
+
 # Every step below is invoked with exactly one positional argument, an Episode:
 # checks and enrichments with the canonical episode, derived-signal functions
 # with the source episode. So all three share one satisfiability rule, and the
 # only thing that differs is what the example in the message should say.
-_STEP_EXAMPLE_BY_KIND = {
+_STEP_EXAMPLE_BY_KIND: dict[_RegistrationStepKind, tuple[str, str]] = {
     # step kind -> (return annotation, wrapper-name suffix)
-    "check": ("hflow.CheckResult", "check"),
-    "enrichment": ("hflow.EnrichmentResult", "enrichment"),
-    "derived channel": ("hflow.DerivedSeries", "series"),
+    _RegistrationStepKind.CHECK: ("hflow.CheckResult", "check"),
+    _RegistrationStepKind.ENRICHMENT: ("hflow.EnrichmentResult", "enrichment"),
+    _RegistrationStepKind.DERIVED_CHANNEL: ("hflow.DerivedSeries", "series"),
 }
 
 
 def _raise_if_step_cannot_take_only_an_episode(
     function: Callable[..., object],
     *,
-    step_kind: str,
+    step_kind: _RegistrationStepKind,
     step_name: str,
     decorator: str,
 ) -> None:
@@ -626,7 +660,7 @@ def _raise_if_step_cannot_take_only_an_episode(
         sorted_names = sorted(unsatisfiable)
         bindings = ", ".join(f"{parameter_name}=..." for parameter_name in sorted_names)
         raise ValueError(
-            f"{step_kind} {step_name!r} cannot be called with only an episode: "
+            f"{step_kind.value} {step_name!r} cannot be called with only an episode: "
             f"required parameter(s) without defaults: {', '.join(sorted_names)}. "
             "Wrap it in a function that binds them, e.g.\n\n"
             f"    {decorator}\n"
@@ -635,7 +669,7 @@ def _raise_if_step_cannot_take_only_an_episode(
         )
     if not accepts_episode:
         raise ValueError(
-            f"{step_kind} {step_name!r} cannot accept the episode: it must take "
+            f"{step_kind.value} {step_name!r} cannot accept the episode: it must take "
             "the episode as its first positional parameter, e.g.\n\n"
             f"    {decorator}\n"
             f"    def {wrapper_name}(ep: hflow.Episode) -> {return_type}:\n"
@@ -1121,7 +1155,7 @@ class App:
             completion = _read_sync_completion_marker(marker_path)
         except (FileNotFoundError, ValueError, OSError):
             return None
-        if completion.transform_kind != "default":
+        if completion.transform_kind is not _TransformKind.DEFAULT:
             return None
         if completion.source_path != source_identifier:
             # Two sources can share a run directory when output_dir= names one.
@@ -1382,7 +1416,7 @@ class App:
                 raise ValueError(f"a step named {check_name!r} is already registered")
             _raise_if_step_cannot_take_only_an_episode(
                 function,
-                step_kind="check",
+                step_kind=_RegistrationStepKind.CHECK,
                 step_name=check_name,
                 decorator='@app.check(version="1")',
             )
@@ -1436,7 +1470,7 @@ class App:
                 raise ValueError(f"a step named {enrichment_name!r} is already registered")
             _raise_if_step_cannot_take_only_an_episode(
                 function,
-                step_kind="enrichment",
+                step_kind=_RegistrationStepKind.ENRICHMENT,
                 step_name=enrichment_name,
                 decorator='@app.enrich(version="1")',
             )
@@ -1474,7 +1508,7 @@ class App:
                 raise ValueError(f"a derived channel for topic {topic!r} is already registered")
             _raise_if_step_cannot_take_only_an_episode(
                 function,
-                step_kind="derived channel",
+                step_kind=_RegistrationStepKind.DERIVED_CHANNEL,
                 step_name=topic,
                 decorator=f'@app.derive("{topic}", version="1")',
             )
@@ -1935,7 +1969,9 @@ class App:
                         source_digest=source_digest,
                         ffmpeg_version=stamps.ffmpeg_version,
                         transform_kind=(
-                            "override" if self.transform_override is not None else "default"
+                            _TransformKind.OVERRIDE
+                            if self.transform_override is not None
+                            else _TransformKind.DEFAULT
                         ),
                     ),
                 )
