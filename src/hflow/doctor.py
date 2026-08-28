@@ -39,6 +39,8 @@ _MAX_FINDINGS_PER_CODE = 3
 
 
 class DiagnosticLevel(StrEnum):
+    """Doctor finding severity: ``error`` breaks the convention, ``warning`` is legal but non-default."""
+
     ERROR = "error"  # breaks the canonical convention (or the MCAP spec)
     WARNING = "warning"  # legal, but deviates from the defaults we write
 

@@ -236,6 +236,7 @@ class GroupedMcapWriter:
         self._flush()
 
     def register_schema(self, name: str, encoding: str, data: bytes) -> SchemaId:
+        """Register a schema and return its id for :meth:`register_channel`."""
         self._raise_if_not_active("register a schema")
         schema_id = SchemaId(len(self._schemas_by_id) + 1)
         schema = Schema(id=schema_id, data=data, encoding=encoding, name=name)
@@ -255,6 +256,11 @@ class GroupedMcapWriter:
         group: str,
         metadata: dict[str, str] | None = None,
     ) -> ChannelId:
+        """Register a topic on a named group and return its id for :meth:`write_message`.
+
+        ``schema_id`` must be a prior :meth:`register_schema` return value, or
+        ``NO_SCHEMA_ID`` for schemaless channels.
+        """
         self._raise_if_not_active("register a channel")
         # schema_id 0 is the MCAP spec's "no schema" sentinel.
         if schema_id != NO_SCHEMA_ID and schema_id not in self._schemas_by_id:
@@ -288,6 +294,11 @@ class GroupedMcapWriter:
         publish_time: int | None = None,
         sequence: int = 0,
     ) -> None:
+        """Write one message on a registered channel.
+
+        ``log_time`` and ``publish_time`` are nanoseconds since epoch; when
+        ``publish_time`` is omitted it defaults to ``log_time``.
+        """
         self._raise_if_not_active("write a message")
         group_name = self._group_name_by_channel_id.get(channel_id)
         if group_name is None:
@@ -318,6 +329,7 @@ class GroupedMcapWriter:
             self._finalize_group_chunk(group_name)
 
     def add_metadata(self, name: str, data: dict[str, str]) -> None:
+        """Append an MCAP Metadata record (e.g. episode or provenance stamps)."""
         self._raise_if_not_active("add metadata")
         self._flush()
         offset = self._stream.tell()
@@ -337,6 +349,7 @@ class GroupedMcapWriter:
         log_time: int = 0,
         create_time: int = 0,
     ) -> None:
+        """Append an MCAP Attachment record; times are nanoseconds since epoch."""
         self._raise_if_not_active("add an attachment")
         self._flush()
         offset = self._stream.tell()
@@ -363,6 +376,9 @@ class GroupedMcapWriter:
         self._flush()
 
     def finish(self) -> None:
+        """Finalize the MCAP file. Must be the last mutating call; safe to call
+        again (idempotent). Further writes raise :class:`RuntimeError`.
+        """
         if self._state is _WriterState.FINISHED:
             return
         self._raise_if_not_active("finish")
