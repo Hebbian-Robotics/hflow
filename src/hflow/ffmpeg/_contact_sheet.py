@@ -142,8 +142,16 @@ def contact_sheet(
     """Composite ``frames`` (from ``Episode.frames()``) into one JPEG grid."""
     if not frames:
         raise ValueError("contact_sheet needs at least one frame")
+    if not isinstance(columns, int) or isinstance(columns, bool):
+        raise ValueError(f"columns must be an int, got {columns!r}")
     if columns < 1:
         raise ValueError(f"columns must be >= 1, got {columns}")
+    if not isinstance(tile_width, int) or isinstance(tile_width, bool):
+        raise ValueError(f"tile_width must be an int, got {tile_width!r}")
+    if tile_width < 1:
+        raise ValueError(f"tile_width must be >= 1, got {tile_width}")
+    if not isinstance(max_tiles, int) or isinstance(max_tiles, bool):
+        raise ValueError(f"max_tiles must be an int, got {max_tiles!r}")
     if max_tiles < 1:
         raise ValueError(f"max_tiles must be >= 1, got {max_tiles}")
     selected_frames = [frames[index] for index in _evenly_sampled_indices(len(frames), max_tiles)]

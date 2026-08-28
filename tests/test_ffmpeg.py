@@ -960,6 +960,54 @@ def test_contact_sheet_rejects_empty_input(tmp_path: Path) -> None:
         contact_sheet([], tmp_path / "never.jpg")
 
 
+def _refuse_ffmpeg_for_invalid_contact_sheet_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_contact_sheet, "_find_usable_font_file", lambda: None)
+
+    def fail_if_ffmpeg_runs(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("invalid contact_sheet arguments must be refused before ffmpeg runs")
+
+    monkeypatch.setattr(_contact_sheet.subprocess, "run", fail_if_ffmpeg_runs)
+
+
+def _unreadable_frame(tmp_path: Path) -> ExtractedFrame:
+    return ExtractedFrame(path=tmp_path / "must-not-be-read.jpg", log_time_ns=0)
+
+
+@pytest.mark.parametrize("tile_width", [0, -320])
+def test_contact_sheet_rejects_non_positive_tile_width_before_ffmpeg(
+    tile_width: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_ffmpeg_for_invalid_contact_sheet_arguments(monkeypatch)
+    with pytest.raises(ValueError, match=rf"tile_width must be >= 1, got {tile_width}"):
+        contact_sheet([_unreadable_frame(tmp_path)], tmp_path / "never.jpg", tile_width=tile_width)
+
+
+def test_contact_sheet_rejects_boolean_columns_before_ffmpeg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_ffmpeg_for_invalid_contact_sheet_arguments(monkeypatch)
+    with pytest.raises(ValueError, match=r"columns must be an int, got True"):
+        contact_sheet([_unreadable_frame(tmp_path)], tmp_path / "never.jpg", columns=True)
+
+
+def test_contact_sheet_rejects_boolean_tile_width_before_ffmpeg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_ffmpeg_for_invalid_contact_sheet_arguments(monkeypatch)
+    with pytest.raises(ValueError, match=r"tile_width must be an int, got True"):
+        contact_sheet([_unreadable_frame(tmp_path)], tmp_path / "never.jpg", tile_width=True)
+
+
+def test_contact_sheet_rejects_boolean_max_tiles_before_ffmpeg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_ffmpeg_for_invalid_contact_sheet_arguments(monkeypatch)
+    with pytest.raises(ValueError, match=r"max_tiles must be an int, got True"):
+        contact_sheet([_unreadable_frame(tmp_path)], tmp_path / "never.jpg", max_tiles=True)
+
+
 def test_coding_range_is_derived_from_luma_and_selects_the_exposure_gates() -> None:
     """Trusting a container's declared range published a defect share off by a
     factor of hundreds on real footage, so the range is measured from the pixels.
