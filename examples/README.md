@@ -95,23 +95,56 @@ ingesting it, and `--ingest-only` to re-run against one you already have.
 
 Code: [`stress/synthetic.py`](./stress/synthetic.py)
 
-## LeRobot pusht converter
+## LeRobot Dataset v3 converter
 
-**Use it for:** converting the LeRobot pusht dataset (Parquet + av1 MP4) into
-canonical MCAP episodes with H.264 video, ready for `hflow doctor` and
-`App.process`.
+**Use it for:** converting episodes from LeRobot Dataset v3 repositories
+(Parquet + av1 MP4) into canonical MCAP episodes with H.264 video, ready for
+`hflow doctor` and `App.process`.
 
-**Prerequisites:** `ffmpeg` on `PATH`; network access to download ~7.5 MB from
-Hugging Face (lerobot/pusht).
+The converter is metadata-driven: the repository's feature schema, frames per
+second, episode boundaries, and video paths are read from `meta/info.json`
+and the episode index, so no dataset-specific constants live in the adapter.
+
+**Supported v3 subset:** video camera features (`dtype: video`) and
+fixed-width float32 state and action vectors. Image-only features, language
+tensors, depth maps, and arbitrary nested features are out of scope and fail
+loud before any output is published.
+
+**Prerequisites:** `ffmpeg` on `PATH`; network access to Hugging Face.
+
+PushT (single camera, 2-dimensional vectors):
 
 ```bash
-uv run python examples/lerobot/prepare.py --episode-index 0
+uv run python examples/lerobot/prepare.py \
+  --repo lerobot/pusht --revision main \
+  --output-dir ./data/lerobot_pusht \
+  --camera-key observation.image \
+  --episode-index 0
 ```
 
-Output: one canonical MCAP at `./data/lerobot_pusht/landing/pusht_episode_0001.mcap`
-passing `hflow doctor`.
+Multi-camera real dataset (two 640x480 cameras, six-dimensional state and
+action, 30 fps, about 86 MB):
+
+```bash
+uv run python examples/lerobot/prepare.py \
+  --repo lerobot/svla_so101_pickplace \
+  --revision f641879e22172be7e8161d5e6c1503c2d2feb657 \
+  --output-dir ./data/lerobot_svla \
+  --camera-key observation.images.up,observation.images.side \
+  --episode-index 0
+```
+
+`--camera-key` accepts a comma-separated list; each selected camera becomes
+its own `foxglove.CompressedVideo` channel. Omit `--episode-index` to convert
+every episode.
+
+Output: one canonical MCAP per episode at
+`./data/<corpus>/landing/lerobot_episode_0001.mcap`, a
+`prepared-manifest.json`, and a `_lerobot_cache/` holding downloaded sources
+(re-run without redownloading). Every converted episode passes `hflow doctor`.
 
 Code: [`lerobot/prepare.py`](./lerobot/prepare.py)
+
 
 ## Example requirements
 
