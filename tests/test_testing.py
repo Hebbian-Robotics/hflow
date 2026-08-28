@@ -280,3 +280,60 @@ def test_video_episode_missing_source_names_the_path_with_errno(tmp_path: Path) 
     assert excinfo.value.filename == str(missing_source)
     assert "No such file or directory" in str(excinfo.value)
     assert str(missing_source) in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("spec_kwargs", "match"),
+    [
+        pytest.param({"duration_s": 0.0}, r"duration_s must be > 0", id="duration_s-zero"),
+        pytest.param({"duration_s": -1.0}, r"duration_s must be > 0", id="duration_s-negative"),
+        pytest.param({"joint_hz": 0.0}, r"joint_hz must be > 0", id="joint_hz-zero"),
+        pytest.param({"image_hz": 0.0}, r"image_hz must be > 0", id="image_hz-zero"),
+        pytest.param(
+            {"duration_s": float("nan")}, r"duration_s must be finite", id="duration_s-nan"
+        ),
+        pytest.param({"image_hz": float("inf")}, r"image_hz must be finite", id="image_hz-inf"),
+        pytest.param({"joint_hz": float("nan")}, r"joint_hz must be finite", id="joint_hz-nan"),
+        pytest.param(
+            {"joint_count": True}, r"joint_count must be an int, got bool", id="joint_count-bool"
+        ),
+        pytest.param(
+            {"duration_s": True},
+            r"duration_s must be an int or float, got bool",
+            id="duration_s-bool",
+        ),
+        pytest.param(
+            {"image_width": True}, r"image_width must be an int, got bool", id="image_width-bool"
+        ),
+        pytest.param(
+            {"image_width": 0}, r"image dimensions must be positive", id="image_width-zero"
+        ),
+        pytest.param(
+            {"image_height": 0}, r"image dimensions must be positive", id="image_height-zero"
+        ),
+        pytest.param({"joint_count": 0}, r"joint_count must be > 0", id="joint_count-zero"),
+        pytest.param(
+            {"duration_s": 1.0, "black_segment": (5.0, 9.0)},
+            r"black_segment must satisfy 0 <= start < end <= duration_s",
+            id="black_segment-past-end",
+        ),
+        pytest.param(
+            {"duration_s": 1.0, "joint_freeze_segment": (5.0, 9.0)},
+            r"joint_freeze_segment must satisfy 0 <= start < end <= duration_s",
+            id="joint_freeze_segment-past-end",
+        ),
+        pytest.param(
+            {"duration_s": 1.0, "timestamp_offset_segment": (5.0, 9.0)},
+            r"timestamp_offset_segment must satisfy 0 <= start < end <= duration_s",
+            id="timestamp_offset_segment-past-end",
+        ),
+    ],
+)
+def test_synthesize_episode_refuses_invalid_spec(
+    tmp_path: Path, spec_kwargs: dict[str, object], match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        synthesize_episode(
+            tmp_path / "refused.mcap",
+            SyntheticEpisodeSpec(cameras=(), **spec_kwargs),  # ty: ignore
+        )

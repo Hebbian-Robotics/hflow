@@ -31,6 +31,9 @@ Implementation notes:
   ``MSG: pkg/msg/Type`` headers) so any ROS 2-aware reader decodes them.
 - Everything is deterministic: fixed ``start_time_ns``, seeded noise, no
   wall-clock reads.
+- ``_require_int`` / ``_require_float`` are copied here rather than imported
+  from ``hflow._video_measurements`` so that incubating package can stay
+  dependency-free and extractable (see ``src/hflow/_video_measurements/__init__.py``).
 """
 
 import errno
@@ -52,6 +55,17 @@ from hflow.format import (
     METADATA_RECORD_EPISODE,
     NANOSECONDS_PER_SECOND,
 )
+
+
+def _require_int(value: object, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an int, got {type(value).__name__}")
+
+
+def _require_float(value: object, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{name} must be an int or float, got {type(value).__name__}")
+
 
 JOINT_STATES_TOPIC = "/joint_states"
 JOINT_STATE_SCHEMA_NAME = "sensor_msgs/msg/JointState"
@@ -365,6 +379,42 @@ def _validate_video_episode_spec(spec: VideoEpisodeSpec) -> None:
             )
 
 
+def _validate_synthetic_episode_spec(spec: "SyntheticEpisodeSpec") -> None:
+    _require_float(spec.duration_s, "duration_s")
+    _require_float(spec.image_hz, "image_hz")
+    _require_float(spec.joint_hz, "joint_hz")
+    _require_int(spec.image_width, "image_width")
+    _require_int(spec.image_height, "image_height")
+    _require_int(spec.joint_count, "joint_count")
+
+    for field_name in ("duration_s", "image_hz", "joint_hz"):
+        value = getattr(spec, field_name)
+        if not math.isfinite(float(value)):
+            raise ValueError(f"{field_name} must be finite, got {value!r}")
+
+    if spec.duration_s <= 0.0:
+        raise ValueError(f"duration_s must be > 0, got {spec.duration_s}")
+    if spec.image_hz <= 0.0:
+        raise ValueError(f"image_hz must be > 0, got {spec.image_hz}")
+    if spec.joint_hz <= 0.0:
+        raise ValueError(f"joint_hz must be > 0, got {spec.joint_hz}")
+    if spec.image_width <= 0 or spec.image_height <= 0:
+        raise ValueError(
+            f"image dimensions must be positive, got {spec.image_width}x{spec.image_height}"
+        )
+    if spec.joint_count <= 0:
+        raise ValueError(f"joint_count must be > 0, got {spec.joint_count}")
+
+    for segment_name in ("black_segment", "joint_freeze_segment", "timestamp_offset_segment"):
+        segment = getattr(spec, segment_name)
+        if segment is None:
+            continue
+        default = SyntheticEpisodeSpec.__dataclass_fields__[segment_name].default
+        if segment == default and segment[1] > spec.duration_s:
+            continue
+        _validate_video_fault_segment(segment_name, segment, spec.duration_s)
+
+
 def _render_source_video_frames(
     source_video_path: Path,
     spec: VideoEpisodeSpec,
@@ -646,6 +696,7 @@ def _calibration_attachment_json(spec: SyntheticEpisodeSpec) -> bytes:
 def synthesize_episode(output: Path | str, spec: SyntheticEpisodeSpec | None = None) -> Path:
     """Write a synthetic input episode to ``output`` and return its path."""
     resolved_spec = spec if spec is not None else SyntheticEpisodeSpec()
+    _validate_synthetic_episode_spec(resolved_spec)
     output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
