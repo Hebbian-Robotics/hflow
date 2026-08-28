@@ -68,9 +68,13 @@ class TestParseStorageRoot:
             parse_storage_root("gs:////x")
 
     def test_empty_local_path_is_refused(self) -> None:
-        with pytest.raises(ValueError, match=r"storage root .* must be a directory path or bucket URL"):
+        with pytest.raises(
+            ValueError, match=r"storage root .* must be a directory path or bucket URL"
+        ):
             parse_storage_root("")
-        with pytest.raises(ValueError, match="storage root '   ' must be a directory path or bucket URL"):
+        with pytest.raises(
+            ValueError, match="storage root '   ' must be a directory path or bucket URL"
+        ):
             parse_storage_root("   ")
 
     def test_is_bucket_url(self) -> None:
