@@ -41,6 +41,37 @@ jobs:
       - name: Tests
         run: uv run pytest -q
 
+  ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Enable pnpm via corepack (Node is preinstalled on the runner)
+        # No version here: ui/package.json's "packageManager" field pins it, so
+        # the version has one owner and corepack reads it from there.
+        run: corepack enable
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Lint, typecheck, and test
+        run: pnpm check
+      - name: Build
+        run: pnpm build
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: "3.11"
+      - name: Verify src/apiSchema.ts still matches the server's OpenAPI schema
+        # The browser's types are generated from the server's own declaration.
+        # A contract change that lands without regenerating puts them silently
+        # out of step again, which is exactly what generating them replaced.
+        run: |
+          pnpm gen:api
+          if ! git diff --exit-code src/apiSchema.ts; then
+            echo "src/apiSchema.ts is stale: run \`pnpm gen:api\` and commit the result." >&2
+            exit 1
+          fi
+
   links:
     runs-on: ubuntu-latest
     steps:

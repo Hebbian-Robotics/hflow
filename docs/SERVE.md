@@ -16,6 +16,11 @@ this package. The server ships no frontend of its own; point
 `HFLOW_UI_ASSETS` at a directory containing an `index.html` to serve one, or
 install a wheel that packages assets under `hflow_server/static/`.
 
+One such client lives in this repo at [`ui/`](../ui/README.md): a single canvas
+that draws an ingest run and drills from the run into a stage, into the steps
+that run inside a batch, and into the episodes that run recorded. It is built
+separately (`cd ui && pnpm build`) and served through `HFLOW_UI_ASSETS`.
+
 It ships as a separate package, `hflow-server`, on purpose: pipeline workers
 install the `hflow` wheel into every task venv, and they should never carry a
 web server. **It is not published to PyPI yet** -- until the first release,
