@@ -1,5 +1,6 @@
 """Transform: synthetic input MCAP -> canonical episode."""
 
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,36 @@ def test_pipeline_version_is_a_content_hash() -> None:
     changed = TransformConfig(gop_preset=GopPreset.WORLD_MODEL)
     assert compute_pipeline_version(base) != compute_pipeline_version(changed)
     assert len(compute_pipeline_version(base)) == 12
+
+
+@pytest.mark.parametrize(
+    ("construct", "field"),
+    [
+        (lambda: TransformConfig(crf=True), "crf"),
+        (lambda: TransformConfig(crf=-1), "crf"),
+        (lambda: TransformConfig(crf=52), "crf"),
+        (lambda: TransformConfig(gop_seconds=True), "gop_seconds"),
+        (lambda: TransformConfig(gop_seconds=0), "gop_seconds"),
+        (lambda: TransformConfig(gop_seconds=float("nan")), "gop_seconds"),
+        (lambda: TransformConfig(gop_seconds=float("inf")), "gop_seconds"),
+        (lambda: TransformConfig(chunk_size_bytes=True), "chunk_size_bytes"),
+        (lambda: TransformConfig(chunk_size_bytes=0), "chunk_size_bytes"),
+        (lambda: TransformConfig(chunk_size_bytes=-1), "chunk_size_bytes"),
+    ],
+)
+def test_transform_config_rejects_invalid_numeric_settings(
+    construct: Callable[[], TransformConfig], field: str
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        construct()
+
+
+def test_transform_config_accepts_valid_numeric_settings() -> None:
+    config = TransformConfig(crf=0, gop_seconds=1, chunk_size_bytes=1)
+
+    assert config.crf == 0
+    assert config.gop_seconds == 1
+    assert config.chunk_size_bytes == 1
 
 
 def test_stamps_carry_source_robot_software_version(source_episode: Path, tmp_path: Path) -> None:

@@ -56,6 +56,7 @@ v1 behavior:
 import hashlib
 import json
 import logging
+import math
 from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 from dataclasses import dataclass, field
@@ -132,6 +133,31 @@ class TransformConfig:
     # topic -> group name, beating the defaults; topics not listed go to
     # ``cameras`` by schema, ``bulk`` by mean message size, else ``state``.
     topic_groups: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Reject invalid settings before they become a pipeline identity."""
+        if isinstance(self.crf, bool) or not isinstance(self.crf, int):
+            raise ValueError(f"crf must be an int, got {type(self.crf).__name__}")
+        if not 0 <= self.crf <= 51:
+            raise ValueError(f"crf must be between 0 and 51, got {self.crf}")
+
+        if self.gop_seconds is not None:
+            if isinstance(self.gop_seconds, bool) or not isinstance(self.gop_seconds, int | float):
+                raise ValueError(
+                    f"gop_seconds must be an int or float, got {type(self.gop_seconds).__name__}"
+                )
+            if not math.isfinite(self.gop_seconds) or self.gop_seconds <= 0:
+                raise ValueError(f"gop_seconds must be positive and finite, got {self.gop_seconds}")
+
+        if self.chunk_size_bytes is not None:
+            if isinstance(self.chunk_size_bytes, bool) or not isinstance(
+                self.chunk_size_bytes, int
+            ):
+                raise ValueError(
+                    f"chunk_size_bytes must be an int, got {type(self.chunk_size_bytes).__name__}"
+                )
+            if self.chunk_size_bytes <= 0:
+                raise ValueError(f"chunk_size_bytes must be positive, got {self.chunk_size_bytes}")
 
 
 @dataclass(frozen=True)
