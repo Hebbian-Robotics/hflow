@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from hflow.steps import SETTLED_STATUSES, Stage
+from hflow.steps import RAN_STATUSES, SETTLED_STATUSES, Stage
 
 if TYPE_CHECKING:
     import duckdb
@@ -179,6 +179,50 @@ def _settled_step_names(
     return settled
 
 
+def _camera_presence_by_episode(
+    connection: "duckdb.DuckDBPyConnection",
+    application: "App",
+    episode_ids: Sequence[str],
+) -> dict[str, bool]:
+    """Whether the default camera check measured at least one camera."""
+    from hflow.checks import (
+        _default_check_version_for_automatic_registration,
+        camera_frame_stats,
+    )
+
+    check_name = camera_frame_stats.__name__
+    check_version = _default_check_version_for_automatic_registration(camera_frame_stats)
+    if not episode_ids or not any(
+        registered.function is camera_frame_stats
+        and registered.name == check_name
+        and registered.version == check_version
+        for registered in application.checks
+    ):
+        return {}
+
+    episode_placeholders = ", ".join("?" for _ in episode_ids)
+    statuses = ", ".join(_quote_sql_string(status.value) for status in RAN_STATUSES)
+    rows = connection.execute(
+        f"""
+        SELECT runs.episode_id, count(measurements.key) > 0
+        FROM check_runs AS runs
+        LEFT JOIN measurements
+          ON measurements.episode_id = runs.episode_id
+         AND measurements.run_fingerprint = runs.run_fingerprint
+         AND measurements.check_name = runs.check_name
+         AND measurements.check_version = runs.check_version
+         AND ends_with(measurements.key, '/message_count')
+        WHERE runs.status IN ({statuses})
+          AND runs.episode_id IN ({episode_placeholders})
+          AND runs.check_name = ?
+          AND runs.check_version = ?
+        GROUP BY runs.episode_id
+        """,
+        [*episode_ids, check_name, check_version],
+    ).fetchall()
+    return {str(episode_id): bool(has_camera) for episode_id, has_camera in rows}
+
+
 def plan_outstanding_stages(
     application: "App",
     source_identities: Sequence[str],
@@ -203,13 +247,12 @@ def plan_outstanding_stages(
     ``source-unreadable``. The real failure is counted and classified in
     ``ingest_failures`` by the stage that hit it.
 
-    Known limitation, stated because it costs work rather than correctness: the
-    media stage records nothing at all on a camera-less episode (there is no
-    contact sheet to render), so "no row" cannot be told from "nothing to
-    render" and such an episode is planned for ``media`` on every pass. The
-    stage is a no-op for it beyond opening the canonical, and the alternative
-    -- treating a missing row as done -- would silently never render a sheet
-    for an episode that wanted one.
+    The automatic ``camera_frame_stats`` check lets the planner distinguish a
+    camera-less episode from one whose contact sheet has not been rendered: a
+    completed current-version check with no per-camera measurements means
+    ``media`` has no work. If that exact default check is not registered or its
+    result is missing, the planner preserves the safe fallback and schedules
+    ``media`` rather than risk omitting a contact sheet.
     """
     from hflow.curation import open_catalog_connection
 
@@ -244,9 +287,13 @@ def plan_outstanding_stages(
                 list(source_identities),
             ).fetchall()
         }
+        episode_ids = sorted(set(episode_by_source.values()))
         identity_pairs = sorted({pair for pairs in required_by_stage.values() for pair in pairs})
-        settled_by_episode = _settled_step_names(
-            connection, sorted(set(episode_by_source.values())), identity_pairs
+        settled_by_episode = _settled_step_names(connection, episode_ids, identity_pairs)
+        camera_presence_by_episode = (
+            _camera_presence_by_episode(connection, application, episode_ids)
+            if Stage.MEDIA in required_by_stage
+            else {}
         )
     finally:
         connection.close()
@@ -261,6 +308,8 @@ def plan_outstanding_stages(
         outstanding_stages: set[Stage] = set()
         outstanding_steps: list[str] = []
         for stage, pairs in required_by_stage.items():
+            if stage is Stage.MEDIA and camera_presence_by_episode.get(episode_id) is False:
+                continue
             missing = [name for name, _version in pairs if name not in settled]
             if missing:
                 outstanding_stages.add(stage)
