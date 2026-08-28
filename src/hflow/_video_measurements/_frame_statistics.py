@@ -382,7 +382,11 @@ class _FrameStatisticsAccumulator:
             overexposed_frame_percent=100.0 * self.overexposed_frame_count / frame_count,
             freeze_intervals=tuple(self.freeze_intervals),
             freeze_total_seconds=sum(
-                interval.end_seconds - interval.start_seconds for interval in self.freeze_intervals
+                (
+                    interval.end_seconds - interval.start_seconds
+                    for interval in self.freeze_intervals
+                ),
+                0.0,
             ),
             average_luma_mean=self.average_luma.mean(),
             average_luma_minimum=self.average_luma.minimum(),

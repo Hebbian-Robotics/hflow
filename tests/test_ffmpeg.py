@@ -371,6 +371,7 @@ def test_synthetic_output_aggregates_exactly() -> None:
     assert stats.average_luma_maximum == pytest.approx(100.0)
     assert stats.freeze_intervals == ()
     assert stats.freeze_total_seconds == 0.0
+    assert type(stats.freeze_total_seconds) is float
     # Default threshold 235.0: none of 100, 10, 40 are >= 235
     assert stats.overexposed_frame_count == 0
     assert stats.overexposed_frame_percent == 0.0
