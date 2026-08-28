@@ -1232,11 +1232,118 @@ def test_content_digest_emits_exactly_the_documented_measurements(
     assert run.result is not None
     measurements = dict(run.result.measurements)
     assert set(measurements) == {"content_digest"}
-    digest = measurements["content_digest"]
-    # Pin the exact digest for the joints-only source episode. The synthetic
-    # writer is deterministic, so a dispatcher that returns a transformed
-    # value (e.g. reversed hex) will not match this literal.
-    assert digest == "1ee3e9bcad4d5a12112b196f7a3d4e272329cc41a5b5efe7e8751339ab1a4722"
+    digest = str(measurements["content_digest"])
+    # Shape only. This episode's joint payloads come from math.sin and math.cos
+    # (hflow.testing), which call the platform's libm, and libm is not
+    # bit-identical across platforms, so its digest is a property of the
+    # machine that produced it. The value is pinned instead against a fixture
+    # this file writes itself, in TestContentDigestIsAPropertyOfTheContent.
+    assert len(digest) == 64
+    assert set(digest) <= set("0123456789abcdef")
+
+
+class TestContentDigestIsAPropertyOfTheContent:
+    """What the digest promises, tested without depending on libm.
+
+    The check's docstring makes two claims: the digest identifies the recorded
+    content, and it is independent of container layout, so two files differing
+    only in chunking, compression, or metadata digest the same. Both are tested
+    here against episodes this class writes itself.
+
+    Writing them here is the point. The synthetic fixtures generate joint
+    values with math.sin and math.cos, which call the platform's libm, and libm
+    is not bit-identical across platforms, so any digest of theirs belongs to
+    the machine that computed it. Every payload below is an integer rendered as
+    JSON, so the bytes are the same everywhere and a literal can be pinned.
+    """
+
+    TOPIC = "/joints"
+    FIRST_LOG_TIME_NS = 1_000_000
+    PAYLOADS = (b'{"v":0}', b'{"v":1}', b'{"v":2}')
+    # Minted from the fixture below. No floating point reaches these bytes, so
+    # this is a property of the payloads and not of the platform: the same
+    # value comes back on Linux and on macOS.
+    PINNED_DIGEST = "61bd180b08e0c3f00713e60c1d54e3d2f048f4c569ee86d073fa6745b467b05a"
+
+    @classmethod
+    def _write(
+        cls,
+        path: Path,
+        *,
+        payloads: Sequence[bytes] | None = None,
+        chunk_size: int = 1 << 20,
+        compress: bool = True,
+        metadata: bool = False,
+    ) -> Path:
+        """One episode, with the container knobs the docstring says do not count."""
+        from mcap.writer import CompressionType, Writer
+
+        with path.open("wb") as handle:
+            writer = Writer(
+                handle,
+                chunk_size=chunk_size,
+                compression=CompressionType.ZSTD if compress else CompressionType.NONE,
+            )
+            writer.start()
+            if metadata:
+                writer.add_metadata("recording", {"operator": "someone"})
+            schema_id = writer.register_schema(
+                name="std_msgs/msg/String", encoding="jsonschema", data=b'{"type": "object"}'
+            )
+            channel_id = writer.register_channel(
+                topic=cls.TOPIC, message_encoding="json", schema_id=schema_id
+            )
+            for index, payload in enumerate(cls.PAYLOADS if payloads is None else payloads):
+                log_time = cls.FIRST_LOG_TIME_NS + index
+                writer.add_message(
+                    channel_id=channel_id, log_time=log_time, data=payload, publish_time=log_time
+                )
+            writer.finish()
+        return path
+
+    @staticmethod
+    def _digest(path: Path) -> str:
+        from hflow.episode import Episode
+
+        result = hflow.checks.content_digest(Episode(path))
+        return str(result.measurements["content_digest"])
+
+    def test_the_emitted_value_is_the_digest_and_not_a_transform_of_it(
+        self, tmp_path: Path
+    ) -> None:
+        """The dispatcher returns the digest itself. A transformed value, the
+        hex reversed for instance, keeps every other property tested in this
+        class: it is still 64 hex characters, it still changes with the content
+        and still holds across containers. Only a literal catches it, which is
+        why the fixture is built from bytes that are the same everywhere."""
+        episode = self._write(tmp_path / "pinned.mcap")
+
+        assert self._digest(episode) == self.PINNED_DIGEST
+
+    def test_a_changed_message_changes_the_digest(self, tmp_path: Path) -> None:
+        """The first claim: the digest identifies the content. One payload
+        differs by one byte."""
+        original = self._write(tmp_path / "original.mcap")
+        edited = self._write(
+            tmp_path / "edited.mcap", payloads=(b'{"v":0}', b'{"v":9}', b'{"v":2}')
+        )
+
+        assert self._digest(edited) != self._digest(original)
+
+    def test_the_container_layout_does_not_change_the_digest(self, tmp_path: Path) -> None:
+        """The second claim, and the one a duplicate hunt rests on: the same
+        recording written differently is the same recording. Chunk size,
+        compression and an extra metadata record all differ here, and the files
+        differ in size because of it."""
+        spread = self._write(
+            tmp_path / "spread.mcap", chunk_size=1024, compress=False, metadata=False
+        )
+        packed = self._write(
+            tmp_path / "packed.mcap", chunk_size=1 << 20, compress=True, metadata=True
+        )
+        assert spread.stat().st_size != packed.stat().st_size
+
+        assert self._digest(spread) == self._digest(packed)
 
 
 def test_content_digest_withdraws_a_key_when_the_fact_does(
