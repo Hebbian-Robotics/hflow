@@ -211,6 +211,16 @@ def diagnose(path: Path | str) -> DoctorReport:
             if schema_name in PASSTHROUGH_VIDEO_SCHEMA_NAMES
         }
 
+        metadata_records = {record.name: dict(record.metadata) for record in reader.iter_metadata()}
+        provenance = metadata_records.get(METADATA_RECORD_PROVENANCE)
+
+        group_by_topic = {}
+        if provenance:
+            for k, v in provenance.items():
+                if k.startswith("group/"):
+                    topic_name = k[len("group/") :]
+                    group_by_topic[topic_name] = v
+
         if summary.statistics is None:
             collector.add(
                 DiagnosticLevel.ERROR, "no-statistics", "summary has no Statistics record"
@@ -230,23 +240,42 @@ def diagnose(path: Path | str) -> DoctorReport:
                     f"chunk {chunk_number} has no MessageIndex records",
                 )
                 continue
-            has_video = any(channel_id in video_channel_ids for channel_id in chunk_channel_ids)
-            has_state = any(channel_id not in video_channel_ids for channel_id in chunk_channel_ids)
-            if has_video and has_state:
-                mixed_topics = sorted(
-                    topics_by_channel_id[channel_id] for channel_id in chunk_channel_ids
-                )
-                collector.add(
-                    # A custom topic-group assignment could legally do this;
-                    # the file alone cannot distinguish that from a writer bug.
-                    DiagnosticLevel.WARNING,
-                    "chunk-mixes-video-and-state",
-                    f"chunk {chunk_number} mixes video and state channels {mixed_topics}; "
-                    "the default convention separates them",
-                )
 
-        metadata_records = {record.name: dict(record.metadata) for record in reader.iter_metadata()}
-        provenance = metadata_records.get(METADATA_RECORD_PROVENANCE)
+            if group_by_topic:
+                chunk_groups = set()
+                for channel_id in chunk_channel_ids:
+                    topic = topics_by_channel_id[channel_id]
+                    if topic in group_by_topic:
+                        chunk_groups.add(group_by_topic[topic])
+
+                if len(chunk_groups) > 1:
+                    mixed_topics = sorted(
+                        topics_by_channel_id[channel_id] for channel_id in chunk_channel_ids
+                    )
+                    collector.add(
+                        DiagnosticLevel.WARNING,
+                        "chunk-mixes-groups",
+                        f"chunk {chunk_number} mixes groups {sorted(chunk_groups)} (channels {mixed_topics}); "
+                        "the default convention separates them",
+                    )
+            else:
+                has_video = any(channel_id in video_channel_ids for channel_id in chunk_channel_ids)
+                has_state = any(
+                    channel_id not in video_channel_ids for channel_id in chunk_channel_ids
+                )
+                if has_video and has_state:
+                    mixed_topics = sorted(
+                        topics_by_channel_id[channel_id] for channel_id in chunk_channel_ids
+                    )
+                    collector.add(
+                        # A custom topic-group assignment could legally do this;
+                        # the file alone cannot distinguish that from a writer bug.
+                        DiagnosticLevel.WARNING,
+                        "chunk-mixes-video-and-state",
+                        f"chunk {chunk_number} mixes video and state channels {mixed_topics}; "
+                        "the default convention separates them",
+                    )
+
         if provenance is None:
             collector.add(
                 DiagnosticLevel.ERROR,

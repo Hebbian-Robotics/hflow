@@ -219,3 +219,99 @@ def test_cli_curate_bad_catalog_prints_one_line(
     captured = capsys.readouterr()
     assert "curate:" in captured.err
     assert "Traceback" not in captured.err
+
+def test_chunk_mixes_groups_with_map(tmp_path: Path) -> None:
+    path = tmp_path / "mixed.mcap"
+    with path.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        writer.add_metadata(
+            name="provenance/v1",
+            metadata={
+                "group//joint_states": "state",
+                "group//lidar_points": "bulk",
+                "schema_version": "1",
+                "pipeline_version": "1",
+            },
+        )
+        schema_id = writer.register_schema(name="dummy", encoding="json", data=b"{}")
+        ch1 = writer.register_channel(
+            topic="/joint_states", message_encoding="json", schema_id=schema_id
+        )
+        ch2 = writer.register_channel(
+            topic="/lidar_points", message_encoding="json", schema_id=schema_id
+        )
+        writer.add_message(ch1, log_time=1000, data=b"{}", publish_time=1000)
+        writer.add_message(ch2, log_time=1000, data=b"{}", publish_time=1000)
+        writer.finish()
+
+    report = diagnose(path)
+    codes = {finding.code for finding in report.findings}
+    assert "chunk-mixes-groups" in codes
+
+
+def test_chunk_no_mix_with_map(tmp_path: Path) -> None:
+    path = tmp_path / "nomix.mcap"
+    with path.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        writer.add_metadata(
+            name="provenance/v1",
+            metadata={
+                "group//joint_states": "state",
+                "schema_version": "1",
+                "pipeline_version": "1",
+            },
+        )
+        schema_id = writer.register_schema(name="dummy", encoding="json", data=b"{}")
+        ch1 = writer.register_channel(
+            topic="/joint_states", message_encoding="json", schema_id=schema_id
+        )
+        writer.add_message(ch1, log_time=1000, data=b"{}", publish_time=1000)
+        writer.finish()
+
+    report = diagnose(path)
+    codes = {finding.code for finding in report.findings}
+    assert "chunk-mixes-groups" not in codes
+
+
+def test_chunk_mix_without_map(tmp_path: Path) -> None:
+    path = tmp_path / "nomap.mcap"
+    with path.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        writer.add_metadata(
+            name="provenance/v1", metadata={"schema_version": "1", "pipeline_version": "1"}
+        )
+        video_schema = writer.register_schema(
+            name="foxglove.CompressedVideo",
+            encoding="protobuf",
+            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
+        )
+        state_schema = writer.register_schema(name="dummy", encoding="json", data=b"{}")
+
+        ch_vid = writer.register_channel(
+            topic="/cam", message_encoding="protobuf", schema_id=video_schema
+        )
+        ch_state = writer.register_channel(
+            topic="/joint_states", message_encoding="json", schema_id=state_schema
+        )
+
+        # We also have to supply valid video otherwise read-failed or other things might mask or spam
+        # But even if it does, chunk-mixes-video-and-state should be there.
+        message = CompressedVideo()
+        message.timestamp.FromNanoseconds(10**9)
+        message.frame_id = "cam"
+        message.data = b"\x00\x00\x00\x01\x41not-aud-delimited"
+        message.format = "h264"
+
+        writer.add_message(
+            ch_vid, log_time=1000, data=message.SerializeToString(), publish_time=1000
+        )
+        writer.add_message(ch_state, log_time=1000, data=b"{}", publish_time=1000)
+        writer.finish()
+
+    report = diagnose(path)
+    codes = {finding.code for finding in report.findings}
+    assert "chunk-mixes-video-and-state" in codes
+    assert "chunk-mixes-groups" not in codes
