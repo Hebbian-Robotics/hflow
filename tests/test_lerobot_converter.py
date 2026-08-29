@@ -25,9 +25,11 @@ _ENCODE = prep._encode_cdr_float32_array
 _FFMPEG = shutil.which("ffmpeg")
 _FFPROBE = shutil.which("ffprobe")
 
-pytestmark = pytest.mark.skipif(
+# Only the remux test below shells out. Scoping this to the module would skip
+# the five metadata tests too, and none of those touch ffmpeg at all.
+_requires_system_ffmpeg = pytest.mark.skipif(
     _FFMPEG is None or _FFPROBE is None,
-    reason="system ffmpeg/ffprobe required",
+    reason="system ffmpeg/ffprobe required: prepare.py shells out to bare 'ffmpeg'",
 )
 
 
@@ -258,6 +260,7 @@ def test_camera_selection_validates_keys(tmp_path: Path, monkeypatch: pytest.Mon
         )
 
 
+@_requires_system_ffmpeg
 def test_converter_output_remuxes_without_tail_loss(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
