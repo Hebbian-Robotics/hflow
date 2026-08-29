@@ -156,13 +156,14 @@ A file claiming this convention must satisfy, in increasing strictness:
 `hflow doctor <file.mcap> [more.mcap ...]` checks every file given and prints
 one report each in argument order; its aggregate result follows the
 [exit code rules](#exit-codes). It validates the container, summary, indexes,
-stamps, per-topic time order, and the H.264 access-unit properties listed
-below. It does not currently classify H.264 picture coding types to detect
-B-frames, so a clean report is not proof of the unchecked no-B-frame
-constraint. The doctor also does not reject non-VCL NAL units before the first
-AUD, so a clean report does not prove the canonical AUD-first constraint. An
-unreadable or unparseable path is reported in place, in the same per-file shape
-(`[error] unreadable: ...`), and the run continues with the remaining files.
+per-group chunk time order, stamps, per-topic time order, and the H.264
+access-unit properties listed below. It does not currently classify H.264
+picture coding types to detect B-frames, so a clean report is not proof of the
+unchecked no-B-frame constraint. The doctor also does not reject non-VCL NAL
+units before the first AUD, so a clean report does not prove the canonical
+AUD-first constraint. An unreadable or unparseable path is reported in place,
+in the same per-file shape (`[error] unreadable: ...`), and the run continues
+with the remaining files.
 
 ### Doctor finding codes
 
@@ -178,6 +179,7 @@ automation. An `error` breaks the canonical convention (or the MCAP spec); a
 | `no-chunk-indexes` | error | The summary has no `ChunkIndex` records. |
 | `chunk-missing-message-indexes` | error | A chunk index has no per-channel `MessageIndex` offsets. |
 | `chunk-mixes-video-and-state` | warning | One chunk contains both video and state channels; custom grouping can make this intentional. |
+| `chunk-group-out-of-time-order` | warning | Within one group, a later `ChunkIndex` has an earlier `message_start_time` than the group's preceding chunk; readers seeking a time range assume each group's chunk sequence is time-ordered. |
 | `missing-provenance` | error | The `provenance/v1` metadata record is absent. |
 | `provenance-missing-key` | error | `provenance/v1` lacks `schema_version` or `pipeline_version`. |
 | `missing-episode-record` | warning | The optional `episode/v1` semantics record is absent. |

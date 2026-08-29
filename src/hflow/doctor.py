@@ -30,6 +30,7 @@ from hflow.format import (
     PASSTHROUGH_VIDEO_SCHEMA_NAMES,
     PROVENANCE_KEY_PIPELINE_VERSION,
     PROVENANCE_KEY_SCHEMA_VERSION,
+    PROVENANCE_KEY_TOPIC_GROUP_PREFIX,
 )
 from hflow.storage import fetch_uri
 
@@ -211,6 +212,40 @@ def diagnose(path: Path | str) -> DoctorReport:
             if schema_name in PASSTHROUGH_VIDEO_SCHEMA_NAMES
         }
 
+        metadata_records = {record.name: dict(record.metadata) for record in reader.iter_metadata()}
+        provenance = metadata_records.get(METADATA_RECORD_PROVENANCE)
+        if provenance is None:
+            collector.add(
+                DiagnosticLevel.ERROR,
+                "missing-provenance",
+                f"no {METADATA_RECORD_PROVENANCE!r} metadata record (version stamps)",
+            )
+        else:
+            for required_key in (PROVENANCE_KEY_SCHEMA_VERSION, PROVENANCE_KEY_PIPELINE_VERSION):
+                if required_key not in provenance:
+                    collector.add(
+                        DiagnosticLevel.ERROR,
+                        "provenance-missing-key",
+                        f"{METADATA_RECORD_PROVENANCE} lacks {required_key!r}",
+                    )
+        if METADATA_RECORD_EPISODE not in metadata_records:
+            collector.add(
+                DiagnosticLevel.WARNING,
+                "missing-episode-record",
+                f"no {METADATA_RECORD_EPISODE!r} metadata record (task/operator/success "
+                "semantics live there)",
+            )
+
+        # The resolved topic-to-group map every canonical episode records in
+        # provenance/v1. It is the map FORMAT.md's chunk-layout rules are
+        # written in terms of, so the doctor checks against what the file
+        # itself declares rather than guessing from chunk membership alone.
+        group_by_topic: dict[str, str] = {}
+        for key, group_name in (provenance or {}).items():
+            if key.startswith(PROVENANCE_KEY_TOPIC_GROUP_PREFIX):
+                topic = key[len(PROVENANCE_KEY_TOPIC_GROUP_PREFIX) :]
+                group_by_topic[topic] = group_name
+
         if summary.statistics is None:
             collector.add(
                 DiagnosticLevel.ERROR, "no-statistics", "summary has no Statistics record"
@@ -221,6 +256,14 @@ def diagnose(path: Path | str) -> DoctorReport:
                 "no-chunk-indexes",
                 "no ChunkIndex records: the file is unchunked or unindexed",
             )
+        # FORMAT.md item 3's second half: within a group, chunks must be
+        # time-ordered, because a reader seeking a time range skips chunks on
+        # the assumption that later chunks start later. Reported once per group
+        # so the finding cap cannot hide affected groups behind a suppression
+        # count. Chunks in different groups may interleave in any order; only
+        # order within one group is the rule.
+        previous_chunk_start_by_group: dict[str, int] = {}
+        groups_out_of_time_order: set[str] = set()
         for chunk_number, chunk_index in enumerate(summary.chunk_indexes):
             chunk_channel_ids = set(chunk_index.message_index_offsets.keys())
             if not chunk_channel_ids:
@@ -245,29 +288,29 @@ def diagnose(path: Path | str) -> DoctorReport:
                     "the default convention separates them",
                 )
 
-        metadata_records = {record.name: dict(record.metadata) for record in reader.iter_metadata()}
-        provenance = metadata_records.get(METADATA_RECORD_PROVENANCE)
-        if provenance is None:
-            collector.add(
-                DiagnosticLevel.ERROR,
-                "missing-provenance",
-                f"no {METADATA_RECORD_PROVENANCE!r} metadata record (version stamps)",
-            )
-        else:
-            for required_key in (PROVENANCE_KEY_SCHEMA_VERSION, PROVENANCE_KEY_PIPELINE_VERSION):
-                if required_key not in provenance:
+            chunk_groups = {
+                group_name
+                for channel_id in chunk_channel_ids
+                if (topic := topics_by_channel_id.get(channel_id)) is not None
+                and (group_name := group_by_topic.get(topic)) is not None
+            }
+            if len(chunk_groups) == 1:
+                (group_name,) = chunk_groups
+                previous_start = previous_chunk_start_by_group.get(group_name)
+                if (
+                    previous_start is not None
+                    and chunk_index.message_start_time < previous_start
+                    and group_name not in groups_out_of_time_order
+                ):
                     collector.add(
-                        DiagnosticLevel.ERROR,
-                        "provenance-missing-key",
-                        f"{METADATA_RECORD_PROVENANCE} lacks {required_key!r}",
+                        DiagnosticLevel.WARNING,
+                        "chunk-group-out-of-time-order",
+                        f"group {group_name!r}: chunk starts descend across the sequence "
+                        f"({previous_start} -> {chunk_index.message_start_time}); a reader "
+                        "seeking a time range expects each group's chunks to be time-ordered",
                     )
-        if METADATA_RECORD_EPISODE not in metadata_records:
-            collector.add(
-                DiagnosticLevel.WARNING,
-                "missing-episode-record",
-                f"no {METADATA_RECORD_EPISODE!r} metadata record (task/operator/success "
-                "semantics live there)",
-            )
+                    groups_out_of_time_order.add(group_name)
+                previous_chunk_start_by_group[group_name] = chunk_index.message_start_time
 
         # Full message pass: CRC validation happens as a side effect of
         # reading every chunk; per-topic time order and video constraints are

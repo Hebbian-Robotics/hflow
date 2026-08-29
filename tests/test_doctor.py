@@ -29,6 +29,43 @@ ROS2_COMPRESSED_VIDEO_SCHEMA = "\n".join(
 )
 
 
+def write_chunked_episode(
+    path: Path,
+    message_specs: list[tuple[str, int, int]],
+    groups_by_topic: dict[str, str],
+    *,
+    chunk_size_bytes: int = 1_000,
+) -> None:
+    """Write an MCAP whose chunk layout is controlled by the caller.
+
+    The stock ``mcap`` writer finalizes a chunk once the accumulated bytes
+    exceed an explicit ``chunk_size``, so varying per-message payload sizes
+    places message boundaries exactly where the test needs them. HFlow's own
+    grouped writer cannot produce chunks out of time order, so the violation
+    fixtures here are built with the stock writer instead.
+    """
+    with path.open("wb") as stream:
+        writer = StockWriter(stream, chunk_size=chunk_size_bytes)
+        writer.start(profile="", library="test")
+        schema_id = writer.register_schema(name="test/v1", encoding="json", data=b"{}")
+        channel_ids: dict[str, int] = {}
+        for topic in sorted({topic for topic, _log_time, _size in message_specs}):
+            channel_ids[topic] = writer.register_channel(
+                topic=topic, message_encoding="json", schema_id=schema_id
+            )
+        for topic, log_time, payload_size in message_specs:
+            writer.add_message(
+                channel_ids[topic],
+                log_time=log_time,
+                data=b"\x00" * payload_size,
+                publish_time=log_time,
+            )
+        provenance = {"schema_version": "1", "pipeline_version": "0123456789ab"}
+        provenance.update({f"group/{topic}": group for topic, group in groups_by_topic.items()})
+        writer.add_metadata("provenance/v1", provenance)
+        writer.finish()
+
+
 @pytest.fixture(scope="module")
 def canonical_episode(tmp_path_factory: pytest.TempPathFactory) -> Path:
     root = tmp_path_factory.mktemp("doctor")
@@ -105,6 +142,95 @@ def test_nonconforming_ros2_video_is_reported(tmp_path: Path) -> None:
     assert not report.conforming
     codes = {finding.code for finding in report.findings}
     assert "video-not-aud-delimited" in codes
+
+
+def test_group_chunk_sequence_descending_is_reported_once(tmp_path: Path) -> None:
+    # One group, three chunks with start times [10 s, 0 s, 5 s]: two descents
+    # within the same group. Each channel's own messages still ascend, so this
+    # is only a chunk-layout deviation, not a per-topic time-order error.
+    path = tmp_path / "group_descends.mcap"
+    write_chunked_episode(
+        path,
+        [
+            ("/alpha", 10 * 10**9, 200),
+            ("/alpha", 11 * 10**9, 900),
+            ("/beta", 0 * 10**9, 200),
+            ("/beta", 1 * 10**9, 900),
+        ],
+        {"/alpha": "cameras", "/beta": "cameras"},
+    )
+
+    report = diagnose(path)
+
+    assert report.conforming  # a layout deviation is a warning, not an error
+    findings = [
+        finding for finding in report.findings if finding.code == "chunk-group-out-of-time-order"
+    ]
+    assert len(findings) == 1, report.summary()
+    finding = findings[0]
+    assert finding.level is DiagnosticLevel.WARNING
+    assert "cameras" in finding.message
+    assert "chunk" in finding.message
+
+
+def test_group_chunk_sequence_ascending_is_not_reported(tmp_path: Path) -> None:
+    path = tmp_path / "group_ascends.mcap"
+    write_chunked_episode(
+        path,
+        [
+            ("/alpha", 0 * 10**9, 200),
+            ("/alpha", 1 * 10**9, 900),
+            ("/beta", 2 * 10**9, 200),
+            ("/beta", 3 * 10**9, 900),
+        ],
+        {"/alpha": "cameras", "/beta": "cameras"},
+    )
+
+    report = diagnose(path)
+
+    codes = {finding.code for finding in report.findings}
+    assert "chunk-group-out-of-time-order" not in codes
+
+
+def test_group_chunks_may_interleave_between_groups(tmp_path: Path) -> None:
+    # The state group's chunks surround a cameras chunk that starts earlier.
+    # Out of global order, but each group's own sequence is ascending, so the
+    # interleaving itself is not reported.
+    path = tmp_path / "groups_interleave.mcap"
+    write_chunked_episode(
+        path,
+        [
+            ("/beta", 2 * 10**9, 5_000),
+            ("/alpha", 0 * 10**9, 5_000),
+            ("/beta", 4 * 10**9, 5_000),
+        ],
+        {"/alpha": "cameras", "/beta": "state"},
+        chunk_size_bytes=1_024,
+    )
+
+    report = diagnose(path)
+
+    codes = {finding.code for finding in report.findings}
+    assert "chunk-group-out-of-time-order" not in codes
+
+
+def test_no_group_map_skips_the_time_order_check(tmp_path: Path) -> None:
+    path = tmp_path / "no_group_map.mcap"
+    write_chunked_episode(
+        path,
+        [
+            ("/alpha", 10 * 10**9, 200),
+            ("/alpha", 11 * 10**9, 900),
+            ("/beta", 0 * 10**9, 200),
+            ("/beta", 1 * 10**9, 900),
+        ],
+        {},
+    )
+
+    report = diagnose(path)
+
+    codes = {finding.code for finding in report.findings}
+    assert "chunk-group-out-of-time-order" not in codes
 
 
 def test_not_an_mcap_file(tmp_path: Path) -> None:
