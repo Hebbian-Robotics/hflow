@@ -231,8 +231,10 @@ def diagnose(path: Path | str) -> DoctorReport:
                 "no-chunk-indexes",
                 "no ChunkIndex records: the file is unchunked or unindexed",
             )
-        last_chunk_start_by_group = {}
-        out_of_order_groups = set()
+        # Item 3's second half: within one group the chunks must ascend by
+        # start time. Groups interleave freely, so this tracks each separately.
+        last_chunk_start_by_group: dict[str, int] = {}
+        out_of_order_groups: set[str] = set()
 
         for chunk_number, chunk_index in enumerate(summary.chunk_indexes):
             chunk_channel_ids = set(chunk_index.message_index_offsets.keys())

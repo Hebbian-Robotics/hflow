@@ -334,8 +334,8 @@ def test_group_chunks_out_of_order(tmp_path: Path) -> None:
         schema_id = writer.register_schema(name="dummy", encoding="json", data=b"{}")
         ch1 = writer.register_channel(topic="/alpha", message_encoding="json", schema_id=schema_id)
 
-        # force a chunk boundary by writing and flushing?
-        # we can just write 2000 bytes since chunk_size=1024
+        # chunk_size=1 puts every message in its own chunk, so the descending
+        # log times below are descending chunk start times.
         writer.add_message(ch1, log_time=1000, data=b"{" + b"a" * 2000 + b"}", publish_time=1000)
         writer.add_message(ch1, log_time=500, data=b"{}", publish_time=500)
         writer.finish()
