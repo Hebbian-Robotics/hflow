@@ -316,3 +316,109 @@ def test_chunk_mix_without_map(tmp_path: Path) -> None:
     codes = {finding.code for finding in report.findings}
     assert "chunk-mixes-video-and-state" in codes
     assert "chunk-mixes-groups" not in codes
+
+
+def test_group_chunks_out_of_order(tmp_path: Path) -> None:
+    path = tmp_path / "descending.mcap"
+    with path.open("wb") as stream:
+        writer = StockWriter(stream, chunk_size=1)
+        writer.start(profile="", library="test")
+        writer.add_metadata(
+            name="provenance/v1",
+            data={
+                "group//alpha": "state",
+                "schema_version": "1",
+                "pipeline_version": "1",
+            },
+        )
+        schema_id = writer.register_schema(name="dummy", encoding="json", data=b"{}")
+        ch1 = writer.register_channel(topic="/alpha", message_encoding="json", schema_id=schema_id)
+
+        # force a chunk boundary by writing and flushing?
+        # we can just write 2000 bytes since chunk_size=1024
+        writer.add_message(ch1, log_time=1000, data=b"{" + b"a" * 2000 + b"}", publish_time=1000)
+        writer.add_message(ch1, log_time=500, data=b"{}", publish_time=500)
+        writer.finish()
+
+    report = diagnose(path)
+    codes = {finding.code for finding in report.findings}
+    assert "group-chunks-out-of-order" in codes
+
+
+def test_group_chunks_ascending_is_clean(tmp_path: Path) -> None:
+    path = tmp_path / "ascending.mcap"
+    with path.open("wb") as stream:
+        writer = StockWriter(stream, chunk_size=1)
+        writer.start(profile="", library="test")
+        writer.add_metadata(
+            name="provenance/v1",
+            data={
+                "group//alpha": "state",
+                "schema_version": "1",
+                "pipeline_version": "1",
+            },
+        )
+        schema_id = writer.register_schema(name="dummy", encoding="json", data=b"{}")
+        ch1 = writer.register_channel(topic="/alpha", message_encoding="json", schema_id=schema_id)
+        writer.add_message(ch1, log_time=500, data=b"x" * 2000, publish_time=500)
+        writer.add_message(ch1, log_time=1000, data=b"x" * 2000, publish_time=1000)
+        writer.finish()
+
+    report = diagnose(path)
+    codes = {finding.code for finding in report.findings}
+    assert "group-chunks-out-of-order" not in codes
+
+
+def test_group_chunks_interleaved_different_groups_is_clean(tmp_path: Path) -> None:
+    path = tmp_path / "interleaved.mcap"
+    with path.open("wb") as stream:
+        writer = StockWriter(stream, chunk_size=1)
+        writer.start(profile="", library="test")
+        writer.add_metadata(
+            name="provenance/v1",
+            data={
+                "group//alpha": "state1",
+                "group//beta": "state2",
+                "schema_version": "1",
+                "pipeline_version": "1",
+            },
+        )
+        schema_id = writer.register_schema(name="dummy", encoding="json", data=b"{}")
+        ch1 = writer.register_channel(topic="/alpha", message_encoding="json", schema_id=schema_id)
+        ch2 = writer.register_channel(topic="/beta", message_encoding="json", schema_id=schema_id)
+
+        # alpha chunk 1: t=1000
+        writer.add_message(ch1, log_time=1000, data=b"x" * 2000, publish_time=1000)
+        # beta chunk 1: t=500
+        writer.add_message(ch2, log_time=500, data=b"x" * 2000, publish_time=500)
+        # alpha chunk 2: t=2000 (ascending for alpha)
+        writer.add_message(ch1, log_time=2000, data=b"x" * 2000, publish_time=2000)
+        writer.finish()
+
+    report = diagnose(path)
+    codes = {finding.code for finding in report.findings}
+    assert "group-chunks-out-of-order" not in codes
+
+
+def test_descending_without_map_is_clean(tmp_path: Path) -> None:
+    path = tmp_path / "descending_nomap.mcap"
+    with path.open("wb") as stream:
+        writer = StockWriter(stream, chunk_size=1)
+        writer.start(profile="", library="test")
+        writer.add_metadata(
+            name="provenance/v1",
+            data={
+                "schema_version": "1",
+                "pipeline_version": "1",
+            },
+        )
+        schema_id = writer.register_schema(name="dummy", encoding="json", data=b"{}")
+        ch1 = writer.register_channel(topic="/alpha", message_encoding="json", schema_id=schema_id)
+
+        writer.add_message(ch1, log_time=1000, data=b"x" * 2000, publish_time=1000)
+        writer.add_message(ch1, log_time=500, data=b"x" * 2000, publish_time=500)
+        writer.finish()
+
+    report = diagnose(path)
+    codes = {finding.code for finding in report.findings}
+    assert "group-chunks-out-of-order" not in codes
