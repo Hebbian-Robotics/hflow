@@ -8,6 +8,7 @@ import duckdb
 import pytest
 
 import hflow
+from hflow.format import CATALOG_FORMAT_VERSION
 from hflow.catalog import (
     _EPISODES_VIEW_RESERVED_COLUMNS,
     TABLE_COLUMN_DDL,
@@ -312,6 +313,14 @@ def test_catalog_refuses_unknown_format_version(tmp_path: Path) -> None:
     (root / "format_version").write_text("999\n")
     with pytest.raises(ValueError, match="format version '999'"):
         Catalog(root)
+
+
+def test_open_catalog_connection_refuses_unknown_format_version(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    root.mkdir()
+    (root / "format_version").write_text("999\n")
+    with pytest.raises(ValueError, match=f"has format version '999'.*this build reads version '{CATALOG_FORMAT_VERSION}'"):
+        open_catalog_connection(root)
 
 
 def test_curate_on_empty_catalog(tmp_path: Path) -> None:
