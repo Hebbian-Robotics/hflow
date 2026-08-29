@@ -63,7 +63,7 @@ def camera_health(episode: hflow.Episode) -> hflow.CheckResult:
 def contact_sheet(episode: hflow.Episode) -> hflow.EnrichmentResult:
     artifact_path = DATA_ROOT / "artifacts" / f"{episode.path.stem}-contact-sheet.jpg"
     sheet = hflow.ffmpeg.contact_sheet(
-        episode.frames(fps=1.0),
+        episode.frames(camera=episode.cameras[0], fps=1.0),
         artifact_path,
         columns=5,
         max_tiles=20,

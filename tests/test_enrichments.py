@@ -238,3 +238,32 @@ def test_labels_near_the_artifact_namespace_still_land_with_real_artifacts(
         assert str(artifact_row[0]).endswith("segments.json")
     finally:
         connection.close()
+
+
+def test_enrichment_resolving_camera_explicitly_succeeds_on_multi_camera_episode(
+    tmp_path: Path,
+) -> None:
+    """Regression: episode.frames() without a camera raises ValueError when the
+    episode has more than one camera track.  An enrichment that calls
+    episode.frames(camera=episode.cameras[0], ...) must complete without error
+    on multi-camera episodes (mirrors the fix in examples/egocentric/pipeline.py).
+    """
+    from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
+    from hflow.transform import write_canonical_episode
+
+    multi_cam_spec = SyntheticEpisodeSpec(duration_s=2.0, cameras=("wrist_cam", "top_cam"))
+    raw = synthesize_episode(tmp_path / "raw.mcap", multi_cam_spec)
+    canonical = tmp_path / "canonical.mcap"
+    write_canonical_episode(raw, canonical)
+
+    app = hflow.App("multi-cam-enrich", data_root=tmp_path / "data")
+    frames_seen: list[int] = []
+
+    @app.enrich(version="1")
+    def count_frames(ep: hflow.Episode) -> hflow.EnrichmentResult:
+        frames_seen.append(sum(1 for _ in ep.frames(camera=ep.cameras[0], fps=1.0)))
+        return hflow.EnrichmentResult(labels={"frame_count": frames_seen[-1]})
+
+    report = app.test(canonical, verbose=False)
+    assert report.enrichments[0].status == hflow.CheckStatus.MEASURED
+    assert frames_seen == [2]
