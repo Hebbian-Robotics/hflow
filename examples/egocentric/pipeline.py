@@ -61,15 +61,23 @@ def camera_health(episode: hflow.Episode) -> hflow.CheckResult:
 
 @app.enrich(version="1")
 def contact_sheet(episode: hflow.Episode) -> hflow.EnrichmentResult:
+    # episode.cameras is sorted, so this is the alphabetically first camera and
+    # not necessarily the one the recorder considered primary. Recorded in the
+    # labels because a sheet that cannot say which camera it shows is a trap on
+    # any multi-camera corpus.
+    camera_topic = episode.cameras[0]
     artifact_path = DATA_ROOT / "artifacts" / f"{episode.path.stem}-contact-sheet.jpg"
     sheet = hflow.ffmpeg.contact_sheet(
-        episode.frames(camera=episode.cameras[0], fps=1.0),
+        episode.frames(camera=camera_topic, fps=1.0),
         artifact_path,
         columns=5,
         max_tiles=20,
     )
     return hflow.EnrichmentResult(
-        labels={"contact_sheet_frame_count": sheet.frames_sampled_from},
+        labels={
+            "contact_sheet_frame_count": sheet.frames_sampled_from,
+            "contact_sheet_camera": camera_topic,
+        },
         artifacts={"contact_sheet": sheet.path},
     )
 
