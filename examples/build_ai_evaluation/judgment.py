@@ -53,7 +53,7 @@ class VisionCheckOutcome:
 
 HAND_COUNT_RESPONSE_SCHEMA: dict[str, object] = {
     "type": "object",
-    "properties": {"hand_count": {"type": "integer"}},
+    "properties": {"hand_count": {"type": "integer", "enum": [0, 1, 2]}},
     "required": ["hand_count"],
 }
 ACTIVE_MANIPULATION_RESPONSE_SCHEMA: dict[str, object] = {
