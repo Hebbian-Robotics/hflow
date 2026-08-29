@@ -220,6 +220,7 @@ def test_cli_curate_bad_catalog_prints_one_line(
     assert "curate:" in captured.err
     assert "Traceback" not in captured.err
 
+
 def test_chunk_mixes_groups_with_map(tmp_path: Path) -> None:
     path = tmp_path / "mixed.mcap"
     with path.open("wb") as stream:
@@ -227,7 +228,7 @@ def test_chunk_mixes_groups_with_map(tmp_path: Path) -> None:
         writer.start(profile="", library="test")
         writer.add_metadata(
             name="provenance/v1",
-            metadata={
+            data={
                 "group//joint_states": "state",
                 "group//lidar_points": "bulk",
                 "schema_version": "1",
@@ -257,7 +258,7 @@ def test_chunk_no_mix_with_map(tmp_path: Path) -> None:
         writer.start(profile="", library="test")
         writer.add_metadata(
             name="provenance/v1",
-            metadata={
+            data={
                 "group//joint_states": "state",
                 "schema_version": "1",
                 "pipeline_version": "1",
@@ -281,7 +282,7 @@ def test_chunk_mix_without_map(tmp_path: Path) -> None:
         writer = StockWriter(stream)
         writer.start(profile="", library="test")
         writer.add_metadata(
-            name="provenance/v1", metadata={"schema_version": "1", "pipeline_version": "1"}
+            name="provenance/v1", data={"schema_version": "1", "pipeline_version": "1"}
         )
         video_schema = writer.register_schema(
             name="foxglove.CompressedVideo",

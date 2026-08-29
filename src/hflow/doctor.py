@@ -216,10 +216,10 @@ def diagnose(path: Path | str) -> DoctorReport:
 
         group_by_topic = {}
         if provenance:
-            for k, v in provenance.items():
-                if k.startswith("group/"):
-                    topic_name = k[len("group/") :]
-                    group_by_topic[topic_name] = v
+            for provenance_key, provenance_value in provenance.items():
+                if provenance_key.startswith("group/"):
+                    topic_name = provenance_key[len("group/") :]
+                    group_by_topic[topic_name] = provenance_value
 
         if summary.statistics is None:
             collector.add(
