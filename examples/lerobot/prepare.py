@@ -161,7 +161,9 @@ def _transcode_mp4_to_h264(mp4_path: Path, gop_seconds: float, fps: float) -> li
         "-sc_threshold",
         "0",
         "-x264-params",
-        "aud=1",
+        # bframes=0: B-frame streams lose their reorder-buffer tail through
+        # the raw Annex B -> MP4 remux, undercounting decoded_frame_count (#250).
+        "aud=1:bframes=0",
         "-f",
         "h264",
         "pipe:1",

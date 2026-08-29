@@ -7,6 +7,9 @@ implementation details or touching the network.
 
 import importlib.util
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -18,6 +21,14 @@ prep = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(prep)
 _DERIVE = prep._derive_numeric_schema
 _ENCODE = prep._encode_cdr_float32_array
+
+_FFMPEG = shutil.which("ffmpeg")
+_FFPROBE = shutil.which("ffprobe")
+
+pytestmark = pytest.mark.skipif(
+    _FFMPEG is None or _FFPROBE is None,
+    reason="system ffmpeg/ffprobe required",
+)
 
 
 def _build_fake_corpus(tmp_path: Path) -> dict:
@@ -245,3 +256,74 @@ def test_camera_selection_validates_keys(tmp_path: Path, monkeypatch: pytest.Mon
             output_dir=tmp_path / "out",
             camera_key="observation.nope",
         )
+
+
+def test_converter_output_remuxes_without_tail_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The converter's stream must decode in full through the hflow remux.
+
+    B-frame H.264 loses its reorder-buffer tail when remuxed from raw Annex
+    B to MP4, so decoded_frame_count undercounts healthy episodes (#250).
+    The converter encodes with bframes=0; prove the full chain decodes
+    every source frame.
+    """
+
+    assert _FFMPEG is not None and _FFPROBE is not None
+    # prepare.py shells out to bare "ffmpeg"/"ffprobe"; make sure it
+    # resolves to the system binary this test found.
+    monkeypatch.setenv(
+        "PATH",
+        str(Path(_FFMPEG).resolve().parent) + os.pathsep + os.environ.get("PATH", ""),
+    )
+
+    source = tmp_path / "source.mp4"
+    subprocess.run(
+        [
+            _FFMPEG,
+            "-hide_banner",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=30:duration=3,format=yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-g",
+            "30",
+            "-keyint_min",
+            "30",
+            "-sc_threshold",
+            "0",
+            str(source),
+        ],
+        capture_output=True,
+        check=True,
+    )
+
+    from hflow.video import write_access_units_to_mp4
+
+    units = prep._transcode_mp4_to_h264(source, gop_seconds=1.0, fps=30.0)
+    muxed = write_access_units_to_mp4(units, fps=30.0, output=tmp_path / "remux.mp4")
+
+    probe = subprocess.run(
+        [
+            _FFPROBE,
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "default=noprint_wrappers=1",
+            str(muxed),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "nb_read_frames=90" in probe.stdout, probe.stdout
