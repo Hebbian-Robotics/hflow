@@ -87,7 +87,11 @@ build-backend = "uv_build"
 exclude-newer = "5 days"
 
 [tool.uv.workspace]
-members = ["packages/*", "examples/build_ai_evaluation"]
+members = [
+    "packages/*",
+    "examples/build_ai_evaluation",
+    "examples/egosuite_evaluation",
+]
 
 [tool.uv.sources]
 hflow-server = { workspace = true }
@@ -131,4 +135,8 @@ possibly-unresolved-reference = "error"
 # Workspace examples typecheck themselves with their own dependencies.
 # openai_vision imports the user's optional client, so the root project does
 # not typecheck it either.
-exclude = ["examples/build_ai_evaluation/", "examples/openai_vision/"]
+exclude = [
+    "examples/build_ai_evaluation/",
+    "examples/egosuite_evaluation/",
+    "examples/openai_vision/",
+]

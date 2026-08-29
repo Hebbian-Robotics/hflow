@@ -1,0 +1,35 @@
+[project]
+name = "hflow-example-egosuite-evaluation"
+version = "0.1.0"
+description = "Inspect AI evaluation against projected EgoSuite hand-pose labels"
+requires-python = ">=3.11"
+dependencies = [
+    "hflow",
+    "inspect-ai>=0.3.260",
+    "openai>=3.3.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.4",
+    "ty>=0.0.74",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+hflow = { workspace = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+extend = "../../pyproject.toml"
+
+[tool.ty.rules]
+division-by-zero = "error"
+deprecated = "error"
+unused-ignore-comment = "error"
+possibly-unresolved-reference = "error"

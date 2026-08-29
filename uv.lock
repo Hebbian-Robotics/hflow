@@ -14,6 +14,7 @@ exclude-newer-span = "P5D"
 members = [
     "hflow",
     "hflow-example-build-ai-evaluation",
+    "hflow-example-egosuite-evaluation",
     "hflow-server",
 ]
 
@@ -1054,6 +1055,37 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "duckdb", specifier = ">=1.5.5" },
+    { name = "hflow", editable = "." },
+    { name = "inspect-ai", specifier = ">=0.3.260" },
+    { name = "openai", specifier = ">=3.3.1" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=9.1.1" },
+    { name = "ruff", specifier = ">=0.16.4" },
+    { name = "ty", specifier = ">=0.0.74" },
+]
+
+[[package]]
+name = "hflow-example-egosuite-evaluation"
+version = "0.1.0"
+source = { virtual = "examples/egosuite_evaluation" }
+dependencies = [
+    { name = "hflow" },
+    { name = "inspect-ai" },
+    { name = "openai" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "ruff" },
+    { name = "ty" },
+]
+
+[package.metadata]
+requires-dist = [
     { name = "hflow", editable = "." },
     { name = "inspect-ai", specifier = ">=0.3.260" },
     { name = "openai", specifier = ">=3.3.1" },
