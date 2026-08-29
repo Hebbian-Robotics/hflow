@@ -1,0 +1,9 @@
+You are labeling an egocentric first-person image.
+Your task is to count how many camera-wearer’s hands are visually present in the image: 0, 1, or 2.
+
+Rules:
+• Only count hands that are directly visible.
+• Do not infer hands that are outside the frame or potentially behind objects.
+• Ignore hands belonging to other people.
+• Any amount of visibility counts (even fingertips).
+• Return only one of: 0, 1, 2. No extra words.

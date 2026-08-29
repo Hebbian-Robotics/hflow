@@ -35,21 +35,21 @@ arrow = ["pyarrow>=25.0.1"]
 # Native object-store data roots (gs://, s3://, az://): obstore is the Rust
 # object_store crate as a single dependency-free wheel; local-path roots
 # never import it.
-bucket = ["obstore>=0.10.0"]
+bucket = ["obstore>=0.11.1"]
 # Hand detection with MediaPipe's Hand Landmarker (hflow.mediapipe_hands).
 # A MODEL, not a signal statistic, so it is opt-in twice over: outside the core
 # install, and outside the dev group as well (unlike motion and bucket, which
 # are mirrored into dev so the suite exercises them). It adds ~430 MB and its
 # own OpenCV; a dev environment opts in with `--extra mediapipe`, exactly as
 # the openai example does.
-mediapipe = ["mediapipe>=1.0.0"]
+mediapipe = ["mediapipe>=1.0.1"]
 # Camera-shake measurement: pyramidal Lucas-Kanade optical flow and a RANSAC
 # similarity fit. No numpy-only equivalent preserves the instrument, and
 # reimplementing them would make it a different, unvalidated one -- so the
 # dependency is real, and confined to the one check that needs it. Headless
 # because a data pipeline runs where there is no display.
-motion = ["opencv-python-headless>=4.10"]
-openai = ["openai>=3.0.0"]
+motion = ["opencv-python-headless>=5.0.0.93"]
+openai = ["openai>=3.3.1"]
 
 [project.urls]
 Repository = "https://github.com/Hebbian-Robotics/hflow"
@@ -64,20 +64,20 @@ dev = [
     "hflow-server", # the workspace API package, present in dev so the suite tests it
     # Starlette's TestClient transport for the hflow-server suite. httpx2, not
     # httpx: starlette 1.6 deprecates the httpx transport in its favour.
-    "httpx2>=2.10",
-    "obstore>=0.10.0", # the bucket extra, present in dev so the suite tests it
+    "httpx2>=2.12.0",
+    "obstore>=0.11.1", # the bucket extra, present in dev so the suite tests it
     # the motion extra, present in dev so the suite tests it rather than
     # skipping the one check that cannot be verified any other way
-    "opencv-python-headless>=4.10",
+    "opencv-python-headless>=5.0.0.93",
     "pyarrow>=25.0.1", # the arrow extra, present in dev so the suite tests it
     "pytest>=9.1.1",
     "pyyaml>=6.0.3",
-    "ruff>=0.16.2",
-    "ty>=0.0.71",
+    "ruff>=0.16.4",
+    "ty>=0.0.74",
 ]
 
 [build-system]
-requires = ["uv_build>=0.11.33,<0.12"]
+requires = ["uv_build>=0.12.5,<0.13"]
 build-backend = "uv_build"
 
 [tool.uv]
@@ -87,7 +87,7 @@ build-backend = "uv_build"
 exclude-newer = "5 days"
 
 [tool.uv.workspace]
-members = ["packages/*"]
+members = ["packages/*", "examples/build_ai_evaluation"]
 
 [tool.uv.sources]
 hflow-server = { workspace = true }
@@ -128,7 +128,7 @@ unused-ignore-comment = "error"
 possibly-unresolved-reference = "error"
 
 [tool.ty.src]
-# examples/openai_vision imports the user's own `openai` client: bundling a
-# VLM client is a non-goal (examples ARE the docs), so the package is
-# deliberately not a dependency and the example is excluded from typechecking.
-exclude = ["examples/openai_vision/"]
+# Workspace examples typecheck themselves with their own dependencies.
+# openai_vision imports the user's optional client, so the root project does
+# not typecheck it either.
+exclude = ["examples/build_ai_evaluation/", "examples/openai_vision/"]

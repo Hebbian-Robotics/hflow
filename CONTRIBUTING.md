@@ -43,11 +43,21 @@ cd hflow
 uv sync --locked
 ```
 
-Every extra the suite exercises is mirrored into the `dev` group, so a plain
-sync is the whole development environment. Two extras stay opt-in because
-nothing in the suite runs them -- `openai`, which talks to a real endpoint, and
-`mediapipe`, which is a model that adds ~430 MB and a second OpenCV
-distribution. Add either with `--extra <name>` when you are working on it.
+Every root-project extra the suite exercises is mirrored into the `dev` group,
+so a plain sync is the whole root development environment.
+
+Examples that need a substantial or specialized dependency stack are separate
+uv workspace projects. Each owns a `pyproject.toml` and colocated tests, while
+using the repository's shared lockfile and workspace copy of HFlow. Select one
+with `--project` only when working on it:
+
+```bash
+uv sync --locked --project examples/path_to_example
+```
+
+The `mediapipe` extra also stays opt-in because it is a model that adds ~430 MB
+and a second OpenCV distribution. Add it with `--extra mediapipe` when you are
+working on it.
 
 Confirm the package and CLI are available:
 
@@ -72,6 +82,13 @@ Run the default suite after every behavior change:
 
 ```bash
 uv run pytest -q
+```
+
+Run a workspace example's colocated tests against its own environment:
+
+```bash
+uv run --locked --project examples/path_to_example \
+  pytest -q examples/path_to_example/tests
 ```
 
 CI runs the suite on Python 3.11 and 3.14. When changing compatibility-sensitive
@@ -130,6 +147,14 @@ repository root, and name the observable result. Keep examples on public APIs;
 tests belong to business logic and boundary behavior, not to checking that a
 documentation snippet copied a third-party SDK correctly.
 
+Give an example its own workspace project when it has a substantial dependency
+stack, multiple entry points, or colocated tests that need dependencies the
+root suite should not install. Its `pyproject.toml` should set
+`tool.uv.package = false`, depend on the workspace copy of `hflow`, and declare
+its own development tools. Register the directory in the root workspace and in
+CI's `workspace-example-checks` matrix. Keep small examples that only use HFlow
+or one optional client in the root project.
+
 ## Changing how episodes are processed
 
 Identities in HFlow are content hashes, and one of them -- `pipeline_version`
@@ -167,6 +192,18 @@ Run the Python quality gate and fix every reported issue:
 uv run ruff check --fix
 uv run ruff format
 uv run ty check
+```
+
+Workspace examples have the same gate, run against their own environments:
+
+```bash
+uv run --locked --project examples/path_to_example \
+  ruff check --fix examples/path_to_example
+uv run --locked --project examples/path_to_example \
+  ruff format examples/path_to_example
+uv run --locked --project examples/path_to_example \
+  ty check --project examples/path_to_example --extra-search-path . \
+  examples/path_to_example
 ```
 
 ### Optional: Pre-commit hooks

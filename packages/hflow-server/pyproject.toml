@@ -17,8 +17,8 @@ dependencies = [
     # wheel's metadata -- and uv ignores this specifier for the workspace
     # member, so in-repo development is unaffected by the number.
     "hflow>=0.3.0",
-    "fastapi>=0.115",
-    "uvicorn>=0.32",
+    "fastapi>=0.141.1",
+    "uvicorn>=0.52.4",
 ]
 
 [project.urls]
@@ -28,5 +28,5 @@ Repository = "https://github.com/Hebbian-Robotics/hflow"
 hflow = { workspace = true }
 
 [build-system]
-requires = ["uv_build>=0.11.33,<0.12"]
+requires = ["uv_build>=0.12.5,<0.13"]
 build-backend = "uv_build"

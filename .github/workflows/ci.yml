@@ -29,8 +29,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Sync environment
         # Not --all-extras: the mediapipe extra is a model, deliberately not
-        # exercised here (see pyproject.toml). Every extra the suite does test
-        # is mirrored into the dev group, so a plain sync is the full env.
+        # exercised here (see pyproject.toml). Workspace examples are checked
+        # separately against the environments they own.
         run: uv sync --locked
       - name: Lint
         run: uv run ruff check
@@ -40,6 +40,31 @@ jobs:
         run: uv run ty check
       - name: Tests
         run: uv run pytest -q
+
+  workspace-example-checks:
+    name: workspace example (${{ matrix.example_project }}, Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    env:
+      WORKSPACE_EXAMPLE_PROJECT: ${{ matrix.example_project }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+        example_project:
+          - examples/build_ai_evaluation
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Lint
+        run: uv run --locked --project "$WORKSPACE_EXAMPLE_PROJECT" ruff check "$WORKSPACE_EXAMPLE_PROJECT"
+      - name: Format check
+        run: uv run --locked --project "$WORKSPACE_EXAMPLE_PROJECT" ruff format --check "$WORKSPACE_EXAMPLE_PROJECT"
+      - name: Typecheck
+        run: uv run --locked --project "$WORKSPACE_EXAMPLE_PROJECT" ty check --project "$WORKSPACE_EXAMPLE_PROJECT" --extra-search-path . "$WORKSPACE_EXAMPLE_PROJECT"
+      - name: Tests
+        run: uv run --locked --project "$WORKSPACE_EXAMPLE_PROJECT" pytest -q "$WORKSPACE_EXAMPLE_PROJECT/tests"
 
   links:
     runs-on: ubuntu-latest

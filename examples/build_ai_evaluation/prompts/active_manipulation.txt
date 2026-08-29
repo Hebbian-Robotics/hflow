@@ -1,0 +1,12 @@
+You are labeling an egocentric first-person image.
+
+Your task is to determine whether the camera-wearer is actively doing active manipulation at this exact moment.
+
+Definition:
+"Active Manipulation" means the wearer is visibly using their hands to work on, modify, assemble, process, or handle physical objects, materials, components, or workpieces in pursuit of a specific goal
+
+Rules:
+• Do not infer actions that are not visible in the frame.
+• If the action is ambiguous or not clearly happening, respond "no."
+• Ignore actions performed by other people.
+• Respond only with: "yes" or "no."

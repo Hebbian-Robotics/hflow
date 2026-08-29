@@ -3,6 +3,18 @@
 Examples are executable documentation. Each one names its prerequisites, gives
 one command to run, and says what successful output looks like.
 
+Most examples use the root HFlow environment. An example with a substantial or
+specialized dependency stack has its own `pyproject.toml` and tests and is a uv
+workspace project. Run one from the repository root with:
+
+```bash
+uv sync --locked --project examples/path_to_example
+uv run --project examples/path_to_example python examples/path_to_example/main.py
+```
+
+These projects share the repository lockfile and use the workspace copy of
+HFlow, but their dependencies are not installed by a normal root `uv sync`.
+
 ## Five-minute quickstart
 
 **Use it for:** seeing the complete in-process lifecycle on a small multimodal
@@ -47,6 +59,51 @@ implements the Responses API.
 
 Guide: [Call an OpenAI vision endpoint from a step](../docs/how-to/call-openai-vision.md)  
 Code: [`openai_vision/pipeline.py`](./openai_vision/pipeline.py)
+
+## Build AI single-frame vision checks
+
+**Use it for:** applying Build AI's single-frame hand-count and
+active-manipulation methodology as HFlow checks, then replaying their
+Egocentric-10K or Egocentric-100K inputs to compare models and prompts.
+
+**Prerequisites:** an OpenAI-compatible vision endpoint. The pinned evaluation
+replay additionally needs the `hf` CLI and sufficient disk for the selected
+Parquet files. Each frame makes two API calls and can incur charges.
+
+```bash
+export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
+export OPENAI_MODEL="qwen/qwen3-vl-32b-instruct"
+export BUILD_AI_API_KEY_ENV="OPENROUTER_API_KEY"
+uv run --project examples/build_ai_evaluation \
+    python -m examples.build_ai_evaluation.pipeline
+```
+
+The HFlow pipeline synthesizes a sample episode when no MCAP path is supplied,
+evaluates its first frame through two `@app.check` steps, and records the raw
+answers, parsed predictions, routed model, and token usage as
+`hflow.CheckResult` measurements. Pass an MCAP path to run the checks on an
+existing episode.
+
+The companion adapter streams the published Parquet images into Inspect AI
+without transcoding them, using the same prompts, schemas, and parsers:
+
+```bash
+uv run --project examples/build_ai_evaluation \
+    python examples/build_ai_evaluation/evaluate.py run \
+    --dataset 10k --source build --limit 1 --download \
+    --api-key-env OPENROUTER_API_KEY
+```
+
+Inspect writes structured per-sample logs under
+`data/build-ai-evaluation/runs/`; the adapter prints hand-visibility and
+active-manipulation prevalence plus agreement with Build AI's published Gemini
+labels and writes a compact comparison summary.
+
+Guide, exact reproduction commands, and output contract:
+[Compare vision models on the Build AI evaluations](../docs/how-to/run-build-ai-evaluation.md)
+
+- HFlow pipeline: [`build_ai_evaluation/pipeline.py`](./build_ai_evaluation/pipeline.py)
+- Reproduction adapter: [`build_ai_evaluation/evaluate.py`](./build_ai_evaluation/evaluate.py)
 
 ## Egocentric factory corpus
 
