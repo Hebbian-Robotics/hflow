@@ -8,7 +8,7 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
-.vscode/
+
 # Default data root for pipelines and the quickstart example (user data,
 # never source).
 data/
