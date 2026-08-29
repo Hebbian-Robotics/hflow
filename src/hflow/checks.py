@@ -410,7 +410,7 @@ def _camera_frame_stats_keys(episode: Episode, *, cameras: Sequence[str] | None 
 
     Per topic: ``message_count`` always; ``expected_frame_count`` and
     ``frame_deficit_pct`` only when the topic carries at least two messages;
-    the seven decoded-evidence keys always. ``camera_instrument`` and
+    the eight decoded-evidence keys always. ``camera_instrument`` and
     ``camera_measurement_definition`` are the two non-topic keys; they ride
     inside the per-topic selection, so an episode with no cameras emits
     nothing at all.
@@ -426,6 +426,7 @@ def _camera_frame_stats_keys(episode: Episode, *, cameras: Sequence[str] | None 
             f"{topic}/{name}"
             for name in (
                 "decoded_frame_count",
+                "decode_deficit_pct",
                 "black_frame_pct",
                 "overexposed_frame_pct",
                 "freeze_total_s",
@@ -529,6 +530,11 @@ def _camera_value(
                 )
             case "decoded_frame_count":
                 return inter.stats.decoded_frame_count
+            case "decode_deficit_pct":
+                message_count = inter.stamps_ns.size
+                return float(
+                    100.0 * (message_count - inter.stats.decoded_frame_count) / message_count
+                )
             case "black_frame_pct":
                 return inter.stats.black_frame_percent
             case "overexposed_frame_pct":
@@ -571,8 +577,8 @@ def camera_frame_stats(
     (blackframe + freezedetect + signalstats in one filter graph, one shared
     frame denominator) over each camera's lossless MP4 remux, and compares
     the stored frame count against the rate the stream claims (declared
-    ``expected_hz`` when given, else the stream's median delta) -- the
-    LeRobot-style frame-count-vs-rate question. Freeze spans become labeled
+    ``expected_hz`` when given, else the stream's median delta), and compares
+    messages present with frames decoded. Freeze spans become labeled
     ``freeze:<topic>`` intervals in log time. Requires a canonical episode
     (``Episode.video`` remuxes in-band H.264 only).
 
@@ -1916,7 +1922,7 @@ def keyframe_interval(episode: Episode, *, cameras: Sequence[str] | None = None)
 _DEFAULT_CHECK_VERSION_BY_FUNCTION: dict[CheckFunction, str] = {
     episode_duration: "1",
     timestamp_regularity: "1",
-    camera_frame_stats: "1",
+    camera_frame_stats: "2",
     keyframe_interval: "1",
     content_digest: "1",
     media_digest: "1",

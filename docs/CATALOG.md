@@ -183,9 +183,15 @@ as media, so a user key there would ship as media the pipeline never produced.
 Keys containing `/` need double quotes in SQL:
 
 ```sql
-SELECT episode_id, "/wrist_cam/compressed/black_frame_pct" AS black_pct
-FROM episodes WHERE black_pct < 5.0
+SELECT episode_id,
+       "/wrist_cam/compressed/black_frame_pct" AS black_pct,
+       "/wrist_cam/compressed/decode_deficit_pct" AS decode_deficit_pct
+FROM episodes WHERE black_pct < 5.0 AND decode_deficit_pct = 0.0
 ```
+
+The built-in `camera_frame_stats` check keeps two deficits separate:
+`frame_deficit_pct` measures missing messages against the expected rate, while
+`decode_deficit_pct` measures messages present whose frames did not decode.
 
 **Omit the key rather than measuring NaN or infinity.** A non-finite float is
 refused at append time, naming the check and the key. NaN compares false against

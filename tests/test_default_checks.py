@@ -1,5 +1,6 @@
 """The baseline every episode gets without anyone registering it."""
 
+import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -7,6 +8,9 @@ from typing import Any
 
 import numpy as np
 import pytest
+from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
+from mcap.writer import Writer as StockWriter
+from mcap_protobuf.schema import build_file_descriptor_set
 
 import hflow
 from hflow._video_measurements import (
@@ -34,7 +38,9 @@ from hflow.checks import (
     camera_frame_stats,
     episode_duration,
 )
+from hflow.ffmpeg import ffmpeg_path
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
+from hflow.video import split_annex_b_stream
 
 
 @pytest.fixture(scope="module")
@@ -65,7 +71,14 @@ def test_a_pipeline_that_registers_nothing_still_records_evidence(
         "media_digest",
     }
     assert len(DEFAULT_CHECKS) == len(measured)
-    assert {run.check.version for run in report.checks} == {"1"}
+    assert {run.check.name: run.check.version for run in report.checks} == {
+        "episode_duration": "1",
+        "timestamp_regularity": "1",
+        "camera_frame_stats": "2",
+        "keyframe_interval": "1",
+        "content_digest": "1",
+        "media_digest": "1",
+    }
     duration = next(run for run in report.checks if run.check.name == "episode_duration")
     assert duration.result is not None
     assert duration.result.measurements["duration_s"] == pytest.approx(1.0, abs=0.2)
@@ -552,6 +565,7 @@ def _pinned_camera_measurements(
     pinned: dict[str, object] = {
         f"{topic}/message_count": frames,
         f"{topic}/decoded_frame_count": frames,
+        f"{topic}/decode_deficit_pct": 0.0,
         f"{topic}/freeze_total_s": 0.0,
         f"{topic}/black_frame_pct": black_frame_pct,
         f"{topic}/overexposed_frame_pct": overexposed_frame_pct,
@@ -701,6 +715,7 @@ def test_a_single_stamp_camera_topic_errors_before_any_measurement(
     assert _camera_frame_stats_keys(Episode(report.canonical_path), cameras=[topic]) == {
         f"{topic}/message_count",
         f"{topic}/decoded_frame_count",
+        f"{topic}/decode_deficit_pct",
         f"{topic}/black_frame_pct",
         f"{topic}/overexposed_frame_pct",
         f"{topic}/freeze_total_s",
@@ -739,6 +754,7 @@ def test_the_body_emits_what_the_fact_names_even_when_the_fact_withdraws_one(
         f"{topic}/expected_frame_count",
         f"{topic}/frame_deficit_pct",
         f"{topic}/decoded_frame_count",
+        f"{topic}/decode_deficit_pct",
         f"{topic}/overexposed_frame_pct",
         f"{topic}/freeze_total_s",
         f"{topic}/luma_avg_mean",
@@ -886,6 +902,84 @@ def test_dispatcher_message_count_and_decoded_frame_count_read_distinct_sources(
     assert _camera_value("/cam0/decoded_frame_count", by_topic) == 15
     # A swap that returns 15 for message_count -- or 13 for decoded_frame_count
     # -- would have to break both asserts, not just one.
+
+
+def test_camera_frame_stats_reports_frames_present_but_not_decoded(tmp_path: Path) -> None:
+    """B-frame reorder loss is visible separately from missing messages."""
+    encoded = subprocess.run(
+        [
+            str(ffmpeg_path()),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=30:duration=3,format=yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-g",
+            "30",
+            "-keyint_min",
+            "30",
+            "-sc_threshold",
+            "0",
+            "-x264-params",
+            "aud=1:repeat-headers=1",
+            "-f",
+            "h264",
+            "pipe:1",
+        ],
+        capture_output=True,
+        check=True,
+    )
+    access_units = split_annex_b_stream(encoded.stdout)
+    assert len(access_units) == 90
+
+    source = tmp_path / "b-frames.mcap"
+    with source.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        schema_id = writer.register_schema(
+            name="foxglove.CompressedVideo",
+            encoding="protobuf",
+            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
+        )
+        topic = "/camera/compressed"
+        channel_id = writer.register_channel(
+            topic=topic, message_encoding="protobuf", schema_id=schema_id
+        )
+        start_time_ns = 1_000_000_000
+        for frame_index, access_unit in enumerate(access_units):
+            log_time_ns = start_time_ns + round(frame_index * 1_000_000_000 / 30)
+            message = CompressedVideo()
+            message.timestamp.FromNanoseconds(log_time_ns)
+            message.frame_id = "camera"
+            message.data = access_unit.data
+            message.format = "h264"
+            writer.add_message(
+                channel_id,
+                log_time=log_time_ns,
+                data=message.SerializeToString(),
+                publish_time=log_time_ns,
+                sequence=frame_index,
+            )
+        writer.finish()
+
+    with hflow.Episode(source) as episode:
+        result = camera_frame_stats(episode)
+
+    message_count = result.measurements[f"{topic}/message_count"]
+    decoded_frame_count = result.measurements[f"{topic}/decoded_frame_count"]
+    assert isinstance(message_count, int)
+    assert isinstance(decoded_frame_count, int)
+    assert message_count == 90
+    assert decoded_frame_count < message_count
+    assert result.measurements[f"{topic}/decode_deficit_pct"] == pytest.approx(
+        100.0 * (message_count - decoded_frame_count) / message_count
+    )
 
 
 # episode_duration: three fixed keys, independent of which topics the episode
