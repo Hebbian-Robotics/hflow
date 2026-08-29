@@ -57,7 +57,10 @@ class TestWorkspaceIdentity:
             "created_at": "bar",
         }
         (tmp_path / "workspace.json").write_text(json.dumps(payload))
-        with pytest.raises(ValueError, match=f"has identity_version 99.*this build reads version {WORKSPACE_IDENTITY_VERSION}"):
+        with pytest.raises(
+            ValueError,
+            match=f"has identity_version 99.*this build reads version {WORKSPACE_IDENTITY_VERSION}",
+        ):
             Workspace.parse(tmp_path).identity()
 
     def test_identity_marker_missing_workspace_id_is_refused(self, tmp_path: Path) -> None:
