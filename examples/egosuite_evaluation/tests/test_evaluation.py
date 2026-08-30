@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -73,6 +74,108 @@ def test_projection_inverts_the_camera_pose_from_world_coordinates() -> None:
     assert projected_hand.joints[0].depth == pytest.approx(2.0)
     assert projected_hand.joints[0].image_x == pytest.approx(100.0)
     assert projected_hand.joints[0].image_y == pytest.approx(50.0)
+
+
+@pytest.mark.parametrize(
+    ("camera_pose", "calibration", "expected_message"),
+    [
+        pytest.param(
+            replace(IDENTITY_CAMERA_POSE, rotation=Quaternion(0.0, 0.0, 0.0, 0.0)),
+            CALIBRATION,
+            "camera quaternion must have a finite, nonzero norm",
+            id="zero-quaternion-norm",
+        ),
+        pytest.param(
+            replace(IDENTITY_CAMERA_POSE, rotation=Quaternion(math.inf, 0.0, 0.0, 1.0)),
+            CALIBRATION,
+            "camera quaternion must have a finite, nonzero norm",
+            id="nonfinite-quaternion-norm",
+        ),
+        pytest.param(
+            IDENTITY_CAMERA_POSE,
+            replace(CALIBRATION, width=0),
+            "camera width and height must be positive",
+            id="zero-width",
+        ),
+        pytest.param(
+            IDENTITY_CAMERA_POSE,
+            replace(CALIBRATION, height=0),
+            "camera width and height must be positive",
+            id="zero-height",
+        ),
+        pytest.param(
+            IDENTITY_CAMERA_POSE,
+            replace(CALIBRATION, focal_length_x=0.0),
+            "camera focal lengths must be positive",
+            id="zero-horizontal-focal-length",
+        ),
+        pytest.param(
+            IDENTITY_CAMERA_POSE,
+            replace(CALIBRATION, focal_length_y=0.0),
+            "camera focal lengths must be positive",
+            id="zero-vertical-focal-length",
+        ),
+        pytest.param(
+            IDENTITY_CAMERA_POSE,
+            replace(CALIBRATION, focal_length_x=math.nan),
+            "camera calibration values must be finite",
+            id="nonfinite-horizontal-focal-length",
+        ),
+        pytest.param(
+            IDENTITY_CAMERA_POSE,
+            replace(CALIBRATION, focal_length_y=math.nan),
+            "camera calibration values must be finite",
+            id="nonfinite-vertical-focal-length",
+        ),
+        pytest.param(
+            IDENTITY_CAMERA_POSE,
+            replace(CALIBRATION, principal_point_x=math.nan),
+            "camera calibration values must be finite",
+            id="nonfinite-horizontal-principal-point",
+        ),
+        pytest.param(
+            IDENTITY_CAMERA_POSE,
+            replace(CALIBRATION, principal_point_y=math.nan),
+            "camera calibration values must be finite",
+            id="nonfinite-vertical-principal-point",
+        ),
+    ],
+)
+def test_projection_rejects_invalid_camera_parameters(
+    camera_pose: CameraPoseInWorld,
+    calibration: PinholeCameraCalibration,
+    expected_message: str,
+) -> None:
+    with pytest.raises(ValueError, match=expected_message):
+        project_world_joints([Point3D(0.0, 0.0, 1.0)], camera_pose, calibration)
+
+
+@pytest.mark.parametrize(
+    ("world_joints", "expected_message"),
+    [
+        pytest.param([], "at least one hand joint is required", id="empty-joint-sequence"),
+        pytest.param(
+            [Point3D(math.inf, 0.0, 1.0)],
+            "hand joint coordinates must be finite",
+            id="nonfinite-joint-x",
+        ),
+        pytest.param(
+            [Point3D(0.0, math.nan, 1.0)],
+            "hand joint coordinates must be finite",
+            id="nonfinite-joint-y",
+        ),
+        pytest.param(
+            [Point3D(0.0, 0.0, math.inf)],
+            "hand joint coordinates must be finite",
+            id="nonfinite-joint-z",
+        ),
+    ],
+)
+def test_projection_rejects_invalid_joint_inputs(
+    world_joints: list[Point3D], expected_message: str
+) -> None:
+    with pytest.raises(ValueError, match=expected_message):
+        project_world_joints(world_joints, IDENTITY_CAMERA_POSE, CALIBRATION)
 
 
 @pytest.mark.parametrize(
