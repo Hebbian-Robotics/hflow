@@ -800,7 +800,13 @@ def run_evaluation(configuration: EvaluationConfiguration, *, download: bool) ->
 
 
 def compare_summaries(summary_paths: Sequence[Path]) -> None:
-    summaries = [json.loads(path.read_text()) for path in summary_paths]
+    summaries = []
+    for path in summary_paths:
+        content = path.read_text()
+        try:
+            summaries.append(json.loads(content))
+        except json.JSONDecodeError as error:
+            raise ValueError(f"invalid JSON in {path}: {error}") from error
     print(
         "| run | dataset | source | hand n | 1+ hands | 2 hands | active n | "
         "active yes | hand agreement | active agreement |"
@@ -933,17 +939,17 @@ def _argument_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = _argument_parser()
     arguments = parser.parse_args()
-    match arguments.command:
-        case "run":
-            try:
+    try:
+        match arguments.command:
+            case "run":
                 configuration = _run_configuration_from_arguments(arguments)
                 run_evaluation(configuration, download=arguments.download)
-            except (FileNotFoundError, RuntimeError, ValueError) as error:
-                parser.error(str(error))
-        case "compare":
-            compare_summaries(arguments.summaries)
-        case unknown_command:
-            raise AssertionError(f"unhandled command: {unknown_command}")
+            case "compare":
+                compare_summaries(arguments.summaries)
+            case unknown_command:
+                raise AssertionError(f"unhandled command: {unknown_command}")
+    except (FileNotFoundError, ValueError, RuntimeError) as error:
+        parser.error(str(error))
 
 
 if __name__ == "__main__":

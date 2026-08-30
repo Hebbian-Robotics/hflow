@@ -18,6 +18,7 @@ from examples.build_ai_evaluation.evaluate import (
     _run_configuration_from_arguments,
     _sanitize_base_url,
     iter_evaluation_frames,
+    main,
     summarize_results,
 )
 from examples.build_ai_evaluation.judgment import (
@@ -312,3 +313,98 @@ def test_evaluation_reader_supports_both_published_parquet_schemas(
     assert frames[0].expected_hand_count == 2
     assert frames[0].expected_active_manipulation == expected_active_manipulation
     assert frames[0].image_data_url.startswith("data:image/png;base64,")
+
+
+def test_compare_missing_file_exits_2(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing_file = "/tmp/nope_file_does_not_exist.json"
+    monkeypatch.setattr(sys, "argv", ["evaluate.py", "compare", missing_file])
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "No such file or directory" in captured.err
+    assert missing_file in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_compare_malformed_json_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bad_json = tmp_path / "bad.json"
+    bad_json.write_text("not json content")
+    monkeypatch.setattr(sys, "argv", ["evaluate.py", "compare", str(bad_json)])
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "invalid JSON in" in captured.err
+    assert str(bad_json) in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_compare_success_exits_normally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    summary_data = {
+        "label": "run1",
+        "dataset_variant": "10k",
+        "sources": {
+            "egocentric": {
+                EvaluationTask.HAND_COUNT.value: {
+                    "valid_count": 10,
+                    "predicted_value_fractions": {"0": 0.1, "2": 0.8},
+                    "reference_value_fractions": {"2": 0.9},
+                    "agreement_fraction": 0.85,
+                },
+                EvaluationTask.ACTIVE_MANIPULATION.value: {
+                    "valid_count": 10,
+                    "predicted_value_fractions": {"yes": 0.9},
+                    "reference_value_fractions": {"yes": 0.95},
+                    "agreement_fraction": 0.9,
+                },
+            }
+        },
+    }
+    summary_file = tmp_path / "summary.json"
+    summary_file.write_text(json.dumps(summary_data))
+
+    monkeypatch.setattr(sys, "argv", ["evaluate.py", "compare", str(summary_file)])
+    main()
+
+    captured = capsys.readouterr()
+    assert "| run | dataset | source |" in captured.out
+    assert "| run1 | 10k | egocentric |" in captured.out
+
+
+def test_run_missing_file_exits_2(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing_file = "/tmp/nope.txt"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate.py",
+            "run",
+            "--dataset",
+            "10k",
+            "--model",
+            "x",
+            "--base-url",
+            "http://127.0.0.1:1",
+            "--hand-count-prompt",
+            missing_file,
+            "--allow-missing-api-key",
+            "--limit",
+            "1",
+        ],
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "No such file or directory" in captured.err
+    assert missing_file in captured.err
+    assert "Traceback" not in captured.err
