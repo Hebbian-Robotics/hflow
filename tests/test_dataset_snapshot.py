@@ -310,9 +310,10 @@ def test_dataset_snapshot_rejects_manifest_episode_ids_absent_from_catalog(tmp_p
 def test_dataset_snapshot_rejects_a_manifest_with_a_null_episode_id(tmp_path: Path) -> None:
     catalog = Catalog(tmp_path / "catalog")
     manifest = tmp_path / "manifest.parquet"
-    duckdb.execute("CREATE TABLE selected_with_a_null (episode_id VARCHAR)")
-    duckdb.execute("INSERT INTO selected_with_a_null VALUES (NULL)")
-    duckdb.execute(f"COPY selected_with_a_null TO '{manifest}' (FORMAT PARQUET)")
+    connection = duckdb.connect()
+    connection.execute("CREATE TABLE selected_with_a_null (episode_id VARCHAR)")
+    connection.execute("INSERT INTO selected_with_a_null VALUES (NULL)")
+    connection.execute(f"COPY selected_with_a_null TO '{manifest}' (FORMAT PARQUET)")
 
     with pytest.raises(ValueError, match=r"manifest\.parquet contains a null episode_id"):
         hflow.export_dataset_snapshot(
