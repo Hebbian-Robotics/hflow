@@ -349,7 +349,31 @@ def _validate_video_fault_segment(
         )
 
 
+def _validate_numeric_spec_fields(
+    *,
+    float_fields: tuple[tuple[str, int | float], ...],
+    int_fields: tuple[tuple[str, int], ...],
+) -> None:
+    """Require the declared numeric field types and finite real-valued fields."""
+    for field_name, value in float_fields:
+        _require_float(value, field_name)
+    for field_name, value in int_fields:
+        _require_int(value, field_name)
+    for field_name, value in float_fields:
+        if not math.isfinite(float(value)):
+            raise ValueError(f"{field_name} must be finite, got {value!r}")
+
+
 def _validate_video_episode_spec(spec: VideoEpisodeSpec) -> None:
+    _validate_numeric_spec_fields(
+        float_fields=(
+            ("source_start_s", spec.source_start_s),
+            ("duration_s", spec.duration_s),
+            ("image_hz", spec.image_hz),
+        ),
+        int_fields=(("image_width", spec.image_width), ("image_height", spec.image_height)),
+    )
+
     if spec.source_start_s < 0.0:
         raise ValueError(f"source_start_s must be >= 0, got {spec.source_start_s}")
     if spec.duration_s <= 0.0:
@@ -380,17 +404,18 @@ def _validate_video_episode_spec(spec: VideoEpisodeSpec) -> None:
 
 
 def _validate_synthetic_episode_spec(spec: "SyntheticEpisodeSpec") -> None:
-    _require_float(spec.duration_s, "duration_s")
-    _require_float(spec.image_hz, "image_hz")
-    _require_float(spec.joint_hz, "joint_hz")
-    _require_int(spec.image_width, "image_width")
-    _require_int(spec.image_height, "image_height")
-    _require_int(spec.joint_count, "joint_count")
-
-    for field_name in ("duration_s", "image_hz", "joint_hz"):
-        value = getattr(spec, field_name)
-        if not math.isfinite(float(value)):
-            raise ValueError(f"{field_name} must be finite, got {value!r}")
+    _validate_numeric_spec_fields(
+        float_fields=(
+            ("duration_s", spec.duration_s),
+            ("image_hz", spec.image_hz),
+            ("joint_hz", spec.joint_hz),
+        ),
+        int_fields=(
+            ("image_width", spec.image_width),
+            ("image_height", spec.image_height),
+            ("joint_count", spec.joint_count),
+        ),
+    )
 
     if spec.duration_s <= 0.0:
         raise ValueError(f"duration_s must be > 0, got {spec.duration_s}")

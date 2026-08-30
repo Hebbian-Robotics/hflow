@@ -285,6 +285,95 @@ def test_video_episode_missing_source_names_the_path_with_errno(tmp_path: Path) 
 @pytest.mark.parametrize(
     ("spec_kwargs", "match"),
     [
+        pytest.param(
+            {"source_start_s": True},
+            r"source_start_s must be an int or float, got bool",
+            id="source_start_s-bool",
+        ),
+        pytest.param(
+            {"source_start_s": float("nan")},
+            r"source_start_s must be finite",
+            id="source_start_s-nan",
+        ),
+        pytest.param(
+            {"source_start_s": -1.0},
+            r"source_start_s must be >= 0",
+            id="source_start_s-negative",
+        ),
+        pytest.param(
+            {"duration_s": True},
+            r"duration_s must be an int or float, got bool",
+            id="duration_s-bool",
+        ),
+        pytest.param(
+            {"duration_s": float("nan")},
+            r"duration_s must be finite",
+            id="duration_s-nan",
+        ),
+        pytest.param({"duration_s": 0.0}, r"duration_s must be > 0", id="duration_s-zero"),
+        pytest.param(
+            {"image_hz": True},
+            r"image_hz must be an int or float, got bool",
+            id="image_hz-bool",
+        ),
+        pytest.param({"image_hz": float("inf")}, r"image_hz must be finite", id="image_hz-inf"),
+        pytest.param({"image_hz": 0.0}, r"image_hz must be > 0", id="image_hz-zero"),
+        pytest.param(
+            {"image_width": True},
+            r"image_width must be an int, got bool",
+            id="image_width-bool",
+        ),
+        pytest.param(
+            {"image_width": float("inf")},
+            r"image_width must be an int, got float",
+            id="image_width-inf",
+        ),
+        pytest.param(
+            {"image_width": 640.0},
+            r"image_width must be an int, got float",
+            id="image_width-float",
+        ),
+        pytest.param(
+            {"image_width": 0}, r"image dimensions must be positive", id="image_width-zero"
+        ),
+        pytest.param({"image_width": 639}, r"image dimensions must be even", id="image_width-odd"),
+        pytest.param(
+            {"image_height": True},
+            r"image_height must be an int, got bool",
+            id="image_height-bool",
+        ),
+        pytest.param(
+            {"image_height": float("nan")},
+            r"image_height must be an int, got float",
+            id="image_height-nan",
+        ),
+        pytest.param(
+            {"image_height": 360.0},
+            r"image_height must be an int, got float",
+            id="image_height-float",
+        ),
+        pytest.param(
+            {"image_height": 0}, r"image dimensions must be positive", id="image_height-zero"
+        ),
+        pytest.param(
+            {"image_height": 359}, r"image dimensions must be even", id="image_height-odd"
+        ),
+    ],
+)
+def test_write_video_episode_refuses_invalid_spec(
+    tmp_path: Path, spec_kwargs: dict[str, object], match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        write_video_episode(
+            tmp_path / "source-is-not-read.mp4",
+            tmp_path / "refused.mcap",
+            VideoEpisodeSpec(**spec_kwargs),  # ty: ignore
+        )
+
+
+@pytest.mark.parametrize(
+    ("spec_kwargs", "match"),
+    [
         pytest.param({"duration_s": 0.0}, r"duration_s must be > 0", id="duration_s-zero"),
         pytest.param({"duration_s": -1.0}, r"duration_s must be > 0", id="duration_s-negative"),
         pytest.param({"joint_hz": 0.0}, r"joint_hz must be > 0", id="joint_hz-zero"),
