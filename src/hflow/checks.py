@@ -532,6 +532,11 @@ def _camera_value(
                 return inter.stats.decoded_frame_count
             case "decode_deficit_pct":
                 message_count = inter.stamps_ns.size
+                if message_count == 0:
+                    raise ValueError(
+                        f"{key!r} has no message denominator: decode deficit is undefined "
+                        "for an empty camera topic"
+                    )
                 return float(
                     100.0 * (message_count - inter.stats.decoded_frame_count) / message_count
                 )

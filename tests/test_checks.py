@@ -384,6 +384,7 @@ def test_camera_frame_stats_sees_the_injected_black_segment(tmp_path: Path) -> N
     message_count = result.measurements[f"{camera_topic}/message_count"]
     decoded_frame_count = result.measurements[f"{camera_topic}/decoded_frame_count"]
     assert message_count == decoded_frame_count
+    assert result.measurements[f"{camera_topic}/decode_deficit_pct"] == pytest.approx(0.0)
     # No dropped frames were injected: the stored count matches the rate.
     assert result.measurements[f"{camera_topic}/frame_deficit_pct"] == pytest.approx(0.0)
     assert result.measurements[f"{camera_topic}/expected_frame_count"] == message_count

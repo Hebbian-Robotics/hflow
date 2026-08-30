@@ -900,12 +900,19 @@ def test_dispatcher_message_count_and_decoded_frame_count_read_distinct_sources(
 
     assert _camera_value("/cam0/message_count", by_topic) == 13
     assert _camera_value("/cam0/decoded_frame_count", by_topic) == 15
+    assert _camera_value("/cam0/decode_deficit_pct", by_topic) == pytest.approx(
+        100.0 * (13 - 15) / 13
+    )
     # A swap that returns 15 for message_count -- or 13 for decoded_frame_count
     # -- would have to break both asserts, not just one.
 
+    empty_topic = {"/cam0": replace(inter, stamps_ns=np.asarray([], dtype=np.int64))}
+    with pytest.raises(ValueError, match="decode deficit is undefined"):
+        _camera_value("/cam0/decode_deficit_pct", empty_topic)
+
 
 def test_camera_frame_stats_reports_frames_present_but_not_decoded(tmp_path: Path) -> None:
-    """B-frame reorder loss is visible separately from missing messages."""
+    """A recorder message without a coded picture creates a decode deficit."""
     encoded = subprocess.run(
         [
             str(ffmpeg_path()),
@@ -927,7 +934,7 @@ def test_camera_frame_stats_reports_frames_present_but_not_decoded(tmp_path: Pat
             "-sc_threshold",
             "0",
             "-x264-params",
-            "aud=1:repeat-headers=1",
+            "aud=1:bframes=0:repeat-headers=1",
             "-f",
             "h264",
             "pipe:1",
@@ -938,7 +945,8 @@ def test_camera_frame_stats_reports_frames_present_but_not_decoded(tmp_path: Pat
     access_units = split_annex_b_stream(encoded.stdout)
     assert len(access_units) == 90
 
-    source = tmp_path / "b-frames.mcap"
+    source = tmp_path / "missing-picture.mcap"
+    access_unit_delimiter_only = b"\x00\x00\x00\x01\x09\xf0"
     with source.open("wb") as stream:
         writer = StockWriter(stream)
         writer.start(profile="", library="test")
@@ -957,7 +965,11 @@ def test_camera_frame_stats_reports_frames_present_but_not_decoded(tmp_path: Pat
             message = CompressedVideo()
             message.timestamp.FromNanoseconds(log_time_ns)
             message.frame_id = "camera"
-            message.data = access_unit.data
+            message.data = (
+                access_unit_delimiter_only
+                if frame_index == len(access_units) - 1
+                else access_unit.data
+            )
             message.format = "h264"
             writer.add_message(
                 channel_id,
@@ -976,7 +988,7 @@ def test_camera_frame_stats_reports_frames_present_but_not_decoded(tmp_path: Pat
     assert isinstance(message_count, int)
     assert isinstance(decoded_frame_count, int)
     assert message_count == 90
-    assert decoded_frame_count < message_count
+    assert decoded_frame_count == message_count - 1
     assert result.measurements[f"{topic}/decode_deficit_pct"] == pytest.approx(
         100.0 * (message_count - decoded_frame_count) / message_count
     )
