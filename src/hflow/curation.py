@@ -429,13 +429,51 @@ def _open_connection_over_root(
     return connection
 
 
+def _reject_non_single_select(sql: str) -> None:
+    """Raise ValueError if *sql* is not exactly one SELECT statement.
+
+    ``connection.execute()`` and ``connection.sql()`` both run **every**
+    semicolon-separated statement in the input and return only the last
+    result, so a tenant-supplied string can smuggle a second statement
+    (``SELECT ...; CREATE TABLE pwned AS SELECT ...``) and it will execute
+    silently.  ``extract_statements`` parses the text **without executing
+    it** and lets us count statements and check their types before anything
+    touches the connection.  A syntactically invalid string raises
+    ``duckdb.Error`` here — treat that as "not exactly one SELECT" too.
+    """
+    parser_connection = duckdb.connect()
+    try:
+        statements = parser_connection.extract_statements(sql)
+    except duckdb.Error as exc:
+        raise ValueError("sql must be exactly one SELECT statement") from exc
+    finally:
+        parser_connection.close()
+    if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
+        raise ValueError("sql must be exactly one SELECT statement")
+
+
 def _stage_manifest_and_count(
     connection: duckdb.DuckDBPyConnection, sql: str, staged_manifest: Path
 ) -> int:
-    """COPY the query's result to the staged manifest; return its row count."""
-    connection.execute(
-        f"COPY ({sql}) TO {_quote_sql_string(str(staged_manifest))} (FORMAT PARQUET)"
-    )
+    """COPY the query's result to the staged manifest; return its row count.
+
+    ``sql`` is tenant-supplied on constrained connections.
+    ``_reject_non_single_select`` calls ``connection.extract_statements``
+    to parse the input **without executing it** and raises ``ValueError``
+    on any payload that is not exactly one SELECT statement — including
+    multi-statement injections separated by semicolons (e.g.
+    ``SELECT ...; CREATE TABLE pwned AS SELECT ...``), DDL-only input, or
+    syntactically invalid strings.  ``connection.sql()`` is **not** the
+    guard: on duckdb 1.5.5 it silently executes all statements and returns
+    ``None`` for multi-statement input.  ``write_parquet`` then materialises
+    the single confirmed-safe relation to the staged path.
+
+    The row-count query only ever receives an internally-generated path,
+    so it keeps the existing f-string form.
+    """
+    _reject_non_single_select(sql)
+    connection.sql(sql).write_parquet(str(staged_manifest))
+
     (row_count,) = connection.execute(
         f"SELECT count(*) FROM read_parquet({_quote_sql_string(str(staged_manifest))})"
     ).fetchone() or (0,)

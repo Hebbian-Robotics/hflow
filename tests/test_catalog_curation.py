@@ -813,6 +813,147 @@ def test_constrained_connection_confines_sql_to_the_catalog(tmp_path: Path) -> N
         connection.close()
 
 
+_MULTI_STATEMENT_PAYLOADS = [
+    # (id, sql_template, expected_refused)
+    # The sql_template may include {decoy} which is replaced at runtime with
+    # a path inside the constrained connection's known writable directory.
+    pytest.param(
+        "SELECT 1) TO {decoy} ...; CREATE TABLE p(x TEXT); --",
+        True,
+        id="copy-escape-old-pr-shape",
+    ),
+    pytest.param(
+        "SELECT 1; CREATE TABLE pwned AS SELECT 1 AS x",
+        True,
+        id="direct-multistatement-select-plus-create",
+    ),
+    pytest.param(
+        "CREATE TABLE t(x INT)",
+        True,
+        id="ddl-only-no-select",
+    ),
+    pytest.param(
+        "SELECT episode_id FROM episodes",
+        False,
+        id="legitimate-single-select",
+    ),
+]
+
+
+@pytest.mark.parametrize("sql_template,expected_refused", _MULTI_STATEMENT_PAYLOADS)
+def test_stage_manifest_and_count_rejects_non_single_select(
+    tmp_path: Path,
+    sql_template: str,
+    expected_refused: bool,
+) -> None:
+    """_stage_manifest_and_count must refuse anything that is not exactly one
+    SELECT statement.
+
+    ``connection.sql()`` and ``connection.execute()`` both silently execute
+    every semicolon-separated statement in their input (verified on duckdb
+    1.5.5: ``connection.sql("SELECT 1; CREATE TABLE pwned(x TEXT)")`` returns
+    None and creates the table).  The guard uses
+    ``connection.extract_statements`` to parse WITHOUT executing; it requires
+    exactly one statement whose type is SELECT.
+
+    Payloads are drawn from the PR #271 reviewer's attack-shape table
+    (kstonekuan):
+      - COPY-escape (old PR shape) — refused
+      - Direct multi-statement SELECT + CREATE — refused
+      - DDL-only, no SELECT — refused
+      - Legitimate single SELECT — allowed
+
+    For refused cases: ValueError is raised BEFORE any table is created and
+    BEFORE any file is written.  For the allowed case: the manifest is
+    produced with the correct row count.
+    """
+    from hflow.curation import _open_connection_over_root, _stage_manifest_and_count
+
+    catalog_dir = tmp_path / "catalog"
+    catalog = Catalog(catalog_dir)
+    catalog.append_episode(
+        canonical_path=_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[_check_row()],
+    )
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    staged_manifest = staging_dir / "manifest.parquet"
+    decoy_path = staging_dir / "decoy.parquet"
+
+    sql = sql_template.replace("{decoy}", str(decoy_path))
+
+    connection = _open_connection_over_root(
+        catalog_dir, constrained=True, writable_directories=(staging_dir,)
+    )
+    try:
+        if expected_refused:
+            with pytest.raises(ValueError, match="exactly one SELECT"):
+                _stage_manifest_and_count(connection, sql, staged_manifest)
+            # Guard fires before any file is written or any table is created.
+            assert not staged_manifest.is_file()
+            assert not decoy_path.exists()
+            with pytest.raises(duckdb.Error):
+                connection.execute("SELECT * FROM pwned")
+            with pytest.raises(duckdb.Error):
+                connection.execute("SELECT * FROM t")
+            with pytest.raises(duckdb.Error):
+                connection.execute("SELECT * FROM p")
+        else:
+            # Legitimate query: manifest must be written with correct row count.
+            row_count = _stage_manifest_and_count(connection, sql, staged_manifest)
+            assert row_count == 1
+            assert staged_manifest.is_file()
+    finally:
+        connection.close()
+
+
+def test_write_parquet_and_copy_format_parquet_are_byte_identical(
+    tmp_path: Path,
+) -> None:
+    """write_parquet() produces the same bytes as the old COPY ... (FORMAT PARQUET).
+
+    The fix replaced ``connection.execute(f"COPY ({sql}) TO ... (FORMAT PARQUET)")``
+    with ``connection.sql(sql).write_parquet(str(path))``.  This test asserts
+    that the two code paths produce byte-identical Parquet files for the same
+    query, so the change is provably transparent to any downstream consumer
+    of the manifest.
+
+    If this test starts failing after a DuckDB upgrade, investigate whether the
+    two code paths still produce logically equivalent output before concluding
+    the change was safe.
+    """
+    import hashlib
+
+    con = duckdb.connect()
+    try:
+        con.execute("CREATE TABLE sample (episode_id VARCHAR, score DOUBLE)")
+        con.execute("INSERT INTO sample VALUES ('ep1', 0.9), ('ep2', 0.75), ('ep3', 0.5)")
+
+        sql = "SELECT episode_id, score FROM sample ORDER BY episode_id"
+        path_copy = tmp_path / "copy_output.parquet"
+        path_write = tmp_path / "write_parquet_output.parquet"
+
+        # Old code path
+        con.execute(f"COPY ({sql}) TO '{path_copy}' (FORMAT PARQUET)")
+        # New code path
+        con.sql(sql).write_parquet(str(path_write))
+
+        digest_copy = hashlib.sha256(path_copy.read_bytes()).hexdigest()
+        digest_write = hashlib.sha256(path_write.read_bytes()).hexdigest()
+
+        assert digest_copy == digest_write, (
+            f"write_parquet and COPY FORMAT PARQUET produced different bytes.\n"
+            f"  COPY sha256:          {digest_copy}\n"
+            f"  write_parquet sha256: {digest_write}\n"
+            "If DuckDB changed its Parquet writer, verify logical equivalence "
+            "and update this test accordingly."
+        )
+    finally:
+        con.close()
+
+
 def test_constrained_curate_writes_the_manifest_but_refuses_outside_reads(
     tmp_path: Path,
 ) -> None:
