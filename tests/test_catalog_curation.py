@@ -909,6 +909,111 @@ def test_stage_manifest_and_count_rejects_non_single_select(
         connection.close()
 
 
+# -- Pin the SQL surface that _reject_non_single_select accepts (#279) --------
+#
+# DuckDB's extract_statements classifies each input and the guard requires
+# exactly one statement whose type is SELECT.  Several query forms land in
+# surprising buckets:
+#
+#   PIVOT  → DuckDB rewrites it to [CREATE, SELECT], so the *count* check
+#            catches it.  That is arguably correct rather than merely strict.
+#   DESCRIBE / SUMMARIZE → both report as SELECT, so they pass the guard.
+#            Before #271 they were syntax errors inside the COPY (...) wrapper.
+#   TABLE / VALUES → report as SELECT, so they pass.
+#
+# Whether DESCRIBE and SUMMARIZE *should* be accepted is a policy decision.
+# As of this writing (main @ 48d53cf, #271 merged) they are accepted, and
+# this table records that fact so the next reader sees a deliberate pin
+# rather than an accident.
+
+_SQL_SURFACE_CASES = [
+    # (sql, expected_refused)
+    pytest.param(
+        "SELECT 1",
+        False,
+        id="plain-select",
+    ),
+    pytest.param(
+        "WITH cte AS (SELECT 1 AS x) SELECT * FROM cte",
+        False,
+        id="with-select",
+    ),
+    pytest.param(
+        "TABLE episodes",
+        False,
+        id="table-shorthand",
+    ),
+    pytest.param(
+        "VALUES (1), (2)",
+        False,
+        id="values-expression",
+    ),
+    pytest.param(
+        "DESCRIBE SELECT 1",
+        False,
+        id="describe-select-accepted-incidentally",
+    ),
+    pytest.param(
+        "SUMMARIZE SELECT 1",
+        False,
+        id="summarize-select-accepted-incidentally",
+    ),
+    # -- Refused ---
+    pytest.param(
+        # DuckDB expands PIVOT to two statements: [CREATE, SELECT].
+        # The count check refuses it, which is correct: the CREATE is real.
+        "PIVOT episodes ON status USING count(*)",
+        True,
+        id="pivot-expands-to-create-plus-select",
+    ),
+    pytest.param(
+        "CREATE TABLE t(x INT)",
+        True,
+        id="ddl-only",
+    ),
+    pytest.param(
+        "INSERT INTO episodes VALUES (1)",
+        True,
+        id="dml-insert",
+    ),
+    pytest.param(
+        "DELETE FROM episodes",
+        True,
+        id="dml-delete",
+    ),
+    pytest.param(
+        "SELECT 1; SELECT 2",
+        True,
+        id="two-selects",
+    ),
+]
+
+
+@pytest.mark.parametrize("sql,expected_refused", _SQL_SURFACE_CASES)
+def test_reject_non_single_select_sql_surface(
+    sql: str,
+    expected_refused: bool,
+) -> None:
+    """Pin which SQL forms the one-SELECT guard accepts and refuses.
+
+    See issue #279 for the full rationale.  The guard is
+    ``_reject_non_single_select`` in ``src/hflow/curation.py``.  It uses
+    DuckDB's ``extract_statements`` to parse without executing, requires
+    exactly one statement, and requires its type to be SELECT.
+
+    This test calls the guard directly on strings — no catalog, no
+    connection, no files — because ``extract_statements`` is a pure parse
+    over the input text.
+    """
+    from hflow.curation import _reject_non_single_select
+
+    if expected_refused:
+        with pytest.raises(ValueError, match="exactly one SELECT"):
+            _reject_non_single_select(sql)
+    else:
+        _reject_non_single_select(sql)  # must not raise
+
+
 def test_write_parquet_and_copy_format_parquet_are_byte_identical(
     tmp_path: Path,
 ) -> None:

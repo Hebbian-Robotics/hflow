@@ -186,6 +186,15 @@ posture a service uses for tenant-supplied SQL
 ([docs/HOSTING.md](./HOSTING.md#trust-model)). The default stays
 unrestricted for your own exploration.
 
+Curation SQL must be exactly one `SELECT` statement. `curate()` parses the
+input with DuckDB's `extract_statements` before executing anything, and
+refuses multi-statement strings, DDL, DML, and queries that DuckDB expands
+internally (notably `PIVOT`, which DuckDB rewrites to a `CREATE` followed by
+a `SELECT`). `WITH ... SELECT`, `TABLE`, and `VALUES` all classify as a
+single `SELECT` and are accepted. `DESCRIBE SELECT ...` and
+`SUMMARIZE SELECT ...` also pass the guard because DuckDB reports them as
+`SELECT`; they work today but are not a promised surface.
+
 ### The view surface
 
 `hflow.open_catalog_connection(catalog_root)` returns a DuckDB connection with
