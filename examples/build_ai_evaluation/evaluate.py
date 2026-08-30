@@ -932,7 +932,12 @@ def _argument_parser() -> argparse.ArgumentParser:
     )
 
     compare_parser = subparsers.add_parser("compare", help="compare completed run summaries")
-    compare_parser.add_argument("summaries", nargs="+", type=Path)
+    compare_parser.add_argument(
+        "summaries",
+        nargs="+",
+        type=Path,
+        help="paths to evaluation run summary JSON files to compare",
+    )
     return parser
 
 
