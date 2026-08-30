@@ -18,7 +18,8 @@ def _single_slice_idr(rbsp: bytes) -> bytes:
 
 
 def test_sampled_frame_mapping_rejects_empty_source_stream() -> None:
-    with pytest.raises(ValueError, match="cannot map sampled frames onto an empty source stream"):
+    message = "cannot map sampled frames onto an empty source stream"
+    with pytest.raises(ValueError, match=message):
         source_log_times_for_sampled_frames(
             [], source_fps=30.0, sample_fps=10.0, start_s=0.0, frame_count=1
         )
@@ -33,8 +34,9 @@ def test_ensure_aud_rejects_slice_header_without_complete_first_mb_value() -> No
     # first_mb_in_slice is unsigned Exp-Golomb. An all-zero RBSP has no
     # terminating one bit, so the decoder must reject it as incomplete.
     malformed_slice = _single_slice_idr(b"\x00")
+    message = "slice header has no complete first_mb_in_slice value"
 
-    with pytest.raises(ValueError, match="slice header has no complete first_mb_in_slice value"):
+    with pytest.raises(ValueError, match=message):
         ensure_access_unit_delimiter(malformed_slice)
 
 
@@ -43,6 +45,7 @@ def test_ensure_aud_rejects_truncated_first_mb_value() -> None:
     # one bit, but only two suffix bits remain in the byte. This deliberately
     # reaches the truncation guard rather than the no-complete-value guard.
     malformed_slice = _single_slice_idr(b"\x04")
+    message = "slice header truncates its first_mb_in_slice value"
 
-    with pytest.raises(ValueError, match="slice header truncates its first_mb_in_slice value"):
+    with pytest.raises(ValueError, match=message):
         ensure_access_unit_delimiter(malformed_slice)
