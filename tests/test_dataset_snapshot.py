@@ -307,6 +307,23 @@ def test_dataset_snapshot_rejects_manifest_episode_ids_absent_from_catalog(tmp_p
     assert not (tmp_path / "dataset-snapshot").exists()
 
 
+def test_dataset_snapshot_rejects_a_manifest_with_a_null_episode_id(tmp_path: Path) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    manifest = tmp_path / "manifest.parquet"
+    duckdb.execute("CREATE TABLE selected_with_a_null (episode_id VARCHAR)")
+    duckdb.execute("INSERT INTO selected_with_a_null VALUES (NULL)")
+    duckdb.execute(f"COPY selected_with_a_null TO '{manifest}' (FORMAT PARQUET)")
+
+    with pytest.raises(ValueError, match=r"manifest\.parquet contains a null episode_id"):
+        hflow.export_dataset_snapshot(
+            catalog.location,
+            tmp_path / "dataset-snapshot",
+            manifest=manifest,
+        )
+
+    assert not (tmp_path / "dataset-snapshot").exists()
+
+
 def test_dataset_snapshot_overwrite_refuses_unmarked_directory_without_removing_it(
     tmp_path: Path,
 ) -> None:
@@ -324,6 +341,59 @@ def test_dataset_snapshot_overwrite_refuses_unmarked_directory_without_removing_
         )
 
     assert sentinel_file.read_text() == "unrelated user data"
+
+
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_dataset_snapshot_refuses_a_symlinked_destination(tmp_path: Path, overwrite: bool) -> None:
+    """A symlinked destination is refused before overwrite is consulted.
+
+    ``Path.is_dir()`` follows symlinks, so every check after this one sees an
+    ordinary directory. Were the refusal to move below the overwrite branch,
+    an overwriting export would rename the link aside and put a real
+    directory in its place instead of exporting into what it pointed at.
+    """
+    catalog = Catalog(tmp_path / "catalog")
+    linked_directory = tmp_path / "linked-directory"
+    linked_directory.mkdir()
+    sentinel_file = linked_directory / "keep-me.txt"
+    sentinel_file.write_text("unrelated user data")
+    output_directory = tmp_path / "dataset-snapshot-link"
+    output_directory.symlink_to(linked_directory)
+
+    with pytest.raises(ValueError, match="dataset-snapshot-link must not be a symlink"):
+        hflow.export_dataset_snapshot(
+            catalog.location,
+            output_directory,
+            overwrite=overwrite,
+        )
+
+    assert output_directory.is_symlink()
+    assert sentinel_file.read_text() == "unrelated user data"
+
+
+def test_dataset_snapshot_overwrite_refuses_a_symlinked_format_marker(tmp_path: Path) -> None:
+    """The marker has to be a regular file, not a link to a valid one elsewhere.
+
+    ``Path.is_file()`` follows symlinks, so without the symlink half of that
+    check a planted link would vouch for a directory that is not a snapshot,
+    and the export would replace it.
+    """
+    catalog = Catalog(tmp_path / "catalog")
+    output_directory = tmp_path / "dataset-snapshot"
+    hflow.export_dataset_snapshot(catalog.location, output_directory)
+    format_marker = output_directory / "format.json"
+    relocated_marker = tmp_path / "relocated-format.json"
+    format_marker.replace(relocated_marker)
+    format_marker.symlink_to(relocated_marker)
+
+    with pytest.raises(ValueError, match=r"regular format\.json"):
+        hflow.export_dataset_snapshot(
+            catalog.location,
+            output_directory,
+            overwrite=True,
+        )
+
+    assert format_marker.is_symlink()
 
 
 def test_dataset_snapshot_excludes_check_runs_without_a_committed_episode(tmp_path: Path) -> None:
