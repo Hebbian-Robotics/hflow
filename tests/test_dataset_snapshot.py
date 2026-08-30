@@ -557,3 +557,51 @@ def test_snapshot_samples_report_unverified_for_a_crashed_critical_check(
         [str(output_directory / "samples.parquet")],
     ).fetchone()
     assert sample_row == (append_result.episode_id, "unverified")
+
+
+def test_parse_dataset_snapshot_destination_refuses_symlink_before_overwrite_check(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "real-target"
+    target.mkdir()
+    link = tmp_path / "link-to-target"
+    link.symlink_to(target)
+
+    with pytest.raises(ValueError, match=r"must not be a symlink"):
+        snapshot_module._parse_dataset_snapshot_destination(link, overwrite=False)
+
+    with pytest.raises(ValueError, match=r"must not be a symlink"):
+        snapshot_module._parse_dataset_snapshot_destination(link, overwrite=True)
+
+
+def test_dataset_snapshot_rejects_manifest_with_null_episode_id(tmp_path: Path) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    manifest = tmp_path / "manifest.parquet"
+    duckdb.execute("DROP TABLE IF EXISTS selected")
+    duckdb.execute("CREATE TABLE selected (episode_id VARCHAR)")
+    duckdb.execute("INSERT INTO selected VALUES (NULL)")
+    duckdb.execute(f"COPY selected TO '{manifest}' (FORMAT PARQUET)")
+
+    with pytest.raises(ValueError, match=r"null episode_id"):
+        hflow.export_dataset_snapshot(
+            catalog.location,
+            tmp_path / "dataset-snapshot",
+            manifest=manifest,
+        )
+
+
+def test_parse_dataset_snapshot_destination_refuses_symlinked_format_marker(
+    tmp_path: Path,
+) -> None:
+    output_directory = tmp_path / "existing-snapshot"
+    output_directory.mkdir()
+    format_marker_target = tmp_path / "format.json"
+    format_marker_target.write_text("{}")
+    format_marker_path = output_directory / snapshot_module._FORMAT_MARKER_FILE_NAME
+    format_marker_path.symlink_to(format_marker_target)
+
+    with pytest.raises(
+        ValueError,
+        match=r"does not contain a regular format\.json",
+    ):
+        snapshot_module._parse_dataset_snapshot_destination(output_directory, overwrite=True)
