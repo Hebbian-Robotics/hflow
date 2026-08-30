@@ -1482,9 +1482,9 @@ def _argument_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = _argument_parser()
     arguments = parser.parse_args()
-    match arguments.command:
-        case "labels":
-            try:
+    try:
+        match arguments.command:
+            case "labels":
                 labels_by_source = _labels_by_source_from_arguments(arguments)
                 _print_reference_summary(labels_by_source)
                 write_label_report(
@@ -1499,17 +1499,14 @@ def main() -> None:
                     output_path=arguments.output,
                 )
                 print(f"\nlabels: {arguments.output}")
-            except (FileNotFoundError, RuntimeError, ValueError) as error:
-                parser.error(str(error))
-        case "run":
-            try:
+            case "run":
                 run_evaluation(_run_configuration_from_arguments(arguments))
-            except (FileNotFoundError, RuntimeError, ValueError) as error:
-                parser.error(str(error))
-        case "compare":
-            compare_summaries(arguments.summaries)
-        case unknown_command:
-            raise AssertionError(f"unhandled command: {unknown_command}")
+            case "compare":
+                compare_summaries(arguments.summaries)
+            case unknown_command:
+                raise AssertionError(f"unhandled command: {unknown_command}")
+    except (FileNotFoundError, RuntimeError, ValueError) as error:
+        parser.error(str(error))
 
 
 if __name__ == "__main__":

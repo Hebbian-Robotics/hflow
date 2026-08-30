@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import sys
 from pathlib import Path
@@ -13,6 +14,7 @@ from examples.egosuite_evaluation.evaluate import (
     ProjectedHandFrameLabel,
     _evaluation_result_summary,
     _selected_frame_indices,
+    main,
     parse_hand_count_response,
     select_episode_paths,
     select_stratified_labels,
@@ -199,3 +201,74 @@ def test_natural_sampling_selects_reproducible_episodes_and_frames() -> None:
     assert selected_frame_indices == sorted(selected_frame_indices)
     assert len(selected_frame_indices) == 4
     assert all(frame_index % 30 == 0 for frame_index in selected_frame_indices)
+
+
+def test_compare_refuses_a_missing_summary_without_a_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    missing_summary_path = tmp_path / "missing-summary.json"
+    monkeypatch.setattr(sys, "argv", ["evaluate.py", "compare", str(missing_summary_path)])
+
+    with pytest.raises(SystemExit) as exit_info:
+        main()
+
+    streams = capsys.readouterr()
+    assert exit_info.value.code == 2
+    assert str(missing_summary_path) in streams.err
+    assert "Traceback" not in streams.err
+
+
+def test_compare_refuses_malformed_json_without_a_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    malformed_summary_path = tmp_path / "malformed-summary.json"
+    malformed_summary_path.write_text("not json")
+    monkeypatch.setattr(sys, "argv", ["evaluate.py", "compare", str(malformed_summary_path)])
+
+    with pytest.raises(SystemExit) as exit_info:
+        main()
+
+    streams = capsys.readouterr()
+    assert exit_info.value.code == 2
+    assert "Expecting value" in streams.err
+    assert "Traceback" not in streams.err
+
+
+def test_compare_preserves_successful_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "label": "candidate",
+                "model": "vision-model",
+                "camera_view": "head-left",
+                "overall": {
+                    "predicted_value_counts": {"0": 1, "1": 2, "2": 3},
+                    "attempted_count": 6,
+                    "agreement_count": 4,
+                    "valid_count": 5,
+                    "agreement_fraction": 0.8,
+                    "attempted_agreement_fraction": 2 / 3,
+                    "macro_attempted_agreement_fraction": 0.5,
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(sys, "argv", ["evaluate.py", "compare", str(summary_path)])
+
+    main()
+
+    assert capsys.readouterr().out.splitlines() == [
+        "| run | model | camera | valid / attempted | valid accuracy | end-to-end accuracy "
+        "| macro end-to-end accuracy | predicted 0 | predicted 1 | predicted 2 |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| candidate | vision-model | head-left | 5 / 6 | 80.00% | 66.67% | 50.00% | 1 | 2 | 3 |",
+    ]
