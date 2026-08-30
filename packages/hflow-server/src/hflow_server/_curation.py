@@ -29,7 +29,12 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
-from hflow.curation import CurationReport, curate
+from hflow.curation import (
+    CurationReport,
+    NonSingleSelectQueryError,
+    curate,
+    reject_non_single_select,
+)
 from hflow.dataset import ManifestAlreadyExistsError, write_dataset_manifest
 from hflow.workspace import Workspace
 from hflow_server import _catalog, _connections, _media, _sidecar
@@ -154,24 +159,21 @@ def _bad_sql_refusal(error: duckdb.Error) -> HTTPException:
 def _reject_non_single_select(user_sql: str) -> None:
     """Refuse anything that is not exactly one SELECT statement.
 
-    ``execute()`` with no bind parameters runs EVERY statement in the string
-    and returns only the LAST result, so a smuggled second statement
-    (``SELECT ...); CREATE TABLE ...; SELECT ... FROM (SELECT ...``) would run
-    silently -- preview 500s on the resulting shape and report answers over
-    the wrong statement. ``extract_statements`` parses the text WITHOUT
-    executing it; require exactly one statement whose type is SELECT.
+    ``hflow.reject_non_single_select`` owns the rule (exactly one statement
+    whose type is SELECT, judged by parsing with ``extract_statements``
+    WITHOUT executing anything); this route only maps its two failure modes
+    onto the two client-facing 400s: DuckDB's own diagnostic for SQL the
+    parser rejects, the fixed sentence for SQL that is well-formed but not a
+    single SELECT.
     """
-    parser_connection = duckdb.connect()
     try:
-        statements = parser_connection.extract_statements(user_sql)
+        reject_non_single_select(user_sql)
     except duckdb.Error as error:
         raise _bad_sql_refusal(error) from error
-    finally:
-        parser_connection.close()
-    if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
+    except NonSingleSelectQueryError:
         raise HTTPException(
             status_code=400, detail="sql must be exactly one read-only SELECT statement"
-        )
+        ) from None
 
 
 def _browsable_relations(

@@ -18,7 +18,13 @@ from hflow.catalog import (
 )
 from hflow.checks import camera_frame_stats
 from hflow.cli import main as cli_main
-from hflow.curation import CurationReport, curate, open_catalog_connection
+from hflow.curation import (
+    CurationReport,
+    NonSingleSelectQueryError,
+    curate,
+    open_catalog_connection,
+    reject_non_single_select,
+)
 from hflow.format import CATALOG_FORMAT_VERSION
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import EpisodeStamps
@@ -907,6 +913,36 @@ def test_stage_manifest_and_count_rejects_non_single_select(
             assert staged_manifest.is_file()
     finally:
         connection.close()
+
+
+def test_reject_non_single_select_refuses_a_single_non_select_statement() -> None:
+    # A lone well-formed CREATE TABLE parses cleanly but is not a SELECT:
+    # a rule rejection, never a parser error.
+    with pytest.raises(NonSingleSelectQueryError, match="exactly one SELECT"):
+        reject_non_single_select("CREATE TABLE t(x INT)")
+
+
+def test_reject_non_single_select_refuses_multiple_statements() -> None:
+    with pytest.raises(NonSingleSelectQueryError, match="exactly one SELECT"):
+        reject_non_single_select("SELECT 1 AS one; CREATE TABLE pwned AS SELECT 1")
+    with pytest.raises(NonSingleSelectQueryError, match="exactly one SELECT"):
+        reject_non_single_select("SELECT 1 AS one; DROP TABLE episodes_raw")
+
+
+def test_reject_non_single_select_accepts_a_single_select() -> None:
+    reject_non_single_select("SELECT 1 AS one")
+    reject_non_single_select("SELECT episode_id FROM episodes")
+
+
+def test_reject_non_single_select_distinguishes_parse_failure_from_rule_rejection() -> None:
+    # Syntactically invalid SQL surfaces DuckDB's own parser error (which a
+    # service renders as the diagnostic message); a well-formed non-SELECT is
+    # the rule's ValueError instead. The server's 400 detail depends on the
+    # two staying apart.
+    with pytest.raises(duckdb.Error, match="Parser Error"):
+        reject_non_single_select("SELEC 1")
+    with pytest.raises(NonSingleSelectQueryError):
+        reject_non_single_select("CREATE TABLE t(x INT)")
 
 
 def test_write_parquet_and_copy_format_parquet_are_byte_identical(
