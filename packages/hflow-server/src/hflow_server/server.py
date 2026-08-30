@@ -12,8 +12,10 @@ identity.
 """
 
 import importlib.resources
+import ipaddress
 import os
 import socket
+import sys
 import threading
 import webbrowser
 from pathlib import Path
@@ -439,6 +441,16 @@ class ServerStartupError(RuntimeError):
     """
 
 
+def _is_loopback_host(host: str) -> bool:
+    """Return whether a host is a loopback IP literal or the localhost name."""
+    if host.casefold() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def serve(settings: ServerSettings) -> None:
     """Run the workspace server: free port, printed URL, browser, uvicorn."""
     application = create_app(settings)
@@ -453,6 +465,14 @@ def serve(settings: ServerSettings) -> None:
     url_host = "127.0.0.1" if settings.host == "0.0.0.0" else settings.host
     workspace_url = f"http://{url_host}:{chosen_port}/"
     print(f"hflow serve: serving {settings.data_root} at {workspace_url}", flush=True)
+    if not _is_loopback_host(settings.host):
+        print(
+            f"hflow serve: warning: binding to {settings.host} exposes this unauthenticated "
+            "workspace to reachable networks; use a loopback host and SSH port forwarding "
+            "for remote access",
+            file=sys.stderr,
+            flush=True,
+        )
     if settings.open_browser:
         # uvicorn.run blocks this thread; a short timer opens the browser
         # once the server has had time to bind.
