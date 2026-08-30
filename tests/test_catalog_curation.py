@@ -843,12 +843,12 @@ _MULTI_STATEMENT_PAYLOADS = [
         id="pivot",  # DuckDB secretly expands this to CREATE then SELECT
     ),
     pytest.param(
-        "DESCRIBE SELECT * FROM episodes",
+        "DESCRIBE SELECT episode_id FROM episodes",
         False,
         id="describe",
     ),
     pytest.param(
-        "SUMMARIZE SELECT ...",
+        "SUMMARIZE SELECT episode_id FROM episodes",
         False,
         id="summarize",
     ),
