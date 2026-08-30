@@ -44,7 +44,7 @@ append at all:
 | `measurements` | measurement key | `key`, typed value columns (`value_double`, `value_text`, `value_bool`), the producing `check_name`/`check_version` |
 | `tags` | tag | `check_name`, `tag` |
 | `intervals` | labeled time span | `label`, `start_ns`, `end_ns` |
-| `ingest_failures` | attempt that produced NO episode row | `source_uri`, `stage`, `failure_kind` (`source-missing` / `source-unreadable` / `infrastructure`), `error_type`, `message`, `pipeline_version`, `orchestrator_run_id`, `recorded_at` |
+| `ingest_failures` | attempt that produced NO episode row | `source_uri`, `stage`, `failure_kind` (`source-missing` / `source-unreadable` / `source-unsupported` / `infrastructure`), `error_type`, `message`, `pipeline_version`, `orchestrator_run_id`, `recorded_at` |
 
 `ingest_failures` is the complement of `episodes`, and exists because
 `episode_id` is a hash of canonical bytes: a recording that never
@@ -291,7 +291,9 @@ decision:
   an unfilled hole excludes the whole corpus. `skipped` is different and stays
   excluded: a step skipped because a critical check quarantined the episode has
   real work to do the moment that check is retuned. So does `error`: a crash is
-  infrastructure, so it is a retry.
+  infrastructure, so it is a retry -- unlike an ingest-time content refusal
+  (`ingest_failures.failure_kind = source-unsupported`), which never reaches
+  a check run at all and is not retried.
 
 An episode inherits a term of its own from that last case. A crash is a retry
 for the *check*, but the episode it was supposed to check is left in a third
