@@ -132,11 +132,37 @@ file records the projected joint count for each hand, the resulting hand count,
 the exact source frame index, and any pose-quality reasons. Run `labels` first
 on a new corpus to inspect class balance before interpreting model accuracy.
 
-For a class-balanced comparison, add `--samples-per-hand-count N`. The command
-deterministically selects up to `N` frames from each projected class across all
-input episodes. `--sample-seed` defaults to 42, and both values are recorded in
-the label report or run contract. `--frame-stride` is applied first, so use
-`--frame-stride 1` when every source frame should be eligible for sampling.
+For a naturally distributed random sample, select episodes and then select
+temporally separated frames within each episode:
+
+```bash
+uv run --project examples/egosuite_evaluation \
+    python examples/egosuite_evaluation/evaluate.py labels \
+    data/egosuite-evaluation/datasets/EgoDemo \
+    --episode-count 100 \
+    --frame-stride 30 \
+    --samples-per-episode 10 \
+    --sample-seed 42 \
+    --output data/egosuite-evaluation/labels/natural-1000.json
+```
+
+`--episode-count` samples from the MCAPs available under the supplied inputs;
+it does not download missing episodes. Sampling the same number of frames from
+each selected episode prevents long recordings from dominating. The frame
+stride is applied before random selection, so the command above samples at
+most ten one-per-second candidates from each of 100 episodes.
+
+The natural sample is the appropriate primary result when measuring expected
+performance on the source distribution. The summary also reports per-class
+agreement and macro agreement so a frequent class cannot hide failures on a
+rare class.
+
+For a class-balanced diagnostic, add `--samples-per-hand-count N`. The command
+deterministically selects up to `N` frames from each projected class after the
+episode and frame selection. `--sample-seed` defaults to 42, and every
+selection value is recorded in the label report or run contract. Use
+`--frame-stride 1` when every source frame should be eligible for the
+diagnostic slice.
 
 Pass a directory to recursively include every MCAP under it:
 
@@ -173,23 +199,26 @@ uv run --project examples/egosuite_evaluation \
     --output data/egosuite-evaluation/runs/gemma-thimble-removal
 ```
 
-After inspecting the full label distribution, run a declared stratified sample
+After inspecting the full label distribution, run a declared natural sample
 over a directory or several MCAP paths:
 
 ```bash
 uv run --project examples/egosuite_evaluation \
     python examples/egosuite_evaluation/evaluate.py run \
     data/egosuite-evaluation/datasets/EgoDemo/EgoStand/mcap \
-    --frame-stride 1 \
-    --samples-per-hand-count 100 \
+    --episode-count 100 \
+    --frame-stride 30 \
+    --samples-per-episode 10 \
     --sample-seed 42 \
     --api-key-env OPENROUTER_API_KEY \
-    --output data/egosuite-evaluation/runs/gemma-stratified-300
+    --output data/egosuite-evaluation/runs/gemma-natural-1000
 ```
 
-This requests at most 300 images. If a class has fewer than 100 eligible
+This requests at most 1,000 images. If an episode has fewer than ten eligible
 frames, all of its frames are retained and the printed target counts expose the
-shortfall.
+shortfall. Add `--samples-per-hand-count` to create a separate rare-case
+diagnostic run; do not describe its constructed class proportions as the
+dataset's natural distribution.
 
 For an unauthenticated self-hosted endpoint, add
 `--allow-missing-api-key`. The model, endpoint, prompt, response format,
@@ -225,8 +254,9 @@ uv run --project examples/egosuite_evaluation \
     data/egosuite-evaluation/runs/qwen-thimble-removal/summary.json
 ```
 
-Agreement must be interpreted with the reference distribution and confusion
-matrix. If nearly every selected frame contains two projected hands, a model
-that always answers `2` can have high accuracy without solving the minority
-cases. Expand the episode set or use `--samples-per-hand-count` before making a
-comparative capability claim.
+Agreement must be interpreted with the reference distribution, per-class
+agreement, macro agreement, and confusion matrix. If nearly every selected
+frame contains two projected hands, a model that always answers `2` can have
+high natural-sample accuracy without solving the minority cases. Report that
+distributional result as-is, then use a separately identified
+`--samples-per-hand-count` slice to compare rare-case behavior.

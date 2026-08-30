@@ -120,8 +120,8 @@ First calculate labels without calling a model:
 ```bash
 uv run --project examples/egosuite_evaluation \
     python examples/egosuite_evaluation/evaluate.py labels \
-    data/egosuite-evaluation/datasets/EgoDemo/EgoStand/mcap \
-    --frame-stride 30
+    data/egosuite-evaluation/datasets/EgoDemo \
+    --episode-count 100 --frame-stride 30 --samples-per-episode 10
 ```
 
 Then run the same selected frames through a VLM:
@@ -129,8 +129,8 @@ Then run the same selected frames through a VLM:
 ```bash
 uv run --project examples/egosuite_evaluation \
     python examples/egosuite_evaluation/evaluate.py run \
-    data/egosuite-evaluation/datasets/EgoDemo/EgoStand/mcap \
-    --frame-stride 30 --limit-per-episode 10 \
+    data/egosuite-evaluation/datasets/EgoDemo \
+    --episode-count 100 --frame-stride 30 --samples-per-episode 10 \
     --api-key-env OPENROUTER_API_KEY
 ```
 
@@ -138,7 +138,10 @@ For every selected frame, the example inverts the labeled camera pose,
 projects both sets of 21 world-space hand joints through the camera intrinsic
 matrix, and counts a hand when at least one joint lands inside the image. The
 VLM receives only the extracted JPEG. Inspect AI writes its structured logs
-and an agreement/confusion summary under `data/egosuite-evaluation/runs/`.
+and dataset-weighted, per-class, macro-agreement, and confusion summaries under
+`data/egosuite-evaluation/runs/`. A separately declared
+`--samples-per-hand-count` slice can diagnose rare classes without presenting
+constructed class proportions as the dataset's natural distribution.
 
 Guide, download command, label contract, and interpretation:
 [Evaluate VLM hand counts against EgoSuite joint labels](../docs/how-to/run-egosuite-hand-evaluation.md)

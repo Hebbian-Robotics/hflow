@@ -131,6 +131,8 @@ class EvaluationConfiguration:
     camera_view: CameraView
     frame_stride: int
     limit_per_episode: int | None
+    episode_count: int | None
+    samples_per_episode: int | None
     samples_per_hand_count: int | None
     sample_seed: int
     output_directory: Path
@@ -193,15 +195,57 @@ def _source_episode_name(source_path: Path) -> str:
     return source_path.stem
 
 
-def _selected_frame_index(
-    source_frame_index: int,
+def select_episode_paths(
+    source_paths: Sequence[Path],
+    *,
+    episode_count: int | None,
+    sample_seed: int,
+) -> tuple[Path, ...]:
+    """Select a reproducible uniform sample of episodes."""
+
+    if episode_count is None:
+        return tuple(source_paths)
+    if episode_count <= 0:
+        raise ValueError("episode count must be positive")
+    if sample_seed < 0:
+        raise ValueError("sample seed must be nonnegative")
+    ranked_source_paths = sorted(
+        source_paths,
+        key=lambda source_path: _sha256_text(f"{sample_seed}\0{_source_episode_name(source_path)}"),
+    )
+    selected_source_paths = set(ranked_source_paths[:episode_count])
+    return tuple(
+        source_path for source_path in source_paths if source_path in selected_source_paths
+    )
+
+
+def _selected_frame_indices(
+    source_path: Path,
+    source_frame_count: int,
+    *,
     frame_stride: int,
     limit_per_episode: int | None,
-) -> bool:
-    if source_frame_index % frame_stride != 0:
-        return False
-    selected_ordinal = source_frame_index // frame_stride
-    return limit_per_episode is None or selected_ordinal < limit_per_episode
+    samples_per_episode: int | None,
+    sample_seed: int,
+) -> list[int]:
+    if limit_per_episode is not None and samples_per_episode is not None:
+        raise ValueError("limit per episode and samples per episode are mutually exclusive")
+    eligible_frame_indices = list(range(0, source_frame_count, frame_stride))
+    if limit_per_episode is not None:
+        return eligible_frame_indices[:limit_per_episode]
+    if samples_per_episode is None:
+        return eligible_frame_indices
+    if samples_per_episode <= 0:
+        raise ValueError("samples per episode must be positive")
+    if sample_seed < 0:
+        raise ValueError("sample seed must be nonnegative")
+    ranked_frame_indices = sorted(
+        eligible_frame_indices,
+        key=lambda frame_index: _sha256_text(
+            f"{sample_seed}\0{_source_episode_name(source_path)}\0{frame_index}"
+        ),
+    )
+    return sorted(ranked_frame_indices[:samples_per_episode])
 
 
 def _message_header_count(decoded_message: Any) -> int | None:
@@ -381,6 +425,8 @@ def load_projected_hand_labels(
     camera_view: CameraView,
     frame_stride: int,
     limit_per_episode: int | None,
+    samples_per_episode: int | None = None,
+    sample_seed: int = 42,
 ) -> list[ProjectedHandFrameLabel]:
     """Read synchronized EgoSuite labels without decoding the video payloads."""
 
@@ -402,11 +448,14 @@ def load_projected_hand_labels(
         camera_view,
         _topic_message_counts(source_path),
     )
-    selected_frame_indices = [
-        frame_index
-        for frame_index in range(source_frame_count)
-        if _selected_frame_index(frame_index, frame_stride, limit_per_episode)
-    ]
+    selected_frame_indices = _selected_frame_indices(
+        source_path,
+        source_frame_count,
+        frame_stride=frame_stride,
+        limit_per_episode=limit_per_episode,
+        samples_per_episode=samples_per_episode,
+        sample_seed=sample_seed,
+    )
     partial_geometry_by_frame = {
         frame_index: _PartialFrameGeometry() for frame_index in selected_frame_indices
     }
@@ -838,6 +887,8 @@ def write_label_report(
     camera_view: CameraView,
     frame_stride: int,
     limit_per_episode: int | None,
+    episode_count: int | None,
+    samples_per_episode: int | None,
     samples_per_hand_count: int | None,
     sample_seed: int,
     output_path: Path,
@@ -849,6 +900,8 @@ def write_label_report(
         "camera_view": camera_view.value,
         "frame_stride": frame_stride,
         "limit_per_episode": limit_per_episode,
+        "episode_count": episode_count,
+        "samples_per_episode": samples_per_episode,
         "samples_per_hand_count": samples_per_hand_count,
         "sample_seed": sample_seed,
         "projection_rule": "hand is in frame when at least one labeled joint has positive depth and projects inside the image bounds",
@@ -871,6 +924,8 @@ def _run_metadata(configuration: EvaluationConfiguration) -> dict[str, object]:
         "camera_view": configuration.camera_view.value,
         "frame_stride": configuration.frame_stride,
         "limit_per_episode": configuration.limit_per_episode,
+        "episode_count": configuration.episode_count,
+        "samples_per_episode": configuration.samples_per_episode,
         "samples_per_hand_count": configuration.samples_per_hand_count,
         "sample_seed": configuration.sample_seed,
         "projection_contract": {
@@ -1003,6 +1058,29 @@ def _evaluation_result_summary(results: Sequence[dict[str, object]]) -> dict[str
     agreement_count = sum(
         result["expected_value"] == result["predicted_value"] for result in valid_results
     )
+    per_class_agreement: dict[str, dict[str, int | float | None]] = {}
+    valid_class_agreement_fractions: list[float] = []
+    attempted_class_agreement_fractions: list[float] = []
+    for expected_value, attempted_count in sorted(expected_counts.items()):
+        valid_count = sum(
+            confusion_counts.get((expected_value, predicted_value), 0)
+            for predicted_value in (0, 1, 2)
+        )
+        class_agreement_count = confusion_counts.get((expected_value, expected_value), 0)
+        valid_class_agreement_fraction = (
+            class_agreement_count / valid_count if valid_count else None
+        )
+        attempted_class_agreement_fraction = class_agreement_count / attempted_count
+        per_class_agreement[str(expected_value)] = {
+            "attempted_count": attempted_count,
+            "valid_count": valid_count,
+            "agreement_count": class_agreement_count,
+            "agreement_fraction": valid_class_agreement_fraction,
+            "attempted_agreement_fraction": attempted_class_agreement_fraction,
+        }
+        if valid_class_agreement_fraction is not None:
+            valid_class_agreement_fractions.append(valid_class_agreement_fraction)
+        attempted_class_agreement_fractions.append(attempted_class_agreement_fraction)
     latency_values = [
         float(latency)
         for result in results
@@ -1029,6 +1107,17 @@ def _evaluation_result_summary(results: Sequence[dict[str, object]]) -> dict[str
         "agreement_count": agreement_count,
         "agreement_fraction": agreement_count / len(valid_results) if valid_results else None,
         "attempted_agreement_fraction": agreement_count / len(results) if results else None,
+        "macro_agreement_fraction": (
+            sum(valid_class_agreement_fractions) / len(valid_class_agreement_fractions)
+            if valid_class_agreement_fractions
+            else None
+        ),
+        "macro_attempted_agreement_fraction": (
+            sum(attempted_class_agreement_fractions) / len(attempted_class_agreement_fractions)
+            if attempted_class_agreement_fractions
+            else None
+        ),
+        "per_class_agreement": per_class_agreement,
         "confusion_matrix": {
             str(expected): {
                 str(predicted): confusion_counts.get((expected, predicted), 0)
@@ -1056,6 +1145,8 @@ def summarize_evaluation_results(
         "model": run_metadata["model"],
         "camera_view": run_metadata["camera_view"],
         "frame_stride": run_metadata["frame_stride"],
+        "episode_count": run_metadata.get("episode_count"),
+        "samples_per_episode": run_metadata.get("samples_per_episode"),
         "samples_per_hand_count": run_metadata["samples_per_hand_count"],
         "sample_seed": run_metadata["sample_seed"],
         "overall": _evaluation_result_summary(deduplicated_results),
@@ -1083,16 +1174,17 @@ def _print_evaluation_summary(summary: Mapping[str, object]) -> None:
     print(f"\nEgoSuite projected-hand evaluation: {summary['label']}")
     print(
         "| valid / attempted | target 0 | target 1 | target 2 | predicted 0 | predicted 1 | "
-        "predicted 2 | valid accuracy | end-to-end accuracy |"
+        "predicted 2 | valid accuracy | end-to-end accuracy | macro end-to-end accuracy |"
     )
-    print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     print(
         f"| {overall['valid_count']} / {overall['attempted_count']} "
         f"| {expected_counts.get(0, 0)} | {expected_counts.get(1, 0)} "
         f"| {expected_counts.get(2, 0)} | {predicted_counts.get(0, 0)} "
         f"| {predicted_counts.get(1, 0)} | {predicted_counts.get(2, 0)} "
         f"| {_format_percentage(overall['agreement_fraction'])} "
-        f"| {_format_percentage(overall['attempted_agreement_fraction'])} |"
+        f"| {_format_percentage(overall['attempted_agreement_fraction'])} "
+        f"| {_format_percentage(overall['macro_attempted_agreement_fraction'])} |"
     )
 
 
@@ -1110,6 +1202,8 @@ def run_evaluation(configuration: EvaluationConfiguration) -> dict[str, object]:
             camera_view=configuration.camera_view,
             frame_stride=configuration.frame_stride,
             limit_per_episode=configuration.limit_per_episode,
+            samples_per_episode=configuration.samples_per_episode,
+            sample_seed=configuration.sample_seed,
         )
         for source_path in configuration.source_paths
     }
@@ -1141,6 +1235,8 @@ def run_evaluation(configuration: EvaluationConfiguration) -> dict[str, object]:
             "requested_model": configuration.model,
             "camera_view": configuration.camera_view.value,
             "frame_stride": configuration.frame_stride,
+            "episode_count": configuration.episode_count,
+            "samples_per_episode": configuration.samples_per_episode,
             "samples_per_hand_count": configuration.samples_per_hand_count,
             "sample_seed": configuration.sample_seed,
             "prompt_sha256": _sha256_text(configuration.prompt),
@@ -1194,9 +1290,9 @@ def run_evaluation(configuration: EvaluationConfiguration) -> dict[str, object]:
 def compare_summaries(summary_paths: Sequence[Path]) -> None:
     print(
         "| run | model | camera | valid / attempted | valid accuracy | end-to-end accuracy "
-        "| predicted 0 | predicted 1 | predicted 2 |"
+        "| macro end-to-end accuracy | predicted 0 | predicted 1 | predicted 2 |"
     )
-    print("|---|---|---|---:|---:|---:|---:|---:|---:|")
+    print("|---|---|---|---:|---:|---:|---:|---:|---:|---:|")
     for summary_path in summary_paths:
         summary = json.loads(summary_path.read_text())
         overall = summary["overall"]
@@ -1209,6 +1305,7 @@ def compare_summaries(summary_paths: Sequence[Path]) -> None:
             f"| {overall['valid_count']} / {overall['attempted_count']} "
             f"| {_format_percentage(overall['agreement_fraction'])} "
             f"| {_format_percentage(attempted_agreement_fraction)} "
+            f"| {_format_percentage(overall.get('macro_attempted_agreement_fraction'))} "
             f"| {predicted_counts.get('0', 0)} | {predicted_counts.get('1', 0)} "
             f"| {predicted_counts.get('2', 0)} |"
         )
@@ -1236,7 +1333,11 @@ def _default_output_directory(model: str, camera_view: CameraView) -> Path:
 def _labels_by_source_from_arguments(
     arguments: argparse.Namespace,
 ) -> dict[Path, list[ProjectedHandFrameLabel]]:
-    source_paths = _resolved_mcap_paths(arguments.inputs)
+    source_paths = select_episode_paths(
+        _resolved_mcap_paths(arguments.inputs),
+        episode_count=arguments.episode_count,
+        sample_seed=arguments.sample_seed,
+    )
     camera_view = CameraView(arguments.camera)
     candidate_labels_by_source = {
         source_path: load_projected_hand_labels(
@@ -1244,6 +1345,8 @@ def _labels_by_source_from_arguments(
             camera_view=camera_view,
             frame_stride=arguments.frame_stride,
             limit_per_episode=arguments.limit_per_episode,
+            samples_per_episode=arguments.samples_per_episode,
+            sample_seed=arguments.sample_seed,
         )
         for source_path in source_paths
     }
@@ -1261,11 +1364,18 @@ def _run_configuration_from_arguments(arguments: argparse.Namespace) -> Evaluati
         raise ValueError("--base-url or OPENAI_BASE_URL is required")
     camera_view = CameraView(arguments.camera)
     output_directory = arguments.output or _default_output_directory(arguments.model, camera_view)
+    source_paths = select_episode_paths(
+        _resolved_mcap_paths(arguments.inputs),
+        episode_count=arguments.episode_count,
+        sample_seed=arguments.sample_seed,
+    )
     return EvaluationConfiguration(
-        source_paths=_resolved_mcap_paths(arguments.inputs),
+        source_paths=source_paths,
         camera_view=camera_view,
         frame_stride=arguments.frame_stride,
         limit_per_episode=arguments.limit_per_episode,
+        episode_count=arguments.episode_count,
+        samples_per_episode=arguments.samples_per_episode,
         samples_per_hand_count=arguments.samples_per_hand_count,
         sample_seed=arguments.sample_seed,
         output_directory=output_directory,
@@ -1298,11 +1408,24 @@ def _add_input_and_projection_arguments(parser: argparse.ArgumentParser) -> None
         default=30,
         help="evaluate every Nth source frame; default 30 (about 1 fps)",
     )
-    parser.add_argument(
+    per_episode_selection = parser.add_mutually_exclusive_group()
+    per_episode_selection.add_argument(
         "--limit-per-episode",
         type=_positive_integer,
         default=None,
         help="stop after this many selected frames in each episode",
+    )
+    parser.add_argument(
+        "--episode-count",
+        type=_positive_integer,
+        default=None,
+        help="select up to N input episodes deterministically",
+    )
+    per_episode_selection.add_argument(
+        "--samples-per-episode",
+        type=_positive_integer,
+        default=None,
+        help="randomly select up to N eligible frames in each episode deterministically",
     )
     parser.add_argument(
         "--samples-per-hand-count",
@@ -1314,7 +1437,7 @@ def _add_input_and_projection_arguments(parser: argparse.ArgumentParser) -> None
         "--sample-seed",
         type=_nonnegative_integer,
         default=42,
-        help="seed for deterministic class-stratified selection; default 42",
+        help="seed for deterministic episode, frame, and class selection; default 42",
     )
 
 
@@ -1369,6 +1492,8 @@ def main() -> None:
                     camera_view=CameraView(arguments.camera),
                     frame_stride=arguments.frame_stride,
                     limit_per_episode=arguments.limit_per_episode,
+                    episode_count=arguments.episode_count,
+                    samples_per_episode=arguments.samples_per_episode,
                     samples_per_hand_count=arguments.samples_per_hand_count,
                     sample_seed=arguments.sample_seed,
                     output_path=arguments.output,

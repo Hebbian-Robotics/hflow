@@ -12,7 +12,9 @@ from examples.egosuite_evaluation.evaluate import (
     CameraView,
     ProjectedHandFrameLabel,
     _evaluation_result_summary,
+    _selected_frame_indices,
     parse_hand_count_response,
+    select_episode_paths,
     select_stratified_labels,
 )
 from examples.egosuite_evaluation.geometry import (
@@ -103,6 +105,31 @@ def test_evaluation_summary_reports_accuracy_and_confusion_without_counting_fail
     assert summary["invalid_count"] == 1
     assert summary["agreement_fraction"] == 0.5
     assert summary["attempted_agreement_fraction"] == pytest.approx(1 / 3)
+    assert summary["macro_agreement_fraction"] == 0.5
+    assert summary["macro_attempted_agreement_fraction"] == pytest.approx(1 / 3)
+    assert summary["per_class_agreement"] == {
+        "0": {
+            "attempted_count": 1,
+            "valid_count": 0,
+            "agreement_count": 0,
+            "agreement_fraction": None,
+            "attempted_agreement_fraction": 0.0,
+        },
+        "1": {
+            "attempted_count": 1,
+            "valid_count": 1,
+            "agreement_count": 0,
+            "agreement_fraction": 0.0,
+            "attempted_agreement_fraction": 0.0,
+        },
+        "2": {
+            "attempted_count": 1,
+            "valid_count": 1,
+            "agreement_count": 1,
+            "agreement_fraction": 1.0,
+            "attempted_agreement_fraction": 1.0,
+        },
+    }
     assert summary["confusion_matrix"] == {
         "0": {"0": 0, "1": 0, "2": 0},
         "1": {"0": 0, "1": 0, "2": 1},
@@ -142,3 +169,33 @@ def test_stratified_selection_caps_each_class_and_is_reproducible() -> None:
     assert [label.expected_hand_count for label in selected_labels].count(1) == 2
     assert [label.expected_hand_count for label in selected_labels].count(2) == 2
     assert first_selection == repeated_selection
+
+
+def test_natural_sampling_selects_reproducible_episodes_and_frames() -> None:
+    source_paths = tuple(Path(f"episode-{episode_index}.mcap") for episode_index in range(5))
+
+    first_episode_selection = select_episode_paths(
+        source_paths,
+        episode_count=3,
+        sample_seed=7,
+    )
+    repeated_episode_selection = select_episode_paths(
+        source_paths,
+        episode_count=3,
+        sample_seed=7,
+    )
+    selected_frame_indices = _selected_frame_indices(
+        first_episode_selection[0],
+        300,
+        frame_stride=30,
+        limit_per_episode=None,
+        samples_per_episode=4,
+        sample_seed=7,
+    )
+
+    assert first_episode_selection == repeated_episode_selection
+    assert len(first_episode_selection) == 3
+    assert set(first_episode_selection).issubset(source_paths)
+    assert selected_frame_indices == sorted(selected_frame_indices)
+    assert len(selected_frame_indices) == 4
+    assert all(frame_index % 30 == 0 for frame_index in selected_frame_indices)
