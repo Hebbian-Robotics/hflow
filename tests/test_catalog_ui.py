@@ -109,6 +109,84 @@ def test_catalog_ui_refuses_an_invalid_port(tmp_path: Path, port: int) -> None:
         catalog_ui.CatalogUiSettings(catalog_root=tmp_path / "catalog", port=port)
 
 
+@pytest.mark.parametrize(
+    ("port", "type_name"),
+    [(True, "bool"), (4213.0, "float"), ("4213", "str")],
+)
+def test_catalog_ui_refuses_a_port_of_the_wrong_type(
+    tmp_path: Path, port: object, type_name: str
+) -> None:
+    from dataclasses import replace
+
+    settings = catalog_ui.CatalogUiSettings(catalog_root=tmp_path / "catalog")
+    with pytest.raises(ValueError, match=f"port must be an int, got {type_name}"):
+        replace(settings, port=port)
+
+
+@pytest.mark.parametrize("port", [1, 65535])
+def test_catalog_ui_accepts_port_boundaries(tmp_path: Path, port: int) -> None:
+    settings = catalog_ui.CatalogUiSettings(catalog_root=tmp_path / "catalog", port=port)
+
+    assert settings.port == port
+
+
+def test_catalog_ui_accepts_an_int_enum_port(tmp_path: Path) -> None:
+    from enum import IntEnum
+
+    class Port(IntEnum):
+        CATALOG_UI = 4213
+
+    settings = catalog_ui.CatalogUiSettings(catalog_root=tmp_path / "catalog", port=Port.CATALOG_UI)
+
+    assert settings.port == Port.CATALOG_UI
+
+
+@pytest.mark.parametrize(
+    ("poll_interval", "type_name"),
+    [(True, "bool"), ("0.5", "str"), (None, "NoneType")],
+)
+def test_catalog_ui_refuses_a_poll_interval_of_the_wrong_type(
+    tmp_path: Path, poll_interval: object, type_name: str
+) -> None:
+    from dataclasses import replace
+
+    settings = catalog_ui.CatalogUiSettings(catalog_root=tmp_path / "catalog")
+    with pytest.raises(
+        ValueError,
+        match=f"catalog_poll_interval_seconds must be an int or float, got {type_name}",
+    ):
+        replace(settings, catalog_poll_interval_seconds=poll_interval)
+
+
+@pytest.mark.parametrize(
+    "poll_interval",
+    [0, -0.5, float("nan"), float("inf"), float("-inf")],
+)
+def test_catalog_ui_refuses_a_nonpositive_or_nonfinite_poll_interval(
+    tmp_path: Path, poll_interval: float
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="catalog_poll_interval_seconds must be positive and finite",
+    ):
+        catalog_ui.CatalogUiSettings(
+            catalog_root=tmp_path / "catalog",
+            catalog_poll_interval_seconds=poll_interval,
+        )
+
+
+@pytest.mark.parametrize("poll_interval", [1, 0.001])
+def test_catalog_ui_accepts_a_positive_finite_poll_interval(
+    tmp_path: Path, poll_interval: float
+) -> None:
+    settings = catalog_ui.CatalogUiSettings(
+        catalog_root=tmp_path / "catalog",
+        catalog_poll_interval_seconds=poll_interval,
+    )
+
+    assert settings.catalog_poll_interval_seconds == poll_interval
+
+
 def test_catalog_ui_refuses_a_port_owned_by_another_process() -> None:
     with socket(AF_INET, SOCK_STREAM) as occupied_port_socket:
         occupied_port_socket.bind(("127.0.0.1", 0))
