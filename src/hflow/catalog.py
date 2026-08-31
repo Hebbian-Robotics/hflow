@@ -111,6 +111,11 @@ _reconciled_append_stems: set[tuple[str, str]] = set()
 
 _FORMAT_MARKER_NAME = "format_version"
 
+# DuckDB BIGINT columns store signed 64-bit integers. Validate timestamp
+# evidence before any catalog files are committed so callers get contextual
+# errors instead of a late database conversion failure.
+_MAX_CATALOG_TIMESTAMP_NS = 2**63 - 1
+
 # The quarantine state rendered as a queryable column by the curation
 # views (curation.py builds both episodes views with it). Declared here
 # because measurement keys are validated against the episodes view's full
@@ -437,6 +442,11 @@ def _normalized_intervals(check_name: str, intervals: list[Interval]) -> list[In
                     f"check {check_name!r} set interval {bound_name} as "
                     f"{type(value).__name__}: interval bounds are int nanoseconds"
                 )
+            if value > _MAX_CATALOG_TIMESTAMP_NS:
+                raise ValueError(
+                    f"check {check_name!r} interval {interval.label!r} set "
+                    f"{bound_name}={value}: interval bounds must fit a DuckDB BIGINT"
+                )
             bounds[bound_name] = value
         start_ns = bounds["start_ns"]
         end_ns = bounds["end_ns"]
@@ -498,6 +508,11 @@ def _normalized_observations(check_name: str, observations: list[Observation]) -
             raise ValueError(
                 f"check {check_name!r} observation {observation_id!r} set timestamp_ns "
                 f"as {type(timestamp_ns).__name__}: observation timestamps are int nanoseconds"
+            )
+        if timestamp_ns > _MAX_CATALOG_TIMESTAMP_NS:
+            raise ValueError(
+                f"check {check_name!r} observation {observation_id!r} set "
+                f"timestamp_ns={timestamp_ns}: timestamps must fit a DuckDB BIGINT"
             )
         if timestamp_ns < 0:
             raise ValueError(
