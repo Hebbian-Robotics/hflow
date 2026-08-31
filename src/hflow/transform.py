@@ -116,9 +116,10 @@ class SourceNotConforming(ValueError):
 
     Raised where the transform has looked at what a channel actually carries
     and found it outside what v1 supports or bridges -- an unsupported image
-    format, a passthrough video channel violating the canonical convention, an
-    unsupported raw image schema, a derived-topic collision. A subclass of
-    ``ValueError`` so existing callers matching on that type keep working.
+    format, a compressed-image channel mixing formats, a passthrough video
+    channel violating the canonical convention, an unsupported raw image
+    schema, a derived-topic collision. A subclass of ``ValueError`` so existing
+    callers matching on that type keep working.
 
     This is the ONLY path into
     :attr:`~hflow.ingest_ledger.IngestFailureKind.SOURCE_UNSUPPORTED`:
@@ -526,7 +527,7 @@ def _decode_compressed_images(
         header = getattr(decoded, "header", None)
         frame_ids.append(str(header.frame_id) if header is not None else "")
     if len(formats) != 1:
-        raise ValueError(f"camera topic {topic!r} mixes image formats {sorted(formats)}")
+        raise SourceNotConforming(f"camera topic {topic!r} mixes image formats {sorted(formats)}")
     return images, frame_ids, _input_codec_for_image_format(formats.pop(), topic)
 
 
