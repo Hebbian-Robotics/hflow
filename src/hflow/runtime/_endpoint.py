@@ -122,7 +122,7 @@ def describe_remote_status(endpoint: RemoteRuntimeEndpoint, *, run_limit: int = 
         lines.append("runs:     none recorded")
     else:
         for run in reversed(recent_runs):  # print oldest-to-newest of the window
-            run_id = run.get("dag_run_id", "<unknown>")
-            run_state = run.get("state", "<unknown>")
+            run_id = run.dag_run_id or "<unknown>"
+            run_state = run.state or "<unknown>"
             lines.append(f"run:      {run_id} [{run_state}]")
     return "\n".join(lines)

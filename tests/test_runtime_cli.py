@@ -14,7 +14,7 @@ import pytest
 import hflow
 from hflow.app import parse_pipeline_spec, resolve_pipeline_spec_for_rendering
 from hflow.cli import main
-from hflow.runtime import AirflowHealth, RuntimeConfig, render_bundle
+from hflow.runtime import AirflowDagRun, AirflowHealth, RuntimeConfig, render_bundle
 from hflow.runtime._client import AirflowClient, AirflowClientError, PasswordCredentials
 
 HEALTHY = AirflowHealth(
@@ -986,7 +986,16 @@ def test_status_remote_reports_health_and_runs_without_a_bundle(
     monkeypatch.setattr(
         AirflowClient,
         "dag_runs",
-        lambda self, dag_id, **_kwargs: [{"dag_run_id": "manual__1", "state": "success"}],
+        lambda self, dag_id, **_kwargs: [
+            AirflowDagRun(
+                dag_run_id="manual__1",
+                state="success",
+                logical_date=None,
+                start_date=None,
+                end_date=None,
+                conf={},
+            )
+        ],
     )
     monkeypatch.setenv("HFLOW_AIRFLOW_URL", "https://workspace.example.com")
     monkeypatch.setenv("HFLOW_AIRFLOW_DAG_ID", "kitchen_ingest")
