@@ -55,6 +55,18 @@ next to the verbatim `error_type` and `message` rather than in place of them;
 anything unrecognized is `infrastructure`, never an accusation against the
 recording.
 
+`source-unsupported` was added after `ingest_failures` already existed in
+deployed catalogs. Rows written before an ingest binary carrying this change
+keep whatever kind that binary assigned at write time -- a content refusal
+recorded as `infrastructure` by an older binary is not retroactively
+reclassified, because the ledger is append-only and nothing rewrites past
+rows. An operator draining an old ledger by kind should expect
+`infrastructure` rows from before the cutover to include content refusals
+alongside genuine infrastructure trouble; `error_type` and `message` remain
+the ground truth for any row, which is exactly why they are kept verbatim
+next to the heuristic. Only rows written by an ingest binary that already
+raises `SourceNotConforming` (see below) can carry `source-unsupported`.
+
 Three durability rules govern writes:
 
 - **Content-addressed**: `episode_id` is a sha256 of the canonical file's

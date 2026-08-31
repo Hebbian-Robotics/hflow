@@ -119,6 +119,14 @@ class SourceNotConforming(ValueError):
     format, a passthrough video channel violating the canonical convention, an
     unsupported raw image schema, a derived-topic collision. A subclass of
     ``ValueError`` so existing callers matching on that type keep working.
+
+    This is the ONLY path into
+    :attr:`~hflow.ingest_ledger.IngestFailureKind.SOURCE_UNSUPPORTED`:
+    ``classify_ingest_failure`` tests ``isinstance(error, SourceNotConforming)``
+    and nothing else routes there, so a bug that raises a bare ``ValueError``
+    for a new refusal falls back to ``infrastructure`` (the safe default)
+    rather than silently landing here. Any new content refusal must raise
+    this type explicitly to be classified correctly.
     """
 
 
