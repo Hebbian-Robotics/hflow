@@ -1,5 +1,7 @@
 """The local DuckDB catalog browser lifecycle."""
 
+from dataclasses import replace
+from enum import IntEnum
 from pathlib import Path
 from socket import AF_INET, SOCK_STREAM, socket
 from threading import Event, Thread
@@ -116,8 +118,6 @@ def test_catalog_ui_refuses_an_invalid_port(tmp_path: Path, port: int) -> None:
 def test_catalog_ui_refuses_a_port_of_the_wrong_type(
     tmp_path: Path, port: object, type_name: str
 ) -> None:
-    from dataclasses import replace
-
     settings = catalog_ui.CatalogUiSettings(catalog_root=tmp_path / "catalog")
     with pytest.raises(ValueError, match=f"port must be an int, got {type_name}"):
         replace(settings, port=port)
@@ -131,8 +131,6 @@ def test_catalog_ui_accepts_port_boundaries(tmp_path: Path, port: int) -> None:
 
 
 def test_catalog_ui_accepts_an_int_enum_port(tmp_path: Path) -> None:
-    from enum import IntEnum
-
     class Port(IntEnum):
         CATALOG_UI = 4213
 
@@ -148,8 +146,6 @@ def test_catalog_ui_accepts_an_int_enum_port(tmp_path: Path) -> None:
 def test_catalog_ui_refuses_a_poll_interval_of_the_wrong_type(
     tmp_path: Path, poll_interval: object, type_name: str
 ) -> None:
-    from dataclasses import replace
-
     settings = catalog_ui.CatalogUiSettings(catalog_root=tmp_path / "catalog")
     with pytest.raises(
         ValueError,
