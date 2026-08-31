@@ -64,6 +64,7 @@ from hflow_server._pipeline import PipelineLoaded, PipelineState, registered_ste
 from hflow_server._runtime import (
     ResolvedRuntime,
     RuntimeResolver,
+    RuntimeSource,
     airflow_failure_refusal,
     optional_string,
     resolved_runtime_or_refuse,
@@ -449,11 +450,13 @@ def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver
     router = APIRouter(prefix="/api/v1")
 
     def stage_task_instances(
-        client: AirflowClient, dag_id: str, dag_run_id: str
+        client: AirflowClient, dag_id: str, dag_run_id: str, *, source: RuntimeSource
     ) -> list[dict[str, Any]]:
         try:
             return client.task_instances(dag_id, dag_run_id)
-        except AirflowClientError:
+        except AirflowClientError as error:
+            if error.status != 404:
+                raise airflow_failure_refusal(error, source=source) from error
             # A stage sub-DAG that vanished (or a run Airflow expired) leaves
             # that lane without task detail; the master's own state -- the
             # page's point -- is already in hand, so this is a thinner
@@ -523,7 +526,9 @@ def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver
                 stage_runs = runtime.client.dag_runs(
                     stage_dag_id, limit=_STAGE_RUN_SEARCH_LIMIT, order_by="-id"
                 )
-            except AirflowClientError:
+            except AirflowClientError as error:
+                if error.status != 404:
+                    raise airflow_failure_refusal(error, source=runtime.source) from error
                 # An unregistered stage sub-DAG (a partial profile, or a
                 # bundle mid-render) is a stage that never ran here.
                 stage_runs = []
@@ -534,7 +539,9 @@ def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver
             stage_run_id = optional_string(matched.run.get("dag_run_id"))
             stage_tasks = (
                 _sorted_task_instances(
-                    stage_task_instances(runtime.client, stage_dag_id, stage_run_id),
+                    stage_task_instances(
+                        runtime.client, stage_dag_id, stage_run_id, source=runtime.source
+                    ),
                     stage_topology.dag,
                 )
                 if stage_run_id is not None

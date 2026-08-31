@@ -433,6 +433,72 @@ def test_run_graph_tolerates_unregistered_stage_sub_dags(
     assert all(stage["dag_run_id"] is None for stage in payload["stages"])
 
 
+def test_run_graph_maps_stage_dag_listing_failures_to_502(
+    bundle_api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stubbed_airflow(
+        monkeypatch,
+        master_run={
+            "dag_run_id": MASTER_RUN_ID,
+            "state": "success",
+            "start_date": MASTER_STARTED_AT,
+        },
+        stage_runs={},
+        task_instances={(MASTER_DAG_ID, MASTER_RUN_ID): []},
+    )
+
+    def failing_stage_runs(
+        self: AirflowClient, dag_id: str, *, limit: int = 100, order_by: str | None = None
+    ) -> list[dict[str, Any]]:
+        if dag_id != MASTER_DAG_ID:
+            raise AirflowClientError(
+                "GET /dagRuns failed with HTTP 503: scheduler down", status=503
+            )
+        return []
+
+    monkeypatch.setattr(AirflowClient, "dag_runs", failing_stage_runs)
+    response = bundle_api.get(f"/api/v1/runtime/runs/{MASTER_RUN_ID}/graph")
+    assert response.status_code == 502
+    assert "scheduler down" in response.json()["detail"]
+
+
+def test_run_graph_maps_stage_task_listing_failures_to_502(
+    bundle_api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stubbed_airflow(
+        monkeypatch,
+        master_run={
+            "dag_run_id": MASTER_RUN_ID,
+            "state": "success",
+            "start_date": MASTER_STARTED_AT,
+        },
+        stage_runs={
+            "demo_pipeline_sync": [
+                {
+                    "dag_run_id": "sync__run",
+                    "state": "success",
+                    "start_date": "2026-08-21T10:00:05+00:00",
+                }
+            ]
+        },
+        task_instances={(MASTER_DAG_ID, MASTER_RUN_ID): []},
+    )
+
+    def failing_task_instances(
+        self: AirflowClient, dag_id: str, dag_run_id: str
+    ) -> list[dict[str, Any]]:
+        if dag_id != MASTER_DAG_ID:
+            raise AirflowClientError(
+                "GET /taskInstances failed with HTTP 401: unauthorized", status=401
+            )
+        return []
+
+    monkeypatch.setattr(AirflowClient, "task_instances", failing_task_instances)
+    response = bundle_api.get(f"/api/v1/runtime/runs/{MASTER_RUN_ID}/graph")
+    assert response.status_code == 502
+    assert "unauthorized" in response.json()["detail"]
+
+
 def test_run_graph_unknown_run_is_a_404(
     bundle_api: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

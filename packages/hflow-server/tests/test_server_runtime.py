@@ -275,6 +275,22 @@ def test_runs_tolerates_an_unregistered_stage_dag(
     assert all(stage["recent"] == [] for stage in payload["stages"])
 
 
+def test_runs_maps_stage_dag_listing_failures_to_502(
+    bundle_api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def failing_dag_runs(
+        self: AirflowClient, dag_id: str, *, limit: int = 100, order_by: str | None = None
+    ) -> list[dict[str, Any]]:
+        if dag_id == "demo_pipeline_ingest":
+            return []
+        raise AirflowClientError("GET /dagRuns failed with HTTP 429: rate limited", status=429)
+
+    monkeypatch.setattr(AirflowClient, "dag_runs", failing_dag_runs)
+    response = bundle_api.get("/api/v1/runtime/runs")
+    assert response.status_code == 502
+    assert "rate limited" in response.json()["detail"]
+
+
 def test_runs_without_a_runtime_is_a_clear_409(
     runtime_free_cwd: Path, tmp_path: Path, unbuilt_assets_dir: Path
 ) -> None:
