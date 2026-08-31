@@ -3,6 +3,7 @@
 import json
 import socket
 import threading
+import urllib.parse
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, ClassVar
@@ -32,6 +33,10 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
     health_response_body: ClassVar[bytes | None] = None
     dag_run_response_body: ClassVar[dict[str, Any] | bytes | None] = None
     task_instances_response_body: ClassVar[dict[str, Any] | bytes | None] = None
+    mapped_instance_count: ClassVar[int] = 0
+    task_instance_pages_served: ClassVar[list[tuple[int, int]]] = []
+    fail_task_instances_at_offset: ClassVar[int | None] = None
+    task_instance_page_overlap: ClassVar[int] = 0
 
     def _read_json(self) -> dict[str, Any] | None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -87,9 +92,28 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
             return
         self._respond(404, {"detail": self.path})
 
+    def _task_instance_page(self, request_query: str) -> dict[str, Any] | None:
+        """One page of the run's task instances, sliced the way Airflow's is."""
+        query = urllib.parse.parse_qs(request_query)
+        limit = int(query.get("limit", ["50"])[0])
+        offset = int(query.get("offset", ["0"])[0])
+        type(self).task_instance_pages_served.append((limit, offset))
+        if offset == type(self).fail_task_instances_at_offset:
+            return None
+        every_instance = [{"task_id": "plan", "map_index": -1}] + [
+            {"task_id": "process_batch", "map_index": index}
+            for index in range(type(self).mapped_instance_count)
+        ]
+        start = max(0, offset - type(self).task_instance_page_overlap)
+        return {
+            "task_instances": every_instance[start : start + limit],
+            "total_entries": len(every_instance),
+        }
+
     def do_GET(self) -> None:
         authorization = self._record(None)
-        if self.path.endswith("/taskInstances"):
+        request_path, _, request_query = self.path.partition("?")
+        if request_path.endswith("/taskInstances"):
             if not self._bearer_ok(authorization):
                 self._respond(401, {"detail": "expired"})
                 return
@@ -100,7 +124,11 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
                     return
                 self._respond(200, body)
                 return
-            self._respond(200, {"task_instances": [{"task_id": "plan", "map_index": -1}]})
+            page = self._task_instance_page(request_query)
+            if page is None:
+                self._respond(500, {"detail": "scheduler unavailable"})
+                return
+            self._respond(200, page)
             return
         if "/dagRuns/" in self.path:
             if not self._bearer_ok(authorization):
@@ -177,6 +205,10 @@ def _reset_stub_airflow_state() -> None:
     _StubAirflowHandler.health_response_body = None
     _StubAirflowHandler.dag_run_response_body = None
     _StubAirflowHandler.task_instances_response_body = None
+    _StubAirflowHandler.mapped_instance_count = 0
+    _StubAirflowHandler.task_instance_pages_served = []
+    _StubAirflowHandler.fail_task_instances_at_offset = None
+    _StubAirflowHandler.task_instance_page_overlap = 0
 
 
 @pytest.fixture(scope="module")
@@ -344,7 +376,7 @@ def test_per_run_endpoints_address_the_same_run(stub_server: str) -> None:
         for method, path, _payload, _authorization in _StubAirflowHandler.requests_seen
         if method == "GET" and "/dagRuns/" in path
     ]
-    assert per_run_paths == [
+    assert [path.partition("?")[0] for path in per_run_paths] == [
         f"/api/v2/dags/pipeline_ingest/dagRuns/{encoded_run}",
         f"/api/v2/dags/pipeline_ingest/dagRuns/{encoded_run}/taskInstances",
     ]
@@ -745,3 +777,104 @@ def test_wait_until_healthy_times_out_with_last_status(stub_server: str) -> None
         monkeypatch.setattr("hflow.runtime._client.time", instantly_advancing_clock)
         client.wait_until_healthy(timeout_s=0.3, poll_interval_s=10.0)
     assert instantly_advancing_clock.current_time_s == pytest.approx(0.3)
+
+
+def test_task_instances_returns_every_page_of_a_wide_fan_out(stub_server: str) -> None:
+    # 250 mapped batches plus plan: more than one page at any page size the
+    # client picks, so a single request could only ever return a prefix.
+    _StubAirflowHandler.mapped_instance_count = 250
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    instances = client.task_instances("pipeline_ingest", "manual__1")
+
+    assert len(instances) == 251
+    mapped = [entry.map_index for entry in instances if entry.task_id == "process_batch"]
+    assert sorted(mapped) == list(range(250))
+    assert len(mapped) == len(set(mapped))
+
+
+def test_task_instances_asks_for_each_page_in_turn(stub_server: str) -> None:
+    _StubAirflowHandler.mapped_instance_count = 250
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    client.task_instances("pipeline_ingest", "manual__1")
+
+    limits = {limit for limit, _offset in _StubAirflowHandler.task_instance_pages_served}
+    offsets = [offset for _limit, offset in _StubAirflowHandler.task_instance_pages_served]
+    # More than one request, or the fan-out was never paged at all.
+    assert len(offsets) > 1
+    assert len(limits) == 1
+    page_size = limits.pop()
+    assert offsets == [page_size * page for page in range(len(offsets))]
+    assert offsets[-1] < 251
+
+
+def test_task_instances_stops_once_the_run_is_exhausted(stub_server: str) -> None:
+    # One short page is the whole run: no second request for an empty tail.
+    _StubAirflowHandler.mapped_instance_count = 3
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    instances = client.task_instances("pipeline_ingest", "manual__1")
+
+    assert len(instances) == 4
+    assert len(_StubAirflowHandler.task_instance_pages_served) == 1
+
+
+def test_task_instances_raises_when_a_later_page_fails(stub_server: str) -> None:
+    # A failure past the first page must not return the pages already read as
+    # though they were the whole run.
+    _StubAirflowHandler.mapped_instance_count = 250
+    client = AirflowClient(stub_server, "airflow", "right-password")
+    page_size = _page_size_the_client_asks_for(client)
+    _StubAirflowHandler.fail_task_instances_at_offset = page_size
+
+    with pytest.raises(AirflowClientError) as error_info:
+        client.task_instances("pipeline_ingest", "manual__1")
+    assert error_info.value.status == 500
+
+
+def test_task_instances_keeps_paging_when_pages_overlap(stub_server: str) -> None:
+    # A server that re-sends rows it already sent pushes the offset past
+    # total_entries while unique instances are still outstanding. Counting the
+    # offset instead of what was kept drops the tail of the run.
+    _StubAirflowHandler.mapped_instance_count = 250
+    _StubAirflowHandler.task_instance_page_overlap = 60
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    instances = client.task_instances("pipeline_ingest", "manual__1")
+
+    mapped = {entry.map_index for entry in instances if entry.task_id == "process_batch"}
+    assert mapped == set(range(250))
+    assert len(instances) == 251
+
+
+def test_task_instances_raises_when_a_page_carries_no_list(stub_server: str) -> None:
+    # A response without the field is malformed, not the end of the run.
+    _StubAirflowHandler.task_instances_response_body = {"total_entries": 4}
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    with pytest.raises(AirflowClientError):
+        client.task_instances("pipeline_ingest", "manual__1")
+
+
+def _page_size_the_client_asks_for(client: AirflowClient) -> int:
+    """Whatever page size the client picks, read off a throwaway request."""
+    _StubAirflowHandler.mapped_instance_count = 0
+    client.task_instances("pipeline_ingest", "probe")
+    page_size = _StubAirflowHandler.task_instance_pages_served[0][0]
+    _StubAirflowHandler.task_instance_pages_served = []
+    _StubAirflowHandler.mapped_instance_count = 250
+    return page_size
+
+
+def test_dag_runs_is_still_capped_by_its_caller(stub_server: str) -> None:
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    client.dag_runs("pipeline_ingest", limit=7)
+
+    run_list_paths = [
+        path
+        for method, path, _payload, _authorization in _StubAirflowHandler.requests_seen
+        if method == "GET" and path.endswith("dagRuns?limit=7")
+    ]
+    assert len(run_list_paths) == 1

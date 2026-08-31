@@ -5,6 +5,7 @@ Every Airflow call is stubbed at the AirflowClient method level (the idiom of
 is a really rendered one so the dag ids are the real derived ones.
 """
 
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -665,3 +666,77 @@ def test_run_graph_over_a_remote_runtime_derives_the_stage_dag_ids(
         "kitchen_labels",
         "kitchen_media",
     ]
+
+
+def test_run_graph_totals_a_fan_out_wider_than_one_airflow_page(
+    bundle_api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point of paging the client: the graph counts every batch.
+
+    ``task_instances`` is left real here and the HTTP layer under it is
+    stubbed instead, so this fails if the client ever stops paging.
+    """
+    fan_out = 250
+    # Raw JSON, not AirflowTaskInstance: the stub sits under the client, so it
+    # returns what Airflow returns and lets the client do its own parsing.
+    every_instance: list[dict[str, Any]] = [
+        {"task_id": "plan", "state": "success", "map_index": -1, "try_number": 1}
+    ] + [
+        {
+            "task_id": "process_batch",
+            "state": "success" if index % 2 else "failed",
+            "map_index": index,
+            "try_number": 1,
+        }
+        for index in range(fan_out)
+    ]
+    monkeypatch.setattr(
+        AirflowClient,
+        "dag_run",
+        lambda self, dag_id, dag_run_id: _dag_run(
+            {
+                "dag_run_id": MASTER_RUN_ID,
+                "state": "running",
+                "start_date": MASTER_STARTED_AT,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        AirflowClient,
+        "dag_runs",
+        lambda self, dag_id, *, limit=100, order_by=None: (
+            [
+                _dag_run(
+                    {
+                        "dag_run_id": "sync__new",
+                        "state": "running",
+                        "start_date": "2026-08-21T10:00:05+00:00",
+                    }
+                )
+            ]
+            if dag_id == "demo_pipeline_sync"
+            else []
+        ),
+    )
+
+    def _paged(self: AirflowClient, method: str, path: str, payload: Any = None) -> dict[str, Any]:
+        request_path, _, request_query = path.partition("?")
+        assert request_path.endswith("/taskInstances")
+        query = urllib.parse.parse_qs(request_query)
+        limit = int(query["limit"][0])
+        offset = int(query["offset"][0])
+        instances = every_instance if "demo_pipeline_sync" in request_path else []
+        return {
+            "task_instances": instances[offset : offset + limit],
+            "total_entries": len(instances),
+        }
+
+    monkeypatch.setattr(AirflowClient, "_authenticated", _paged)
+
+    payload = bundle_api.get(f"/api/v1/runtime/runs/{MASTER_RUN_ID}/graph").json()
+    sync_stage = next(stage for stage in payload["stages"] if stage["stage"] == "sync")
+    assert sync_stage["mapped_summary"] == {
+        "task_id": "process_batch",
+        "total": fan_out,
+        "by_state": {"failed": fan_out // 2, "success": fan_out // 2},
+    }
