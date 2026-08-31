@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType, ModuleType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Generic, TypeVar, assert_never
 
 if TYPE_CHECKING:
     from hflow.runtime import BundlePaths
@@ -499,32 +499,95 @@ class SkippedByQuarantine:
 StepNotRun = SupersededByPipeline | SkippedByQuarantine
 
 
+_ResultT = TypeVar("_ResultT")
+
+
+@dataclass(frozen=True)
+class Measured(Generic[_ResultT]):
+    """The step ran and returned a result."""
+
+    result: _ResultT
+
+
+@dataclass(frozen=True)
+class Errored:
+    """The step raised, or returned something that is not a result."""
+
+    error: str
+
+
+@dataclass(frozen=True)
+class NotRun:
+    """The step was registered and deliberately not invoked."""
+
+    not_run: StepNotRun
+
+
+@dataclass(frozen=True)
+class PublishFailed:
+    """The enrichment returned labels, then an artifact would not publish.
+
+    Its own state rather than a result and an error side by side: the labels
+    are real and are recorded, and the run still has to report an error, which
+    is the one place the old three-field shape needed two of them set at once.
+    """
+
+    result: "EnrichmentResult"
+    error: str
+
+
+# Exactly one variant, held in one field, so a report cannot carry two answers
+# at once and cannot carry none.
+CheckOutcome = Measured[CheckResult] | Errored | NotRun
+EnrichmentOutcome = Measured[EnrichmentResult] | Errored | NotRun | PublishFailed
+
+
+def _not_run_status(step_not_run: StepNotRun) -> CheckStatus:
+    """The status a registered step that was never invoked records."""
+    match step_not_run:
+        case SupersededByPipeline():
+            return CheckStatus.SUPERSEDED
+        case SkippedByQuarantine():
+            return CheckStatus.SKIPPED
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
 @dataclass
 class CheckRunReport:
     """Outcome of one check invocation inside a test run."""
 
     check: RegisteredCheck
-    result: CheckResult | None = None
-    error: str | None = None
-    not_run: StepNotRun | None = None
+    outcome: CheckOutcome
     duration_s: float = 0.0
 
     @property
+    def result(self) -> CheckResult | None:
+        return self.outcome.result if isinstance(self.outcome, Measured) else None
+
+    @property
+    def error(self) -> str | None:
+        return self.outcome.error if isinstance(self.outcome, Errored) else None
+
+    @property
+    def not_run(self) -> StepNotRun | None:
+        return self.outcome.not_run if isinstance(self.outcome, NotRun) else None
+
+    @property
     def status(self) -> CheckStatus:
-        match self.not_run:
-            case SupersededByPipeline():
-                return CheckStatus.SUPERSEDED
-            case SkippedByQuarantine():
-                return CheckStatus.SKIPPED
-            case None:
-                pass
-        if self.error is not None:
-            return CheckStatus.ERROR
-        if self.result is not None and self.result.verdict is False:
-            return CheckStatus.FAILED
-        if self.result is not None and self.result.verdict is True:
-            return CheckStatus.PASSED
-        return CheckStatus.MEASURED
+        match self.outcome:
+            case NotRun(not_run=step_not_run):
+                return _not_run_status(step_not_run)
+            case Errored():
+                return CheckStatus.ERROR
+            case Measured(result=result):
+                if result.verdict is False:
+                    return CheckStatus.FAILED
+                if result.verdict is True:
+                    return CheckStatus.PASSED
+                return CheckStatus.MEASURED
+            case _ as unreachable:
+                assert_never(unreachable)
 
 
 @dataclass
@@ -532,27 +595,36 @@ class EnrichmentRunReport:
     """Outcome of one enrichment invocation inside a test run."""
 
     enrichment: RegisteredEnrichment
-    result: EnrichmentResult | None = None
-    error: str | None = None
-    not_run: StepNotRun | None = None
+    outcome: EnrichmentOutcome
     duration_s: float = 0.0
     artifact_uris: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def result(self) -> EnrichmentResult | None:
+        return self.outcome.result if isinstance(self.outcome, Measured | PublishFailed) else None
+
+    @property
+    def error(self) -> str | None:
+        return self.outcome.error if isinstance(self.outcome, Errored | PublishFailed) else None
+
+    @property
+    def not_run(self) -> StepNotRun | None:
+        return self.outcome.not_run if isinstance(self.outcome, NotRun) else None
 
     @property
     def status(self) -> CheckStatus:
         # Enrichments have no verdicts, so the verdict statuses never apply;
         # supersession does not either, since only auto-registered CHECKS have
         # an automatic copy to stand down.
-        match self.not_run:
-            case SkippedByQuarantine():
-                return CheckStatus.SKIPPED
-            case SupersededByPipeline():
-                return CheckStatus.SUPERSEDED
-            case None:
-                pass
-        if self.error is not None:
-            return CheckStatus.ERROR
-        return CheckStatus.MEASURED
+        match self.outcome:
+            case NotRun(not_run=step_not_run):
+                return _not_run_status(step_not_run)
+            case Errored() | PublishFailed():
+                return CheckStatus.ERROR
+            case Measured():
+                return CheckStatus.MEASURED
+            case _ as unreachable:
+                assert_never(unreachable)
 
 
 def _unsatisfiable_check_parameters(
@@ -684,26 +756,26 @@ def _execute_enrichment(
 ) -> EnrichmentRunReport:
     """Run one enrichment-shaped step (user enrichment or the built-in media
     step) with the shared timing/boundary/error mechanics."""
-    enrichment_run = EnrichmentRunReport(enrichment=registered_enrichment)
     if not_run is not None:
-        enrichment_run.not_run = not_run
-        return enrichment_run
+        return EnrichmentRunReport(enrichment=registered_enrichment, outcome=NotRun(not_run))
+    outcome: EnrichmentOutcome
     started = time.perf_counter()
     try:
         returned_enrichment = registered_enrichment.function(canonical_episode)
         if isinstance(returned_enrichment, EnrichmentResult):
-            enrichment_run.result = returned_enrichment
+            outcome = Measured(returned_enrichment)
         else:
-            enrichment_run.error = (
+            outcome = Errored(
                 f"enrichment returned {type(returned_enrichment).__name__}, "
                 "expected hflow.EnrichmentResult -- wrap it: return "
                 "hflow.EnrichmentResult(labels=...)"
             )
     except Exception:
-        enrichment_run.error = traceback.format_exc(limit=8)
-    finally:
-        enrichment_run.duration_s = time.perf_counter() - started
-    return enrichment_run
+        outcome = Errored(traceback.format_exc(limit=8))
+    duration_s = time.perf_counter() - started
+    return EnrichmentRunReport(
+        enrichment=registered_enrichment, outcome=outcome, duration_s=duration_s
+    )
 
 
 def _check_run_rows(report: "TestReport") -> list[CheckRunRow]:
@@ -1116,8 +1188,7 @@ class App:
             superseded_keys = sorted(set(run.result.measurements) & pipeline_measurement_keys)
             if not superseded_keys:
                 continue
-            run.not_run = SupersededByPipeline(superseded_keys=tuple(superseded_keys))
-            run.result = None
+            run.outcome = NotRun(SupersededByPipeline(superseded_keys=tuple(superseded_keys)))
 
     def _reusable_canonical_episode(
         self,
@@ -1999,8 +2070,6 @@ class App:
             from hflow.checks import _DEFAULT_KEY_FACTS
 
             for registered in checks_to_run:
-                run = CheckRunReport(check=registered)
-                report.checks.append(run)
                 # Quarantine stops the user's own steps from piling more
                 # work onto an already-rejected episode, but the defaults
                 # are cheap diagnostic evidence and the episode you most
@@ -2016,7 +2085,12 @@ class App:
                 # *adds* a quarantine tag rather than gating later
                 # ones. They just do not get blanket-skipped.
                 if report.quarantined and registered.name not in self._default_check_names:
-                    run.not_run = SkippedByQuarantine(tuple(report.quarantine_tags))
+                    report.checks.append(
+                        CheckRunReport(
+                            check=registered,
+                            outcome=NotRun(SkippedByQuarantine(tuple(report.quarantine_tags))),
+                        )
+                    )
                     continue
                 # A default with a registered key pattern: if any pipeline
                 # step has already emitted a key the default would emit,
@@ -2034,27 +2108,34 @@ class App:
                         predicted = pattern(canonical_episode)
                         superseded_keys = sorted(predicted & pipeline_emitted_keys)
                         if superseded_keys:
-                            run.not_run = SupersededByPipeline(
-                                superseded_keys=tuple(superseded_keys)
+                            report.checks.append(
+                                CheckRunReport(
+                                    check=registered,
+                                    outcome=NotRun(
+                                        SupersededByPipeline(superseded_keys=tuple(superseded_keys))
+                                    ),
+                                )
                             )
                             continue
+                outcome: CheckOutcome
                 started = time.perf_counter()
                 try:
                     returned = registered.function(canonical_episode)
                     # Parse the boundary: user code may return anything.
                     if isinstance(returned, CheckResult):
-                        run.result = returned
+                        outcome = Measured(returned)
                     else:
-                        run.error = (
+                        outcome = Errored(
                             f"check returned {type(returned).__name__}, expected "
                             "hflow.CheckResult -- wrap it: return hflow.CheckResult("
                             "measurements=...)"
                         )
                 except Exception:
                     # Infrastructure, not data: never recorded as a quality outcome.
-                    run.error = traceback.format_exc(limit=8)
-                finally:
-                    run.duration_s = time.perf_counter() - started
+                    outcome = Errored(traceback.format_exc(limit=8))
+                duration_s = time.perf_counter() - started
+                run = CheckRunReport(check=registered, outcome=outcome, duration_s=duration_s)
+                report.checks.append(run)
                 _apply_gate(registered, run)
                 if run.result is not None and registered.name not in self._default_check_names:
                     # User steps feed the supersede-overlap test for any
@@ -2150,10 +2231,16 @@ class App:
                         f"artifact {artifact_name!r} at {artifact_path} could not be "
                         f"published:\n{traceback.format_exc(limit=4)}"
                     )
-                    enrichment_run.error = (
+                    combined_error = (
                         f"{enrichment_run.error}\n{publish_error}"
                         if enrichment_run.error
                         else publish_error
+                    )
+                    enrichment_result_so_far = enrichment_run.result
+                    enrichment_run.outcome = (
+                        PublishFailed(result=enrichment_result_so_far, error=combined_error)
+                        if enrichment_result_so_far is not None
+                        else Errored(combined_error)
                     )
 
         # Assembled even when not recording, so the dev loop refuses a key
