@@ -3,13 +3,13 @@
 The exporter resolves a curation selection to source LeRobot provenance,
 fetches the source chunks, and publishes a local LeRobot Dataset v3
 repository containing exactly the selected episodes. The tests use a
-synthetic source corpus and a fake manifest, with the network-touching
-helpers monkeypatched, exactly like the converter tests.
+synthetic source corpus and a fake manifest, with the public
+``hflow.import_lerobot_dataset`` entry point monkeypatched to
+materialize the synthetic archive.
 """
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import shutil
 import sys
@@ -18,15 +18,12 @@ from pathlib import Path
 import duckdb
 import pytest
 
-pytest.importorskip("examples.lerobot.prepare")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-_EXPORT_PATH = Path(__file__).resolve().parent.parent / "examples" / "lerobot" / "export.py"
-_spec = importlib.util.spec_from_file_location("lerobot_export", _EXPORT_PATH)
-assert _spec and _spec.loader
-export = importlib.util.module_from_spec(_spec)
-sys.modules["lerobot_export"] = export
-_spec.loader.exec_module(export)
+import hflow
+from examples.lerobot import export
 
+CAMS = ("observation.images.up", "observation.images.side")
 LENGTHS = [60, 65, 70, 75]  # episode lengths: 60 + i*5
 OFFSETS = [0, 60, 125, 195]  # cumulative data offsets
 
@@ -184,12 +181,30 @@ def _fake_corpus(tmp_path: Path) -> dict:
 @pytest.fixture()
 def fake_corpus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
     corpus = _fake_corpus(tmp_path)
-    monkeypatch.setattr(
-        export.prepare,
-        "_ensure_source_archive",
-        lambda dataset, cache_dir: corpus,
-    )
-    monkeypatch.setattr(export.prepare, "_download_file", lambda url, dest, **kw: None)
+    corpus["_import_calls"] = []
+
+    def _fake_import(
+        dataset_repo: str,
+        revision: str,
+        output_dir: Path,
+        episode_index: object = None,
+        camera_keys: tuple[str, ...] = (),
+    ) -> list[Path]:
+        corpus["_import_calls"].append(
+            {
+                "dataset_repo": dataset_repo,
+                "revision": revision,
+                "episode_index": episode_index,
+                "camera_keys": camera_keys,
+            }
+        )
+        _make_data_local(corpus)
+        cache = Path(output_dir) / "_lerobot_cache"
+        if not cache.exists():
+            shutil.copytree(tmp_path, cache)
+        return []
+
+    monkeypatch.setattr(hflow, "import_lerobot_dataset", _fake_import)
     return corpus
 
 
@@ -237,7 +252,7 @@ def test_export_noncontiguous_selection(fake_corpus: dict, tmp_path: Path) -> No
         ],
     )
     dest = tmp_path / "out"
-    export.export(dest, manifest=manifest)
+    export.export(dest, manifest=manifest, camera_keys=CAMS)
 
     info = json.loads((dest / "meta" / "info.json").read_text())
     assert info["total_episodes"] == 2
@@ -310,7 +325,7 @@ def test_export_mixed_repositories_fail(fake_corpus: dict, tmp_path: Path) -> No
     manifest = _fake_manifest(tmp_path, rows)
     dest = tmp_path / "out"
     with pytest.raises(ValueError, match="mixes source repositories"):
-        export.export(dest, manifest=manifest)
+        export.export(dest, manifest=manifest, camera_keys=CAMS)
     assert not dest.exists()
 
 
@@ -331,7 +346,7 @@ def test_export_nonimmutable_revision_fails(fake_corpus: dict, tmp_path: Path) -
     manifest = _fake_manifest(tmp_path, rows)
     dest = tmp_path / "out"
     with pytest.raises(ValueError, match="not an immutable commit sha"):
-        export.export(dest, manifest=manifest)
+        export.export(dest, manifest=manifest, camera_keys=CAMS)
     assert not dest.exists()
 
 
@@ -339,7 +354,7 @@ def test_export_missing_provenance_fails(fake_corpus: dict, tmp_path: Path) -> N
     manifest = _fake_manifest(tmp_path, [{"metadata_json": None}])
     dest = tmp_path / "out"
     with pytest.raises(ValueError, match="lacks LeRobot provenance"):
-        export.export(dest, manifest=manifest)
+        export.export(dest, manifest=manifest, camera_keys=CAMS)
     assert not dest.exists()
 
 
@@ -347,7 +362,7 @@ def test_export_missing_source_episode_fails(fake_corpus: dict, tmp_path: Path) 
     manifest = _fake_manifest(tmp_path, [{"metadata_json": _provenance_meta(9)}])
     dest = tmp_path / "out"
     with pytest.raises(ValueError, match="source episodes not present"):
-        export.export(dest, manifest=manifest)
+        export.export(dest, manifest=manifest, camera_keys=CAMS)
     assert not dest.exists()
 
 
@@ -361,7 +376,7 @@ def test_export_duplicate_episode_fails(fake_corpus: dict, tmp_path: Path) -> No
     )
     dest = tmp_path / "out"
     with pytest.raises(ValueError, match="duplicate source episode indexes"):
-        export.export(dest, manifest=manifest)
+        export.export(dest, manifest=manifest, camera_keys=CAMS)
     assert not dest.exists()
 
 
@@ -383,7 +398,30 @@ def test_export_sql_selection(fake_corpus: dict, tmp_path: Path) -> None:
     export.export(
         dest,
         sql=f"SELECT episode_id, metadata_json FROM read_parquet('{catalog}')",
+        camera_keys=CAMS,
     )
     info = json.loads((dest / "meta" / "info.json").read_text())
     assert info["total_episodes"] == 2
     assert info["total_frames"] == 60 + 75  # episodes 0 and 3
+
+
+def test_export_drives_public_importer(fake_corpus: dict, tmp_path: Path) -> None:
+    """Materialization goes through hflow.import_lerobot_dataset.
+
+    Regression for the review finding that export imported private helpers
+    from examples/lerobot/prepare.py; the source archive must be
+    materialized through the exported entry point, all episodes, with the
+    camera keys the user asked to export.
+    """
+    manifest = _fake_manifest(tmp_path, [{"metadata_json": _provenance_meta(0)}])
+    export.export(
+        tmp_path / "out",
+        manifest=manifest,
+        camera_keys=("observation.images.up", "observation.images.side"),
+    )
+    assert fake_corpus["_import_calls"], "export must drive the public importer"
+    call = fake_corpus["_import_calls"][-1]
+    assert call["dataset_repo"] == "lerobot/fake"
+    assert call["revision"] == "a" * 40
+    assert call["episode_index"] is None
+    assert call["camera_keys"] == ("observation.images.up", "observation.images.side")

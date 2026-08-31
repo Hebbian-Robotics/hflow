@@ -12,6 +12,10 @@ episode data rows are sliced from their source chunk parquets, so camera
 content, feature schema, dtypes, shapes, and frame timing match the source
 exactly. Episode indexes are renumbered sequentially in selection order.
 
+The source archive is materialized through the public
+``hflow.import_lerobot_dataset`` entry point (``hflow import lerobot``) and
+consumed from the ``_lerobot_cache`` artifacts that entry point writes.
+
 Failures fail before any publishable output is written: mixed source
 repositories or revisions, missing provenance, missing source episodes,
 duplicate selections, and incompatible feature schemas all abort without
@@ -35,21 +39,11 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-try:
-    import examples.lerobot.prepare as prepare
-except ModuleNotFoundError:
-    # Direct `python examples/lerobot/export.py` runs: repository root is
-    # not on sys.path, so add it (examples/ is not a package).
-    import sys as _sys
-    from pathlib import Path as _Path
-    _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
-    import examples.lerobot.prepare as prepare
-
+import hflow
 
 EXPORT_VERSION = "lerobot-export-v1"
 
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-_CAMERA_KEY_RE = re.compile(r"^observation\.images\.[A-Za-z0-9_]+$")
 
 
 @dataclass(frozen=True)
@@ -151,6 +145,100 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _read_corpus_from_cache(cache_dir: Path) -> dict:
+    """Reconstruct the source corpus from the importer's materialized archive.
+
+    ``hflow.import_lerobot_dataset`` writes meta/info.json, the
+    meta/episodes parquets, data chunks, and video chunks under
+    ``<output_dir>/_lerobot_cache``. Export consumes exactly those public
+    artifacts; the dictionary mirrors the archive shape the converter used.
+    """
+    info_path = cache_dir / "meta" / "info.json"
+    if not info_path.exists():
+        raise FileNotFoundError(
+            f"materialized archive has no {info_path}; the public importer writes it during export"
+        )
+    info = json.loads(info_path.read_text())
+
+    episodes_dir = cache_dir / "meta" / "episodes"
+    ep_files = sorted(episodes_dir.rglob("*.parquet"))
+    if not ep_files:
+        raise FileNotFoundError(
+            f"materialized archive has no episode parquets under {episodes_dir}"
+        )
+
+    conn = duckdb.connect()
+    try:
+        rows: list[dict] = []
+        windows: dict[int, dict[str, dict]] = {}
+        for ep_file in ep_files:
+            quoted = str(ep_file).replace("'", "''")
+            cols = [
+                d[0]
+                for d in conn.execute(f"SELECT * FROM read_parquet('{quoted}') LIMIT 0").description
+            ]
+            data = conn.execute(f"SELECT * FROM read_parquet('{quoted}')").fetchall()
+            for row in data:
+                d = dict(zip(cols, row, strict=True))
+                ep_idx = int(d["episode_index"])
+                tasks = d.get("tasks")
+                if isinstance(tasks, list):
+                    task = str(tasks[0]) if tasks else ""
+                else:
+                    task = str(tasks or "")
+                rows.append(
+                    {
+                        "episode_index": ep_idx,
+                        "task": task,
+                        "length": int(d["length"]),
+                        "data_chunk": str(d["data/chunk_index"]).split("/")[-1],
+                        "data_file": str(d["data/file_index"]).split("/")[-1],
+                        "data_from": int(d["dataset_from_index"]),
+                        "data_to": int(d["dataset_to_index"]),
+                    }
+                )
+                cam_windows: dict[str, dict] = {}
+                for col in cols:
+                    if col.startswith("videos/") and col.endswith("/from_timestamp"):
+                        cam = col.split("/")[1]
+                        cam_windows[cam] = {
+                            "chunk_index": str(d.get(f"videos/{cam}/chunk_index") or ""),
+                            "file_index": str(d.get(f"videos/{cam}/file_index") or ""),
+                            "from_timestamp": float(d.get(f"videos/{cam}/from_timestamp") or 0.0),
+                            "to_timestamp": float(d.get(f"videos/{cam}/to_timestamp") or 0.0),
+                        }
+                windows.setdefault(ep_idx, {}).update(cam_windows)
+    finally:
+        conn.close()
+
+    rows.sort(key=lambda e: e["episode_index"])
+    for e in rows:
+        e["video_windows"] = dict(windows.get(e["episode_index"], {}))
+    return {"info": info, "episodes": rows, "cache_dir": cache_dir}
+
+
+def _materialize_source_archive(
+    src_ds: str, src_rev: str, cache_dir: Path, camera_keys: tuple[str, ...]
+) -> dict:
+    """Materialize the source archive through the public importer.
+
+    ``hflow.import_lerobot_dataset`` (exported from ``hflow/__init__.py``;
+    ``hflow import lerobot`` on the CLI) resolves the immutable revision,
+    validates the camera keys, and downloads the corpus metadata, data
+    chunks, and video chunks under ``<output_dir>/_lerobot_cache``. Export
+    consumes that archive; the canonical landing MCAPs the importer also
+    writes are a side effect export does not use.
+    """
+    hflow.import_lerobot_dataset(
+        dataset_repo=src_ds,
+        revision=src_rev,
+        output_dir=cache_dir.parent,
+        episode_index=None,
+        camera_keys=camera_keys,
+    )
+    return _read_corpus_from_cache(cache_dir)
+
+
 def _episode_rows(table: pa.Table) -> list[dict]:
     cols = table.column_names
     out: list[dict] = []
@@ -172,16 +260,16 @@ def _write_v3_repository(
     cache_dir: Path = corpus["cache_dir"]
     info = corpus["info"]
     src_by_index = {e["episode_index"]: e for e in corpus["episodes"]}
-    base = f"https://huggingface.co/datasets/{src_ds}/resolve/{src_rev}"
 
-    # download data + video chunks (same access path the converter uses)
+    # Data and video chunks come from the archive the public importer
+    # materialized; a missing file is a broken materialization, not a
+    # download to retry quietly here.
     def _fetch_data(ep: dict) -> Path:
         chunk = int(ep["data_chunk"])
         file = int(ep["data_file"])
-        rel = corpus["data_path"].format(chunk_index=chunk, file_index=file)
         local = cache_dir / "data" / f"chunk-{chunk:06d}-file-{file:06d}.parquet"
         if not local.exists():
-            prepare._download_file(f"{base}/{rel}", local)
+            raise FileNotFoundError(f"source data chunk missing: {local}")
         return local
 
     def _fetch_video(cam: str, vw: dict, ep: dict) -> Path:
@@ -190,17 +278,9 @@ def _write_v3_repository(
             if str(vw.get("chunk_index", "")).isdigit()
             else int(ep["data_chunk"])
         )
-        file = (
-            int(vw["file_index"])
-            if str(vw.get("file_index", "")).isdigit()
-            else int(ep["data_file"])
-        )
-        rel = corpus["video_path"].format(
-            chunk_index=chunk, file_index=file, video_key=cam, camera_key=cam
-        )
         local = cache_dir / "videos" / f"{cam.replace('/', '_').replace('.', '_')}-chunk{chunk}.mp4"
         if not local.exists():
-            prepare._download_file(f"{base}/{rel}", local)
+            raise FileNotFoundError(f"source video chunk missing: {local}")
         return local
 
     episodes_dir = destination / "meta" / "episodes" / "chunk-000"
@@ -447,8 +527,7 @@ def export(
     *,
     manifest: Path | None = None,
     sql: str | None = None,
-    catalog_root: Path | None = None,
-    camera_keys: tuple[str, ...] | None = None,
+    camera_keys: tuple[str, ...],
 ) -> Path:
     """Export the curated selection into a new local LeRobot v3 repository."""
     rows = _read_selection(manifest, sql)
@@ -462,25 +541,15 @@ def export(
     want_indexes = [s.source_episode_index for s in selections]
     if len(set(want_indexes)) != len(want_indexes):
         raise ValueError("selection contains duplicate source episode indexes")
+    if not camera_keys:
+        raise ValueError("camera_keys must name at least one camera feature")
+    if len(set(camera_keys)) != len(camera_keys):
+        raise ValueError("camera_keys must not contain duplicates")
 
     with tempfile.TemporaryDirectory(prefix="lerobot-export-") as tmp:
         stage_root = Path(tmp)
         cache_dir = stage_root / "_lerobot_cache"
-        corpus = prepare._ensure_source_archive(
-            prepare.DatasetSource(repo_id=src_ds, revision=src_rev, license=""),
-            cache_dir,
-        )
-
-        if camera_keys is None:
-            camera_keys = tuple(corpus["video_keys"])
-        else:
-            for k in camera_keys:
-                if not _CAMERA_KEY_RE.match(k):
-                    raise ValueError(f"invalid camera key {k!r}")
-                if k not in corpus["video_keys"]:
-                    raise ValueError(
-                        f"camera key {k!r} not in source cameras {corpus['video_keys']}"
-                    )
+        corpus = _materialize_source_archive(src_ds, src_rev, cache_dir, camera_keys)
 
         exist = {e["episode_index"] for e in corpus["episodes"]}
         missing = [i for i in want_indexes if i not in exist]
@@ -535,21 +604,21 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, default=None, help="hflow curate output parquet")
     parser.add_argument("--sql", type=str, default=None, help="curation SQL over the catalog")
     parser.add_argument(
-        "--catalog-root", type=Path, default=None, help="HFlow catalog root (for --sql selections)"
-    )
-    parser.add_argument(
-        "--camera-keys", type=str, default=None, help="comma-separated camera keys (default: all)"
+        "--camera-keys",
+        type=str,
+        required=True,
+        help=(
+            "comma-separated camera features to export "
+            "(e.g. observation.images.up,observation.images.side)"
+        ),
     )
     args = parser.parse_args()
 
-    camera_keys = None
-    if args.camera_keys:
-        camera_keys = tuple(k.strip() for k in args.camera_keys.split(",") if k.strip())
+    camera_keys = tuple(k.strip() for k in args.camera_keys.split(",") if k.strip())
     out = export(
         args.destination,
         manifest=args.manifest,
         sql=args.sql,
-        catalog_root=args.catalog_root,
         camera_keys=camera_keys,
     )
     print(f"exported to {out}")
