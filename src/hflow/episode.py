@@ -613,7 +613,7 @@ class Episode:
         self,
         camera: str | None = None,
         *,
-        frame_indices: Sequence[int],
+        frame_indices: Sequence[int | np.integer[Any]],
     ) -> list[ExtractedFrame]:
         """Extract JPEGs at exact, ascending source-message frame indices.
 

@@ -2,7 +2,7 @@
 infrastructure. Mirrors the README design-target example."""
 
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import pytest
@@ -178,12 +178,12 @@ def test_canonical_episode_extracts_exact_source_frame_indices(
         )
 
         numpy_frame_indices = [
-            cast(int, np.int32(0)),
-            cast(int, np.int64(1)),
-            cast(int, np.uint32(2)),
-            cast(int, np.uint64(7)),
-            cast(int, np.int64(8)),
-            cast(int, np.uint32(29)),
+            np.int32(0),
+            np.int64(1),
+            np.uint32(2),
+            np.uint64(7),
+            np.int64(8),
+            np.uint32(29),
         ]
         numpy_frames = episode.frames_at_indices(
             camera_topic,
@@ -204,6 +204,24 @@ def test_canonical_episode_extracts_exact_source_frame_indices(
             )
             == selected_frames
         )
+
+
+@pytest.mark.parametrize(
+    "invalid_frame_indices",
+    [[True], [np.bool_(True)], [3.0], [np.float64(3.0)]],
+)
+def test_canonical_episode_rejects_non_integer_frame_indices(
+    report_and_app: tuple[hflow.TestReport, hflow.App],
+    invalid_frame_indices: list[Any],
+) -> None:
+    report, _app = report_and_app
+    with hflow.Episode(report.canonical_path) as episode:
+        camera_topic = next(topic for topic in episode.cameras if "overhead_cam" in topic)
+        with pytest.raises(ValueError):
+            episode.frames_at_indices(
+                camera_topic,
+                frame_indices=invalid_frame_indices,
+            )
 
 
 def test_arrow_export(report_and_app: tuple[hflow.TestReport, hflow.App]) -> None:
