@@ -173,6 +173,34 @@ class TestLocalStorageRoot:
         with pytest.raises(ValueError, match="must not be empty"):
             root.read_bytes("")
 
+    def test_windows_drive_letter_keys_are_refused(self, tmp_path: Path) -> None:
+        """A key like "C:/Windows/win.ini" is not absolute under
+        ``PurePosixPath`` (POSIX has no drive letters), so it previously
+        passed the "must be relative" check. That mattered because
+        ``LocalStorageRoot`` joins a validated key onto the real root with
+        ``self.path / key`` using the *native* platform's pathlib: on native
+        Windows, joining a drive-letter path onto an existing path does not
+        append it -- pathlib discards the left operand and the join
+        resolves to the drive-letter path outright, escaping the root
+        entirely. This is refused regardless of which OS runs the check.
+        """
+        root = LocalStorageRoot(tmp_path)
+        with pytest.raises(ValueError, match="relative to the storage root"):
+            root.read_bytes("C:/Windows/win.ini")
+        with pytest.raises(ValueError, match="relative to the storage root"):
+            root.read_bytes("C:\\Windows\\win.ini")
+        with pytest.raises(ValueError, match="relative to the storage root"):
+            root.read_bytes("D:/secrets.txt")
+        # A colon that isn't drive-letter-shaped is still a legitimate key
+        # component and must not be refused by this check. (But native Windows
+        # forbids colons in filenames entirely, so we only exercise the write
+        # on OSes where it can succeed at the filesystem level.)
+        import sys
+
+        if sys.platform != "win32":
+            root.write_bytes("weird/C:notdrive.txt", b"payload")
+            assert root.read_bytes("weird/C:notdrive.txt") == b"payload"
+
 
 class TestBucketStorageRoot:
     def test_round_trip_and_listing(self, bucket_over_tmp: tuple[BucketStorageRoot, Path]) -> None:

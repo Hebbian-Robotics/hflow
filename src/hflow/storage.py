@@ -41,7 +41,7 @@ import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 # Schemes obstore's from_url() accepts that name an object store we support.
@@ -109,14 +109,27 @@ _RESERVED_KEY_SUFFIXES = (".remote-etag", ".mirror-lock")
 
 
 def _validated_relative_key(relative: str) -> str:
-    """Parse a storage-relative key: POSIX-style, inside the root, non-empty."""
+    """Parse a storage-relative key: POSIX-style, inside the root, non-empty.
+
+    ``PurePosixPath.is_absolute()`` only recognizes a leading ``/`` --
+    it has no concept of Windows drive letters, so a key like
+    ``"C:/Windows/win.ini"`` passes this check as "relative". That matters
+    because :class:`LocalStorageRoot` later joins a validated key onto the
+    real root with ``self.path / key`` using the *native* platform's
+    ``pathlib`` semantics: on native Windows, joining a drive-letter path
+    onto an existing path does not append it -- pathlib's documented
+    behavior discards the left operand entirely, so ``self.path / key``
+    resolves to the drive-letter path outright, escaping the intended root.
+    Checking ``PureWindowsPath.is_absolute()`` as well closes that gap
+    regardless of which OS actually validates the key.
+    """
     key = PurePosixPath(str(relative).replace("\\", "/"))
     if not str(key) or str(key) == ".":
         raise ValueError("storage key must not be empty")
-    if key.is_absolute() or ".." in key.parts:
+    if key.is_absolute() or PureWindowsPath(str(key)).is_absolute() or ".." in key.parts:
         raise ValueError(
             f"storage key {relative!r} must be relative to the storage root "
-            "(no leading '/', no '..')"
+            "(no leading '/', no '..', no Windows drive letter)"
         )
     if key.name.endswith(_RESERVED_KEY_SUFFIXES):
         raise ValueError(
