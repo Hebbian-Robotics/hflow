@@ -484,7 +484,12 @@ def _derive_numeric_schema(feature_name: str, feature_specification: dict) -> _N
             f"dtype={declared_dtype}, shape={declared_shape} "
             "(only float32 fixed-width numeric vectors are supported)"
         )
-    if len(declared_shape) != 1 or not isinstance(declared_shape[0], int) or declared_shape[0] < 1:
+    if (
+        len(declared_shape) != 1
+        or isinstance(declared_shape[0], bool)
+        or not isinstance(declared_shape[0], int)
+        or declared_shape[0] < 1
+    ):
         raise ValueError(
             f"unsupported feature {feature_name}: "
             f"dtype={declared_dtype}, shape={declared_shape} "

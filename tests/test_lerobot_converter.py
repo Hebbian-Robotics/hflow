@@ -155,6 +155,46 @@ def test_derive_numeric_schema_rejects_unsupported() -> None:
         _DERIVE("observation.state", {"dtype": "float32", "shape": [2, 3]})
     with pytest.raises(ValueError, match="unsupported feature"):
         _DERIVE("observation.state", {"dtype": "float32", "shape": []})
+    for shape in ([True], [False]):
+        with pytest.raises(
+            ValueError,
+            match=rf"unsupported feature action: dtype=float32, shape=\[{shape[0]}\]",
+        ):
+            _DERIVE("action", {"dtype": "float32", "shape": shape})
+
+
+def test_import_rejects_required_boolean_dimension_without_dataset_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_dir = tmp_path / "out"
+    dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
+    monkeypatch.setattr(
+        prep,
+        "_hf_repo_info",
+        lambda repo, revision: {"sha": "abc", "license": "apache-2.0"},
+    )
+    monkeypatch.setattr(
+        prep,
+        "_ensure_source_archive",
+        lambda source, cache_dir: {
+            "numeric_features": {
+                "action": {"dtype": "float32", "shape": [True]},
+                "observation.state": {"dtype": "float32", "shape": [6]},
+            },
+            "video_keys": [prep.DEFAULT_CAMERA_KEY],
+            "episodes": [],
+            "dataset": dataset_source,
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"unsupported feature action: dtype=float32, shape=\[True\]",
+    ):
+        prep.import_lerobot_dataset(dataset_repo="fake/repo", output_dir=output_dir)
+
+    assert not (output_dir / "landing").exists()
+    assert not (output_dir / "prepared-manifest.json").exists()
 
 
 def test_cdr_float32_array_n_byte_compatible() -> None:
