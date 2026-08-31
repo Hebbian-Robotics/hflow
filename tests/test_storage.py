@@ -174,27 +174,38 @@ class TestLocalStorageRoot:
             root.read_bytes("")
 
     def test_windows_drive_letter_keys_are_refused(self, tmp_path: Path) -> None:
-        """A key like "C:/Windows/win.ini" is not absolute under
-        ``PurePosixPath`` (POSIX has no drive letters), so it previously
-        passed the "must be relative" check. That mattered because
-        ``LocalStorageRoot`` joins a validated key onto the real root with
-        ``self.path / key`` using the *native* platform's pathlib: on native
-        Windows, joining a drive-letter path onto an existing path does not
-        append it -- pathlib discards the left operand and the join
-        resolves to the drive-letter path outright, escaping the root
-        entirely. This is refused regardless of which OS runs the check.
+        """Storage keys with any Windows drive component are refused.
+
+        ``PurePosixPath`` has no concept of Windows drive letters, so keys
+        like ``"C:/Windows/win.ini"`` pass the POSIX absolute check as
+        "relative". This guard also checks ``PureWindowsPath(...).drive``
+        so that the validator is platform-independent: a key produced on a
+        Windows client is refused even when the validating process runs on
+        Linux.
+
+        The right predicate is ``.drive``, not ``.is_absolute()``. A
+        drive-relative key like ``"C:foo.txt"`` has a drive but no root, so
+        ``.is_absolute()`` returns False and the key would slip through.
+        Keying on ``.drive`` catches drive-absolute, drive-relative, and
+        UNC shapes.
         """
         root = LocalStorageRoot(tmp_path)
+        # drive-absolute forms
         with pytest.raises(ValueError, match="relative to the storage root"):
             root.read_bytes("C:/Windows/win.ini")
         with pytest.raises(ValueError, match="relative to the storage root"):
             root.read_bytes("C:\\Windows\\win.ini")
         with pytest.raises(ValueError, match="relative to the storage root"):
             root.read_bytes("D:/secrets.txt")
-        # A colon that isn't drive-letter-shaped is still a legitimate key
-        # component and must not be refused by this check. (But native Windows
-        # forbids colons in filenames entirely, so we only exercise the write
-        # on OSes where it can succeed at the filesystem level.)
+        # drive-relative forms: has a drive but no leading slash; is_absolute()
+        # returns False for these, so they used to slip through
+        with pytest.raises(ValueError, match="relative to the storage root"):
+            root.read_bytes("C:foo.txt")
+        with pytest.raises(ValueError, match="relative to the storage root"):
+            root.read_bytes("C:")
+        # A colon that is not drive-letter-shaped must still be accepted.
+        # (Native Windows forbids colons in filenames at the OS level, so
+        # this write is gated to platforms where it can succeed.)
         import sys
 
         if sys.platform != "win32":
