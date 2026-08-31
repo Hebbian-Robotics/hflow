@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import cast
 
 import duckdb
+import numpy as np
 import pytest
 
 import hflow
@@ -1532,6 +1533,101 @@ def test_same_interval_bound_in_a_numpy_or_python_scalar_replays_as_one_run(
     ]
     assert [attempt.written for attempt in attempts] == [True, False]
     assert len({attempt.run_fingerprint for attempt in attempts}) == 1
+
+
+def test_catalog_timestamp_bigint_boundaries_round_trip(tmp_path: Path) -> None:
+    """The complete non-negative BIGINT domain survives catalog storage."""
+    maximum = 2**63 - 1
+    row = CheckRunRow(
+        check_name="range_check",
+        check_version="v1",
+        critical=False,
+        status=hflow.CheckStatus.MEASURED,
+        duration_s=0.1,
+        observations=[
+            hflow.Observation("zero", 0, {"score": 0}),
+            hflow.Observation("maximum", cast(int, np.int64(maximum)), {"score": 1}),
+        ],
+        intervals=[
+            hflow.Interval(start_ns=0, end_ns=0, label="zero"),
+            hflow.Interval(start_ns=cast(int, np.int64(maximum)), end_ns=maximum, label="maximum"),
+        ],
+    )
+    catalog = Catalog(tmp_path / "catalog")
+    catalog.append_episode(
+        canonical_path=_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[row],
+    )
+
+    connection = open_catalog_connection(tmp_path / "catalog")
+    try:
+        assert connection.execute(
+            "SELECT observation_id, timestamp_ns FROM observations_latest ORDER BY timestamp_ns"
+        ).fetchall() == [("zero", 0), ("maximum", maximum)]
+        assert connection.execute(
+            "SELECT label, start_ns, end_ns FROM intervals ORDER BY start_ns"
+        ).fetchall() == [("zero", 0, 0), ("maximum", maximum, maximum)]
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("timestamp_ns", [2**63, np.uint64(2**63)])
+def test_out_of_range_observation_timestamp_is_refused_before_catalog_writes(
+    tmp_path: Path, timestamp_ns: object
+) -> None:
+    row = CheckRunRow(
+        check_name="range_check",
+        check_version="v1",
+        critical=False,
+        status=hflow.CheckStatus.MEASURED,
+        duration_s=0.1,
+        observations=[hflow.Observation("frame:1", cast(int, timestamp_ns), {"score": 1})],
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"range_check.*'frame:1'.*timestamp_ns=9223372036854775808.*BIGINT",
+    ):
+        Catalog(tmp_path / "catalog").append_episode(
+            canonical_path=_fake_canonical(tmp_path),
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[row],
+        )
+
+    assert not list((tmp_path / "catalog").rglob("*.parquet"))
+
+
+@pytest.mark.parametrize("bound_name", ["start_ns", "end_ns"])
+@pytest.mark.parametrize("bound", [2**63, np.uint64(2**63)])
+def test_out_of_range_interval_bound_is_refused_before_catalog_writes(
+    tmp_path: Path, bound_name: str, bound: object
+) -> None:
+    bounds = {"start_ns": 0, "end_ns": 10}
+    bounds[bound_name] = cast(int, bound)
+    row = CheckRunRow(
+        check_name="range_check",
+        check_version="v1",
+        critical=False,
+        status=hflow.CheckStatus.MEASURED,
+        duration_s=0.1,
+        intervals=[hflow.Interval(**bounds, label="segment")],
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"range_check.*'segment'.*{bound_name}=9223372036854775808.*BIGINT",
+    ):
+        Catalog(tmp_path / "catalog").append_episode(
+            canonical_path=_fake_canonical(tmp_path),
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[row],
+        )
+
+    assert not list((tmp_path / "catalog").rglob("*.parquet"))
 
 
 def test_non_scalar_measurement_is_refused_naming_the_check_and_key(
