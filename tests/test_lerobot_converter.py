@@ -544,3 +544,94 @@ def test_hf_repo_info_wrong_shape_refusal_unchanged(
     _stub_urlopen(monkeypatch, {"/api/datasets/": b"[1, 2, 3]"})
     with pytest.raises(ValueError, match="not a JSON object"):
         prep._hf_repo_info("lerobot/pusht", "main")
+
+
+@pytest.mark.parametrize(
+    "bad_fps",
+    [
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        True,
+        None,
+        "30",
+        0,
+        -30,
+    ],
+    ids=[
+        "nan",
+        "positive-infinity",
+        "negative-infinity",
+        "boolean",
+        "missing",
+        "nonnumeric",
+        "zero",
+        "negative",
+    ],
+)
+def test_info_json_refuses_non_finite_or_non_positive_fps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_fps: object
+) -> None:
+    """Invalid fps metadata must be refused before any episode discovery runs."""
+    corpus = _build_fake_corpus(tmp_path)
+    info = dict(corpus["info"])
+    if bad_fps is None:
+        info.pop("fps")
+    else:
+        info["fps"] = bad_fps
+    expected_value = info.get("fps")
+    monkeypatch.setattr(
+        prep, "_hf_repo_info", lambda repo, rev: {"sha": rev, "license": "apache-2.0"}
+    )
+    monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: info)
+
+    def fail_tree(repo: str, rev: str, path: str) -> list[dict]:
+        raise AssertionError("episode metadata discovery must not run after invalid fps")
+
+    monkeypatch.setattr(prep, "_hf_tree", fail_tree)
+
+    dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
+    cache_dir = tmp_path / "cache"
+    with pytest.raises(ValueError, match="fps") as excinfo:
+        prep._ensure_source_archive(dataset_source, cache_dir)
+
+    message = str(excinfo.value)
+    assert "FPS must be finite and positive" in message
+    assert repr(expected_value) in message
+    # Refusal happens before episode metadata discovery: no downloads, no output.
+    assert not cache_dir.exists() or not (cache_dir / "meta" / "episodes").exists()
+
+
+def test_info_json_accepts_normal_positive_fps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    corpus = _build_fake_corpus(tmp_path)
+    corpus["info"]["fps"] = 30
+    monkeypatch.setattr(
+        prep, "_hf_repo_info", lambda repo, rev: {"sha": rev, "license": "apache-2.0"}
+    )
+    monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: corpus["info"])
+    monkeypatch.setattr(
+        prep,
+        "_hf_tree",
+        lambda repo, rev, path: (
+            [{"path": "meta/episodes/chunk-000/file-000.parquet", "type": "file"}]
+            if "episodes" in path
+            else [{"path": "meta/info.json", "type": "file"}]
+        ),
+    )
+
+    def fake_dl(url: str, dest: Path, **kw: object) -> None:
+        import shutil
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if "meta/episodes" in url:
+            shutil.copy(
+                str(tmp_path / "meta" / "episodes" / "chunk-000" / "file-000.parquet"), dest
+            )
+
+    monkeypatch.setattr(prep, "_download_file", fake_dl)
+
+    dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
+    source_archive = prep._ensure_source_archive(dataset_source, tmp_path / "cache")
+    assert source_archive["fps"] == 30

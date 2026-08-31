@@ -24,7 +24,7 @@ from hflow.doctor import diagnose
 from hflow.format import METADATA_RECORD_EPISODE
 from hflow.reader import TopicInfo
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
-from hflow.transform import write_canonical_episode
+from hflow.transform import SourceNotConforming, write_canonical_episode
 from hflow.video import estimate_fps_from_log_times
 
 ANNEX_B_START_CODE = b"\x00\x00\x00\x01"
@@ -124,7 +124,7 @@ def test_transform_rejects_nonconforming_passthrough_video(tmp_path: Path) -> No
             channel_id, log_time=10**9, data=message.SerializeToString(), publish_time=10**9
         )
         writer.finish()
-    with pytest.raises(ValueError, match="requires 'h264'"):
+    with pytest.raises(SourceNotConforming, match="requires 'h264'"):
         write_canonical_episode(source, tmp_path / "out.mcap")
 
 
@@ -174,7 +174,7 @@ def test_transform_rejects_each_passthrough_video_channel_starting_mid_gop(
         ],
     )
 
-    with pytest.raises(ValueError, match=r"/cam/right.*starts mid-GOP"):
+    with pytest.raises(SourceNotConforming, match=r"/cam/right.*starts mid-GOP"):
         write_canonical_episode(source, tmp_path / "out.mcap")
 
 
@@ -238,7 +238,7 @@ def test_transform_still_rejects_undelimited_video_starting_mid_gop(tmp_path: Pa
     source = tmp_path / "undelimited-mid-gop.mcap"
     _write_passthrough_video_source(source, [("/cam", 1, NON_KEYFRAME_WITHOUT_AUD)])
 
-    with pytest.raises(ValueError, match="starts mid-GOP"):
+    with pytest.raises(SourceNotConforming, match="starts mid-GOP"):
         write_canonical_episode(source, tmp_path / "out.mcap")
 
 
@@ -248,7 +248,7 @@ def test_transform_and_doctor_reject_multiple_pictures_without_auds(tmp_path: Pa
         source, [("/cam", 1, KEYFRAME_WITHOUT_AUD + NON_KEYFRAME_WITHOUT_AUD)]
     )
 
-    with pytest.raises(ValueError, match="message contains 2 pictures"):
+    with pytest.raises(SourceNotConforming, match="message contains 2 pictures"):
         write_canonical_episode(source, tmp_path / "out.mcap")
 
     report = diagnose(source)

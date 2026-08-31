@@ -16,6 +16,7 @@ Hugging Face Hub, and uses HFlow's managed FFmpeg build.
 
 import json
 import logging
+import math
 import os
 import struct
 import subprocess
@@ -330,11 +331,12 @@ def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _S
     if (
         isinstance(frames_per_second, bool)
         or not isinstance(frames_per_second, int | float)
+        or not math.isfinite(frames_per_second)
         or frames_per_second <= 0
     ):
         raise ValueError(
             f"LeRobot meta/info.json has invalid fps={frames_per_second!r}; "
-            "expected a positive number"
+            "FPS must be finite and positive"
         )
     data_path_template = dataset_information.get("data_path")
     if not isinstance(data_path_template, str) or not data_path_template.strip():
