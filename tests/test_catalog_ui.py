@@ -123,6 +123,100 @@ def test_catalog_ui_refuses_a_port_of_the_wrong_type(
         replace(settings, port=port)
 
 
+class _RecordingCatalogConnection:
+    """DuckDB connection proxy that records every statement it executes."""
+
+    def __init__(self, inner: duckdb.DuckDBPyConnection) -> None:
+        self._inner = inner
+        self.executed_statements: list[str] = []
+        self.closed = False
+
+    def execute(self, sql: str, *parameters: object) -> object:
+        self.executed_statements.append(sql)
+        return self._inner.execute(sql, *parameters)
+
+    def close(self) -> None:
+        self.closed = True
+        self._inner.close()
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
+def _serve_until_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ui_extension_loaded: bool,
+) -> _RecordingCatalogConnection:
+    shutdown_event = Event()
+    server_started_event = Event()
+    connections: list[_RecordingCatalogConnection] = []
+    background_failures: list[BaseException] = []
+
+    real_open_catalog_connection = catalog_ui.open_catalog_connection
+
+    def record_server_start(catalog_connection: duckdb.DuckDBPyConnection, port: int) -> None:
+        assert port == catalog_ui.DEFAULT_CATALOG_UI_PORT
+        server_started_event.set()
+
+    def open_recorded_connection(catalog_root: Path) -> _RecordingCatalogConnection:
+        connection = _RecordingCatalogConnection(real_open_catalog_connection(catalog_root))
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(catalog_ui, "open_catalog_connection", open_recorded_connection)
+    monkeypatch.setattr(catalog_ui, "_start_duckdb_ui_server", record_server_start)
+    monkeypatch.setattr(
+        catalog_ui,
+        "_ui_extension_is_loaded",
+        lambda _catalog_connection: ui_extension_loaded,
+    )
+
+    def run_catalog_ui() -> None:
+        try:
+            catalog_ui.serve_catalog_ui(
+                catalog_ui.CatalogUiSettings(
+                    catalog_root=tmp_path / "catalog",
+                    open_browser=False,
+                    catalog_poll_interval_seconds=0.01,
+                ),
+                shutdown_event=shutdown_event,
+            )
+        except BaseException as error:
+            background_failures.append(error)
+
+    catalog_ui_thread = Thread(target=run_catalog_ui)
+    catalog_ui_thread.start()
+    try:
+        assert server_started_event.wait(timeout=2)
+    finally:
+        shutdown_event.set()
+        catalog_ui_thread.join(timeout=2)
+
+    assert not catalog_ui_thread.is_alive()
+    assert background_failures == []
+    (connection,) = connections
+    return connection
+
+
+def test_catalog_ui_shutdown_does_not_stop_a_server_the_ui_extension_never_loaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    connection = _serve_until_shutdown(tmp_path, monkeypatch, ui_extension_loaded=False)
+
+    assert "CALL stop_ui_server()" not in connection.executed_statements
+    assert connection.closed
+
+
+def test_catalog_ui_shutdown_stops_the_server_when_the_ui_extension_is_loaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    connection = _serve_until_shutdown(tmp_path, monkeypatch, ui_extension_loaded=True)
+
+    assert "CALL stop_ui_server()" in connection.executed_statements
+    assert connection.closed
+
+
 @pytest.mark.parametrize("port", [1, 65535])
 def test_catalog_ui_accepts_port_boundaries(tmp_path: Path, port: int) -> None:
     settings = catalog_ui.CatalogUiSettings(catalog_root=tmp_path / "catalog", port=port)

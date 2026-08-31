@@ -86,11 +86,22 @@ def _start_duckdb_ui_server(catalog_connection: duckdb.DuckDBPyConnection, port:
         ) from error
 
 
+def _ui_extension_is_loaded(catalog_connection: duckdb.DuckDBPyConnection) -> bool:
+    row = catalog_connection.execute(
+        "SELECT count(*) FROM duckdb_extensions() WHERE extension_name = 'ui' AND loaded"
+    ).fetchone()
+    return row is not None and int(row[0]) > 0
+
+
 def _stop_duckdb_ui_server(
     catalog_connection: duckdb.DuckDBPyConnection, server_started: bool
 ) -> None:
     try:
-        if server_started:
+        # stop_ui_server only exists once the ui extension is loaded. Calling it
+        # without the extension makes DuckDB auto-install the extension from the
+        # network -- seconds on a slow connection, and pointless: there is no
+        # server to stop if the extension was never loaded.
+        if server_started and _ui_extension_is_loaded(catalog_connection):
             catalog_connection.execute("CALL stop_ui_server()")
     except duckdb.Error:
         # The process is already leaving. A server that stopped independently
