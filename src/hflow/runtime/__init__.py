@@ -56,6 +56,7 @@ from hflow.runtime._topology import (
     StageTopology,
     ingest_dag_topology,
 )
+from hflow.uri import DataRootRelativeUri, parse_data_root_relative_uri
 
 __all__ = [
     "DEFAULT_AIRFLOW_IMAGE",
@@ -68,6 +69,7 @@ __all__ = [
     "ComposeError",
     "DagTaskNode",
     "DagTopology",
+    "DataRootRelativeUri",
     "DeployConfig",
     "DeployPaths",
     "IngestTopology",
@@ -88,6 +90,7 @@ __all__ = [
     "infer_hflow_source",
     "ingest_dag_topology",
     "load_bundle",
+    "parse_data_root_relative_uri",
     "render_bundle",
     "render_deploy_bundle",
     "resolve_remote_endpoint",

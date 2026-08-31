@@ -335,13 +335,46 @@ def test_ingest_rejects_absolute_and_escaping_uris_before_any_runtime(
     data_root = tmp_path / "bare-root"
     data_root.mkdir()
     client = _client_over(data_root, unbuilt_assets_dir)
-    for hostile_uri in ("/etc/passwd", "../../etc/shadow", "sub/../../escape.mcap"):
+    for hostile_uri in (
+        "/etc/passwd",
+        "C:/Windows/System32/config/SAM",
+        "../../etc/shadow",
+        "sub/../../escape.mcap",
+    ):
         response = client.post(
             "/api/v1/runtime/ingest",
             json={"uris": [hostile_uri], "profile": "full", "mode": "batch"},
         )
         assert response.status_code == 400, hostile_uri
         assert "not relative to the data root" in response.json()["detail"]
+
+
+def test_ingest_trims_uris_before_triggering(
+    bundle_api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_ingest(
+        self: AirflowClient,
+        dag_id: str,
+        uris: list[str],
+        *,
+        profile: str = "full",
+        online: bool = False,
+        batch_count: int | None = None,
+        dag_run_id: str | None = None,
+    ) -> dict[str, str]:
+        captured["uris"] = uris
+        return {"dag_run_id": "manual__trimmed", "state": "queued"}
+
+    monkeypatch.setattr(AirflowClient, "ingest", fake_ingest)
+    response = bundle_api.post(
+        "/api/v1/runtime/ingest",
+        json={"uris": [" episodes-in/a/../b.mcap "], "profile": "full", "mode": "batch"},
+    )
+
+    assert response.status_code == 200
+    assert captured["uris"] == ["episodes-in/a/../b.mcap"]
 
 
 def test_ingest_without_a_runtime_is_a_clear_409(

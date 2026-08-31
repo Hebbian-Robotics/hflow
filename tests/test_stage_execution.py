@@ -10,6 +10,7 @@ import pytest
 
 import hflow
 from hflow import stage_execution
+from hflow.runtime import parse_data_root_relative_uri
 from hflow.stage_execution import (
     StageBatchCounts,
     load_pipeline_application,
@@ -117,13 +118,18 @@ class TestConfFlags:
 
 class TestEpisodeReferences:
     def test_bucket_root_joins_as_url_and_local_as_path(self) -> None:
+        uri = parse_data_root_relative_uri("episodes-in/a.mcap")
         assert (
-            resolve_episode_reference("gs://bucket/prefix", "episodes-in/a.mcap")
+            resolve_episode_reference("gs://bucket/prefix", uri)
             == "gs://bucket/prefix/episodes-in/a.mcap"
         )
-        assert resolve_episode_reference("/opt/airflow/data", "episodes-in/a.mcap") == Path(
+        assert resolve_episode_reference("/opt/airflow/data", uri) == Path(
             "/opt/airflow/data/episodes-in/a.mcap"
         )
+
+    def test_bucket_reference_does_not_repair_an_invalid_leading_slash(self) -> None:
+        with pytest.raises(ValueError, match="relative to the data root"):
+            parse_data_root_relative_uri("/episodes-in/a.mcap")
 
 
 class TestPipelineLoading:

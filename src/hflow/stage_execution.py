@@ -35,6 +35,7 @@ from hflow.stage_planning import (
 )
 from hflow.steps import IngestMode, Stage
 from hflow.storage import is_bucket_url, parse_storage_root
+from hflow.uri import DataRootRelativeUri, parse_data_root_relative_uri
 
 if TYPE_CHECKING:
     from hflow.app import App
@@ -121,10 +122,10 @@ def require_application_data_root(application: "App", expected_data_root: str) -
         )
 
 
-def resolve_episode_reference(data_root: str, uri: str) -> "Path | str":
+def resolve_episode_reference(data_root: str, uri: DataRootRelativeUri) -> "Path | str":
     """A conf URI (relative to the data root) as a processable reference."""
     if is_bucket_url(data_root):
-        return data_root.rstrip("/") + "/" + uri.lstrip("/")
+        return data_root.rstrip("/") + "/" + uri
     return Path(data_root) / uri
 
 
@@ -228,7 +229,9 @@ def process_stage_batch(
     with _batch_quarantine_history(application, stage) as quarantine_history:
         for uri in uris:
             try:
-                episode_reference = resolve_episode_reference(data_root, str(uri))
+                episode_reference = resolve_episode_reference(
+                    data_root, parse_data_root_relative_uri(str(uri))
+                )
                 report = application.process(
                     episode_reference,
                     record=True,
@@ -389,7 +392,9 @@ def _plan_after_sync(
 
     data_root = str(application.data_root)
     identity_by_uri = {
-        str(uri): application.source_identity(resolve_episode_reference(data_root, str(uri)))
+        str(uri): application.source_identity(
+            resolve_episode_reference(data_root, parse_data_root_relative_uri(str(uri)))
+        )
         for uri in uris
     }
     plans = plan_outstanding_stages(

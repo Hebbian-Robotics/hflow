@@ -242,6 +242,31 @@ def test_ingest_refuses_a_batch_count_the_run_could_not_honour(stub_server: str)
     assert _StubAirflowHandler.requests_seen == []
 
 
+@pytest.mark.parametrize(
+    "uri", ["", "   ", "/absolute.mcap", "../escape.mcap", "a/../../escape.mcap"]
+)
+def test_ingest_refuses_invalid_uris_before_http(stub_server: str, uri: str) -> None:
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    with pytest.raises(ValueError, match=r"relative to the data root|non-empty"):
+        client.ingest("pipeline_ingest", [uri])
+
+    assert _StubAirflowHandler.requests_seen == []
+
+
+def test_ingest_trims_valid_uris_without_normalizing_internal_segments(stub_server: str) -> None:
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    client.ingest("pipeline_ingest", ["  episodes-in/a/../b.mcap  "])
+
+    trigger_requests = [
+        entry for entry in _StubAirflowHandler.requests_seen if entry[1].endswith("/dagRuns")
+    ]
+    payload = trigger_requests[0][2]
+    assert payload is not None
+    assert payload["conf"]["uris"] == ["episodes-in/a/../b.mcap"]
+
+
 def test_bad_credentials_surface_clearly(stub_server: str) -> None:
     client = AirflowClient(stub_server, "airflow", "wrong-password")
     with pytest.raises(AirflowClientError) as error_info:

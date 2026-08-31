@@ -19,9 +19,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
+
+from hflow.uri import parse_data_root_relative_uri
 
 
 class AirflowClientError(RuntimeError):
@@ -312,7 +314,7 @@ class AirflowClient:
     def ingest(
         self,
         dag_id: str,
-        uris: list[str],
+        uris: Sequence[str],
         *,
         profile: str = "full",
         online: bool = False,
@@ -342,8 +344,9 @@ class AirflowClient:
             # Same wording as hflow.batching.plan_batches, the task-side owner
             # of this invariant, so both entry points say the same thing.
             raise ValueError(f"batch_count must be >= 1, got {batch_count}")
+        validated_uris = [str(parse_data_root_relative_uri(uri)) for uri in uris]
         conf: dict[str, Any] = {
-            "uris": uris,
+            "uris": validated_uris,
             "profile": profile,
             "mode": "online" if online else "batch",
         }

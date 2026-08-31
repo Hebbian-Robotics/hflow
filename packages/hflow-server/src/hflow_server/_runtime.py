@@ -24,7 +24,6 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
-from posixpath import normpath
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
@@ -36,6 +35,7 @@ from hflow.runtime import (
     client_for_bundle,
     client_for_endpoint,
     load_bundle,
+    parse_data_root_relative_uri,
     resolve_remote_endpoint,
     sub_dag_id_for_stage,
 )
@@ -412,20 +412,10 @@ def create_runtime_router(settings: ServerSettings, resolver: RuntimeResolver) -
     @router.post("/runtime/ingest")
     def trigger_ingest(request: IngestRequest) -> IngestTriggerResponse:
         refuse_when_read_only(settings, disabled_actions="triggering ingest runs is")
-        uris = [uri.strip() for uri in request.uris]
-        if any(not uri for uri in uris):
-            raise HTTPException(status_code=400, detail="every uri must be a non-empty string")
-        # URIs resolve against the runtime's data root; absolute host paths and
-        # ../ escapes cannot work there, so refuse them before triggering --
-        # the same guard `hflow ingest` enforces (src/hflow/cli.py).
-        for uri in uris:
-            if uri.startswith("/") or normpath(uri).startswith(".."):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"{uri!r} is not relative to the data root -- URIs are resolved "
-                    "against the runtime's configured data root (e.g. "
-                    "`episodes-in/run_0001.mcap`)",
-                )
+        try:
+            uris = [str(parse_data_root_relative_uri(uri)) for uri in request.uris]
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
         if request.profile not in RUN_PROFILES:
             raise HTTPException(
                 status_code=400,

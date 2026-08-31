@@ -41,6 +41,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from hflow.steps import RAN_STATUSES, SETTLED_STATUSES, Stage
+from hflow.uri import parse_data_root_relative_uri
 
 if TYPE_CHECKING:
     import duckdb
@@ -372,7 +373,9 @@ def outstanding_stage_uris(
     from hflow.stage_execution import resolve_episode_reference
 
     identity_by_uri = {
-        uri: application.source_identity(resolve_episode_reference(data_root, str(uri)))
+        uri: application.source_identity(
+            resolve_episode_reference(data_root, parse_data_root_relative_uri(str(uri)))
+        )
         for uri in uris
     }
     plans = plan_outstanding_stages(application, list(identity_by_uri.values()), (stage,))
