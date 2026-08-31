@@ -545,7 +545,7 @@ def import_lerobot_dataset(
         raise ValueError("camera_keys must not contain duplicates")
 
     repository_information = _hf_repo_info(normalized_dataset_repo, normalized_revision)
-    cache_directory = output_dir / "_lerobot_cache"
+    cache_directory = output_dir / "_lerobot_cache" / repository_information["sha"]
     source_archive = _ensure_source_archive(
         DatasetSource(
             repo_id=normalized_dataset_repo,
