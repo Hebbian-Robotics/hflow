@@ -30,8 +30,10 @@ from examples.egosuite_evaluation.geometry import (
     project_world_joints,
 )
 from examples.egosuite_evaluation.judgment import (
-    HandCountJudgment,
+    ModelResponseMetadata,
+    ParsedHandCountOutcome,
     ResponseFormat,
+    UnparsedHandCountOutcome,
     evaluate_image_with_model,
 )
 from examples.egosuite_evaluation.pipeline import (
@@ -129,11 +131,12 @@ def test_model_response_without_text_is_a_recoverable_invalid_judgment() -> None
         max_tokens=512,
     )
 
-    assert judgment == HandCountJudgment(
+    assert judgment == UnparsedHandCountOutcome(
         raw_response="",
-        predicted_hand_count=None,
-        response_model="routed-model",
-        usage={"total_tokens": 17},
+        response_metadata=ModelResponseMetadata(
+            response_model="routed-model",
+            usage={"total_tokens": 17},
+        ),
         parse_error="endpoint returned no text completion content",
     )
 
@@ -200,23 +203,28 @@ def test_pipeline_records_agreement_output_validity_and_frame_intervals() -> Non
         for frame_index in range(3)
     ]
     judgments = [
-        HandCountJudgment(
+        ParsedHandCountOutcome(
             raw_response='{"hand_count": 1}',
+            response_metadata=ModelResponseMetadata(
+                response_model="routed-model",
+                usage={"prompt_tokens": 10, "completion_tokens": 2},
+            ),
             predicted_hand_count=1,
-            response_model="routed-model",
-            usage={"prompt_tokens": 10, "completion_tokens": 2},
         ),
-        HandCountJudgment(
+        ParsedHandCountOutcome(
             raw_response='{"hand_count": 1}',
+            response_metadata=ModelResponseMetadata(
+                response_model="routed-model",
+                usage={"prompt_tokens": 11, "completion_tokens": 2},
+            ),
             predicted_hand_count=1,
-            response_model="routed-model",
-            usage={"prompt_tokens": 11, "completion_tokens": 2},
         ),
-        HandCountJudgment(
+        UnparsedHandCountOutcome(
             raw_response="not a count",
-            predicted_hand_count=None,
-            response_model="routed-model",
-            usage={"prompt_tokens": 12, "completion_tokens": 2},
+            response_metadata=ModelResponseMetadata(
+                response_model="routed-model",
+                usage={"prompt_tokens": 12, "completion_tokens": 2},
+            ),
             parse_error="hand count must be 0, 1, or 2",
         ),
     ]

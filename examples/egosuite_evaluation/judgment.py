@@ -31,12 +31,32 @@ class ResponseFormat(StrEnum):
 
 
 @dataclass(frozen=True)
-class HandCountJudgment:
-    raw_response: str
-    predicted_hand_count: int | None
+class ModelResponseMetadata:
+    """Provider response fields retained for every hand-count outcome."""
+
     response_model: str | None
     usage: dict[str, object]
-    parse_error: str | None = None
+
+
+@dataclass(frozen=True)
+class ParsedHandCountOutcome:
+    """A model response successfully parsed as a supported hand count."""
+
+    raw_response: str
+    response_metadata: ModelResponseMetadata
+    predicted_hand_count: int
+
+
+@dataclass(frozen=True)
+class UnparsedHandCountOutcome:
+    """A completed model response outside the supported hand-count vocabulary."""
+
+    raw_response: str
+    response_metadata: ModelResponseMetadata
+    parse_error: str
+
+
+HandCountOutcome = ParsedHandCountOutcome | UnparsedHandCountOutcome
 
 
 def image_file_data_url(image_path: Path) -> str:
@@ -118,12 +138,19 @@ def _chat_completion_response_text(response: object) -> str:
     raise ValueError("endpoint returned no text completion content")
 
 
-def _response_usage(response: object) -> dict[str, object]:
+def _response_metadata(response: object) -> ModelResponseMetadata:
+    response_model = getattr(response, "model", None)
+    normalized_response_model = response_model if isinstance(response_model, str) else None
     usage = getattr(response, "usage", None)
-    if usage is None or not callable(getattr(usage, "model_dump", None)):
-        return {}
-    dumped_usage = usage.model_dump(exclude_none=True)
-    return dumped_usage if isinstance(dumped_usage, dict) else {}
+    parsed_usage: dict[str, object] = {}
+    if usage is not None and callable(getattr(usage, "model_dump", None)):
+        dumped_usage = usage.model_dump(exclude_none=True)
+        if isinstance(dumped_usage, dict):
+            parsed_usage = dumped_usage
+    return ModelResponseMetadata(
+        response_model=normalized_response_model,
+        usage=parsed_usage,
+    )
 
 
 def evaluate_image_with_model(
@@ -135,7 +162,7 @@ def evaluate_image_with_model(
     response_format: ResponseFormat,
     temperature: float | None,
     max_tokens: int,
-) -> HandCountJudgment:
+) -> HandCountOutcome:
     """Run one hand-count request through an OpenAI-compatible client."""
 
     request_parameters: dict[str, object] = {
@@ -158,32 +185,25 @@ def evaluate_image_with_model(
         request_parameters["temperature"] = temperature
 
     response = client.chat.completions.create(**request_parameters)
-    response_model = getattr(response, "model", None)
-    normalized_response_model = response_model if isinstance(response_model, str) else None
-    usage = _response_usage(response)
+    response_metadata = _response_metadata(response)
     try:
         raw_response = _chat_completion_response_text(response)
     except ValueError as error:
-        return HandCountJudgment(
+        return UnparsedHandCountOutcome(
             raw_response="",
-            predicted_hand_count=None,
-            response_model=normalized_response_model,
-            usage=usage,
+            response_metadata=response_metadata,
             parse_error=str(error),
         )
     try:
         predicted_hand_count = parse_hand_count_response(raw_response)
     except ValueError as error:
-        return HandCountJudgment(
+        return UnparsedHandCountOutcome(
             raw_response=raw_response,
-            predicted_hand_count=None,
-            response_model=normalized_response_model,
-            usage=usage,
+            response_metadata=response_metadata,
             parse_error=str(error),
         )
-    return HandCountJudgment(
+    return ParsedHandCountOutcome(
         raw_response=raw_response,
+        response_metadata=response_metadata,
         predicted_hand_count=predicted_hand_count,
-        response_model=normalized_response_model,
-        usage=usage,
     )
