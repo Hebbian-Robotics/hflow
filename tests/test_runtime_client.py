@@ -12,6 +12,8 @@ import pytest
 from hflow.runtime import (
     AirflowClient,
     AirflowClientError,
+    AirflowDagRun,
+    AirflowTaskInstance,
     BearerToken,
     PasswordCredentials,
     RemoteRuntimeEndpoint,
@@ -28,6 +30,8 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
     healthy: ClassVar[bool] = True
     expire_first_token: ClassVar[bool] = False
     health_response_body: ClassVar[bytes | None] = None
+    dag_run_response_body: ClassVar[object | None] = None
+    task_instances_response_body: ClassVar[object | None] = None
 
     def _read_json(self) -> dict[str, Any] | None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -66,6 +70,13 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
             if not self._bearer_ok(authorization):
                 self._respond(401, {"detail": "expired"})
                 return
+            if type(self).dag_run_response_body is not None:
+                body = type(self).dag_run_response_body
+                if isinstance(body, bytes):
+                    self._respond_bytes(200, body)
+                else:
+                    self._respond(200, body)
+                return
             requested_run_id = (payload or {}).get("dag_run_id")
             if requested_run_id == "already-exists" or (payload or {}).get("conf", {}).get(
                 "force_conflict"
@@ -82,11 +93,25 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
             if not self._bearer_ok(authorization):
                 self._respond(401, {"detail": "expired"})
                 return
+            if type(self).task_instances_response_body is not None:
+                body = type(self).task_instances_response_body
+                if isinstance(body, bytes):
+                    self._respond_bytes(200, body)
+                else:
+                    self._respond(200, body)
+                return
             self._respond(200, {"task_instances": [{"task_id": "plan", "map_index": -1}]})
             return
         if "/dagRuns/" in self.path:
             if not self._bearer_ok(authorization):
                 self._respond(401, {"detail": "expired"})
+                return
+            if type(self).dag_run_response_body is not None:
+                body = type(self).dag_run_response_body
+                if isinstance(body, bytes):
+                    self._respond_bytes(200, body)
+                else:
+                    self._respond_bytes(200, json.dumps(body).encode())
                 return
             existing_run_id = self.path.rsplit("/", 1)[-1]
             self._respond(200, {"dag_run_id": existing_run_id, "state": "running"})
@@ -94,6 +119,13 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
         if "/dagRuns" in self.path:  # the run LIST (with or without ?limit=)
             if not self._bearer_ok(authorization):
                 self._respond(401, {"detail": "expired"})
+                return
+            if type(self).dag_run_response_body is not None:
+                body = type(self).dag_run_response_body
+                if isinstance(body, bytes):
+                    self._respond_bytes(200, body)
+                else:
+                    self._respond_bytes(200, json.dumps(body).encode())
                 return
             self._respond(200, {"dag_runs": [{"dag_run_id": "manual__1", "state": "success"}]})
             return
@@ -143,6 +175,8 @@ def _reset_stub_airflow_state() -> None:
     _StubAirflowHandler.healthy = True
     _StubAirflowHandler.expire_first_token = False
     _StubAirflowHandler.health_response_body = None
+    _StubAirflowHandler.dag_run_response_body = None
+    _StubAirflowHandler.task_instances_response_body = None
 
 
 @pytest.fixture(scope="module")
@@ -172,7 +206,7 @@ def test_trigger_fetches_token_once_and_sends_bearer(stub_server: str) -> None:
     client = AirflowClient(stub_server, "airflow", "right-password")
     first = client.trigger_dag_run("pipeline_ingest", conf={"uris": ["a.mcap"]})
     second = client.ingest("pipeline_ingest", ["b.mcap"])
-    assert first["state"] == "queued" and second["state"] == "queued"
+    assert first.state == "queued" and second.state == "queued"
     assert len(_StubAirflowHandler.issued_tokens) == 1  # token cached across calls
 
     trigger_requests = [
@@ -189,18 +223,112 @@ def test_expired_token_is_refreshed_once(stub_server: str) -> None:
     client = AirflowClient(stub_server, "airflow", "right-password")
     client._token = None  # force initial fetch
     result = client.trigger_dag_run("pipeline_ingest")
-    assert result["state"] == "queued"
+    assert result.state == "queued"
     assert len(_StubAirflowHandler.issued_tokens) == 2  # refreshed exactly once
 
 
 def test_caller_supplied_dag_run_id_makes_retries_idempotent(stub_server: str) -> None:
     client = AirflowClient(stub_server, "airflow", "right-password")
     created = client.ingest("pipeline_ingest", ["a.mcap"], dag_run_id="my-run-1")
-    assert created == {"dag_run_id": "my-run-1", "state": "queued"}
+    assert created == AirflowDagRun(
+        dag_run_id="my-run-1",
+        state="queued",
+        logical_date=None,
+        start_date=None,
+        end_date=None,
+        conf={},
+    )
 
     # A retry whose id already exists gets the EXISTING run back, not a 409.
     existing = client.trigger_dag_run("pipeline_ingest", dag_run_id="already-exists")
-    assert existing == {"dag_run_id": "already-exists", "state": "running"}
+    assert existing == AirflowDagRun(
+        dag_run_id="already-exists",
+        state="running",
+        logical_date=None,
+        start_date=None,
+        end_date=None,
+        conf={},
+    )
+
+
+def test_dag_run_response_is_parsed_into_typed_model(stub_server: str) -> None:
+    _StubAirflowHandler.dag_run_response_body = {
+        "dag_run_id": "run-1",
+        "state": "running",
+        "logical_date": "2026-08-22T03:06:55+00:00",
+        "start_date": "2026-08-22T03:07:00+00:00",
+        "end_date": None,
+        "conf": {"uris": ["a.mcap"]},
+    }
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    run = client.dag_run("pipeline_ingest", "run-1")
+
+    assert run == AirflowDagRun(
+        dag_run_id="run-1",
+        state="running",
+        logical_date="2026-08-22T03:06:55+00:00",
+        start_date="2026-08-22T03:07:00+00:00",
+        end_date=None,
+        conf={"uris": ["a.mcap"]},
+    )
+
+
+def test_task_instance_response_is_parsed_into_typed_model(stub_server: str) -> None:
+    _StubAirflowHandler.task_instances_response_body = {
+        "task_instances": [
+            {
+                "task_id": "process_batch",
+                "state": "success",
+                "start_date": "2026-08-22T03:07:00+00:00",
+                "end_date": "2026-08-22T03:07:05+00:00",
+                "queued_when": "2026-08-22T03:06:59+00:00",
+                "try_number": 2,
+                "map_index": 3,
+                "duration": 5.0,
+            }
+        ]
+    }
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    instances = client.task_instances("pipeline_ingest", "run-1")
+
+    assert instances == [
+        AirflowTaskInstance(
+            task_id="process_batch",
+            state="success",
+            start_date="2026-08-22T03:07:00+00:00",
+            end_date="2026-08-22T03:07:05+00:00",
+            queued_at="2026-08-22T03:06:59+00:00",
+            try_number=2,
+            map_index=3,
+            duration=5.0,
+        )
+    ]
+
+
+def test_malformed_dag_run_item_raises_typed_client_error(stub_server: str) -> None:
+    _StubAirflowHandler.dag_run_response_body = {
+        "dag_runs": ["not-an-object"]
+    }
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    with pytest.raises(
+        AirflowClientError, match="returned a DAG run that is not a JSON object"
+    ):
+        client.dag_runs("pipeline_ingest")
+
+
+def test_malformed_task_instance_item_raises_typed_client_error(stub_server: str) -> None:
+    _StubAirflowHandler.task_instances_response_body = {
+        "task_instances": ["not-an-object"]
+    }
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    with pytest.raises(
+        AirflowClientError, match="returned a task instance that is not a JSON object"
+    ):
+        client.task_instances("pipeline_ingest", "run-1")
 
 
 def test_per_run_endpoints_address_the_same_run(stub_server: str) -> None:
@@ -323,7 +451,7 @@ def test_bearer_token_auth_never_calls_the_token_endpoint(stub_server: str) -> N
     _StubAirflowHandler.issued_tokens.append("pre-issued-token")
     client = AirflowClient(stub_server, auth=BearerToken("pre-issued-token"))
     result = client.trigger_dag_run("pipeline_ingest")
-    assert result["state"] == "queued"
+    assert result.state == "queued"
     token_endpoint_requests = [
         entry for entry in _StubAirflowHandler.requests_seen if entry[1] == "/auth/token"
     ]

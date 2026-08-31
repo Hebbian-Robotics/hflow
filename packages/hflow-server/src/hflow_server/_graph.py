@@ -38,6 +38,8 @@ from hflow.manifest import PipelineManifest
 from hflow.runtime import (
     AirflowClient,
     AirflowClientError,
+    AirflowDagRun,
+    AirflowTaskInstance,
     DagTaskNode,
     DagTopology,
     IngestTopology,
@@ -261,44 +263,37 @@ def _parsed_timestamp(value: object) -> datetime | None:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
-def _duration_seconds(instance: dict[str, Any]) -> float | None:
+def _duration_seconds(instance: AirflowTaskInstance) -> float | None:
     """One task instance's wall duration, computed here rather than trusted.
 
     Airflow's own ``duration`` field is the fallback for an instance whose
     timestamps this build cannot parse.
     """
-    started_at = _parsed_timestamp(instance.get("start_date"))
-    ended_at = _parsed_timestamp(instance.get("end_date"))
+    started_at = _parsed_timestamp(instance.start_date)
+    ended_at = _parsed_timestamp(instance.end_date)
     if started_at is not None and ended_at is not None:
         return (ended_at - started_at).total_seconds()
-    reported_duration = instance.get("duration")
-    if isinstance(reported_duration, int | float) and not isinstance(reported_duration, bool):
-        return float(reported_duration) if isfinite(float(reported_duration)) else None
+    if instance.duration is not None and isfinite(instance.duration):
+        return instance.duration
     return None
 
 
-def _task_instance(instance: dict[str, Any]) -> RunTaskInstance:
+def _task_instance(instance: AirflowTaskInstance) -> RunTaskInstance:
     """One Airflow task instance reduced to what the graph draws."""
-    try_number = instance.get("try_number")
-    map_index = instance.get("map_index")
     return RunTaskInstance(
-        task_id=optional_string(instance.get("task_id")),
-        state=optional_string(instance.get("state")),
-        start_date=optional_string(instance.get("start_date")),
-        end_date=optional_string(instance.get("end_date")),
-        # Airflow has spelled the queued timestamp both ways across versions
-        # and may omit it; absent is fine.
-        queued_at=optional_string(instance.get("queued_when") or instance.get("queued_at")),
-        try_number=int(try_number) if isinstance(try_number, int) else None,
-        # -1 is Airflow's "not a mapped instance"; an absent value means the
-        # same thing.
-        map_index=int(map_index) if isinstance(map_index, int) else -1,
+        task_id=instance.task_id,
+        state=instance.state,
+        start_date=instance.start_date,
+        end_date=instance.end_date,
+        queued_at=instance.queued_at,
+        try_number=instance.try_number,
+        map_index=instance.map_index,
         duration_s=_duration_seconds(instance),
     )
 
 
 def _sorted_task_instances(
-    instances: list[dict[str, Any]], topology: DagTopology
+    instances: list[AirflowTaskInstance], topology: DagTopology
 ) -> list[RunTaskInstance]:
     """Task instances in TOPOLOGY order (then by map index), not API order."""
     topology_positions = {node.task_id: index for index, node in enumerate(topology.tasks)}
@@ -349,7 +344,7 @@ def _mapped_summary(
 class _MatchedStageRun:
     """The stage run a master run most plausibly triggered, and how it matched."""
 
-    run: dict[str, Any]
+    run: AirflowDagRun
     match: StageRunMatch
 
 
@@ -372,18 +367,18 @@ class _MasterRunWindow:
         return started_at <= self.ended_at + _STAGE_RUN_START_GRACE_AFTER_MASTER_END
 
 
-def _master_run_window(master_run: dict[str, Any]) -> _MasterRunWindow | None:
+def _master_run_window(master_run: AirflowDagRun) -> _MasterRunWindow | None:
     """One master run's live interval, or None when it has not started yet."""
-    started_at = _parsed_timestamp(master_run.get("start_date"))
+    started_at = _parsed_timestamp(master_run.start_date)
     if started_at is None:
         return None
     return _MasterRunWindow(
-        started_at=started_at, ended_at=_parsed_timestamp(master_run.get("end_date"))
+        started_at=started_at, ended_at=_parsed_timestamp(master_run.end_date)
     )
 
 
 def _matched_stage_run(
-    stage_runs: list[dict[str, Any]], window: _MasterRunWindow | None
+    stage_runs: list[AirflowDagRun], window: _MasterRunWindow | None
 ) -> _MatchedStageRun | None:
     """The EARLIEST run of one stage sub-DAG that started inside the master's window.
 
@@ -413,10 +408,10 @@ def _matched_stage_run(
     """
     if window is None:
         return None
-    earliest_run: dict[str, Any] | None = None
+    earliest_run: AirflowDagRun | None = None
     earliest_started_at: datetime | None = None
     for run in stage_runs:
-        started_at = _parsed_timestamp(run.get("start_date"))
+        started_at = _parsed_timestamp(run.start_date)
         if started_at is None or not window.contains_stage_run_start(started_at):
             continue
         if earliest_started_at is None or started_at < earliest_started_at:
@@ -531,7 +526,7 @@ def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver
             if matched is None:
                 stages.append(_empty_stage_graph(stage_topology))
                 continue
-            stage_run_id = optional_string(matched.run.get("dag_run_id"))
+            stage_run_id = matched.run.dag_run_id
             stage_tasks = (
                 _sorted_task_instances(
                     stage_task_instances(runtime.client, stage_dag_id, stage_run_id),
@@ -545,7 +540,7 @@ def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver
                     stage=stage_topology.stage,
                     dag_id=stage_dag_id,
                     dag_run_id=stage_run_id,
-                    state=optional_string(matched.run.get("state")),
+                    state=matched.run.state,
                     match=matched.match,
                     tasks=stage_tasks,
                     mapped_summary=_mapped_summary(stage_tasks, stage_topology),
@@ -554,8 +549,8 @@ def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver
 
         return RunGraphResponse(
             master=RunGraphMaster(
-                dag_run_id=optional_string(master_run.get("dag_run_id")) or dag_run_id,
-                state=optional_string(master_run.get("state")),
+                dag_run_id=master_run.dag_run_id or dag_run_id,
+                state=master_run.state,
                 tasks=_sorted_task_instances(master_instances, topology.master),
             ),
             stages=stages,
