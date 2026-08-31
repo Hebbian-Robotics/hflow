@@ -2,7 +2,7 @@
 infrastructure. Mirrors the README design-target example."""
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -177,7 +177,25 @@ def test_canonical_episode_extracts_exact_source_frame_indices(
             frame_indices=selected_frame_indices,
         )
 
+        numpy_frame_indices = [
+            cast(int, np.int32(0)),
+            cast(int, np.int64(1)),
+            cast(int, np.uint32(2)),
+            cast(int, np.uint64(7)),
+            cast(int, np.int64(8)),
+            cast(int, np.uint32(29)),
+        ]
+        numpy_frames = episode.frames_at_indices(
+            camera_topic,
+            frame_indices=numpy_frame_indices,
+        )
+
         assert [frame.log_time_ns for frame in selected_frames] == expected_log_times.tolist()
+        assert [frame.log_time_ns for frame in numpy_frames] == expected_log_times.tolist()
+        assert [frame.path.read_bytes() for frame in numpy_frames] == [
+            frame.path.read_bytes() for frame in selected_frames
+        ]
+        assert numpy_frames == selected_frames
         assert all(frame.path.read_bytes()[:2] == b"\xff\xd8" for frame in selected_frames)
         assert (
             episode.frames_at_indices(
