@@ -219,7 +219,13 @@ def _hf_repo_info(repo_id: str, revision: str) -> _DatasetRepositoryInformation:
     """Resolve the immutable commit sha and license for a HF dataset repo."""
     url = f"https://huggingface.co/api/datasets/{repo_id}/revision/{revision}"
     with urllib.request.urlopen(_hugging_face_request(url), timeout=60) as response:
-        repository_information = json.loads(response.read().decode())
+        try:
+            repository_information = json.loads(response.read().decode())
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"Hugging Face repository response for {repo_id}@{revision} is not valid "
+                f"JSON: {error}"
+            ) from error
     if not isinstance(repository_information, dict):
         raise ValueError("Hugging Face repository response is not a JSON object")
     resolved_revision = repository_information.get("sha")
@@ -239,7 +245,13 @@ def _hf_tree(repo_id: str, revision: str, path: str) -> list[dict]:
     """List files under a HF dataset tree path (recursive)."""
     url = f"https://huggingface.co/api/datasets/{repo_id}/tree/{revision}/{path}?recursive=true"
     with urllib.request.urlopen(_hugging_face_request(url), timeout=60) as response:
-        tree_entries = json.loads(response.read().decode())
+        try:
+            tree_entries = json.loads(response.read().decode())
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"Hugging Face tree response for {repo_id}@{revision} path {path!r} is not "
+                f"valid JSON: {error}"
+            ) from error
     if not isinstance(tree_entries, list) or not all(
         isinstance(tree_entry, dict) for tree_entry in tree_entries
     ):
@@ -268,7 +280,12 @@ def _fetch_info_json(repo_id: str, revision: str, cache_dir: Path) -> dict:
         raise RuntimeError("meta/info.json not found; not a LeRobot v3 repository")
     load_url = f"https://huggingface.co/datasets/{repo_id}/resolve/{revision}/meta/info.json"
     with urllib.request.urlopen(_hugging_face_request(load_url), timeout=120) as response:
-        dataset_information = json.loads(response.read().decode())
+        try:
+            dataset_information = json.loads(response.read().decode())
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"LeRobot meta/info.json for {repo_id}@{revision} is not valid JSON: {error}"
+            ) from error
     if not isinstance(dataset_information, dict):
         raise ValueError("LeRobot meta/info.json is not a JSON object")
     (cache_dir / "meta").mkdir(parents=True, exist_ok=True)

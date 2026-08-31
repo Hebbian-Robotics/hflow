@@ -8,6 +8,7 @@ implementation details or touching the network.
 import json
 import shutil
 import subprocess
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -395,3 +396,151 @@ def test_converter_output_remuxes_without_tail_loss(
         check=True,
     )
     assert "nb_read_frames=90" in probe.stdout, probe.stdout
+
+
+# --- Hugging Face JSON boundary contextual errors (#301) ---------------------
+#
+# The LeRobot importer decodes response bytes at three HF boundaries (repo
+# info, tree listings, meta/info.json). Invalid UTF-8 or malformed JSON must
+# surface as a contextual ValueError naming the source, with the original
+# decoder exception chained as the cause. These tests stub urlopen with local
+# bytes; no network request is made.
+
+
+class _StubResponse:
+    """Minimal urlopen response double: a context manager with read()."""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def __enter__(self) -> "_StubResponse":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._body
+
+
+class _StubUrlopen:
+    """Routes urlopen calls to fixed bytes by a marker in the request URL."""
+
+    def __init__(self, routes: dict[str, bytes]) -> None:
+        self._routes = routes
+
+    def __call__(self, request: urllib.request.Request, timeout: int = 60) -> _StubResponse:
+        url = request.full_url
+        for marker, body in self._routes.items():
+            if marker in url:
+                return _StubResponse(body)
+        raise AssertionError(f"unexpected urlopen URL: {url}")
+
+
+def _stub_urlopen(monkeypatch: pytest.MonkeyPatch, routes: dict[str, bytes]) -> None:
+    monkeypatch.setattr(urllib.request, "urlopen", _StubUrlopen(routes))
+
+
+_INVALID_UTF8 = b"\xff\xfe\x00"
+_MALFORMED_JSON = b"{not json"
+
+
+def test_hf_repo_info_invalid_utf8_raises_contextual_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_urlopen(monkeypatch, {"/api/datasets/": _INVALID_UTF8})
+    with pytest.raises(ValueError) as excinfo:
+        prep._hf_repo_info("lerobot/pusht", "main")
+    assert "lerobot/pusht@main" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, UnicodeDecodeError)
+
+
+def test_hf_repo_info_malformed_json_raises_contextual_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_urlopen(monkeypatch, {"/api/datasets/": _MALFORMED_JSON})
+    with pytest.raises(ValueError) as excinfo:
+        prep._hf_repo_info("lerobot/pusht", "main")
+    assert "lerobot/pusht@main" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
+
+
+def test_hf_tree_invalid_utf8_raises_contextual_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_urlopen(monkeypatch, {"/tree/": _INVALID_UTF8})
+    with pytest.raises(ValueError) as excinfo:
+        prep._hf_tree("lerobot/pusht", "main", "meta")
+    message = str(excinfo.value)
+    assert "lerobot/pusht@main" in message
+    assert "'meta'" in message
+    assert isinstance(excinfo.value.__cause__, UnicodeDecodeError)
+
+
+def test_hf_tree_malformed_json_raises_contextual_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_urlopen(monkeypatch, {"/tree/": b"[1, 2"})
+    with pytest.raises(ValueError) as excinfo:
+        prep._hf_tree("lerobot/pusht", "main", "meta")
+    message = str(excinfo.value)
+    assert "lerobot/pusht@main" in message
+    assert "'meta'" in message
+    assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
+
+
+def test_fetch_info_json_invalid_utf8_raises_contextual_value_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    tree_body = json.dumps([{"path": "meta/info.json", "type": "file"}]).encode()
+    _stub_urlopen(
+        monkeypatch,
+        {"recursive=true": tree_body, "meta/info.json": _INVALID_UTF8},
+    )
+    with pytest.raises(ValueError) as excinfo:
+        prep._fetch_info_json("lerobot/pusht", "main", tmp_path)
+    message = str(excinfo.value)
+    assert "meta/info.json" in message
+    assert "lerobot/pusht@main" in message
+    assert isinstance(excinfo.value.__cause__, UnicodeDecodeError)
+
+
+def test_fetch_info_json_malformed_json_raises_contextual_value_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    tree_body = json.dumps([{"path": "meta/info.json", "type": "file"}]).encode()
+    _stub_urlopen(
+        monkeypatch,
+        {"recursive=true": tree_body, "meta/info.json": b"{oops"},
+    )
+    with pytest.raises(ValueError) as excinfo:
+        prep._fetch_info_json("lerobot/pusht", "main", tmp_path)
+    message = str(excinfo.value)
+    assert "meta/info.json" in message
+    assert "lerobot/pusht@main" in message
+    assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
+
+
+def test_hf_repo_info_valid_json_still_resolves(monkeypatch: pytest.MonkeyPatch) -> None:
+    body = json.dumps({"sha": "abc123", "cardData": {"license": "apache-2.0"}}).encode()
+    _stub_urlopen(monkeypatch, {"/api/datasets/": body})
+    assert prep._hf_repo_info("lerobot/pusht", "main") == {
+        "sha": "abc123",
+        "license": "apache-2.0",
+    }
+
+
+def test_hf_tree_valid_json_still_returns_entries(monkeypatch: pytest.MonkeyPatch) -> None:
+    body = json.dumps([{"path": "meta/info.json", "type": "file"}]).encode()
+    _stub_urlopen(monkeypatch, {"/tree/": body})
+    assert prep._hf_tree("lerobot/pusht", "main", "meta") == [
+        {"path": "meta/info.json", "type": "file"}
+    ]
+
+
+def test_hf_repo_info_wrong_shape_refusal_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_urlopen(monkeypatch, {"/api/datasets/": b"[1, 2, 3]"})
+    with pytest.raises(ValueError, match="not a JSON object"):
+        prep._hf_repo_info("lerobot/pusht", "main")
