@@ -16,6 +16,7 @@ import pytest
 
 import hflow
 from hflow.app import _read_sync_completion_marker
+from hflow.format import FFMPEG_VERSION_NOT_USED
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import EpisodeStamps, TransformConfig, write_canonical_episode
 
@@ -25,6 +26,22 @@ SYNC_ONLY = {hflow.Stage.SYNC}
 def _episode(path: Path, *, duration_s: float = 1.0, seed: int = 0) -> Path:
     return synthesize_episode(
         path, SyntheticEpisodeSpec(duration_s=duration_s, cameras=(), seed=seed)
+    )
+
+
+def _camera_episode(path: Path, *, duration_s: float = 0.5, seed: int = 0) -> Path:
+    """One short camera-bearing source: enough for ffmpeg to stamp a real version."""
+    return synthesize_episode(
+        path,
+        SyntheticEpisodeSpec(
+            duration_s=duration_s,
+            cameras=("wrist_cam",),
+            image_hz=10.0,
+            seed=seed,
+            black_segment=None,
+            timestamp_offset_segment=None,
+            joint_jump_at_s=None,
+        ),
     )
 
 
@@ -43,6 +60,63 @@ def test_an_unchanged_source_is_not_transcoded_twice(tmp_path: Path) -> None:
     # The canonical file was not rewritten, which is the whole point.
     assert second.canonical_path.stat().st_mtime_ns == mtime_after_first
     assert first.stamps == second.stamps
+
+
+def test_an_unchanged_source_with_a_camera_is_not_transcoded_twice(tmp_path: Path) -> None:
+    """Control: the ffmpeg reuse comparisons are reachable, and still pass."""
+    source = _camera_episode(tmp_path / "episode_0001.mcap")
+    app = hflow.App("reuse-camera", data_root=tmp_path / "data", default_checks=())
+
+    first = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
+    mtime_after_first = first.canonical_path.stat().st_mtime_ns
+    second = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
+
+    assert first.stamps.ffmpeg_version != FFMPEG_VERSION_NOT_USED
+    assert first.sync_reused is False
+    assert second.sync_reused is True
+    assert second.canonical_path.stat().st_mtime_ns == mtime_after_first
+    assert first.stamps == second.stamps
+
+
+def test_a_marker_recording_a_different_ffmpeg_version_is_not_reused(tmp_path: Path) -> None:
+    """The witness carries the build that encoded the canonical; a different
+    recorded version cannot prove the next transcode would match those bytes."""
+    source = _camera_episode(tmp_path / "episode_0001.mcap")
+    app = hflow.App("marker-ffmpeg", data_root=tmp_path / "data", default_checks=())
+    first = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
+
+    marker_path = first.canonical_path.parent / ".sync-complete.json"
+    marker_payload = json.loads(marker_path.read_text())
+    marker_payload["ffmpeg_version"] = "ffmpeg version other-than-canonical-stamps"
+    marker_path.write_text(json.dumps(marker_payload, sort_keys=True) + "\n")
+
+    # The witness is still complete: refusal must come from the stamps-vs-marker
+    # comparison, not from dropping a partial group.
+    assert first.stamps.ffmpeg_version != FFMPEG_VERSION_NOT_USED
+    witness = _read_sync_completion_marker(marker_path).reuse_witness
+    assert witness is not None
+    assert witness.ffmpeg_version != first.stamps.ffmpeg_version
+
+    second = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
+    assert second.sync_reused is False
+
+
+def test_a_canonical_ffmpeg_version_that_no_longer_matches_the_live_build_is_not_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The transform stamps ffmpeg outside pipeline_version, so a newer build
+    must refuse reuse even when the marker still agrees with the canonical."""
+    source = _camera_episode(tmp_path / "episode_0001.mcap")
+    app = hflow.App("live-ffmpeg", data_root=tmp_path / "data", default_checks=())
+    first = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
+    assert first.stamps.ffmpeg_version != FFMPEG_VERSION_NOT_USED
+
+    # Local import inside the reuse gate: patch the source module, not a name
+    # bound on hflow.app.
+    monkeypatch.setattr("hflow.ffmpeg.ffmpeg_version", lambda: "ffmpeg version not-the-live-build")
+
+    second = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
+    assert second.sync_reused is False
 
 
 def test_sync_completion_marker_keeps_its_existing_json_bytes(tmp_path: Path) -> None:
