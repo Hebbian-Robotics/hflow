@@ -427,7 +427,18 @@ class TestResolveRemoteEndpoint:
                 environ={"HFLOW_AIRFLOW_TOKEN": "minted-token"},
             )
 
-    @pytest.mark.parametrize("hostless_url", ["http://", "https://", "https:///path"])
+    @pytest.mark.parametrize(
+        "hostless_url",
+        [
+            "http://",
+            "https://",
+            "https:///path",
+            # A port or userinfo alone still names no host, and these are the
+            # shapes that separate `hostname` from the truthy `netloc`.
+            "http://:8080",
+            "http://user@",
+        ],
+    )
     def test_hostless_url_is_refused_at_the_boundary(self, hostless_url: str) -> None:
         with pytest.raises(ValueError, match="needs a host"):
             resolve_remote_endpoint(
@@ -445,6 +456,26 @@ class TestResolveRemoteEndpoint:
                     "HFLOW_AIRFLOW_TOKEN": "minted-token",
                 },
             )
+
+    @pytest.mark.parametrize(
+        "hosted_url",
+        [
+            "http://127.0.0.1:8080",
+            "http://127.0.0.1:8080/airflow",
+            "https://workspace.example.com:8443/prefix/path",
+            "http://[::1]:8080",
+        ],
+    )
+    def test_explicit_port_and_path_prefix_stay_accepted(self, hosted_url: str) -> None:
+        # The host requirement must not narrow the shapes a real deployment
+        # uses: loopback addresses, explicit ports, and path-prefixed bases.
+        endpoint = resolve_remote_endpoint(
+            airflow_url=hosted_url,
+            dag_id="kitchen_ingest",
+            environ={"HFLOW_AIRFLOW_TOKEN": "minted-token"},
+        )
+        assert endpoint is not None
+        assert endpoint.base_url == hosted_url
 
 
 def test_describe_remote_status_reports_health_dag_and_recent_runs(stub_server: str) -> None:

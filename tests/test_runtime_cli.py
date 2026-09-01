@@ -960,7 +960,8 @@ def test_ingest_remote_with_hostless_url_names_the_fix(
     assert exit_code == 2
     error_output = capsys.readouterr().err
     assert "needs a host" in error_output
-    assert "--airflow-url" in error_output or "HFLOW_AIRFLOW_URL" in error_output
+    assert "--airflow-url" in error_output
+    assert "HFLOW_AIRFLOW_URL" in error_output
 
 
 def test_explicit_bundle_dir_stays_local_even_with_remote_environment(
