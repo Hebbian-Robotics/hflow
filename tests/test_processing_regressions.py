@@ -41,6 +41,12 @@ KEYFRAME_WITHOUT_AUD = b"".join(
     for nal_type in (0x67, 0x68, 0x65)
 )
 NON_KEYFRAME_WITHOUT_AUD = ANNEX_B_START_CODE + b"\x41\x80payload"
+# A non-IDR slice whose slice header parses as slice_type 1 (B): first_mb_in_slice
+# ue(0) is bit '1', slice_type ue(1) is bits '010'.
+B_FRAME_ACCESS_UNIT = b"".join(
+    ANNEX_B_START_CODE + bytes([nal_type]) + (b"\xa0payload" if nal_type == 0x41 else b"payload")
+    for nal_type in (0x09, 0x41)
+)
 ROS2_COMPRESSED_VIDEO_SCHEMA = "\n".join(
     [
         "builtin_interfaces/Time timestamp",
@@ -159,6 +165,17 @@ def _write_passthrough_video_source(
             payloads_by_topic.setdefault(topic, []).append(payload)
         writer.finish()
     return payloads_by_topic
+
+
+def test_transform_rejects_passthrough_video_carrying_b_frames(tmp_path: Path) -> None:
+    source = tmp_path / "bframe.mcap"
+    _write_passthrough_video_source(
+        source,
+        [("/cam", 1, KEYFRAME_ACCESS_UNIT), ("/cam", 2, B_FRAME_ACCESS_UNIT)],
+    )
+
+    with pytest.raises(SourceNotConforming, match=r"/cam.*B-frames"):
+        write_canonical_episode(source, tmp_path / "out.mcap")
 
 
 def test_transform_rejects_each_passthrough_video_channel_starting_mid_gop(

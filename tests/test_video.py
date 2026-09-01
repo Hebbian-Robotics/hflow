@@ -9,9 +9,11 @@ import pytest
 from hflow.ffmpeg import ffmpeg_path, ffprobe_path
 from hflow.video import (
     AccessUnit,
+    PictureCodingScan,
     VideoEncodeError,
     encode_images_to_h264,
     ensure_access_unit_delimiter,
+    scan_picture_coding_types,
     split_annex_b_stream,
     write_access_units_to_mp4,
 )
@@ -123,6 +125,110 @@ def test_remux_to_mp4_preserves_every_frame(
     # be confused with a copy on this hardware.
     assert stream_fields["profile"] not in ("", "unknown")
     assert remux_elapsed_seconds < 5.0
+
+
+@pytest.fixture(scope="module")
+def b_frame_stream(jpeg_frames: list[bytes]) -> bytes:
+    """The same frames re-encoded with libx264 defaults (B-frames enabled)."""
+    command: list[str] = [
+        str(ffmpeg_path()),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "image2pipe",
+        "-framerate",
+        str(FPS),
+        "-c:v",
+        "mjpeg",
+        "-i",
+        "-",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-pix_fmt",
+        "yuv420p",
+        "-x264-params",
+        "bframes=3:b_adapt=0",
+        "-f",
+        "h264",
+        "-",
+    ]
+    completed = subprocess.run(command, input=b"".join(jpeg_frames), capture_output=True)
+    assert completed.returncode == 0, completed.stderr.decode()
+    return completed.stdout
+
+
+def _slice_header_rbsp(first_mb_in_slice: int, slice_type_code: int) -> bytes:
+    """Pack first_mb_in_slice and slice_type as consecutive Exp-Golomb values."""
+
+    def exp_golomb_bits(value: int) -> str:
+        return "0" * ((value + 1).bit_length() - 1) + bin(value + 1)[2:]
+
+    bits = exp_golomb_bits(first_mb_in_slice) + exp_golomb_bits(slice_type_code) + "1"
+    bits += "0" * (-len(bits) % 8)
+    return bytes(int(bits[index : index + 8], 2) for index in range(0, len(bits), 8))
+
+
+def test_scan_reports_b_pictures_in_a_real_b_frame_stream(b_frame_stream: bytes) -> None:
+    scan = scan_picture_coding_types(b_frame_stream)
+
+    assert scan.picture_count == FRAME_COUNT
+    assert scan.b_picture_count > 0
+    assert scan.reorder_depth >= 1
+
+
+def test_scan_reports_no_b_pictures_for_the_canonical_stream(
+    encoded_units: list[AccessUnit],
+) -> None:
+    canonical_stream = b"".join(unit.data for unit in encoded_units)
+
+    scan = scan_picture_coding_types(canonical_stream)
+
+    assert scan == PictureCodingScan(
+        picture_count=FRAME_COUNT, b_picture_count=0, reorder_depth=0, trailing_b_pictures=0
+    )
+
+
+def test_scan_measures_reorder_depth_and_trailing_tail() -> None:
+    non_idr_nal = b"\x00\x00\x00\x01\x41"
+    stream = b"".join(
+        non_idr_nal + _slice_header_rbsp(0, slice_type_code)
+        for slice_type_code in (0, 1, 1, 0, 1)  # P, B, B, P, B in decode order
+    )
+
+    scan = scan_picture_coding_types(stream)
+
+    assert scan == PictureCodingScan(
+        picture_count=5, b_picture_count=3, reorder_depth=2, trailing_b_pictures=1
+    )
+
+
+def test_scan_refuses_an_unparseable_slice_header() -> None:
+    # An all-zero RBSP never terminates the first Exp-Golomb value, so the
+    # slice header cannot be classified and the scan must fail closed.
+    unparseable_slice = b"\x00\x00\x00\x01\x41\x00"
+
+    with pytest.raises(ValueError, match="cannot be classified"):
+        scan_picture_coding_types(unparseable_slice)
+
+
+def test_remux_refuses_a_b_frame_stream_naming_the_tail(
+    b_frame_stream: bytes, tmp_path: Path
+) -> None:
+    output_path = tmp_path / "bframe.mp4"
+
+    with pytest.raises(ValueError, match="reorder depth") as error:
+        write_access_units_to_mp4((b_frame_stream,), fps=FPS, output=output_path)
+
+    message = str(error.value)
+    assert "B picture" in message
+    assert "at risk" in message
+    assert "docs/FORMAT.md" in message
+    # The refusal fires before ffmpeg runs, so no partial MP4 is left behind.
+    assert not output_path.exists()
+    assert not output_path.with_name(output_path.name + ".tmp").exists()
 
 
 def test_split_rejects_garbage_without_aud() -> None:

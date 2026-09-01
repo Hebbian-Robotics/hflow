@@ -509,6 +509,14 @@ def _validate_passthrough_video_payload(
             f"pass-through video topic {topic!r} starts mid-GOP: its first message "
             "is not a keyframe, so the stream is not decodable from the start"
         )
+    coding_types = video_module.scan_picture_coding_types(message.data)
+    if coding_types.b_picture_count:
+        raise SourceNotConforming(
+            f"pass-through video topic {topic!r} carries B-frames (reorder depth "
+            f"{coding_types.reorder_depth}); the canonical convention requires "
+            "bframes=0 because a -c:v copy MP4 remux drops the reorder tail "
+            "(measured 301 of 303 in #250) -- re-encode upstream with bframes=0"
+        )
 
 
 def _decode_compressed_images(
