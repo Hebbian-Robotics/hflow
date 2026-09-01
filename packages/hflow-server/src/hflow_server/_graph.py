@@ -67,7 +67,6 @@ from hflow_server._runtime import (
     ResolvedRuntime,
     RuntimeResolver,
     airflow_failure_refusal,
-    optional_string,
     resolved_runtime_or_refuse,
 )
 

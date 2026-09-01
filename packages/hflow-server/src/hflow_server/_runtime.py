@@ -25,7 +25,6 @@ import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from posixpath import normpath
-from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
