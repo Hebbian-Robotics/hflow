@@ -29,7 +29,6 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from math import isfinite
-from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
