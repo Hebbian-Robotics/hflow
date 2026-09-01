@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from itertools import islice
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, assert_never, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import duckdb
@@ -434,7 +434,68 @@ def _required_parquet_paths(
     return selected_paths
 
 
-def _run_metadata(configuration: EvaluationConfiguration) -> dict[str, object]:
+def _required_run_metadata_string(
+    document: Mapping[str, object], field_name: str, record_context: str
+) -> str:
+    field_value = document.get(field_name)
+    if not isinstance(field_value, str) or not field_value:
+        raise ValueError(f"{record_context} field {field_name!r} must be a string")
+    return field_value
+
+
+def _required_prompt_digests(document: Mapping[str, object], record_context: str) -> dict[str, str]:
+    raw_prompts = document.get("prompts")
+    if not isinstance(raw_prompts, dict):
+        raise ValueError(f"{record_context} field 'prompts' must be a JSON object")
+    digests: dict[str, str] = {}
+    for task_key, entry in raw_prompts.items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("sha256"), str):
+            raise ValueError(
+                f"{record_context} prompts entry {task_key!r} must carry a string 'sha256'"
+            )
+        digests[str(task_key)] = entry["sha256"]
+    return digests
+
+
+@dataclass(frozen=True)
+class BuildAIRunMetadata:
+    """Saved run.json metadata, parsed once at the load boundary.
+
+    ``document`` is the full persisted schema; the other fields are the
+    consumed subset, typed so task creation and summary generation never
+    index back into the JSON shape.
+    """
+
+    label: str
+    fingerprint: str
+    dataset_variant: str
+    model: str
+    prompt_sha256s: dict[str, str]
+    document: Mapping[str, object]
+
+    def to_json_dict(self) -> dict[str, object]:
+        return dict(self.document)
+
+    @classmethod
+    def from_json_file(cls, metadata_path: Path) -> BuildAIRunMetadata:
+        try:
+            document = json.loads(metadata_path.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"could not read run metadata {metadata_path}: {error}") from error
+        if not isinstance(document, dict):
+            raise ValueError(f"{metadata_path} must contain a JSON object")
+        context = str(metadata_path)
+        return cls(
+            label=_required_run_metadata_string(document, "label", context),
+            fingerprint=_required_run_metadata_string(document, "fingerprint", context),
+            dataset_variant=_required_run_metadata_string(document, "dataset_variant", context),
+            model=_required_run_metadata_string(document, "model", context),
+            prompt_sha256s=_required_prompt_digests(document, context),
+            document=document,
+        )
+
+
+def _run_metadata_document(configuration: EvaluationConfiguration) -> dict[str, object]:
     specification = DATASET_SPECIFICATIONS[configuration.dataset_variant]
     prompt_metadata = {
         task.value: {
@@ -473,33 +534,49 @@ def _run_metadata(configuration: EvaluationConfiguration) -> dict[str, object]:
     }
 
 
+def _run_metadata(configuration: EvaluationConfiguration) -> BuildAIRunMetadata:
+    document = _run_metadata_document(configuration)
+    return BuildAIRunMetadata(
+        label=configuration.label,
+        fingerprint=str(document["fingerprint"]),
+        dataset_variant=configuration.dataset_variant.value,
+        model=configuration.model,
+        prompt_sha256s={
+            task.value: _sha256_text(definition.prompt)
+            for task, definition in configuration.task_definitions.items()
+            if task in configuration.selected_tasks
+        },
+        document=document,
+    )
+
+
 def _write_json_atomically(path: Path, value: object) -> None:
     temporary_path = path.with_suffix(f"{path.suffix}.tmp")
     temporary_path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
     temporary_path.replace(path)
 
 
-def _prepare_output_directory(configuration: EvaluationConfiguration) -> dict[str, object]:
+def _prepare_output_directory(configuration: EvaluationConfiguration) -> BuildAIRunMetadata:
     configuration.output_directory.mkdir(parents=True, exist_ok=True)
     metadata_path = configuration.output_directory / RUN_METADATA_FILE_NAME
     current_metadata = _run_metadata(configuration)
     if metadata_path.is_file():
-        existing_metadata = json.loads(metadata_path.read_text())
-        if existing_metadata.get("fingerprint") != current_metadata["fingerprint"]:
+        existing_metadata = BuildAIRunMetadata.from_json_file(metadata_path)
+        if existing_metadata.fingerprint != current_metadata.fingerprint:
             raise ValueError(
                 f"{metadata_path} describes a different experiment; choose another --output"
             )
         return existing_metadata
-    _write_json_atomically(metadata_path, current_metadata)
+    _write_json_atomically(metadata_path, current_metadata.to_json_dict())
     return current_metadata
 
 
 def _create_inspect_tasks(
     configuration: EvaluationConfiguration,
     selected_parquet_paths: Sequence[tuple[SourceSelection, Path]],
-    run_metadata: Mapping[str, object],
+    run_metadata: BuildAIRunMetadata,
 ) -> list[Task]:
-    fingerprint = str(run_metadata["fingerprint"])
+    fingerprint = run_metadata.fingerprint
     sample_batch_size = max(configuration.worker_count * 2, 1)
     tasks: list[Task] = []
     for source, parquet_path in selected_parquet_paths:
@@ -540,21 +617,17 @@ def _create_inspect_tasks(
     return tasks
 
 
-def _result_key(result: dict[str, object]) -> tuple[str, str, str]:
-    return (
-        str(result["source_dataset"]),
-        str(result["frame_id"]),
-        str(result["task"]),
-    )
+def _result_key(result: EvaluatedSample) -> tuple[str, str, str]:
+    return (result.source_dataset, result.frame_id, result.task.value)
 
 
 def summarize_results(
-    run_metadata: dict[str, object],
-    results: Sequence[dict[str, object]],
+    run_metadata: BuildAIRunMetadata,
+    results: Sequence[EvaluatedSample],
 ) -> dict[str, object]:
     """Compute prevalence and reference agreement without counting failures negative."""
     latest_results = {_result_key(result): result for result in results}
-    source_names = sorted({str(result["source_dataset"]) for result in latest_results.values()})
+    source_names = sorted({result.source_dataset for result in latest_results.values()})
     summaries_by_source: dict[str, object] = {}
     for source_name in source_names:
         task_summaries: dict[str, object] = {}
@@ -562,26 +635,33 @@ def summarize_results(
             task_results = [
                 result
                 for result in latest_results.values()
-                if result.get("source_dataset") == source_name and result.get("task") == task.value
+                if result.source_dataset == source_name and result.task == task
             ]
-            valid_results = [result for result in task_results if result.get("status") == "ok"]
+            valid_pairs: list[tuple[int | str, int | str]] = []
+            invalid_count = 0
+            error_count = 0
+            for result in task_results:
+                match result.outcome:
+                    case SuccessfulSampleOutcome(predicted_value=predicted_value):
+                        valid_pairs.append((result.expected_value, predicted_value))
+                    case InvalidResponseSampleOutcome():
+                        invalid_count += 1
+                    case ExecutionErrorSampleOutcome():
+                        error_count += 1
+                    case _:
+                        assert_never(result.outcome)
             predicted_value_counts = Counter(
-                str(result["predicted_value"]) for result in valid_results
+                str(predicted_value) for _, predicted_value in valid_pairs
             )
-            reference_value_counts = Counter(
-                str(result["expected_value"])
-                for result in task_results
-                if "expected_value" in result
-            )
+            reference_value_counts = Counter(str(result.expected_value) for result in task_results)
             agreement_count = sum(
-                result.get("predicted_value") == result.get("expected_value")
-                for result in valid_results
+                expected_value == predicted_value for expected_value, predicted_value in valid_pairs
             )
-            valid_count = len(valid_results)
+            valid_count = len(valid_pairs)
             numeric_usage_totals: Counter[str] = Counter()
             for result in task_results:
-                usage = result.get("usage")
-                if isinstance(usage, dict):
+                usage = result.outcome.response_metadata.usage
+                if usage is not None:
                     numeric_usage_totals.update(
                         {
                             str(name): float(value)
@@ -590,15 +670,15 @@ def summarize_results(
                         }
                     )
             latency_values = [
-                float(latency_value)
+                float(result.outcome.response_metadata.latency_seconds)
                 for result in task_results
-                if isinstance((latency_value := result.get("latency_seconds")), int | float)
+                if result.outcome.response_metadata.latency_seconds is not None
             ]
             task_summaries[task.value] = {
                 "attempted_count": len(task_results),
                 "valid_count": valid_count,
-                "invalid_count": sum(result.get("status") == "invalid" for result in task_results),
-                "error_count": sum(result.get("status") == "error" for result in task_results),
+                "invalid_count": invalid_count,
+                "error_count": error_count,
                 "predicted_value_counts": dict(sorted(predicted_value_counts.items())),
                 "predicted_value_fractions": {
                     value: count / valid_count
@@ -621,14 +701,15 @@ def summarize_results(
                 "usage_totals": dict(sorted(numeric_usage_totals.items())),
             }
         summaries_by_source[source_name] = task_summaries
-    prompt_metadata = cast(dict[str, dict[str, object]], run_metadata["prompts"])
     return {
         "schema_version": SCHEMA_VERSION,
-        "label": run_metadata["label"],
-        "fingerprint": run_metadata["fingerprint"],
-        "dataset_variant": run_metadata["dataset_variant"],
-        "model": run_metadata["model"],
-        "prompts": {task: {"sha256": prompt["sha256"]} for task, prompt in prompt_metadata.items()},
+        "label": run_metadata.label,
+        "fingerprint": run_metadata.fingerprint,
+        "dataset_variant": run_metadata.dataset_variant,
+        "model": run_metadata.model,
+        "prompts": {
+            task: {"sha256": sha256} for task, sha256 in run_metadata.prompt_sha256s.items()
+        },
         "sources": summaries_by_source,
     }
 
@@ -638,51 +719,110 @@ def _sample_expected_value(sample: EvalSample, task: EvaluationTask) -> int | st
     return parse_task_response(task, raw_target)
 
 
-def _sample_result(
-    log: EvalLog,
-    sample: EvalSample,
-    configuration: EvaluationConfiguration,
-) -> dict[str, object]:
+@dataclass(frozen=True)
+class SampleResponseMetadata:
+    """Provider response fields retained for every sample outcome variant."""
+
+    response_model: str | None
+    latency_seconds: float | None
+    usage: Mapping[str, object] | None
+
+
+@dataclass(frozen=True)
+class SuccessfulSampleOutcome:
+    """A completed response parsed into the task's result vocabulary."""
+
+    raw_response: str
+    response_metadata: SampleResponseMetadata
+    predicted_value: int | str
+
+
+@dataclass(frozen=True)
+class InvalidResponseSampleOutcome:
+    """A completed response outside the task's result vocabulary."""
+
+    raw_response: str
+    response_metadata: SampleResponseMetadata
+    parse_error: str
+
+
+@dataclass(frozen=True)
+class ExecutionErrorSampleOutcome:
+    """Inspect reported an execution failure instead of a completed response."""
+
+    raw_response: str
+    response_metadata: SampleResponseMetadata
+    error: str
+
+
+SampleOutcome = SuccessfulSampleOutcome | InvalidResponseSampleOutcome | ExecutionErrorSampleOutcome
+
+
+@dataclass(frozen=True)
+class EvaluatedSample:
+    """One evaluated Inspect sample: identification plus exactly one outcome variant."""
+
+    source_dataset: str
+    frame_id: str
+    task: EvaluationTask
+    expected_value: int | str
+    outcome: SampleOutcome
+
+
+def _sample_result(log: EvalLog, sample: EvalSample) -> EvaluatedSample:
     log_metadata = log.eval.metadata or {}
     task = EvaluationTask(str(log_metadata["evaluation_task"]))
-    base_result: dict[str, object] = {
-        "schema_version": SCHEMA_VERSION,
-        "dataset_variant": configuration.dataset_variant.value,
-        "source_dataset": str(log_metadata["source_dataset"]),
-        "frame_id": str(sample.id),
-        "task": task.value,
-        "expected_value": _sample_expected_value(sample, task),
-        "model": configuration.model,
-        "raw_response": sample.output.completion,
-    }
-    if sample.output.model:
-        base_result["response_model"] = sample.output.model
-    if sample.output.time is not None:
-        base_result["latency_seconds"] = sample.output.time
-    if sample.output.usage is not None:
-        base_result["usage"] = sample.output.usage.model_dump(exclude_none=True)
-    sample_error = sample.error
-    if sample_error is not None or sample.output.error is not None:
+    response_metadata = SampleResponseMetadata(
+        response_model=sample.output.model or None,
+        latency_seconds=sample.output.time,
+        usage=(
+            sample.output.usage.model_dump(exclude_none=True)
+            if sample.output.usage is not None
+            else None
+        ),
+    )
+    if sample.error is not None or sample.output.error is not None:
+        sample_error = sample.error
         error_message = sample_error.message if sample_error is not None else sample.output.error
-        return {**base_result, "status": "error", "error": str(error_message)[:1000]}
-    try:
-        predicted_value = parse_task_response(task, sample.output.completion)
-    except ValueError as error:
-        return {**base_result, "status": "invalid", "error": str(error)}
-    return {**base_result, "status": "ok", "predicted_value": predicted_value}
+        outcome: SampleOutcome = ExecutionErrorSampleOutcome(
+            raw_response=sample.output.completion,
+            response_metadata=response_metadata,
+            error=str(error_message)[:1000],
+        )
+    else:
+        try:
+            predicted_value = parse_task_response(task, sample.output.completion)
+        except ValueError as error:
+            outcome = InvalidResponseSampleOutcome(
+                raw_response=sample.output.completion,
+                response_metadata=response_metadata,
+                parse_error=str(error),
+            )
+        else:
+            outcome = SuccessfulSampleOutcome(
+                raw_response=sample.output.completion,
+                response_metadata=response_metadata,
+                predicted_value=predicted_value,
+            )
+    return EvaluatedSample(
+        source_dataset=str(log_metadata["source_dataset"]),
+        frame_id=str(sample.id),
+        task=task,
+        expected_value=_sample_expected_value(sample, task),
+        outcome=outcome,
+    )
 
 
 def _results_from_inspect_logs(
-    log_headers: Sequence[EvalLog], configuration: EvaluationConfiguration
-) -> tuple[list[dict[str, object]], list[str]]:
-    results: list[dict[str, object]] = []
+    log_headers: Sequence[EvalLog],
+) -> tuple[list[EvaluatedSample], list[str]]:
+    results: list[EvaluatedSample] = []
     log_locations: list[str] = []
     for log_header in log_headers:
         log_locations.append(log_header.location)
         completed_log = read_eval_log(log_header.location)
         results.extend(
-            _sample_result(completed_log, sample, configuration)
-            for sample in completed_log.samples or []
+            _sample_result(completed_log, sample) for sample in completed_log.samples or []
         )
     return results, log_locations
 
@@ -768,7 +908,7 @@ def run_evaluation(configuration: EvaluationConfiguration, *, download: bool) ->
             model_base_url=configuration.base_url,
             model_args={"api_key_var": configuration.api_key_environment_variable},
             metadata={
-                "run_fingerprint": run_metadata["fingerprint"],
+                "run_fingerprint": run_metadata.fingerprint,
                 "label": configuration.label,
             },
             max_connections=configuration.worker_count,
@@ -786,7 +926,7 @@ def run_evaluation(configuration: EvaluationConfiguration, *, download: bool) ->
         if inserted_placeholder_api_key:
             os.environ.pop(configuration.api_key_environment_variable, None)
 
-    results, log_locations = _results_from_inspect_logs(log_headers, configuration)
+    results, log_locations = _results_from_inspect_logs(log_headers)
     summary = summarize_results(run_metadata, results)
     summary["inspect_logs"] = log_locations
     summary_path = configuration.output_directory / SUMMARY_FILE_NAME
