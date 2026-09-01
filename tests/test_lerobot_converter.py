@@ -589,10 +589,12 @@ def test_fetch_info_json_malformed_json_raises_contextual_value_error(
 
 
 def test_hf_repo_info_valid_json_still_resolves(monkeypatch: pytest.MonkeyPatch) -> None:
-    body = json.dumps({"sha": "abc123", "cardData": {"license": "apache-2.0"}}).encode()
+    # A real resolved commit sha: at least the 7 hex characters the sha
+    # validation requires, since a cache directory is named after it.
+    body = json.dumps({"sha": "abc1234", "cardData": {"license": "apache-2.0"}}).encode()
     _stub_urlopen(monkeypatch, {"/api/datasets/": body})
     assert prep._hf_repo_info("lerobot/pusht", "main") == {
-        "sha": "abc123",
+        "sha": "abc1234",
         "license": "apache-2.0",
     }
 
