@@ -378,13 +378,20 @@ def test_ingest_triggers_the_master_dag(
         online: bool = False,
         batch_count: int | None = None,
         dag_run_id: str | None = None,
-    ) -> dict[str, str]:
+    ) -> AirflowDagRun:
         captured["dag_id"] = dag_id
         captured["uris"] = uris
         captured["profile"] = profile
         captured["online"] = online
         captured["batch_count"] = batch_count
-        return {"dag_run_id": "manual__ui", "state": "queued"}
+        return AirflowDagRun(
+            dag_run_id="manual__ui",
+            state="queued",
+            logical_date=None,
+            start_date=None,
+            end_date=None,
+            conf={},
+        )
 
     monkeypatch.setattr(AirflowClient, "ingest", fake_ingest)
     response = bundle_api.post(
@@ -413,10 +420,17 @@ def test_ingest_batch_count_rides_the_trigger_conf(
         conf: dict[str, Any] | None = None,
         *,
         dag_run_id: str | None = None,
-    ) -> dict[str, str]:
+    ) -> AirflowDagRun:
         captured["dag_id"] = dag_id
         captured["conf"] = conf
-        return {"dag_run_id": "manual__sharded", "state": "queued"}
+        return AirflowDagRun(
+            dag_run_id="manual__sharded",
+            state="queued",
+            logical_date=None,
+            start_date=None,
+            end_date=None,
+            conf={},
+        )
 
     monkeypatch.setattr(AirflowClient, "trigger_dag_run", fake_trigger)
     response = bundle_api.post(

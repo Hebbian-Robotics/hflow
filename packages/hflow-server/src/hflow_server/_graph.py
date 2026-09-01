@@ -442,7 +442,7 @@ def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver
 
     def stage_task_instances(
         client: AirflowClient, dag_id: str, dag_run_id: str
-    ) -> list[dict[str, Any]]:
+    ) -> list[AirflowTaskInstance]:
         try:
             return client.task_instances(dag_id, dag_run_id)
         except AirflowClientError:

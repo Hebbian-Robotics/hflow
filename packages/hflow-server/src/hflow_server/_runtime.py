@@ -454,8 +454,8 @@ def create_runtime_router(settings: ServerSettings, resolver: RuntimeResolver) -
         except AirflowClientError as error:
             raise airflow_failure_refusal(error, source=runtime.source) from error
         return IngestTriggerResponse(
-            dag_run_id=optional_string(trigger_response.get("dag_run_id")),
-            state=optional_string(trigger_response.get("state")),
+            dag_run_id=trigger_response.dag_run_id,
+            state=trigger_response.state,
         )
 
     return router

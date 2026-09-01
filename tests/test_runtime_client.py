@@ -30,8 +30,8 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
     healthy: ClassVar[bool] = True
     expire_first_token: ClassVar[bool] = False
     health_response_body: ClassVar[bytes | None] = None
-    dag_run_response_body: ClassVar[object | None] = None
-    task_instances_response_body: ClassVar[object | None] = None
+    dag_run_response_body: ClassVar[dict[str, Any] | bytes | None] = None
+    task_instances_response_body: ClassVar[dict[str, Any] | bytes | None] = None
 
     def _read_json(self) -> dict[str, Any] | None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -70,12 +70,12 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
             if not self._bearer_ok(authorization):
                 self._respond(401, {"detail": "expired"})
                 return
-            if type(self).dag_run_response_body is not None:
-                body = type(self).dag_run_response_body
+            body = type(self).dag_run_response_body
+            if body is not None:
                 if isinstance(body, bytes):
                     self._respond_bytes(200, body)
-                else:
-                    self._respond(200, body)
+                    return
+                self._respond(200, body)
                 return
             requested_run_id = (payload or {}).get("dag_run_id")
             if requested_run_id == "already-exists" or (payload or {}).get("conf", {}).get(
@@ -93,12 +93,12 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
             if not self._bearer_ok(authorization):
                 self._respond(401, {"detail": "expired"})
                 return
-            if type(self).task_instances_response_body is not None:
-                body = type(self).task_instances_response_body
+            body = type(self).task_instances_response_body
+            if body is not None:
                 if isinstance(body, bytes):
                     self._respond_bytes(200, body)
-                else:
-                    self._respond(200, body)
+                    return
+                self._respond(200, body)
                 return
             self._respond(200, {"task_instances": [{"task_id": "plan", "map_index": -1}]})
             return

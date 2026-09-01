@@ -1183,7 +1183,7 @@ def _command_ingest(arguments: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
         return 1
-    run_id = dag_run.get("dag_run_id", "<unknown>")
+    run_id = dag_run.dag_run_id or "<unknown>"
     lane = "online" if arguments.online else "batch"
     print(
         f"triggered {dag_id} run {run_id} over {len(arguments.uris)} episode(s) "

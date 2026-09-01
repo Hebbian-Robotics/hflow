@@ -82,6 +82,9 @@ def _task_instance(
 def _dag_run(value: dict[str, Any] | AirflowDagRun) -> AirflowDagRun:
     if isinstance(value, AirflowDagRun):
         return value
+    conf = value.get("conf")
+    if not isinstance(conf, dict):
+        conf = {}
     return AirflowDagRun(
         dag_run_id=value.get("dag_run_id") if isinstance(value.get("dag_run_id"), str) else None,
         state=value.get("state") if isinstance(value.get("state"), str) else None,
@@ -90,7 +93,7 @@ def _dag_run(value: dict[str, Any] | AirflowDagRun) -> AirflowDagRun:
         else None,
         start_date=value.get("start_date") if isinstance(value.get("start_date"), str) else None,
         end_date=value.get("end_date") if isinstance(value.get("end_date"), str) else None,
-        conf=value.get("conf") if isinstance(value.get("conf"), dict) else {},
+        conf=conf,
     )
 
 

@@ -117,7 +117,7 @@ def _wait_for_terminal_dag_run_state(
     deadline = time.monotonic() + timeout_s
     state = "unknown"
     while time.monotonic() < deadline:
-        state = str(client.dag_run(dag_id, dag_run_id).get("state"))
+        state = str(client.dag_run(dag_id, dag_run_id).state)
         if state in ("success", "failed"):
             return state
         time.sleep(5.0)
@@ -153,19 +153,20 @@ def _run_master_to_success(
     timeout_s: float,
 ) -> None:
     triggered = client.ingest(master_dag_id, uris, profile=profile, online=online)
+    assert triggered.dag_run_id is not None
     final_state = _wait_for_terminal_dag_run_state(
-        client, master_dag_id, triggered["dag_run_id"], timeout_s=timeout_s
+        client, master_dag_id, triggered.dag_run_id, timeout_s=timeout_s
     )
     assert final_state == "success", (
-        f"master run {triggered['dag_run_id']} over {uris} "
+        f"master run {triggered.dag_run_id} over {uris} "
         f"(profile={profile!r}, online={online}) ended {final_state!r}"
     )
 
 
 def _successful_run_count(client: AirflowClient, dag_id: str) -> int:
     runs = client.dag_runs(dag_id)
-    assert all(run.get("state") != "failed" for run in runs), (dag_id, runs)
-    return sum(1 for run in runs if run.get("state") == "success")
+    assert all(run.state != "failed" for run in runs), (dag_id, runs)
+    return sum(1 for run in runs if run.state == "success")
 
 
 def _count(connection: Any, sql: str) -> int:
@@ -316,7 +317,7 @@ def test_master_profiles_and_online_lane_end_to_end(tmp_path: Path) -> None:
             timeout_s=PARTIAL_RUN_TIMEOUT_S,
         )
         assert _successful_run_count(client, meta_dag_id) == 2
-        online_confs = [run.get("conf") for run in client.dag_runs(meta_dag_id)]
+        online_confs = [run.conf for run in client.dag_runs(meta_dag_id)]
         assert any(
             isinstance(conf, dict) and conf.get("mode") == "online" for conf in online_confs
         ), online_confs

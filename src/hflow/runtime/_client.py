@@ -421,7 +421,7 @@ class AirflowClient:
         online: bool = False,
         batch_count: int | None = None,
         dag_run_id: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> AirflowDagRun:
         """Trigger the MASTER ingest DAG over ``uris`` (the SDK/CLI entry point).
 
         ``profile`` names a run profile (the master validates it against the
