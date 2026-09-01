@@ -25,11 +25,12 @@ import tempfile
 import time
 import traceback
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType, ModuleType
-from typing import TYPE_CHECKING, Generic, TypeVar, assert_never
+from typing import TYPE_CHECKING, Generic, NewType, TypeVar, assert_never
 
 if TYPE_CHECKING:
     from hflow.runtime import BundlePaths
@@ -457,6 +458,91 @@ def _resolve_stages(stages: Iterable[Stage] | str | None) -> frozenset[Stage]:
     if isinstance(stages, str):
         return stages_for_profile(stages)
     return frozenset(Stage(stage) for stage in stages)
+
+
+_ConcurrentTestLimit = NewType("_ConcurrentTestLimit", int)
+_ConcurrentInputT = TypeVar("_ConcurrentInputT")
+_ConcurrentResultT = TypeVar("_ConcurrentResultT")
+
+
+def _parse_concurrent_test_limit(max_workers: int) -> _ConcurrentTestLimit:
+    """Refine the public integer before the scheduler can consume it."""
+
+    if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers <= 0:
+        raise ValueError("max_workers must be a positive integer")
+    return _ConcurrentTestLimit(max_workers)
+
+
+def _run_with_bounded_concurrency(
+    inputs: Sequence[_ConcurrentInputT],
+    operation: Callable[[_ConcurrentInputT], _ConcurrentResultT],
+    *,
+    concurrency_limit: _ConcurrentTestLimit,
+) -> list[_ConcurrentResultT]:
+    """Run at most ``concurrency_limit`` submitted operations, retaining input order.
+
+    A rolling window matters even though the executor also limits active threads:
+    ``Executor.map`` submits its complete input eagerly on Python 3.11-3.13. Keeping
+    submitted work bounded means a preparation failure can stop later episodes before
+    they create files or make endpoint calls. Already-running operations finish before
+    the exception escapes, so no worker keeps mutating a workspace after the caller has
+    regained control.
+    """
+
+    if not inputs:
+        return []
+
+    results_by_input_index: dict[int, _ConcurrentResultT] = {}
+    next_input_index = 0
+    with ThreadPoolExecutor(max_workers=int(concurrency_limit)) as thread_pool:
+        input_index_by_future: dict[Future[_ConcurrentResultT], int] = {}
+
+        def submit_next_input() -> bool:
+            nonlocal next_input_index
+            if next_input_index >= len(inputs):
+                return False
+            submitted_input_index = next_input_index
+            next_input_index += 1
+            future = thread_pool.submit(operation, inputs[submitted_input_index])
+            input_index_by_future[future] = submitted_input_index
+            return True
+
+        for _ in range(min(int(concurrency_limit), len(inputs))):
+            submit_next_input()
+
+        try:
+            while input_index_by_future:
+                completed_futures, _ = wait(
+                    input_index_by_future,
+                    return_when=FIRST_COMPLETED,
+                )
+                ordered_completed_futures = sorted(
+                    completed_futures,
+                    key=input_index_by_future.__getitem__,
+                )
+                completed_results: list[tuple[int, _ConcurrentResultT]] = []
+                for completed_future in ordered_completed_futures:
+                    completed_input_index = input_index_by_future.pop(completed_future)
+                    completed_results.append((completed_input_index, completed_future.result()))
+                results_by_input_index.update(completed_results)
+                for _ in completed_results:
+                    submit_next_input()
+        except BaseException:
+            # Cancellation must also cover KeyboardInterrupt/SystemExit: returning control
+            # while queued workers can still write is unsafe regardless of failure kind.
+            for outstanding_future in input_index_by_future:
+                outstanding_future.cancel()
+            raise
+
+    return [results_by_input_index[input_index] for input_index in range(len(inputs))]
+
+
+@dataclass(frozen=True)
+class _PreparedProcessConfiguration:
+    """Run selections whose endpoint preflight has already succeeded."""
+
+    enabled_stages: frozenset[Stage]
+    registered_step_selection: RegisteredStepSelection
 
 
 @dataclass(frozen=True)
@@ -1767,6 +1853,31 @@ class App:
                 + ", ".join(endpoint_environment_variable_name(alias) for alias in missing)
             )
 
+    def _prepare_process_configuration(
+        self,
+        *,
+        stages: Iterable[Stage] | str | None,
+        step_names: Iterable[str] | None,
+        registered_step_selection: RegisteredStepSelection | None = None,
+    ) -> _PreparedProcessConfiguration:
+        """Parse one run request and resolve endpoints before episode I/O."""
+
+        enabled_stages = _resolve_stages(stages)
+        if registered_step_selection is not None:
+            if step_names is not None:
+                raise TypeError("step_names and registered_step_selection cannot both be provided")
+            resolved_step_selection = registered_step_selection
+        else:
+            resolved_step_selection = self._resolve_registered_step_selection(
+                step_names,
+                enabled_stages,
+            )
+        self._preflight(resolved_step_selection)
+        return _PreparedProcessConfiguration(
+            enabled_stages=enabled_stages,
+            registered_step_selection=resolved_step_selection,
+        )
+
     def _ordered_checks(self) -> list[RegisteredCheck]:
         # Cheap-first: steps that need no special resources run before steps
         # declaring requires/uses. Within each class, the pipeline's own
@@ -1825,6 +1936,77 @@ class App:
             record=record,
             stages=stages,
             step_names=step_names,
+        )
+
+    def test_many(
+        self,
+        episodes: Iterable[Path | str],
+        *,
+        max_workers: int = 1,
+        verbose: bool = False,
+        record: bool = False,
+        stages: Iterable[Stage] | str | None = None,
+        step_names: Iterable[str] | None = None,
+    ) -> list[TestReport]:
+        """Run the in-process dev loop over distinct episodes with bounded concurrency.
+
+        Reports preserve the input order even when ``max_workers`` allows episodes to
+        finish out of order. At most ``max_workers`` episodes are submitted at once. Each
+        episode keeps the same output-directory, recording, stage-selection, and error
+        behavior as :meth:`test`; an exception raised while preparing one episode stops
+        new submissions, waits for already-running episodes, and propagates to the caller.
+        Duplicate source identities are refused because concurrent writes to one test-run
+        directory are ambiguous.
+
+        ``verbose`` defaults to ``False`` so concurrent reports do not interleave on
+        stdout. Use this for local corpus experiments; use :meth:`run` or a deployed
+        runtime when durable orchestration, retries, and scheduling are required.
+        """
+
+        if isinstance(episodes, Path | str):
+            raise TypeError("episodes must be an iterable of episode paths, not one path")
+        concurrency_limit = _parse_concurrent_test_limit(max_workers)
+        if isinstance(step_names, str):
+            raise TypeError("step_names must be an iterable of names, not one string")
+
+        episode_references = tuple(episodes)
+        if not episode_references:
+            return []
+        source_reference_by_identity: dict[str, Path | str] = {}
+        for episode_reference in episode_references:
+            source_identity = self.source_identity(episode_reference)
+            previous_reference = source_reference_by_identity.get(source_identity)
+            if previous_reference is not None:
+                raise ValueError(
+                    f"duplicate episode source identity {source_identity!r}: "
+                    f"{str(previous_reference)!r} and {str(episode_reference)!r}"
+                )
+            source_reference_by_identity[source_identity] = episode_reference
+
+        stable_stages = stages if stages is None or isinstance(stages, str) else tuple(stages)
+        stable_step_names = None if step_names is None else tuple(step_names)
+        prepared_process_configuration = self._prepare_process_configuration(
+            stages=stable_stages,
+            step_names=stable_step_names,
+        )
+
+        def test_episode(episode_reference: Path | str) -> TestReport:
+            return self.process(
+                episode_reference,
+                output_dir=self.workspace.test_runs_root.child(
+                    _source_artifact_directory_name(episode_reference, self.storage_root)
+                ),
+                verbose=verbose,
+                record=record,
+                _prepared_process_configuration=prepared_process_configuration,
+            )
+
+        if concurrency_limit == 1:
+            return [test_episode(episode_reference) for episode_reference in episode_references]
+        return _run_with_bounded_concurrency(
+            episode_references,
+            test_episode,
+            concurrency_limit=concurrency_limit,
         )
 
     def run(
@@ -1915,6 +2097,7 @@ class App:
         quarantine_history: QuarantineHistory | None = None,
         orchestrator_run_id: str | None = None,
         _registered_step_selection: RegisteredStepSelection | None = None,
+        _prepared_process_configuration: _PreparedProcessConfiguration | None = None,
     ) -> TestReport:
         """Process one episode through the enabled stages of the stage
         graph: transform to canonical (``sync``), run checks with gate
@@ -1962,17 +2145,26 @@ class App:
         only, never part of any identity hash (see
         :meth:`hflow.catalog.Catalog.append_episode`).
         """
-        enabled_stages = _resolve_stages(stages)
-        if _registered_step_selection is None:
-            registered_step_selection = self._resolve_registered_step_selection(
-                step_names, enabled_stages
-            )
+        if _prepared_process_configuration is not None:
+            if (
+                stages is not None
+                or step_names is not None
+                or _registered_step_selection is not None
+            ):
+                raise TypeError(
+                    "a prepared process configuration cannot be combined with stages, "
+                    "step_names, or _registered_step_selection"
+                )
+            prepared_process_configuration = _prepared_process_configuration
         else:
-            if step_names is not None:
-                raise TypeError("step_names and _registered_step_selection cannot both be provided")
-            registered_step_selection = _registered_step_selection
+            prepared_process_configuration = self._prepare_process_configuration(
+                stages=stages,
+                step_names=step_names,
+                registered_step_selection=_registered_step_selection,
+            )
+        enabled_stages = prepared_process_configuration.enabled_stages
+        registered_step_selection = prepared_process_configuration.registered_step_selection
         source_identifier = self._resolve_source_identity(episode, output_dir=output_dir)
-        self._preflight(registered_step_selection)
         if Stage.SYNC in enabled_stages:
             source_path = self._fetch_source(episode)  # the transform reads it
         else:

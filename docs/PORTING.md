@@ -269,6 +269,25 @@ report = app.test("episode_0001.mcap")
 
 `app.test()` runs the whole registered pipeline on one episode **in-process**, with no Docker and no scheduler. It transforms the input into a canonical episode under `<data_root>/test-runs/`, runs every check with the ordering and gate semantics described above, prints a summary, and returns the full `TestReport` (per-check status, measurements, durations, quarantine tags). Iterate on a check in seconds; the canonical file it writes opens directly in Foxglove or Rerun for eyeballing.
 
+For a bounded local corpus experiment, use the same loop without rebuilding
+thread-pool plumbing in every pipeline:
+
+```python
+reports = app.test_many(
+    ["episode_0001.mcap", "episode_0002.mcap"],
+    max_workers=4,
+    stages=(hflow.Stage.SYNC, hflow.Stage.META),
+)
+```
+
+`app.test_many()` preserves input order and keeps at most `max_workers`
+episodes submitted at once. Sources must be distinct because each source owns
+one test-run directory. A source-preparation failure stops new submissions and
+is raised after already-running episodes finish, so no worker keeps writing
+after control returns to the caller. This remains an in-process development
+tool; use `app.run()` or a deployed runtime when the corpus needs durable
+scheduling and retries.
+
 ### Test one check directly
 
 For the tightest loop on one check, open an existing canonical episode and call

@@ -99,6 +99,96 @@ def test_whole_pipeline_runs_without_quarantine(
     assert "camera_blackout" in summary_text
 
 
+def test_many_runs_distinct_episodes_and_preserves_input_order(tmp_path: Path) -> None:
+    source_paths = tuple(
+        synthesize_episode(
+            tmp_path / "sources" / f"episode_{episode_number:04d}.mcap",
+            SyntheticEpisodeSpec(
+                duration_s=0.1,
+                cameras=(),
+                task=f"task-{episode_number}",
+            ),
+        )
+        for episode_number in range(3)
+    )
+    application = hflow.App(
+        "batch-test",
+        data_root=tmp_path / "data",
+        default_checks=(),
+    )
+
+    @application.check(version="1")
+    def episode_task(episode: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"episode/task": str(episode.metadata["task"])})
+
+    requested_source_paths = (source_paths[2], source_paths[0], source_paths[1])
+    reports = application.test_many(
+        requested_source_paths,
+        max_workers=2,
+        stages=(hflow.Stage.SYNC, hflow.Stage.META),
+    )
+
+    assert [report.source_path for report in reports] == list(requested_source_paths)
+    measured_tasks: list[str] = []
+    for report in reports:
+        task_check_run = next(
+            check_run for check_run in report.checks if check_run.check.name == "episode_task"
+        )
+        assert task_check_run.result is not None
+        measured_tasks.append(str(task_check_run.result.measurements["episode/task"]))
+    assert measured_tasks == ["task-2", "task-0", "task-1"]
+
+
+def test_many_refuses_duplicate_source_identities(tmp_path: Path) -> None:
+    source_path = synthesize_episode(
+        tmp_path / "episode.mcap",
+        SyntheticEpisodeSpec(duration_s=0.1, cameras=()),
+    )
+    application = hflow.App("batch-test", data_root=tmp_path / "data", default_checks=())
+
+    with pytest.raises(ValueError, match="duplicate episode source identity"):
+        application.test_many((source_path, source_path), max_workers=2)
+
+
+@pytest.mark.parametrize("invalid_max_workers", (0, -1, True))
+def test_many_refuses_invalid_concurrency_limits(
+    tmp_path: Path,
+    invalid_max_workers: int,
+) -> None:
+    application = hflow.App("batch-test", data_root=tmp_path / "data", default_checks=())
+
+    with pytest.raises(ValueError, match="max_workers must be a positive integer"):
+        application.test_many((), max_workers=invalid_max_workers)
+
+
+def test_many_stops_scheduling_new_episodes_after_preparation_failure(
+    tmp_path: Path,
+) -> None:
+    first_valid_source = synthesize_episode(
+        tmp_path / "sources" / "first-valid.mcap",
+        SyntheticEpisodeSpec(duration_s=0.1, cameras=()),
+    )
+    source_that_must_not_start = synthesize_episode(
+        tmp_path / "sources" / "must-not-start.mcap",
+        SyntheticEpisodeSpec(duration_s=0.1, cameras=()),
+    )
+    missing_source = tmp_path / "sources" / "missing.mcap"
+    application = hflow.App("batch-test", data_root=tmp_path / "data", default_checks=())
+
+    with pytest.raises(FileNotFoundError):
+        application.test_many(
+            (missing_source, first_valid_source, source_that_must_not_start),
+            max_workers=2,
+            stages=(hflow.Stage.SYNC,),
+        )
+
+    test_run_directories = tuple(application.workspace.test_runs_root.workspace.iterdir())
+    assert not any(
+        run_directory.name.startswith(f"{source_that_must_not_start.stem}-")
+        for run_directory in test_run_directories
+    )
+
+
 def test_ported_user_check_saw_real_joints(
     report_and_app: tuple[hflow.TestReport, hflow.App],
 ) -> None:
