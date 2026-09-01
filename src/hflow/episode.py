@@ -613,7 +613,7 @@ class Episode:
         self,
         camera: str | None = None,
         *,
-        frame_indices: Sequence[int],
+        frame_indices: Sequence[int | np.integer[Any]],
     ) -> list[ExtractedFrame]:
         """Extract JPEGs at exact, ascending source-message frame indices.
 
@@ -623,7 +623,10 @@ class Episode:
         unambiguous one-to-one order.
         """
 
-        selected_frame_indices = list(frame_indices)
+        selected_frame_indices = [
+            frame_index.item() if isinstance(frame_index, np.generic) else frame_index
+            for frame_index in frame_indices
+        ]
         if any(isinstance(frame_index, bool) for frame_index in selected_frame_indices):
             raise ValueError("frame indices must be integers, not booleans")
         if any(not isinstance(frame_index, int) for frame_index in selected_frame_indices):

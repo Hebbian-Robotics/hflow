@@ -27,6 +27,7 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
     requests_seen: ClassVar[list[tuple[str, str, dict[str, Any] | None, str | None]]] = []
     healthy: ClassVar[bool] = True
     expire_first_token: ClassVar[bool] = False
+    health_response_body: ClassVar[bytes | None] = None
 
     def _read_json(self) -> dict[str, Any] | None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -35,7 +36,9 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length))
 
     def _respond(self, status: int, payload: dict[str, Any]) -> None:
-        body = json.dumps(payload).encode()
+        self._respond_bytes(status, json.dumps(payload).encode())
+
+    def _respond_bytes(self, status: int, body: bytes) -> None:
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -105,6 +108,10 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
             self._respond(200, {"dag_id": requested_dag_id})
             return
         if self.path == "/api/v2/monitor/health":
+            health_response_body = type(self).health_response_body
+            if health_response_body is not None:
+                self._respond_bytes(200, health_response_body)
+                return
             status = "healthy" if type(self).healthy else "unhealthy"
             self._respond(
                 200,  # always 200: the body is the signal
@@ -135,6 +142,7 @@ def _reset_stub_airflow_state() -> None:
     _StubAirflowHandler.requests_seen = []
     _StubAirflowHandler.healthy = True
     _StubAirflowHandler.expire_first_token = False
+    _StubAirflowHandler.health_response_body = None
 
 
 @pytest.fixture(scope="module")
@@ -242,6 +250,29 @@ def test_ingest_refuses_a_batch_count_the_run_could_not_honour(stub_server: str)
     assert _StubAirflowHandler.requests_seen == []
 
 
+def test_ingest_serializes_selected_step_names(stub_server: str) -> None:
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    client.ingest(
+        "pipeline_ingest",
+        ["a.mcap"],
+        step_names=("camera_integrity", "hand_activity"),
+    )
+
+    trigger_request = next(
+        entry for entry in _StubAirflowHandler.requests_seen if entry[1].endswith("/dagRuns")
+    )
+    assert trigger_request[2] == {
+        "logical_date": None,
+        "conf": {
+            "uris": ["a.mcap"],
+            "profile": "full",
+            "mode": "batch",
+            "step_names": ["camera_integrity", "hand_activity"],
+        },
+    }
+
+
 def test_bad_credentials_surface_clearly(stub_server: str) -> None:
     client = AirflowClient(stub_server, "airflow", "wrong-password")
     with pytest.raises(AirflowClientError) as error_info:
@@ -257,6 +288,56 @@ def test_health_parses_body_not_status(stub_server: str) -> None:
     unhealthy = client.health()  # still HTTP 200: the body is the signal
     assert not unhealthy.healthy
     assert "scheduler=unhealthy" in unhealthy.summary()
+
+
+def test_malformed_success_response_raises_typed_client_error(stub_server: str) -> None:
+    _StubAirflowHandler.health_response_body = (
+        b"<html>\n  <body>proxy returned an invalid API response "
+        + b"x" * 250
+        + b" end-of-response</body>\n</html>"
+    )
+    url = f"{stub_server}/api/v2/monitor/health"
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    with pytest.raises(AirflowClientError) as error_info:
+        client.health()
+
+    message = str(error_info.value)
+    assert message.startswith(f"GET {url} returned malformed JSON: <html> <body>")
+    assert "proxy returned an invalid API response" in message
+    assert "end-of-response" not in message
+    assert "\n" not in message
+
+
+def test_invalid_utf8_success_response_raises_typed_client_error(stub_server: str) -> None:
+    _StubAirflowHandler.health_response_body = (
+        b'{"detail":"upstream returned invalid bytes \xff' + b"x" * 250 + b'end-of-response"}'
+    )
+    url = f"{stub_server}/api/v2/monitor/health"
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    with pytest.raises(AirflowClientError) as error_info:
+        client.health()
+
+    message = str(error_info.value)
+    assert message.startswith(f"GET {url} returned invalid UTF-8: ")
+    assert "upstream returned invalid bytes" in message
+    assert "end-of-response" not in message
+
+
+def test_empty_success_response_still_returns_an_empty_object(stub_server: str) -> None:
+    _StubAirflowHandler.health_response_body = b""
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    assert client.health().components == {}
+
+
+def test_non_object_success_response_is_still_refused(stub_server: str) -> None:
+    _StubAirflowHandler.health_response_body = b'["healthy"]'
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    with pytest.raises(AirflowClientError, match="returned non-object JSON"):
+        client.health()
 
 
 def test_bearer_token_auth_never_calls_the_token_endpoint(stub_server: str) -> None:

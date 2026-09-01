@@ -111,6 +111,25 @@ _TRANSCODABLE_IMAGE_SCHEMAS = frozenset(
 _RAW_IMAGE_SCHEMAS = frozenset({"sensor_msgs/msg/Image", "foxglove.RawImage"})
 
 
+class SourceNotConforming(ValueError):
+    """The recording refuses transcoding on its contents, not the machine.
+
+    Raised where the transform has looked at what a channel actually carries
+    and found it outside what v1 supports or bridges -- an unsupported image
+    format, a passthrough video channel violating the canonical convention, an
+    unsupported raw image schema, a derived-topic collision. A subclass of
+    ``ValueError`` so existing callers matching on that type keep working.
+
+    This is the ONLY path into
+    :attr:`~hflow.ingest_ledger.IngestFailureKind.SOURCE_UNSUPPORTED`:
+    ``classify_ingest_failure`` tests ``isinstance(error, SourceNotConforming)``
+    and nothing else routes there, so a bug that raises a bare ``ValueError``
+    for a new refusal falls back to ``infrastructure`` (the safe default)
+    rather than silently landing here. Any new content refusal must raise
+    this type explicitly to be classified correctly.
+    """
+
+
 @dataclass(frozen=True)
 class TransformConfig:
     """Configuration for :func:`write_canonical_episode`. This is the
@@ -245,7 +264,7 @@ def _input_codec_for_image_format(image_format: str, topic: str) -> Literal["mjp
         return "png"
     if "jpeg" in lowered or "jpg" in lowered:
         return "mjpeg"
-    raise ValueError(
+    raise SourceNotConforming(
         f"camera topic {topic!r} carries unsupported compressed-image format "
         f"{image_format!r}; v1 transcodes jpeg and png"
     )
@@ -435,7 +454,7 @@ class _PassthroughVideoMessage:
 
 def _parse_passthrough_video_message(topic: str, decoded_message: Any) -> _PassthroughVideoMessage:
     if decoded_message.format != "h264":
-        raise ValueError(
+        raise SourceNotConforming(
             f"pass-through video topic {topic!r} carries format "
             f"{decoded_message.format!r}; the canonical convention requires 'h264' "
             "(re-encode upstream -- v1 does not transcode CompressedVideo)"
@@ -450,7 +469,7 @@ def _insert_missing_passthrough_video_aud(
     try:
         canonical_data = video_module.ensure_access_unit_delimiter(message.data)
     except ValueError as error:
-        raise ValueError(
+        raise SourceNotConforming(
             f"pass-through video topic {topic!r} violates the canonical convention: {error}"
         ) from error
     return _PassthroughVideoMessage(format=message.format, data=canonical_data)
@@ -468,24 +487,24 @@ def _validate_passthrough_video_payload(
     try:
         access_units = video_module.split_annex_b_stream(message.data)
     except ValueError as error:
-        raise ValueError(
+        raise SourceNotConforming(
             f"pass-through video topic {topic!r} violates the canonical convention: "
             f"{error} (re-encode upstream -- v1 does not transcode CompressedVideo)"
         ) from error
     if len(access_units) != 1:
-        raise ValueError(
+        raise SourceNotConforming(
             f"pass-through video topic {topic!r} has a message containing "
             f"{len(access_units)} access units; the canonical convention requires "
             "exactly one decodable frame per message"
         )
     access_unit = access_units[0]
     if access_unit.is_keyframe and not access_unit.has_parameter_sets:
-        raise ValueError(
+        raise SourceNotConforming(
             f"pass-through video topic {topic!r} has a keyframe without SPS/PPS; "
             "the canonical convention requires parameter sets on every keyframe"
         )
     if is_first_message and not access_unit.is_keyframe:
-        raise ValueError(
+        raise SourceNotConforming(
             f"pass-through video topic {topic!r} starts mid-GOP: its first message "
             "is not a keyframe, so the stream is not decodable from the start"
         )
@@ -552,7 +571,7 @@ def write_canonical_episode(
         infos = reader.channels()
         for info in infos.values():
             if info.schema_name in _RAW_IMAGE_SCHEMAS:
-                raise NotImplementedError(
+                raise SourceNotConforming(
                     f"raw image channel {info.topic!r} ({info.schema_name}) is not supported "
                     "in v1; record compressed images upstream"
                 )
@@ -561,7 +580,7 @@ def write_canonical_episode(
             if derived_topic in source_topic_names:
                 # A second channel on the topic would be MCAP-legal but make
                 # topic-keyed reads ambiguous forever; refuse loudly instead.
-                raise ValueError(
+                raise SourceNotConforming(
                     f"derived channel topic {derived_topic!r} collides with a source "
                     "channel topic; pick a topic not present in the source"
                 )

@@ -33,6 +33,13 @@ from hflow.stage_planning import (
     OutstandingStages,
     StageSelection,
 )
+from hflow.step_selection import (
+    ALL_REGISTERED_STEPS,
+    AllRegisteredSteps,
+    RegisteredStepSelection,
+    SelectedRegisteredSteps,
+    selected_step_names_for_stage,
+)
 from hflow.steps import IngestMode, Stage
 from hflow.storage import is_bucket_url, parse_storage_root
 
@@ -128,6 +135,35 @@ def resolve_episode_reference(data_root: str, uri: str) -> "Path | str":
     return Path(data_root) / uri
 
 
+def resolve_step_names_for_stage(
+    application: "App",
+    step_names: Iterable[str] | None,
+    enabled_stage_names: Iterable[str],
+    stage_name: str,
+) -> frozenset[str] | None:
+    """Parse a serialized run selection and return one stage's share.
+
+    Schedulers carry one global list through their run configuration. Each
+    worker calls this after loading the pipeline, which is the first boundary
+    that knows both the registered names and their owning stages.
+    """
+    stage = Stage(stage_name)
+    enabled_stages = frozenset(Stage(name) for name in enabled_stage_names)
+    if stage not in enabled_stages:
+        raise ValueError(
+            f"stage {stage.value!r} is not enabled for this run; enabled stages: "
+            f"{sorted(enabled.value for enabled in enabled_stages)}"
+        )
+    registered_step_selection = application._resolve_registered_step_selection(
+        step_names, enabled_stages
+    )
+    return selected_step_names_for_stage(
+        registered_step_selection,
+        stage,
+        application._registered_step_stages(),
+    )
+
+
 # The spellings a conf flag counts as true. Anything else, including the empty
 # string a cleared trigger-form field sends, is false.
 _TRUE_CONF_SPELLINGS = frozenset({"1", "true", "yes", "on"})
@@ -197,6 +233,9 @@ def process_stage_batch(
     uris: Sequence[str],
     stage_name: str,
     orchestrator_run_id: str | None = None,
+    *,
+    step_names: Iterable[str] | None = None,
+    _registered_step_selection: RegisteredStepSelection | None = None,
 ) -> StageBatchCounts:
     """Run one stage over every episode in a batch, counting outcomes.
 
@@ -206,6 +245,11 @@ def process_stage_batch(
 
     ``orchestrator_run_id`` is recorded on every episode this batch appends,
     so the catalog can be asked which orchestrated run produced a row.
+
+    ``step_names`` optionally limits this stage to named registered steps.
+    It remains keyword-only because a scheduler crossing a serialization
+    boundary should name the filter it is applying, not depend on argument
+    position. ``None`` preserves complete-stage execution.
 
     Named for the ROLE, not for Airflow, because this module is the one owner
     of run semantics across execution backends and nothing here should have to
@@ -219,23 +263,47 @@ def process_stage_batch(
     # Stage(stage_name) parses the conf string at this boundary: an unknown
     # stage is a loud ValueError before any episode is touched.
     stage = Stage(stage_name)
+    if _registered_step_selection is not None:
+        if step_names is not None:
+            raise TypeError("step_names and _registered_step_selection cannot both be provided")
+        registered_step_selection = _registered_step_selection
+    elif step_names is None:
+        registered_step_selection = ALL_REGISTERED_STEPS
+    else:
+        registered_step_selection = application._resolve_registered_step_selection(
+            step_names, {stage}
+        )
     data_root = str(application.data_root)
     counts: StageBatchCounts = {"processed": 0, "quarantined": 0, "errors": 0}
     # The labels and media gates read the episode's cataloged quarantine
     # state; opening that reader once per batch rather than once per episode
     # is the difference between one mirror sync and one per episode. Stages
     # that decide quarantine themselves never read it.
-    with _batch_quarantine_history(application, stage) as quarantine_history:
+    with _batch_quarantine_history(
+        application,
+        stage,
+        preserve_existing_quarantine=isinstance(registered_step_selection, SelectedRegisteredSteps),
+    ) as quarantine_history:
         for uri in uris:
             try:
                 episode_reference = resolve_episode_reference(data_root, str(uri))
-                report = application.process(
-                    episode_reference,
-                    record=True,
-                    stages={stage},
-                    quarantine_history=quarantine_history,
-                    orchestrator_run_id=orchestrator_run_id,
-                )
+                if isinstance(registered_step_selection, AllRegisteredSteps):
+                    report = application.process(
+                        episode_reference,
+                        record=True,
+                        stages={stage},
+                        quarantine_history=quarantine_history,
+                        orchestrator_run_id=orchestrator_run_id,
+                    )
+                else:
+                    report = application.process(
+                        episode_reference,
+                        record=True,
+                        stages={stage},
+                        _registered_step_selection=registered_step_selection,
+                        quarantine_history=quarantine_history,
+                        orchestrator_run_id=orchestrator_run_id,
+                    )
             except Exception as error:
                 traceback.print_exc()
                 # A source that never canonicalized has no catalog row to be,
@@ -285,6 +353,7 @@ def run_stages_directly(
     *,
     selection: StageSelection = StageSelection.OUTSTANDING,
     orchestrator_run_id: str | None = None,
+    step_names: Iterable[str] | None = None,
 ) -> list[StageOutcome]:
     """Run the stage graph in this process, with the runtime's own semantics.
 
@@ -320,16 +389,33 @@ def run_stages_directly(
     The per-stage budgets apply to what each stage actually ran. That is the
     honest denominator: a stage handed four outstanding episodes out of four
     hundred should fail loudly when all four error, and it does.
+
+    ``step_names`` optionally selects registered steps across the enabled
+    stages. The selection is validated once before any source is touched and
+    partitioned by stage for execution. Unselected steps produce no outcomes
+    and remain outstanding in the catalog.
     """
     enabled_stages = set(stages)
     ordered_stages = [stage for stage in Stage if stage in enabled_stages]
+    registered_step_selection = application._resolve_registered_step_selection(
+        step_names, enabled_stages
+    )
+    stage_by_step_name = application._registered_step_stages()
+
+    def selected_names_for_stage(stage: Stage) -> frozenset[str] | None:
+        return selected_step_names_for_stage(registered_step_selection, stage, stage_by_step_name)
+
     plan_against_catalog = selection is StageSelection.OUTSTANDING and Stage.SYNC in enabled_stages
 
     outcomes: list[StageOutcome] = []
     plans: dict[str, EpisodeStagePlan] | None = None
     for stage in ordered_stages:
         skipped_as_current = 0
-        if stage is Stage.SYNC or not plan_against_catalog:
+        stage_step_names = selected_names_for_stage(stage)
+        if stage is not Stage.SYNC and stage_step_names == frozenset():
+            # Explicitly unselected is not the same fact as already current.
+            stage_uris = []
+        elif stage is Stage.SYNC or not plan_against_catalog:
             stage_uris = list(uris)
         else:
             if plans is None:
@@ -337,6 +423,7 @@ def run_stages_directly(
                     application,
                     uris,
                     [later for later in ordered_stages if later is not Stage.SYNC],
+                    registered_step_selection,
                 )
             stage_uris = []
             for uri in uris:
@@ -357,7 +444,15 @@ def run_stages_directly(
         # answer a question about no episodes.
         counts: StageBatchCounts = (
             process_stage_batch(
-                application, stage_uris, stage.value, orchestrator_run_id=orchestrator_run_id
+                application,
+                stage_uris,
+                stage.value,
+                orchestrator_run_id=orchestrator_run_id,
+                _registered_step_selection=(
+                    ALL_REGISTERED_STEPS
+                    if stage_step_names is None
+                    else SelectedRegisteredSteps(stage_step_names)
+                ),
             )
             if stage_uris
             else {"processed": 0, "quarantined": 0, "errors": 0}
@@ -373,7 +468,10 @@ def run_stages_directly(
 
 
 def _plan_after_sync(
-    application: "App", uris: Sequence[str], later_stages: Sequence[Stage]
+    application: "App",
+    uris: Sequence[str],
+    later_stages: Sequence[Stage],
+    registered_step_selection: RegisteredStepSelection,
 ) -> "dict[str, EpisodeStagePlan]":
     """The post-sync plan, keyed by the caller's own uri spelling.
 
@@ -393,7 +491,10 @@ def _plan_after_sync(
         for uri in uris
     }
     plans = plan_outstanding_stages(
-        application, sorted(set(identity_by_uri.values())), later_stages
+        application,
+        sorted(set(identity_by_uri.values())),
+        later_stages,
+        _registered_step_selection=registered_step_selection,
     )
     return {uri: plans[identity] for uri, identity in identity_by_uri.items()}
 
@@ -430,12 +531,18 @@ def _record_failure_quietly(
 
 @contextmanager
 def _batch_quarantine_history(
-    application: "App", stage: Stage
+    application: "App",
+    stage: Stage,
+    *,
+    preserve_existing_quarantine: bool = False,
 ) -> Iterator[QuarantineHistory | None]:
-    """One catalog reader for a whole batch, or ``None`` where the stage
-    never asks: only stages running without ``meta`` consult the catalog for
-    quarantine, and ``meta`` itself decides it in memory."""
-    if stage is Stage.META:
+    """One catalog reader for a whole batch, or ``None`` when none is needed.
+
+    A complete meta stage decides quarantine entirely in memory. A selected
+    subset still reads prior state so unselected gates retain their last known
+    outcome; labels and media always read prior state because meta is absent.
+    """
+    if stage is Stage.META and not preserve_existing_quarantine:
         yield None
         return
     with QuarantineHistory(application.workspace.catalog_root) as history:

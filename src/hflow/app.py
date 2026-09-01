@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType, ModuleType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Generic, TypeVar, assert_never
 
 if TYPE_CHECKING:
     from hflow.runtime import BundlePaths
@@ -55,6 +55,12 @@ from hflow.manifest import (
 )
 from hflow.reader import open_reader
 from hflow.resample import DerivedSeries
+from hflow.step_selection import (
+    ALL_REGISTERED_STEPS,
+    RegisteredStepSelection,
+    SelectedRegisteredSteps,
+    registered_step_is_selected,
+)
 from hflow.steps import (
     GATE_UNEVALUATED_TAG_PREFIX,
     RUN_PROFILES,
@@ -499,32 +505,95 @@ class SkippedByQuarantine:
 StepNotRun = SupersededByPipeline | SkippedByQuarantine
 
 
+_ResultT = TypeVar("_ResultT")
+
+
+@dataclass(frozen=True)
+class Measured(Generic[_ResultT]):
+    """The step ran and returned a result."""
+
+    result: _ResultT
+
+
+@dataclass(frozen=True)
+class Errored:
+    """The step raised, or returned something that is not a result."""
+
+    error: str
+
+
+@dataclass(frozen=True)
+class NotRun:
+    """The step was registered and deliberately not invoked."""
+
+    not_run: StepNotRun
+
+
+@dataclass(frozen=True)
+class PublishFailed:
+    """The enrichment returned labels, then an artifact would not publish.
+
+    Its own state rather than a result and an error side by side: the labels
+    are real and are recorded, and the run still has to report an error, which
+    is the one place the old three-field shape needed two of them set at once.
+    """
+
+    result: "EnrichmentResult"
+    error: str
+
+
+# Exactly one variant, held in one field, so a report cannot carry two answers
+# at once and cannot carry none.
+CheckOutcome = Measured[CheckResult] | Errored | NotRun
+EnrichmentOutcome = Measured[EnrichmentResult] | Errored | NotRun | PublishFailed
+
+
+def _not_run_status(step_not_run: StepNotRun) -> CheckStatus:
+    """The status a registered step that was never invoked records."""
+    match step_not_run:
+        case SupersededByPipeline():
+            return CheckStatus.SUPERSEDED
+        case SkippedByQuarantine():
+            return CheckStatus.SKIPPED
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
 @dataclass
 class CheckRunReport:
     """Outcome of one check invocation inside a test run."""
 
     check: RegisteredCheck
-    result: CheckResult | None = None
-    error: str | None = None
-    not_run: StepNotRun | None = None
+    outcome: CheckOutcome
     duration_s: float = 0.0
 
     @property
+    def result(self) -> CheckResult | None:
+        return self.outcome.result if isinstance(self.outcome, Measured) else None
+
+    @property
+    def error(self) -> str | None:
+        return self.outcome.error if isinstance(self.outcome, Errored) else None
+
+    @property
+    def not_run(self) -> StepNotRun | None:
+        return self.outcome.not_run if isinstance(self.outcome, NotRun) else None
+
+    @property
     def status(self) -> CheckStatus:
-        match self.not_run:
-            case SupersededByPipeline():
-                return CheckStatus.SUPERSEDED
-            case SkippedByQuarantine():
-                return CheckStatus.SKIPPED
-            case None:
-                pass
-        if self.error is not None:
-            return CheckStatus.ERROR
-        if self.result is not None and self.result.verdict is False:
-            return CheckStatus.FAILED
-        if self.result is not None and self.result.verdict is True:
-            return CheckStatus.PASSED
-        return CheckStatus.MEASURED
+        match self.outcome:
+            case NotRun(not_run=step_not_run):
+                return _not_run_status(step_not_run)
+            case Errored():
+                return CheckStatus.ERROR
+            case Measured(result=result):
+                if result.verdict is False:
+                    return CheckStatus.FAILED
+                if result.verdict is True:
+                    return CheckStatus.PASSED
+                return CheckStatus.MEASURED
+            case _ as unreachable:
+                assert_never(unreachable)
 
 
 @dataclass
@@ -532,27 +601,36 @@ class EnrichmentRunReport:
     """Outcome of one enrichment invocation inside a test run."""
 
     enrichment: RegisteredEnrichment
-    result: EnrichmentResult | None = None
-    error: str | None = None
-    not_run: StepNotRun | None = None
+    outcome: EnrichmentOutcome
     duration_s: float = 0.0
     artifact_uris: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def result(self) -> EnrichmentResult | None:
+        return self.outcome.result if isinstance(self.outcome, Measured | PublishFailed) else None
+
+    @property
+    def error(self) -> str | None:
+        return self.outcome.error if isinstance(self.outcome, Errored | PublishFailed) else None
+
+    @property
+    def not_run(self) -> StepNotRun | None:
+        return self.outcome.not_run if isinstance(self.outcome, NotRun) else None
 
     @property
     def status(self) -> CheckStatus:
         # Enrichments have no verdicts, so the verdict statuses never apply;
         # supersession does not either, since only auto-registered CHECKS have
         # an automatic copy to stand down.
-        match self.not_run:
-            case SkippedByQuarantine():
-                return CheckStatus.SKIPPED
-            case SupersededByPipeline():
-                return CheckStatus.SUPERSEDED
-            case None:
-                pass
-        if self.error is not None:
-            return CheckStatus.ERROR
-        return CheckStatus.MEASURED
+        match self.outcome:
+            case NotRun(not_run=step_not_run):
+                return _not_run_status(step_not_run)
+            case Errored() | PublishFailed():
+                return CheckStatus.ERROR
+            case Measured():
+                return CheckStatus.MEASURED
+            case _ as unreachable:
+                assert_never(unreachable)
 
 
 def _unsatisfiable_check_parameters(
@@ -684,26 +762,26 @@ def _execute_enrichment(
 ) -> EnrichmentRunReport:
     """Run one enrichment-shaped step (user enrichment or the built-in media
     step) with the shared timing/boundary/error mechanics."""
-    enrichment_run = EnrichmentRunReport(enrichment=registered_enrichment)
     if not_run is not None:
-        enrichment_run.not_run = not_run
-        return enrichment_run
+        return EnrichmentRunReport(enrichment=registered_enrichment, outcome=NotRun(not_run))
+    outcome: EnrichmentOutcome
     started = time.perf_counter()
     try:
         returned_enrichment = registered_enrichment.function(canonical_episode)
         if isinstance(returned_enrichment, EnrichmentResult):
-            enrichment_run.result = returned_enrichment
+            outcome = Measured(returned_enrichment)
         else:
-            enrichment_run.error = (
+            outcome = Errored(
                 f"enrichment returned {type(returned_enrichment).__name__}, "
                 "expected hflow.EnrichmentResult -- wrap it: return "
                 "hflow.EnrichmentResult(labels=...)"
             )
     except Exception:
-        enrichment_run.error = traceback.format_exc(limit=8)
-    finally:
-        enrichment_run.duration_s = time.perf_counter() - started
-    return enrichment_run
+        outcome = Errored(traceback.format_exc(limit=8))
+    duration_s = time.perf_counter() - started
+    return EnrichmentRunReport(
+        enrichment=registered_enrichment, outcome=outcome, duration_s=duration_s
+    )
 
 
 def _check_run_rows(report: "TestReport") -> list[CheckRunRow]:
@@ -1116,8 +1194,7 @@ class App:
             superseded_keys = sorted(set(run.result.measurements) & pipeline_measurement_keys)
             if not superseded_keys:
                 continue
-            run.not_run = SupersededByPipeline(superseded_keys=tuple(superseded_keys))
-            run.result = None
+            run.outcome = NotRun(SupersededByPipeline(superseded_keys=tuple(superseded_keys)))
 
     def _reusable_canonical_episode(
         self,
@@ -1228,14 +1305,58 @@ class App:
         self.checks = [registered for registered in self.checks if registered.name != check_name]
         self._default_check_names.discard(check_name)
 
-    def _registered_step_names(self) -> set[str]:
+    def _registered_step_stages(self) -> dict[str, Stage]:
         # Checks, enrichments, and the built-in media step share the catalog's
         # check_name column, so names are unique across all three.
-        return (
-            {MEDIA_CONTACT_SHEET_STEP_NAME}
-            | {registered.name for registered in self.checks}
-            | {registered.name for registered in self.enrichments}
+        return {
+            MEDIA_CONTACT_SHEET_STEP_NAME: Stage.MEDIA,
+            **{registered.name: Stage.META for registered in self.checks},
+            **{registered.name: Stage.LABELS for registered in self.enrichments},
+        }
+
+    def _registered_step_names(self) -> set[str]:
+        return set(self._registered_step_stages())
+
+    def _resolve_registered_step_selection(
+        self,
+        step_names: Iterable[str] | None,
+        enabled_stages: Iterable[Stage],
+    ) -> RegisteredStepSelection:
+        """Parse a registered-step request before any episode I/O.
+
+        The returned variant preserves what was learned here, so planning and
+        execution do not reinterpret ``None`` or revalidate raw names.
+        """
+        if step_names is None:
+            return ALL_REGISTERED_STEPS
+        if isinstance(step_names, str):
+            raise TypeError("step_names must be an iterable of names, not one string")
+        selected_step_names = frozenset(step_names)
+        non_string_step_names = sorted(
+            repr(step_name) for step_name in selected_step_names if not isinstance(step_name, str)
         )
+        if non_string_step_names:
+            raise TypeError(f"step names must be strings, got {non_string_step_names}")
+        stage_by_step_name = self._registered_step_stages()
+        unknown_step_names = sorted(selected_step_names - stage_by_step_name.keys())
+        if unknown_step_names:
+            raise ValueError(
+                f"unknown step names {unknown_step_names}; registered steps: "
+                f"{sorted(stage_by_step_name)}"
+            )
+        enabled_stage_set = frozenset(enabled_stages)
+        disabled_selections = sorted(
+            f"{step_name} ({stage_by_step_name[step_name].value})"
+            for step_name in selected_step_names
+            if stage_by_step_name[step_name] not in enabled_stage_set
+        )
+        if disabled_selections:
+            raise ValueError(
+                "selected steps belong to stages that are not enabled: "
+                f"{disabled_selections}; enabled stages: "
+                f"{sorted(stage.value for stage in enabled_stage_set)}"
+            )
+        return SelectedRegisteredSteps(selected_step_names)
 
     @property
     def pipeline_version(self) -> str:
@@ -1575,11 +1696,15 @@ class App:
             f"a key under the data root {self.storage_root}"
         )
 
-    def _used_endpoint_aliases(self) -> set[str]:
+    def _used_endpoint_aliases(
+        self,
+        step_selection: RegisteredStepSelection = ALL_REGISTERED_STEPS,
+    ) -> set[str]:
         return {
             registered.uses
             for registered in [*self.checks, *self.enrichments]
             if registered.uses is not None
+            and registered_step_is_selected(step_selection, registered.name)
         }
 
     def _resolve_endpoint_overrides(self) -> None:
@@ -1623,10 +1748,17 @@ class App:
                 resolved[alias] = environment_override
         self.endpoints = MappingProxyType(resolved)
 
-    def _preflight(self) -> None:
+    def _preflight(
+        self,
+        step_selection: RegisteredStepSelection = ALL_REGISTERED_STEPS,
+    ) -> None:
         self._resolve_endpoint_overrides()
         missing = sorted(
-            {alias for alias in self._used_endpoint_aliases() if alias not in self.endpoints}
+            {
+                alias
+                for alias in self._used_endpoint_aliases(step_selection)
+                if alias not in self.endpoints
+            }
         )
         if missing:
             raise ValueError(
@@ -1666,6 +1798,7 @@ class App:
         verbose: bool = True,
         record: bool = False,
         stages: Iterable[Stage] | str | None = None,
+        step_names: Iterable[str] | None = None,
     ) -> TestReport:
         """The dev loop: run the whole pipeline on one episode, in-process.
 
@@ -1675,7 +1808,9 @@ class App:
         record to the catalog -- iterating on a check should not pollute it.
         Pass ``record=True`` to append the run (idempotent per episode
         content and step versions). ``stages`` selects a run profile or an
-        explicit stage set, exactly as in :meth:`process`.
+        explicit stage set, exactly as in :meth:`process`. ``step_names``
+        optionally limits execution to named registered steps within those
+        stages.
         """
         return self.process(
             episode,
@@ -1689,6 +1824,7 @@ class App:
             verbose=verbose,
             record=record,
             stages=stages,
+            step_names=step_names,
         )
 
     def run(
@@ -1775,8 +1911,10 @@ class App:
         verbose: bool = False,
         record: bool = True,
         stages: Iterable[Stage] | str | None = None,
+        step_names: Iterable[str] | None = None,
         quarantine_history: QuarantineHistory | None = None,
         orchestrator_run_id: str | None = None,
+        _registered_step_selection: RegisteredStepSelection | None = None,
     ) -> TestReport:
         """Process one episode through the enabled stages of the stage
         graph: transform to canonical (``sync``), run checks with gate
@@ -1795,6 +1933,13 @@ class App:
         stamps are reconstructed from its own provenance record. Without
         ``meta``, the quarantine gate for ``labels``/``media`` comes from the
         episode's latest cataloged state (no catalog = no known quarantine).
+
+        ``step_names`` optionally selects registered checks, enrichments, or
+        the built-in ``media/contact_sheet`` step within the enabled stages.
+        ``None`` preserves the complete stage behavior; an empty iterable runs
+        no registered steps. Unknown names and names belonging to disabled
+        stages are refused before source or canonical episode I/O. Unselected
+        steps produce no run rows, so they remain eligible for a later pass.
 
         ``quarantine_history`` is that gate's catalog reader, open across a
         whole batch so a stage does not re-sync and re-open the catalog once
@@ -1818,8 +1963,16 @@ class App:
         :meth:`hflow.catalog.Catalog.append_episode`).
         """
         enabled_stages = _resolve_stages(stages)
+        if _registered_step_selection is None:
+            registered_step_selection = self._resolve_registered_step_selection(
+                step_names, enabled_stages
+            )
+        else:
+            if step_names is not None:
+                raise TypeError("step_names and _registered_step_selection cannot both be provided")
+            registered_step_selection = _registered_step_selection
         source_identifier = self._resolve_source_identity(episode, output_dir=output_dir)
-        self._preflight()
+        self._preflight(registered_step_selection)
         if Stage.SYNC in enabled_stages:
             source_path = self._fetch_source(episode)  # the transform reads it
         else:
@@ -1988,7 +2141,15 @@ class App:
                 sync_reused=reused_canonical,
             )
 
-            checks_to_run = self._ordered_checks() if Stage.META in enabled_stages else []
+            checks_to_run = (
+                [
+                    registered
+                    for registered in self._ordered_checks()
+                    if registered_step_is_selected(registered_step_selection, registered.name)
+                ]
+                if Stage.META in enabled_stages
+                else []
+            )
             # Keys already emitted by the pipeline's own steps in this run.
             # A default that has any key in common with what is here can be
             # superseded at the top of the loop, before paying its ffmpeg
@@ -1999,8 +2160,6 @@ class App:
             from hflow.checks import _DEFAULT_KEY_FACTS
 
             for registered in checks_to_run:
-                run = CheckRunReport(check=registered)
-                report.checks.append(run)
                 # Quarantine stops the user's own steps from piling more
                 # work onto an already-rejected episode, but the defaults
                 # are cheap diagnostic evidence and the episode you most
@@ -2016,7 +2175,12 @@ class App:
                 # *adds* a quarantine tag rather than gating later
                 # ones. They just do not get blanket-skipped.
                 if report.quarantined and registered.name not in self._default_check_names:
-                    run.not_run = SkippedByQuarantine(tuple(report.quarantine_tags))
+                    report.checks.append(
+                        CheckRunReport(
+                            check=registered,
+                            outcome=NotRun(SkippedByQuarantine(tuple(report.quarantine_tags))),
+                        )
+                    )
                     continue
                 # A default with a registered key pattern: if any pipeline
                 # step has already emitted a key the default would emit,
@@ -2034,27 +2198,34 @@ class App:
                         predicted = pattern(canonical_episode)
                         superseded_keys = sorted(predicted & pipeline_emitted_keys)
                         if superseded_keys:
-                            run.not_run = SupersededByPipeline(
-                                superseded_keys=tuple(superseded_keys)
+                            report.checks.append(
+                                CheckRunReport(
+                                    check=registered,
+                                    outcome=NotRun(
+                                        SupersededByPipeline(superseded_keys=tuple(superseded_keys))
+                                    ),
+                                )
                             )
                             continue
+                outcome: CheckOutcome
                 started = time.perf_counter()
                 try:
                     returned = registered.function(canonical_episode)
                     # Parse the boundary: user code may return anything.
                     if isinstance(returned, CheckResult):
-                        run.result = returned
+                        outcome = Measured(returned)
                     else:
-                        run.error = (
+                        outcome = Errored(
                             f"check returned {type(returned).__name__}, expected "
                             "hflow.CheckResult -- wrap it: return hflow.CheckResult("
                             "measurements=...)"
                         )
                 except Exception:
                     # Infrastructure, not data: never recorded as a quality outcome.
-                    run.error = traceback.format_exc(limit=8)
-                finally:
-                    run.duration_s = time.perf_counter() - started
+                    outcome = Errored(traceback.format_exc(limit=8))
+                duration_s = time.perf_counter() - started
+                run = CheckRunReport(check=registered, outcome=outcome, duration_s=duration_s)
+                report.checks.append(run)
                 _apply_gate(registered, run)
                 if run.result is not None and registered.name not in self._default_check_names:
                     # User steps feed the supersede-overlap test for any
@@ -2070,11 +2241,15 @@ class App:
                         run.result.tags.append(f"failed:{registered.name}")
 
             # Quarantine gate for labels/media: meta's in-memory result when
-            # it ran in this same invocation; otherwise the episode's latest
-            # cataloged state. No catalog row = no known quarantine: proceed.
-            # A cataloged quarantine is carried into this run's tags so a
-            # recorded run without meta never masks the state.
-            if Stage.META not in enabled_stages:
+            # it ran completely in this invocation; otherwise combine it with
+            # the episode's latest cataloged state. A partial meta run replaces
+            # a selected check's prior quarantine only when that check actually
+            # produced a result. Unselected and errored gates retain their last
+            # known state, so selecting one check cannot silently clear another
+            # gate. No catalog row means no known quarantine.
+            if Stage.META not in enabled_stages or isinstance(
+                registered_step_selection, SelectedRegisteredSteps
+            ):
                 episode_id = content_episode_id(canonical_path)
                 if quarantine_history is not None:
                     carried_tags = quarantine_history.quarantine_tags(episode_id)
@@ -2082,13 +2257,30 @@ class App:
                     with QuarantineHistory(self.workspace.catalog_root) as history:
                         carried_tags = history.quarantine_tags(episode_id)
                 if carried_tags is not None:
-                    report.quarantine_tags.extend(carried_tags)
+                    successfully_rechecked_names = {
+                        run.check.name for run in report.checks if run.result is not None
+                    }
+                    retained_tags = [
+                        tag
+                        for tag in carried_tags
+                        if not (
+                            tag.startswith("quarantined:")
+                            and tag.removeprefix("quarantined:") in successfully_rechecked_names
+                        )
+                    ]
+                    report.quarantine_tags = list(
+                        dict.fromkeys([*retained_tags, *report.quarantine_tags])
+                    )
             quarantine_skip = (
                 SkippedByQuarantine(tuple(report.quarantine_tags)) if report.quarantined else None
             )
 
             if Stage.LABELS in enabled_stages:
                 for registered_enrichment in self._ordered_enrichments():
+                    if not registered_step_is_selected(
+                        registered_step_selection, registered_enrichment.name
+                    ):
+                        continue
                     report.enrichments.append(
                         _execute_enrichment(
                             registered_enrichment, canonical_episode, quarantine_skip
@@ -2097,7 +2289,15 @@ class App:
 
             # The media stage is silently absent on a camera-less episode:
             # there is nothing to render, so no row claims otherwise.
-            if Stage.MEDIA in enabled_stages and canonical_episode.cameras:
+            if (
+                Stage.MEDIA in enabled_stages
+                and canonical_episode.cameras
+                and (
+                    registered_step_is_selected(
+                        registered_step_selection, MEDIA_CONTACT_SHEET_STEP_NAME
+                    )
+                )
+            ):
                 media_directory = run_dir / "media"
 
                 def render_contact_sheets(media_episode: Episode) -> EnrichmentResult:
@@ -2150,10 +2350,16 @@ class App:
                         f"artifact {artifact_name!r} at {artifact_path} could not be "
                         f"published:\n{traceback.format_exc(limit=4)}"
                     )
-                    enrichment_run.error = (
+                    combined_error = (
                         f"{enrichment_run.error}\n{publish_error}"
                         if enrichment_run.error
                         else publish_error
+                    )
+                    enrichment_result_so_far = enrichment_run.result
+                    enrichment_run.outcome = (
+                        PublishFailed(result=enrichment_result_so_far, error=combined_error)
+                        if enrichment_result_so_far is not None
+                        else Errored(combined_error)
                     )
 
         # Assembled even when not recording, so the dev loop refuses a key

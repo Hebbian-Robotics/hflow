@@ -177,7 +177,25 @@ def test_canonical_episode_extracts_exact_source_frame_indices(
             frame_indices=selected_frame_indices,
         )
 
+        numpy_frame_indices = [
+            np.int32(0),
+            np.int64(1),
+            np.uint32(2),
+            np.uint64(7),
+            np.int64(8),
+            np.uint32(29),
+        ]
+        numpy_frames = episode.frames_at_indices(
+            camera_topic,
+            frame_indices=numpy_frame_indices,
+        )
+
         assert [frame.log_time_ns for frame in selected_frames] == expected_log_times.tolist()
+        assert [frame.log_time_ns for frame in numpy_frames] == expected_log_times.tolist()
+        assert [frame.path.read_bytes() for frame in numpy_frames] == [
+            frame.path.read_bytes() for frame in selected_frames
+        ]
+        assert numpy_frames == selected_frames
         assert all(frame.path.read_bytes()[:2] == b"\xff\xd8" for frame in selected_frames)
         assert (
             episode.frames_at_indices(
@@ -186,6 +204,24 @@ def test_canonical_episode_extracts_exact_source_frame_indices(
             )
             == selected_frames
         )
+
+
+@pytest.mark.parametrize(
+    "invalid_frame_indices",
+    [[True], [np.bool_(True)], [3.0], [np.float64(3.0)]],
+)
+def test_canonical_episode_rejects_non_integer_frame_indices(
+    report_and_app: tuple[hflow.TestReport, hflow.App],
+    invalid_frame_indices: list[Any],
+) -> None:
+    report, _app = report_and_app
+    with hflow.Episode(report.canonical_path) as episode:
+        camera_topic = next(topic for topic in episode.cameras if "overhead_cam" in topic)
+        with pytest.raises(ValueError):
+            episode.frames_at_indices(
+                camera_topic,
+                frame_indices=invalid_frame_indices,
+            )
 
 
 def test_arrow_export(report_and_app: tuple[hflow.TestReport, hflow.App]) -> None:

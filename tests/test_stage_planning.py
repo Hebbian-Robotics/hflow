@@ -147,6 +147,53 @@ class TestReingestingAnUnchangedCorpus:
         assert measured == (1,)
 
 
+def test_selected_steps_are_planned_and_replayed_independently(
+    tmp_path: Path, source_episode: Path
+) -> None:
+    data_root = tmp_path / "data"
+    episode_path = data_root / EPISODE_URI
+    episode_path.parent.mkdir(parents=True)
+    episode_path.write_bytes(source_episode.read_bytes())
+    application = hflow.App("selected-planning", data_root=data_root, default_checks=())
+    invocation_counts = {"first_check": 0, "second_check": 0}
+
+    @application.check(version="1")
+    def first_check(ep: hflow.Episode) -> hflow.CheckResult:
+        invocation_counts["first_check"] += 1
+        return hflow.CheckResult(measurements={"first": 1.0})
+
+    @application.check(version="1")
+    def second_check(ep: hflow.Episode) -> hflow.CheckResult:
+        invocation_counts["second_check"] += 1
+        return hflow.CheckResult(measurements={"second": 1.0})
+
+    first_run = run_stages_directly(
+        application,
+        [EPISODE_URI],
+        hflow.RUN_PROFILES["full"],
+        step_names={"first_check"},
+    )
+    repeated_first_run = run_stages_directly(
+        application,
+        [EPISODE_URI],
+        hflow.RUN_PROFILES["full"],
+        step_names={"first_check"},
+    )
+    second_run = run_stages_directly(
+        application,
+        [EPISODE_URI],
+        hflow.RUN_PROFILES["full"],
+        step_names={"second_check"},
+    )
+
+    assert invocation_counts == {"first_check": 1, "second_check": 1}
+    assert _stage(first_run, hflow.Stage.META).counts["processed"] == 1
+    assert _stage(repeated_first_run, hflow.Stage.META).counts["processed"] == 0
+    assert _stage(repeated_first_run, hflow.Stage.META).skipped_as_current == 1
+    assert _stage(second_run, hflow.Stage.META).counts["processed"] == 1
+    assert _stage(first_run, hflow.Stage.LABELS).skipped_as_current == 0
+
+
 class TestWhatSchedulesWorkAgain:
     def test_a_check_added_afterwards(self, project: Path) -> None:
         _ingest(project)
@@ -592,7 +639,7 @@ def added_later(ep: hflow.Episode) -> hflow.CheckResult:
 
 # What a rendered `plan` task is once its Airflow decorator is stripped: conf
 # values in, JSON-able batches out.
-RenderedPlan = Callable[[list[str], str, int | None, bool | str], list[dict[str, Any]]]
+RenderedPlan = Callable[..., list[dict[str, Any]]]
 
 
 class TestTheRenderedPlanTask:
@@ -662,6 +709,23 @@ class TestTheRenderedPlanTask:
         batches = plan([EPISODE_URI], "batch", None, True)
 
         assert [item for batch in batches for item in batch["items"]] == [EPISODE_URI]
+
+    def test_selected_steps_reach_the_rendered_catalog_filter(
+        self, project: Path, plan: RenderedPlan
+    ) -> None:
+        _ingest(project)
+
+        with pytest.raises(SystemExit) as excinfo:
+            plan(
+                [EPISODE_URI],
+                "batch",
+                None,
+                False,
+                ["episode_duration"],
+                ["sync", "meta", "labels", "media"],
+            )
+
+        assert excinfo.value.code == 99
 
     def test_a_conf_string_reads_as_the_flag_it_spells(
         self, project: Path, plan: RenderedPlan

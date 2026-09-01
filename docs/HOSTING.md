@@ -44,7 +44,7 @@ Two rules a hosted workspace must follow:
 |---|---|---|
 | Pipeline manifest (`hflow manifest`, `App.manifest()`) | pipeline author's environment | step names, explicit versions, gate flags, endpoint aliases, pipeline/schema versions -- what a service displays, diffs, and validates without holding the code. Producing it imports (executes) the pipeline declarations, so treat the result as the author's claims. |
 | Bundle manifest (`hflow-bundle.json`) | `hflow up` / `hflow deploy` | the rendered bundle as data: manifest version, kind, hflow version, DAG ids, data root, pipeline filename, app variable, requirements flag, task queue, venv interpreter path. The provisioning/upload contract. |
-| Trigger conf | any REST caller | `{"uris": [...], "profile": ..., "mode": "batch"\|"online", "batch_count": ...}` on Airflow's `dagRuns` endpoint -- already the wire shape a control plane calls. |
+| Trigger conf | any REST caller | `{"uris": [...], "profile": ..., "mode": "batch"\|"online", "batch_count": ..., "step_names": [...]}` on Airflow's `dagRuns` endpoint -- already the wire shape a control plane calls. |
 | Run states | Airflow REST | `hflow status --airflow-url ...` (and `hflow.runtime.describe_remote_status`) report health, registration, and recent run states with no local files. |
 | Catalog facts | curation | manifests, coverage reports, and stale lists carry URIs (pointers) and measurements -- not media. |
 
@@ -91,6 +91,28 @@ execution backend (a hosted executor, a different scheduler, a plain worker
 loop around `app.process()`) reuses the same semantics instead of copying
 generated code. Bundles pin `hflow==<renderer's version>`, so rendered DAGs
 and the library they call cannot skew inside one bundle.
+
+Hosted executors can limit a stage invocation to registered steps without
+forking those semantics:
+
+```python
+from hflow.stage_execution import process_stage_batch
+
+counts = process_stage_batch(
+    app,
+    episode_uris,
+    "meta",
+    orchestrator_run_id=run_id,
+    step_names={"camera_integrity", "hand_activity"},
+)
+```
+
+The filter is optional: omitting it retains complete-stage execution. Unknown
+names or names from another stage fail before episode I/O, unselected steps
+write no catalog outcome, and partial metadata runs preserve quarantine from
+unselected gates. The built-in Airflow bundle exposes the same operation
+through repeatable `hflow ingest --step NAME` flags and the SDK's
+`AirflowClient.ingest(..., step_names=...)` argument.
 
 Routing seams for shared or multi-pool schedulers, all rendered per bundle:
 

@@ -519,8 +519,19 @@ def _refresh_local_catalog_connection(
         raise
 
 
-def _reject_non_single_select(sql: str) -> None:
-    """Raise ValueError if *sql* is not exactly one SELECT statement.
+class NonSingleSelectQueryError(ValueError):
+    """SQL that parsed cleanly but is not exactly one SELECT statement.
+
+    The single-SELECT rule's failure modes stay distinct so a caller can face
+    them differently: a syntactically invalid string raises the parser's
+    ``duckdb.Error`` with DuckDB's own diagnostic, while this exception is a
+    WELL-FORMED input that just is not the one allowed shape — a lone
+    ``CREATE TABLE``, a multi-statement string, or no statements at all.
+    """
+
+
+def reject_non_single_select(sql: str) -> None:
+    """Raise ``NonSingleSelectQueryError`` unless *sql* is one SELECT statement.
 
     ``connection.execute()`` and ``connection.sql()`` both run **every**
     semicolon-separated statement in the input and return only the last
@@ -528,18 +539,17 @@ def _reject_non_single_select(sql: str) -> None:
     (``SELECT ...; CREATE TABLE pwned AS SELECT ...``) and it will execute
     silently.  ``extract_statements`` parses the text **without executing
     it** and lets us count statements and check their types before anything
-    touches the connection.  A syntactically invalid string raises
-    ``duckdb.Error`` here — treat that as "not exactly one SELECT" too.
+    touches the connection.  A syntactically invalid string propagates the
+    parser's ``duckdb.Error`` untouched — that is NOT this exception — so
+    the two failure modes stay distinguishable.
     """
     parser_connection = duckdb.connect()
     try:
         statements = parser_connection.extract_statements(sql)
-    except duckdb.Error as exc:
-        raise ValueError("sql must be exactly one SELECT statement") from exc
     finally:
         parser_connection.close()
     if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
-        raise ValueError("sql must be exactly one SELECT statement")
+        raise NonSingleSelectQueryError("sql must be exactly one SELECT statement")
 
 
 def _stage_manifest_and_count(
@@ -548,20 +558,27 @@ def _stage_manifest_and_count(
     """COPY the query's result to the staged manifest; return its row count.
 
     ``sql`` is tenant-supplied on constrained connections.
-    ``_reject_non_single_select`` calls ``connection.extract_statements``
-    to parse the input **without executing it** and raises ``ValueError``
-    on any payload that is not exactly one SELECT statement — including
-    multi-statement injections separated by semicolons (e.g.
-    ``SELECT ...; CREATE TABLE pwned AS SELECT ...``), DDL-only input, or
-    syntactically invalid strings.  ``connection.sql()`` is **not** the
-    guard: on duckdb 1.5.5 it silently executes all statements and returns
-    ``None`` for multi-statement input.  ``write_parquet`` then materialises
-    the single confirmed-safe relation to the staged path.
+    ``reject_non_single_select`` parses the input **without executing it**
+    and refuses any payload that is not exactly one SELECT statement —
+    including multi-statement injections separated by semicolons (e.g.
+    ``SELECT ...; CREATE TABLE pwned AS SELECT ...``) and DDL-only input.
+    ``connection.sql()`` is **not** the guard: on duckdb 1.5.5 it silently
+    executes all statements and returns ``None`` for multi-statement input.
+    ``write_parquet`` then materialises the single confirmed-safe relation
+    to the staged path.
+
+    A parser ``duckdb.Error`` here is surfaced as the same ``ValueError``
+    this function has always raised for library callers; the
+    parse-failure/rule-rejection distinction the service relies on is intact
+    on ``reject_non_single_select`` itself.
 
     The row-count query only ever receives an internally-generated path,
     so it keeps the existing f-string form.
     """
-    _reject_non_single_select(sql)
+    try:
+        reject_non_single_select(sql)
+    except duckdb.Error as exc:
+        raise ValueError("sql must be exactly one SELECT statement") from exc
     connection.sql(sql).write_parquet(str(staged_manifest))
 
     (row_count,) = connection.execute(

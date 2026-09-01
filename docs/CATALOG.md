@@ -32,6 +32,22 @@ entry.run_fingerprint  # content hash of versions + the observable run outcome
 entry.written  # False when this exact run was already recorded
 ```
 
+For a targeted backfill, `step_names=` records only the selected registered
+steps:
+
+```python
+report = app.process(
+    "episode_0001.mcap",
+    stages={hflow.Stage.META},
+    step_names={"camera_integrity"},
+)
+```
+
+Unselected steps do not receive `skipped` rows and therefore remain eligible
+for later execution. A partial metadata run retains existing quarantine from
+unselected or errored critical checks; successfully re-running a selected gate
+replaces that gate's prior quarantine state.
+
 One append writes one Parquet file into each of six table directories under
 `<data_root>/catalog/`, all named `<episode_id>-<run_fingerprint>.parquet`.
 A separate `ingest_failures/` directory records the attempts that produced no
@@ -45,7 +61,7 @@ append at all:
 | `observations` | observation field | `observation_id`, `timestamp_ns`, `key`, typed value columns, and the producing `check_name`/`check_version` |
 | `tags` | tag | `check_name`, `tag` |
 | `intervals` | labeled time span | `label`, `start_ns`, `end_ns` |
-| `ingest_failures` | attempt that produced NO episode row | `source_uri`, `stage`, `failure_kind` (`source-missing` / `source-unreadable` / `infrastructure`), `error_type`, `message`, `pipeline_version`, `orchestrator_run_id`, `recorded_at` |
+| `ingest_failures` | attempt that produced NO episode row | `source_uri`, `stage`, `failure_kind` (`source-missing` / `source-unreadable` / `source-unsupported` / `infrastructure`), `error_type`, `message`, `pipeline_version`, `orchestrator_run_id`, `recorded_at` |
 
 `ingest_failures` is the complement of `episodes`, and exists because
 `episode_id` is a hash of canonical bytes: a recording that never
@@ -55,6 +71,18 @@ tables above in any other sense. `failure_kind` is a heuristic and is stored
 next to the verbatim `error_type` and `message` rather than in place of them;
 anything unrecognized is `infrastructure`, never an accusation against the
 recording.
+
+`source-unsupported` was added after `ingest_failures` already existed in
+deployed catalogs. Rows written before an ingest binary carrying this change
+keep whatever kind that binary assigned at write time -- a content refusal
+recorded as `infrastructure` by an older binary is not retroactively
+reclassified, because the ledger is append-only and nothing rewrites past
+rows. An operator draining an old ledger by kind should expect
+`infrastructure` rows from before the cutover to include content refusals
+alongside genuine infrastructure trouble; `error_type` and `message` remain
+the ground truth for any row, which is exactly why they are kept verbatim
+next to the heuristic. Only rows written by an ingest binary that already
+raises `SourceNotConforming` (see below) can carry `source-unsupported`.
 
 Three durability rules govern writes:
 
@@ -337,7 +365,9 @@ decision:
   an unfilled hole excludes the whole corpus. `skipped` is different and stays
   excluded: a step skipped because a critical check quarantined the episode has
   real work to do the moment that check is retuned. So does `error`: a crash is
-  infrastructure, so it is a retry.
+  infrastructure, so it is a retry -- unlike an ingest-time content refusal
+  (`ingest_failures.failure_kind = source-unsupported`), which never reaches
+  a check run at all and is not retried.
 
 An episode inherits a term of its own from that last case. A crash is a retry
 for the *check*, but the episode it was supposed to check is left in a third

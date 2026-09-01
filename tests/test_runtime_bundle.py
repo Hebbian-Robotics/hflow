@@ -425,10 +425,13 @@ def test_master_dag_source_compiles_and_encodes_contract(
     assert "deferrable=True" in dag_source
     for stage in Stage:
         assert f'"{stage.value}": "my_pipeline_{stage.value}"' in dag_source
-    # uris/mode/batch_count pass through to every triggered sub-DAG.
+    # Run inputs pass through to every triggered sub-DAG; the resolved profile
+    # stages let each worker validate and take its share of step_names.
     assert '"uris": "{{ params.uris }}"' in dag_source
     assert '"mode": "{{ params.mode }}"' in dag_source
     assert '"batch_count": "{{ params.batch_count }}"' in dag_source
+    assert '"step_names": "{{ params.step_names }}"' in dag_source
+    assert '"enabled_stage_names": enabled_stage_names' in dag_source
 
 
 def test_sub_dag_sources_compile_and_encode_contract(config: RuntimeConfig, tmp_path: Path) -> None:
@@ -441,10 +444,8 @@ def test_sub_dag_sources_compile_and_encode_contract(config: RuntimeConfig, tmp_
 
         assert f'dag_id="my_pipeline_{stage.value}"' in dag_source
         assert "schedule=None" in dag_source
-        assert (
-            'params={"uris": [], "mode": "batch", "batch_count": None, "all_stages": False}'
-            in dag_source
-        )
+        assert '"step_names": None' in dag_source
+        assert f'"enabled_stage_names": ["{stage.value}"]' in dag_source
         # All three tasks run in the user venv via external python.
         assert dag_source.count("@task.external_python(python='/opt/venvs/user/bin/python'") == 3
         # Imports live inside the (indented) function bodies -- the operator
@@ -461,20 +462,17 @@ def test_sub_dag_sources_compile_and_encode_contract(config: RuntimeConfig, tmp_
         assert "resolve_user_pipeline_path('my_pipeline.py')" in dag_source
         assert 'load_pipeline_application(pipeline_path, "app")' in dag_source
         # Each sub-DAG runs exactly its own stage of the stage graph.
-        assert (
-            f'process_stage_batch(app, batch["items"], "{stage.value}", orchestrator_run_id)'
-            in dag_source
-        )
+        assert "resolve_step_names_for_stage(" in dag_source
+        assert 'step_names="{{ params.step_names }}"' in dag_source
+        assert f'            "{stage.value}",' in dag_source
         # The stagger, mapped batches, and budget gate are one contract.
         assert 'time.sleep(float(batch["start_delay_s"]))' in dag_source
         # partial() binds this sub-DAG's own run id across the whole fan-out.
         # It is a rendered template argument because the callable runs under
         # expect_airflow=False and so cannot read the Airflow context, and it
         # is what lets a catalog row name the run that produced it.
-        assert (
-            'process_batch.partial(orchestrator_run_id="{{ run_id }}").expand(batch=batches)'
-            in dag_source
-        )
+        assert 'orchestrator_run_id="{{ run_id }}"' in dag_source
+        assert ").expand(batch=batches)" in dag_source
         # The gate materializes the mapped results (lazy XCom proxies cannot
         # cross the external-python pickle boundary; list-typed task_ids keeps
         # a single-batch run from being flattened) and keeps the edge explicit.

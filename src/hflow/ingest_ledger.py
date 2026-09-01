@@ -47,10 +47,13 @@ INGEST_FAILURES_COLUMN_DDL = (
 class IngestFailureKind(StrEnum):
     """Whose problem this was, as far as the engine can honestly tell.
 
-    Three members, because three is what the evidence supports. The point of
+    Four members, because four is what the evidence supports. The point of
     the distinction is triage: a source that is bad stays bad and wants a
     human, while infrastructure trouble wants a retry -- and reporting one as
-    the other sends people to the wrong place.
+    the other sends people to the wrong place. The three source-side members
+    separate different flavors of "bad": missing entirely, unreadable as a
+    file at all, and readable but refusing on its contents (a transform
+    declining to bridge or transcode what it found).
 
     ``INFRASTRUCTURE`` is the default for anything unrecognized, never the
     other way round. Guessing "your data is bad" from a crash the engine did
@@ -60,6 +63,7 @@ class IngestFailureKind(StrEnum):
 
     SOURCE_MISSING = "source-missing"
     SOURCE_UNREADABLE = "source-unreadable"
+    SOURCE_UNSUPPORTED = "source-unsupported"
     INFRASTRUCTURE = "infrastructure"
 
 
@@ -85,9 +89,15 @@ def classify_ingest_failure(error: BaseException) -> IngestFailureKind:
     next to the evidence that would correct it rather than replacing it.
     """
     from hflow.app import SourceNotFound
+    from hflow.transform import SourceNotConforming
 
     if isinstance(error, SourceNotFound):
         return IngestFailureKind.SOURCE_MISSING
+    if isinstance(error, SourceNotConforming):
+        # A refusal about the recording's contents (an unsupported format, a
+        # canonical-convention violation) -- distinct from SOURCE_UNREADABLE,
+        # which is a file that isn't even a readable MCAP.
+        return IngestFailureKind.SOURCE_UNSUPPORTED
     try:
         from mcap.exceptions import McapError
     except ImportError:  # pragma: no cover - mcap is a hard dependency

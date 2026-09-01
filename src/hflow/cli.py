@@ -628,6 +628,17 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     ingest_parser.add_argument(
+        "--step",
+        dest="step_names",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help=(
+            "run only this registered check, enrichment, or media step; repeat "
+            "to select more than one"
+        ),
+    )
+    ingest_parser.add_argument(
         "--online",
         action="store_true",
         help=(
@@ -1059,7 +1070,13 @@ def _ingest_in_process(arguments: argparse.Namespace) -> int:
         file=sys.stderr,
     )
     try:
-        outcomes = run_stages_directly(app, list(arguments.uris), stages, selection=selection)
+        outcomes = run_stages_directly(
+            app,
+            list(arguments.uris),
+            stages,
+            selection=selection,
+            step_names=arguments.step_names,
+        )
     except RuntimeError as error:
         # The mass-failure gates, verbatim: the same budgets a scheduled run
         # applies, so a corpus that would fail there fails here too.
@@ -1160,12 +1177,21 @@ def _command_ingest(arguments: argparse.Namespace) -> int:
         dag_id = paths.dag_id
         watch_location = paths.api_base_url
     try:
-        dag_run = client.ingest(
-            dag_id,
-            list(arguments.uris),
-            profile=arguments.profile,
-            online=arguments.online,
-        )
+        if arguments.step_names is None:
+            dag_run = client.ingest(
+                dag_id,
+                list(arguments.uris),
+                profile=arguments.profile,
+                online=arguments.online,
+            )
+        else:
+            dag_run = client.ingest(
+                dag_id,
+                list(arguments.uris),
+                profile=arguments.profile,
+                online=arguments.online,
+                step_names=arguments.step_names,
+            )
     except AirflowClientError as error:
         print(f"ingest: {error}", file=sys.stderr)
         if error.status == 404:

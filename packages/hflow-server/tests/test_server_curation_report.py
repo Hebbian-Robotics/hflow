@@ -54,6 +54,7 @@ def test_report_refuses_a_plain_multi_statement(api: TestClient) -> None:
         json={"sql": "SELECT 1; DROP TABLE episodes_raw"},
     )
     assert response.status_code == 400
+    assert response.json()["detail"] == "sql must be exactly one read-only SELECT statement"
 
 
 def test_report_over_an_empty_catalog(empty_catalog_api: TestClient) -> None:

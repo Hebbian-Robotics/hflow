@@ -68,6 +68,18 @@ stage sub-DAG filters its own `uris` at plan time, after the sync sub-DAG has
 finished, so it reads the catalog state the in-process plan would read. A stage
 left with nothing outstanding skips rather than reporting a hollow success.
 
+Use repeatable `--step` flags for a targeted check or enrichment pass. The
+same selection works in-process and through a rendered Airflow bundle:
+
+```bash
+hflow ingest --profile metadata_backfill \
+  --step camera_integrity --step hand_activity episodes-in/*.mcap
+```
+
+The profile must enable every selected step's owning stage. `sync` still runs
+when the profile includes it; unselected steps write no catalog rows and
+remain available to a later run.
+
 `--all-stages` has a counterpart there: pass `all_stages: true` in the trigger
 conf and every stage runs over everything it was handed, whatever the catalog
 says. The master passes it down to every sub-DAG it triggers, and a directly
@@ -181,7 +193,7 @@ anything is triggered):
 hflow ingest episodes-in/run_0001.mcap episodes-in/run_0002.mcap
 ```
 
-Two flags select what runs and how:
+Three flags select what runs and how:
 
 - **`--profile`** picks the run profile: which stage sub-DAGs the master
   enables. `full` (default) runs everything; `metadata_backfill` re-runs only
@@ -191,6 +203,9 @@ Two flags select what runs and how:
   backfill or relabel pass appends rows when the pipeline declares a new check
   or enrichment version; re-running the same declared versions over identical
   episodes is a recorded no-op, not duplicate evidence.
+- **`--step NAME`** limits work to one registered check, enrichment, or media
+  step; repeat the flag to select several. The selected names travel in the
+  DAG-run configuration and each sub-DAG takes only its own share.
 - **`--online`** selects the latency-first trigger lane: the sub-DAGs process
   the URIs as **one immediate batch**, no bin-packing, no stagger delays.
   Meant for one run per episode as it lands (a collection rig posting each
@@ -198,7 +213,8 @@ Two flags select what runs and how:
   throughput over shards.
 
 This wraps Airflow's REST API v2 `dagRuns` endpoint with
-`{"uris": [...], "profile": "full", "mode": "batch"}` in the run conf. A
+`{"uris": [...], "profile": "full", "mode": "batch", "step_names": [...]}`
+in the run conf (`step_names` is omitted without `--step`). A
 collection rig or upload script can call the same endpoint directly, no CLI
 required (`"mode": "online"` is the `--online` lane).
 

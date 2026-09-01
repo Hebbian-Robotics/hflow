@@ -19,7 +19,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -58,6 +58,11 @@ class BearerToken:
 
 
 AirflowAuth = PasswordCredentials | BearerToken
+
+
+def _body_excerpt(body: str) -> str:
+    """Collapse a response body to the bounded excerpt exposed to callers."""
+    return " ".join(body.split())[:200]
 
 
 @dataclass(frozen=True)
@@ -135,12 +140,12 @@ class AirflowClient:
             request.add_header("Authorization", f"Bearer {bearer_token}")
         try:
             with urllib.request.urlopen(request, timeout=self._request_timeout_s) as response:
-                response_text = response.read().decode()
+                response_body = response.read()
         except urllib.error.HTTPError as error:
             error_body = error.read().decode(errors="replace")
             # Airflow puts the useful part ("detail") in the body; surface a
             # truncated copy so failures are diagnosable from the message.
-            body_excerpt = " ".join(error_body.split())[:200]
+            body_excerpt = _body_excerpt(error_body)
             raise AirflowClientError(
                 f"{method} {url} failed with HTTP {error.code}"
                 + (f": {body_excerpt}" if body_excerpt else ""),
@@ -155,9 +160,27 @@ class AirflowClient:
             # published port before the api-server listens) must also become
             # AirflowClientError, or wait_until_healthy cannot retry them.
             raise AirflowClientError(f"{method} {url} failed: {error!r}") from error
+        try:
+            response_text = response_body.decode("utf-8")
+        except UnicodeDecodeError as error:
+            response_text = response_body.decode("utf-8", errors="replace")
+            body_excerpt = _body_excerpt(response_text)
+            raise AirflowClientError(
+                f"{method} {url} returned invalid UTF-8"
+                + (f": {body_excerpt}" if body_excerpt else ""),
+                body=response_text,
+            ) from error
         if not response_text:
             return {}
-        parsed = json.loads(response_text)
+        try:
+            parsed = json.loads(response_text)
+        except json.JSONDecodeError as error:
+            body_excerpt = _body_excerpt(response_text)
+            raise AirflowClientError(
+                f"{method} {url} returned malformed JSON"
+                + (f": {body_excerpt}" if body_excerpt else ""),
+                body=response_text,
+            ) from error
         if not isinstance(parsed, dict):
             raise AirflowClientError(f"{method} {url} returned non-object JSON: {parsed!r}")
         return parsed
@@ -192,7 +215,7 @@ class AirflowClient:
                 # A pre-issued token cannot be refreshed here; retrying with
                 # the same bytes would just 401 again. Keep the server's own
                 # explanation in the message -- it is what the CLI prints.
-                body_excerpt = " ".join(error.body.split())[:200]
+                body_excerpt = _body_excerpt(error.body)
                 raise AirflowClientError(
                     f"{method} {url} rejected the pre-issued bearer token (HTTP 401): "
                     "the token is expired or invalid -- obtain a fresh one"
@@ -317,6 +340,7 @@ class AirflowClient:
         profile: str = "full",
         online: bool = False,
         batch_count: int | None = None,
+        step_names: Iterable[str] | None = None,
         dag_run_id: str | None = None,
     ) -> dict[str, Any]:
         """Trigger the MASTER ingest DAG over ``uris`` (the SDK/CLI entry point).
@@ -328,7 +352,9 @@ class AirflowClient:
         immediate batch, no bin-packing, no stagger -- instead of the default
         staggered batch lane. ``batch_count`` overrides the master's own
         bin-packing for the batch lane (ignored by the online lane, which is
-        always one batch). Supply ``dag_run_id`` when the caller may retry
+        always one batch). ``step_names`` limits the run to named registered
+        checks, enrichments, or media steps while preserving the profile's
+        stage ordering. Supply ``dag_run_id`` when the caller may retry
         (see :meth:`trigger_dag_run` for the idempotency contract).
 
         This method owns the trigger conf's shape: every caller -- the CLI,
@@ -349,4 +375,11 @@ class AirflowClient:
         }
         if batch_count is not None:
             conf["batch_count"] = batch_count
+        if step_names is not None:
+            if isinstance(step_names, str):
+                raise TypeError("step_names must be an iterable of names, not one string")
+            selected_step_names = list(step_names)
+            if not all(isinstance(step_name, str) for step_name in selected_step_names):
+                raise TypeError("step names must be strings")
+            conf["step_names"] = selected_step_names
         return self.trigger_dag_run(dag_id, conf=conf, dag_run_id=dag_run_id)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 import webbrowser
 from dataclasses import dataclass
@@ -32,10 +33,26 @@ class CatalogUiSettings:
     catalog_poll_interval_seconds: float = DEFAULT_CATALOG_POLL_INTERVAL_SECONDS
 
     def __post_init__(self) -> None:
+        if isinstance(self.port, bool) or not isinstance(self.port, int):
+            raise ValueError(f"port must be an int, got {type(self.port).__name__}")
         if not 1 <= self.port <= 65535:
             raise ValueError("port must be between 1 and 65535")
-        if self.catalog_poll_interval_seconds <= 0:
-            raise ValueError("catalog poll interval must be greater than zero")
+
+        if isinstance(self.catalog_poll_interval_seconds, bool) or not isinstance(
+            self.catalog_poll_interval_seconds, int | float
+        ):
+            raise ValueError(
+                "catalog_poll_interval_seconds must be an int or float, got "
+                f"{type(self.catalog_poll_interval_seconds).__name__}"
+            )
+        if (
+            not math.isfinite(self.catalog_poll_interval_seconds)
+            or self.catalog_poll_interval_seconds <= 0
+        ):
+            raise ValueError(
+                "catalog_poll_interval_seconds must be positive and finite, got "
+                f"{self.catalog_poll_interval_seconds}"
+            )
 
 
 def _raise_if_loopback_port_is_unavailable(port: int) -> None:

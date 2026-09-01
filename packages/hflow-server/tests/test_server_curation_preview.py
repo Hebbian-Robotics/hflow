@@ -119,6 +119,7 @@ def test_preview_refuses_multiple_statements(api: TestClient) -> None:
         json={"sql": "SELECT 1; DROP TABLE episodes_raw"},
     )
     assert response.status_code == 400
+    assert response.json()["detail"] == "sql must be exactly one read-only SELECT statement"
 
 
 def test_preview_refuses_a_paren_closing_smuggle_as_400_not_500(api: TestClient) -> None:
@@ -150,6 +151,7 @@ def test_preview_refuses_a_non_select_single_statement(api: TestClient) -> None:
     # A single well-formed but non-SELECT statement is refused too.
     response = api.post("/api/v1/curation/preview", json={"sql": "CREATE TABLE t AS SELECT 1"})
     assert response.status_code == 400
+    assert response.json()["detail"] == "sql must be exactly one read-only SELECT statement"
 
 
 def test_preview_refuses_an_oversized_sql_body(api: TestClient) -> None:

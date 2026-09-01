@@ -999,13 +999,13 @@ def test_status_remote_reports_health_and_runs_without_a_bundle(
     assert "manual__1 [success]" in output
 
 
-def test_ingest_plumbs_profile_and_online_into_conf(
+def test_ingest_plumbs_profile_lane_and_steps_into_conf(
     monkeypatch: pytest.MonkeyPatch,
     pipeline_file: Path,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """--profile/--online land in the trigger conf keys "profile"/"mode"."""
+    """CLI selection reaches the SDK-owned trigger configuration."""
     bundle_dir = _rendered_bundle(tmp_path, pipeline_file)
     captured: dict[str, object] = {}
 
@@ -1022,11 +1022,28 @@ def test_ingest_plumbs_profile_and_online_into_conf(
 
     monkeypatch.setattr(AirflowClient, "trigger_dag_run", fake_trigger)
     exit_code = main(
-        ["ingest", "a.mcap", "--bundle-dir", str(bundle_dir), "--profile", "relabel", "--online"]
+        [
+            "ingest",
+            "a.mcap",
+            "--bundle-dir",
+            str(bundle_dir),
+            "--profile",
+            "relabel",
+            "--online",
+            "--step",
+            "caption",
+            "--step",
+            "embedding",
+        ]
     )
     assert exit_code == 0
     assert captured["dag_id"] == "demo_pipeline_ingest"
-    assert captured["conf"] == {"uris": ["a.mcap"], "profile": "relabel", "mode": "online"}
+    assert captured["conf"] == {
+        "uris": ["a.mcap"],
+        "profile": "relabel",
+        "mode": "online",
+        "step_names": ["caption", "embedding"],
+    }
     assert "profile relabel, online lane" in capsys.readouterr().out
 
 

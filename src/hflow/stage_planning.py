@@ -40,6 +40,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from hflow.step_selection import (
+    RegisteredStepSelection,
+    registered_step_is_selected,
+)
 from hflow.steps import RAN_STATUSES, SETTLED_STATUSES, Stage
 
 if TYPE_CHECKING:
@@ -108,7 +112,9 @@ EpisodeStagePlan = OutstandingStages | NoCanonicalEpisode
 
 
 def _required_steps_by_stage(
-    application: "App", candidate_stages: Iterable[Stage]
+    application: "App",
+    candidate_stages: Iterable[Stage],
+    step_selection: RegisteredStepSelection,
 ) -> dict[Stage, tuple[tuple[str, str], ...]]:
     """The ``(name, version)`` pairs each stage is responsible for recording.
 
@@ -118,19 +124,35 @@ def _required_steps_by_stage(
     """
     from hflow.app import MEDIA_CONTACT_SHEET_STEP_NAME, media_contact_sheet_step_version
 
+    candidates = frozenset(candidate_stages)
     by_stage: dict[Stage, tuple[tuple[str, str], ...]] = {
         Stage.META: tuple(
-            sorted((registered.name, registered.version) for registered in application.checks)
+            sorted(
+                (registered.name, registered.version)
+                for registered in application.checks
+                if registered_step_is_selected(step_selection, registered.name)
+            )
         ),
         Stage.LABELS: tuple(
-            sorted((registered.name, registered.version) for registered in application.enrichments)
+            sorted(
+                (registered.name, registered.version)
+                for registered in application.enrichments
+                if registered_step_is_selected(step_selection, registered.name)
+            )
         ),
-        Stage.MEDIA: ((MEDIA_CONTACT_SHEET_STEP_NAME, media_contact_sheet_step_version()),),
+        Stage.MEDIA: (
+            ((MEDIA_CONTACT_SHEET_STEP_NAME, media_contact_sheet_step_version()),)
+            if registered_step_is_selected(step_selection, MEDIA_CONTACT_SHEET_STEP_NAME)
+            else ()
+        ),
     }
-    candidates = frozenset(candidate_stages)
     # Iterated in stage-graph order rather than the caller's, so a plan reads
     # the same way twice regardless of what kind of collection it was handed.
-    return {stage: by_stage[stage] for stage in Stage if stage in candidates and stage in by_stage}
+    return {
+        stage: by_stage[stage]
+        for stage in Stage
+        if stage in candidates and stage in by_stage and by_stage[stage]
+    }
 
 
 def _quote_sql_string(value: str) -> str:
@@ -227,8 +249,15 @@ def plan_outstanding_stages(
     application: "App",
     source_identities: Sequence[str],
     candidate_stages: Iterable[Stage],
+    *,
+    step_names: Iterable[str] | None = None,
+    _registered_step_selection: RegisteredStepSelection | None = None,
 ) -> dict[str, EpisodeStagePlan]:
     """Per source recording, which of ``candidate_stages`` still has work to do.
+
+    ``step_names`` optionally narrows the question to registered steps in the
+    candidate stages. Unselected steps neither schedule work nor count as
+    current; they remain available to a later plan.
 
     **Call this only after ``sync`` has run in the same invocation.** Everything
     below reads the catalog as this run's own output, and that is only true then.
@@ -256,7 +285,16 @@ def plan_outstanding_stages(
     """
     from hflow.curation import open_catalog_connection
 
-    required_by_stage = _required_steps_by_stage(application, candidate_stages)
+    candidate_stage_set = frozenset(candidate_stages)
+    if _registered_step_selection is None:
+        step_selection = application._resolve_registered_step_selection(
+            step_names, candidate_stage_set
+        )
+    else:
+        if step_names is not None:
+            raise TypeError("step_names and _registered_step_selection cannot both be provided")
+        step_selection = _registered_step_selection
+    required_by_stage = _required_steps_by_stage(application, candidate_stage_set, step_selection)
     if not source_identities or not required_by_stage:
         # No stage among the candidates records anything, so every recording is
         # trivially up to date rather than un-runnable.
@@ -328,8 +366,12 @@ def outstanding_stage_uris(
     stage: Stage,
     *,
     data_root: str,
+    step_names: Iterable[str] | None = None,
 ) -> list[str]:
     """Which of ``uris`` still owe ``stage`` work, in the order given.
+
+    ``step_names`` asks the same question for a selected subset of that
+    stage's registered steps. The selection is validated before catalog I/O.
 
     The same question :func:`plan_outstanding_stages` answers for a direct
     run, asked for one stage and answered in the caller's own vocabulary:
@@ -375,7 +417,12 @@ def outstanding_stage_uris(
         uri: application.source_identity(resolve_episode_reference(data_root, str(uri)))
         for uri in uris
     }
-    plans = plan_outstanding_stages(application, list(identity_by_uri.values()), (stage,))
+    plans = plan_outstanding_stages(
+        application,
+        list(identity_by_uri.values()),
+        (stage,),
+        step_names=step_names,
+    )
     return [
         uri
         for uri in uris
