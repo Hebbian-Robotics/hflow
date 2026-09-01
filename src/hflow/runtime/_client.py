@@ -121,9 +121,7 @@ def _optional_float(value: object) -> float | None:
 
 def _parse_dag_run(value: object, *, endpoint: str) -> AirflowDagRun:
     if not isinstance(value, dict):
-        raise AirflowClientError(
-            f"{endpoint} returned a DAG run that is not a JSON object"
-        )
+        raise AirflowClientError(f"{endpoint} returned a DAG run that is not a JSON object")
     conf = value.get("conf")
     return AirflowDagRun(
         dag_run_id=_optional_string(value.get("dag_run_id")),
@@ -137,9 +135,7 @@ def _parse_dag_run(value: object, *, endpoint: str) -> AirflowDagRun:
 
 def _parse_task_instance(value: object, *, endpoint: str) -> AirflowTaskInstance:
     if not isinstance(value, dict):
-        raise AirflowClientError(
-            f"{endpoint} returned a task instance that is not a JSON object"
-        )
+        raise AirflowClientError(f"{endpoint} returned a task instance that is not a JSON object")
     try_number = value.get("try_number")
     map_index = value.get("map_index")
     queued_at = value.get("queued_when") or value.get("queued_at")

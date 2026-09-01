@@ -371,9 +371,7 @@ def _master_run_window(master_run: AirflowDagRun) -> _MasterRunWindow | None:
     started_at = _parsed_timestamp(master_run.start_date)
     if started_at is None:
         return None
-    return _MasterRunWindow(
-        started_at=started_at, ended_at=_parsed_timestamp(master_run.end_date)
-    )
+    return _MasterRunWindow(started_at=started_at, ended_at=_parsed_timestamp(master_run.end_date))
 
 
 def _matched_stage_run(

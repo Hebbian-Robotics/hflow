@@ -88,12 +88,8 @@ def _dag_run(value: dict[str, Any] | AirflowDagRun) -> AirflowDagRun:
         logical_date=value.get("logical_date")
         if isinstance(value.get("logical_date"), str)
         else None,
-        start_date=value.get("start_date")
-        if isinstance(value.get("start_date"), str)
-        else None,
-        end_date=value.get("end_date")
-        if isinstance(value.get("end_date"), str)
-        else None,
+        start_date=value.get("start_date") if isinstance(value.get("start_date"), str) else None,
+        end_date=value.get("end_date") if isinstance(value.get("end_date"), str) else None,
         conf=value.get("conf") if isinstance(value.get("conf"), dict) else {},
     )
 
@@ -120,9 +116,7 @@ def _stubbed_airflow(
     monkeypatch.setattr(
         AirflowClient,
         "task_instances",
-        lambda self, dag_id, dag_run_id: list(
-            task_instances.get((dag_id, dag_run_id), [])
-        ),
+        lambda self, dag_id, dag_run_id: list(task_instances.get((dag_id, dag_run_id), [])),
     )
 
 
@@ -252,9 +246,7 @@ def test_run_graph_passes_the_run_id_through_verbatim(
     """Airflow run ids carry ':' and '+'; the path must not mangle them."""
     requested: list[tuple[str, str]] = []
 
-    def capturing_dag_run(
-        self: AirflowClient, dag_id: str, dag_run_id: str
-    ) -> AirflowDagRun:
+    def capturing_dag_run(self: AirflowClient, dag_id: str, dag_run_id: str) -> AirflowDagRun:
         requested.append((dag_id, dag_run_id))
         return _dag_run({"dag_run_id": dag_run_id, "state": "success", "start_date": None})
 

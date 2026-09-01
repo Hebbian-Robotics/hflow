@@ -308,21 +308,15 @@ def test_task_instance_response_is_parsed_into_typed_model(stub_server: str) -> 
 
 
 def test_malformed_dag_run_item_raises_typed_client_error(stub_server: str) -> None:
-    _StubAirflowHandler.dag_run_response_body = {
-        "dag_runs": ["not-an-object"]
-    }
+    _StubAirflowHandler.dag_run_response_body = {"dag_runs": ["not-an-object"]}
     client = AirflowClient(stub_server, "airflow", "right-password")
 
-    with pytest.raises(
-        AirflowClientError, match="returned a DAG run that is not a JSON object"
-    ):
+    with pytest.raises(AirflowClientError, match="returned a DAG run that is not a JSON object"):
         client.dag_runs("pipeline_ingest")
 
 
 def test_malformed_task_instance_item_raises_typed_client_error(stub_server: str) -> None:
-    _StubAirflowHandler.task_instances_response_body = {
-        "task_instances": ["not-an-object"]
-    }
+    _StubAirflowHandler.task_instances_response_body = {"task_instances": ["not-an-object"]}
     client = AirflowClient(stub_server, "airflow", "right-password")
 
     with pytest.raises(
