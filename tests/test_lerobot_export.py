@@ -10,6 +10,7 @@ materialize the synthetic archive.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import sys
@@ -199,7 +200,7 @@ def fake_corpus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
             }
         )
         _make_data_local(corpus)
-        cache = Path(output_dir) / "_lerobot_cache"
+        cache = Path(output_dir) / "_lerobot_cache" / str(revision)
         if not cache.exists():
             shutil.copytree(tmp_path, cache)
         return []
@@ -425,3 +426,81 @@ def test_export_drives_public_importer(fake_corpus: dict, tmp_path: Path) -> Non
     assert call["revision"] == "a" * 40
     assert call["episode_index"] is None
     assert call["camera_keys"] == ("observation.images.up", "observation.images.side")
+
+
+def _exported_dataset(fake_corpus: dict, tmp_path: Path) -> Path:
+    """Export a valid single-episode dataset for the corruption tests."""
+    manifest = _fake_manifest(tmp_path, [{"metadata_json": _provenance_meta(0)}])
+    dest = tmp_path / "out"
+    export.export(dest, manifest=manifest, camera_keys=CAMS)
+    return dest
+
+
+def test_export_provenance_digests_match_bytes(fake_corpus: dict, tmp_path: Path) -> None:
+    """Provenance digests correspond to the bytes on disk.
+
+    Regression for the review finding that _sha256 could return a constant
+    without any test noticing: each digest must equal the sha256 of the
+    file it names, and distinct files must produce distinct digests.
+    """
+
+    def _sha(path: Path) -> str:
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    dest = _exported_dataset(fake_corpus, tmp_path)
+    prov = json.loads((dest / "export-provenance.json").read_text())
+
+    up = dest / "videos" / "observation.images.up" / "chunk-000" / "file-000.mp4"
+    side = dest / "videos" / "observation.images.side" / "chunk-000" / "file-000.mp4"
+    data = dest / "data" / "chunk-000" / "file-000.parquet"
+    assert prov["video_sha256"]["observation.images.up"] == _sha(up)
+    assert prov["video_sha256"]["observation.images.side"] == _sha(side)
+    assert prov["data_parquet_sha256"] == _sha(data)
+    # a constant would fail here: different files have different digests
+    assert (
+        prov["video_sha256"]["observation.images.up"]
+        != prov["video_sha256"]["observation.images.side"]
+    )
+    assert prov["data_parquet_sha256"] not in prov["video_sha256"].values()
+
+
+def test_validate_v3_rejects_incoherent_info(fake_corpus: dict, tmp_path: Path) -> None:
+    """info.json coherence is a hard validation: wrong code => refusal."""
+    dest = _exported_dataset(fake_corpus, tmp_path)
+    meta = dest / "meta" / "info.json"
+    info = json.loads(meta.read_text())
+    info["code"] = "LeRobotDataset/v2"
+    meta.write_text(json.dumps(info))
+    with pytest.raises(ValueError, match="not LeRobotDataset/v3"):
+        export._validate_v3(dest)
+
+
+def test_validate_v3_rejects_window_length_mismatch(fake_corpus: dict, tmp_path: Path) -> None:
+    """Per-episode window must equal length: corrupt length => refusal."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    dest = _exported_dataset(fake_corpus, tmp_path)
+    ep_pq = dest / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    table = pq.read_table(str(ep_pq))
+    lengths = table.column("length").to_pylist()
+    lengths[0] = int(lengths[0]) + 1
+    table = table.set_column(
+        table.schema.get_field_index("length"), "length", pa.array(lengths, pa.int64())
+    )
+    pq.write_table(table, str(ep_pq))
+    with pytest.raises(ValueError, match="!= length"):
+        export._validate_v3(dest)
+
+
+def test_validate_v3_rejects_missing_video(fake_corpus: dict, tmp_path: Path) -> None:
+    """Every referenced camera's video file must exist: missing => refusal."""
+    dest = _exported_dataset(fake_corpus, tmp_path)
+    video = dest / "videos" / "observation.images.side" / "chunk-000" / "file-000.mp4"
+    video.unlink()
+    with pytest.raises(ValueError, match="references missing video"):
+        export._validate_v3(dest)
