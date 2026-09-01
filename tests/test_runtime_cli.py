@@ -942,6 +942,27 @@ def test_ingest_remote_without_credentials_names_the_environment_fix(
     assert "HFLOW_AIRFLOW_TOKEN" in capsys.readouterr().err
 
 
+def test_ingest_remote_with_hostless_url_names_the_fix(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HFLOW_AIRFLOW_TOKEN", "minted-token")
+    exit_code = main(
+        [
+            "ingest",
+            "a.mcap",
+            "--airflow-url",
+            "http://",
+            "--dag-id",
+            "kitchen_ingest",
+        ]
+    )
+    assert exit_code == 2
+    error_output = capsys.readouterr().err
+    assert "needs a host" in error_output
+    assert "--airflow-url" in error_output or "HFLOW_AIRFLOW_URL" in error_output
+
+
 def test_explicit_bundle_dir_stays_local_even_with_remote_environment(
     monkeypatch: pytest.MonkeyPatch,
     pipeline_file: Path,

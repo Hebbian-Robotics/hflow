@@ -427,6 +427,25 @@ class TestResolveRemoteEndpoint:
                 environ={"HFLOW_AIRFLOW_TOKEN": "minted-token"},
             )
 
+    @pytest.mark.parametrize("hostless_url", ["http://", "https://", "https:///path"])
+    def test_hostless_url_is_refused_at_the_boundary(self, hostless_url: str) -> None:
+        with pytest.raises(ValueError, match="needs a host"):
+            resolve_remote_endpoint(
+                airflow_url=hostless_url,
+                dag_id="kitchen_ingest",
+                environ={"HFLOW_AIRFLOW_TOKEN": "minted-token"},
+            )
+
+    def test_hostless_url_from_environment_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="needs a host"):
+            resolve_remote_endpoint(
+                dag_id="kitchen_ingest",
+                environ={
+                    "HFLOW_AIRFLOW_URL": "https://",
+                    "HFLOW_AIRFLOW_TOKEN": "minted-token",
+                },
+            )
+
 
 def test_describe_remote_status_reports_health_dag_and_recent_runs(stub_server: str) -> None:
     _StubAirflowHandler.issued_tokens.append("pre-issued-token")
