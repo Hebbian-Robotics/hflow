@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 import hflow
+from hflow.app import _read_sync_completion_marker
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import EpisodeStamps, TransformConfig, write_canonical_episode
 
@@ -170,6 +171,13 @@ def test_every_partial_reuse_witness_stays_readable_but_is_not_reused(
         if key not in witness_fields or key in present_fields
     }
     marker_path.write_text(json.dumps(marker_payload, sort_keys=True) + "\n")
+
+    # Pin the mechanism, not only the outcome: the reader must drop the whole
+    # group. Read before the runs below, which rewrite the marker with a
+    # complete witness. Without this, the parse could go back to accepting a
+    # partial witness and the run below would still refuse reuse, on a later
+    # gate check rather than on this one.
+    assert _read_sync_completion_marker(marker_path).reuse_witness is None
 
     metadata_only = app.process(source, record=False, stages={hflow.Stage.META}, verbose=False)
     assert metadata_only.canonical_path == first.canonical_path

@@ -253,10 +253,24 @@ class _TransformKind(StrEnum):
 
 @dataclass(frozen=True)
 class _SyncReuseWitness:
-    """Proof that a canonical can be safely reused by sync."""
+    """Enough to decide that re-running sync would rewrite byte-identical output.
 
+    Complete or absent: a partial witness cannot prove that re-running sync
+    would reproduce the existing canonical, so the parser drops the whole
+    group rather than letting the surviving fields answer for the missing one.
+    """
+
+    # Which source BYTES produced the canonical. Content, never size+mtime:
+    # this repo identifies by content everywhere, and a same-length rewrite
+    # or a preserved mtime would defeat the weaker test silently.
     source_digest: str
+    # The transform is stamped with an ffmpeg version that does NOT reach
+    # pipeline_version, and different builds genuinely encode differently.
     ffmpeg_version: str
+    # An @app.transform override is contractually required to end in
+    # write_canonical_episode, so it stamps the SAME pipeline_version the
+    # default transform would: without this, REMOVING an override would reuse
+    # a canonical the current pipeline cannot produce.
     transform_kind: _TransformKind
 
 
@@ -264,8 +278,11 @@ class _SyncReuseWitness:
 class _SyncCompletion:
     """Proof that sync completed for one source path and canonical version.
 
-    ``reuse_witness`` is complete or absent: a partial witness cannot prove
-    that re-running sync would reproduce the existing canonical.
+    ``reuse_witness`` is optional because markers written before it existed
+    are still valid proof for the non-sync stages, which is all those stages
+    ever asked of them. A witness-less marker simply never satisfies the reuse
+    gate: one re-transcode rewrites it in the current shape, and that is the
+    whole migration.
     """
 
     source_path: str
