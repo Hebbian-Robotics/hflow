@@ -43,6 +43,12 @@ _VCL_NAL_TYPES = frozenset({1, 2, 3, 4, 5})
 # Types whose RBSP starts with a slice header. Data partitions B/C (3/4) are
 # VCL data but carry no ``first_mb_in_slice`` of their own.
 _SLICE_HEADER_NAL_TYPES = frozenset({1, 2, 5})
+# How many bytes of a VCL NAL's payload to unescape when reading the slice
+# header. ``first_mb_in_slice`` and ``slice_type`` are the first two Exp-Golomb
+# values; 16 bytes is enough at any legal macroblock index (``#346`` measured
+# this against 4K-class inputs). A NAL whose slice header needs more is
+# caught by the head-too-short fallback in the scan.
+_SLICE_HEADER_HEAD_BYTES = 16
 # Annex B AUD with primary_pic_type 7 (any I/P/B picture), followed by the
 # required RBSP stop bit. x264 writes the narrower ``09 10`` for the streams
 # HFlow encodes; repair deliberately uses the permissive value because it must
@@ -238,6 +244,36 @@ def _nal_header_offset(stream: bytes, nal_start_offset: int) -> int:
     raise ValueError(f"invalid Annex B start code at byte {nal_start_offset}")
 
 
+def _unescape_ebsp_head(ebsp: bytes, max_bytes: int) -> bytes:
+    """Unescape up to ``max_bytes`` of an EBSP into a bytearray prefix.
+
+    The slice-header readers only need the first handful of bytes of any VCL
+    NAL's payload: ``first_mb_in_slice`` and ``slice_type`` are the first two
+    Exp-Golomb values, and 16 bytes is enough at any legal macroblock index.
+    Walking the whole payload copies the entire NAL per VCL NAL even when the
+    scan never looks at most of it, which is the cost ``#346`` measured.
+
+    Returns the unescaped prefix as a ``bytes`` value. The emulation-prevention
+    state is honored across the boundary, so a 0x03 byte straddling the
+    ``max_bytes`` cut is consumed and does not appear in the output -- the
+    caller is expected to fall back to the full unescape when the prefix
+    is too short to parse, which is what ``scan_picture_coding_types`` does.
+    """
+    if max_bytes >= len(ebsp):
+        return _remove_emulation_prevention_bytes(ebsp)
+    rbsp = bytearray()
+    consecutive_zeros = 0
+    for index, byte in enumerate(ebsp):
+        if index >= max_bytes:
+            break
+        if consecutive_zeros >= 2 and byte == 0x03:
+            consecutive_zeros = 0
+            continue
+        rbsp.append(byte)
+        consecutive_zeros = consecutive_zeros + 1 if byte == 0 else 0
+    return bytes(rbsp)
+
+
 def _remove_emulation_prevention_bytes(ebsp: bytes) -> bytes:
     rbsp = bytearray()
     consecutive_zeros = 0
@@ -250,19 +286,25 @@ def _remove_emulation_prevention_bytes(ebsp: bytes) -> bytes:
     return bytes(rbsp)
 
 
-def _decode_unsigned_exp_golomb(rbsp: bytes) -> int:
-    """Decode the first unsigned Exp-Golomb value in an RBSP."""
+def _decode_first_mb_in_slice(rbsp: bytes) -> int:
+    """Decode ``first_mb_in_slice`` from a slice-header RBSP, raising on failure.
+
+    Replicates the two fail-closed messages of the previous
+    :func:`_decode_unsigned_exp_golomb` so existing tests and ``hflow doctor``
+    diagnostic text stay byte-identical. Used only by
+    :func:`count_h264_pictures` (and through it,
+    :func:`ensure_access_unit_delimiter`), where the older "no complete value"
+    vs. "truncated" distinction is part of the public error contract.
+    """
     bit_count = len(rbsp) * 8
     leading_zero_bits = 0
     while leading_zero_bits < bit_count:
         byte = rbsp[leading_zero_bits // 8]
-        bit = (byte >> (7 - leading_zero_bits % 8)) & 1
-        if bit:
+        if (byte >> (7 - leading_zero_bits % 8)) & 1:
             break
         leading_zero_bits += 1
-    if leading_zero_bits == bit_count:
+    else:
         raise ValueError("slice header has no complete first_mb_in_slice value")
-
     suffix_start = leading_zero_bits + 1
     suffix_end = suffix_start + leading_zero_bits
     if suffix_end > bit_count:
@@ -320,8 +362,17 @@ def count_h264_pictures(stream: bytes) -> int:
             else len(stream)
         )
         nal_header_offset = _nal_header_offset(stream, nal_start_offset)
-        rbsp = _remove_emulation_prevention_bytes(stream[nal_header_offset + 1 : nal_end_offset])
-        if _decode_unsigned_exp_golomb(rbsp) == 0:
+        slice_payload = stream[nal_header_offset + 1 : nal_end_offset]
+        rbsp = _unescape_ebsp_head(slice_payload, _SLICE_HEADER_HEAD_BYTES)
+        try:
+            first_mb_in_slice = _decode_first_mb_in_slice(rbsp)
+        except ValueError:
+            # The head was too short: fall back to the full unescape so the
+            # existing fail-closed messages ("no complete" / "truncated")
+            # still fire for ``hflow doctor`` and the AUD repair path.
+            rbsp = _remove_emulation_prevention_bytes(slice_payload)
+            first_mb_in_slice = _decode_first_mb_in_slice(rbsp)
+        if first_mb_in_slice == 0:
             picture_count += 1
     return picture_count
 
@@ -388,13 +439,20 @@ def scan_picture_coding_types(stream: bytes) -> PictureCodingScan:
             else len(stream)
         )
         nal_header_offset = _nal_header_offset(stream, nal_start_offset)
-        rbsp = _remove_emulation_prevention_bytes(stream[nal_header_offset + 1 : nal_end_offset])
+        slice_payload = stream[nal_header_offset + 1 : nal_end_offset]
+        rbsp = _unescape_ebsp_head(slice_payload, _SLICE_HEADER_HEAD_BYTES)
         slice_header_fields = _slice_header_fields(rbsp)
         if slice_header_fields is None:
-            raise ValueError(
-                "a slice header is incomplete or truncated; picture coding types "
-                "cannot be classified"
-            )
+            # The head was too short to read both Exp-Golomb values. Fall
+            # back to the full unescape so the existing fail-closed message
+            # still fires on the malformed cases the existing tests pin.
+            rbsp = _remove_emulation_prevention_bytes(slice_payload)
+            slice_header_fields = _slice_header_fields(rbsp)
+            if slice_header_fields is None:
+                raise ValueError(
+                    "a slice header is incomplete or truncated; picture coding types "
+                    "cannot be classified"
+                )
         first_mb_in_slice, slice_type_code = slice_header_fields
         slice_is_b = slice_type_code % 5 == 1
         if first_mb_in_slice == 0:

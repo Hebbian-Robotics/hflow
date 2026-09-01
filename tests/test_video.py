@@ -11,6 +11,9 @@ from hflow.video import (
     AccessUnit,
     PictureCodingScan,
     VideoEncodeError,
+    _remove_emulation_prevention_bytes,
+    _unescape_ebsp_head,
+    count_h264_pictures,
     encode_images_to_h264,
     ensure_access_unit_delimiter,
     scan_picture_coding_types,
@@ -335,3 +338,67 @@ def _ffprobe_video_stream_fields(mp4_path: Path) -> dict[str, str]:
         field_name, _, field_value = output_line.partition("=")
         stream_fields[field_name.strip()] = field_value.strip()
     return stream_fields
+
+
+def test_unescape_ebsp_head_matches_full_unescape_for_the_prefix() -> None:
+    """The head-only unescape must produce the same prefix the full unescape
+    does, so the slice-header readers see identical bytes for the bytes they
+    actually read. An emulation-prevention 0x03 consumed by the full pass
+    after the cut is irrelevant: the prefix ends at the cut either way."""
+    payload = b"\x00\x00\x00\x01\x65" + bytes(range(256)) * 4
+    full = _remove_emulation_prevention_bytes(payload)
+    for max_bytes in (8, 16, 32, 64, 128):
+        head = _unescape_ebsp_head(payload, max_bytes)
+        if max_bytes >= len(payload):
+            assert head == full
+        else:
+            # The head may be slightly shorter than max_bytes when the
+            # unescape consumes a 0x03 after the 00 00 pair -- that is
+            # correct emulation-prevention behavior, and the full pass has
+            # the same property.
+            assert head == full[: len(head)]
+
+
+def test_unescape_ebsp_head_with_max_bytes_at_or_above_length_returns_full_unescape() -> None:
+    """Asking for the whole NAL (or more) must be a fast path to the full
+    unescape, with no behavioral difference. The scan uses this when a
+    VCL NAL is shorter than the slice-header head budget, which is
+    common for very small frames."""
+    payload = b"\x00\x00\x03\x01\x02"
+    assert _unescape_ebsp_head(payload, len(payload)) == _remove_emulation_prevention_bytes(payload)
+    assert _unescape_ebsp_head(payload, len(payload) + 100) == _remove_emulation_prevention_bytes(
+        payload
+    )
+
+
+def test_scan_results_match_count_h264_pictures_on_canonical_and_b_frame_streams(
+    encoded_units: list[AccessUnit], b_frame_stream: bytes
+) -> None:
+    """The two readers share the NAL walk and the head-only unescape; the
+    scan's picture_count and count_h264_pictures must agree on every input
+    the existing test suite covers. Pinning the contract here means a future
+    divergence surfaces as a test failure rather than a silent miss."""
+    canonical_stream = b"".join(unit.data for unit in encoded_units)
+    canonical_scan = scan_picture_coding_types(canonical_stream)
+    assert canonical_scan.picture_count == count_h264_pictures(canonical_stream)
+    assert canonical_scan.picture_count == FRAME_COUNT
+
+    b_scan = scan_picture_coding_types(b_frame_stream)
+    assert b_scan.picture_count == count_h264_pictures(b_frame_stream)
+    assert b_scan.picture_count == FRAME_COUNT
+
+
+def test_scan_refuses_a_truncated_slice_with_the_existing_fail_closed_message() -> None:
+    """A NAL whose head runs out before both Exp-Golomb values finish must
+    still fail closed with the same message the unoptimized path produced.
+    The 16-byte head is enough at any legal first_mb_in_slice; the synthetic
+    NAL here is engineered to demand more, exercising the fallback path."""
+    # first_mb_in_slice = 2^15 needs 15 leading zero bits + 1 + 15 suffix bits
+    # = 31 bits. _SLICE_HEADER_HEAD_BYTES = 16 covers 128 bits, so 31 fits,
+    # but we deliberately encode a value whose unescaped form exceeds 16
+    # bytes to force the fallback. Easiest: stuff the payload with 0x00 so
+    # the decoder's "no terminating 1 bit" guard fires regardless of head.
+    bad_slice = b"\x00\x00\x00\x01\x41" + b"\x00" * 64
+
+    with pytest.raises(ValueError, match="cannot be classified"):
+        scan_picture_coding_types(bad_slice)
