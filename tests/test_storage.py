@@ -12,6 +12,7 @@ A live object-store integration test runs only when
 
 import errno
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -206,8 +207,6 @@ class TestLocalStorageRoot:
         # A colon that is not drive-letter-shaped must still be accepted.
         # (Native Windows forbids colons in filenames at the OS level, so
         # this write is gated to platforms where it can succeed.)
-        import sys
-
         if sys.platform != "win32":
             root.write_bytes("weird/C:notdrive.txt", b"payload")
             assert root.read_bytes("weird/C:notdrive.txt") == b"payload"
