@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import urllib.request
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -704,3 +705,168 @@ def test_info_json_accepts_normal_positive_fps(
     dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
     source_archive = prep._ensure_source_archive(dataset_source, tmp_path / "cache")
     assert source_archive["fps"] == 30
+
+
+def test_video_cache_keeps_distinct_file_indices_in_same_chunk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two episodes sharing camera and video chunk but with different file_index
+
+    must use distinct cached MP4 paths rather than aliasing to one local file.
+    """
+    import duckdb
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    data_dir = cache_dir / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create dummy parquet data files for episodes 0 and 1
+    conn = duckdb.connect()
+    for file_idx in (0, 1):
+        data_path = data_dir / f"chunk-000000-file-{file_idx:06d}.parquet"
+        conn.execute(
+            f"""
+            COPY (
+                SELECT
+                    i AS index,
+                    CAST(i * 0.033 AS FLOAT) AS timestamp,
+                    [CAST(1.0 AS FLOAT)] AS "observation.state",
+                    [CAST(2.0 AS FLOAT)] AS action
+                FROM range(0, 5) t(i)
+            ) TO '{str(data_path).replace("'", "''")}' (FORMAT parquet)
+            """
+        )
+
+    dataset_source = prep.DatasetSource(
+        repo_id="fake/repo", revision="abc1234", license="apache-2.0"
+    )
+
+    source_archive = {
+        "info": {"fps": 30},
+        "fps": 30,
+        "data_path": "data/{chunk_index}/{file_index}.parquet",
+        "video_path": "videos/{camera_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+        "episodes": [
+            {
+                "episode_index": 0,
+                "task": "task0",
+                "length": 5,
+                "data_chunk": "0",
+                "data_file": "0",
+                "data_from": 0,
+                "data_to": 5,
+                "video_windows": {
+                    "observation.image": {
+                        "chunk_index": 0,
+                        "file_index": 0,
+                        "from_timestamp": 0.0,
+                        "to_timestamp": 0.0,
+                    }
+                },
+            },
+            {
+                "episode_index": 1,
+                "task": "task1",
+                "length": 5,
+                "data_chunk": "0",
+                "data_file": "1",
+                "data_from": 0,
+                "data_to": 5,
+                "video_windows": {
+                    "observation.image": {
+                        "chunk_index": 0,
+                        "file_index": 1,
+                        "from_timestamp": 0.0,
+                        "to_timestamp": 0.0,
+                    }
+                },
+            },
+        ],
+        "video_keys": ["observation.image"],
+        "numeric_features": {
+            "action": {"dtype": "float32", "shape": [1]},
+            "observation.state": {"dtype": "float32", "shape": [1]},
+        },
+        "cache_dir": cache_dir,
+        "dataset": dataset_source,
+    }
+
+    downloaded_urls: list[str] = []
+    downloaded_destinations: list[Path] = []
+
+    def fake_download_file(url: str, destination: Path) -> None:
+        downloaded_urls.append(url)
+        downloaded_destinations.append(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"dummy mp4 for " + url.encode())
+
+    transcoded_sources: list[Path] = []
+
+    dummy_access_unit = (
+        b"\x00\x00\x00\x01\x09\xf0"
+        b"\x00\x00\x00\x01\x67sps"
+        b"\x00\x00\x00\x01\x68pps"
+        b"\x00\x00\x00\x01\x65\x80payload"
+    )
+
+    def fake_transcode(video_path: Path, *args: object, **kwargs: object) -> list[bytes]:
+        transcoded_sources.append(video_path)
+        return [dummy_access_unit] * 5
+
+    monkeypatch.setattr(prep, "_download_file", fake_download_file)
+    monkeypatch.setattr(prep, "_transcode_mp4_to_h264", fake_transcode)
+    monkeypatch.setattr(
+        prep, "_get_video_pts_times", lambda *args, **kwargs: [i * 0.033 for i in range(5)]
+    )
+    monkeypatch.setattr(prep, "ffmpeg_version", lambda: "ffmpeg 7.0")
+
+    numeric_schemas = {
+        "observation.state": prep._derive_numeric_schema(
+            "observation.state", {"dtype": "float32", "shape": [1]}
+        ),
+        "action": prep._derive_numeric_schema("action", {"dtype": "float32", "shape": [1]}),
+    }
+
+    output_dir = tmp_path / "output"
+    typed_source_archive = cast(prep._SourceArchive, source_archive)
+    out_ep0 = prep._convert_single_episode(
+        source_archive=typed_source_archive,
+        dataset_source=dataset_source,
+        output_dir=output_dir,
+        episode_index=0,
+        camera_keys=("observation.image",),
+        numeric_schemas=numeric_schemas,
+        frames_per_second=30,
+    )
+    assert out_ep0.exists()
+
+    out_ep1 = prep._convert_single_episode(
+        source_archive=typed_source_archive,
+        dataset_source=dataset_source,
+        output_dir=output_dir,
+        episode_index=1,
+        camera_keys=("observation.image",),
+        numeric_schemas=numeric_schemas,
+        frames_per_second=30,
+    )
+    assert out_ep1.exists()
+
+    # The two episodes must use distinct cached video files
+    assert len(transcoded_sources) == 2
+    assert transcoded_sources[0] != transcoded_sources[1]
+    assert "chunk0-file0" in transcoded_sources[0].name
+    assert "chunk0-file1" in transcoded_sources[1].name
+
+    # Re-running ep0 reuses the existing cached file without re-downloading
+    prev_downloads_count = len(downloaded_urls)
+    prep._convert_single_episode(
+        source_archive=typed_source_archive,
+        dataset_source=dataset_source,
+        output_dir=output_dir,
+        episode_index=0,
+        camera_keys=("observation.image",),
+        numeric_schemas=numeric_schemas,
+        frames_per_second=30,
+    )
+    assert len(downloaded_urls) == prev_downloads_count

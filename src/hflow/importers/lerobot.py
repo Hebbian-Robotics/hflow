@@ -40,7 +40,7 @@ DEFAULT_REVISION = "main"
 DEFAULT_OUTPUT_DIR = Path("./data/lerobot_pusht")
 DEFAULT_CAMERA_KEY = "observation.image"
 
-CONVERTER_VERSION = "lerobot-converter-v3"
+CONVERTER_VERSION = "lerobot-converter-v4"
 PRESENTATION_TIMESTAMP_EPSILON_S = 0.050
 
 # Timestamp handling
@@ -783,7 +783,10 @@ def _convert_single_episode(
         local_video_path = (
             cache_directory
             / "videos"
-            / (f"{camera_key.replace('/', '_').replace('.', '_')}-chunk{video_chunk_index}.mp4")
+            / (
+                f"{camera_key.replace('/', '_').replace('.', '_')}"
+                f"-chunk{video_chunk_index}-file{video_file_index}.mp4"
+            )
         )
         if not local_video_path.exists():
             _download_file(f"{dataset_base_url}/{video_relative_path}", local_video_path)
