@@ -150,8 +150,9 @@ def _read_corpus_from_cache(cache_dir: Path) -> dict:
 
     ``hflow.import_lerobot_dataset`` writes meta/info.json, the
     meta/episodes parquets, data chunks, and video chunks under
-    ``<output_dir>/_lerobot_cache``. Export consumes exactly those public
-    artifacts; the dictionary mirrors the archive shape the converter used.
+    ``<output_dir>/_lerobot_cache/<resolved revision>``. Export consumes
+    exactly those public artifacts; the dictionary mirrors the archive
+    shape the converter used.
     """
     info_path = cache_dir / "meta" / "info.json"
     if not info_path.exists():
@@ -225,9 +226,11 @@ def _materialize_source_archive(
     ``hflow.import_lerobot_dataset`` (exported from ``hflow/__init__.py``;
     ``hflow import lerobot`` on the CLI) resolves the immutable revision,
     validates the camera keys, and downloads the corpus metadata, data
-    chunks, and video chunks under ``<output_dir>/_lerobot_cache``. Export
-    consumes that archive; the canonical landing MCAPs the importer also
-    writes are a side effect export does not use.
+    chunks, and video chunks under
+    ``<output_dir>/_lerobot_cache/<resolved revision>`` (the cache is
+    namespaced by the resolved commit sha). Export consumes that archive;
+    the canonical landing MCAPs the importer also writes are a side effect
+    export does not use.
     """
     hflow.import_lerobot_dataset(
         dataset_repo=src_ds,
@@ -236,7 +239,15 @@ def _materialize_source_archive(
         episode_index=None,
         camera_keys=camera_keys,
     )
-    return _read_corpus_from_cache(cache_dir)
+    # main namespaces the materialized archive under the resolved revision
+    # sha (fix(lerobot) #328); resolve that single subdirectory loudly.
+    namespaces = sorted(p for p in cache_dir.iterdir() if p.is_dir())
+    if len(namespaces) != 1:
+        raise ValueError(
+            f"unexpected importer cache layout under {cache_dir}: "
+            f"expected one revision-namespaced directory, found {len(namespaces)}"
+        )
+    return _read_corpus_from_cache(namespaces[0])
 
 
 def _episode_rows(table: pa.Table) -> list[dict]:
