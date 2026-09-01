@@ -65,6 +65,7 @@ from examples.egosuite_evaluation.judgment import (  # noqa: E402
 )
 
 SCHEMA_VERSION = 1
+PROJECTED_HAND_LABEL_TYPE = "projected-hand-joints"
 EXPECTED_HAND_JOINT_COUNT = 21
 DEFAULT_RUNS_DIRECTORY = Path("data/egosuite-evaluation/runs")
 DEFAULT_LABELS_DIRECTORY = Path("data/egosuite-evaluation/labels")
@@ -151,6 +152,30 @@ def load_projected_hand_label_report(
         ) from error
     if not isinstance(report_payload, dict):
         raise ValueError(f"projected-hand label report {report_path} must contain a JSON object")
+
+    schema_version = report_payload.get("schema_version")
+    if (
+        schema_version is None
+        or isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != SCHEMA_VERSION
+    ):
+        raise ValueError(
+            f"projected-hand label report {report_path} field 'schema_version' has invalid "
+            f"value {schema_version!r}; supported schema_version is {SCHEMA_VERSION}"
+        )
+
+    label_type = report_payload.get("label_type")
+    if (
+        label_type is None
+        or not isinstance(label_type, str)
+        or label_type != PROJECTED_HAND_LABEL_TYPE
+    ):
+        raise ValueError(
+            f"projected-hand label report {report_path} field 'label_type' has invalid "
+            f"value {label_type!r}; supported label_type is {PROJECTED_HAND_LABEL_TYPE!r}"
+        )
+
     raw_frame_records = report_payload.get("frames")
     if not isinstance(raw_frame_records, list):
         raise ValueError(f"projected-hand label report {report_path} must contain a 'frames' array")
@@ -889,7 +914,7 @@ def write_label_report(
     all_labels = [label for labels in labels_by_source.values() for label in labels]
     report = {
         "schema_version": SCHEMA_VERSION,
-        "label_type": "projected-hand-joints",
+        "label_type": PROJECTED_HAND_LABEL_TYPE,
         "camera_view": camera_view.value,
         "frame_stride": frame_stride,
         "limit_per_episode": limit_per_episode,
