@@ -274,3 +274,86 @@ def test_reuse_never_leaves_the_marker_missing(
     app.process(source, record=False, stages=stage_set, verbose=False)
 
     assert marker_path.read_bytes() == marker_before
+
+
+def test_a_complete_witness_round_trips_through_the_marker(tmp_path: Path) -> None:
+    """Reading the marker the writer just wrote must rebuild a complete
+    ``_SyncReuseWitness``: same source_digest, same ffmpeg_version, same
+    transform_kind. Catches any future refactor that drops a field from the
+    wire shape or splits the witness back into scattered optionals."""
+    from hflow.app import _read_sync_completion_marker, _SyncReuseWitness, _TransformKind
+
+    source = _episode(tmp_path / "episode_0001.mcap")
+    app = hflow.App("witness-rt", data_root=tmp_path / "data", default_checks=())
+    first = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
+    marker_path = first.canonical_path.parent / ".sync-complete.json"
+
+    completion = _read_sync_completion_marker(marker_path)
+    assert completion.reuse_witness == _SyncReuseWitness(
+        source_digest=f"sha256:{hashlib.sha256(source.read_bytes()).hexdigest()}",
+        ffmpeg_version=first.stamps.ffmpeg_version,
+        transform_kind=_TransformKind.DEFAULT,
+    )
+
+
+@pytest.mark.parametrize(
+    "missing_witness_field",
+    ["source_digest", "ffmpeg_version", "transform_kind"],
+)
+def test_a_marker_missing_any_one_witness_field_drops_the_whole_witness(
+    tmp_path: Path, missing_witness_field: str
+) -> None:
+    """A partial witness must NOT satisfy the gate: the three fields are an
+    all-or-nothing group, because a partial record would silently pass the
+    gate on three independent field checks."""
+    source = _episode(tmp_path / "episode_0001.mcap")
+    app = hflow.App("partial", data_root=tmp_path / "data", default_checks=())
+    first = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
+    marker_path = first.canonical_path.parent / ".sync-complete.json"
+    marker_payload = json.loads(marker_path.read_text())
+    marker_payload.pop(missing_witness_field)
+    marker_path.write_text(json.dumps(marker_payload, sort_keys=True) + "\n")
+
+    # Non-sync stages still see the marker as valid basic proof.
+    metadata_only = app.process(source, record=False, stages={hflow.Stage.META}, verbose=False)
+    assert metadata_only.canonical_path == first.canonical_path
+
+    # Sync refuses to reuse: the witness is gone, the gate cannot prove
+    # anything, the next run will transcode and re-stamp a complete witness.
+    second = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
+    assert second.sync_reused is False
+
+
+def test_a_malformed_witness_field_drops_the_whole_witness(tmp_path: Path) -> None:
+    """A non-string witness value is the same as a missing one: the gate
+    cannot prove reuse is safe on it, and a partial read that filled in the
+    others would still let the gate pass on three independent field checks."""
+    source = _episode(tmp_path / "episode_0001.mcap")
+    app = hflow.App("malformed", data_root=tmp_path / "data", default_checks=())
+    first = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
+    marker_path = first.canonical_path.parent / ".sync-complete.json"
+    marker_payload = json.loads(marker_path.read_text())
+    marker_payload["ffmpeg_version"] = 12345  # wrong type, would have parsed
+    marker_path.write_text(json.dumps(marker_payload, sort_keys=True) + "\n")
+
+    second = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
+    assert second.sync_reused is False
+
+    third = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
+    assert third.sync_reused is True
+
+
+def test_a_witness_with_no_transform_kind_record_drops_to_no_witness(tmp_path: Path) -> None:
+    """Empty-string witness fields are the same as missing ones: a record
+    that claims "I proved reuse" while providing nothing to check against
+    cannot pass the gate."""
+    source = _episode(tmp_path / "episode_0001.mcap")
+    app = hflow.App("empty", data_root=tmp_path / "data", default_checks=())
+    first = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
+    marker_path = first.canonical_path.parent / ".sync-complete.json"
+    marker_payload = json.loads(marker_path.read_text())
+    marker_payload["source_digest"] = ""
+    marker_path.write_text(json.dumps(marker_payload, sort_keys=True) + "\n")
+
+    second = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
+    assert second.sync_reused is False
