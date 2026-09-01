@@ -704,3 +704,157 @@ def test_info_json_accepts_normal_positive_fps(
     dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
     source_archive = prep._ensure_source_archive(dataset_source, tmp_path / "cache")
     assert source_archive["fps"] == 30
+
+
+def test_index_discovery_multi_shard_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Multi-shard episode metadata with identical basenames in different chunk directories
+
+    must not collide and must attach video windows from all shards.
+    """
+    import duckdb
+
+    info = {
+        "fps": 30,
+        "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+        "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+        "features": {
+            "action": {"dtype": "float32", "shape": [6]},
+            "observation.state": {"dtype": "float32", "shape": [6]},
+            "observation.images.up": {"dtype": "video", "shape": [480, 640, 3]},
+            "timestamp": {"dtype": "float32", "shape": [1]},
+        },
+        "robot_type": "so101",
+    }
+    (tmp_path / "meta").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "meta" / "info.json").write_text(json.dumps(info))
+
+    conn = duckdb.connect()
+    ep_cols = [
+        "episode_index",
+        "length",
+        "data/chunk_index",
+        "data/file_index",
+        "dataset_from_index",
+        "dataset_to_index",
+        "videos/observation.images.up/chunk_index",
+        "videos/observation.images.up/file_index",
+        "videos/observation.images.up/from_timestamp",
+        "videos/observation.images.up/to_timestamp",
+        "tasks",
+    ]
+    ep_cols_q = ",".join(f'"{c}"' for c in ep_cols)
+
+    # Shard 0: episode 0
+    row_ep0 = [
+        0,
+        60,
+        "chunk-000",
+        "file-000",
+        0,
+        60,
+        "chunk-000",
+        "file-000",
+        0.0,
+        2.0,
+        "['task-0']",
+    ]
+    p0 = tmp_path / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    p0.parent.mkdir(parents=True, exist_ok=True)
+    vals_sql0 = (
+        "("
+        + ",".join(
+            f"'{v}'" if isinstance(v, str) and not v.startswith("[") else str(v) for v in row_ep0
+        )
+        + ")"
+    )
+    p0_sql = str(p0).replace("'", "''")
+    conn.execute(
+        f"COPY (SELECT * FROM (VALUES {vals_sql0}) AS t({ep_cols_q})) TO '{p0_sql}' (FORMAT parquet)"
+    )
+
+    # Shard 1: episode 1 (same basename file-000.parquet in chunk-001)
+    row_ep1 = [
+        1,
+        65,
+        "chunk-001",
+        "file-000",
+        0,
+        65,
+        "chunk-001",
+        "file-000",
+        0.0,
+        2.166667,
+        "['task-1']",
+    ]
+    p1 = tmp_path / "meta" / "episodes" / "chunk-001" / "file-000.parquet"
+    p1.parent.mkdir(parents=True, exist_ok=True)
+    vals_sql1 = (
+        "("
+        + ",".join(
+            f"'{v}'" if isinstance(v, str) and not v.startswith("[") else str(v) for v in row_ep1
+        )
+        + ")"
+    )
+    p1_sql = str(p1).replace("'", "''")
+    conn.execute(
+        f"COPY (SELECT * FROM (VALUES {vals_sql1}) AS t({ep_cols_q})) TO '{p1_sql}' (FORMAT parquet)"
+    )
+
+    monkeypatch.setattr(
+        prep, "_hf_repo_info", lambda repo, rev: {"sha": rev, "license": "apache-2.0"}
+    )
+    monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: info)
+    monkeypatch.setattr(
+        prep,
+        "_hf_tree",
+        lambda repo, rev, path: (
+            [
+                {"path": "meta/episodes/chunk-000/file-000.parquet", "type": "file"},
+                {"path": "meta/episodes/chunk-001/file-000.parquet", "type": "file"},
+            ]
+            if "episodes" in path
+            else [{"path": "meta/info.json", "type": "file"}]
+        ),
+    )
+
+    downloaded_paths: list[Path] = []
+
+    def fake_dl(url: str, dest: Path, **kw: object) -> None:
+        import shutil
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        downloaded_paths.append(dest)
+        if "chunk-000" in url:
+            shutil.copy(str(p0), dest)
+        elif "chunk-001" in url:
+            shutil.copy(str(p1), dest)
+
+    monkeypatch.setattr(prep, "_download_file", fake_dl)
+
+    cache_dir = tmp_path / "cache"
+    ds = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
+    found = prep._ensure_source_archive(ds, cache_dir)
+
+    # Verify distinct downloaded destinations
+    assert len(downloaded_paths) == 2
+    assert downloaded_paths[0] != downloaded_paths[1]
+    assert "chunk-000" in str(downloaded_paths[0])
+    assert "chunk-001" in str(downloaded_paths[1])
+
+    # Verify episode metadata from all shards
+    assert len(found["episodes"]) == 2
+    assert found["episodes"][0]["episode_index"] == 0
+    assert found["episodes"][0]["task"] == "task-0"
+    assert found["episodes"][0]["length"] == 60
+    assert found["episodes"][0]["video_windows"]["observation.images.up"][
+        "to_timestamp"
+    ] == pytest.approx(2.0)
+
+    assert found["episodes"][1]["episode_index"] == 1
+    assert found["episodes"][1]["task"] == "task-1"
+    assert found["episodes"][1]["length"] == 65
+    assert found["episodes"][1]["video_windows"]["observation.images.up"][
+        "to_timestamp"
+    ] == pytest.approx(2.166667)

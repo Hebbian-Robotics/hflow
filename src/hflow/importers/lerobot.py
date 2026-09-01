@@ -40,7 +40,7 @@ DEFAULT_REVISION = "main"
 DEFAULT_OUTPUT_DIR = Path("./data/lerobot_pusht")
 DEFAULT_CAMERA_KEY = "observation.image"
 
-CONVERTER_VERSION = "lerobot-converter-v3"
+CONVERTER_VERSION = "lerobot-converter-v4"
 PRESENTATION_TIMESTAMP_EPSILON_S = 0.050
 
 # Timestamp handling
@@ -357,7 +357,15 @@ def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _S
     entries = _hf_tree(dataset_source.repo_id, dataset_source.revision, "meta/episodes")
     for entry in entries:
         if entry.get("type") == "file" and entry["path"].endswith(".parquet"):
-            destination_path = episodes_metadata_directory / Path(entry["path"]).name
+            entry_path = entry["path"]
+            if entry_path.startswith("meta/episodes/"):
+                relative_entry_path = entry_path[len("meta/episodes/") :]
+            elif entry_path.startswith("meta/"):
+                relative_entry_path = entry_path[len("meta/") :]
+            else:
+                relative_entry_path = entry_path
+            destination_path = episodes_metadata_directory / relative_entry_path
+            destination_path.parent.mkdir(parents=True, exist_ok=True)
             if not destination_path.exists():
                 _download_file(f"{dataset_base_url}/{entry['path']}", destination_path)
             episode_metadata_files.append(destination_path)
@@ -426,34 +434,39 @@ def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _S
                 f'"videos/{camera_key}/to_timestamp" as "vto_{camera_key}",',
             ]
         video_window_select_sql = "episode_index, " + " ".join(video_window_selectors).rstrip(",")
-        first_episode_metadata_file = str(episode_metadata_files[0]).replace("'", "''")
-        video_window_rows = connection.execute(
-            f"SELECT {video_window_select_sql} FROM read_parquet('{first_episode_metadata_file}')"
-        ).fetchall()
-        video_window_column_names = [
-            column_description[0] for column_description in connection.description
-        ]
-        for video_window_row in video_window_rows:
-            video_window_by_column = dict(
-                zip(video_window_column_names, video_window_row, strict=True)
-            )
-            episode_index = int(video_window_by_column["episode_index"])
-            video_windows_by_episode[episode_index] = {}
-            for camera_key in video_keys:
-                video_chunk_index = video_window_by_column.get(f"vc_{camera_key}")
-                video_file_index = video_window_by_column.get(f"vf_{camera_key}")
-                video_windows_by_episode[episode_index][camera_key] = {
-                    "chunk_index": (
-                        "" if video_chunk_index is None else str(video_chunk_index).split("/")[-1]
-                    ),
-                    "file_index": (
-                        "" if video_file_index is None else str(video_file_index).split("/")[-1]
-                    ),
-                    "from_timestamp": float(
-                        video_window_by_column.get(f"vfrom_{camera_key}") or 0.0
-                    ),
-                    "to_timestamp": float(video_window_by_column.get(f"vto_{camera_key}") or 0.0),
-                }
+        for episode_metadata_file in episode_metadata_files:
+            escaped_file = str(episode_metadata_file).replace("'", "''")
+            video_window_rows = connection.execute(
+                f"SELECT {video_window_select_sql} FROM read_parquet('{escaped_file}')"
+            ).fetchall()
+            video_window_column_names = [
+                column_description[0] for column_description in connection.description
+            ]
+            for video_window_row in video_window_rows:
+                video_window_by_column = dict(
+                    zip(video_window_column_names, video_window_row, strict=True)
+                )
+                episode_index = int(video_window_by_column["episode_index"])
+                video_windows_by_episode[episode_index] = {}
+                for camera_key in video_keys:
+                    video_chunk_index = video_window_by_column.get(f"vc_{camera_key}")
+                    video_file_index = video_window_by_column.get(f"vf_{camera_key}")
+                    video_windows_by_episode[episode_index][camera_key] = {
+                        "chunk_index": (
+                            ""
+                            if video_chunk_index is None
+                            else str(video_chunk_index).split("/")[-1]
+                        ),
+                        "file_index": (
+                            "" if video_file_index is None else str(video_file_index).split("/")[-1]
+                        ),
+                        "from_timestamp": float(
+                            video_window_by_column.get(f"vfrom_{camera_key}") or 0.0
+                        ),
+                        "to_timestamp": float(
+                            video_window_by_column.get(f"vto_{camera_key}") or 0.0
+                        ),
+                    }
         for episode_row in episode_rows:
             episode_row["video_windows"] = dict(
                 video_windows_by_episode.get(episode_row["episode_index"], {})
