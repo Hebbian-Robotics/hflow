@@ -5,6 +5,7 @@ with a synthetic v3-style corpus, without asserting third-party
 implementation details or touching the network.
 """
 
+import io
 import json
 import shutil
 import subprocess
@@ -344,6 +345,21 @@ def test_import_namespaces_source_cache_by_resolved_revision(
         "sha-a",
         "sha-b",
     ]
+
+
+@pytest.mark.parametrize("resolved_sha", ["../../evil", "/tmp/probe-328-absolute"])
+def test_hf_repo_info_rejects_malformed_commit_sha(
+    resolved_sha: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    response_body = json.dumps({"sha": resolved_sha, "cardData": {"license": "apache-2.0"}})
+    monkeypatch.setattr(
+        prep.urllib.request,
+        "urlopen",
+        lambda request, timeout: io.BytesIO(response_body.encode()),
+    )
+
+    with pytest.raises(ValueError, match="malformed commit sha"):
+        prep._hf_repo_info("fake/repo", "main")
 
 
 def test_import_refuses_invalid_arguments_before_network(tmp_path: Path) -> None:
