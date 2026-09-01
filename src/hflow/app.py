@@ -252,33 +252,26 @@ class _TransformKind(StrEnum):
 
 
 @dataclass(frozen=True)
+class _SyncReuseWitness:
+    """Proof that a canonical can be safely reused by sync."""
+
+    source_digest: str
+    ffmpeg_version: str
+    transform_kind: _TransformKind
+
+
+@dataclass(frozen=True)
 class _SyncCompletion:
     """Proof that sync completed for one source path and canonical version.
 
-    The last three fields are the *reuse witness*: enough to decide that
-    re-running sync would rewrite byte-identical output, so it can be skipped.
-    They are optional because markers written before they existed are still
-    valid proof for the non-sync stages, which is all those stages ever asked
-    of them. A witness-less marker simply never satisfies the reuse gate: one
-    re-transcode rewrites it in the current shape, and that is the whole
-    migration.
+    ``reuse_witness`` is complete or absent: a partial witness cannot prove
+    that re-running sync would reproduce the existing canonical.
     """
 
     source_path: str
     schema_version: str
     pipeline_version: str
-    # Which source BYTES produced the canonical. Content, never size+mtime:
-    # this repo identifies by content everywhere, and a same-length rewrite
-    # or a preserved mtime would defeat the weaker test silently.
-    source_digest: str | None = None
-    # The transform is stamped with an ffmpeg version that does NOT reach
-    # pipeline_version, and different builds genuinely encode differently.
-    ffmpeg_version: str | None = None
-    # An @app.transform override is contractually required to end in
-    # write_canonical_episode, so it stamps the SAME pipeline_version the
-    # default transform would: without this, REMOVING an override would reuse
-    # a canonical the current pipeline cannot produce.
-    transform_kind: _TransformKind | None = None
+    reuse_witness: _SyncReuseWitness | None = None
 
 
 def _source_identity(source_reference: Path | str, storage_root: StorageRoot) -> str:
@@ -338,10 +331,14 @@ def _write_sync_completion_marker(marker_path: Path, completion: _SyncCompletion
         "schema_version": completion.schema_version,
         "pipeline_version": completion.pipeline_version,
     }
-    for witness_field in ("source_digest", "ffmpeg_version", "transform_kind"):
-        witness_value = getattr(completion, witness_field)
-        if witness_value is not None:
-            marker_payload[witness_field] = witness_value
+    if completion.reuse_witness is not None:
+        marker_payload.update(
+            {
+                "source_digest": completion.reuse_witness.source_digest,
+                "ffmpeg_version": completion.reuse_witness.ffmpeg_version,
+                "transform_kind": completion.reuse_witness.transform_kind,
+            }
+        )
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
@@ -381,29 +378,36 @@ def _read_sync_completion_marker(marker_path: Path) -> _SyncCompletion:
                 f"{field_name!r} must be a non-empty string"
             )
         required_values[field_name] = field_value
-    # Parsed leniently, on purpose: a missing or malformed witness field means
-    # "cannot prove reuse is safe", which the gate already treats as a miss.
-    # Requiring them would make every pre-witness marker unreadable and break
-    # the non-sync stages, which never needed a witness at all.
-    optional_values = {
-        field_name: value
-        for field_name in ("source_digest", "ffmpeg_version")
-        if isinstance(value := marker_payload.get(field_name), str) and value
-    }
+    # Parsed leniently, on purpose: a missing, partial, malformed, or future
+    # witness means "cannot prove reuse is safe", which the gate treats as a
+    # miss. Keeping the basic marker readable preserves legacy non-sync stages.
+    source_digest = marker_payload.get("source_digest")
+    ffmpeg_version = marker_payload.get("ffmpeg_version")
     raw_transform_kind = marker_payload.get("transform_kind")
-    transform_kind: _TransformKind | None = None
-    if isinstance(raw_transform_kind, str) and raw_transform_kind:
+    reuse_witness: _SyncReuseWitness | None = None
+    if (
+        isinstance(source_digest, str)
+        and source_digest
+        and isinstance(ffmpeg_version, str)
+        and ffmpeg_version
+        and isinstance(raw_transform_kind, str)
+        and raw_transform_kind
+    ):
         try:
             transform_kind = _TransformKind(raw_transform_kind)
         except ValueError:
             transform_kind = None
+        if transform_kind is not None:
+            reuse_witness = _SyncReuseWitness(
+                source_digest=source_digest,
+                ffmpeg_version=ffmpeg_version,
+                transform_kind=transform_kind,
+            )
     return _SyncCompletion(
         source_path=required_values["source_path"],
         schema_version=required_values["schema_version"],
         pipeline_version=required_values["pipeline_version"],
-        source_digest=optional_values.get("source_digest"),
-        ffmpeg_version=optional_values.get("ffmpeg_version"),
-        transform_kind=transform_kind,
+        reuse_witness=reuse_witness,
     )
 
 
@@ -1319,12 +1323,13 @@ class App:
             completion = _read_sync_completion_marker(marker_path)
         except (FileNotFoundError, ValueError, OSError):
             return None
-        if completion.transform_kind is not _TransformKind.DEFAULT:
+        witness = completion.reuse_witness
+        if witness is None or witness.transform_kind is not _TransformKind.DEFAULT:
             return None
         if completion.source_path != source_identifier:
             # Two sources can share a run directory when output_dir= names one.
             return None
-        if completion.source_digest != source_digest:
+        if witness.source_digest != source_digest:
             return None
         if completion.schema_version != EPISODE_FORMAT_VERSION:
             return None
@@ -1353,7 +1358,7 @@ class App:
             or canonical_stamps.pipeline_version != completion.pipeline_version
         ):
             return None
-        if canonical_stamps.ffmpeg_version != completion.ffmpeg_version:
+        if canonical_stamps.ffmpeg_version != witness.ffmpeg_version:
             return None
         if canonical_stamps.ffmpeg_version != FFMPEG_VERSION_NOT_USED:
             # Only now, when the recording demonstrably has video, is it worth
@@ -2305,6 +2310,7 @@ class App:
             # whole file (hundreds of megabytes) to store the bytes already
             # there -- and rewrite a marker that is still true.
             if Stage.SYNC in enabled_stages and not reused_canonical:
+                assert source_digest is not None
                 canonical_uri = run_storage_root.publish(canonical_path, canonical_file_name)
                 _write_sync_completion_marker(
                     sync_completion_marker_path,
@@ -2312,12 +2318,14 @@ class App:
                         source_path=source_identifier,
                         schema_version=stamps.schema_version,
                         pipeline_version=stamps.pipeline_version,
-                        source_digest=source_digest,
-                        ffmpeg_version=stamps.ffmpeg_version,
-                        transform_kind=(
-                            _TransformKind.OVERRIDE
-                            if self.transform_override is not None
-                            else _TransformKind.DEFAULT
+                        reuse_witness=_SyncReuseWitness(
+                            source_digest=source_digest,
+                            ffmpeg_version=stamps.ffmpeg_version,
+                            transform_kind=(
+                                _TransformKind.OVERRIDE
+                                if self.transform_override is not None
+                                else _TransformKind.DEFAULT
+                            ),
                         ),
                     ),
                 )

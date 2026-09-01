@@ -144,6 +144,41 @@ def test_a_marker_without_a_witness_transcodes_once_and_gains_one(tmp_path: Path
 
 
 @pytest.mark.parametrize(
+    "present_fields",
+    [
+        ("source_digest",),
+        ("ffmpeg_version",),
+        ("transform_kind",),
+        ("source_digest", "ffmpeg_version"),
+        ("source_digest", "transform_kind"),
+        ("ffmpeg_version", "transform_kind"),
+    ],
+)
+def test_every_partial_reuse_witness_stays_readable_but_is_not_reused(
+    tmp_path: Path, present_fields: tuple[str, ...]
+) -> None:
+    source = _episode(tmp_path / "episode_0001.mcap")
+    app = hflow.App("partial-witness", data_root=tmp_path / "data", default_checks=())
+    first = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
+
+    marker_path = first.canonical_path.parent / ".sync-complete.json"
+    marker_payload = json.loads(marker_path.read_text())
+    witness_fields = {"source_digest", "ffmpeg_version", "transform_kind"}
+    marker_payload = {
+        key: value
+        for key, value in marker_payload.items()
+        if key not in witness_fields or key in present_fields
+    }
+    marker_path.write_text(json.dumps(marker_payload, sort_keys=True) + "\n")
+
+    metadata_only = app.process(source, record=False, stages={hflow.Stage.META}, verbose=False)
+    assert metadata_only.canonical_path == first.canonical_path
+
+    second = app.process(source, record=False, stages=SYNC_ONLY, verbose=False)
+    assert second.sync_reused is False
+
+
+@pytest.mark.parametrize(
     "raw_transform_kind", [None, "future-transform"], ids=["missing", "unknown"]
 )
 def test_a_marker_without_a_known_transform_kind_stays_readable_but_is_not_reused(
