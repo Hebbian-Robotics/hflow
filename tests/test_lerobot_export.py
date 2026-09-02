@@ -29,8 +29,12 @@ LENGTHS = [60, 65, 70, 75]  # episode lengths: 60 + i*5
 OFFSETS = [0, 60, 125, 195]  # cumulative data offsets
 
 
-def _fake_corpus(tmp_path: Path) -> dict:
-    """Synthetic v3 source: 4 episodes, 2 cameras, 6-dim state/action."""
+def _fake_corpus(tmp_path: Path, *, chunk1_eps: tuple[int, ...] = ()) -> dict:
+    """Synthetic v3 source: 4 episodes, 2 cameras, 6-dim state/action.
+
+    Episodes named in ``chunk1_eps`` reference video chunk 1 (files present
+    with distinguishable bytes), so a selection can span two source chunks.
+    """
     info = {
         "fps": 30,
         "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
@@ -50,6 +54,7 @@ def _fake_corpus(tmp_path: Path) -> dict:
     rows = []
     for i in range(4):
         length = LENGTHS[i]
+        vchunk = 1 if i in chunk1_eps else 0
         rows.append(
             [
                 i,
@@ -58,11 +63,11 @@ def _fake_corpus(tmp_path: Path) -> dict:
                 0,
                 OFFSETS[i],
                 OFFSETS[i] + length,
-                0,
+                vchunk,
                 0,
                 0.0,
                 2.0 + i * 0.2,
-                0,
+                vchunk,
                 0,
                 0.0,
                 2.0 + i * 0.2,
@@ -129,12 +134,14 @@ def _fake_corpus(tmp_path: Path) -> dict:
     )
 
     # video chunks (fake bytes); exporter fetches them under the converter's
-    # local naming: cache/videos/<sanitized-cam>-chunk<N>.mp4
-    for cam in ("observation.images.up", "observation.images.side"):
-        vname = cam.replace("/", "_").replace(".", "_") + "-chunk0.mp4"
-        vdir = tmp_path / "videos"
-        vdir.mkdir(parents=True, exist_ok=True)
-        (vdir / vname).write_bytes(f"fake-mp4-{cam}".encode())
+    # local naming: cache/videos/<sanitized-cam>-chunk<N>-file<M>.mp4
+    for chunk in (0, 1) if chunk1_eps else (0,):
+        for cam in ("observation.images.up", "observation.images.side"):
+            vname = cam.replace("/", "_").replace(".", "_") + f"-chunk{chunk}-file0.mp4"
+            vdir = tmp_path / "videos"
+            vdir.mkdir(parents=True, exist_ok=True)
+            marker = "" if chunk == 0 else "CHUNK-ONE-"
+            (vdir / vname).write_bytes(f"fake-mp4-{marker}{cam}".encode())
 
     conn.close()
 
@@ -151,13 +158,13 @@ def _fake_corpus(tmp_path: Path) -> dict:
                 "data_to": OFFSETS[i] + LENGTHS[i],
                 "video_windows": {
                     "observation.images.up": {
-                        "chunk_index": "0",
+                        "chunk_index": str(vchunk),
                         "file_index": "0",
                         "from_timestamp": 0.0,
                         "to_timestamp": 2.0 + i * 0.2,
                     },
                     "observation.images.side": {
-                        "chunk_index": "0",
+                        "chunk_index": str(vchunk),
                         "file_index": "0",
                         "from_timestamp": 0.0,
                         "to_timestamp": 2.0 + i * 0.2,
@@ -179,9 +186,7 @@ def _fake_corpus(tmp_path: Path) -> dict:
     }
 
 
-@pytest.fixture()
-def fake_corpus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
-    corpus = _fake_corpus(tmp_path)
+def _install_fake_import(corpus: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     corpus["_import_calls"] = []
 
     def _fake_import(
@@ -206,6 +211,19 @@ def fake_corpus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
         return []
 
     monkeypatch.setattr(hflow, "import_lerobot_dataset", _fake_import)
+
+
+@pytest.fixture()
+def fake_corpus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
+    corpus = _fake_corpus(tmp_path)
+    _install_fake_import(corpus, tmp_path, monkeypatch)
+    return corpus
+
+
+@pytest.fixture()
+def multi_chunk_corpus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
+    corpus = _fake_corpus(tmp_path, chunk1_eps=(2,))
+    _install_fake_import(corpus, tmp_path, monkeypatch)
     return corpus
 
 
@@ -274,28 +292,33 @@ def test_export_noncontiguous_selection(fake_corpus: dict, tmp_path: Path) -> No
     assert [r[0] for r in rows] == [0, 1]
     assert rows[0][1] == 60
     assert rows[1][1] == 70
+    assert [r[2] for r in rows] == [0, 1]  # plain indexes, one data parquet per episode
     assert (rows[0][3], rows[0][4]) == (0, 60)
     assert (rows[1][3], rows[1][4]) == (60, 130)
     assert rows[1][5] == ["task-2"]
 
+    ep1_data = dest / "data" / "chunk-000" / "file-001.parquet"
+    assert ep1_data.exists()  # the per-episode file episode 1 references
     conn = duckdb.connect()
     dcount = conn.execute(
-        "SELECT count(*), min(episode_index), max(episode_index) FROM read_parquet('"
+        "SELECT count(*) FROM read_parquet('"
         + str(dest / "data/chunk-000/file-000.parquet").replace("'", "''")
         + "')"
     ).fetchall()[0]
-    # frame indexes preserve the source per-episode numbering
+    dcount2 = conn.execute(
+        "SELECT count(*), max(frame_index) FROM read_parquet('"
+        + str(ep1_data).replace("'", "''")
+        + "')"
+    ).fetchall()[0]
     frames = conn.execute(
         "SELECT frame_index FROM read_parquet('"
         + str(dest / "data/chunk-000/file-000.parquet").replace("'", "''")
         + "')"
     ).fetchall()
     conn.close()
-    assert dcount[0] == 130
-    assert dcount[1] == 0
-    assert dcount[2] == 1
-    assert [f[0] for f in frames[:3]] == [0, 1, 2]  # ep0 keeps 0..59
-    assert frames[60][0] == 0  # ep2 restarts at 0
+    assert dcount[0] == 60  # episode 0 alone in its own parquet
+    assert dcount2 == (70, 69)  # episode 1: full length, per-episode restart
+    assert [f[0] for f in frames[:3]] == [0, 1, 2]
 
     for cam in ("observation.images.up", "observation.images.side"):
         v = dest / "videos" / cam / "chunk-000" / "file-000.mp4"
@@ -457,15 +480,153 @@ def test_export_provenance_digests_match_bytes(fake_corpus: dict, tmp_path: Path
     up = dest / "videos" / "observation.images.up" / "chunk-000" / "file-000.mp4"
     side = dest / "videos" / "observation.images.side" / "chunk-000" / "file-000.mp4"
     data = dest / "data" / "chunk-000" / "file-000.parquet"
-    assert prov["video_sha256"]["observation.images.up"] == _sha(up)
-    assert prov["video_sha256"]["observation.images.side"] == _sha(side)
-    assert prov["data_parquet_sha256"] == _sha(data)
+    assert set(prov["video_sha256"]) == {
+        "observation.images.up",
+        "observation.images.side",
+    }
+    assert prov["video_sha256"]["observation.images.up"] == {
+        "videos/observation.images.up/chunk-000/file-000.mp4": _sha(up)
+    }
+    assert prov["video_sha256"]["observation.images.side"] == {
+        "videos/observation.images.side/chunk-000/file-000.mp4": _sha(side)
+    }
+    assert prov["data_parquet_sha256"] == {"data/chunk-000/file-000.parquet": _sha(data)}
     # a constant would fail here: different files have different digests
+    video_digests = [
+        digest for per_cam in prov["video_sha256"].values() for digest in per_cam.values()
+    ]
     assert (
-        prov["video_sha256"]["observation.images.up"]
-        != prov["video_sha256"]["observation.images.side"]
+        prov["video_sha256"]["observation.images.up"][
+            "videos/observation.images.up/chunk-000/file-000.mp4"
+        ]
+        != prov["video_sha256"]["observation.images.side"][
+            "videos/observation.images.side/chunk-000/file-000.mp4"
+        ]
     )
-    assert prov["data_parquet_sha256"] not in prov["video_sha256"].values()
+    assert all(digest not in video_digests for digest in prov["data_parquet_sha256"].values())
+
+
+def test_export_multi_chunk_videos(multi_chunk_corpus: dict, tmp_path: Path) -> None:
+    """A selection spanning two source video chunks ships both byte-exact.
+
+    Regression for the review finding that every camera landed in
+    chunk-000/file-000.mp4 and the second source chunk never reached the
+    output: distinct source (chunk, file) identities must land in distinct
+    destination files, and each episode row must reference the file its
+    frames actually come from.
+    """
+    manifest = _fake_manifest(
+        tmp_path,
+        [
+            {"metadata_json": _provenance_meta(0)},
+            {"metadata_json": _provenance_meta(1)},
+            {"metadata_json": _provenance_meta(2, task="task-2")},
+        ],
+    )
+    dest = tmp_path / "out"
+    export.export(dest, manifest=manifest, camera_keys=CAMS)
+
+    up0 = dest / "videos" / "observation.images.up" / "chunk-000" / "file-000.mp4"
+    up1 = dest / "videos" / "observation.images.up" / "chunk-001" / "file-000.mp4"
+    side1 = dest / "videos" / "observation.images.side" / "chunk-001" / "file-000.mp4"
+    assert up0.read_bytes() == b"fake-mp4-observation.images.up"
+    assert up1.read_bytes() == b"fake-mp4-CHUNK-ONE-observation.images.up"
+    assert side1.read_bytes() == b"fake-mp4-CHUNK-ONE-observation.images.side"
+    assert not (dest / "videos" / "observation.images.up" / "chunk-000" / "file-001.mp4").exists()
+
+    conn = duckdb.connect()
+    rows = conn.execute(
+        'SELECT episode_index, "videos/observation.images.up/chunk_index" FROM read_parquet(\''
+        + str(dest / "meta/episodes/chunk-000/file-000.parquet").replace("'", "''")
+        + "')"
+    ).fetchall()
+    conn.close()
+    assert rows == [(0, 0), (1, 0), (2, 1)]
+
+    info = json.loads((dest / "meta" / "info.json").read_text())
+    assert info["total_videos"] == 4  # up/side x chunk0/chunk1, deduplicated
+
+    prov = json.loads((dest / "export-provenance.json").read_text())
+    up_digests = prov["video_sha256"]["observation.images.up"]
+    assert (
+        up_digests["videos/observation.images.up/chunk-000/file-000.mp4"]
+        != up_digests["videos/observation.images.up/chunk-001/file-000.mp4"]
+    )
+    assert set(prov["video_sha256"]["observation.images.side"]) == {
+        "videos/observation.images.side/chunk-000/file-000.mp4",
+        "videos/observation.images.side/chunk-001/file-000.mp4",
+    }
+
+
+def test_export_output_readback(fake_corpus: dict, tmp_path: Path) -> None:
+    """The exported episode parquet parses with the exporter's own reader.
+
+    Regression for the review finding that data/chunk_index was written as
+    'chunk-000' and broke int() conversion on re-read: exported indexes are
+    plain integers and every referenced data file exists on disk.
+    """
+    dest = _exported_dataset(fake_corpus, tmp_path)
+    corpus = export._read_corpus_from_cache(dest)
+    assert len(corpus["episodes"]) == 1
+    ep = corpus["episodes"][0]
+    assert int(ep["data_chunk"]) == 0
+    assert int(ep["data_file"]) == 0
+    assert ep["video_windows"]["observation.images.up"]["chunk_index"] == "0"
+    info = json.loads((dest / "meta" / "info.json").read_text())
+    drel = info["data_path"].format(
+        chunk_index=int(ep["data_chunk"]), file_index=int(ep["data_file"])
+    )
+    assert (dest / drel).exists()
+
+
+def test_export_validation_failure_leaves_no_destination(
+    fake_corpus: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A staging validation refusal propagates and never publishes.
+
+    Regression for the review finding that the _validate_v3 call could be
+    deleted without any test noticing: a validator refusal must abort the
+    export, leave no destination behind, and leave a pre-existing
+    destination untouched.
+    """
+
+    def _reject(_stage: Path) -> None:
+        raise ValueError("staged dataset rejected for the test")
+
+    monkeypatch.setattr(export, "_validate_v3", _reject)
+
+    dest = tmp_path / "out"
+    dest.mkdir()
+    (dest / "sentinel.txt").write_text("keep")
+    manifest = _fake_manifest(tmp_path, [{"metadata_json": _provenance_meta(0)}])
+    with pytest.raises(ValueError, match="rejected for the test"):
+        export.export(dest, manifest=manifest, camera_keys=CAMS)
+    assert (dest / "sentinel.txt").read_text() == "keep"
+
+    dest2 = tmp_path / "out2"
+    with pytest.raises(ValueError, match="rejected for the test"):
+        export.export(dest2, manifest=manifest, camera_keys=CAMS)
+    assert not dest2.exists()
+
+
+def test_validate_v3_rejects_non_integer_data_refs(fake_corpus: dict, tmp_path: Path) -> None:
+    """Index fields must be values data_path can format: 'chunk-000' => refusal.
+
+    Regression for the review finding that the exported data refs were
+    written as 'chunk-000' strings: the loader formats these with :03d, so a
+    non-integer reference makes the dataset unloadable and must be refused.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    dest = _exported_dataset(fake_corpus, tmp_path)
+    ep_pq = dest / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    table = pq.read_table(str(ep_pq))
+    idx = table.schema.get_field_index("data/chunk_index")
+    table = table.set_column(idx, "data/chunk_index", pa.array(["chunk-000"], pa.string()))
+    pq.write_table(table, str(ep_pq))
+    with pytest.raises(ValueError, match="cannot format references"):
+        export._validate_v3(dest)
 
 
 def test_validate_v3_rejects_incoherent_info(fake_corpus: dict, tmp_path: Path) -> None:
