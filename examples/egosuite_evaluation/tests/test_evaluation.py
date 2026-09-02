@@ -35,6 +35,7 @@ from examples.egosuite_evaluation.evaluate import (
     select_episode_paths,
     select_stratified_labels,
     summarize_evaluation_results,
+    write_label_report,
 )
 from examples.egosuite_evaluation.geometry import (
     CameraPoseInWorld,
@@ -268,25 +269,30 @@ def test_pipeline_registers_projected_hand_visibility_as_an_hflow_check() -> Non
 def test_saved_label_report_selects_exact_frames_for_a_canonical_episode(tmp_path: Path) -> None:
     source_path = tmp_path / "episode-123.mcap"
     report_path = tmp_path / "labels.json"
-    report_path.write_text(
-        json.dumps(
-            {
-                "frames": [
-                    {
-                        "source_path": str(source_path),
-                        "source_episode": "episode-123",
-                        "camera_view": "head-left",
-                        "frame_index": frame_index,
-                        "left_in_frame_joint_count": 21,
-                        "right_in_frame_joint_count": 21 if frame_index == 8 else 0,
-                        "expected_hand_count": 2 if frame_index == 8 else 1,
-                        "left_hand_issue_reasons": [],
-                        "right_hand_issue_reasons": ["occlusion"] if frame_index == 8 else [],
-                    }
-                    for frame_index in (8, 3)
-                ]
-            }
+    labels = [
+        ProjectedHandFrameLabel(
+            source_path=source_path,
+            source_episode="episode-123",
+            camera_view=CameraView.HEAD_LEFT,
+            frame_index=frame_index,
+            left_in_frame_joint_count=21,
+            right_in_frame_joint_count=21 if frame_index == 8 else 0,
+            expected_hand_count=2 if frame_index == 8 else 1,
+            left_hand_issue_reasons=(),
+            right_hand_issue_reasons=("occlusion",) if frame_index == 8 else (),
         )
+        for frame_index in (8, 3)
+    ]
+    write_label_report(
+        {source_path: labels},
+        camera_view=CameraView.HEAD_LEFT,
+        frame_stride=30,
+        limit_per_episode=None,
+        episode_count=None,
+        samples_per_episode=None,
+        samples_per_hand_count=None,
+        sample_seed=42,
+        output_path=report_path,
     )
 
     labels_by_source_episode = load_projected_hand_label_report(report_path)
@@ -297,6 +303,80 @@ def test_saved_label_report_selects_exact_frames_for_a_canonical_episode(tmp_pat
     assert [label.frame_index for label in selected_labels] == [3, 8]
     assert [label.expected_hand_count for label in selected_labels] == [1, 2]
     assert selected_labels[1].right_hand_issue_reasons == ("occlusion",)
+
+
+@pytest.mark.parametrize(
+    ("envelope", "field_name", "found_value", "supported_value"),
+    [
+        pytest.param(
+            {"label_type": "projected-hand-joints"},
+            "schema_version",
+            "None",
+            "1",
+            id="missing-schema-version",
+        ),
+        pytest.param(
+            {"schema_version": "1", "label_type": "projected-hand-joints"},
+            "schema_version",
+            "'1'",
+            "1",
+            id="non-integer-schema-version",
+        ),
+        pytest.param(
+            {"schema_version": 0, "label_type": "projected-hand-joints"},
+            "schema_version",
+            "0",
+            "1",
+            id="older-schema-version",
+        ),
+        pytest.param(
+            {"schema_version": 2, "label_type": "projected-hand-joints"},
+            "schema_version",
+            "2",
+            "1",
+            id="future-schema-version",
+        ),
+        pytest.param(
+            {"schema_version": 1},
+            "label_type",
+            "None",
+            "'projected-hand-joints'",
+            id="missing-label-type",
+        ),
+        pytest.param(
+            {"schema_version": 1, "label_type": 1},
+            "label_type",
+            "1",
+            "'projected-hand-joints'",
+            id="non-string-label-type",
+        ),
+        pytest.param(
+            {"schema_version": 1, "label_type": "bounding-boxes"},
+            "label_type",
+            "'bounding-boxes'",
+            "'projected-hand-joints'",
+            id="unsupported-label-type",
+        ),
+    ],
+)
+def test_saved_label_report_rejects_unsupported_envelope_before_frames(
+    tmp_path: Path,
+    envelope: dict[str, object],
+    field_name: str,
+    found_value: str,
+    supported_value: str,
+) -> None:
+    report_path = tmp_path / "labels.json"
+    report_path.write_text(json.dumps({**envelope, "frames": [None]}))
+
+    with pytest.raises(ValueError) as error:
+        load_projected_hand_label_report(report_path)
+
+    message = str(error.value)
+    assert str(report_path) in message
+    assert repr(field_name) in message
+    assert f"value {found_value}" in message
+    assert f"supported value is {supported_value}" in message
 
 
 def test_pipeline_records_agreement_output_validity_and_frame_intervals() -> None:
