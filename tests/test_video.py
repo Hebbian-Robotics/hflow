@@ -11,6 +11,7 @@ from hflow.video import (
     AccessUnit,
     PictureCodingScan,
     VideoEncodeError,
+    _first_mb_failure_message,
     _remove_emulation_prevention_bytes,
     _unescape_ebsp_head,
     count_h264_pictures,
@@ -386,6 +387,65 @@ def test_scan_results_match_count_h264_pictures_on_canonical_and_b_frame_streams
     b_scan = scan_picture_coding_types(b_frame_stream)
     assert b_scan.picture_count == count_h264_pictures(b_frame_stream)
     assert b_scan.picture_count == FRAME_COUNT
+
+
+def test_scan_and_count_agree_on_multi_slice_and_escape_heavy_streams() -> None:
+    """Extends the equivalence pin to the inputs #355 calls out: a
+    multi-slice picture and a stream whose emulation-prevention triples
+    straddle the 16-byte head boundary. Both readers run one walk now;
+    any future divergence between them fails here."""
+    # Two pictures, the first split into two slices (first_mb_in_slice 0, 1).
+    multi_slice_stream = b"".join(
+        b"\x00\x00\x00\x01\x41" + _slice_header_rbsp(first_mb, slice_type)
+        for first_mb, slice_type in ((0, 2), (1, 2), (0, 0))
+    )
+    assert scan_picture_coding_types(multi_slice_stream).picture_count == 2
+    assert count_h264_pictures(multi_slice_stream) == 2
+
+    def escape_prevention_bytes(rbsp: bytes) -> bytes:
+        """Encode one RBSP the way an encoder would: 0x03 after each 00 00
+        pair followed by a byte at or below 0x03."""
+        encoded = bytearray()
+        consecutive_zeros = 0
+        for byte in rbsp:
+            if consecutive_zeros >= 2 and byte <= 0x03:
+                encoded.append(0x03)
+                consecutive_zeros = 0
+            encoded.append(byte)
+            consecutive_zeros = consecutive_zeros + 1 if byte == 0 else 0
+        return bytes(encoded)
+
+    # first_mb_in_slice = 2**70 encodes as 70 leading zero bits, so its
+    # header starts with eight 0x00 bytes and needs 141 bits in total: the
+    # escapes push the header past what a 16-byte head can unescape, and
+    # only the full-payload fallback can decode it. It appears as the second
+    # slice of a picture, since a picture's first slice always carries 0.
+    wide_rbsp = _slice_header_rbsp(2**70, 7)
+    assert wide_rbsp.startswith(b"\x00" * 8)
+    escape_stream = b"".join(
+        b"\x00\x00\x00\x01\x41" + escape_prevention_bytes(rbsp)
+        for rbsp in (
+            _slice_header_rbsp(0, 7),
+            wide_rbsp,
+            _slice_header_rbsp(0, 7),
+        )
+    )
+    assert scan_picture_coding_types(escape_stream).picture_count == 2
+    assert count_h264_pictures(escape_stream) == 2
+    assert scan_picture_coding_types(escape_stream).b_picture_count == 0
+
+
+def test_first_mb_failure_message_names_both_failure_kinds() -> None:
+    """count_h264_pictures owes hflow doctor two distinct messages, and the
+    walk no longer raises them itself: this helper is the only place they
+    are produced. An all-zero RBSP never terminates the first Exp-Golomb
+    value; 00000100 carries the terminating one bit but loses its suffix."""
+    assert (
+        _first_mb_failure_message(b"\x00") == "slice header has no complete first_mb_in_slice value"
+    )
+    assert (
+        _first_mb_failure_message(b"\x04") == "slice header truncates its first_mb_in_slice value"
+    )
 
 
 def test_scan_refuses_a_truncated_slice_with_the_existing_fail_closed_message() -> None:

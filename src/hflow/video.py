@@ -19,9 +19,10 @@ Everything here shells out to the pinned ffmpeg (``hflow.ffmpeg``).
 import itertools
 import statistics
 import subprocess
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from hflow.ffmpeg import ffmpeg_path
 
@@ -286,43 +287,15 @@ def _remove_emulation_prevention_bytes(ebsp: bytes) -> bytes:
     return bytes(rbsp)
 
 
-def _decode_first_mb_in_slice(rbsp: bytes) -> int:
-    """Decode ``first_mb_in_slice`` from a slice-header RBSP, raising on failure.
-
-    Replicates the two fail-closed messages of the previous
-    :func:`_decode_unsigned_exp_golomb` so existing tests and ``hflow doctor``
-    diagnostic text stay byte-identical. Used only by
-    :func:`count_h264_pictures` (and through it,
-    :func:`ensure_access_unit_delimiter`), where the older "no complete value"
-    vs. "truncated" distinction is part of the public error contract.
-    """
-    bit_count = len(rbsp) * 8
-    leading_zero_bits = 0
-    while leading_zero_bits < bit_count:
-        byte = rbsp[leading_zero_bits // 8]
-        if (byte >> (7 - leading_zero_bits % 8)) & 1:
-            break
-        leading_zero_bits += 1
-    else:
-        raise ValueError("slice header has no complete first_mb_in_slice value")
-    suffix_start = leading_zero_bits + 1
-    suffix_end = suffix_start + leading_zero_bits
-    if suffix_end > bit_count:
-        raise ValueError("slice header truncates its first_mb_in_slice value")
-    suffix = 0
-    for bit_offset in range(suffix_start, suffix_end):
-        byte = rbsp[bit_offset // 8]
-        suffix = (suffix << 1) | ((byte >> (7 - bit_offset % 8)) & 1)
-    return (1 << leading_zero_bits) - 1 + suffix
-
-
 def _decode_unsigned_exp_golomb_at(rbsp: bytes, bit_offset: int) -> tuple[int, int] | None:
-    """Offset-aware form of :func:`_decode_unsigned_exp_golomb`.
+    """Decode one unsigned Exp-Golomb value starting at ``bit_offset``.
 
     Returns ``(value, next_bit_offset)``, or ``None`` when the value is
     incomplete or truncated. Returning ``None`` instead of raising lets
     callers count unparseable slice headers and refuse fail-closed rather
-    than guess a picture type.
+    than guess a picture type; a caller whose message contract distinguishes
+    the two failure kinds inspects the RBSP bits itself (see
+    :func:`_first_mb_failure_message`).
     """
     bit_count = len(rbsp) * 8
     leading_zero_bits = 0
@@ -344,15 +317,52 @@ def _decode_unsigned_exp_golomb_at(rbsp: bytes, bit_offset: int) -> tuple[int, i
     return (1 << leading_zero_bits) - 1 + suffix, suffix_end
 
 
-def count_h264_pictures(stream: bytes) -> int:
-    """Count coded pictures in one Annex B payload from its slice headers.
+class _SliceHeader(NamedTuple):
+    """The slice-header fields of one VCL NAL, decoded per field.
 
-    ``first_mb_in_slice == 0`` marks the first slice of a picture. Counting
-    that value distinguishes two pictures from a valid multi-slice picture
-    without relying on AUDs, which are precisely what repairable inputs lack.
+    A field is ``None`` when it could not be decoded, and ``malformed``
+    carries the fully unescaped payload for exactly those NALs. The fields
+    fail independently, and the consumers disagree about which failure
+    matters: :func:`count_h264_pictures` reads only ``first_mb_in_slice``
+    and must keep succeeding on a header whose ``slice_type`` is truncated,
+    while :func:`scan_picture_coding_types` needs both. Carrying the bytes
+    rather than a failure kind lets each consumer raise its own message
+    without the walk knowing any message text.
+    """
+
+    first_mb_in_slice: int | None
+    slice_type: int | None
+    malformed: bytes | None
+
+
+def _slice_header_fields(rbsp: bytes) -> tuple[int | None, int | None]:
+    """Decode ``(first_mb_in_slice, slice_type)`` from one slice-header RBSP.
+
+    Both fields are unsigned Exp-Golomb values per the H.264 slice header
+    syntax, decoded with the one offset-aware decoder. Each is ``None``
+    independently when its bits run out: ``first_mb_in_slice`` when the
+    first value never terminates, ``slice_type`` when the second one does.
+    """
+    first_field = _decode_unsigned_exp_golomb_at(rbsp, 0)
+    if first_field is None:
+        return None, None
+    slice_type_field = _decode_unsigned_exp_golomb_at(rbsp, first_field[1])
+    return first_field[0], None if slice_type_field is None else slice_type_field[0]
+
+
+def _iter_slice_headers(stream: bytes) -> Iterator[_SliceHeader]:
+    """Yield the slice header of every VCL NAL carrying one, in stream order.
+
+    The one NAL walk behind :func:`count_h264_pictures` and
+    :func:`scan_picture_coding_types` (#355): one filter, one head-then-full
+    unescape, one Exp-Golomb decoder. The 16-byte head is read first because
+    that is all a legal slice header needs (#346 measured the full-payload
+    unescape at 27 to 31 times the cost); the fallback re-reads both fields
+    from the fully unescaped payload once, here, so neither consumer
+    re-implements the pair. A NAL whose header still does not decode yields
+    ``malformed`` set instead of raising, and the consumer owns the message.
     """
     nal_offsets_and_types = _annex_b_nal_offsets_and_types(stream)
-    picture_count = 0
     for nal_index, (nal_start_offset, nal_type) in enumerate(nal_offsets_and_types):
         if nal_type not in _SLICE_HEADER_NAL_TYPES:
             continue
@@ -364,34 +374,60 @@ def count_h264_pictures(stream: bytes) -> int:
         nal_header_offset = _nal_header_offset(stream, nal_start_offset)
         slice_payload = stream[nal_header_offset + 1 : nal_end_offset]
         rbsp = _unescape_ebsp_head(slice_payload, _SLICE_HEADER_HEAD_BYTES)
-        try:
-            first_mb_in_slice = _decode_first_mb_in_slice(rbsp)
-        except ValueError:
-            # The head was too short: fall back to the full unescape so the
-            # existing fail-closed messages ("no complete" / "truncated")
-            # still fire for ``hflow doctor`` and the AUD repair path.
+        first_mb_in_slice, slice_type = _slice_header_fields(rbsp)
+        if first_mb_in_slice is None or slice_type is None:
+            # The head was too short for both Exp-Golomb values; the full
+            # payload may still hold them. The head is a prefix of the full
+            # unescape, so a field that decoded from the head keeps its
+            # value here.
             rbsp = _remove_emulation_prevention_bytes(slice_payload)
-            first_mb_in_slice = _decode_first_mb_in_slice(rbsp)
-        if first_mb_in_slice == 0:
+            first_mb_in_slice, slice_type = _slice_header_fields(rbsp)
+        yield _SliceHeader(
+            first_mb_in_slice,
+            slice_type,
+            None if first_mb_in_slice is not None and slice_type is not None else rbsp,
+        )
+
+
+def _first_mb_failure_message(rbsp: bytes) -> str:
+    """The pinned ``count_h264_pictures`` message for an undecodable header.
+
+    Called only on a payload whose ``first_mb_in_slice`` failed to decode,
+    so the two failure kinds of :func:`_decode_unsigned_exp_golomb_at` are
+    the whole space: no terminating one bit at all, or a one bit whose
+    suffix ran past the end. Both strings reach ``hflow doctor`` diagnostics
+    and the AUD repair path, so they are part of the public error contract
+    and must not change.
+    """
+    bit_count = len(rbsp) * 8
+    leading_zero_bits = 0
+    while leading_zero_bits < bit_count:
+        byte = rbsp[leading_zero_bits // 8]
+        if (byte >> (7 - leading_zero_bits % 8)) & 1:
+            break
+        leading_zero_bits += 1
+    else:
+        return "slice header has no complete first_mb_in_slice value"
+    return "slice header truncates its first_mb_in_slice value"
+
+
+def count_h264_pictures(stream: bytes) -> int:
+    """Count coded pictures in one Annex B payload from its slice headers.
+
+    ``first_mb_in_slice == 0`` marks the first slice of a picture. Counting
+    that value distinguishes two pictures from a valid multi-slice picture
+    without relying on AUDs, which are precisely what repairable inputs lack.
+    """
+    picture_count = 0
+    for slice_header in _iter_slice_headers(stream):
+        if slice_header.first_mb_in_slice is None:
+            # The walk sets ``malformed`` exactly when a field failed to
+            # decode, so a None first_mb_in_slice always carries the bytes.
+            assert slice_header.malformed is not None
+            raise ValueError(_first_mb_failure_message(slice_header.malformed))
+        if slice_header.first_mb_in_slice == 0:
             picture_count += 1
     return picture_count
-
-
-def _slice_header_fields(rbsp: bytes) -> tuple[int, int] | None:
-    """Return ``(first_mb_in_slice, slice_type)`` from a slice header RBSP.
-
-    Both fields are unsigned Exp-Golomb values per the H.264 slice header
-    syntax. Returning ``None`` when either is incomplete or truncated lets
-    callers treat an unparseable slice header fail-closed instead of guessing
-    a picture type.
-    """
-    first_field = _decode_unsigned_exp_golomb_at(rbsp, 0)
-    if first_field is None:
-        return None
-    slice_type_field = _decode_unsigned_exp_golomb_at(rbsp, first_field[1])
-    if slice_type_field is None:
-        return None
-    return first_field[0], slice_type_field[0]
 
 
 @dataclass(frozen=True)
@@ -428,34 +464,15 @@ def scan_picture_coding_types(stream: bytes) -> PictureCodingScan:
     fail-closed as an error: an uncountable slice means the stream's B-frame
     freedom cannot be proven.
     """
-    nal_offsets_and_types = _annex_b_nal_offsets_and_types(stream)
     picture_is_b: list[bool] = []
-    for nal_index, (nal_start_offset, nal_type) in enumerate(nal_offsets_and_types):
-        if nal_type not in _SLICE_HEADER_NAL_TYPES:
-            continue
-        nal_end_offset = (
-            nal_offsets_and_types[nal_index + 1][0]
-            if nal_index + 1 < len(nal_offsets_and_types)
-            else len(stream)
-        )
-        nal_header_offset = _nal_header_offset(stream, nal_start_offset)
-        slice_payload = stream[nal_header_offset + 1 : nal_end_offset]
-        rbsp = _unescape_ebsp_head(slice_payload, _SLICE_HEADER_HEAD_BYTES)
-        slice_header_fields = _slice_header_fields(rbsp)
-        if slice_header_fields is None:
-            # The head was too short to read both Exp-Golomb values. Fall
-            # back to the full unescape so the existing fail-closed message
-            # still fires on the malformed cases the existing tests pin.
-            rbsp = _remove_emulation_prevention_bytes(slice_payload)
-            slice_header_fields = _slice_header_fields(rbsp)
-            if slice_header_fields is None:
-                raise ValueError(
-                    "a slice header is incomplete or truncated; picture coding types "
-                    "cannot be classified"
-                )
-        first_mb_in_slice, slice_type_code = slice_header_fields
-        slice_is_b = slice_type_code % 5 == 1
-        if first_mb_in_slice == 0:
+    for slice_header in _iter_slice_headers(stream):
+        if slice_header.first_mb_in_slice is None or slice_header.slice_type is None:
+            raise ValueError(
+                "a slice header is incomplete or truncated; picture coding types "
+                "cannot be classified"
+            )
+        slice_is_b = slice_header.slice_type % 5 == 1
+        if slice_header.first_mb_in_slice == 0:
             picture_is_b.append(slice_is_b)
         elif picture_is_b:
             picture_is_b[-1] = picture_is_b[-1] or slice_is_b
