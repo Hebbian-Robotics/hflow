@@ -69,12 +69,13 @@ import os
 import re
 import secrets
 import shutil
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
 from hflow import __version__
-from hflow.app import DEFAULT_APP_VARIABLE, ENDPOINT_ENVIRONMENT_VARIABLE_PREFIX
+from hflow.app import DEFAULT_APP_VARIABLE
 from hflow.runtime._templates import (
     COMPOSE_TEMPLATE,
     DAG_BUNDLE_CONFIG_LIST_JSON,
@@ -158,7 +159,40 @@ CONTAINER_VENV_PYTHON = "/opt/venvs/user/bin/python"
 # generated files: the artifact a provisioning service (or `load_bundle`)
 # reads instead of regexing generated code or parsing DEPLOY.md prose.
 BUNDLE_MANIFEST_FILE_NAME = "hflow-bundle.json"
-BUNDLE_MANIFEST_VERSION = 1
+BUNDLE_MANIFEST_VERSION = 2
+
+_ENVIRONMENT_VARIABLE_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def parse_environment_variable_names(variable_names: object) -> tuple[str, ...]:
+    """Validate an explicit environment-variable allowlist at its boundary."""
+    if isinstance(variable_names, str):
+        raise ValueError(
+            "passthrough_environment_variables must be an iterable of names, not one string"
+        )
+    if not isinstance(variable_names, Iterable):
+        raise ValueError("passthrough_environment_variables must be an iterable of names")
+    names = tuple(variable_names)
+
+    invalid_names = [
+        variable_name
+        for variable_name in names
+        if not isinstance(variable_name, str)
+        or _ENVIRONMENT_VARIABLE_NAME_PATTERN.fullmatch(variable_name) is None
+    ]
+    if invalid_names:
+        raise ValueError(
+            "environment variable names must match [A-Za-z_][A-Za-z0-9_]*; invalid: "
+            f"{invalid_names!r}"
+        )
+    duplicate_names = sorted(
+        {variable_name for variable_name in names if names.count(variable_name) > 1}
+    )
+    if duplicate_names:
+        raise ValueError(
+            f"environment variable names must be unique; duplicates: {duplicate_names}"
+        )
+    return names
 
 
 class BundleKind(StrEnum):
@@ -202,6 +236,9 @@ class RuntimeConfig:
         on one worker's disk and be unreadable from the next task's host.
         A bucket URL here requires the matching Airflow provider (e.g.
         ``apache-airflow-providers-amazon``) in Airflow's own environment.
+    :param passthrough_environment_variables: Explicit names to forward from
+        the launch environment into every runtime service. Values are never
+        written to the bundle.
     """
 
     pipeline_file: Path
@@ -218,6 +255,7 @@ class RuntimeConfig:
     admin_password: str | None = None  # None: generated once into .env
     task_queue: str | None = None
     xcom_objectstorage_url: str | None = None
+    passthrough_environment_variables: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         # A range invariant of the field, checked where the field is set, so a
@@ -244,6 +282,11 @@ class RuntimeConfig:
             )
         if not MIN_PORT <= self.api_port <= MAX_PORT:
             raise ValueError(f"api_port {self.api_port!r} is not in {MIN_PORT}-{MAX_PORT}")
+        object.__setattr__(
+            self,
+            "passthrough_environment_variables",
+            parse_environment_variable_names(self.passthrough_environment_variables),
+        )
 
     def resolved_dag_id(self) -> str:
         if self.dag_id is not None:
@@ -343,25 +386,19 @@ def _bucket_compose_credentials(bucket_url: str) -> tuple[str, str]:
     return "".join(environment_lines), mount_suffix
 
 
-def _endpoint_environment_passthrough_lines() -> str:
-    """Compose env lines forwarding ``HFLOW_ENDPOINT_*`` into every service.
-
-    Same contract as the bucket-credential passthrough: variable NAMES only,
-    resolved by compose from the shell that runs it -- values never land in
-    the bundle. This is what delivers ``App``'s endpoint-alias overrides
-    (app.py's ``HFLOW_ENDPOINT_<ALIAS>`` seam) to the task processes;
-    re-render after changing WHICH variables your shell exports. The charset
-    guard refuses names that could break the generated YAML.
-    """
-    environment_lines: list[str] = []
-    for variable_name in sorted(os.environ):
-        if (
-            variable_name.startswith(ENDPOINT_ENVIRONMENT_VARIABLE_PREFIX)
-            and os.environ[variable_name]
-            and re.fullmatch(r"[A-Z0-9_]+", variable_name)
-        ):
-            environment_lines.append(f"\n    {variable_name}: ${{{variable_name}}}")
-    return "".join(environment_lines)
+def _environment_passthrough_lines(variable_names: tuple[str, ...]) -> str:
+    """Compose env lines for an explicit allowlist, without serializing values."""
+    missing_names = [
+        variable_name for variable_name in variable_names if variable_name not in os.environ
+    ]
+    if missing_names:
+        raise ValueError(
+            "cannot pass environment variables that are absent from the launch environment: "
+            f"{missing_names}"
+        )
+    return "".join(
+        f"\n    {variable_name}: ${{{variable_name}}}" for variable_name in variable_names
+    )
 
 
 def hflow_distribution_requirement(*, include_bucket_extra: bool) -> str:
@@ -375,6 +412,7 @@ def _render_compose(
     hflow_source: Path | None,
     project_name: str,
     xcom_objectstorage_url: str | None = None,
+    passthrough_environment_variables: tuple[str, ...] = (),
 ) -> str:
     airflow_hflow_source_mount = ""
     venv_init_hflow_source_mount = ""
@@ -411,9 +449,9 @@ def _render_compose(
         # A multi-machine executor needs an XCom store every host reaches;
         # the file:// defaults above are single-host by construction.
         xcom_objectstorage_path = xcom_objectstorage_url
-    # Endpoint-alias overrides ride the same passthrough slot as bucket
-    # credentials, in BOTH modes -- names only, values from the launch shell.
-    environment_passthrough = bucket_credentials_env + _endpoint_environment_passthrough_lines()
+    environment_passthrough = bucket_credentials_env + _environment_passthrough_lines(
+        passthrough_environment_variables
+    )
     return COMPOSE_TEMPLATE.substitute(
         project_name=project_name,
         data_volume_line=data_volume_line,
@@ -780,6 +818,7 @@ def write_bundle_manifest(
     requirements_included: bool,
     task_queue: str | None,
     venv_python: str,
+    passthrough_environment_variables: tuple[str, ...],
 ) -> Path:
     """Emit ``hflow-bundle.json``: the bundle described as data, not prose.
 
@@ -799,6 +838,7 @@ def write_bundle_manifest(
         "requirements_included": requirements_included,
         "task_queue": task_queue,
         "venv_python": venv_python,
+        "passthrough_environment_variables": list(passthrough_environment_variables),
     }
     manifest_file = output_directory / BUNDLE_MANIFEST_FILE_NAME
     manifest_file.write_text(json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n")
@@ -1049,6 +1089,7 @@ def render_bundle(config: RuntimeConfig, bundle_dir: Path | str) -> BundlePaths:
             hflow_source,
             _project_name(bundle_directory),
             config.xcom_objectstorage_url,
+            config.passthrough_environment_variables,
         )
     )
 
@@ -1082,6 +1123,7 @@ def render_bundle(config: RuntimeConfig, bundle_dir: Path | str) -> BundlePaths:
         requirements_included=config.requirements_file is not None,
         task_queue=config.task_queue,
         venv_python=CONTAINER_VENV_PYTHON,
+        passthrough_environment_variables=config.passthrough_environment_variables,
     )
 
     # Create-if-absent: an existing .env is never rewritten, so its secrets

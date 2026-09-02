@@ -2,7 +2,7 @@
 
 v1 core is deliberately frames-only: most models and the OpenAI-compatible
 protocol do not take video, so the honest unit is the frame, and there is no
-bundled VLM client (docs/ARCHITECTURE.md, "Model-based checks"). Some model
+generic VLM client abstraction (docs/ARCHITECTURE.md, "Model-based checks"). Some model
 servers *do* speak a native-video protocol, and the knowledge worth packaging
 is exactly the protocol trivia: how that server wants video attached to a
 request. This module is the seam where contributors ship that trivia as

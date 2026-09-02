@@ -158,17 +158,6 @@ def test_built_in_media_step_name_is_reserved_for_user_steps(tmp_path: Path) -> 
         app.enrich(version="1", name=MEDIA_CONTACT_SHEET_STEP_NAME)(enrichment)
 
 
-def test_enrichment_uses_alias_is_preflighted(source_episode: Path, tmp_path: Path) -> None:
-    app = hflow.App("enrich-preflight", data_root=tmp_path)
-
-    @app.enrich(version="1", uses="captioner")
-    def needs_endpoint(ep: hflow.Episode) -> hflow.EnrichmentResult:
-        return hflow.EnrichmentResult()
-
-    with pytest.raises(ValueError, match="captioner"):
-        app.test(source_episode, verbose=False)
-
-
 def test_enrichment_label_claiming_the_artifact_namespace_is_refused(
     source_episode: Path, tmp_path: Path
 ) -> None:

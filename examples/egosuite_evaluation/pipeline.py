@@ -37,7 +37,6 @@ from examples.egosuite_evaluation.judgment import (
     image_file_data_url,
 )
 
-VISION_ENDPOINT_ALIAS = "vision"
 DEFAULT_HFLOW_DATA_ROOT = Path("data/egosuite-evaluation/hflow")
 DEFAULT_OPENAI_COMPATIBLE_BASE_URL = "http://localhost:8000/v1"
 DEFAULT_MODEL_NAME = "model-not-configured"
@@ -45,6 +44,7 @@ MEASUREMENT_PREFIX = "egosuite/hand_count"
 
 
 class PipelineConfiguration(NamedTuple):
+    endpoint: str
     model: str
     api_key_environment_variable: str
     allow_missing_api_key: bool
@@ -84,6 +84,7 @@ def _pipeline_configuration() -> PipelineConfiguration:
     prompt_path = Path(os.environ.get("EGOSUITE_HAND_COUNT_PROMPT", str(DEFAULT_PROMPT_PATH)))
     raw_label_manifest_path = os.environ.get("EGOSUITE_LABEL_MANIFEST")
     return PipelineConfiguration(
+        endpoint=os.environ.get("OPENAI_BASE_URL", DEFAULT_OPENAI_COMPATIBLE_BASE_URL),
         model=os.environ.get("OPENAI_MODEL", DEFAULT_MODEL_NAME),
         api_key_environment_variable=os.environ.get("EGOSUITE_API_KEY_ENV", "OPENAI_API_KEY"),
         allow_missing_api_key=_boolean_environment_variable("EGOSUITE_ALLOW_MISSING_API_KEY"),
@@ -116,9 +117,6 @@ manifest_labels_by_source_episode = (
 app = hflow.App(
     "egosuite-projected-hand-visibility-example",
     data_root=os.environ.get("HFLOW_DATA_ROOT", str(DEFAULT_HFLOW_DATA_ROOT)),
-    endpoints={
-        VISION_ENDPOINT_ALIAS: os.environ.get("OPENAI_BASE_URL", DEFAULT_OPENAI_COMPATIBLE_BASE_URL)
-    },
     default_checks=(),
 )
 
@@ -126,6 +124,7 @@ app = hflow.App(
 def _check_version() -> hflow.StepVersion:
     version_contract = {
         "prompt": pipeline_configuration.prompt,
+        "endpoint": pipeline_configuration.endpoint,
         "model": pipeline_configuration.model,
         "response_format": pipeline_configuration.response_format.value,
         "temperature": pipeline_configuration.temperature,
@@ -178,13 +177,12 @@ def _client_for_current_thread() -> Any:
             f"{pipeline_configuration.api_key_environment_variable} is not set; set "
             "EGOSUITE_ALLOW_MISSING_API_KEY=1 only for an unauthenticated endpoint"
         )
-    endpoint_url = app.endpoints[VISION_ENDPOINT_ALIAS]
-    client_cache_key = (endpoint_url, api_key)
+    client_cache_key = (pipeline_configuration.endpoint, api_key)
     if getattr(_client_by_thread, "cache_key", None) != client_cache_key:
         openai_module = importlib.import_module("openai")
         _client_by_thread.client = openai_module.OpenAI(
             api_key=api_key or "not-needed",
-            base_url=endpoint_url,
+            base_url=pipeline_configuration.endpoint,
             max_retries=pipeline_configuration.max_retries,
         )
         _client_by_thread.cache_key = client_cache_key
@@ -333,7 +331,7 @@ def hand_visibility_check_result(
 
 @app.check(
     name="egosuite_projected_hand_visibility",
-    uses=VISION_ENDPOINT_ALIAS,
+    requires=("vision-model",),
     version=_check_version(),
 )
 def egosuite_projected_hand_visibility(episode: hflow.Episode) -> hflow.CheckResult:

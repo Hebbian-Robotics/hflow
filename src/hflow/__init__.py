@@ -6,7 +6,7 @@ for orientation and docs/ARCHITECTURE.md for the design and its references.
 
 from importlib.metadata import PackageNotFoundError, version
 
-from hflow import checks, ffmpeg, providers, testing
+from hflow import build_ai_vlm_checks, checks, ffmpeg, providers, testing
 from hflow.app import (
     App,
     CheckOutcome,
@@ -188,6 +188,7 @@ __all__ = [
     "Workspace",
     "WorkspaceIdentity",
     "__version__",
+    "build_ai_vlm_checks",
     "checks",
     "curate",
     "diagnose",

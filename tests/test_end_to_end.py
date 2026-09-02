@@ -441,12 +441,10 @@ def test_crashing_check_is_infrastructure_not_data(
 def test_resource_declaring_checks_run_after_plain_ones(
     state_only_source_episode: Path, tmp_path: Path
 ) -> None:
-    app = hflow.App(
-        "ordered-pipeline", data_root=tmp_path, endpoints={"judge": "http://localhost:9"}
-    )
+    app = hflow.App("ordered-pipeline", data_root=tmp_path)
     execution_order: list[str] = []
 
-    @app.check(version="1", uses="judge")
+    @app.check(version="1", requires=("vision-model",))
     def expensive(ep: hflow.Episode) -> hflow.CheckResult:
         execution_order.append("expensive")
         return hflow.CheckResult()
@@ -458,97 +456,6 @@ def test_resource_declaring_checks_run_after_plain_ones(
 
     app.test(state_only_source_episode, verbose=False)
     assert execution_order == ["cheap", "expensive"]
-
-
-def test_missing_provider_alias_fails_preflight(
-    state_only_source_episode: Path, tmp_path: Path
-) -> None:
-    app = hflow.App("misconfigured", data_root=tmp_path)
-
-    @app.check(version="1", uses="judge")
-    def needs_endpoint(ep: hflow.Episode) -> hflow.CheckResult:
-        return hflow.CheckResult()
-
-    with pytest.raises(ValueError, match="judge") as error_info:
-        app.test(state_only_source_episode, verbose=False)
-    # The failure names the environment escape hatch a deployment would use.
-    assert "HFLOW_ENDPOINT_JUDGE" in str(error_info.value)
-
-
-def test_endpoint_alias_satisfied_by_environment_only(
-    state_only_source_episode: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A deployment (or control plane) supplies an endpoint alias through
-    HFLOW_ENDPOINT_<ALIAS>: preflight passes and the running step sees the
-    injected value, with nothing endpoint-shaped in the pipeline file."""
-    monkeypatch.setenv("HFLOW_ENDPOINT_JUDGE", "http://injected:8000/v1")
-    app = hflow.App("env-endpoints", data_root=tmp_path)
-    endpoint_values_seen_by_step: list[str] = []
-
-    # Endpoint configuration affects behavior, so its compatibility is part
-    # of the version the pipeline author declares.
-    @app.check(uses="judge", version="v1")
-    def needs_endpoint(ep: hflow.Episode) -> hflow.CheckResult:
-        endpoint_values_seen_by_step.append(app.endpoints["judge"])
-        return hflow.CheckResult()
-
-    report = app.test(state_only_source_episode, verbose=False)
-    assert not report.has_errors
-    assert endpoint_values_seen_by_step == ["http://injected:8000/v1"]
-
-
-def test_endpoint_environment_override_wins_over_the_literal(
-    state_only_source_episode: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("HFLOW_ENDPOINT_JUDGE", "http://deployment-injected:9000")
-    app = hflow.App(
-        "env-endpoints", data_root=tmp_path, endpoints={"judge": "http://from-code:8000"}
-    )
-    endpoint_values_seen_by_step: list[str] = []
-
-    @app.check(uses="judge", version="v1")
-    def needs_endpoint(ep: hflow.Episode) -> hflow.CheckResult:
-        endpoint_values_seen_by_step.append(app.endpoints["judge"])
-        return hflow.CheckResult()
-
-    app.test(state_only_source_episode, verbose=False)
-    assert endpoint_values_seen_by_step == ["http://deployment-injected:9000"]
-
-    # Unsetting the override restores the pipeline literal on the next run:
-    # resolution rebuilds from the pristine literals, never mutates them.
-    monkeypatch.delenv("HFLOW_ENDPOINT_JUDGE")
-    app.test(state_only_source_episode, verbose=False)
-    assert endpoint_values_seen_by_step[-1] == "http://from-code:8000"
-
-
-def test_endpoints_mapping_refuses_direct_mutation(tmp_path: Path) -> None:
-    """The resolved mapping is rebuilt at every run start, so a direct
-    mutation would be silently discarded -- it must refuse loudly instead."""
-    from typing import cast
-
-    app = hflow.App("read-only", data_root=tmp_path, endpoints={"judge": "http://a:1"})
-    with pytest.raises(TypeError):
-        cast("dict[str, str]", app.endpoints)["judge"] = "http://mutated:2"
-
-
-def test_colliding_endpoint_alias_names_are_refused(
-    state_only_source_episode: Path, tmp_path: Path
-) -> None:
-    """HFLOW_ENDPOINT_* naming is lossy (non-alphanumerics collapse to '_'):
-    two aliases mapping to one variable would be silently co-overridden, so
-    preflight refuses the ambiguity loudly."""
-    app = hflow.App(
-        "colliding",
-        data_root=tmp_path,
-        endpoints={"judge-v1": "http://a:1", "judge.v1": "http://b:2"},
-    )
-
-    @app.check(uses="judge-v1", version="v1")
-    def needs_endpoint(ep: hflow.Episode) -> hflow.CheckResult:
-        return hflow.CheckResult()
-
-    with pytest.raises(ValueError, match="HFLOW_ENDPOINT_JUDGE_V1"):
-        app.test(state_only_source_episode, verbose=False)
 
 
 def test_check_claiming_an_episode_column_refuses_the_append(

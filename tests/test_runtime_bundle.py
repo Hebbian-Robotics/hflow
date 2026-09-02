@@ -12,7 +12,7 @@ import yaml
 
 import hflow
 from hflow.runtime import BundlePaths, RuntimeConfig, bundle_dag_ids, render_bundle
-from hflow.runtime._bundle import infer_hflow_source
+from hflow.runtime._bundle import BUNDLE_MANIFEST_VERSION, infer_hflow_source
 from hflow.steps import RUN_PROFILES, Stage
 
 AIRFLOW_SERVICE_NAMES = (
@@ -508,7 +508,7 @@ def test_bundle_manifest_describes_the_bundle_and_load_bundle_prefers_it(
     paths, _ = _render(replace(config, task_queue="workspace-a"), tmp_path / "bundle")
     manifest_file = paths.bundle_dir / "hflow-bundle.json"
     manifest_payload = json.loads(manifest_file.read_text())
-    assert manifest_payload["manifest_version"] == 1
+    assert manifest_payload["manifest_version"] == BUNDLE_MANIFEST_VERSION
     assert manifest_payload["kind"] == "compose"
     assert manifest_payload["hflow_version"] == hflow.__version__
     assert manifest_payload["dag_id"] == "my_pipeline_ingest"
@@ -575,25 +575,49 @@ def test_xcom_objectstorage_url_override(config: RuntimeConfig, tmp_path: Path) 
     )
 
 
-def test_endpoint_environment_variables_pass_through_by_name(
+def test_explicit_environment_variables_pass_through_by_name(
     config: RuntimeConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Exported HFLOW_ENDPOINT_* variables at render time are wired into the
-    containers' environment as name-only ${VAR} references (same contract as
-    bucket credentials: values never land in the bundle), so App's endpoint
-    overlay works inside the runtime's task processes."""
-    monkeypatch.setenv("HFLOW_ENDPOINT_JUDGE", "http://judge:8000/v1")
-    _, compose = _render(config, tmp_path / "bundle")
-    scheduler_env = compose["services"]["airflow-scheduler"]["environment"]
-    assert scheduler_env["HFLOW_ENDPOINT_JUDGE"] == "${HFLOW_ENDPOINT_JUDGE}"
-    assert "http://judge:8000/v1" not in (tmp_path / "bundle" / "docker-compose.yaml").read_text()
+    """An allowlisted value reaches containers but never bundle contents."""
+    from dataclasses import replace
 
-    monkeypatch.delenv("HFLOW_ENDPOINT_JUDGE")
-    _, rerendered_compose = _render(config, tmp_path / "bundle-without")
-    assert (
-        "HFLOW_ENDPOINT_JUDGE"
-        not in (rerendered_compose["services"]["airflow-scheduler"]["environment"])
-    )
+    monkeypatch.setenv("MODEL_API_KEY", "secret-value")
+    configured = replace(config, passthrough_environment_variables=("MODEL_API_KEY",))
+    paths, compose = _render(configured, tmp_path / "bundle")
+    scheduler_env = compose["services"]["airflow-scheduler"]["environment"]
+    assert scheduler_env["MODEL_API_KEY"] == "${MODEL_API_KEY}"
+    assert "secret-value" not in paths.compose_file.read_text()
+
+    manifest_payload = json.loads((paths.bundle_dir / "hflow-bundle.json").read_text())
+    assert manifest_payload["passthrough_environment_variables"] == ["MODEL_API_KEY"]
+
+
+def test_absent_explicit_environment_variable_is_refused(
+    config: RuntimeConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace
+
+    monkeypatch.delenv("MODEL_API_KEY", raising=False)
+    configured = replace(config, passthrough_environment_variables=("MODEL_API_KEY",))
+    with pytest.raises(ValueError, match="MODEL_API_KEY"):
+        _render(configured, tmp_path / "bundle")
+
+
+@pytest.mark.parametrize(
+    "variable_names",
+    [
+        ("MODEL-API-KEY",),
+        ("MODEL_API_KEY", "MODEL_API_KEY"),
+    ],
+)
+def test_invalid_environment_passthrough_allowlist_is_refused_at_construction(
+    config: RuntimeConfig,
+    variable_names: tuple[str, ...],
+) -> None:
+    from dataclasses import replace
+
+    with pytest.raises(ValueError, match="environment variable names"):
+        replace(config, passthrough_environment_variables=variable_names)
 
 
 def test_env_file_carries_generated_postgres_password_and_bind_host(

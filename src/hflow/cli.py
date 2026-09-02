@@ -436,10 +436,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     manifest_parser = subparsers.add_parser(
         "manifest",
-        help="print the pipeline's manifest (steps, versions, endpoints) as JSON",
+        help="print the pipeline's manifest (steps, versions, requirements) as JSON",
         description=(
             "Import the pipeline file and print its manifest -- step names, "
-            "explicit versions, gate flags, endpoint aliases, and version "
+            "explicit versions, gate flags, resource requirements, and version "
             "stamps -- as JSON on stdout. This is the metadata a pipeline "
             "crosses a control boundary as. Importing EXECUTES the pipeline "
             "file, so run this in the pipeline's own environment."
@@ -516,6 +516,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="user requirements file for the task venv (default: hflow only)",
     )
+    up_parser.add_argument(
+        "--pass-env",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "environment variable to forward into every runtime service without writing its "
+            "value to the bundle; repeat for multiple variables"
+        ),
+    )
 
     deploy_parser = subparsers.add_parser(
         "deploy",
@@ -558,6 +568,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "the user venv's python interpreter on the workers "
             f"(default: {DEFAULT_DEPLOY_VENV_PYTHON})"
+        ),
+    )
+    deploy_parser.add_argument(
+        "--pass-env",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "environment variable the platform must provide to every task; repeat for multiple "
+            "variables"
         ),
     )
 
@@ -920,6 +940,7 @@ def _command_up(arguments: argparse.Namespace) -> int:
             requirements_file=arguments.requirements,
             hflow_source=hflow_source,
             api_port=arguments.api_port,
+            passthrough_environment_variables=tuple(arguments.pass_env),
         )
     except ValueError as error:
         # Its own block, not the start_runtime handler below: nothing has been
@@ -1005,6 +1026,7 @@ def _command_deploy(arguments: argparse.Namespace) -> int:
             app_variable=app_variable,
             requirements_file=arguments.requirements,
             venv_python_path=arguments.venv_python,
+            passthrough_environment_variables=tuple(arguments.pass_env),
         )
         paths = render_deploy_bundle(config, arguments.output_dir)
     except (ValueError, FileNotFoundError) as error:
