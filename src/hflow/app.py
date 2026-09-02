@@ -24,12 +24,13 @@ import sys
 import tempfile
 import time
 import traceback
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from types import MappingProxyType, ModuleType
-from typing import TYPE_CHECKING
+from types import ModuleType
+from typing import TYPE_CHECKING, Generic, NewType, TypeVar, assert_never
 
 if TYPE_CHECKING:
     from hflow.runtime import BundlePaths
@@ -55,6 +56,12 @@ from hflow.manifest import (
 )
 from hflow.reader import open_reader
 from hflow.resample import DerivedSeries
+from hflow.step_selection import (
+    ALL_REGISTERED_STEPS,
+    RegisteredStepSelection,
+    SelectedRegisteredSteps,
+    registered_step_is_selected,
+)
 from hflow.steps import (
     GATE_UNEVALUATED_TAG_PREFIX,
     RUN_PROFILES,
@@ -166,18 +173,6 @@ DEFAULT_DATA_ROOT = "./data"
 # to agree on it.
 DEFAULT_APP_VARIABLE = "app"
 
-# Environment overrides for endpoint aliases (see App(endpoints=...)):
-# HFLOW_ENDPOINT_<ALIAS>, the alias uppercased with every non-alphanumeric
-# character replaced by "_". The deployment exports the variable; the
-# pipeline file stays environment-portable.
-ENDPOINT_ENVIRONMENT_VARIABLE_PREFIX = "HFLOW_ENDPOINT_"
-
-
-def endpoint_environment_variable_name(alias: str) -> str:
-    """The environment variable that overrides one endpoint alias."""
-    sanitized_alias = re.sub(r"[^A-Za-z0-9]", "_", alias).upper()
-    return f"{ENDPOINT_ENVIRONMENT_VARIABLE_PREFIX}{sanitized_alias}"
-
 
 def default_data_root() -> "Path | str | StorageRoot":
     """The workspace hflow acts on when no argument and no flag names one.
@@ -245,33 +240,43 @@ class _TransformKind(StrEnum):
 
 
 @dataclass(frozen=True)
+class _SyncReuseWitness:
+    """Enough to decide that re-running sync would rewrite byte-identical output.
+
+    Complete or absent: a partial witness cannot prove that re-running sync
+    would reproduce the existing canonical, so the parser drops the whole
+    group rather than letting the surviving fields answer for the missing one.
+    """
+
+    # Which source BYTES produced the canonical. Content, never size+mtime:
+    # this repo identifies by content everywhere, and a same-length rewrite
+    # or a preserved mtime would defeat the weaker test silently.
+    source_digest: str
+    # The transform is stamped with an ffmpeg version that does NOT reach
+    # pipeline_version, and different builds genuinely encode differently.
+    ffmpeg_version: str
+    # An @app.transform override is contractually required to end in
+    # write_canonical_episode, so it stamps the SAME pipeline_version the
+    # default transform would: without this, REMOVING an override would reuse
+    # a canonical the current pipeline cannot produce.
+    transform_kind: _TransformKind
+
+
+@dataclass(frozen=True)
 class _SyncCompletion:
     """Proof that sync completed for one source path and canonical version.
 
-    The last three fields are the *reuse witness*: enough to decide that
-    re-running sync would rewrite byte-identical output, so it can be skipped.
-    They are optional because markers written before they existed are still
-    valid proof for the non-sync stages, which is all those stages ever asked
-    of them. A witness-less marker simply never satisfies the reuse gate: one
-    re-transcode rewrites it in the current shape, and that is the whole
-    migration.
+    ``reuse_witness`` is optional because markers written before it existed
+    are still valid proof for the non-sync stages, which is all those stages
+    ever asked of them. A witness-less marker simply never satisfies the reuse
+    gate: one re-transcode rewrites it in the current shape, and that is the
+    whole migration.
     """
 
     source_path: str
     schema_version: str
     pipeline_version: str
-    # Which source BYTES produced the canonical. Content, never size+mtime:
-    # this repo identifies by content everywhere, and a same-length rewrite
-    # or a preserved mtime would defeat the weaker test silently.
-    source_digest: str | None = None
-    # The transform is stamped with an ffmpeg version that does NOT reach
-    # pipeline_version, and different builds genuinely encode differently.
-    ffmpeg_version: str | None = None
-    # An @app.transform override is contractually required to end in
-    # write_canonical_episode, so it stamps the SAME pipeline_version the
-    # default transform would: without this, REMOVING an override would reuse
-    # a canonical the current pipeline cannot produce.
-    transform_kind: _TransformKind | None = None
+    reuse_witness: _SyncReuseWitness | None = None
 
 
 def _source_identity(source_reference: Path | str, storage_root: StorageRoot) -> str:
@@ -331,10 +336,14 @@ def _write_sync_completion_marker(marker_path: Path, completion: _SyncCompletion
         "schema_version": completion.schema_version,
         "pipeline_version": completion.pipeline_version,
     }
-    for witness_field in ("source_digest", "ffmpeg_version", "transform_kind"):
-        witness_value = getattr(completion, witness_field)
-        if witness_value is not None:
-            marker_payload[witness_field] = witness_value
+    if completion.reuse_witness is not None:
+        marker_payload.update(
+            {
+                "source_digest": completion.reuse_witness.source_digest,
+                "ffmpeg_version": completion.reuse_witness.ffmpeg_version,
+                "transform_kind": completion.reuse_witness.transform_kind,
+            }
+        )
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
@@ -374,29 +383,36 @@ def _read_sync_completion_marker(marker_path: Path) -> _SyncCompletion:
                 f"{field_name!r} must be a non-empty string"
             )
         required_values[field_name] = field_value
-    # Parsed leniently, on purpose: a missing or malformed witness field means
-    # "cannot prove reuse is safe", which the gate already treats as a miss.
-    # Requiring them would make every pre-witness marker unreadable and break
-    # the non-sync stages, which never needed a witness at all.
-    optional_values = {
-        field_name: value
-        for field_name in ("source_digest", "ffmpeg_version")
-        if isinstance(value := marker_payload.get(field_name), str) and value
-    }
+    # Parsed leniently, on purpose: a missing, partial, malformed, or future
+    # witness means "cannot prove reuse is safe", which the gate treats as a
+    # miss. Keeping the basic marker readable preserves legacy non-sync stages.
+    source_digest = marker_payload.get("source_digest")
+    ffmpeg_version = marker_payload.get("ffmpeg_version")
     raw_transform_kind = marker_payload.get("transform_kind")
-    transform_kind: _TransformKind | None = None
-    if isinstance(raw_transform_kind, str) and raw_transform_kind:
+    reuse_witness: _SyncReuseWitness | None = None
+    if (
+        isinstance(source_digest, str)
+        and source_digest
+        and isinstance(ffmpeg_version, str)
+        and ffmpeg_version
+        and isinstance(raw_transform_kind, str)
+        and raw_transform_kind
+    ):
         try:
             transform_kind = _TransformKind(raw_transform_kind)
         except ValueError:
             transform_kind = None
+        if transform_kind is not None:
+            reuse_witness = _SyncReuseWitness(
+                source_digest=source_digest,
+                ffmpeg_version=ffmpeg_version,
+                transform_kind=transform_kind,
+            )
     return _SyncCompletion(
         source_path=required_values["source_path"],
         schema_version=required_values["schema_version"],
         pipeline_version=required_values["pipeline_version"],
-        source_digest=optional_values.get("source_digest"),
-        ffmpeg_version=optional_values.get("ffmpeg_version"),
-        transform_kind=transform_kind,
+        reuse_witness=reuse_witness,
     )
 
 
@@ -453,6 +469,103 @@ def _resolve_stages(stages: Iterable[Stage] | str | None) -> frozenset[Stage]:
     return frozenset(Stage(stage) for stage in stages)
 
 
+_ConcurrentTestLimit = NewType("_ConcurrentTestLimit", int)
+_ConcurrentInputT = TypeVar("_ConcurrentInputT")
+_ConcurrentResultT = TypeVar("_ConcurrentResultT")
+
+
+def _parse_concurrent_test_limit(max_workers: int) -> _ConcurrentTestLimit:
+    """Refine the public integer before the scheduler can consume it."""
+
+    if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers <= 0:
+        raise ValueError("max_workers must be a positive integer")
+    return _ConcurrentTestLimit(max_workers)
+
+
+def _run_with_bounded_concurrency(
+    inputs: Sequence[_ConcurrentInputT],
+    operation: Callable[[_ConcurrentInputT], _ConcurrentResultT],
+    *,
+    concurrency_limit: _ConcurrentTestLimit,
+    on_completion: Callable[[int, _ConcurrentResultT, int, int], None] | None = None,
+) -> list[_ConcurrentResultT]:
+    """Run at most ``concurrency_limit`` submitted operations, retaining input order.
+
+    A rolling window matters even though the executor also limits active threads:
+    ``Executor.map`` submits its complete input eagerly on Python 3.11-3.13. Keeping
+    submitted work bounded means a preparation failure can stop later episodes before
+    they create files or make endpoint calls. Already-running operations finish before
+    the exception escapes, so no worker keeps mutating a workspace after the caller has
+    regained control. Completion callbacks run on the coordinator before replacement
+    work is submitted, so a callback failure has the same stop-scheduling guarantee.
+    """
+
+    if not inputs:
+        return []
+
+    results_by_input_index: dict[int, _ConcurrentResultT] = {}
+    next_input_index = 0
+    completed_result_count = 0
+    with ThreadPoolExecutor(max_workers=int(concurrency_limit)) as thread_pool:
+        input_index_by_future: dict[Future[_ConcurrentResultT], int] = {}
+
+        def submit_next_input() -> bool:
+            nonlocal next_input_index
+            if next_input_index >= len(inputs):
+                return False
+            submitted_input_index = next_input_index
+            next_input_index += 1
+            future = thread_pool.submit(operation, inputs[submitted_input_index])
+            input_index_by_future[future] = submitted_input_index
+            return True
+
+        for _ in range(min(int(concurrency_limit), len(inputs))):
+            submit_next_input()
+
+        try:
+            while input_index_by_future:
+                completed_futures, _ = wait(
+                    input_index_by_future,
+                    return_when=FIRST_COMPLETED,
+                )
+                ordered_completed_futures = sorted(
+                    completed_futures,
+                    key=input_index_by_future.__getitem__,
+                )
+                completed_results: list[tuple[int, _ConcurrentResultT]] = []
+                for completed_future in ordered_completed_futures:
+                    completed_input_index = input_index_by_future.pop(completed_future)
+                    completed_results.append((completed_input_index, completed_future.result()))
+                for completed_input_index, completed_result in completed_results:
+                    results_by_input_index[completed_input_index] = completed_result
+                    completed_result_count += 1
+                    if on_completion is not None:
+                        on_completion(
+                            completed_input_index,
+                            completed_result,
+                            completed_result_count,
+                            len(inputs),
+                        )
+                for _ in completed_results:
+                    submit_next_input()
+        except BaseException:
+            # Cancellation must also cover KeyboardInterrupt/SystemExit: returning control
+            # while queued workers can still write is unsafe regardless of failure kind.
+            for outstanding_future in input_index_by_future:
+                outstanding_future.cancel()
+            raise
+
+    return [results_by_input_index[input_index] for input_index in range(len(inputs))]
+
+
+@dataclass(frozen=True)
+class _PreparedProcessConfiguration:
+    """Run selections whose endpoint preflight has already succeeded."""
+
+    enabled_stages: frozenset[Stage]
+    registered_step_selection: RegisteredStepSelection
+
+
 @dataclass(frozen=True)
 class SupersededByPipeline:
     """An auto-registered default that stood down: the pipeline measures this.
@@ -499,32 +612,95 @@ class SkippedByQuarantine:
 StepNotRun = SupersededByPipeline | SkippedByQuarantine
 
 
+_ResultT = TypeVar("_ResultT")
+
+
+@dataclass(frozen=True)
+class Measured(Generic[_ResultT]):
+    """The step ran and returned a result."""
+
+    result: _ResultT
+
+
+@dataclass(frozen=True)
+class Errored:
+    """The step raised, or returned something that is not a result."""
+
+    error: str
+
+
+@dataclass(frozen=True)
+class NotRun:
+    """The step was registered and deliberately not invoked."""
+
+    not_run: StepNotRun
+
+
+@dataclass(frozen=True)
+class PublishFailed:
+    """The enrichment returned labels, then an artifact would not publish.
+
+    Its own state rather than a result and an error side by side: the labels
+    are real and are recorded, and the run still has to report an error, which
+    is the one place the old three-field shape needed two of them set at once.
+    """
+
+    result: "EnrichmentResult"
+    error: str
+
+
+# Exactly one variant, held in one field, so a report cannot carry two answers
+# at once and cannot carry none.
+CheckOutcome = Measured[CheckResult] | Errored | NotRun
+EnrichmentOutcome = Measured[EnrichmentResult] | Errored | NotRun | PublishFailed
+
+
+def _not_run_status(step_not_run: StepNotRun) -> CheckStatus:
+    """The status a registered step that was never invoked records."""
+    match step_not_run:
+        case SupersededByPipeline():
+            return CheckStatus.SUPERSEDED
+        case SkippedByQuarantine():
+            return CheckStatus.SKIPPED
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
 @dataclass
 class CheckRunReport:
     """Outcome of one check invocation inside a test run."""
 
     check: RegisteredCheck
-    result: CheckResult | None = None
-    error: str | None = None
-    not_run: StepNotRun | None = None
+    outcome: CheckOutcome
     duration_s: float = 0.0
 
     @property
+    def result(self) -> CheckResult | None:
+        return self.outcome.result if isinstance(self.outcome, Measured) else None
+
+    @property
+    def error(self) -> str | None:
+        return self.outcome.error if isinstance(self.outcome, Errored) else None
+
+    @property
+    def not_run(self) -> StepNotRun | None:
+        return self.outcome.not_run if isinstance(self.outcome, NotRun) else None
+
+    @property
     def status(self) -> CheckStatus:
-        match self.not_run:
-            case SupersededByPipeline():
-                return CheckStatus.SUPERSEDED
-            case SkippedByQuarantine():
-                return CheckStatus.SKIPPED
-            case None:
-                pass
-        if self.error is not None:
-            return CheckStatus.ERROR
-        if self.result is not None and self.result.verdict is False:
-            return CheckStatus.FAILED
-        if self.result is not None and self.result.verdict is True:
-            return CheckStatus.PASSED
-        return CheckStatus.MEASURED
+        match self.outcome:
+            case NotRun(not_run=step_not_run):
+                return _not_run_status(step_not_run)
+            case Errored():
+                return CheckStatus.ERROR
+            case Measured(result=result):
+                if result.verdict is False:
+                    return CheckStatus.FAILED
+                if result.verdict is True:
+                    return CheckStatus.PASSED
+                return CheckStatus.MEASURED
+            case _ as unreachable:
+                assert_never(unreachable)
 
 
 @dataclass
@@ -532,27 +708,36 @@ class EnrichmentRunReport:
     """Outcome of one enrichment invocation inside a test run."""
 
     enrichment: RegisteredEnrichment
-    result: EnrichmentResult | None = None
-    error: str | None = None
-    not_run: StepNotRun | None = None
+    outcome: EnrichmentOutcome
     duration_s: float = 0.0
     artifact_uris: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def result(self) -> EnrichmentResult | None:
+        return self.outcome.result if isinstance(self.outcome, Measured | PublishFailed) else None
+
+    @property
+    def error(self) -> str | None:
+        return self.outcome.error if isinstance(self.outcome, Errored | PublishFailed) else None
+
+    @property
+    def not_run(self) -> StepNotRun | None:
+        return self.outcome.not_run if isinstance(self.outcome, NotRun) else None
 
     @property
     def status(self) -> CheckStatus:
         # Enrichments have no verdicts, so the verdict statuses never apply;
         # supersession does not either, since only auto-registered CHECKS have
         # an automatic copy to stand down.
-        match self.not_run:
-            case SkippedByQuarantine():
-                return CheckStatus.SKIPPED
-            case SupersededByPipeline():
-                return CheckStatus.SUPERSEDED
-            case None:
-                pass
-        if self.error is not None:
-            return CheckStatus.ERROR
-        return CheckStatus.MEASURED
+        match self.outcome:
+            case NotRun(not_run=step_not_run):
+                return _not_run_status(step_not_run)
+            case Errored() | PublishFailed():
+                return CheckStatus.ERROR
+            case Measured():
+                return CheckStatus.MEASURED
+            case _ as unreachable:
+                assert_never(unreachable)
 
 
 def _unsatisfiable_check_parameters(
@@ -684,26 +869,26 @@ def _execute_enrichment(
 ) -> EnrichmentRunReport:
     """Run one enrichment-shaped step (user enrichment or the built-in media
     step) with the shared timing/boundary/error mechanics."""
-    enrichment_run = EnrichmentRunReport(enrichment=registered_enrichment)
     if not_run is not None:
-        enrichment_run.not_run = not_run
-        return enrichment_run
+        return EnrichmentRunReport(enrichment=registered_enrichment, outcome=NotRun(not_run))
+    outcome: EnrichmentOutcome
     started = time.perf_counter()
     try:
         returned_enrichment = registered_enrichment.function(canonical_episode)
         if isinstance(returned_enrichment, EnrichmentResult):
-            enrichment_run.result = returned_enrichment
+            outcome = Measured(returned_enrichment)
         else:
-            enrichment_run.error = (
+            outcome = Errored(
                 f"enrichment returned {type(returned_enrichment).__name__}, "
                 "expected hflow.EnrichmentResult -- wrap it: return "
                 "hflow.EnrichmentResult(labels=...)"
             )
     except Exception:
-        enrichment_run.error = traceback.format_exc(limit=8)
-    finally:
-        enrichment_run.duration_s = time.perf_counter() - started
-    return enrichment_run
+        outcome = Errored(traceback.format_exc(limit=8))
+    duration_s = time.perf_counter() - started
+    return EnrichmentRunReport(
+        enrichment=registered_enrichment, outcome=outcome, duration_s=duration_s
+    )
 
 
 def _check_run_rows(report: "TestReport") -> list[CheckRunRow]:
@@ -902,6 +1087,25 @@ class TestReport:
     # without comparing file timestamps.
     sync_reused: bool = False
 
+    def check(self, name: str) -> CheckRunReport:
+        """Return the run report for the uniquely named check.
+
+        Raises :class:`KeyError` with the available names when this report does
+        not contain the requested check. Check names are unique within an
+        application, so callers never need to choose between multiple runs.
+        """
+
+        for check_run in self.checks:
+            if check_run.check.name == name:
+                return check_run
+
+        available_check_names = ", ".join(repr(check_run.check.name) for check_run in self.checks)
+        if not available_check_names:
+            available_check_names = "(none)"
+        raise KeyError(
+            f"test report has no check named {name!r}; available checks: {available_check_names}"
+        )
+
     @property
     def quarantined(self) -> bool:
         """Whether this run carries any quarantine tag.
@@ -1006,6 +1210,37 @@ class TestReport:
         return self.summary()
 
 
+@dataclass(frozen=True)
+class TestManyProgress:
+    """One completed episode reported from the ``test_many`` coordinator."""
+
+    input_index: int
+    completed_count: int
+    total_count: int
+    report: TestReport
+
+    def summary(self) -> str:
+        """Return a concise completion line suitable for ``on_progress=print``."""
+
+        return f"[{self.completed_count}/{self.total_count}] {self.report.source_path.name}"
+
+    def __str__(self) -> str:
+        return self.summary()
+
+
+@dataclass(frozen=True)
+class TestManyReport:
+    """The input-ordered reports produced by one bounded local corpus test."""
+
+    reports: tuple[TestReport, ...]
+
+    @property
+    def has_errors(self) -> bool:
+        """Whether any episode report contains a check or enrichment error."""
+
+        return any(report.has_errors for report in self.reports)
+
+
 class App:
     """A named pipeline: registered checks plus transform configuration.
 
@@ -1021,18 +1256,6 @@ class App:
         ``None`` enables the whole automatic baseline; an empty iterable
         disables it. Register pipeline-authored checks with
         ``app.check(version=...)`` instead.
-    :param endpoints: Named endpoint aliases (e.g. ``{"judge": "http://..."}``)
-        that checks declare with ``uses="judge"`` and resolve via
-        ``app.endpoints["judge"]`` in their own client code. At run start,
-        an ``HFLOW_ENDPOINT_<ALIAS>`` environment variable overrides (or
-        supplies) an alias's value, so deployments inject their own endpoints
-        without editing pipeline code. The resolved ``app.endpoints`` mapping
-        is read-only and rebuilt at every run start -- supply or override
-        aliases through this parameter or the environment variable, never by
-        mutating the mapping. (Named ``endpoints``, not "providers": in the
-        Airflow ecosystem "provider" means a plugin package, and
-        ``hflow.providers`` already means the video-protocol extension
-        point.)
     """
 
     def __init__(
@@ -1041,7 +1264,6 @@ class App:
         data_root: Path | str | StorageRoot | None = None,
         *,
         transform: TransformConfig | None = None,
-        endpoints: dict[str, str] | None = None,
         default_checks: Iterable[CheckFunction] | None = None,
     ) -> None:
         self.name = name
@@ -1053,15 +1275,6 @@ class App:
             else self.storage_root.url
         )
         self.transform_config = transform if transform is not None else TransformConfig()
-        # The constructor literals stay pristine; ``endpoints`` is the
-        # RESOLVED mapping, rebuilt (literals overlaid with the current
-        # environment) at every run start so overrides set, changed, or
-        # unset between runs all take effect. Read-only on purpose: a direct
-        # mutation would be silently discarded by the next rebuild, so it
-        # refuses loudly instead -- supply aliases via App(endpoints=...) or
-        # HFLOW_ENDPOINT_<ALIAS>.
-        self._endpoint_literals: dict[str, str] = dict(endpoints) if endpoints else {}
-        self.endpoints: Mapping[str, str] = MappingProxyType(dict(self._endpoint_literals))
         self.checks: list[RegisteredCheck] = []
         self.enrichments: list[RegisteredEnrichment] = []
         self.derived: list[DerivedChannel] = []
@@ -1116,8 +1329,7 @@ class App:
             superseded_keys = sorted(set(run.result.measurements) & pipeline_measurement_keys)
             if not superseded_keys:
                 continue
-            run.not_run = SupersededByPipeline(superseded_keys=tuple(superseded_keys))
-            run.result = None
+            run.outcome = NotRun(SupersededByPipeline(superseded_keys=tuple(superseded_keys)))
 
     def _reusable_canonical_episode(
         self,
@@ -1156,12 +1368,13 @@ class App:
             completion = _read_sync_completion_marker(marker_path)
         except (FileNotFoundError, ValueError, OSError):
             return None
-        if completion.transform_kind is not _TransformKind.DEFAULT:
+        witness = completion.reuse_witness
+        if witness is None or witness.transform_kind is not _TransformKind.DEFAULT:
             return None
         if completion.source_path != source_identifier:
             # Two sources can share a run directory when output_dir= names one.
             return None
-        if completion.source_digest != source_digest:
+        if witness.source_digest != source_digest:
             return None
         if completion.schema_version != EPISODE_FORMAT_VERSION:
             return None
@@ -1190,7 +1403,7 @@ class App:
             or canonical_stamps.pipeline_version != completion.pipeline_version
         ):
             return None
-        if canonical_stamps.ffmpeg_version != completion.ffmpeg_version:
+        if canonical_stamps.ffmpeg_version != witness.ffmpeg_version:
             return None
         if canonical_stamps.ffmpeg_version != FFMPEG_VERSION_NOT_USED:
             # Only now, when the recording demonstrably has video, is it worth
@@ -1228,14 +1441,58 @@ class App:
         self.checks = [registered for registered in self.checks if registered.name != check_name]
         self._default_check_names.discard(check_name)
 
-    def _registered_step_names(self) -> set[str]:
+    def _registered_step_stages(self) -> dict[str, Stage]:
         # Checks, enrichments, and the built-in media step share the catalog's
         # check_name column, so names are unique across all three.
-        return (
-            {MEDIA_CONTACT_SHEET_STEP_NAME}
-            | {registered.name for registered in self.checks}
-            | {registered.name for registered in self.enrichments}
+        return {
+            MEDIA_CONTACT_SHEET_STEP_NAME: Stage.MEDIA,
+            **{registered.name: Stage.META for registered in self.checks},
+            **{registered.name: Stage.LABELS for registered in self.enrichments},
+        }
+
+    def _registered_step_names(self) -> set[str]:
+        return set(self._registered_step_stages())
+
+    def _resolve_registered_step_selection(
+        self,
+        step_names: Iterable[str] | None,
+        enabled_stages: Iterable[Stage],
+    ) -> RegisteredStepSelection:
+        """Parse a registered-step request before any episode I/O.
+
+        The returned variant preserves what was learned here, so planning and
+        execution do not reinterpret ``None`` or revalidate raw names.
+        """
+        if step_names is None:
+            return ALL_REGISTERED_STEPS
+        if isinstance(step_names, str):
+            raise TypeError("step_names must be an iterable of names, not one string")
+        selected_step_names = frozenset(step_names)
+        non_string_step_names = sorted(
+            repr(step_name) for step_name in selected_step_names if not isinstance(step_name, str)
         )
+        if non_string_step_names:
+            raise TypeError(f"step names must be strings, got {non_string_step_names}")
+        stage_by_step_name = self._registered_step_stages()
+        unknown_step_names = sorted(selected_step_names - stage_by_step_name.keys())
+        if unknown_step_names:
+            raise ValueError(
+                f"unknown step names {unknown_step_names}; registered steps: "
+                f"{sorted(stage_by_step_name)}"
+            )
+        enabled_stage_set = frozenset(enabled_stages)
+        disabled_selections = sorted(
+            f"{step_name} ({stage_by_step_name[step_name].value})"
+            for step_name in selected_step_names
+            if stage_by_step_name[step_name] not in enabled_stage_set
+        )
+        if disabled_selections:
+            raise ValueError(
+                "selected steps belong to stages that are not enabled: "
+                f"{disabled_selections}; enabled stages: "
+                f"{sorted(stage.value for stage in enabled_stage_set)}"
+            )
+        return SelectedRegisteredSteps(selected_step_names)
 
     @property
     def pipeline_version(self) -> str:
@@ -1345,7 +1602,7 @@ class App:
 
     def manifest(self) -> PipelineManifest:
         """This pipeline's JSON-able description: step names, explicit
-        versions, gate flags, endpoint aliases, and version stamps.
+        versions, gate flags, resource requirements, and version stamps.
 
         The metadata a pipeline crosses a control boundary as (`hflow
         manifest` on the CLI): a service can display, diff, and validate
@@ -1372,9 +1629,6 @@ class App:
                 DerivedChannelManifest(topic=channel.topic, version=channel.version)
                 for channel in self.derived
             ),
-            endpoint_aliases=tuple(
-                sorted(set(self._endpoint_literals) | self._used_endpoint_aliases())
-            ),
             has_transform_override=self.transform_override is not None,
         )
 
@@ -1385,7 +1639,6 @@ class App:
         name: str | None = None,
         critical: bool = False,
         requires: Iterable[str] | None = None,
-        uses: str | None = None,
         gate: Gate | None = None,
     ) -> Callable[[CheckFunction], CheckFunction]:
         """Register a check function. See ``hflow.steps.CheckResult``.
@@ -1438,7 +1691,6 @@ class App:
                     function=function,
                     critical=critical,
                     requires=requires_set,
-                    uses=uses,
                     version=step_version,
                     gate=gate,
                 )
@@ -1453,7 +1705,6 @@ class App:
         version: str,
         name: str | None = None,
         requires: Iterable[str] | None = None,
-        uses: str | None = None,
     ) -> Callable[[EnrichmentFunction], EnrichmentFunction]:
         """Register an enrichment. See ``hflow.steps.EnrichmentResult``.
 
@@ -1481,7 +1732,6 @@ class App:
                     name=enrichment_name,
                     function=function,
                     requires=requires_set,
-                    uses=uses,
                     version=step_version,
                 )
             )
@@ -1575,69 +1825,33 @@ class App:
             f"a key under the data root {self.storage_root}"
         )
 
-    def _used_endpoint_aliases(self) -> set[str]:
-        return {
-            registered.uses
-            for registered in [*self.checks, *self.enrichments]
-            if registered.uses is not None
-        }
+    def _prepare_process_configuration(
+        self,
+        *,
+        stages: Iterable[Stage] | str | None,
+        step_names: Iterable[str] | None,
+        registered_step_selection: RegisteredStepSelection | None = None,
+    ) -> _PreparedProcessConfiguration:
+        """Parse one run request before episode I/O."""
 
-    def _resolve_endpoint_overrides(self) -> None:
-        """Rebuild ``endpoints``: literals overlaid with the environment.
-
-        The environment wins over a literal in the pipeline file, and an
-        alias supplied ONLY by the environment satisfies steps' ``uses=``
-        preflight -- this is how a deployment (or a control plane) injects
-        per-workspace endpoints without editing customer code. Runs at
-        preflight, after every registration, so ``app.endpoints[alias]``
-        inside a running step always sees the resolved value; rebuilding
-        from the pristine literals each time means an override set, changed,
-        or UNSET between runs in one process always takes effect.
-
-        The environment naming is lossy (non-alphanumerics collapse to
-        ``_``), so two aliases that map to one variable would be silently
-        co-overridden -- refused loudly here instead.
-        """
-        aliases = sorted(set(self._endpoint_literals) | self._used_endpoint_aliases())
-        aliases_by_variable: dict[str, list[str]] = {}
-        for alias in aliases:
-            aliases_by_variable.setdefault(endpoint_environment_variable_name(alias), []).append(
-                alias
+        enabled_stages = _resolve_stages(stages)
+        if registered_step_selection is not None:
+            if step_names is not None:
+                raise TypeError("step_names and registered_step_selection cannot both be provided")
+            resolved_step_selection = registered_step_selection
+        else:
+            resolved_step_selection = self._resolve_registered_step_selection(
+                step_names,
+                enabled_stages,
             )
-        colliding = {
-            variable: names for variable, names in aliases_by_variable.items() if len(names) > 1
-        }
-        if colliding:
-            raise ValueError(
-                "endpoint aliases are indistinguishable under HFLOW_ENDPOINT_* naming: "
-                + "; ".join(
-                    f"{variable} would override all of {names}"
-                    for variable, names in sorted(colliding.items())
-                )
-                + " -- rename an alias so each maps to a distinct environment variable"
-            )
-        resolved = dict(self._endpoint_literals)
-        for alias in aliases:
-            environment_override = os.environ.get(endpoint_environment_variable_name(alias))
-            if environment_override:
-                resolved[alias] = environment_override
-        self.endpoints = MappingProxyType(resolved)
-
-    def _preflight(self) -> None:
-        self._resolve_endpoint_overrides()
-        missing = sorted(
-            {alias for alias in self._used_endpoint_aliases() if alias not in self.endpoints}
+        return _PreparedProcessConfiguration(
+            enabled_stages=enabled_stages,
+            registered_step_selection=resolved_step_selection,
         )
-        if missing:
-            raise ValueError(
-                f"steps declare endpoint aliases {missing} but App(endpoints=...) "
-                f"defines only {sorted(self.endpoints)} -- pass the alias there, or export "
-                + ", ".join(endpoint_environment_variable_name(alias) for alias in missing)
-            )
 
     def _ordered_checks(self) -> list[RegisteredCheck]:
         # Cheap-first: steps that need no special resources run before steps
-        # declaring requires/uses. Within each class, the pipeline's own
+        # declaring requirements. Within each class, the pipeline's own
         # steps run before the automatic defaults -- so a wrapper registered
         # under its own name with non-default parameters has a chance to
         # emit its measurement keys before the default would run, and the
@@ -1647,7 +1861,7 @@ class App:
         return sorted(
             self.checks,
             key=lambda registered: (
-                bool(registered.requires) or registered.uses is not None,
+                bool(registered.requires),
                 registered.name in self._default_check_names,
             ),
         )
@@ -1655,7 +1869,7 @@ class App:
     def _ordered_enrichments(self) -> list[RegisteredEnrichment]:
         return sorted(
             self.enrichments,
-            key=lambda registered: bool(registered.requires) or registered.uses is not None,
+            key=lambda registered: bool(registered.requires),
         )
 
     def test(
@@ -1666,6 +1880,7 @@ class App:
         verbose: bool = True,
         record: bool = False,
         stages: Iterable[Stage] | str | None = None,
+        step_names: Iterable[str] | None = None,
     ) -> TestReport:
         """The dev loop: run the whole pipeline on one episode, in-process.
 
@@ -1675,7 +1890,9 @@ class App:
         record to the catalog -- iterating on a check should not pollute it.
         Pass ``record=True`` to append the run (idempotent per episode
         content and step versions). ``stages`` selects a run profile or an
-        explicit stage set, exactly as in :meth:`process`.
+        explicit stage set, exactly as in :meth:`process`. ``step_names``
+        optionally limits execution to named registered steps within those
+        stages.
         """
         return self.process(
             episode,
@@ -1689,7 +1906,114 @@ class App:
             verbose=verbose,
             record=record,
             stages=stages,
+            step_names=step_names,
         )
+
+    def test_many(
+        self,
+        episodes: Iterable[Path | str],
+        *,
+        max_workers: int = 1,
+        verbose: bool = False,
+        record: bool = False,
+        stages: Iterable[Stage] | str | None = None,
+        step_names: Iterable[str] | None = None,
+        on_progress: Callable[[TestManyProgress], None] | None = None,
+    ) -> TestManyReport:
+        """Run the in-process dev loop over distinct episodes with bounded concurrency.
+
+        The returned :class:`TestManyReport` preserves input order even when
+        ``max_workers`` allows episodes to finish out of order. ``on_progress`` receives
+        a :class:`TestManyProgress` on this coordinator thread immediately after each
+        episode completes; progress events follow completion order and carry the original
+        input index. At most ``max_workers`` episodes are submitted at once.
+
+        Each episode keeps the same output-directory, recording, stage-selection, and
+        error behavior as :meth:`test`; an exception raised while preparing one episode
+        or by ``on_progress`` stops new submissions, waits for already-running episodes,
+        and propagates to the caller. Duplicate source identities are refused because
+        concurrent writes to one test-run directory are ambiguous.
+
+        ``verbose`` defaults to ``False`` so concurrent reports do not interleave on
+        stdout. Use this for local corpus experiments; use :meth:`run` or a deployed
+        runtime when durable orchestration, retries, and scheduling are required.
+        """
+
+        if isinstance(episodes, Path | str):
+            raise TypeError("episodes must be an iterable of episode paths, not one path")
+        concurrency_limit = _parse_concurrent_test_limit(max_workers)
+        if isinstance(step_names, str):
+            raise TypeError("step_names must be an iterable of names, not one string")
+        if on_progress is not None and not callable(on_progress):
+            raise TypeError("on_progress must be callable")
+
+        episode_references = tuple(episodes)
+        if not episode_references:
+            return TestManyReport(reports=())
+        source_reference_by_identity: dict[str, Path | str] = {}
+        for episode_reference in episode_references:
+            source_identity = self.source_identity(episode_reference)
+            previous_reference = source_reference_by_identity.get(source_identity)
+            if previous_reference is not None:
+                raise ValueError(
+                    f"duplicate episode source identity {source_identity!r}: "
+                    f"{str(previous_reference)!r} and {str(episode_reference)!r}"
+                )
+            source_reference_by_identity[source_identity] = episode_reference
+
+        stable_stages = stages if stages is None or isinstance(stages, str) else tuple(stages)
+        stable_step_names = None if step_names is None else tuple(step_names)
+        prepared_process_configuration = self._prepare_process_configuration(
+            stages=stable_stages,
+            step_names=stable_step_names,
+        )
+
+        def test_episode(episode_reference: Path | str) -> TestReport:
+            return self.process(
+                episode_reference,
+                output_dir=self.workspace.test_runs_root.child(
+                    _source_artifact_directory_name(episode_reference, self.storage_root)
+                ),
+                verbose=verbose,
+                record=record,
+                _prepared_process_configuration=prepared_process_configuration,
+            )
+
+        def report_completion(
+            input_index: int,
+            report: TestReport,
+            completed_count: int,
+            total_count: int,
+        ) -> None:
+            if on_progress is not None:
+                on_progress(
+                    TestManyProgress(
+                        input_index=input_index,
+                        completed_count=completed_count,
+                        total_count=total_count,
+                        report=report,
+                    )
+                )
+
+        if concurrency_limit == 1:
+            sequential_reports: list[TestReport] = []
+            for input_index, episode_reference in enumerate(episode_references):
+                report = test_episode(episode_reference)
+                sequential_reports.append(report)
+                report_completion(
+                    input_index,
+                    report,
+                    len(sequential_reports),
+                    len(episode_references),
+                )
+            return TestManyReport(reports=tuple(sequential_reports))
+        reports = _run_with_bounded_concurrency(
+            episode_references,
+            test_episode,
+            concurrency_limit=concurrency_limit,
+            on_completion=report_completion,
+        )
+        return TestManyReport(reports=tuple(reports))
 
     def run(
         self,
@@ -1775,8 +2099,11 @@ class App:
         verbose: bool = False,
         record: bool = True,
         stages: Iterable[Stage] | str | None = None,
+        step_names: Iterable[str] | None = None,
         quarantine_history: QuarantineHistory | None = None,
         orchestrator_run_id: str | None = None,
+        _registered_step_selection: RegisteredStepSelection | None = None,
+        _prepared_process_configuration: _PreparedProcessConfiguration | None = None,
     ) -> TestReport:
         """Process one episode through the enabled stages of the stage
         graph: transform to canonical (``sync``), run checks with gate
@@ -1795,6 +2122,13 @@ class App:
         stamps are reconstructed from its own provenance record. Without
         ``meta``, the quarantine gate for ``labels``/``media`` comes from the
         episode's latest cataloged state (no catalog = no known quarantine).
+
+        ``step_names`` optionally selects registered checks, enrichments, or
+        the built-in ``media/contact_sheet`` step within the enabled stages.
+        ``None`` preserves the complete stage behavior; an empty iterable runs
+        no registered steps. Unknown names and names belonging to disabled
+        stages are refused before source or canonical episode I/O. Unselected
+        steps produce no run rows, so they remain eligible for a later pass.
 
         ``quarantine_history`` is that gate's catalog reader, open across a
         whole batch so a stage does not re-sync and re-open the catalog once
@@ -1817,9 +2151,26 @@ class App:
         only, never part of any identity hash (see
         :meth:`hflow.catalog.Catalog.append_episode`).
         """
-        enabled_stages = _resolve_stages(stages)
+        if _prepared_process_configuration is not None:
+            if (
+                stages is not None
+                or step_names is not None
+                or _registered_step_selection is not None
+            ):
+                raise TypeError(
+                    "a prepared process configuration cannot be combined with stages, "
+                    "step_names, or _registered_step_selection"
+                )
+            prepared_process_configuration = _prepared_process_configuration
+        else:
+            prepared_process_configuration = self._prepare_process_configuration(
+                stages=stages,
+                step_names=step_names,
+                registered_step_selection=_registered_step_selection,
+            )
+        enabled_stages = prepared_process_configuration.enabled_stages
+        registered_step_selection = prepared_process_configuration.registered_step_selection
         source_identifier = self._resolve_source_identity(episode, output_dir=output_dir)
-        self._preflight()
         if Stage.SYNC in enabled_stages:
             source_path = self._fetch_source(episode)  # the transform reads it
         else:
@@ -1960,6 +2311,7 @@ class App:
             # whole file (hundreds of megabytes) to store the bytes already
             # there -- and rewrite a marker that is still true.
             if Stage.SYNC in enabled_stages and not reused_canonical:
+                assert source_digest is not None
                 canonical_uri = run_storage_root.publish(canonical_path, canonical_file_name)
                 _write_sync_completion_marker(
                     sync_completion_marker_path,
@@ -1967,12 +2319,14 @@ class App:
                         source_path=source_identifier,
                         schema_version=stamps.schema_version,
                         pipeline_version=stamps.pipeline_version,
-                        source_digest=source_digest,
-                        ffmpeg_version=stamps.ffmpeg_version,
-                        transform_kind=(
-                            _TransformKind.OVERRIDE
-                            if self.transform_override is not None
-                            else _TransformKind.DEFAULT
+                        reuse_witness=_SyncReuseWitness(
+                            source_digest=source_digest,
+                            ffmpeg_version=stamps.ffmpeg_version,
+                            transform_kind=(
+                                _TransformKind.OVERRIDE
+                                if self.transform_override is not None
+                                else _TransformKind.DEFAULT
+                            ),
                         ),
                     ),
                 )
@@ -1988,7 +2342,15 @@ class App:
                 sync_reused=reused_canonical,
             )
 
-            checks_to_run = self._ordered_checks() if Stage.META in enabled_stages else []
+            checks_to_run = (
+                [
+                    registered
+                    for registered in self._ordered_checks()
+                    if registered_step_is_selected(registered_step_selection, registered.name)
+                ]
+                if Stage.META in enabled_stages
+                else []
+            )
             # Keys already emitted by the pipeline's own steps in this run.
             # A default that has any key in common with what is here can be
             # superseded at the top of the loop, before paying its ffmpeg
@@ -1999,8 +2361,6 @@ class App:
             from hflow.checks import _DEFAULT_KEY_FACTS
 
             for registered in checks_to_run:
-                run = CheckRunReport(check=registered)
-                report.checks.append(run)
                 # Quarantine stops the user's own steps from piling more
                 # work onto an already-rejected episode, but the defaults
                 # are cheap diagnostic evidence and the episode you most
@@ -2016,7 +2376,12 @@ class App:
                 # *adds* a quarantine tag rather than gating later
                 # ones. They just do not get blanket-skipped.
                 if report.quarantined and registered.name not in self._default_check_names:
-                    run.not_run = SkippedByQuarantine(tuple(report.quarantine_tags))
+                    report.checks.append(
+                        CheckRunReport(
+                            check=registered,
+                            outcome=NotRun(SkippedByQuarantine(tuple(report.quarantine_tags))),
+                        )
+                    )
                     continue
                 # A default with a registered key pattern: if any pipeline
                 # step has already emitted a key the default would emit,
@@ -2034,27 +2399,34 @@ class App:
                         predicted = pattern(canonical_episode)
                         superseded_keys = sorted(predicted & pipeline_emitted_keys)
                         if superseded_keys:
-                            run.not_run = SupersededByPipeline(
-                                superseded_keys=tuple(superseded_keys)
+                            report.checks.append(
+                                CheckRunReport(
+                                    check=registered,
+                                    outcome=NotRun(
+                                        SupersededByPipeline(superseded_keys=tuple(superseded_keys))
+                                    ),
+                                )
                             )
                             continue
+                outcome: CheckOutcome
                 started = time.perf_counter()
                 try:
                     returned = registered.function(canonical_episode)
                     # Parse the boundary: user code may return anything.
                     if isinstance(returned, CheckResult):
-                        run.result = returned
+                        outcome = Measured(returned)
                     else:
-                        run.error = (
+                        outcome = Errored(
                             f"check returned {type(returned).__name__}, expected "
                             "hflow.CheckResult -- wrap it: return hflow.CheckResult("
                             "measurements=...)"
                         )
                 except Exception:
                     # Infrastructure, not data: never recorded as a quality outcome.
-                    run.error = traceback.format_exc(limit=8)
-                finally:
-                    run.duration_s = time.perf_counter() - started
+                    outcome = Errored(traceback.format_exc(limit=8))
+                duration_s = time.perf_counter() - started
+                run = CheckRunReport(check=registered, outcome=outcome, duration_s=duration_s)
+                report.checks.append(run)
                 _apply_gate(registered, run)
                 if run.result is not None and registered.name not in self._default_check_names:
                     # User steps feed the supersede-overlap test for any
@@ -2070,11 +2442,15 @@ class App:
                         run.result.tags.append(f"failed:{registered.name}")
 
             # Quarantine gate for labels/media: meta's in-memory result when
-            # it ran in this same invocation; otherwise the episode's latest
-            # cataloged state. No catalog row = no known quarantine: proceed.
-            # A cataloged quarantine is carried into this run's tags so a
-            # recorded run without meta never masks the state.
-            if Stage.META not in enabled_stages:
+            # it ran completely in this invocation; otherwise combine it with
+            # the episode's latest cataloged state. A partial meta run replaces
+            # a selected check's prior quarantine only when that check actually
+            # produced a result. Unselected and errored gates retain their last
+            # known state, so selecting one check cannot silently clear another
+            # gate. No catalog row means no known quarantine.
+            if Stage.META not in enabled_stages or isinstance(
+                registered_step_selection, SelectedRegisteredSteps
+            ):
                 episode_id = content_episode_id(canonical_path)
                 if quarantine_history is not None:
                     carried_tags = quarantine_history.quarantine_tags(episode_id)
@@ -2082,13 +2458,30 @@ class App:
                     with QuarantineHistory(self.workspace.catalog_root) as history:
                         carried_tags = history.quarantine_tags(episode_id)
                 if carried_tags is not None:
-                    report.quarantine_tags.extend(carried_tags)
+                    successfully_rechecked_names = {
+                        run.check.name for run in report.checks if run.result is not None
+                    }
+                    retained_tags = [
+                        tag
+                        for tag in carried_tags
+                        if not (
+                            tag.startswith("quarantined:")
+                            and tag.removeprefix("quarantined:") in successfully_rechecked_names
+                        )
+                    ]
+                    report.quarantine_tags = list(
+                        dict.fromkeys([*retained_tags, *report.quarantine_tags])
+                    )
             quarantine_skip = (
                 SkippedByQuarantine(tuple(report.quarantine_tags)) if report.quarantined else None
             )
 
             if Stage.LABELS in enabled_stages:
                 for registered_enrichment in self._ordered_enrichments():
+                    if not registered_step_is_selected(
+                        registered_step_selection, registered_enrichment.name
+                    ):
+                        continue
                     report.enrichments.append(
                         _execute_enrichment(
                             registered_enrichment, canonical_episode, quarantine_skip
@@ -2097,7 +2490,15 @@ class App:
 
             # The media stage is silently absent on a camera-less episode:
             # there is nothing to render, so no row claims otherwise.
-            if Stage.MEDIA in enabled_stages and canonical_episode.cameras:
+            if (
+                Stage.MEDIA in enabled_stages
+                and canonical_episode.cameras
+                and (
+                    registered_step_is_selected(
+                        registered_step_selection, MEDIA_CONTACT_SHEET_STEP_NAME
+                    )
+                )
+            ):
                 media_directory = run_dir / "media"
 
                 def render_contact_sheets(media_episode: Episode) -> EnrichmentResult:
@@ -2107,7 +2508,6 @@ class App:
                     name=MEDIA_CONTACT_SHEET_STEP_NAME,
                     function=render_contact_sheets,
                     requires=frozenset(),
-                    uses=None,
                     # HFlow owns this built-in, so a renderer behavior change
                     # must bump the explicit constant above.
                     version=media_contact_sheet_step_version(),
@@ -2150,10 +2550,16 @@ class App:
                         f"artifact {artifact_name!r} at {artifact_path} could not be "
                         f"published:\n{traceback.format_exc(limit=4)}"
                     )
-                    enrichment_run.error = (
+                    combined_error = (
                         f"{enrichment_run.error}\n{publish_error}"
                         if enrichment_run.error
                         else publish_error
+                    )
+                    enrichment_result_so_far = enrichment_run.result
+                    enrichment_run.outcome = (
+                        PublishFailed(result=enrichment_result_so_far, error=combined_error)
+                        if enrichment_result_so_far is not None
+                        else Errored(combined_error)
                     )
 
         # Assembled even when not recording, so the dev loop refuses a key

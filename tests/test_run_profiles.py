@@ -101,6 +101,154 @@ def test_metadata_backfill_runs_checks_only(source_episode: Path, tmp_path: Path
     assert backfill_row_names == [("joints",)]
 
 
+def test_step_selection_records_only_the_named_step(source_episode: Path, tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    app = hflow.App("selected-steps", data_root=data_root, default_checks=())
+
+    @app.check(version="1")
+    def selected_check(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"selected": 1.0})
+
+    @app.check(version="1")
+    def unselected_check(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"unselected": 1.0})
+
+    @app.enrich(version="1")
+    def unselected_enrichment(ep: hflow.Episode) -> hflow.EnrichmentResult:
+        return hflow.EnrichmentResult(labels={"caption": "not requested"})
+
+    report = app.process(
+        source_episode,
+        stages={hflow.Stage.SYNC, hflow.Stage.META, hflow.Stage.LABELS},
+        step_names={"selected_check"},
+    )
+
+    assert [run.check.name for run in report.checks] == ["selected_check"]
+    assert not report.enrichments
+    assert report.catalog_entry is not None
+    connection = open_catalog_connection(data_root / "catalog")
+    try:
+        recorded_step_names = connection.execute(
+            "SELECT check_name FROM check_runs WHERE run_fingerprint = ?",
+            [report.catalog_entry.run_fingerprint],
+        ).fetchall()
+    finally:
+        connection.close()
+    assert recorded_step_names == [("selected_check",)]
+
+
+def test_step_selection_runs_only_the_named_enrichment(
+    source_episode: Path, tmp_path: Path
+) -> None:
+    data_root = tmp_path / "data"
+    app = hflow.App("selected-enrichment", data_root=data_root, default_checks=())
+
+    @app.enrich(version="1")
+    def selected_caption(ep: hflow.Episode) -> hflow.EnrichmentResult:
+        return hflow.EnrichmentResult(labels={"caption": "selected"})
+
+    @app.enrich(version="1")
+    def unselected_embedding(ep: hflow.Episode) -> hflow.EnrichmentResult:
+        return hflow.EnrichmentResult(labels={"embedding": "not requested"})
+
+    report = app.process(
+        source_episode,
+        stages={hflow.Stage.SYNC, hflow.Stage.LABELS},
+        step_names={"selected_caption"},
+    )
+
+    assert [run.enrichment.name for run in report.enrichments] == ["selected_caption"]
+    assert report.enrichments[0].result is not None
+    assert report.enrichments[0].result.labels == {"caption": "selected"}
+    assert report.catalog_entry is not None
+    connection = open_catalog_connection(data_root / "catalog")
+    try:
+        recorded_step_names = connection.execute(
+            "SELECT check_name FROM check_runs WHERE run_fingerprint = ?",
+            [report.catalog_entry.run_fingerprint],
+        ).fetchall()
+    finally:
+        connection.close()
+    assert recorded_step_names == [("selected_caption",)]
+
+
+def test_step_selection_validates_names_and_enabled_stages_before_episode_io(
+    tmp_path: Path,
+) -> None:
+    missing_episode = tmp_path / "missing.mcap"
+    app = _app_with_check_and_enrichment(tmp_path / "data")
+
+    with pytest.raises(ValueError, match=r"unknown step names.*not_registered"):
+        app.process(missing_episode, step_names={"not_registered"})
+
+    with pytest.raises(ValueError, match=r"caption \(labels\).+enabled stages: \['meta'\]"):
+        app.process(
+            missing_episode,
+            stages={hflow.Stage.META},
+            step_names={"caption"},
+        )
+
+
+def test_unselected_enrichment_does_not_run(source_episode: Path, tmp_path: Path) -> None:
+    app = hflow.App("selected-endpoint", data_root=tmp_path / "data", default_checks=())
+
+    @app.check(version="1")
+    def local_check(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"local": 1.0})
+
+    @app.enrich(version="1", requires=("vision-model",))
+    def remote_enrichment(ep: hflow.Episode) -> hflow.EnrichmentResult:
+        return hflow.EnrichmentResult(labels={"remote": "unused"})
+
+    report = app.process(
+        source_episode,
+        stages={hflow.Stage.SYNC, hflow.Stage.META},
+        step_names={"local_check"},
+        record=False,
+    )
+
+    assert [run.check.name for run in report.checks] == ["local_check"]
+
+
+def test_partial_metadata_run_preserves_unselected_quarantine_and_rechecked_gate_replaces_it(
+    source_episode: Path, tmp_path: Path
+) -> None:
+    data_root = tmp_path / "data"
+    original_application = hflow.App("selected-quarantine", data_root=data_root, default_checks=())
+
+    @original_application.check(version="1", name="safety_gate", critical=True)
+    def rejecting_safety_gate(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(verdict=False)
+
+    @original_application.check(version="1")
+    def refreshed_evidence(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"refreshed": 1.0})
+
+    assert original_application.process(source_episode).quarantined
+
+    partial_report = original_application.process(
+        source_episode,
+        stages={hflow.Stage.META},
+        step_names={"refreshed_evidence"},
+    )
+    assert partial_report.quarantined
+    assert partial_report.quarantine_tags == ["quarantined:safety_gate"]
+
+    revised_application = hflow.App("selected-quarantine", data_root=data_root, default_checks=())
+
+    @revised_application.check(version="2", name="safety_gate", critical=True)
+    def accepting_safety_gate(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(verdict=True)
+
+    revised_report = revised_application.process(
+        source_episode,
+        stages={hflow.Stage.META},
+        step_names={"safety_gate"},
+    )
+    assert not revised_report.quarantined
+    assert revised_report.quarantine_tags == []
+
+
 def test_relabel_without_canonical_errors_helpfully(source_episode: Path, tmp_path: Path) -> None:
     app = _app_with_check_and_enrichment(tmp_path / "data")
     with pytest.raises(FileNotFoundError, match="run the full or sync profile first"):
@@ -169,6 +317,27 @@ def test_media_stage_records_a_contact_sheet_artifact(tmp_path: Path) -> None:
         connection.close()
     assert artifact_row is not None
     assert str(artifact_row[0]).endswith("wrist_cam_compressed.jpg")
+
+
+def test_media_step_selection_distinguishes_unselected_from_requested(tmp_path: Path) -> None:
+    source_episode = synthesize_episode(tmp_path / "camera_episode.mcap", CAMERA_SPEC)
+    data_root = tmp_path / "data"
+    app = hflow.App("selected-media", data_root=data_root, default_checks=())
+
+    unselected_report = app.process(
+        source_episode,
+        stages={hflow.Stage.SYNC, hflow.Stage.MEDIA},
+        step_names=set(),
+    )
+    assert not unselected_report.enrichments
+
+    selected_report = app.process(
+        source_episode,
+        stages={hflow.Stage.MEDIA},
+        step_names={"media/contact_sheet"},
+    )
+    assert [run.enrichment.name for run in selected_report.enrichments] == ["media/contact_sheet"]
+    assert selected_report.enrichments[0].status == hflow.CheckStatus.MEASURED
 
 
 def test_media_stage_is_silently_absent_without_cameras(

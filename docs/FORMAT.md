@@ -153,6 +153,14 @@ A file claiming this convention must satisfy, in increasing strictness:
 4. **Video constraints**: every `foxglove.CompressedVideo` message is one Annex B access unit beginning with an AUD; every IDR access unit contains SPS and PPS; no B-frames; `format="h264"`.
 5. **Stamps**: `provenance/v1` present with `schema_version` and `pipeline_version`.
 
+The no-B-frame constraint is enforced by refusal at two boundaries, because a `-c:v copy` remux
+to MP4 cannot represent the reorder tail: the trailing B frames are silently undecodable from
+the muxed file (measured in [#250](https://github.com/Hebbian-Robotics/hflow/issues/250): 303
+samples in, 301 decoded). The transform refuses pass-through video that carries B-frames, and
+the MP4 remux behind `Episode.video` refuses any B-frame payload outright, with an error naming
+the observed reorder depth and the frames at risk. `hflow doctor` still does not classify
+picture coding types (below), so a clean report does not prove this constraint; the refusals do.
+
 `hflow doctor <file.mcap> [more.mcap ...]` checks every file given and prints
 one report each in argument order; its aggregate result follows the
 [exit code rules](#exit-codes). It validates the container, summary, indexes,

@@ -85,8 +85,8 @@ def registered_step_tier(step: StepManifest) -> StepTier:
     """Which cheap-first tier this step runs in (1 first, 2 second).
 
     Mirrors :meth:`hflow.App._ordered_checks` and ``_ordered_enrichments``
-    EXACTLY: both sort on ``bool(requires) or uses is not None``, so tier 2 is
-    precisely the steps declaring a required channel or an endpoint alias.
+    EXACTLY: both sort on ``bool(requires)``, so tier 2 is precisely the steps
+    declaring a required capability or channel.
     Within a tier there is no ordering at all -- registration order is what
     the stable sort preserves, not a dependency.
 
@@ -97,7 +97,7 @@ def registered_step_tier(step: StepManifest) -> StepTier:
     endpoints project from :func:`registered_steps_by_stage` rather than
     restating the expression a second time.
     """
-    return 2 if (bool(step.requires) or step.uses is not None) else 1
+    return 2 if bool(step.requires) else 1
 
 
 def _in_execution_order(

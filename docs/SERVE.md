@@ -69,7 +69,7 @@ These are API capabilities, not browser screens. A frontend supplied through
   runtime (`HFLOW_AIRFLOW_URL` and friends); when neither is reachable the
   API reports which it looked for and why it failed.
 - **Pipeline data** -- the generated DAG plus the registered steps by stage, with
-  explicit versions, critical flags, and endpoint aliases, and the
+  explicit versions, critical flags, and resource requirements, and the
   versions actually observed in the catalog. The data nests each stage's
   steps inside its `process_batch` node, which is where they run, instead of
   inventing dependency edges between them. Requires

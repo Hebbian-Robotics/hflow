@@ -24,7 +24,7 @@ from hflow.doctor import diagnose
 from hflow.format import METADATA_RECORD_EPISODE
 from hflow.reader import TopicInfo
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
-from hflow.transform import write_canonical_episode
+from hflow.transform import SourceNotConforming, write_canonical_episode
 from hflow.video import estimate_fps_from_log_times
 
 ANNEX_B_START_CODE = b"\x00\x00\x00\x01"
@@ -41,6 +41,12 @@ KEYFRAME_WITHOUT_AUD = b"".join(
     for nal_type in (0x67, 0x68, 0x65)
 )
 NON_KEYFRAME_WITHOUT_AUD = ANNEX_B_START_CODE + b"\x41\x80payload"
+# A non-IDR slice whose slice header parses as slice_type 1 (B): first_mb_in_slice
+# ue(0) is bit '1', slice_type ue(1) is bits '010'.
+B_FRAME_ACCESS_UNIT = b"".join(
+    ANNEX_B_START_CODE + bytes([nal_type]) + (b"\xa0payload" if nal_type == 0x41 else b"payload")
+    for nal_type in (0x09, 0x41)
+)
 ROS2_COMPRESSED_VIDEO_SCHEMA = "\n".join(
     [
         "builtin_interfaces/Time timestamp",
@@ -124,7 +130,7 @@ def test_transform_rejects_nonconforming_passthrough_video(tmp_path: Path) -> No
             channel_id, log_time=10**9, data=message.SerializeToString(), publish_time=10**9
         )
         writer.finish()
-    with pytest.raises(ValueError, match="requires 'h264'"):
+    with pytest.raises(SourceNotConforming, match="requires 'h264'"):
         write_canonical_episode(source, tmp_path / "out.mcap")
 
 
@@ -161,6 +167,17 @@ def _write_passthrough_video_source(
     return payloads_by_topic
 
 
+def test_transform_rejects_passthrough_video_carrying_b_frames(tmp_path: Path) -> None:
+    source = tmp_path / "bframe.mcap"
+    _write_passthrough_video_source(
+        source,
+        [("/cam", 1, KEYFRAME_ACCESS_UNIT), ("/cam", 2, B_FRAME_ACCESS_UNIT)],
+    )
+
+    with pytest.raises(SourceNotConforming, match=r"/cam.*B-frames"):
+        write_canonical_episode(source, tmp_path / "out.mcap")
+
+
 def test_transform_rejects_each_passthrough_video_channel_starting_mid_gop(
     tmp_path: Path,
 ) -> None:
@@ -174,7 +191,7 @@ def test_transform_rejects_each_passthrough_video_channel_starting_mid_gop(
         ],
     )
 
-    with pytest.raises(ValueError, match=r"/cam/right.*starts mid-GOP"):
+    with pytest.raises(SourceNotConforming, match=r"/cam/right.*starts mid-GOP"):
         write_canonical_episode(source, tmp_path / "out.mcap")
 
 
@@ -238,7 +255,7 @@ def test_transform_still_rejects_undelimited_video_starting_mid_gop(tmp_path: Pa
     source = tmp_path / "undelimited-mid-gop.mcap"
     _write_passthrough_video_source(source, [("/cam", 1, NON_KEYFRAME_WITHOUT_AUD)])
 
-    with pytest.raises(ValueError, match="starts mid-GOP"):
+    with pytest.raises(SourceNotConforming, match="starts mid-GOP"):
         write_canonical_episode(source, tmp_path / "out.mcap")
 
 
@@ -248,7 +265,7 @@ def test_transform_and_doctor_reject_multiple_pictures_without_auds(tmp_path: Pa
         source, [("/cam", 1, KEYFRAME_WITHOUT_AUD + NON_KEYFRAME_WITHOUT_AUD)]
     )
 
-    with pytest.raises(ValueError, match="message contains 2 pictures"):
+    with pytest.raises(SourceNotConforming, match="message contains 2 pictures"):
         write_canonical_episode(source, tmp_path / "out.mcap")
 
     report = diagnose(source)
@@ -705,6 +722,42 @@ def test_step_version_changes_only_when_the_author_bumps_it() -> None:
 
     assert before.checks[0].version == after.checks[0].version
     assert bumped.checks[0].version != before.checks[0].version
+
+
+def test_contract_step_versions_are_stable_and_change_with_the_contract() -> None:
+    first_contract = {
+        "model": "vision-model",
+        "prompt": "count the hands",
+        "labels": ["zero", "one", "two"],
+        "settings": {"temperature": 0.0, "max_tokens": 64},
+    }
+    equivalent_contract_with_different_container_order = {
+        "settings": {"max_tokens": 64, "temperature": 0.0},
+        "labels": ("zero", "one", "two"),
+        "prompt": "count the hands",
+        "model": "vision-model",
+    }
+    changed_contract = {**first_contract, "prompt": "count visible hands"}
+
+    first_version = hflow.step_version_from_contract("hand-count-v1", first_contract)
+    equivalent_version = hflow.step_version_from_contract(
+        "hand-count-v1",
+        equivalent_contract_with_different_container_order,
+    )
+    changed_version = hflow.step_version_from_contract("hand-count-v1", changed_contract)
+
+    assert first_version == equivalent_version
+    assert changed_version != first_version
+    assert str(first_version).startswith("hand-count-v1-")
+    assert len(hflow.fingerprint_contract(first_contract)) == 64
+
+
+@pytest.mark.parametrize("unsupported_value", (float("nan"), Path("prompt.txt")))
+def test_contract_fingerprints_refuse_values_outside_canonical_json(
+    unsupported_value: object,
+) -> None:
+    with pytest.raises((TypeError, ValueError), match=r"contract value at \$\.value"):
+        hflow.fingerprint_contract({"value": unsupported_value})
 
 
 def test_all_step_registration_surfaces_reject_invalid_versions() -> None:

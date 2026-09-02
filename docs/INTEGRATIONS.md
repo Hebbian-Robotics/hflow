@@ -95,7 +95,10 @@ model-based step. The step owns the endpoint, credentials, model, prompt,
 sampling policy, and interpretation of the response.
 
 The [OpenAI vision guide](./how-to/call-openai-vision.md) demonstrates the
-pattern with an ordinary client. The
+generic pattern with an ordinary client. The opt-in
+[Build AI checks](./how-to/run-build-ai-evaluation.md) provide a named,
+published hand-visibility and active-manipulation methodology while leaving
+endpoint and model selection with each registration. The
 [native-video provider protocol](./PROVIDERS.md) is an extension point for
 servers whose request format contains reusable protocol knowledge.
 

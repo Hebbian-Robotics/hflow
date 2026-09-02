@@ -19,7 +19,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -60,6 +60,11 @@ class BearerToken:
 AirflowAuth = PasswordCredentials | BearerToken
 
 
+def _body_excerpt(body: str) -> str:
+    """Collapse a response body to the bounded excerpt exposed to callers."""
+    return " ".join(body.split())[:200]
+
+
 @dataclass(frozen=True)
 class AirflowHealth:
     """Parsed ``/api/v2/monitor/health`` body."""
@@ -76,6 +81,74 @@ class AirflowHealth:
     def summary(self) -> str:
         parts = [f"{name}={status or 'absent'}" for name, status in sorted(self.components.items())]
         return ", ".join(parts)
+
+
+@dataclass(frozen=True)
+class AirflowDagRun:
+    """Parsed Airflow DAG run fields used by HFlow."""
+
+    dag_run_id: str | None
+    state: str | None
+    logical_date: str | None
+    start_date: str | None
+    end_date: str | None
+    conf: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class AirflowTaskInstance:
+    """Parsed Airflow task-instance fields used by HFlow."""
+
+    task_id: str | None
+    state: str | None
+    start_date: str | None
+    end_date: str | None
+    queued_at: str | None
+    try_number: int | None
+    map_index: int
+    duration: float | None
+
+
+def _optional_string(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _optional_float(value: object) -> float | None:
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
+def _parse_dag_run(value: object, *, endpoint: str) -> AirflowDagRun:
+    if not isinstance(value, dict):
+        raise AirflowClientError(f"{endpoint} returned a DAG run that is not a JSON object")
+    conf = value.get("conf")
+    return AirflowDagRun(
+        dag_run_id=_optional_string(value.get("dag_run_id")),
+        state=_optional_string(value.get("state")),
+        logical_date=_optional_string(value.get("logical_date")),
+        start_date=_optional_string(value.get("start_date")),
+        end_date=_optional_string(value.get("end_date")),
+        conf=conf if isinstance(conf, dict) else {},
+    )
+
+
+def _parse_task_instance(value: object, *, endpoint: str) -> AirflowTaskInstance:
+    if not isinstance(value, dict):
+        raise AirflowClientError(f"{endpoint} returned a task instance that is not a JSON object")
+    try_number = value.get("try_number")
+    map_index = value.get("map_index")
+    queued_at = value.get("queued_when") or value.get("queued_at")
+    return AirflowTaskInstance(
+        task_id=_optional_string(value.get("task_id")),
+        state=_optional_string(value.get("state")),
+        start_date=_optional_string(value.get("start_date")),
+        end_date=_optional_string(value.get("end_date")),
+        queued_at=_optional_string(queued_at),
+        try_number=try_number if isinstance(try_number, int) else None,
+        map_index=map_index if isinstance(map_index, int) else -1,
+        duration=_optional_float(value.get("duration")),
+    )
 
 
 def _dag_run_path(dag_id: str, dag_run_id: str) -> str:
@@ -135,12 +208,12 @@ class AirflowClient:
             request.add_header("Authorization", f"Bearer {bearer_token}")
         try:
             with urllib.request.urlopen(request, timeout=self._request_timeout_s) as response:
-                response_text = response.read().decode()
+                response_body = response.read()
         except urllib.error.HTTPError as error:
             error_body = error.read().decode(errors="replace")
             # Airflow puts the useful part ("detail") in the body; surface a
             # truncated copy so failures are diagnosable from the message.
-            body_excerpt = " ".join(error_body.split())[:200]
+            body_excerpt = _body_excerpt(error_body)
             raise AirflowClientError(
                 f"{method} {url} failed with HTTP {error.code}"
                 + (f": {body_excerpt}" if body_excerpt else ""),
@@ -155,9 +228,27 @@ class AirflowClient:
             # published port before the api-server listens) must also become
             # AirflowClientError, or wait_until_healthy cannot retry them.
             raise AirflowClientError(f"{method} {url} failed: {error!r}") from error
+        try:
+            response_text = response_body.decode("utf-8")
+        except UnicodeDecodeError as error:
+            response_text = response_body.decode("utf-8", errors="replace")
+            body_excerpt = _body_excerpt(response_text)
+            raise AirflowClientError(
+                f"{method} {url} returned invalid UTF-8"
+                + (f": {body_excerpt}" if body_excerpt else ""),
+                body=response_text,
+            ) from error
         if not response_text:
             return {}
-        parsed = json.loads(response_text)
+        try:
+            parsed = json.loads(response_text)
+        except json.JSONDecodeError as error:
+            body_excerpt = _body_excerpt(response_text)
+            raise AirflowClientError(
+                f"{method} {url} returned malformed JSON"
+                + (f": {body_excerpt}" if body_excerpt else ""),
+                body=response_text,
+            ) from error
         if not isinstance(parsed, dict):
             raise AirflowClientError(f"{method} {url} returned non-object JSON: {parsed!r}")
         return parsed
@@ -192,7 +283,7 @@ class AirflowClient:
                 # A pre-issued token cannot be refreshed here; retrying with
                 # the same bytes would just 401 again. Keep the server's own
                 # explanation in the message -- it is what the CLI prints.
-                body_excerpt = " ".join(error.body.split())[:200]
+                body_excerpt = _body_excerpt(error.body)
                 raise AirflowClientError(
                     f"{method} {url} rejected the pre-issued bearer token (HTTP 401): "
                     "the token is expired or invalid -- obtain a fresh one"
@@ -254,7 +345,7 @@ class AirflowClient:
         conf: dict[str, Any] | None = None,
         *,
         dag_run_id: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> AirflowDagRun:
         """Trigger a run; pass ``dag_run_id`` to make retries idempotent.
 
         A caller-generated id decided BEFORE the POST means a retry after a
@@ -264,8 +355,10 @@ class AirflowClient:
         payload: dict[str, Any] = {"logical_date": None, "conf": conf or {}}
         if dag_run_id is not None:
             payload["dag_run_id"] = dag_run_id
+        endpoint = f"{self.base_url}/api/v2/dags/{dag_id}/dagRuns"
         try:
-            return self._authenticated("POST", f"/api/v2/dags/{dag_id}/dagRuns", payload)
+            response = self._authenticated("POST", f"/api/v2/dags/{dag_id}/dagRuns", payload)
+            return _parse_dag_run(response, endpoint=endpoint)
         except AirflowClientError as error:
             if error.status == 409 and dag_run_id is not None:
                 return self.dag_run(dag_id, dag_run_id)
@@ -275,25 +368,31 @@ class AirflowClient:
         """The DAG's details; 404s (as AirflowClientError) until it registers."""
         return self._authenticated("GET", f"/api/v2/dags/{dag_id}")
 
-    def dag_run(self, dag_id: str, dag_run_id: str) -> dict[str, Any]:
-        return self._authenticated("GET", _dag_run_path(dag_id, dag_run_id))
+    def dag_run(self, dag_id: str, dag_run_id: str) -> AirflowDagRun:
+        path = _dag_run_path(dag_id, dag_run_id)
+        response = self._authenticated("GET", path)
+        return _parse_dag_run(response, endpoint=f"{self.base_url}{path}")
 
     def dag_runs(
         self, dag_id: str, *, limit: int = 100, order_by: str | None = None
-    ) -> list[dict[str, Any]]:
-        """The DAG's runs (up to ``limit``), as the API returns them.
+    ) -> list[AirflowDagRun]:
+        """The DAG's runs (up to ``limit``), parsed into typed responses.
 
         Airflow's default ordering is id ASCENDING, so with more runs than
         ``limit`` the server truncates to the OLDEST -- pass
         ``order_by="-id"`` for the newest first.
         """
         query = f"limit={limit}" + (f"&order_by={order_by}" if order_by else "")
-        response = self._authenticated("GET", f"/api/v2/dags/{dag_id}/dagRuns?{query}")
+        path = f"/api/v2/dags/{dag_id}/dagRuns?{query}"
+        response = self._authenticated("GET", path)
         runs = response.get("dag_runs")
-        return runs if isinstance(runs, list) else []
+        if not isinstance(runs, list):
+            return []
+        endpoint = f"{self.base_url}{path}"
+        return [_parse_dag_run(run, endpoint=endpoint) for run in runs]
 
-    def task_instances(self, dag_id: str, dag_run_id: str) -> list[dict[str, Any]]:
-        """Every task instance of one run, as the API returns them.
+    def task_instances(self, dag_id: str, dag_run_id: str) -> list[AirflowTaskInstance]:
+        """Every task instance of one run, parsed into typed responses.
 
         Includes one entry per dynamically mapped instance (``process_batch``
         fans out over the planned batches), distinguished by ``map_index``;
@@ -302,9 +401,13 @@ class AirflowClient:
         HFlow's: this is a thin pass-through so a UI can colour the task graph
         :func:`hflow.runtime.ingest_dag_topology` describes.
         """
-        response = self._authenticated("GET", f"{_dag_run_path(dag_id, dag_run_id)}/taskInstances")
+        path = f"{_dag_run_path(dag_id, dag_run_id)}/taskInstances"
+        response = self._authenticated("GET", path)
         task_instances = response.get("task_instances")
-        return task_instances if isinstance(task_instances, list) else []
+        if not isinstance(task_instances, list):
+            return []
+        endpoint = f"{self.base_url}{path}"
+        return [_parse_task_instance(instance, endpoint=endpoint) for instance in task_instances]
 
     def unpause_dag(self, dag_id: str) -> dict[str, Any]:
         return self._authenticated("PATCH", f"/api/v2/dags/{dag_id}", {"is_paused": False})
@@ -317,8 +420,9 @@ class AirflowClient:
         profile: str = "full",
         online: bool = False,
         batch_count: int | None = None,
+        step_names: Iterable[str] | None = None,
         dag_run_id: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> AirflowDagRun:
         """Trigger the MASTER ingest DAG over ``uris`` (the SDK/CLI entry point).
 
         ``profile`` names a run profile (the master validates it against the
@@ -328,7 +432,9 @@ class AirflowClient:
         immediate batch, no bin-packing, no stagger -- instead of the default
         staggered batch lane. ``batch_count`` overrides the master's own
         bin-packing for the batch lane (ignored by the online lane, which is
-        always one batch). Supply ``dag_run_id`` when the caller may retry
+        always one batch). ``step_names`` limits the run to named registered
+        checks, enrichments, or media steps while preserving the profile's
+        stage ordering. Supply ``dag_run_id`` when the caller may retry
         (see :meth:`trigger_dag_run` for the idempotency contract).
 
         This method owns the trigger conf's shape: every caller -- the CLI,
@@ -349,4 +455,11 @@ class AirflowClient:
         }
         if batch_count is not None:
             conf["batch_count"] = batch_count
+        if step_names is not None:
+            if isinstance(step_names, str):
+                raise TypeError("step_names must be an iterable of names, not one string")
+            selected_step_names = list(step_names)
+            if not all(isinstance(step_name, str) for step_name in selected_step_names):
+                raise TypeError("step names must be strings")
+            conf["step_names"] = selected_step_names
         return self.trigger_dag_run(dag_id, conf=conf, dag_run_id=dag_run_id)

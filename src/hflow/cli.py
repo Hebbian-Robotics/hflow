@@ -436,10 +436,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     manifest_parser = subparsers.add_parser(
         "manifest",
-        help="print the pipeline's manifest (steps, versions, endpoints) as JSON",
+        help="print the pipeline's manifest (steps, versions, requirements) as JSON",
         description=(
             "Import the pipeline file and print its manifest -- step names, "
-            "explicit versions, gate flags, endpoint aliases, and version "
+            "explicit versions, gate flags, resource requirements, and version "
             "stamps -- as JSON on stdout. This is the metadata a pipeline "
             "crosses a control boundary as. Importing EXECUTES the pipeline "
             "file, so run this in the pipeline's own environment."
@@ -516,6 +516,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="user requirements file for the task venv (default: hflow only)",
     )
+    up_parser.add_argument(
+        "--pass-env",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "environment variable to forward into every runtime service without writing its "
+            "value to the bundle; repeat for multiple variables"
+        ),
+    )
 
     deploy_parser = subparsers.add_parser(
         "deploy",
@@ -558,6 +568,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "the user venv's python interpreter on the workers "
             f"(default: {DEFAULT_DEPLOY_VENV_PYTHON})"
+        ),
+    )
+    deploy_parser.add_argument(
+        "--pass-env",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "environment variable the platform must provide to every task; repeat for multiple "
+            "variables"
         ),
     )
 
@@ -625,6 +645,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "current versions. Use it when an artifact was deleted out from "
             "under a recorded step -- that is the one thing the catalog cannot "
             "see. Applies only when the episodes are processed in this process"
+        ),
+    )
+    ingest_parser.add_argument(
+        "--step",
+        dest="step_names",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help=(
+            "run only this registered check, enrichment, or media step; repeat "
+            "to select more than one"
         ),
     )
     ingest_parser.add_argument(
@@ -909,6 +940,7 @@ def _command_up(arguments: argparse.Namespace) -> int:
             requirements_file=arguments.requirements,
             hflow_source=hflow_source,
             api_port=arguments.api_port,
+            passthrough_environment_variables=tuple(arguments.pass_env),
         )
     except ValueError as error:
         # Its own block, not the start_runtime handler below: nothing has been
@@ -994,6 +1026,7 @@ def _command_deploy(arguments: argparse.Namespace) -> int:
             app_variable=app_variable,
             requirements_file=arguments.requirements,
             venv_python_path=arguments.venv_python,
+            passthrough_environment_variables=tuple(arguments.pass_env),
         )
         paths = render_deploy_bundle(config, arguments.output_dir)
     except (ValueError, FileNotFoundError) as error:
@@ -1059,7 +1092,13 @@ def _ingest_in_process(arguments: argparse.Namespace) -> int:
         file=sys.stderr,
     )
     try:
-        outcomes = run_stages_directly(app, list(arguments.uris), stages, selection=selection)
+        outcomes = run_stages_directly(
+            app,
+            list(arguments.uris),
+            stages,
+            selection=selection,
+            step_names=arguments.step_names,
+        )
     except RuntimeError as error:
         # The mass-failure gates, verbatim: the same budgets a scheduled run
         # applies, so a corpus that would fail there fails here too.
@@ -1160,12 +1199,21 @@ def _command_ingest(arguments: argparse.Namespace) -> int:
         dag_id = paths.dag_id
         watch_location = paths.api_base_url
     try:
-        dag_run = client.ingest(
-            dag_id,
-            list(arguments.uris),
-            profile=arguments.profile,
-            online=arguments.online,
-        )
+        if arguments.step_names is None:
+            dag_run = client.ingest(
+                dag_id,
+                list(arguments.uris),
+                profile=arguments.profile,
+                online=arguments.online,
+            )
+        else:
+            dag_run = client.ingest(
+                dag_id,
+                list(arguments.uris),
+                profile=arguments.profile,
+                online=arguments.online,
+                step_names=arguments.step_names,
+            )
     except AirflowClientError as error:
         print(f"ingest: {error}", file=sys.stderr)
         if error.status == 404:
@@ -1183,7 +1231,7 @@ def _command_ingest(arguments: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
         return 1
-    run_id = dag_run.get("dag_run_id", "<unknown>")
+    run_id = dag_run.dag_run_id or "<unknown>"
     lane = "online" if arguments.online else "batch"
     print(
         f"triggered {dag_id} run {run_id} over {len(arguments.uris)} episode(s) "

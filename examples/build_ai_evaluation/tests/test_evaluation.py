@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -10,19 +11,32 @@ from typing import cast
 import duckdb
 import hflow
 import pytest
+from inspect_ai.log import EvalConfig, EvalDataset, EvalLog, EvalSample, EvalSpec
+from inspect_ai.model import ModelOutput
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from examples.build_ai_evaluation.evaluate import (
+    BuildAIRunMetadata,
+    DatasetVariant,
+    EvaluatedSample,
+    EvaluationConfiguration,
+    ExecutionErrorSampleOutcome,
+    InvalidResponseSampleOutcome,
+    SampleResponseMetadata,
     SourceSelection,
+    SuccessfulSampleOutcome,
     _argument_parser,
+    _prepare_output_directory,
     _run_configuration_from_arguments,
+    _sample_result,
     _sanitize_base_url,
     iter_evaluation_frames,
     main,
     summarize_results,
 )
-from examples.build_ai_evaluation.judgment import (
+from examples.build_ai_evaluation.pipeline import app
+from hflow.build_ai_vlm_checks import (
     ACTIVE_MANIPULATION_RESPONSE_SCHEMA,
     HAND_COUNT_RESPONSE_SCHEMA,
     EvaluationTask,
@@ -35,7 +49,6 @@ from examples.build_ai_evaluation.judgment import (
     parse_active_manipulation_response,
     parse_hand_count_response,
 )
-from examples.build_ai_evaluation.pipeline import VISION_ENDPOINT_ALIAS, app
 
 
 class _FixtureUsage:
@@ -80,25 +93,23 @@ _TASK_VALUE_CONTRACTS: dict[
 }
 
 
-def test_task_schema_value_sets_match_their_parsers() -> None:
-    """Each task's schema must state the value set its parser enforces.
-
-    Both tasks answer from a closed set, so the schema can say so and a
-    provider doing constrained decoding will not emit anything else. When only
-    the parser knows, an out-of-set answer costs a request and lands as an
-    unparsed episode with no prediction (#257).
-    """
+def test_task_schemas_and_parsers_match_the_published_contract() -> None:
+    """Preserve Build AI's schema shapes and enforce its prose vocabulary."""
     executable_tasks = set(EvaluationTask) - {EvaluationTask.BOTH}
     assert set(_TASK_VALUE_CONTRACTS) == executable_tasks
 
     for task, (schema, property_name, parser, rejected_values) in _TASK_VALUE_CONTRACTS.items():
         properties = cast(dict[str, dict[str, object]], schema["properties"])
         property_schema = properties[property_name]
-        assert "enum" in property_schema, (
-            f"{task.value}: {property_name!r} has no 'enum', so its schema does not state the "
-            "value set its parser enforces and the model is free to answer outside it"
+        permitted_values = (
+            [0, 1, 2]
+            if task is EvaluationTask.HAND_COUNT
+            else cast(list[object], property_schema["enum"])
         )
-        permitted_values = cast(list[object], property_schema["enum"])
+        if task is EvaluationTask.HAND_COUNT:
+            # The published schema says INTEGER without an enum. Keeping that
+            # exact shape also avoids Gemini/OpenRouter emitting an empty object.
+            assert property_schema == {"type": "integer"}
         for value in permitted_values:
             assert parser(json.dumps({property_name: value})) == value, (
                 f"{task.value}: the schema permits {value!r} but the parser does not accept it"
@@ -230,61 +241,82 @@ def test_build_ai_pipeline_registers_both_judgments_as_hflow_checks() -> None:
 
     assert set(checks_by_name) == {
         "build_ai_active_manipulation",
-        "build_ai_hand_count",
+        "build_ai_hand_visibility",
     }
-    assert all(check.uses == VISION_ENDPOINT_ALIAS for check in checks_by_name.values())
+    assert all(check.requires == frozenset({"vision-model"}) for check in checks_by_name.values())
 
 
 def test_summary_reports_prevalence_agreement_and_failures_without_counting_failures_negative() -> (
     None
 ):
-    run_metadata: dict[str, object] = {
-        "label": "candidate",
-        "fingerprint": "fingerprint",
-        "dataset_variant": "10k",
-        "model": "candidate-model",
-        "prompts": {
-            EvaluationTask.HAND_COUNT.value: {"sha256": "hand-hash"},
-            EvaluationTask.ACTIVE_MANIPULATION.value: {"sha256": "active-hash"},
+    run_metadata = BuildAIRunMetadata(
+        label="candidate",
+        fingerprint="fingerprint",
+        dataset_variant="10k",
+        model="candidate-model",
+        prompt_sha256s={
+            EvaluationTask.HAND_COUNT.value: "hand-hash",
+            EvaluationTask.ACTIVE_MANIPULATION.value: "active-hash",
         },
-    }
-    results: list[dict[str, object]] = [
-        {
-            "source_dataset": "egocentric10k",
-            "frame_id": "frame-1",
-            "task": EvaluationTask.HAND_COUNT.value,
-            "status": "ok",
-            "predicted_value": 2,
-            "expected_value": 2,
-            "latency_seconds": 1.0,
-            "usage": {"prompt_tokens": 10, "completion_tokens": 2},
-        },
-        {
-            "source_dataset": "egocentric10k",
-            "frame_id": "frame-2",
-            "task": EvaluationTask.HAND_COUNT.value,
-            "status": "ok",
-            "predicted_value": 0,
-            "expected_value": 1,
-            "latency_seconds": 3.0,
-            "usage": {"prompt_tokens": 12, "completion_tokens": 2},
-        },
-        {
-            "source_dataset": "egocentric10k",
-            "frame_id": "frame-1",
-            "task": EvaluationTask.ACTIVE_MANIPULATION.value,
-            "status": "ok",
-            "predicted_value": "yes",
-            "expected_value": "yes",
-            "latency_seconds": 2.0,
-        },
-        {
-            "source_dataset": "egocentric10k",
-            "frame_id": "frame-2",
-            "task": EvaluationTask.ACTIVE_MANIPULATION.value,
-            "status": "error",
-            "latency_seconds": 4.0,
-        },
+        document={},
+    )
+    results = [
+        EvaluatedSample(
+            source_dataset="egocentric10k",
+            frame_id="frame-1",
+            task=EvaluationTask.HAND_COUNT,
+            expected_value=2,
+            outcome=SuccessfulSampleOutcome(
+                raw_response="2",
+                response_metadata=SampleResponseMetadata(
+                    response_model=None,
+                    latency_seconds=1.0,
+                    usage={"prompt_tokens": 10, "completion_tokens": 2},
+                ),
+                predicted_value=2,
+            ),
+        ),
+        EvaluatedSample(
+            source_dataset="egocentric10k",
+            frame_id="frame-2",
+            task=EvaluationTask.HAND_COUNT,
+            expected_value=1,
+            outcome=SuccessfulSampleOutcome(
+                raw_response="0",
+                response_metadata=SampleResponseMetadata(
+                    response_model=None,
+                    latency_seconds=3.0,
+                    usage={"prompt_tokens": 12, "completion_tokens": 2},
+                ),
+                predicted_value=0,
+            ),
+        ),
+        EvaluatedSample(
+            source_dataset="egocentric10k",
+            frame_id="frame-1",
+            task=EvaluationTask.ACTIVE_MANIPULATION,
+            expected_value="yes",
+            outcome=SuccessfulSampleOutcome(
+                raw_response="yes",
+                response_metadata=SampleResponseMetadata(
+                    response_model=None, latency_seconds=2.0, usage=None
+                ),
+                predicted_value="yes",
+            ),
+        ),
+        EvaluatedSample(
+            source_dataset="egocentric10k",
+            frame_id="frame-2",
+            task=EvaluationTask.ACTIVE_MANIPULATION,
+            expected_value="no",
+            outcome=ExecutionErrorSampleOutcome(
+                raw_response="",
+                response_metadata=SampleResponseMetadata(
+                    response_model=None, latency_seconds=4.0, usage=None
+                ),
+                error="boom",
+            ),
+        ),
     ]
 
     summary = summarize_results(run_metadata, results)
@@ -301,6 +333,301 @@ def test_summary_reports_prevalence_agreement_and_failures_without_counting_fail
     assert active_summary["valid_count"] == 1
     assert active_summary["error_count"] == 1
     assert active_summary["predicted_value_fractions"] == {"yes": 1.0}
+
+
+def _eval_log(metadata: dict[str, str], samples: list[EvalSample]) -> EvalLog:
+    return EvalLog(
+        eval=EvalSpec(
+            created="2026-08-31T00:00:00Z",
+            task="t",
+            dataset=EvalDataset(),
+            model="m",
+            config=EvalConfig(),
+            metadata=metadata,
+        ),
+        samples=samples,
+    )
+
+
+def _eval_sample(frame_id: str, output: ModelOutput, target: str = "2") -> EvalSample:
+    return EvalSample(
+        id=frame_id,
+        input="image",
+        target=target,
+        epoch=1,
+        output=output,
+    )
+
+
+def test_sample_result_outcome_variants_are_exclusive() -> None:
+    log = _eval_log(
+        {"evaluation_task": "hand-count", "source_dataset": "egocentric10k"},
+        [
+            _eval_sample("ok", ModelOutput(completion='{"hand_count": 2}', model="m")),
+            _eval_sample("invalid", ModelOutput(completion="not a count")),
+            _eval_sample("error", ModelOutput(completion="garbage", error="boom")),
+        ],
+    )
+    samples = log.samples
+    assert samples is not None
+
+    results = [_sample_result(log, sample) for sample in samples]
+
+    success = results[0].outcome
+    assert isinstance(success, SuccessfulSampleOutcome)
+    assert success.predicted_value == 2
+    assert success.raw_response == '{"hand_count": 2}'
+    assert success.response_metadata.response_model == "m"
+    assert not hasattr(success, "parse_error")
+    assert not hasattr(success, "error")
+    invalid = results[1].outcome
+    assert isinstance(invalid, InvalidResponseSampleOutcome)
+    assert invalid.parse_error == "hand count must be 0, 1, or 2"
+    assert invalid.raw_response == "not a count"
+    assert not hasattr(invalid, "predicted_value")
+    error = results[2].outcome
+    assert isinstance(error, ExecutionErrorSampleOutcome)
+    assert error.error == "boom"
+    assert error.raw_response == "garbage"
+    assert not hasattr(error, "predicted_value")
+    assert results[0].expected_value == 2
+    assert results[0].task == EvaluationTask.HAND_COUNT
+    assert results[0].source_dataset == "egocentric10k"
+
+
+def _evaluation_configuration(output_directory: Path) -> EvaluationConfiguration:
+    data_directory = output_directory.parent / "data"
+    data_directory.mkdir(parents=True, exist_ok=True)
+    return EvaluationConfiguration(
+        dataset_variant=DatasetVariant.EGOCENTRIC_10K,
+        selected_sources=(SourceSelection.BUILD_AI,),
+        selected_tasks=(EvaluationTask.HAND_COUNT,),
+        data_directory=data_directory,
+        output_directory=output_directory,
+        model="vision-model",
+        base_url="http://127.0.0.1:8000/v1",
+        api_key_environment_variable="HFLOW_TEST_API_KEY",
+        allow_missing_api_key=True,
+        response_format=ResponseFormat.JSON_SCHEMA,
+        temperature=None,
+        max_tokens=512,
+        max_retries=2,
+        worker_count=2,
+        row_limit_per_source=None,
+        label="run-label",
+        task_definitions={
+            EvaluationTask.HAND_COUNT: TaskDefinition(
+                task=EvaluationTask.HAND_COUNT,
+                prompt="count hands",
+                response_schema=HAND_COUNT_RESPONSE_SCHEMA,
+            )
+        },
+    )
+
+
+def test_prepare_output_directory_writes_and_resumes_the_same_fingerprint(
+    tmp_path: Path,
+) -> None:
+    configuration = _evaluation_configuration(tmp_path / "run")
+    metadata_path = tmp_path / "run" / "run.json"
+
+    first = _prepare_output_directory(configuration)
+    second = _prepare_output_directory(configuration)
+
+    assert metadata_path.is_file()
+    assert second == first
+    assert second.fingerprint == first.fingerprint
+    assert second.label == "run-label"
+    assert second.model == "vision-model"
+    assert second.prompt_sha256s == first.prompt_sha256s
+
+
+def test_prepare_output_directory_refuses_a_different_experiment(tmp_path: Path) -> None:
+    configuration = _evaluation_configuration(tmp_path / "run")
+    _prepare_output_directory(configuration)
+
+    different = replace(configuration, model="other-model")
+
+    with pytest.raises(ValueError, match="describes a different experiment"):
+        _prepare_output_directory(different)
+
+
+def test_run_metadata_refuses_a_non_object_run_json(tmp_path: Path) -> None:
+    configuration = _evaluation_configuration(tmp_path / "run")
+    metadata_path = tmp_path / "run" / "run.json"
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text("[]")
+
+    with pytest.raises(ValueError) as error:
+        _prepare_output_directory(configuration)
+
+    message = str(error.value)
+    assert str(metadata_path) in message
+    assert "must contain a JSON object" in message
+
+
+def test_run_metadata_refuses_invalid_json(tmp_path: Path) -> None:
+    configuration = _evaluation_configuration(tmp_path / "run")
+    metadata_path = tmp_path / "run" / "run.json"
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text("not json")
+
+    with pytest.raises(ValueError) as error:
+        _prepare_output_directory(configuration)
+
+    message = str(error.value)
+    assert str(metadata_path) in message
+    assert "could not read run metadata" in message
+
+
+def test_run_metadata_names_the_file_and_the_bad_field(tmp_path: Path) -> None:
+    configuration = _evaluation_configuration(tmp_path / "run")
+    metadata_path = tmp_path / "run" / "run.json"
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+
+    metadata_path.write_text(json.dumps({"fingerprint": "x"}))
+    with pytest.raises(ValueError) as error:
+        _prepare_output_directory(configuration)
+    message = str(error.value)
+    assert str(metadata_path) in message
+    assert "'label'" in message
+
+    metadata_path.write_text(json.dumps({"label": 3}))
+    with pytest.raises(ValueError) as error:
+        _prepare_output_directory(configuration)
+    message = str(error.value)
+    assert str(metadata_path) in message
+    assert "'label'" in message
+
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "label": "run-label",
+                "fingerprint": "x",
+                "model": "vision-model",
+                "dataset_variant": "10k",
+            }
+        )
+    )
+    with pytest.raises(ValueError) as error:
+        _prepare_output_directory(configuration)
+    message = str(error.value)
+    assert str(metadata_path) in message
+    assert "'prompts'" in message
+
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "label": "run-label",
+                "fingerprint": "x",
+                "model": "vision-model",
+                "dataset_variant": "10k",
+                "prompts": {"hand-count": {"text": "no digest"}},
+            }
+        )
+    )
+    with pytest.raises(ValueError) as error:
+        _prepare_output_directory(configuration)
+    message = str(error.value)
+    assert str(metadata_path) in message
+    assert "'hand-count'" in message
+    assert "'sha256'" in message
+
+
+def test_run_metadata_document_persists_the_existing_schema(tmp_path: Path) -> None:
+    configuration = _evaluation_configuration(tmp_path / "run")
+    metadata_path = tmp_path / "run" / "run.json"
+
+    metadata = _prepare_output_directory(configuration)
+
+    document = json.loads(metadata_path.read_text())
+    assert document == metadata.to_json_dict()
+    assert set(document) == {
+        "adapter_schema_version",
+        "api_key_environment_variable",
+        "base_url",
+        "dataset_repository",
+        "dataset_revision",
+        "dataset_variant",
+        "fingerprint",
+        "inspect_ai_version",
+        "label",
+        "max_retries",
+        "max_tokens",
+        "model",
+        "prompts",
+        "response_format",
+        "row_limit_per_source",
+        "schema_version",
+        "sources",
+        "tasks",
+        "temperature",
+        "worker_count",
+    }
+    assert document["label"] == "run-label"
+    assert document["row_limit_per_source"] is None
+    assert document["schema_version"] == 1
+
+
+def test_summarize_results_persists_the_existing_schema() -> None:
+    run_metadata = BuildAIRunMetadata(
+        label="run-label",
+        fingerprint="0" * 64,
+        dataset_variant="10k",
+        model="vision-model",
+        prompt_sha256s={EvaluationTask.HAND_COUNT.value: "hand-hash"},
+        document={},
+    )
+    results = [
+        EvaluatedSample(
+            source_dataset="egocentric10k",
+            frame_id="frame-1",
+            task=EvaluationTask.HAND_COUNT,
+            expected_value=2,
+            outcome=SuccessfulSampleOutcome(
+                raw_response="2",
+                response_metadata=SampleResponseMetadata(
+                    response_model=None, latency_seconds=None, usage=None
+                ),
+                predicted_value=2,
+            ),
+        )
+    ]
+
+    summary = summarize_results(run_metadata, results)
+    source_summaries = summary["sources"]
+    assert isinstance(source_summaries, dict)
+
+    assert set(summary) == {
+        "schema_version",
+        "label",
+        "fingerprint",
+        "dataset_variant",
+        "model",
+        "prompts",
+        "sources",
+    }
+    assert summary["prompts"] == {"hand-count": {"sha256": "hand-hash"}}
+    task_summaries = source_summaries["egocentric10k"]
+    assert isinstance(task_summaries, dict)
+    hand_summary = task_summaries[EvaluationTask.HAND_COUNT.value]
+    assert isinstance(hand_summary, dict)
+    assert set(hand_summary) == {
+        "attempted_count",
+        "valid_count",
+        "invalid_count",
+        "error_count",
+        "predicted_value_counts",
+        "predicted_value_fractions",
+        "reference_value_counts",
+        "reference_value_fractions",
+        "agreement_count",
+        "agreement_fraction",
+        "average_latency_seconds",
+        "usage_totals",
+    }
+    assert hand_summary["attempted_count"] == 1
+    assert hand_summary["agreement_fraction"] == 1.0
 
 
 def test_base_url_metadata_drops_embedded_credentials_and_query_values() -> None:

@@ -16,7 +16,9 @@ Hugging Face Hub, and uses HFlow's managed FFmpeg build.
 
 import json
 import logging
+import math
 import os
+import re
 import struct
 import subprocess
 import tempfile
@@ -25,6 +27,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NotRequired, TypedDict
+from urllib.parse import urlsplit
 
 from mcap.writer import Writer as McapWriter
 
@@ -38,7 +41,7 @@ DEFAULT_REVISION = "main"
 DEFAULT_OUTPUT_DIR = Path("./data/lerobot_pusht")
 DEFAULT_CAMERA_KEY = "observation.image"
 
-CONVERTER_VERSION = "lerobot-converter-v3"
+CONVERTER_VERSION = "lerobot-converter-v4"
 PRESENTATION_TIMESTAMP_EPSILON_S = 0.050
 
 # Timestamp handling
@@ -219,7 +222,13 @@ def _hf_repo_info(repo_id: str, revision: str) -> _DatasetRepositoryInformation:
     """Resolve the immutable commit sha and license for a HF dataset repo."""
     url = f"https://huggingface.co/api/datasets/{repo_id}/revision/{revision}"
     with urllib.request.urlopen(_hugging_face_request(url), timeout=60) as response:
-        repository_information = json.loads(response.read().decode())
+        try:
+            repository_information = json.loads(response.read().decode())
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"Hugging Face repository response for {repo_id}@{revision} is not valid "
+                f"JSON: {error}"
+            ) from error
     if not isinstance(repository_information, dict):
         raise ValueError("Hugging Face repository response is not a JSON object")
     resolved_revision = repository_information.get("sha")
@@ -227,6 +236,8 @@ def _hf_repo_info(repo_id: str, revision: str) -> _DatasetRepositoryInformation:
         raise ValueError(
             f"Hugging Face did not resolve {repo_id}@{revision} to an immutable commit"
         )
+    if not re.fullmatch(r"[0-9a-f]{7,64}", resolved_revision):
+        raise ValueError(f"Hugging Face returned a malformed commit sha for {repo_id}@{revision}")
     card_data = repository_information.get("cardData")
     license_name = card_data.get("license") if isinstance(card_data, dict) else None
     return {
@@ -238,13 +249,70 @@ def _hf_repo_info(repo_id: str, revision: str) -> _DatasetRepositoryInformation:
 def _hf_tree(repo_id: str, revision: str, path: str) -> list[dict]:
     """List files under a HF dataset tree path (recursive)."""
     url = f"https://huggingface.co/api/datasets/{repo_id}/tree/{revision}/{path}?recursive=true"
-    with urllib.request.urlopen(_hugging_face_request(url), timeout=60) as response:
-        tree_entries = json.loads(response.read().decode())
-    if not isinstance(tree_entries, list) or not all(
-        isinstance(tree_entry, dict) for tree_entry in tree_entries
-    ):
-        raise ValueError(f"Hugging Face tree response for {path!r} is not a list of objects")
-    return tree_entries
+    initial_url_parts = urlsplit(url)
+    initial_origin = (initial_url_parts.scheme, initial_url_parts.netloc)
+    all_tree_entries: list[dict] = []
+    seen_paths: set[str] = set()
+    visited_urls: set[str] = set()
+    next_url: str | None = url
+    while next_url is not None:
+        if next_url in visited_urls:
+            raise ValueError(
+                f"Hugging Face tree response for {repo_id}@{revision} path {path!r} "
+                f"repeated an already fetched pagination URL: {next_url!r}"
+            )
+        try:
+            next_url_parts = urlsplit(next_url)
+        except ValueError as error:
+            raise ValueError(
+                f"Hugging Face tree response for {repo_id}@{revision} path {path!r} "
+                f"contains an invalid pagination URL: {next_url!r}"
+            ) from error
+        next_origin = (next_url_parts.scheme, next_url_parts.netloc)
+        if next_origin != initial_origin:
+            raise ValueError(
+                f"Hugging Face tree response for {repo_id}@{revision} path {path!r} "
+                f"contains a pagination URL with a different scheme and host: {next_url!r}"
+            )
+        visited_urls.add(next_url)
+        with urllib.request.urlopen(_hugging_face_request(next_url), timeout=60) as response:
+            try:
+                tree_entries = json.loads(response.read().decode())
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    f"Hugging Face tree response for {repo_id}@{revision} path {path!r} is not "
+                    f"valid JSON: {error}"
+                ) from error
+            link_header = response.headers.get("Link")
+        if not isinstance(tree_entries, list) or not all(
+            isinstance(tree_entry, dict) for tree_entry in tree_entries
+        ):
+            raise ValueError(f"Hugging Face tree response for {path!r} is not a list of objects")
+        for tree_entry in tree_entries:
+            tree_entry_path = tree_entry.get("path")
+            if isinstance(tree_entry_path, str):
+                if tree_entry_path in seen_paths:
+                    continue
+                seen_paths.add(tree_entry_path)
+            all_tree_entries.append(tree_entry)
+
+        next_url = None
+        for link_entry in (link_header or "").split(","):
+            link_match = re.fullmatch(r"\s*<([^>]+)>\s*;\s*(.*)", link_entry)
+            if link_match is None:
+                continue
+            relation_match = re.search(
+                r"(?:^|;)\s*rel\s*=\s*(?:\"([^\"]+)\"|([^;\s]+))",
+                link_match.group(2),
+                flags=re.IGNORECASE,
+            )
+            if relation_match is None:
+                continue
+            relations = (relation_match.group(1) or relation_match.group(2)).split()
+            if any(relation.lower() == "next" for relation in relations):
+                next_url = link_match.group(1)
+                break
+    return all_tree_entries
 
 
 def _hugging_face_request(url: str) -> urllib.request.Request:
@@ -268,7 +336,12 @@ def _fetch_info_json(repo_id: str, revision: str, cache_dir: Path) -> dict:
         raise RuntimeError("meta/info.json not found; not a LeRobot v3 repository")
     load_url = f"https://huggingface.co/datasets/{repo_id}/resolve/{revision}/meta/info.json"
     with urllib.request.urlopen(_hugging_face_request(load_url), timeout=120) as response:
-        dataset_information = json.loads(response.read().decode())
+        try:
+            dataset_information = json.loads(response.read().decode())
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"LeRobot meta/info.json for {repo_id}@{revision} is not valid JSON: {error}"
+            ) from error
     if not isinstance(dataset_information, dict):
         raise ValueError("LeRobot meta/info.json is not a JSON object")
     (cache_dir / "meta").mkdir(parents=True, exist_ok=True)
@@ -313,11 +386,12 @@ def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _S
     if (
         isinstance(frames_per_second, bool)
         or not isinstance(frames_per_second, int | float)
+        or not math.isfinite(frames_per_second)
         or frames_per_second <= 0
     ):
         raise ValueError(
             f"LeRobot meta/info.json has invalid fps={frames_per_second!r}; "
-            "expected a positive number"
+            "FPS must be finite and positive"
         )
     data_path_template = dataset_information.get("data_path")
     if not isinstance(data_path_template, str) or not data_path_template.strip():
@@ -545,7 +619,7 @@ def import_lerobot_dataset(
         raise ValueError("camera_keys must not contain duplicates")
 
     repository_information = _hf_repo_info(normalized_dataset_repo, normalized_revision)
-    cache_directory = output_dir / "_lerobot_cache"
+    cache_directory = output_dir / "_lerobot_cache" / repository_information["sha"]
     source_archive = _ensure_source_archive(
         DatasetSource(
             repo_id=normalized_dataset_repo,
@@ -761,7 +835,10 @@ def _convert_single_episode(
         local_video_path = (
             cache_directory
             / "videos"
-            / (f"{camera_key.replace('/', '_').replace('.', '_')}-chunk{video_chunk_index}.mp4")
+            / (
+                f"{camera_key.replace('/', '_').replace('.', '_')}"
+                f"-chunk{video_chunk_index}-file{video_file_index}.mp4"
+            )
         )
         if not local_video_path.exists():
             _download_file(f"{dataset_base_url}/{video_relative_path}", local_video_path)

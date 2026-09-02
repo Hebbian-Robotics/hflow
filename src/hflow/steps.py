@@ -440,7 +440,6 @@ class RegisteredEnrichment:
     name: str
     function: EnrichmentFunction
     requires: frozenset[str]
-    uses: str | None
     version: StepVersion
 
 
@@ -457,6 +456,5 @@ class RegisteredCheck:
     function: CheckFunction
     critical: bool
     requires: frozenset[str]
-    uses: str | None
     version: StepVersion
     gate: Gate | None = None

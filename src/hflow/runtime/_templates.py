@@ -301,7 +301,8 @@ enabled stage set, then trigger only those sub-DAGs, chained sequentially
 -- no user venv, no hflow import.
 
 Trigger conf: {"uris": [...], "profile": "full", "mode": "batch"|"online",
-"batch_count": optional int, "all_stages": optional bool}.
+"batch_count": optional int, "all_stages": optional bool,
+"step_names": optional list[str]}.
 "uris"/"mode"/"batch_count"/"all_stages" pass through to
 every triggered sub-DAG; mode "online" is the latency-first lane (one run per
 episode as it lands): each sub-DAG processes the conf's uris as one immediate
@@ -358,6 +359,8 @@ staggered near-equal-byte shards, `online` is the latency-first lane (one
 immediate run, no batching, no stagger); `batch_count`: optional override;
 `all_stages`: run every stage over everything it is handed instead of only
 what the catalog does not already record as current.
+`step_names`: run only those registered checks, enrichments, or media steps;
+sync still runs first when the profile includes it.
 
 Each sub-DAG (`$sync_dag_id`, `$meta_dag_id`, `$labels_dag_id`,
 `$media_dag_id`) is also directly triggerable with the same conf for
@@ -379,6 +382,7 @@ per-stage reruns -- e.g. a re-label pass over already-canonical episodes.
         "mode": "batch",
         "batch_count": None,
         "all_stages": False,
+        "step_names": None,
     },
 )
 def master_ingest():
@@ -431,6 +435,8 @@ def master_ingest():
                 "mode": "{{ params.mode }}",
                 "batch_count": "{{ params.batch_count }}",
                 "all_stages": "{{ params.all_stages }}",
+                "step_names": "{{ params.step_names }}",
+                "enabled_stage_names": enabled_stage_names,
             },
             wait_for_completion=True,
             deferrable=True,
@@ -473,7 +479,8 @@ plan -> process_batch (dynamically mapped) -> $gate_name, all via
 never meet Airflow's pins). Imports live inside the function bodies because
 the operator extracts each body to a temp file; only JSON-able data crosses
 task borders. Trigger conf: {"uris": [...], "mode": "batch"|"online",
-"batch_count": optional int, "all_stages": optional bool}.
+"batch_count": optional int, "all_stages": optional bool,
+"step_names": optional list[str]}.
 """
 
 from airflow.sdk import dag, task
@@ -493,6 +500,7 @@ user dependencies never meet Airflow's pins.
 `mode`: `batch` (bin-packed, staggered shards) or `online` (one immediate
 latency-first run); `batch_count`: optional override; `all_stages`: run every
 uri handed over instead of only the ones this stage still owes work on.
+`step_names`: run only the named registered steps assigned to this stage.
 """
 
 
@@ -504,11 +512,25 @@ uri handed over instead of only the ones this stage still owes work on.
     tags=["$pipeline_tag", "stage:$stage_name"],
     schedule=None,
     render_template_as_native_obj=True,
-    params={"uris": [], "mode": "batch", "batch_count": None, "all_stages": False},
+    params={
+        "uris": [],
+        "mode": "batch",
+        "batch_count": None,
+        "all_stages": False,
+        "step_names": None,
+        "enabled_stage_names": ["$stage_name"],
+    },
 )
 def ingest_stage():
     @task.external_python(python=$venv_python, expect_airflow=False, skip_on_exit_code=99$task_queue_argument)
-    def plan(uris, mode, batch_count, all_stages):
+    def plan(
+        uris,
+        mode,
+        batch_count,
+        all_stages,
+        step_names=None,
+        enabled_stage_names=("$stage_name",),
+    ):
         """Narrow uris to what this stage still owes, then bin-pack them.
 
         The lane semantics live in hflow.stage_execution (one owner for every
@@ -529,6 +551,27 @@ def ingest_stage():
         # The conf vocabulary is parsed at the library boundary, like mode.
         # This task only feeds it what Airflow rendered.
         all_stages = parse_conf_flag(all_stages)
+        if all_stages and step_names is not None and "$stage_name" != "sync":
+            import os
+
+            from hflow.app import DATA_ROOT_ENVIRONMENT_VARIABLE
+            from hflow.stage_execution import (
+                load_pipeline_application,
+                require_application_data_root,
+                resolve_step_names_for_stage,
+                resolve_user_pipeline_path,
+            )
+
+            expected_data_root = $data_root
+            os.environ[DATA_ROOT_ENVIRONMENT_VARIABLE] = expected_data_root
+            planning_app = load_pipeline_application(
+                resolve_user_pipeline_path($pipeline_filename), "$app_variable"
+            )
+            require_application_data_root(planning_app, expected_data_root)
+            if resolve_step_names_for_stage(
+                planning_app, step_names, enabled_stage_names, "$stage_name"
+            ) == frozenset():
+                raise SystemExit(99)
 $stage_plan_filter        return plan_stage_batches(
             [str(uri) for uri in uris],
             mode=mode,
@@ -537,7 +580,7 @@ $stage_plan_filter        return plan_stage_batches(
         )
 
     @task.external_python(python=$venv_python, expect_airflow=False$task_queue_argument)
-    def process_batch(batch, orchestrator_run_id):
+    def process_batch(batch, orchestrator_run_id, step_names, enabled_stage_names):
         """Sleep the stagger delay, then run this sub-DAG's stage on every episode.
 
         The pipeline-loading contract and the per-episode accounting loop live
@@ -557,6 +600,7 @@ $stage_plan_filter        return plan_stage_batches(
             load_pipeline_application,
             process_stage_batch,
             require_application_data_root,
+            resolve_step_names_for_stage,
             resolve_user_pipeline_path,
         )
 
@@ -570,7 +614,16 @@ $stage_plan_filter        return plan_stage_batches(
         pipeline_path = resolve_user_pipeline_path($pipeline_filename)
         app = load_pipeline_application(pipeline_path, "$app_variable")
         require_application_data_root(app, expected_data_root)
-        return process_stage_batch(app, batch["items"], "$stage_name", orchestrator_run_id)
+        stage_step_names = resolve_step_names_for_stage(
+            app, step_names, enabled_stage_names, "$stage_name"
+        )
+        return process_stage_batch(
+            app,
+            batch["items"],
+            "$stage_name",
+            orchestrator_run_id,
+            step_names=stage_step_names,
+        )
 '''
 
 _SUB_DAG_QUARANTINE_GATE = '''\
@@ -610,6 +663,8 @@ _SUB_DAG_FOOTER = """\
         mode="{{ params.mode }}",
         batch_count="{{ params.batch_count }}",
         all_stages="{{ params.all_stages }}",
+        step_names="{{ params.step_names }}",
+        enabled_stage_names="{{ params.enabled_stage_names }}",
     )
     # partial() binds the run id once for every mapped instance: it is the
     # same value for the whole fan-out, and only expand()'s argument varies.
@@ -617,7 +672,11 @@ _SUB_DAG_FOOTER = """\
     # reports for this stage, so a catalog row joins straight to the run the
     # UI is drawing. Rendering happens DAG-side, before the external-python
     # callable is invoked, which is the only way in (expect_airflow=False).
-    batch_counts = process_batch.partial(orchestrator_run_id="{{ run_id }}").expand(batch=batches)
+    batch_counts = process_batch.partial(
+        orchestrator_run_id="{{ run_id }}",
+        step_names="{{ params.step_names }}",
+        enabled_stage_names="{{ params.enabled_stage_names }}",
+    ).expand(batch=batches)
     # The mapped task's aggregated XCom is a lazy proxy that cannot cross the
     # external-python pickle boundary (it references the in-DAG callable), so
     # the gate pulls it via a template: `| list` materializes plain dicts
@@ -701,6 +760,7 @@ OUTSTANDING_PLAN_FILTER_TEMPLATE = Template(
             from hflow.stage_execution import (
                 load_pipeline_application,
                 require_application_data_root,
+                resolve_step_names_for_stage,
                 resolve_user_pipeline_path,
             )
             from hflow.stage_planning import outstanding_stage_uris
@@ -716,11 +776,18 @@ OUTSTANDING_PLAN_FILTER_TEMPLATE = Template(
                 resolve_user_pipeline_path($pipeline_filename), "$app_variable"
             )
             require_application_data_root(planning_app, expected_data_root)
+            stage_step_names = resolve_step_names_for_stage(
+                planning_app,
+                step_names,
+                enabled_stage_names,
+                "$stage_name",
+            )
             uris = outstanding_stage_uris(
                 planning_app,
                 [str(uri) for uri in uris],
                 Stage("$stage_name"),
                 data_root=expected_data_root,
+                step_names=stage_step_names,
             )
             if not uris:
                 raise SystemExit(99)  # skip_on_exit_code: whole stage SKIPPED

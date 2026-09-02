@@ -28,8 +28,8 @@ scope** means it is deliberately not part of this repository.
 | Input formats and triggering | Data from multiple sources and vendors lands in a bucket | The pipeline consumes MCAP; a first-party LeRobot Dataset v3 importer converts its supported video/state/action subset to canonical MCAP. Runs are triggered explicitly through the SDK/CLI or Airflow API; there is no bucket/filesystem watcher | **Simplified; more importers deferred** |
 | Canonical episode format | MCAP, H.264 GOPs matched to read patterns, topic-group chunking, and version stamps | An independently specified, standard-MCAP convention covering the same ground (GOP presets, topic-group chunking, version stamps); interoperability with standard readers is tested, but compatibility with Dyna's undisclosed internal layout is not claimed | **Implemented independently** |
 | Ingestion graph and gates | Airflow transformation, quality-check, and enrichment stages with run profiles and critical/non-critical steps | The stage graph, profiles, quarantine gates, local Compose runtime, and bring-your-own Airflow bundle are implemented | **Implemented at small scale** |
-| Checkpoint and replay | Durable pipeline state, checkpointable multi-day runs, replay from any step, cross-DAG artifact sharing, and selective reprocessing | Durable outputs, a sync completion marker, versioned catalog facts, stage-profile reruns that reuse the previous run's published canonical episode (cross-run artifact sharing through the data root), and `hflow stale` for selective reprocessing; no general arbitrary-step checkpoint/replay engine | **Partial; arbitrary-step replay deferred** |
-| Per-step compute | Resources and worker allocation tailored to each step | `requires=`/`uses=` record intent, validate configured endpoint aliases, and put cheaper steps first; they do not yet route tasks to heterogeneous worker pools or probe GPU/endpoint health | **Deferred** |
+| Checkpoint and replay | Durable pipeline state, checkpointable multi-day runs, replay from any step, cross-DAG artifact sharing, and selective reprocessing | Durable outputs, a sync completion marker, versioned catalog facts, stage-profile reruns, and explicit selection of registered steps with catalog-aware outstanding-work planning; no general content-addressed checkpoint for every step artifact | **Partial; general artifact checkpoints deferred** |
+| Per-step compute | Resources and worker allocation tailored to each step | `requires=` records intent and puts cheaper steps first; it does not yet route tasks to heterogeneous worker pools or probe GPU/model-service health | **Deferred** |
 | Batch scheduling | Byte-balanced batches and staggered starts, plus joint optimization against network, I/O, database, and worker limits | First-fit-decreasing byte balancing and deterministic stagger are implemented; the joint optimizer is not | **Simplified; optimizer deferred** |
 | Catalog and curation | Transactional database, CDC, analytical warehouse, and a memory-mapped training manifest | Parquet catalog plus DuckDB SQL and Parquet manifests; no database/CDC/warehouse stack and no training dataloader | **Simplified; training loader out of scope** |
 | Corpus caching and fleet orchestration | Alluxio/NVMe cache warming and training-fleet orchestration at million-hour scale | No distributed corpus cache, cache warmer, Slurm/Ansible fleet layer, or topology-aware training orchestration | **Out of scope** |
@@ -162,13 +162,11 @@ The built-in transform resamples streams onto a common grid, computes derived si
 
 Each DAG step should get resources matched to its own requirements (Dyna's
 article counts per-step tailoring among the DAG rewrite's wins). In HFlow, a
-step can declare `requires={"gpu"}` and `uses="judge"` (a named endpoint
-alias), but the current implementation uses those declarations only to validate
-that named endpoint aliases are configured and to order plain steps before
-resource-declaring steps. It does **not** yet probe endpoint health or GPU
-visibility, or route individual steps to heterogeneous Airflow worker pools. A
-bring-your-own Airflow deployment must currently arrange those resources
-outside HFlow.
+step can declare `requires={"gpu"}`; the current implementation uses that
+declaration to order plain steps before resource-declaring steps. It does
+**not** yet probe model-service health or GPU visibility, or route individual
+steps to heterogeneous Airflow worker pools. A bring-your-own Airflow
+deployment must currently arrange those resources outside HFlow.
 
 ### Batching
 
@@ -246,10 +244,13 @@ Enrichment generates model-derived features -- performance labels, video caption
 (the classes Dyna's article names; the mechanisms are unspecified there).
 
 HFlow supports frames-only VLM usage in v1: most models and the OpenAI-compatible protocol don't
-natively support video, so the honest unit is the frame. The user extracts frames explicitly
-(`ep.frames(fps=...)`), calls their own client (any OpenAI-compatible endpoint, hosted or
-self-run vLLM/Ollama; each step names its endpoint), and owns the aggregation of per-frame
-answers. There is no bundled VLM client; examples show plain `openai` calls. Two helpers survive
+natively support video, so the honest unit is the frame. A generic model step extracts frames
+explicitly (`ep.frames(fps=...)`), calls its own client (hosted or self-run vLLM/Ollama), and owns
+its endpoint, credentials, model, prompt, and aggregation policy. The opt-in
+`hflow.build_ai_vlm_checks.register_hand_visibility` and
+`register_active_manipulation` integrations bundle one published methodology
+on top of the optional OpenAI-compatible client; they still require the caller
+to supply endpoint and model configuration per check. Two helpers survive
 because they encode non-obvious value: the **contact sheet** (N timestamped frames composited
 into one image; works even on single-image models, cheap on vision tokens) and frame extraction
 itself. Missing/occluded hand positions -- one of the issue classes Dyna's article names -- is
@@ -293,13 +294,14 @@ HFlow's small-scale durability model is drawn from production experience with
 Pareto and targets the same requirements Dyna's article states: durable
 externally-stored pipeline state, checkpointable multi-day runs, replay from
 any step, and selective reprocessing (the article leaves the mechanisms
-unspecified). Today, canonical outputs and catalog facts are durable,
-the sync stage has a persisted completion marker, and run profiles can replay a
-stage -- a later run (a relabel pass, a different profile) consumes the
-canonical episode a previous run published, which is cross-DAG artifact
-sharing in miniature, through the data root. A general content-addressed
-checkpoint for every user step and replay from an arbitrary step remain design
-targets rather than current guarantees:
+unspecified). Today, canonical outputs and catalog facts are durable, the sync
+stage has a persisted completion marker, and run profiles can replay a stage.
+Direct and hosted executors can also select registered steps by name;
+catalog-aware planning then runs only selected steps whose current versions
+have no settled outcome. A later run consumes the canonical episode a previous
+run published, which is cross-DAG artifact sharing in miniature through the
+data root. A general content-addressed checkpoint for every user-step artifact
+remains a design target rather than a current guarantee:
 
 - One local-directory-or-bucket **data root** holds everything durable; pipeline processes are stateless. Bucket roots download through an etag-validated per-worker mirror and publish canonical episodes and artifacts back to the store. Catalog appends use store-native create-if-absent writes.
 - **Content-addressed artifacts (target)**: derived outputs will be addressed by

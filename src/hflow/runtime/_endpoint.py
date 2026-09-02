@@ -57,11 +57,17 @@ def resolve_remote_endpoint(
     base_url = airflow_url or environment.get(AIRFLOW_URL_ENVIRONMENT_VARIABLE)
     if not base_url:
         return None
-    if urlsplit(base_url).scheme not in ("http", "https"):
+    parsed_base_url = urlsplit(base_url)
+    if parsed_base_url.scheme not in ("http", "https"):
         # Parse at the boundary: a scheme-less URL would otherwise surface
         # as a raw urllib ValueError traceback deep inside the first request.
         raise ValueError(
             f"remote Airflow URL {base_url!r} needs an http:// or https:// scheme "
+            f"(from --airflow-url or {AIRFLOW_URL_ENVIRONMENT_VARIABLE})"
+        )
+    if not parsed_base_url.hostname:
+        raise ValueError(
+            f"remote Airflow URL {base_url!r} needs a host "
             f"(from --airflow-url or {AIRFLOW_URL_ENVIRONMENT_VARIABLE})"
         )
 
@@ -122,7 +128,7 @@ def describe_remote_status(endpoint: RemoteRuntimeEndpoint, *, run_limit: int = 
         lines.append("runs:     none recorded")
     else:
         for run in reversed(recent_runs):  # print oldest-to-newest of the window
-            run_id = run.get("dag_run_id", "<unknown>")
-            run_state = run.get("state", "<unknown>")
+            run_id = run.dag_run_id or "<unknown>"
+            run_state = run.state or "<unknown>"
             lines.append(f"run:      {run_id} [{run_state}]")
     return "\n".join(lines)

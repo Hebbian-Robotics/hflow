@@ -99,6 +99,148 @@ def test_whole_pipeline_runs_without_quarantine(
     assert "camera_blackout" in summary_text
 
 
+def test_report_returns_a_named_check_and_explains_missing_names(
+    report_and_app: tuple[hflow.TestReport, hflow.App],
+) -> None:
+    report, _application = report_and_app
+
+    named_check_run = report.check("joint_smoothness")
+
+    assert named_check_run.check.name == "joint_smoothness"
+    assert named_check_run.result is not None
+    with pytest.raises(KeyError) as missing_check_error:
+        report.check("unregistered_check")
+    assert "test report has no check named 'unregistered_check'" in str(missing_check_error.value)
+    assert "'joint_smoothness'" in str(missing_check_error.value)
+
+
+def test_many_runs_distinct_episodes_and_preserves_input_order(tmp_path: Path) -> None:
+    source_paths = tuple(
+        synthesize_episode(
+            tmp_path / "sources" / f"episode_{episode_number:04d}.mcap",
+            SyntheticEpisodeSpec(
+                duration_s=0.1,
+                cameras=(),
+                task=f"task-{episode_number}",
+            ),
+        )
+        for episode_number in range(3)
+    )
+    application = hflow.App(
+        "batch-test",
+        data_root=tmp_path / "data",
+        default_checks=(),
+    )
+
+    @application.check(version="1")
+    def episode_task(episode: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"episode/task": str(episode.metadata["task"])})
+
+    requested_source_paths = (source_paths[2], source_paths[0], source_paths[1])
+    progress_events: list[hflow.TestManyProgress] = []
+    batch_report = application.test_many(
+        requested_source_paths,
+        max_workers=2,
+        stages=(hflow.Stage.SYNC, hflow.Stage.META),
+        on_progress=progress_events.append,
+    )
+    reports = batch_report.reports
+
+    assert [report.source_path for report in reports] == list(requested_source_paths)
+    assert batch_report.has_errors is False
+    assert [progress.completed_count for progress in progress_events] == [1, 2, 3]
+    assert {progress.total_count for progress in progress_events} == {3}
+    assert {progress.input_index for progress in progress_events} == {0, 1, 2}
+    assert all(
+        progress.report.source_path == requested_source_paths[progress.input_index]
+        for progress in progress_events
+    )
+    measured_tasks: list[str] = []
+    for report in reports:
+        task_check_run = report.check("episode_task")
+        assert task_check_run.result is not None
+        measured_tasks.append(str(task_check_run.result.measurements["episode/task"]))
+    assert measured_tasks == ["task-2", "task-0", "task-1"]
+
+
+def test_many_refuses_duplicate_source_identities(tmp_path: Path) -> None:
+    source_path = synthesize_episode(
+        tmp_path / "episode.mcap",
+        SyntheticEpisodeSpec(duration_s=0.1, cameras=()),
+    )
+    application = hflow.App("batch-test", data_root=tmp_path / "data", default_checks=())
+
+    with pytest.raises(ValueError, match="duplicate episode source identity"):
+        application.test_many((source_path, source_path), max_workers=2)
+
+
+@pytest.mark.parametrize("invalid_max_workers", (0, -1, True))
+def test_many_refuses_invalid_concurrency_limits(
+    tmp_path: Path,
+    invalid_max_workers: int,
+) -> None:
+    application = hflow.App("batch-test", data_root=tmp_path / "data", default_checks=())
+
+    with pytest.raises(ValueError, match="max_workers must be a positive integer"):
+        application.test_many((), max_workers=invalid_max_workers)
+
+
+def test_many_stops_scheduling_new_episodes_after_preparation_failure(
+    tmp_path: Path,
+) -> None:
+    first_valid_source = synthesize_episode(
+        tmp_path / "sources" / "first-valid.mcap",
+        SyntheticEpisodeSpec(duration_s=0.1, cameras=()),
+    )
+    source_that_must_not_start = synthesize_episode(
+        tmp_path / "sources" / "must-not-start.mcap",
+        SyntheticEpisodeSpec(duration_s=0.1, cameras=()),
+    )
+    missing_source = tmp_path / "sources" / "missing.mcap"
+    application = hflow.App("batch-test", data_root=tmp_path / "data", default_checks=())
+
+    with pytest.raises(FileNotFoundError):
+        application.test_many(
+            (missing_source, first_valid_source, source_that_must_not_start),
+            max_workers=2,
+            stages=(hflow.Stage.SYNC,),
+        )
+
+    test_run_directories = tuple(application.workspace.test_runs_root.workspace.iterdir())
+    assert not any(
+        run_directory.name.startswith(f"{source_that_must_not_start.stem}-")
+        for run_directory in test_run_directories
+    )
+
+
+def test_many_stops_scheduling_new_episodes_after_progress_failure(tmp_path: Path) -> None:
+    source_paths = tuple(
+        synthesize_episode(
+            tmp_path / "sources" / f"episode_{episode_number}.mcap",
+            SyntheticEpisodeSpec(duration_s=0.1, cameras=()),
+        )
+        for episode_number in range(3)
+    )
+    application = hflow.App("batch-test", data_root=tmp_path / "data", default_checks=())
+
+    def reject_first_progress(_progress: hflow.TestManyProgress) -> None:
+        raise RuntimeError("progress consumer failed")
+
+    with pytest.raises(RuntimeError, match="progress consumer failed"):
+        application.test_many(
+            source_paths,
+            max_workers=2,
+            stages=(hflow.Stage.SYNC,),
+            on_progress=reject_first_progress,
+        )
+
+    test_run_directories = tuple(application.workspace.test_runs_root.workspace.iterdir())
+    assert not any(
+        run_directory.name.startswith(f"{source_paths[2].stem}-")
+        for run_directory in test_run_directories
+    )
+
+
 def test_ported_user_check_saw_real_joints(
     report_and_app: tuple[hflow.TestReport, hflow.App],
 ) -> None:
@@ -177,7 +319,25 @@ def test_canonical_episode_extracts_exact_source_frame_indices(
             frame_indices=selected_frame_indices,
         )
 
+        numpy_frame_indices = [
+            np.int32(0),
+            np.int64(1),
+            np.uint32(2),
+            np.uint64(7),
+            np.int64(8),
+            np.uint32(29),
+        ]
+        numpy_frames = episode.frames_at_indices(
+            camera_topic,
+            frame_indices=numpy_frame_indices,
+        )
+
         assert [frame.log_time_ns for frame in selected_frames] == expected_log_times.tolist()
+        assert [frame.log_time_ns for frame in numpy_frames] == expected_log_times.tolist()
+        assert [frame.path.read_bytes() for frame in numpy_frames] == [
+            frame.path.read_bytes() for frame in selected_frames
+        ]
+        assert numpy_frames == selected_frames
         assert all(frame.path.read_bytes()[:2] == b"\xff\xd8" for frame in selected_frames)
         assert (
             episode.frames_at_indices(
@@ -186,6 +346,24 @@ def test_canonical_episode_extracts_exact_source_frame_indices(
             )
             == selected_frames
         )
+
+
+@pytest.mark.parametrize(
+    "invalid_frame_indices",
+    [[True], [np.bool_(True)], [3.0], [np.float64(3.0)]],
+)
+def test_canonical_episode_rejects_non_integer_frame_indices(
+    report_and_app: tuple[hflow.TestReport, hflow.App],
+    invalid_frame_indices: list[Any],
+) -> None:
+    report, _app = report_and_app
+    with hflow.Episode(report.canonical_path) as episode:
+        camera_topic = next(topic for topic in episode.cameras if "overhead_cam" in topic)
+        with pytest.raises(ValueError):
+            episode.frames_at_indices(
+                camera_topic,
+                frame_indices=invalid_frame_indices,
+            )
 
 
 def test_arrow_export(report_and_app: tuple[hflow.TestReport, hflow.App]) -> None:
@@ -263,12 +441,10 @@ def test_crashing_check_is_infrastructure_not_data(
 def test_resource_declaring_checks_run_after_plain_ones(
     state_only_source_episode: Path, tmp_path: Path
 ) -> None:
-    app = hflow.App(
-        "ordered-pipeline", data_root=tmp_path, endpoints={"judge": "http://localhost:9"}
-    )
+    app = hflow.App("ordered-pipeline", data_root=tmp_path)
     execution_order: list[str] = []
 
-    @app.check(version="1", uses="judge")
+    @app.check(version="1", requires=("vision-model",))
     def expensive(ep: hflow.Episode) -> hflow.CheckResult:
         execution_order.append("expensive")
         return hflow.CheckResult()
@@ -280,97 +456,6 @@ def test_resource_declaring_checks_run_after_plain_ones(
 
     app.test(state_only_source_episode, verbose=False)
     assert execution_order == ["cheap", "expensive"]
-
-
-def test_missing_provider_alias_fails_preflight(
-    state_only_source_episode: Path, tmp_path: Path
-) -> None:
-    app = hflow.App("misconfigured", data_root=tmp_path)
-
-    @app.check(version="1", uses="judge")
-    def needs_endpoint(ep: hflow.Episode) -> hflow.CheckResult:
-        return hflow.CheckResult()
-
-    with pytest.raises(ValueError, match="judge") as error_info:
-        app.test(state_only_source_episode, verbose=False)
-    # The failure names the environment escape hatch a deployment would use.
-    assert "HFLOW_ENDPOINT_JUDGE" in str(error_info.value)
-
-
-def test_endpoint_alias_satisfied_by_environment_only(
-    state_only_source_episode: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A deployment (or control plane) supplies an endpoint alias through
-    HFLOW_ENDPOINT_<ALIAS>: preflight passes and the running step sees the
-    injected value, with nothing endpoint-shaped in the pipeline file."""
-    monkeypatch.setenv("HFLOW_ENDPOINT_JUDGE", "http://injected:8000/v1")
-    app = hflow.App("env-endpoints", data_root=tmp_path)
-    endpoint_values_seen_by_step: list[str] = []
-
-    # Endpoint configuration affects behavior, so its compatibility is part
-    # of the version the pipeline author declares.
-    @app.check(uses="judge", version="v1")
-    def needs_endpoint(ep: hflow.Episode) -> hflow.CheckResult:
-        endpoint_values_seen_by_step.append(app.endpoints["judge"])
-        return hflow.CheckResult()
-
-    report = app.test(state_only_source_episode, verbose=False)
-    assert not report.has_errors
-    assert endpoint_values_seen_by_step == ["http://injected:8000/v1"]
-
-
-def test_endpoint_environment_override_wins_over_the_literal(
-    state_only_source_episode: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("HFLOW_ENDPOINT_JUDGE", "http://deployment-injected:9000")
-    app = hflow.App(
-        "env-endpoints", data_root=tmp_path, endpoints={"judge": "http://from-code:8000"}
-    )
-    endpoint_values_seen_by_step: list[str] = []
-
-    @app.check(uses="judge", version="v1")
-    def needs_endpoint(ep: hflow.Episode) -> hflow.CheckResult:
-        endpoint_values_seen_by_step.append(app.endpoints["judge"])
-        return hflow.CheckResult()
-
-    app.test(state_only_source_episode, verbose=False)
-    assert endpoint_values_seen_by_step == ["http://deployment-injected:9000"]
-
-    # Unsetting the override restores the pipeline literal on the next run:
-    # resolution rebuilds from the pristine literals, never mutates them.
-    monkeypatch.delenv("HFLOW_ENDPOINT_JUDGE")
-    app.test(state_only_source_episode, verbose=False)
-    assert endpoint_values_seen_by_step[-1] == "http://from-code:8000"
-
-
-def test_endpoints_mapping_refuses_direct_mutation(tmp_path: Path) -> None:
-    """The resolved mapping is rebuilt at every run start, so a direct
-    mutation would be silently discarded -- it must refuse loudly instead."""
-    from typing import cast
-
-    app = hflow.App("read-only", data_root=tmp_path, endpoints={"judge": "http://a:1"})
-    with pytest.raises(TypeError):
-        cast("dict[str, str]", app.endpoints)["judge"] = "http://mutated:2"
-
-
-def test_colliding_endpoint_alias_names_are_refused(
-    state_only_source_episode: Path, tmp_path: Path
-) -> None:
-    """HFLOW_ENDPOINT_* naming is lossy (non-alphanumerics collapse to '_'):
-    two aliases mapping to one variable would be silently co-overridden, so
-    preflight refuses the ambiguity loudly."""
-    app = hflow.App(
-        "colliding",
-        data_root=tmp_path,
-        endpoints={"judge-v1": "http://a:1", "judge.v1": "http://b:2"},
-    )
-
-    @app.check(uses="judge-v1", version="v1")
-    def needs_endpoint(ep: hflow.Episode) -> hflow.CheckResult:
-        return hflow.CheckResult()
-
-    with pytest.raises(ValueError, match="HFLOW_ENDPOINT_JUDGE_V1"):
-        app.test(state_only_source_episode, verbose=False)
 
 
 def test_check_claiming_an_episode_column_refuses_the_append(

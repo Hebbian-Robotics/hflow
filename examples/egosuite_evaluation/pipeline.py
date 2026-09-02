@@ -12,13 +12,12 @@ import argparse
 import concurrent.futures
 import hashlib
 import importlib
-import json
 import os
 import threading
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, assert_never
 
 import hflow
 from examples.egosuite_evaluation.evaluate import (
@@ -30,13 +29,14 @@ from examples.egosuite_evaluation.evaluate import (
 )
 from examples.egosuite_evaluation.judgment import (
     DEFAULT_PROMPT_PATH,
-    HandCountJudgment,
+    HandCountOutcome,
+    ParsedHandCountOutcome,
     ResponseFormat,
+    UnparsedHandCountOutcome,
     evaluate_image_with_model,
     image_file_data_url,
 )
 
-VISION_ENDPOINT_ALIAS = "vision"
 DEFAULT_HFLOW_DATA_ROOT = Path("data/egosuite-evaluation/hflow")
 DEFAULT_OPENAI_COMPATIBLE_BASE_URL = "http://localhost:8000/v1"
 DEFAULT_MODEL_NAME = "model-not-configured"
@@ -44,6 +44,7 @@ MEASUREMENT_PREFIX = "egosuite/hand_count"
 
 
 class PipelineConfiguration(NamedTuple):
+    endpoint: str
     model: str
     api_key_environment_variable: str
     allow_missing_api_key: bool
@@ -83,6 +84,7 @@ def _pipeline_configuration() -> PipelineConfiguration:
     prompt_path = Path(os.environ.get("EGOSUITE_HAND_COUNT_PROMPT", str(DEFAULT_PROMPT_PATH)))
     raw_label_manifest_path = os.environ.get("EGOSUITE_LABEL_MANIFEST")
     return PipelineConfiguration(
+        endpoint=os.environ.get("OPENAI_BASE_URL", DEFAULT_OPENAI_COMPATIBLE_BASE_URL),
         model=os.environ.get("OPENAI_MODEL", DEFAULT_MODEL_NAME),
         api_key_environment_variable=os.environ.get("EGOSUITE_API_KEY_ENV", "OPENAI_API_KEY"),
         allow_missing_api_key=_boolean_environment_variable("EGOSUITE_ALLOW_MISSING_API_KEY"),
@@ -115,17 +117,14 @@ manifest_labels_by_source_episode = (
 app = hflow.App(
     "egosuite-projected-hand-visibility-example",
     data_root=os.environ.get("HFLOW_DATA_ROOT", str(DEFAULT_HFLOW_DATA_ROOT)),
-    endpoints={
-        VISION_ENDPOINT_ALIAS: os.environ.get("OPENAI_BASE_URL", DEFAULT_OPENAI_COMPATIBLE_BASE_URL)
-    },
     default_checks=(),
 )
 
 
-def _check_version() -> str:
+def _check_version() -> hflow.StepVersion:
     version_contract = {
-        "contract": "egosuite-projected-hand-visibility-v1",
         "prompt": pipeline_configuration.prompt,
+        "endpoint": pipeline_configuration.endpoint,
         "model": pipeline_configuration.model,
         "response_format": pipeline_configuration.response_format.value,
         "temperature": pipeline_configuration.temperature,
@@ -140,9 +139,10 @@ def _check_version() -> str:
             else None
         ),
     }
-    serialized_contract = json.dumps(version_contract, sort_keys=True, separators=(",", ":"))
-    contract_digest = hashlib.sha256(serialized_contract.encode()).hexdigest()[:16]
-    return f"egosuite-projected-hand-visibility-v1-{contract_digest}"
+    return hflow.step_version_from_contract(
+        "egosuite-projected-hand-visibility-v1",
+        version_contract,
+    )
 
 
 def labels_for_pipeline_episode(
@@ -177,20 +177,19 @@ def _client_for_current_thread() -> Any:
             f"{pipeline_configuration.api_key_environment_variable} is not set; set "
             "EGOSUITE_ALLOW_MISSING_API_KEY=1 only for an unauthenticated endpoint"
         )
-    endpoint_url = app.endpoints[VISION_ENDPOINT_ALIAS]
-    client_cache_key = (endpoint_url, api_key)
+    client_cache_key = (pipeline_configuration.endpoint, api_key)
     if getattr(_client_by_thread, "cache_key", None) != client_cache_key:
         openai_module = importlib.import_module("openai")
         _client_by_thread.client = openai_module.OpenAI(
             api_key=api_key or "not-needed",
-            base_url=endpoint_url,
+            base_url=pipeline_configuration.endpoint,
             max_retries=pipeline_configuration.max_retries,
         )
         _client_by_thread.cache_key = client_cache_key
     return _client_by_thread.client
 
 
-def _evaluate_frame(extracted_frame: hflow.ExtractedFrame) -> HandCountJudgment:
+def _evaluate_frame(extracted_frame: hflow.ExtractedFrame) -> HandCountOutcome:
     return evaluate_image_with_model(
         client=_client_for_current_thread(),
         model=pipeline_configuration.model,
@@ -205,7 +204,7 @@ def _evaluate_frame(extracted_frame: hflow.ExtractedFrame) -> HandCountJudgment:
 def hand_visibility_check_result(
     labels: Sequence[ProjectedHandFrameLabel],
     extracted_frames: Sequence[hflow.ExtractedFrame],
-    judgments: Sequence[HandCountJudgment],
+    judgments: Sequence[HandCountOutcome],
     *,
     requested_model: str,
 ) -> hflow.CheckResult:
@@ -214,17 +213,19 @@ def hand_visibility_check_result(
     if not (len(labels) == len(extracted_frames) == len(judgments)):
         raise ValueError("labels, extracted frames, and judgments must have equal lengths")
     reference_counts = Counter(label.expected_hand_count for label in labels)
-    predicted_counts = Counter(
-        judgment.predicted_hand_count
-        for judgment in judgments
-        if judgment.predicted_hand_count is not None
-    )
-    valid_count = sum(judgment.predicted_hand_count is not None for judgment in judgments)
-    agreement_count = sum(
-        judgment.predicted_hand_count == label.expected_hand_count
-        for label, judgment in zip(labels, judgments, strict=True)
-        if judgment.predicted_hand_count is not None
-    )
+    predicted_counts: Counter[int] = Counter()
+    valid_count = 0
+    agreement_count = 0
+    for label, judgment in zip(labels, judgments, strict=True):
+        match judgment:
+            case ParsedHandCountOutcome(predicted_hand_count=predicted_hand_count):
+                predicted_counts[predicted_hand_count] += 1
+                valid_count += 1
+                agreement_count += predicted_hand_count == label.expected_hand_count
+            case UnparsedHandCountOutcome():
+                pass
+            case unexpected_judgment:
+                assert_never(unexpected_judgment)
     attempted_count = len(labels)
     measurements: dict[str, hflow.MeasurementValue] = {
         f"{MEASUREMENT_PREFIX}/attempted_count": attempted_count,
@@ -249,40 +250,68 @@ def hand_visibility_check_result(
         measurements[f"{MEASUREMENT_PREFIX}/predicted/{hand_count}"] = predicted_counts[hand_count]
 
     response_models = sorted(
-        {judgment.response_model for judgment in judgments if judgment.response_model is not None}
+        {
+            judgment.response_metadata.response_model
+            for judgment in judgments
+            if judgment.response_metadata.response_model is not None
+        }
     )
     if response_models:
         measurements[f"{MEASUREMENT_PREFIX}/response_models"] = ",".join(response_models)
     usage_totals: dict[str, float] = {}
     for judgment in judgments:
-        for usage_name, usage_value in judgment.usage.items():
+        for usage_name, usage_value in judgment.response_metadata.usage.items():
             if isinstance(usage_value, int | float) and not isinstance(usage_value, bool):
                 usage_totals[usage_name] = usage_totals.get(usage_name, 0.0) + usage_value
     for usage_name, usage_total in usage_totals.items():
         measurements[f"{MEASUREMENT_PREFIX}/usage/{usage_name}"] = usage_total
 
     observations: list[hflow.Observation] = []
+    intervals: list[hflow.Interval] = []
     for label, extracted_frame, judgment in zip(labels, extracted_frames, judgments, strict=True):
         observation_values: dict[str, hflow.MeasurementValue] = {
             "frame_index": label.frame_index,
             "reference_hand_count": label.expected_hand_count,
-            "valid": judgment.predicted_hand_count is not None,
-            "agreement": judgment.predicted_hand_count == label.expected_hand_count,
             "raw_response": judgment.raw_response,
             "requested_model": requested_model,
             "left_in_frame_joint_count": label.left_in_frame_joint_count,
             "right_in_frame_joint_count": label.right_in_frame_joint_count,
             "pose_issue": bool(label.left_hand_issue_reasons or label.right_hand_issue_reasons),
         }
-        if judgment.predicted_hand_count is not None:
-            observation_values["predicted_hand_count"] = judgment.predicted_hand_count
-        if judgment.response_model is not None:
-            observation_values["response_model"] = judgment.response_model
-        if judgment.parse_error is not None:
-            observation_values["parse_error"] = judgment.parse_error
-        for usage_name, usage_value in judgment.usage.items():
+        if judgment.response_metadata.response_model is not None:
+            observation_values["response_model"] = judgment.response_metadata.response_model
+        for usage_name, usage_value in judgment.response_metadata.usage.items():
             if isinstance(usage_value, int | float | str | bool):
                 observation_values[f"usage/{usage_name}"] = usage_value
+        match judgment:
+            case ParsedHandCountOutcome(predicted_hand_count=predicted_hand_count):
+                observation_values["predicted_hand_count"] = predicted_hand_count
+                observation_values["valid"] = True
+                observation_values["agreement"] = predicted_hand_count == label.expected_hand_count
+                if predicted_hand_count != label.expected_hand_count:
+                    intervals.append(
+                        hflow.Interval(
+                            start_ns=extracted_frame.log_time_ns,
+                            end_ns=extracted_frame.log_time_ns,
+                            label=(
+                                f"{MEASUREMENT_PREFIX}/reference_{label.expected_hand_count}_"
+                                f"predicted_{predicted_hand_count}"
+                            ),
+                        )
+                    )
+            case UnparsedHandCountOutcome(parse_error=parse_error):
+                observation_values["valid"] = False
+                observation_values["agreement"] = False
+                observation_values["parse_error"] = parse_error
+                intervals.append(
+                    hflow.Interval(
+                        start_ns=extracted_frame.log_time_ns,
+                        end_ns=extracted_frame.log_time_ns,
+                        label=f"{MEASUREMENT_PREFIX}/unparsed",
+                    )
+                )
+            case unexpected_judgment:
+                assert_never(unexpected_judgment)
         observations.append(
             hflow.Observation(
                 observation_id=f"frame:{label.frame_index}",
@@ -291,24 +320,6 @@ def hand_visibility_check_result(
             )
         )
 
-    intervals: list[hflow.Interval] = []
-    for label, extracted_frame, judgment in zip(labels, extracted_frames, judgments, strict=True):
-        if judgment.predicted_hand_count is None:
-            interval_label = f"{MEASUREMENT_PREFIX}/unparsed"
-        elif judgment.predicted_hand_count != label.expected_hand_count:
-            interval_label = (
-                f"{MEASUREMENT_PREFIX}/reference_{label.expected_hand_count}_"
-                f"predicted_{judgment.predicted_hand_count}"
-            )
-        else:
-            continue
-        intervals.append(
-            hflow.Interval(
-                start_ns=extracted_frame.log_time_ns,
-                end_ns=extracted_frame.log_time_ns,
-                label=interval_label,
-            )
-        )
     tags = [f"{MEASUREMENT_PREFIX}/has_unparsed_output"] if valid_count < attempted_count else []
     return hflow.CheckResult(
         measurements=measurements,
@@ -320,7 +331,7 @@ def hand_visibility_check_result(
 
 @app.check(
     name="egosuite_projected_hand_visibility",
-    uses=VISION_ENDPOINT_ALIAS,
+    requires=("vision-model",),
     version=_check_version(),
 )
 def egosuite_projected_hand_visibility(episode: hflow.Episode) -> hflow.CheckResult:

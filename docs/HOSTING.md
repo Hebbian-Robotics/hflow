@@ -42,9 +42,9 @@ Two rules a hosted workspace must follow:
 
 | artifact | producer | contents |
 |---|---|---|
-| Pipeline manifest (`hflow manifest`, `App.manifest()`) | pipeline author's environment | step names, explicit versions, gate flags, endpoint aliases, pipeline/schema versions -- what a service displays, diffs, and validates without holding the code. Producing it imports (executes) the pipeline declarations, so treat the result as the author's claims. |
-| Bundle manifest (`hflow-bundle.json`) | `hflow up` / `hflow deploy` | the rendered bundle as data: manifest version, kind, hflow version, DAG ids, data root, pipeline filename, app variable, requirements flag, task queue, venv interpreter path. The provisioning/upload contract. |
-| Trigger conf | any REST caller | `{"uris": [...], "profile": ..., "mode": "batch"\|"online", "batch_count": ...}` on Airflow's `dagRuns` endpoint -- already the wire shape a control plane calls. |
+| Pipeline manifest (`hflow manifest`, `App.manifest()`) | pipeline author's environment | step names, explicit versions, gate flags, resource requirements, pipeline/schema versions -- what a service displays, diffs, and validates without holding the code. Producing it imports (executes) the pipeline declarations, so treat the result as the author's claims. |
+| Bundle manifest (`hflow-bundle.json`) | `hflow up` / `hflow deploy` | the rendered bundle as data: manifest version, kind, hflow version, DAG ids, data root, pipeline filename, app variable, requirements flag, task queue, venv interpreter path, and explicitly forwarded environment-variable names. The provisioning/upload contract. |
+| Trigger conf | any REST caller | `{"uris": [...], "profile": ..., "mode": "batch"\|"online", "batch_count": ..., "step_names": [...]}` on Airflow's `dagRuns` endpoint -- already the wire shape a control plane calls. |
 | Run states | Airflow REST | `hflow status --airflow-url ...` (and `hflow.runtime.describe_remote_status`) report health, registration, and recent run states with no local files. |
 | Catalog facts | curation | manifests, coverage reports, and stale lists carry URIs (pointers) and measurements -- not media. |
 
@@ -70,16 +70,17 @@ must not edit. The full set:
 | variable | read by | meaning |
 |---|---|---|
 | `HFLOW_DATA_ROOT` | `hflow.App` (when constructed without `data_root`) | the workspace's data root; the generated DAG tasks export it before importing the pipeline, so one file runs unedited at every vantage |
-| `HFLOW_ENDPOINT_<ALIAS>` | `App` endpoints at run start | overrides (or supplies) the endpoint alias `<alias>` (uppercased, non-alphanumerics as `_`; aliases whose names collide under that mapping are refused at preflight); how per-workspace model endpoints are injected without touching customer code. The Compose renderer forwards variables exported at render time into the containers by name, like bucket credentials; deploy-mode workers set them directly (DEPLOY.md). |
 | `HFLOW_AIRFLOW_URL` / `HFLOW_AIRFLOW_DAG_ID` | `hflow ingest` / `hflow status` | the remote runtime to address when no `--airflow-url`/`--dag-id` flag is given |
 | `HFLOW_AIRFLOW_TOKEN`, `HFLOW_AIRFLOW_USERNAME`, `HFLOW_AIRFLOW_PASSWORD` | remote-endpoint resolution | credentials for the remote runtime (environment only, never argv; token wins) |
 | `HFLOW_USER_DIR` | generated DAG tasks | where the pipeline file lives on the workers (default `/opt/user`) |
 | `HFLOW_MIRROR_DIR` | `hflow.storage` | base directory for bucket-root spool mirrors; point it at per-job ephemeral disk on shared workers so tenant bytes do not accumulate in a machine-global cache |
 | `HFLOW_FFMPEG` / `HFLOW_FFPROBE` | `hflow.ffmpeg` | operator-managed binaries instead of the pinned auto-download; bake these into hosted worker images (see licensing below) |
 
-Step credentials (API keys for model endpoints) stay in the customer's own
-client code via the environment, exactly like the examples: the seam a
-deployment controls is *which* environment those step processes receive.
+Step configuration and credentials stay in the customer's own client code via
+the environment, exactly like the examples. `hflow up --pass-env NAME` forwards
+an explicit variable into Compose services by name without writing its value to
+the bundle; `hflow deploy --pass-env NAME` records the same operator requirement
+in the bundle manifest and generated `DEPLOY.md`.
 
 ## Run semantics live in the library
 
@@ -91,6 +92,28 @@ execution backend (a hosted executor, a different scheduler, a plain worker
 loop around `app.process()`) reuses the same semantics instead of copying
 generated code. Bundles pin `hflow==<renderer's version>`, so rendered DAGs
 and the library they call cannot skew inside one bundle.
+
+Hosted executors can limit a stage invocation to registered steps without
+forking those semantics:
+
+```python
+from hflow.stage_execution import process_stage_batch
+
+counts = process_stage_batch(
+    app,
+    episode_uris,
+    "meta",
+    orchestrator_run_id=run_id,
+    step_names={"camera_integrity", "hand_activity"},
+)
+```
+
+The filter is optional: omitting it retains complete-stage execution. Unknown
+names or names from another stage fail before episode I/O, unselected steps
+write no catalog outcome, and partial metadata runs preserve quarantine from
+unselected gates. The built-in Airflow bundle exposes the same operation
+through repeatable `hflow ingest --step NAME` flags and the SDK's
+`AirflowClient.ingest(..., step_names=...)` argument.
 
 Routing seams for shared or multi-pool schedulers, all rendered per bundle:
 

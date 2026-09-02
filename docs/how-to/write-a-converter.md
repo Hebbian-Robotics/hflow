@@ -17,7 +17,7 @@ Raw `sensor_msgs/msg/Image` and `foxglove.RawImage` channels are not supported. 
 
 Those are the HFlow-specific acceptance rules. Other malformed records or payloads can still be rejected by the MCAP decoder, the selected message decoder, or ffmpeg. HFlow does not require source provenance metadata, canonical chunk layout, globally sorted messages, or canonical identifiers before ingest.
 
-When ingest cannot create an episode, inspect both `error_type` and `message` in the [`ingest_failures` table](../CATALOG.md), not only `failure_kind`. MCAP parse exceptions are classified as `source-unreadable`, but transform-level `ValueError` and `NotImplementedError` exceptions currently fall under the fallback `infrastructure` classification even when their messages identify an unsupported converter output. The classification logic is in [`classify_ingest_failure`](../../src/hflow/ingest_ledger.py).
+When ingest cannot create an episode, `failure_kind` in the [`ingest_failures` table](../CATALOG.md) now tells you which side of the boundary it was: `source-unsupported` means the transform read the file fine but refused on its contents (the cases named above -- an unsupported image format, mixed image formats on one channel, a passthrough video violation, a raw image channel, a derived-topic collision), `source-unreadable` means the file was not a readable MCAP at all, and `infrastructure` is everything else the engine did not recognize. Still inspect `error_type` and `message` alongside `failure_kind` for the specific reason -- the kind tells you where to look, not what went wrong. The classification logic is in [`classify_ingest_failure`](../../src/hflow/ingest_ledger.py).
 
 ## What HFlow adds
 

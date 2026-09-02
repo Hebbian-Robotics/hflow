@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from hflow_server import ServerSettings, create_app
 
 from hflow.runtime import RuntimeConfig, render_bundle
-from hflow.runtime._client import AirflowClient, AirflowClientError, AirflowHealth
+from hflow.runtime._client import AirflowClient, AirflowClientError, AirflowDagRun, AirflowHealth
 
 HEALTHY = AirflowHealth(
     components={
@@ -209,21 +209,29 @@ def test_runs_shape_over_a_bundle_with_stage_strips(
 
     def fake_dag_runs(
         self: AirflowClient, dag_id: str, *, limit: int = 100, order_by: str | None = None
-    ) -> list[dict[str, Any]]:
+    ) -> list[AirflowDagRun]:
         dag_runs_calls.append((dag_id, limit, order_by))
         if dag_id == "demo_pipeline_ingest":
             return [
-                {
-                    "dag_run_id": "manual__1",
-                    "state": "success",
-                    "logical_date": None,
-                    "start_date": "2026-08-21T00:00:00Z",
-                    "end_date": "2026-08-21T00:05:00Z",
-                    "conf": {"uris": ["a.mcap"], "profile": "full", "mode": "batch"},
-                    "internal_field": "never surfaced",
-                }
+                AirflowDagRun(
+                    dag_run_id="manual__1",
+                    state="success",
+                    logical_date=None,
+                    start_date="2026-08-21T00:00:00Z",
+                    end_date="2026-08-21T00:05:00Z",
+                    conf={"uris": ["a.mcap"], "profile": "full", "mode": "batch"},
+                )
             ]
-        return [{"dag_run_id": f"{dag_id}__r1", "state": "running"}]
+        return [
+            AirflowDagRun(
+                dag_run_id=f"{dag_id}__r1",
+                state="running",
+                logical_date=None,
+                start_date=None,
+                end_date=None,
+                conf={},
+            )
+        ]
 
     monkeypatch.setattr(AirflowClient, "dag_runs", fake_dag_runs)
     response = bundle_api.get("/api/v1/runtime/runs", params={"limit": 5})
@@ -370,13 +378,20 @@ def test_ingest_triggers_the_master_dag(
         online: bool = False,
         batch_count: int | None = None,
         dag_run_id: str | None = None,
-    ) -> dict[str, str]:
+    ) -> AirflowDagRun:
         captured["dag_id"] = dag_id
         captured["uris"] = uris
         captured["profile"] = profile
         captured["online"] = online
         captured["batch_count"] = batch_count
-        return {"dag_run_id": "manual__ui", "state": "queued"}
+        return AirflowDagRun(
+            dag_run_id="manual__ui",
+            state="queued",
+            logical_date=None,
+            start_date=None,
+            end_date=None,
+            conf={},
+        )
 
     monkeypatch.setattr(AirflowClient, "ingest", fake_ingest)
     response = bundle_api.post(
@@ -405,10 +420,17 @@ def test_ingest_batch_count_rides_the_trigger_conf(
         conf: dict[str, Any] | None = None,
         *,
         dag_run_id: str | None = None,
-    ) -> dict[str, str]:
+    ) -> AirflowDagRun:
         captured["dag_id"] = dag_id
         captured["conf"] = conf
-        return {"dag_run_id": "manual__sharded", "state": "queued"}
+        return AirflowDagRun(
+            dag_run_id="manual__sharded",
+            state="queued",
+            logical_date=None,
+            start_date=None,
+            end_date=None,
+            conf={},
+        )
 
     monkeypatch.setattr(AirflowClient, "trigger_dag_run", fake_trigger)
     response = bundle_api.post(

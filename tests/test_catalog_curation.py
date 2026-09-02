@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import cast
 
 import duckdb
+import numpy as np
 import pytest
 
 import hflow
@@ -19,7 +20,13 @@ from hflow.catalog import (
 )
 from hflow.checks import camera_frame_stats
 from hflow.cli import main as cli_main
-from hflow.curation import CurationReport, curate, open_catalog_connection
+from hflow.curation import (
+    CurationReport,
+    NonSingleSelectQueryError,
+    curate,
+    open_catalog_connection,
+    reject_non_single_select,
+)
 from hflow.format import CATALOG_FORMAT_VERSION
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import EpisodeStamps
@@ -1060,49 +1067,34 @@ def test_stage_manifest_and_count_rejects_non_single_select(
         connection.close()
 
 
-def test_write_parquet_and_copy_format_parquet_are_byte_identical(
-    tmp_path: Path,
-) -> None:
-    """write_parquet() produces the same bytes as the old COPY ... (FORMAT PARQUET).
+def test_reject_non_single_select_refuses_a_single_non_select_statement() -> None:
+    # A lone well-formed CREATE TABLE parses cleanly but is not a SELECT:
+    # a rule rejection, never a parser error.
+    with pytest.raises(NonSingleSelectQueryError, match="exactly one SELECT"):
+        reject_non_single_select("CREATE TABLE t(x INT)")
 
-    The fix replaced ``connection.execute(f"COPY ({sql}) TO ... (FORMAT PARQUET)")``
-    with ``connection.sql(sql).write_parquet(str(path))``.  This test asserts
-    that the two code paths produce byte-identical Parquet files for the same
-    query, so the change is provably transparent to any downstream consumer
-    of the manifest.
 
-    If this test starts failing after a DuckDB upgrade, investigate whether the
-    two code paths still produce logically equivalent output before concluding
-    the change was safe.
-    """
-    import hashlib
+def test_reject_non_single_select_refuses_multiple_statements() -> None:
+    with pytest.raises(NonSingleSelectQueryError, match="exactly one SELECT"):
+        reject_non_single_select("SELECT 1 AS one; CREATE TABLE pwned AS SELECT 1")
+    with pytest.raises(NonSingleSelectQueryError, match="exactly one SELECT"):
+        reject_non_single_select("SELECT 1 AS one; DROP TABLE episodes_raw")
 
-    con = duckdb.connect()
-    try:
-        con.execute("CREATE TABLE sample (episode_id VARCHAR, score DOUBLE)")
-        con.execute("INSERT INTO sample VALUES ('ep1', 0.9), ('ep2', 0.75), ('ep3', 0.5)")
 
-        sql = "SELECT episode_id, score FROM sample ORDER BY episode_id"
-        path_copy = tmp_path / "copy_output.parquet"
-        path_write = tmp_path / "write_parquet_output.parquet"
+def test_reject_non_single_select_accepts_a_single_select() -> None:
+    reject_non_single_select("SELECT 1 AS one")
+    reject_non_single_select("SELECT episode_id FROM episodes")
 
-        # Old code path
-        con.execute(f"COPY ({sql}) TO '{path_copy}' (FORMAT PARQUET)")
-        # New code path
-        con.sql(sql).write_parquet(str(path_write))
 
-        digest_copy = hashlib.sha256(path_copy.read_bytes()).hexdigest()
-        digest_write = hashlib.sha256(path_write.read_bytes()).hexdigest()
-
-        assert digest_copy == digest_write, (
-            f"write_parquet and COPY FORMAT PARQUET produced different bytes.\n"
-            f"  COPY sha256:          {digest_copy}\n"
-            f"  write_parquet sha256: {digest_write}\n"
-            "If DuckDB changed its Parquet writer, verify logical equivalence "
-            "and update this test accordingly."
-        )
-    finally:
-        con.close()
+def test_reject_non_single_select_distinguishes_parse_failure_from_rule_rejection() -> None:
+    # Syntactically invalid SQL surfaces DuckDB's own parser error (which a
+    # service renders as the diagnostic message); a well-formed non-SELECT is
+    # the rule's ValueError instead. The server's 400 detail depends on the
+    # two staying apart.
+    with pytest.raises(duckdb.Error, match="Parser Error"):
+        reject_non_single_select("SELEC 1")
+    with pytest.raises(NonSingleSelectQueryError):
+        reject_non_single_select("CREATE TABLE t(x INT)")
 
 
 def test_constrained_curate_writes_the_manifest_but_refuses_outside_reads(
@@ -1532,6 +1524,101 @@ def test_same_interval_bound_in_a_numpy_or_python_scalar_replays_as_one_run(
     ]
     assert [attempt.written for attempt in attempts] == [True, False]
     assert len({attempt.run_fingerprint for attempt in attempts}) == 1
+
+
+def test_catalog_timestamp_bigint_boundaries_round_trip(tmp_path: Path) -> None:
+    """The complete non-negative BIGINT domain survives catalog storage."""
+    maximum = 2**63 - 1
+    row = CheckRunRow(
+        check_name="range_check",
+        check_version="v1",
+        critical=False,
+        status=hflow.CheckStatus.MEASURED,
+        duration_s=0.1,
+        observations=[
+            hflow.Observation("zero", 0, {"score": 0}),
+            hflow.Observation("maximum", cast(int, np.int64(maximum)), {"score": 1}),
+        ],
+        intervals=[
+            hflow.Interval(start_ns=0, end_ns=0, label="zero"),
+            hflow.Interval(start_ns=cast(int, np.int64(maximum)), end_ns=maximum, label="maximum"),
+        ],
+    )
+    catalog = Catalog(tmp_path / "catalog")
+    catalog.append_episode(
+        canonical_path=_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[row],
+    )
+
+    connection = open_catalog_connection(tmp_path / "catalog")
+    try:
+        assert connection.execute(
+            "SELECT observation_id, timestamp_ns FROM observations_latest ORDER BY timestamp_ns"
+        ).fetchall() == [("zero", 0), ("maximum", maximum)]
+        assert connection.execute(
+            "SELECT label, start_ns, end_ns FROM intervals ORDER BY start_ns"
+        ).fetchall() == [("zero", 0, 0), ("maximum", maximum, maximum)]
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("timestamp_ns", [2**63, np.uint64(2**63)])
+def test_out_of_range_observation_timestamp_is_refused_before_catalog_writes(
+    tmp_path: Path, timestamp_ns: object
+) -> None:
+    row = CheckRunRow(
+        check_name="range_check",
+        check_version="v1",
+        critical=False,
+        status=hflow.CheckStatus.MEASURED,
+        duration_s=0.1,
+        observations=[hflow.Observation("frame:1", cast(int, timestamp_ns), {"score": 1})],
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"range_check.*'frame:1'.*timestamp_ns=9223372036854775808.*BIGINT",
+    ):
+        Catalog(tmp_path / "catalog").append_episode(
+            canonical_path=_fake_canonical(tmp_path),
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[row],
+        )
+
+    assert not list((tmp_path / "catalog").rglob("*.parquet"))
+
+
+@pytest.mark.parametrize("bound_name", ["start_ns", "end_ns"])
+@pytest.mark.parametrize("bound", [2**63, np.uint64(2**63)])
+def test_out_of_range_interval_bound_is_refused_before_catalog_writes(
+    tmp_path: Path, bound_name: str, bound: object
+) -> None:
+    bounds = {"start_ns": 0, "end_ns": 10}
+    bounds[bound_name] = cast(int, bound)
+    row = CheckRunRow(
+        check_name="range_check",
+        check_version="v1",
+        critical=False,
+        status=hflow.CheckStatus.MEASURED,
+        duration_s=0.1,
+        intervals=[hflow.Interval(**bounds, label="segment")],
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"range_check.*'segment'.*{bound_name}=9223372036854775808.*BIGINT",
+    ):
+        Catalog(tmp_path / "catalog").append_episode(
+            canonical_path=_fake_canonical(tmp_path),
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[row],
+        )
+
+    assert not list((tmp_path / "catalog").rglob("*.parquet"))
 
 
 def test_non_scalar_measurement_is_refused_naming_the_check_and_key(

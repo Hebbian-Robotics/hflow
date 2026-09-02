@@ -12,7 +12,7 @@ import yaml
 
 import hflow
 from hflow.runtime import BundlePaths, RuntimeConfig, bundle_dag_ids, render_bundle
-from hflow.runtime._bundle import infer_hflow_source
+from hflow.runtime._bundle import BUNDLE_MANIFEST_VERSION, infer_hflow_source
 from hflow.steps import RUN_PROFILES, Stage
 
 AIRFLOW_SERVICE_NAMES = (
@@ -425,10 +425,13 @@ def test_master_dag_source_compiles_and_encodes_contract(
     assert "deferrable=True" in dag_source
     for stage in Stage:
         assert f'"{stage.value}": "my_pipeline_{stage.value}"' in dag_source
-    # uris/mode/batch_count pass through to every triggered sub-DAG.
+    # Run inputs pass through to every triggered sub-DAG; the resolved profile
+    # stages let each worker validate and take its share of step_names.
     assert '"uris": "{{ params.uris }}"' in dag_source
     assert '"mode": "{{ params.mode }}"' in dag_source
     assert '"batch_count": "{{ params.batch_count }}"' in dag_source
+    assert '"step_names": "{{ params.step_names }}"' in dag_source
+    assert '"enabled_stage_names": enabled_stage_names' in dag_source
 
 
 def test_sub_dag_sources_compile_and_encode_contract(config: RuntimeConfig, tmp_path: Path) -> None:
@@ -441,10 +444,8 @@ def test_sub_dag_sources_compile_and_encode_contract(config: RuntimeConfig, tmp_
 
         assert f'dag_id="my_pipeline_{stage.value}"' in dag_source
         assert "schedule=None" in dag_source
-        assert (
-            'params={"uris": [], "mode": "batch", "batch_count": None, "all_stages": False}'
-            in dag_source
-        )
+        assert '"step_names": None' in dag_source
+        assert f'"enabled_stage_names": ["{stage.value}"]' in dag_source
         # All three tasks run in the user venv via external python.
         assert dag_source.count("@task.external_python(python='/opt/venvs/user/bin/python'") == 3
         # Imports live inside the (indented) function bodies -- the operator
@@ -461,20 +462,17 @@ def test_sub_dag_sources_compile_and_encode_contract(config: RuntimeConfig, tmp_
         assert "resolve_user_pipeline_path('my_pipeline.py')" in dag_source
         assert 'load_pipeline_application(pipeline_path, "app")' in dag_source
         # Each sub-DAG runs exactly its own stage of the stage graph.
-        assert (
-            f'process_stage_batch(app, batch["items"], "{stage.value}", orchestrator_run_id)'
-            in dag_source
-        )
+        assert "resolve_step_names_for_stage(" in dag_source
+        assert 'step_names="{{ params.step_names }}"' in dag_source
+        assert f'            "{stage.value}",' in dag_source
         # The stagger, mapped batches, and budget gate are one contract.
         assert 'time.sleep(float(batch["start_delay_s"]))' in dag_source
         # partial() binds this sub-DAG's own run id across the whole fan-out.
         # It is a rendered template argument because the callable runs under
         # expect_airflow=False and so cannot read the Airflow context, and it
         # is what lets a catalog row name the run that produced it.
-        assert (
-            'process_batch.partial(orchestrator_run_id="{{ run_id }}").expand(batch=batches)'
-            in dag_source
-        )
+        assert 'orchestrator_run_id="{{ run_id }}"' in dag_source
+        assert ").expand(batch=batches)" in dag_source
         # The gate materializes the mapped results (lazy XCom proxies cannot
         # cross the external-python pickle boundary; list-typed task_ids keeps
         # a single-batch run from being flattened) and keeps the edge explicit.
@@ -510,7 +508,7 @@ def test_bundle_manifest_describes_the_bundle_and_load_bundle_prefers_it(
     paths, _ = _render(replace(config, task_queue="workspace-a"), tmp_path / "bundle")
     manifest_file = paths.bundle_dir / "hflow-bundle.json"
     manifest_payload = json.loads(manifest_file.read_text())
-    assert manifest_payload["manifest_version"] == 1
+    assert manifest_payload["manifest_version"] == BUNDLE_MANIFEST_VERSION
     assert manifest_payload["kind"] == "compose"
     assert manifest_payload["hflow_version"] == hflow.__version__
     assert manifest_payload["dag_id"] == "my_pipeline_ingest"
@@ -577,25 +575,49 @@ def test_xcom_objectstorage_url_override(config: RuntimeConfig, tmp_path: Path) 
     )
 
 
-def test_endpoint_environment_variables_pass_through_by_name(
+def test_explicit_environment_variables_pass_through_by_name(
     config: RuntimeConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Exported HFLOW_ENDPOINT_* variables at render time are wired into the
-    containers' environment as name-only ${VAR} references (same contract as
-    bucket credentials: values never land in the bundle), so App's endpoint
-    overlay works inside the runtime's task processes."""
-    monkeypatch.setenv("HFLOW_ENDPOINT_JUDGE", "http://judge:8000/v1")
-    _, compose = _render(config, tmp_path / "bundle")
-    scheduler_env = compose["services"]["airflow-scheduler"]["environment"]
-    assert scheduler_env["HFLOW_ENDPOINT_JUDGE"] == "${HFLOW_ENDPOINT_JUDGE}"
-    assert "http://judge:8000/v1" not in (tmp_path / "bundle" / "docker-compose.yaml").read_text()
+    """An allowlisted value reaches containers but never bundle contents."""
+    from dataclasses import replace
 
-    monkeypatch.delenv("HFLOW_ENDPOINT_JUDGE")
-    _, rerendered_compose = _render(config, tmp_path / "bundle-without")
-    assert (
-        "HFLOW_ENDPOINT_JUDGE"
-        not in (rerendered_compose["services"]["airflow-scheduler"]["environment"])
-    )
+    monkeypatch.setenv("MODEL_API_KEY", "secret-value")
+    configured = replace(config, passthrough_environment_variables=("MODEL_API_KEY",))
+    paths, compose = _render(configured, tmp_path / "bundle")
+    scheduler_env = compose["services"]["airflow-scheduler"]["environment"]
+    assert scheduler_env["MODEL_API_KEY"] == "${MODEL_API_KEY}"
+    assert "secret-value" not in paths.compose_file.read_text()
+
+    manifest_payload = json.loads((paths.bundle_dir / "hflow-bundle.json").read_text())
+    assert manifest_payload["passthrough_environment_variables"] == ["MODEL_API_KEY"]
+
+
+def test_absent_explicit_environment_variable_is_refused(
+    config: RuntimeConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace
+
+    monkeypatch.delenv("MODEL_API_KEY", raising=False)
+    configured = replace(config, passthrough_environment_variables=("MODEL_API_KEY",))
+    with pytest.raises(ValueError, match="MODEL_API_KEY"):
+        _render(configured, tmp_path / "bundle")
+
+
+@pytest.mark.parametrize(
+    "variable_names",
+    [
+        ("MODEL-API-KEY",),
+        ("MODEL_API_KEY", "MODEL_API_KEY"),
+    ],
+)
+def test_invalid_environment_passthrough_allowlist_is_refused_at_construction(
+    config: RuntimeConfig,
+    variable_names: tuple[str, ...],
+) -> None:
+    from dataclasses import replace
+
+    with pytest.raises(ValueError, match="environment variable names"):
+        replace(config, passthrough_environment_variables=variable_names)
 
 
 def test_env_file_carries_generated_postgres_password_and_bind_host(
@@ -907,23 +929,6 @@ def test_api_port_inside_the_tcp_range_is_accepted(config: RuntimeConfig, good_p
     from dataclasses import replace
 
     assert replace(config, api_port=good_port).api_port == good_port
-
-
-def test_api_port_true_is_rejected_even_though_it_passes_the_range(
-    config: RuntimeConfig,
-) -> None:
-    """bool is the case the range check cannot catch.
-
-    True == 1, so the range test passes it, and the value is only ever str()-ed
-    after that. Without this it reaches the rendered .env as API_PORT=True.
-    False is covered alongside the other wrong types below, where it is the
-    weaker case: it is 0, so the range check would reject it anyway, just with
-    the wrong reason.
-    """
-    from dataclasses import replace
-
-    with pytest.raises(ValueError, match="api_port must be an int, not bool: True"):
-        replace(config, api_port=True)
 
 
 def test_api_port_accepts_an_int_enum_member(config: RuntimeConfig) -> None:

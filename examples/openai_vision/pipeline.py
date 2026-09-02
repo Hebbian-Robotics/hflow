@@ -16,7 +16,6 @@ from openai import OpenAI
 import hflow
 
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-OPENAI_ENDPOINT_ALIAS = "vision"
 ACTIVITY_PROMPT = (
     "Describe the physical activity across this timestamped sequence in one concise sentence. "
     "State when the visual evidence is insufficient."
@@ -30,7 +29,6 @@ HAND_VISIBILITY_PROMPT = (
 app = hflow.App(
     "openai-vision-example",
     data_root="./data/openai-vision",
-    endpoints={OPENAI_ENDPOINT_ALIAS: OPENAI_BASE_URL},
 )
 
 
@@ -39,7 +37,7 @@ def _image_data_url(image_path: Path) -> str:
     return f"data:image/jpeg;base64,{encoded_image}"
 
 
-@app.check(uses=OPENAI_ENDPOINT_ALIAS, version="responses-contact-sheet-v1")
+@app.check(requires=("vision-model",), version="responses-contact-sheet-v1")
 def describe_activity(episode: hflow.Episode) -> hflow.CheckResult:
     contact_sheet = hflow.ffmpeg.contact_sheet(
         episode.frames(fps=0.5),
@@ -49,7 +47,7 @@ def describe_activity(episode: hflow.Episode) -> hflow.CheckResult:
     )
     client = OpenAI(
         api_key=os.environ["OPENAI_API_KEY"],
-        base_url=app.endpoints[OPENAI_ENDPOINT_ALIAS],
+        base_url=OPENAI_BASE_URL,
     )
     model_name = os.environ["OPENAI_MODEL"]
     response = client.responses.create(
@@ -76,7 +74,7 @@ def describe_activity(episode: hflow.Episode) -> hflow.CheckResult:
     )
 
 
-@app.check(uses=OPENAI_ENDPOINT_ALIAS, version="hand-visibility-contact-sheet-v1")
+@app.check(requires=("vision-model",), version="hand-visibility-contact-sheet-v1")
 def hand_visibility(episode: hflow.Episode) -> hflow.CheckResult:
     """Missing/occluded hand positions, a quality issue named in Dyna's article.
 
@@ -93,7 +91,7 @@ def hand_visibility(episode: hflow.Episode) -> hflow.CheckResult:
     tile_count = len(contact_sheet.tile_log_times_ns)
     client = OpenAI(
         api_key=os.environ["OPENAI_API_KEY"],
-        base_url=app.endpoints[OPENAI_ENDPOINT_ALIAS],
+        base_url=OPENAI_BASE_URL,
     )
     response = client.responses.create(
         model=os.environ["OPENAI_MODEL"],

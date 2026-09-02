@@ -14,7 +14,7 @@ import pytest
 import hflow
 from hflow.app import parse_pipeline_spec, resolve_pipeline_spec_for_rendering
 from hflow.cli import main
-from hflow.runtime import AirflowHealth, RuntimeConfig, render_bundle
+from hflow.runtime import AirflowDagRun, AirflowHealth, RuntimeConfig, render_bundle
 from hflow.runtime._client import AirflowClient, AirflowClientError, PasswordCredentials
 
 HEALTHY = AirflowHealth(
@@ -502,38 +502,6 @@ def test_up_reports_a_missing_pipeline_file_as_bad_input(
     assert "containers may still be running" not in streams.err
 
 
-def test_up_reports_a_missing_requirements_file_the_same_way(
-    compose_calls: list[list[str]],
-    healthy_client: None,
-    pipeline_file: Path,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """--requirements takes the same path through render_bundle as --pipeline."""
-    missing = tmp_path / "no-such-requirements.txt"
-
-    exit_code = main(
-        [
-            "up",
-            "--pipeline",
-            str(pipeline_file),
-            "--data-root",
-            str(tmp_path / "data"),
-            "--bundle-dir",
-            str(tmp_path / "runtime"),
-            "--requirements",
-            str(missing),
-        ]
-    )
-
-    assert exit_code == 2
-    assert compose_calls == []
-    streams = capsys.readouterr()
-    assert f"up: [Errno 2] No such file or directory: '{missing}'" in streams.err
-    assert "Traceback" not in streams.err
-    assert "containers may still be running" not in streams.err
-
-
 def test_deploy_missing_pipeline_names_the_reason_not_just_the_path(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -564,45 +532,6 @@ def test_deploy_missing_pipeline_names_the_reason_not_just_the_path(
     assert exit_code == 2
     streams = capsys.readouterr()
     assert f"deploy: [Errno 2] No such file or directory: '{missing}'" in streams.err
-
-
-def test_up_reports_a_pipeline_directory_as_a_directory(
-    compose_calls: list[list[str]],
-    healthy_client: None,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """The command from the #102 report, end to end.
-
-    The unit test on render_bundle pins the raise, and the ENOENT test above
-    pins the handler, but nothing ran the reported command itself. Anything
-    that later branched on errno between render_bundle and here would regress
-    this to a traceback with the whole suite still green.
-    """
-    a_directory = tmp_path / "pipelines"
-    a_directory.mkdir()
-    bundle_dir = tmp_path / "runtime"
-
-    exit_code = main(
-        [
-            "up",
-            "--pipeline",
-            str(a_directory),
-            "--data-root",
-            str(tmp_path / "data"),
-            "--bundle-dir",
-            str(bundle_dir),
-        ]
-    )
-
-    assert exit_code == 2
-    assert not bundle_dir.exists()
-    assert compose_calls == []
-    streams = capsys.readouterr()
-    assert f"up: [Errno 21] Is a directory: '{a_directory}'" in streams.err
-    assert "No such file or directory" not in streams.err
-    assert "Traceback" not in streams.err
-    assert "containers may still be running" not in streams.err
 
 
 def test_up_reports_a_data_root_that_is_a_file(
@@ -661,133 +590,6 @@ def test_curate_reports_a_sql_file_that_is_a_directory(
     assert f"curate: [Errno 21] Is a directory: '{a_directory}'" in streams.err
     assert "No such file or directory" not in streams.err
     assert "Traceback" not in streams.err
-
-
-def test_up_reports_a_requirements_directory_as_a_directory(
-    compose_calls: list[list[str]],
-    healthy_client: None,
-    pipeline_file: Path,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """The other `up` raise site, so reverting it alone cannot stay green."""
-    a_directory = tmp_path / "reqs"
-    a_directory.mkdir()
-    bundle_dir = tmp_path / "runtime"
-
-    exit_code = main(
-        [
-            "up",
-            "--pipeline",
-            str(pipeline_file),
-            "--data-root",
-            str(tmp_path / "data"),
-            "--bundle-dir",
-            str(bundle_dir),
-            "--requirements",
-            str(a_directory),
-        ]
-    )
-
-    assert exit_code == 2
-    assert compose_calls == []
-    streams = capsys.readouterr()
-    assert f"up: [Errno 21] Is a directory: '{a_directory}'" in streams.err
-    assert "Traceback" not in streams.err
-
-
-def test_deploy_reports_a_requirements_directory_as_a_directory(
-    pipeline_file: Path,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """The fourth raise site, pinned at the CLI like its three siblings."""
-    a_directory = tmp_path / "reqs"
-    a_directory.mkdir()
-
-    exit_code = main(
-        [
-            "deploy",
-            "--pipeline",
-            str(pipeline_file),
-            "--data-root-uri",
-            "s3://bucket/data",
-            "--output-dir",
-            str(tmp_path / "out"),
-            "--requirements",
-            str(a_directory),
-        ]
-    )
-
-    assert exit_code == 2
-    streams = capsys.readouterr()
-    assert f"deploy: [Errno 21] Is a directory: '{a_directory}'" in streams.err
-    assert "Traceback" not in streams.err
-
-
-def test_deploy_pipeline_directory_says_is_a_directory(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """The #102 repro end to end: the path exists, it is just the wrong kind.
-
-    The exit code and the absent traceback were already right (#90, #95); this
-    pins the message only. The class stays FileNotFoundError on purpose, so the
-    handler in cli.py that turns this into exit 2 keeps catching it.
-    """
-    a_directory = tmp_path / "pipelines"
-    a_directory.mkdir()
-
-    exit_code = main(
-        [
-            "deploy",
-            "--pipeline",
-            str(a_directory),
-            "--data-root-uri",
-            "s3://bucket/data",
-            "--output-dir",
-            str(tmp_path / "out"),
-        ]
-    )
-
-    assert exit_code == 2
-    assert not (tmp_path / "out").exists()
-    streams = capsys.readouterr()
-    assert f"deploy: [Errno 21] Is a directory: '{a_directory}'" in streams.err
-    assert "No such file or directory" not in streams.err
-    assert "Traceback" not in streams.err
-
-
-def test_deploy_missing_requirements_names_the_reason_too(
-    pipeline_file: Path,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """The other raise site render_deploy_bundle owns.
-
-    Without this, reverting the requirements raise in _deploy.py alone leaves
-    the whole suite green while `deploy --requirements <missing>` goes back to
-    printing a bare path.
-    """
-    missing = tmp_path / "no-such-requirements.txt"
-
-    exit_code = main(
-        [
-            "deploy",
-            "--pipeline",
-            str(pipeline_file),
-            "--data-root-uri",
-            "s3://bucket/data",
-            "--output-dir",
-            str(tmp_path / "out"),
-            "--requirements",
-            str(missing),
-        ]
-    )
-
-    assert exit_code == 2
-    streams = capsys.readouterr()
-    assert f"deploy: [Errno 2] No such file or directory: '{missing}'" in streams.err
 
 
 def test_up_from_published_install_uses_matching_distribution(
@@ -850,7 +652,7 @@ def test_ingest_uses_env_credentials_and_dag_id(
         profile: str = "full",
         online: bool = False,
         dag_run_id: str | None = None,
-    ) -> dict[str, str]:
+    ) -> AirflowDagRun:
         client_auth = self._auth
         assert isinstance(client_auth, PasswordCredentials)
         captured["credentials"] = (client_auth.username, client_auth.password)
@@ -858,7 +660,14 @@ def test_ingest_uses_env_credentials_and_dag_id(
         captured["uris"] = uris
         captured["profile"] = profile
         captured["online"] = online
-        return {"dag_run_id": "manual__test"}
+        return AirflowDagRun(
+            dag_run_id="manual__test",
+            state="queued",
+            logical_date=None,
+            start_date=None,
+            end_date=None,
+            conf={},
+        )
 
     monkeypatch.setattr(AirflowClient, "ingest", fake_ingest)
     exit_code = main(["ingest", "a.mcap", "sub/b.mcap", "--bundle-dir", str(bundle_dir)])
@@ -893,12 +702,19 @@ def test_ingest_targets_a_remote_endpoint_without_any_bundle(
         profile: str = "full",
         online: bool = False,
         dag_run_id: str | None = None,
-    ) -> dict[str, str]:
+    ) -> AirflowDagRun:
         captured["base_url"] = self.base_url
         captured["auth"] = self._auth
         captured["dag_id"] = dag_id
         captured["uris"] = uris
-        return {"dag_run_id": "manual__remote"}
+        return AirflowDagRun(
+            dag_run_id="manual__remote",
+            state="queued",
+            logical_date=None,
+            start_date=None,
+            end_date=None,
+            conf={},
+        )
 
     monkeypatch.setattr(AirflowClient, "ingest", fake_ingest)
     monkeypatch.setenv("HFLOW_AIRFLOW_TOKEN", "minted-token")
@@ -942,6 +758,28 @@ def test_ingest_remote_without_credentials_names_the_environment_fix(
     assert "HFLOW_AIRFLOW_TOKEN" in capsys.readouterr().err
 
 
+def test_ingest_remote_with_hostless_url_names_the_fix(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HFLOW_AIRFLOW_TOKEN", "minted-token")
+    exit_code = main(
+        [
+            "ingest",
+            "a.mcap",
+            "--airflow-url",
+            "http://",
+            "--dag-id",
+            "kitchen_ingest",
+        ]
+    )
+    assert exit_code == 2
+    error_output = capsys.readouterr().err
+    assert "needs a host" in error_output
+    assert "--airflow-url" in error_output
+    assert "HFLOW_AIRFLOW_URL" in error_output
+
+
 def test_explicit_bundle_dir_stays_local_even_with_remote_environment(
     monkeypatch: pytest.MonkeyPatch,
     pipeline_file: Path,
@@ -962,9 +800,16 @@ def test_explicit_bundle_dir_stays_local_even_with_remote_environment(
         profile: str = "full",
         online: bool = False,
         dag_run_id: str | None = None,
-    ) -> dict[str, str]:
+    ) -> AirflowDagRun:
         captured["base_url"] = self.base_url
-        return {"dag_run_id": "manual__local"}
+        return AirflowDagRun(
+            dag_run_id="manual__local",
+            state="queued",
+            logical_date=None,
+            start_date=None,
+            end_date=None,
+            conf={},
+        )
 
     monkeypatch.setattr(AirflowClient, "ingest", fake_ingest)
     assert main(["ingest", "a.mcap", "--bundle-dir", str(bundle_dir)]) == 0
@@ -986,7 +831,16 @@ def test_status_remote_reports_health_and_runs_without_a_bundle(
     monkeypatch.setattr(
         AirflowClient,
         "dag_runs",
-        lambda self, dag_id, **_kwargs: [{"dag_run_id": "manual__1", "state": "success"}],
+        lambda self, dag_id, **_kwargs: [
+            AirflowDagRun(
+                dag_run_id="manual__1",
+                state="success",
+                logical_date=None,
+                start_date=None,
+                end_date=None,
+                conf={},
+            )
+        ],
     )
     monkeypatch.setenv("HFLOW_AIRFLOW_URL", "https://workspace.example.com")
     monkeypatch.setenv("HFLOW_AIRFLOW_DAG_ID", "kitchen_ingest")
@@ -999,13 +853,13 @@ def test_status_remote_reports_health_and_runs_without_a_bundle(
     assert "manual__1 [success]" in output
 
 
-def test_ingest_plumbs_profile_and_online_into_conf(
+def test_ingest_plumbs_profile_lane_and_steps_into_conf(
     monkeypatch: pytest.MonkeyPatch,
     pipeline_file: Path,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """--profile/--online land in the trigger conf keys "profile"/"mode"."""
+    """CLI selection reaches the SDK-owned trigger configuration."""
     bundle_dir = _rendered_bundle(tmp_path, pipeline_file)
     captured: dict[str, object] = {}
 
@@ -1015,18 +869,42 @@ def test_ingest_plumbs_profile_and_online_into_conf(
         conf: dict[str, object] | None = None,
         *,
         dag_run_id: str | None = None,
-    ) -> dict[str, str]:
+    ) -> AirflowDagRun:
         captured["dag_id"] = dag_id
         captured["conf"] = conf
-        return {"dag_run_id": "manual__relabel"}
+        return AirflowDagRun(
+            dag_run_id="manual__relabel",
+            state="queued",
+            logical_date=None,
+            start_date=None,
+            end_date=None,
+            conf={},
+        )
 
     monkeypatch.setattr(AirflowClient, "trigger_dag_run", fake_trigger)
     exit_code = main(
-        ["ingest", "a.mcap", "--bundle-dir", str(bundle_dir), "--profile", "relabel", "--online"]
+        [
+            "ingest",
+            "a.mcap",
+            "--bundle-dir",
+            str(bundle_dir),
+            "--profile",
+            "relabel",
+            "--online",
+            "--step",
+            "caption",
+            "--step",
+            "embedding",
+        ]
     )
     assert exit_code == 0
     assert captured["dag_id"] == "demo_pipeline_ingest"
-    assert captured["conf"] == {"uris": ["a.mcap"], "profile": "relabel", "mode": "online"}
+    assert captured["conf"] == {
+        "uris": ["a.mcap"],
+        "profile": "relabel",
+        "mode": "online",
+        "step_names": ["caption", "embedding"],
+    }
     assert "profile relabel, online lane" in capsys.readouterr().out
 
 

@@ -6,15 +6,23 @@ for orientation and docs/ARCHITECTURE.md for the design and its references.
 
 from importlib.metadata import PackageNotFoundError, version
 
-from hflow import checks, ffmpeg, providers, testing
+from hflow import build_ai_vlm_checks, checks, ffmpeg, providers, testing
 from hflow.app import (
     App,
+    CheckOutcome,
     CheckRunReport,
     CheckStatus,
+    EnrichmentOutcome,
     EnrichmentRunReport,
+    Errored,
+    Measured,
+    NotRun,
+    PublishFailed,
     SkippedByQuarantine,
     StepNotRun,
     SupersededByPipeline,
+    TestManyProgress,
+    TestManyReport,
     TestReport,
     import_pipeline_application,
 )
@@ -36,6 +44,11 @@ from hflow.curation import (
 )
 from hflow.doctor import DiagnosticLevel, DoctorReport, Finding, diagnose
 from hflow.episode import ChannelData, DecodedMessageBatch, Episode, ExtractedFrame
+from hflow.fingerprints import (
+    ContractFingerprint,
+    fingerprint_contract,
+    step_version_from_contract,
+)
 from hflow.format import GopPreset
 from hflow.importers import import_lerobot_dataset
 from hflow.manifest import (
@@ -77,6 +90,7 @@ from hflow.steps import (
     RegisteredCheck,
     RegisteredEnrichment,
     Stage,
+    StepVersion,
     Threshold,
     evaluate_gate,
     stages_for_profile,
@@ -111,11 +125,13 @@ __all__ = [
     "CatalogUiStartupError",
     "ChannelData",
     "CheckCoverage",
+    "CheckOutcome",
     "CheckResult",
     "CheckRunReport",
     "CheckRunRow",
     "CheckStatus",
     "Comparison",
+    "ContractFingerprint",
     "CurationReport",
     "DatasetSnapshotReport",
     "DecodedMessageBatch",
@@ -124,11 +140,13 @@ __all__ = [
     "DerivedSeries",
     "DiagnosticLevel",
     "DoctorReport",
+    "EnrichmentOutcome",
     "EnrichmentResult",
     "EnrichmentRunReport",
     "Episode",
     "EpisodeReader",
     "EpisodeStamps",
+    "Errored",
     "ExtractedFrame",
     "Finding",
     "Gate",
@@ -138,11 +156,14 @@ __all__ = [
     "IngestMode",
     "Interval",
     "LocalStorageRoot",
+    "Measured",
     "MeasurementValue",
     "MessageBatch",
+    "NotRun",
     "Observation",
     "PipelineManifest",
     "PlannedBatch",
+    "PublishFailed",
     "PythonMcapEpisodeReader",
     "RegisteredCheck",
     "RegisteredEnrichment",
@@ -155,8 +176,11 @@ __all__ = [
     "StepKind",
     "StepManifest",
     "StepNotRun",
+    "StepVersion",
     "StorageRoot",
     "SupersededByPipeline",
+    "TestManyProgress",
+    "TestManyReport",
     "TestReport",
     "Threshold",
     "TopicInfo",
@@ -164,6 +188,7 @@ __all__ = [
     "Workspace",
     "WorkspaceIdentity",
     "__version__",
+    "build_ai_vlm_checks",
     "checks",
     "curate",
     "diagnose",
@@ -171,6 +196,7 @@ __all__ = [
     "export_dataset_snapshot",
     "fetch_uri",
     "ffmpeg",
+    "fingerprint_contract",
     "import_lerobot_dataset",
     "import_pipeline_application",
     "is_bucket_url",
@@ -183,6 +209,7 @@ __all__ = [
     "serve_catalog_ui",
     "stages_for_profile",
     "stale_episodes",
+    "step_version_from_contract",
     "testing",
     "to_grid",
     "write_canonical_episode",

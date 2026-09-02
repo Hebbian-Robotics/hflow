@@ -43,6 +43,12 @@ _VCL_NAL_TYPES = frozenset({1, 2, 3, 4, 5})
 # Types whose RBSP starts with a slice header. Data partitions B/C (3/4) are
 # VCL data but carry no ``first_mb_in_slice`` of their own.
 _SLICE_HEADER_NAL_TYPES = frozenset({1, 2, 5})
+# How many bytes of a VCL NAL's payload to unescape when reading the slice
+# header. ``first_mb_in_slice`` and ``slice_type`` are the first two Exp-Golomb
+# values; 16 bytes is enough at any legal macroblock index (``#346`` measured
+# this against 4K-class inputs). A NAL whose slice header needs more is
+# caught by the head-too-short fallback in the scan.
+_SLICE_HEADER_HEAD_BYTES = 16
 # Annex B AUD with primary_pic_type 7 (any I/P/B picture), followed by the
 # required RBSP stop bit. x264 writes the narrower ``09 10`` for the streams
 # HFlow encodes; repair deliberately uses the permissive value because it must
@@ -238,6 +244,36 @@ def _nal_header_offset(stream: bytes, nal_start_offset: int) -> int:
     raise ValueError(f"invalid Annex B start code at byte {nal_start_offset}")
 
 
+def _unescape_ebsp_head(ebsp: bytes, max_bytes: int) -> bytes:
+    """Unescape up to ``max_bytes`` of an EBSP into a bytearray prefix.
+
+    The slice-header readers only need the first handful of bytes of any VCL
+    NAL's payload: ``first_mb_in_slice`` and ``slice_type`` are the first two
+    Exp-Golomb values, and 16 bytes is enough at any legal macroblock index.
+    Walking the whole payload copies the entire NAL per VCL NAL even when the
+    scan never looks at most of it, which is the cost ``#346`` measured.
+
+    Returns the unescaped prefix as a ``bytes`` value. The emulation-prevention
+    state is honored across the boundary, so a 0x03 byte straddling the
+    ``max_bytes`` cut is consumed and does not appear in the output -- the
+    caller is expected to fall back to the full unescape when the prefix
+    is too short to parse, which is what ``scan_picture_coding_types`` does.
+    """
+    if max_bytes >= len(ebsp):
+        return _remove_emulation_prevention_bytes(ebsp)
+    rbsp = bytearray()
+    consecutive_zeros = 0
+    for index, byte in enumerate(ebsp):
+        if index >= max_bytes:
+            break
+        if consecutive_zeros >= 2 and byte == 0x03:
+            consecutive_zeros = 0
+            continue
+        rbsp.append(byte)
+        consecutive_zeros = consecutive_zeros + 1 if byte == 0 else 0
+    return bytes(rbsp)
+
+
 def _remove_emulation_prevention_bytes(ebsp: bytes) -> bytes:
     rbsp = bytearray()
     consecutive_zeros = 0
@@ -250,19 +286,25 @@ def _remove_emulation_prevention_bytes(ebsp: bytes) -> bytes:
     return bytes(rbsp)
 
 
-def _decode_unsigned_exp_golomb(rbsp: bytes) -> int:
-    """Decode the first unsigned Exp-Golomb value in an RBSP."""
+def _decode_first_mb_in_slice(rbsp: bytes) -> int:
+    """Decode ``first_mb_in_slice`` from a slice-header RBSP, raising on failure.
+
+    Replicates the two fail-closed messages of the previous
+    :func:`_decode_unsigned_exp_golomb` so existing tests and ``hflow doctor``
+    diagnostic text stay byte-identical. Used only by
+    :func:`count_h264_pictures` (and through it,
+    :func:`ensure_access_unit_delimiter`), where the older "no complete value"
+    vs. "truncated" distinction is part of the public error contract.
+    """
     bit_count = len(rbsp) * 8
     leading_zero_bits = 0
     while leading_zero_bits < bit_count:
         byte = rbsp[leading_zero_bits // 8]
-        bit = (byte >> (7 - leading_zero_bits % 8)) & 1
-        if bit:
+        if (byte >> (7 - leading_zero_bits % 8)) & 1:
             break
         leading_zero_bits += 1
-    if leading_zero_bits == bit_count:
+    else:
         raise ValueError("slice header has no complete first_mb_in_slice value")
-
     suffix_start = leading_zero_bits + 1
     suffix_end = suffix_start + leading_zero_bits
     if suffix_end > bit_count:
@@ -272,6 +314,34 @@ def _decode_unsigned_exp_golomb(rbsp: bytes) -> int:
         byte = rbsp[bit_offset // 8]
         suffix = (suffix << 1) | ((byte >> (7 - bit_offset % 8)) & 1)
     return (1 << leading_zero_bits) - 1 + suffix
+
+
+def _decode_unsigned_exp_golomb_at(rbsp: bytes, bit_offset: int) -> tuple[int, int] | None:
+    """Offset-aware form of :func:`_decode_unsigned_exp_golomb`.
+
+    Returns ``(value, next_bit_offset)``, or ``None`` when the value is
+    incomplete or truncated. Returning ``None`` instead of raising lets
+    callers count unparseable slice headers and refuse fail-closed rather
+    than guess a picture type.
+    """
+    bit_count = len(rbsp) * 8
+    leading_zero_bits = 0
+    while True:
+        if bit_offset + leading_zero_bits >= bit_count:
+            return None
+        byte = rbsp[(bit_offset + leading_zero_bits) // 8]
+        if (byte >> (7 - (bit_offset + leading_zero_bits) % 8)) & 1:
+            break
+        leading_zero_bits += 1
+    suffix_start = bit_offset + leading_zero_bits + 1
+    suffix_end = suffix_start + leading_zero_bits
+    if suffix_end > bit_count:
+        return None
+    suffix = 0
+    for bit_position in range(suffix_start, suffix_end):
+        byte = rbsp[bit_position // 8]
+        suffix = (suffix << 1) | ((byte >> (7 - bit_position % 8)) & 1)
+    return (1 << leading_zero_bits) - 1 + suffix, suffix_end
 
 
 def count_h264_pictures(stream: bytes) -> int:
@@ -292,10 +362,124 @@ def count_h264_pictures(stream: bytes) -> int:
             else len(stream)
         )
         nal_header_offset = _nal_header_offset(stream, nal_start_offset)
-        rbsp = _remove_emulation_prevention_bytes(stream[nal_header_offset + 1 : nal_end_offset])
-        if _decode_unsigned_exp_golomb(rbsp) == 0:
+        slice_payload = stream[nal_header_offset + 1 : nal_end_offset]
+        rbsp = _unescape_ebsp_head(slice_payload, _SLICE_HEADER_HEAD_BYTES)
+        try:
+            first_mb_in_slice = _decode_first_mb_in_slice(rbsp)
+        except ValueError:
+            # The head was too short: fall back to the full unescape so the
+            # existing fail-closed messages ("no complete" / "truncated")
+            # still fire for ``hflow doctor`` and the AUD repair path.
+            rbsp = _remove_emulation_prevention_bytes(slice_payload)
+            first_mb_in_slice = _decode_first_mb_in_slice(rbsp)
+        if first_mb_in_slice == 0:
             picture_count += 1
     return picture_count
+
+
+def _slice_header_fields(rbsp: bytes) -> tuple[int, int] | None:
+    """Return ``(first_mb_in_slice, slice_type)`` from a slice header RBSP.
+
+    Both fields are unsigned Exp-Golomb values per the H.264 slice header
+    syntax. Returning ``None`` when either is incomplete or truncated lets
+    callers treat an unparseable slice header fail-closed instead of guessing
+    a picture type.
+    """
+    first_field = _decode_unsigned_exp_golomb_at(rbsp, 0)
+    if first_field is None:
+        return None
+    slice_type_field = _decode_unsigned_exp_golomb_at(rbsp, first_field[1])
+    if slice_type_field is None:
+        return None
+    return first_field[0], slice_type_field[0]
+
+
+@dataclass(frozen=True)
+class PictureCodingScan:
+    """Picture coding-type evidence parsed from one Annex B payload's slice headers.
+
+    A picture is B when any of its slices declares ``slice_type`` B (codes 1
+    and 6, H.264 spec Table 7-6; 0/5 are P and 2/7 are I). Pictures group on
+    ``first_mb_in_slice == 0``, exactly as :func:`count_h264_pictures` groups
+    them.
+    """
+
+    picture_count: int
+    b_picture_count: int
+    # A B picture cannot be presented before the next non-B picture arrives,
+    # so a run of D consecutive B pictures needs D frames of decoder reorder
+    # buffering: the longest such run is the reorder depth this stream needs.
+    reorder_depth: int
+    # The B pictures after the last non-B picture. With no anchor behind them,
+    # a ``-c:v copy`` MP4 remux drops exactly this tail at end of stream
+    # (#250 measured 303 samples in, 301 decoded).
+    trailing_b_pictures: int
+
+
+def scan_picture_coding_types(stream: bytes) -> PictureCodingScan:
+    """Classify the pictures in one Annex B payload as B or not B.
+
+    Detection reads slice headers, not AUD ``primary_pic_type`` values: the
+    AUD repair path (:func:`ensure_access_unit_delimiter`) deliberately writes
+    the permissive type-7 delimiter without knowing the real picture type, so
+    only slice headers tell the truth. Data partitions B/C (NAL types 3/4)
+    carry no slice header of their own and are skipped, as in
+    :func:`count_h264_pictures`. A slice header that cannot be parsed is
+    fail-closed as an error: an uncountable slice means the stream's B-frame
+    freedom cannot be proven.
+    """
+    nal_offsets_and_types = _annex_b_nal_offsets_and_types(stream)
+    picture_is_b: list[bool] = []
+    for nal_index, (nal_start_offset, nal_type) in enumerate(nal_offsets_and_types):
+        if nal_type not in _SLICE_HEADER_NAL_TYPES:
+            continue
+        nal_end_offset = (
+            nal_offsets_and_types[nal_index + 1][0]
+            if nal_index + 1 < len(nal_offsets_and_types)
+            else len(stream)
+        )
+        nal_header_offset = _nal_header_offset(stream, nal_start_offset)
+        slice_payload = stream[nal_header_offset + 1 : nal_end_offset]
+        rbsp = _unescape_ebsp_head(slice_payload, _SLICE_HEADER_HEAD_BYTES)
+        slice_header_fields = _slice_header_fields(rbsp)
+        if slice_header_fields is None:
+            # The head was too short to read both Exp-Golomb values. Fall
+            # back to the full unescape so the existing fail-closed message
+            # still fires on the malformed cases the existing tests pin.
+            rbsp = _remove_emulation_prevention_bytes(slice_payload)
+            slice_header_fields = _slice_header_fields(rbsp)
+            if slice_header_fields is None:
+                raise ValueError(
+                    "a slice header is incomplete or truncated; picture coding types "
+                    "cannot be classified"
+                )
+        first_mb_in_slice, slice_type_code = slice_header_fields
+        slice_is_b = slice_type_code % 5 == 1
+        if first_mb_in_slice == 0:
+            picture_is_b.append(slice_is_b)
+        elif picture_is_b:
+            picture_is_b[-1] = picture_is_b[-1] or slice_is_b
+        else:
+            raise ValueError(
+                "a slice header claims first_mb_in_slice > 0 before any picture starts; "
+                "picture coding types cannot be classified"
+            )
+    reorder_depth = 0
+    current_run = 0
+    for picture_is_b_flag in picture_is_b:
+        current_run = current_run + 1 if picture_is_b_flag else 0
+        reorder_depth = max(reorder_depth, current_run)
+    trailing_b_pictures = 0
+    for picture_is_b_flag in reversed(picture_is_b):
+        if not picture_is_b_flag:
+            break
+        trailing_b_pictures += 1
+    return PictureCodingScan(
+        picture_count=len(picture_is_b),
+        b_picture_count=sum(picture_is_b),
+        reorder_depth=reorder_depth,
+        trailing_b_pictures=trailing_b_pictures,
+    )
 
 
 def ensure_access_unit_delimiter(access_unit: bytes) -> bytes:
@@ -400,8 +584,25 @@ def write_access_units_to_mp4(
     ``ffmpeg -r {fps} -f h264 -i - -c:v copy -movflags +faststart``. The
     resulting file plays in anything; frame timing is constant-rate ``fps``
     (callers needing exact per-frame log times use the message timestamps).
+
+    Raises ``ValueError`` on a stream carrying B-frames: a ``-c:v copy`` remux
+    cannot represent the reorder tail, and the trailing frames are silently
+    undecodable from the muxed file (#250 measured 303 samples in, 301
+    decoded). Canonical video requires ``bframes=0`` (docs/FORMAT.md, "The
+    H.264 bitstream constraints").
     """
     annex_b_stream = b"".join(units)
+    coding_types = scan_picture_coding_types(annex_b_stream)
+    if coding_types.b_picture_count:
+        raise ValueError(
+            f"cannot remux to MP4 without dropping frames: the stream carries "
+            f"{coding_types.b_picture_count} B picture(s) across "
+            f"{coding_types.picture_count} (reorder depth "
+            f"{coding_types.reorder_depth}); a -c:v copy remux drops the reorder "
+            f"tail, putting the last {coding_types.trailing_b_pictures} frame(s) at "
+            "risk (measured 301 of 303 in #250). Canonical video requires "
+            "bframes=0; re-encode upstream -- see docs/FORMAT.md item 4"
+        )
     # Write to a sibling temp path and replace atomically: callers cache on
     # bare file existence, so the final path must never hold a partial MP4.
     temporary_output = output.with_name(output.name + ".tmp")

@@ -13,7 +13,12 @@ from fastapi.testclient import TestClient
 from hflow_server import ServerSettings, create_app
 
 from hflow.runtime import RuntimeConfig, render_bundle
-from hflow.runtime._client import AirflowClient, AirflowClientError
+from hflow.runtime._client import (
+    AirflowClient,
+    AirflowClientError,
+    AirflowDagRun,
+    AirflowTaskInstance,
+)
 
 PIPELINE_SOURCE = "import hflow\n\napp = hflow.App('demo', data_root='/opt/airflow/data')\n"
 
@@ -61,16 +66,35 @@ def _task_instance(
     start_date: str | None = None,
     end_date: str | None = None,
     try_number: int = 1,
-) -> dict[str, Any]:
-    return {
-        "task_id": task_id,
-        "state": state,
-        "map_index": map_index,
-        "start_date": start_date,
-        "end_date": end_date,
-        "try_number": try_number,
-        "operator": "never surfaced",
-    }
+) -> AirflowTaskInstance:
+    return AirflowTaskInstance(
+        task_id=task_id,
+        state=state,
+        map_index=map_index,
+        start_date=start_date,
+        end_date=end_date,
+        try_number=try_number,
+        queued_at=None,
+        duration=None,
+    )
+
+
+def _dag_run(value: dict[str, Any] | AirflowDagRun) -> AirflowDagRun:
+    if isinstance(value, AirflowDagRun):
+        return value
+    conf = value.get("conf")
+    if not isinstance(conf, dict):
+        conf = {}
+    return AirflowDagRun(
+        dag_run_id=value.get("dag_run_id") if isinstance(value.get("dag_run_id"), str) else None,
+        state=value.get("state") if isinstance(value.get("state"), str) else None,
+        logical_date=value.get("logical_date")
+        if isinstance(value.get("logical_date"), str)
+        else None,
+        start_date=value.get("start_date") if isinstance(value.get("start_date"), str) else None,
+        end_date=value.get("end_date") if isinstance(value.get("end_date"), str) else None,
+        conf=conf,
+    )
 
 
 def _stubbed_airflow(
@@ -78,13 +102,19 @@ def _stubbed_airflow(
     *,
     master_run: dict[str, Any],
     stage_runs: dict[str, list[dict[str, Any]]],
-    task_instances: dict[tuple[str, str], list[dict[str, Any]]],
+    task_instances: dict[tuple[str, str], list[AirflowTaskInstance]],
 ) -> None:
-    monkeypatch.setattr(AirflowClient, "dag_run", lambda self, dag_id, dag_run_id: dict(master_run))
+    monkeypatch.setattr(
+        AirflowClient,
+        "dag_run",
+        lambda self, dag_id, dag_run_id: _dag_run(master_run),
+    )
     monkeypatch.setattr(
         AirflowClient,
         "dag_runs",
-        lambda self, dag_id, *, limit=100, order_by=None: list(stage_runs.get(dag_id, [])),
+        lambda self, dag_id, *, limit=100, order_by=None: [
+            _dag_run(run) for run in stage_runs.get(dag_id, [])
+        ],
     )
     monkeypatch.setattr(
         AirflowClient,
@@ -219,9 +249,9 @@ def test_run_graph_passes_the_run_id_through_verbatim(
     """Airflow run ids carry ':' and '+'; the path must not mangle them."""
     requested: list[tuple[str, str]] = []
 
-    def capturing_dag_run(self: AirflowClient, dag_id: str, dag_run_id: str) -> dict[str, Any]:
+    def capturing_dag_run(self: AirflowClient, dag_id: str, dag_run_id: str) -> AirflowDagRun:
         requested.append((dag_id, dag_run_id))
-        return {"dag_run_id": dag_run_id, "state": "success", "start_date": None}
+        return _dag_run({"dag_run_id": dag_run_id, "state": "success", "start_date": None})
 
     monkeypatch.setattr(AirflowClient, "dag_run", capturing_dag_run)
     monkeypatch.setattr(AirflowClient, "task_instances", lambda self, dag_id, dag_run_id: [])
@@ -341,14 +371,16 @@ def test_an_ended_master_run_never_adopts_a_later_unrelated_stage_run(
         ],
     }
     monkeypatch.setattr(
-        AirflowClient, "dag_run", lambda self, dag_id, dag_run_id: dict(master_runs[dag_run_id])
+        AirflowClient,
+        "dag_run",
+        lambda self, dag_id, dag_run_id: _dag_run(master_runs[dag_run_id]),
     )
     monkeypatch.setattr(
         AirflowClient,
         "dag_runs",
-        lambda self, dag_id, *, limit=100, order_by=None: list(
-            interleaved_stage_runs.get(dag_id, [])
-        ),
+        lambda self, dag_id, *, limit=100, order_by=None: [
+            _dag_run(run) for run in interleaved_stage_runs.get(dag_id, [])
+        ],
     )
     monkeypatch.setattr(AirflowClient, "task_instances", lambda self, dag_id, dag_run_id: [])
 
@@ -418,11 +450,13 @@ def test_run_graph_tolerates_unregistered_stage_sub_dags(
     monkeypatch.setattr(
         AirflowClient,
         "dag_run",
-        lambda self, dag_id, dag_run_id: {
-            "dag_run_id": dag_run_id,
-            "state": "success",
-            "start_date": MASTER_STARTED_AT,
-        },
+        lambda self, dag_id, dag_run_id: _dag_run(
+            {
+                "dag_run_id": dag_run_id,
+                "state": "success",
+                "start_date": MASTER_STARTED_AT,
+            }
+        ),
     )
     monkeypatch.setattr(AirflowClient, "dag_runs", stage_runs_404)
     monkeypatch.setattr(AirflowClient, "task_instances", lambda self, dag_id, dag_run_id: [])

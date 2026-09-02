@@ -905,7 +905,86 @@ def write_label_report(
     _write_json_atomically(output_path, report)
 
 
-def _run_metadata(configuration: EvaluationConfiguration) -> dict[str, object]:
+def _required_run_metadata_string(
+    document: Mapping[str, object], field_name: str, record_context: str
+) -> str:
+    field_value = document.get(field_name)
+    if not isinstance(field_value, str) or not field_value:
+        raise ValueError(f"{record_context} field {field_name!r} must be a string")
+    return field_value
+
+
+def _required_run_metadata_integer(
+    document: Mapping[str, object], field_name: str, record_context: str
+) -> int:
+    field_value = document.get(field_name)
+    if not isinstance(field_value, int) or isinstance(field_value, bool):
+        raise ValueError(f"{record_context} field {field_name!r} must be an integer")
+    return field_value
+
+
+def _optional_run_metadata_integer(
+    document: Mapping[str, object], field_name: str, record_context: str
+) -> int | None:
+    field_value = document.get(field_name)
+    if field_value is None:
+        return None
+    if not isinstance(field_value, int) or isinstance(field_value, bool):
+        raise ValueError(f"{record_context} field {field_name!r} must be an integer or null")
+    return field_value
+
+
+@dataclass(frozen=True)
+class RunMetadata:
+    """Saved run.json metadata, parsed once at the load boundary.
+
+    ``document`` is the full persisted schema; the other fields are the
+    consumed subset, typed so task creation and summary generation never
+    index back into the JSON shape.
+    """
+
+    label: str
+    fingerprint: str
+    model: str
+    camera_view: str
+    frame_stride: int
+    episode_count: int | None
+    samples_per_episode: int | None
+    samples_per_hand_count: int | None
+    sample_seed: int
+    document: Mapping[str, object]
+
+    def to_json_dict(self) -> dict[str, object]:
+        return dict(self.document)
+
+    @classmethod
+    def from_json_file(cls, metadata_path: Path) -> RunMetadata:
+        try:
+            document = json.loads(metadata_path.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"could not read run metadata {metadata_path}: {error}") from error
+        if not isinstance(document, dict):
+            raise ValueError(f"{metadata_path} must contain a JSON object")
+        context = str(metadata_path)
+        return cls(
+            label=_required_run_metadata_string(document, "label", context),
+            fingerprint=_required_run_metadata_string(document, "fingerprint", context),
+            model=_required_run_metadata_string(document, "model", context),
+            camera_view=_required_run_metadata_string(document, "camera_view", context),
+            frame_stride=_required_run_metadata_integer(document, "frame_stride", context),
+            episode_count=_optional_run_metadata_integer(document, "episode_count", context),
+            samples_per_episode=_optional_run_metadata_integer(
+                document, "samples_per_episode", context
+            ),
+            samples_per_hand_count=_optional_run_metadata_integer(
+                document, "samples_per_hand_count", context
+            ),
+            sample_seed=_required_run_metadata_integer(document, "sample_seed", context),
+            document=document,
+        )
+
+
+def _run_metadata_document(configuration: EvaluationConfiguration) -> dict[str, object]:
     source_descriptors = [
         {"path": str(path), "size_bytes": path.stat().st_size}
         for path in configuration.source_paths
@@ -940,11 +1019,10 @@ def _run_metadata(configuration: EvaluationConfiguration) -> dict[str, object]:
             "response_schema": HAND_COUNT_RESPONSE_SCHEMA,
         },
     }
-    serialized_contract = json.dumps(result_contract, sort_keys=True, separators=(",", ":"))
     return {
         "schema_version": SCHEMA_VERSION,
         "label": configuration.label,
-        "fingerprint": _sha256_text(serialized_contract),
+        "fingerprint": hflow.fingerprint_contract(result_contract),
         **result_contract,
         "api_key_environment_variable": configuration.api_key_environment_variable,
         "worker_count": configuration.worker_count,
@@ -952,18 +1030,34 @@ def _run_metadata(configuration: EvaluationConfiguration) -> dict[str, object]:
     }
 
 
-def _prepare_output_directory(configuration: EvaluationConfiguration) -> dict[str, object]:
+def _run_metadata(configuration: EvaluationConfiguration) -> RunMetadata:
+    document = _run_metadata_document(configuration)
+    return RunMetadata(
+        label=configuration.label,
+        fingerprint=str(document["fingerprint"]),
+        model=configuration.model,
+        camera_view=configuration.camera_view.value,
+        frame_stride=configuration.frame_stride,
+        episode_count=configuration.episode_count,
+        samples_per_episode=configuration.samples_per_episode,
+        samples_per_hand_count=configuration.samples_per_hand_count,
+        sample_seed=configuration.sample_seed,
+        document=document,
+    )
+
+
+def _prepare_output_directory(configuration: EvaluationConfiguration) -> RunMetadata:
     configuration.output_directory.mkdir(parents=True, exist_ok=True)
     metadata_path = configuration.output_directory / RUN_METADATA_FILE_NAME
     current_metadata = _run_metadata(configuration)
     if metadata_path.is_file():
-        existing_metadata = json.loads(metadata_path.read_text())
-        if existing_metadata.get("fingerprint") != current_metadata["fingerprint"]:
+        existing_metadata = RunMetadata.from_json_file(metadata_path)
+        if existing_metadata.fingerprint != current_metadata.fingerprint:
             raise ValueError(
                 f"{metadata_path} describes a different experiment; choose another --output"
             )
         return existing_metadata
-    _write_json_atomically(metadata_path, current_metadata)
+    _write_json_atomically(metadata_path, current_metadata.to_json_dict())
     return current_metadata
 
 
@@ -976,80 +1070,121 @@ def _sample_expected_value(sample: EvalSample) -> int:
     return parse_hand_count_response(raw_target)
 
 
-def _sample_result(
-    log: EvalLog,
-    sample: EvalSample,
-    configuration: EvaluationConfiguration,
-) -> dict[str, object]:
+@dataclass(frozen=True)
+class SampleResponseMetadata:
+    """Provider response fields retained for every sample outcome variant."""
+
+    response_model: str | None
+    latency_seconds: float | None
+    usage: Mapping[str, object] | None
+
+
+@dataclass(frozen=True)
+class SuccessfulSampleOutcome:
+    """A completed response parsed into the hand-count result vocabulary."""
+
+    raw_response: str
+    response_metadata: SampleResponseMetadata
+    predicted_value: int
+
+
+@dataclass(frozen=True)
+class InvalidResponseSampleOutcome:
+    """A completed response outside the hand-count result vocabulary."""
+
+    raw_response: str
+    response_metadata: SampleResponseMetadata
+    parse_error: str
+
+
+@dataclass(frozen=True)
+class ExecutionErrorSampleOutcome:
+    """Inspect reported an execution failure instead of a completed response."""
+
+    raw_response: str
+    response_metadata: SampleResponseMetadata
+    error: str
+
+
+SampleOutcome = SuccessfulSampleOutcome | InvalidResponseSampleOutcome | ExecutionErrorSampleOutcome
+
+
+@dataclass(frozen=True)
+class EvaluatedSample:
+    """One evaluated Inspect sample: identification plus exactly one outcome variant."""
+
+    frame_id: str
+    source_episode: str
+    expected_value: int
+    outcome: SampleOutcome
+
+
+def _sample_result(log: EvalLog, sample: EvalSample) -> EvaluatedSample:
     sample_metadata = sample.metadata or {}
-    base_result: dict[str, object] = {
-        "schema_version": SCHEMA_VERSION,
-        "source_path": str(sample_metadata["source_path"]),
-        "source_episode": str(sample_metadata["source_episode"]),
-        "camera_view": str(sample_metadata["camera_view"]),
-        "frame_id": str(sample.id),
-        "frame_index": int(sample_metadata["frame_index"]),
-        "left_in_frame_joint_count": int(sample_metadata["left_in_frame_joint_count"]),
-        "right_in_frame_joint_count": int(sample_metadata["right_in_frame_joint_count"]),
-        "left_hand_issue_reasons": sample_metadata["left_hand_issue_reasons"],
-        "right_hand_issue_reasons": sample_metadata["right_hand_issue_reasons"],
-        "expected_value": _sample_expected_value(sample),
-        "model": configuration.model,
-        "raw_response": sample.output.completion,
-    }
-    if sample.output.model:
-        base_result["response_model"] = sample.output.model
-    if sample.output.time is not None:
-        base_result["latency_seconds"] = sample.output.time
-    if sample.output.usage is not None:
-        base_result["usage"] = sample.output.usage.model_dump(exclude_none=True)
+    response_metadata = SampleResponseMetadata(
+        response_model=sample.output.model or None,
+        latency_seconds=sample.output.time,
+        usage=(
+            sample.output.usage.model_dump(exclude_none=True)
+            if sample.output.usage is not None
+            else None
+        ),
+    )
     if sample.error is not None or sample.output.error is not None:
         error_message = sample.error.message if sample.error is not None else sample.output.error
-        return {**base_result, "status": "error", "error": str(error_message)[:1000]}
-    try:
-        predicted_value = parse_hand_count_response(sample.output.completion)
-    except ValueError as error:
-        return {**base_result, "status": "invalid", "error": str(error)}
-    return {**base_result, "status": "ok", "predicted_value": predicted_value}
+        outcome: SampleOutcome = ExecutionErrorSampleOutcome(
+            raw_response=sample.output.completion,
+            response_metadata=response_metadata,
+            error=str(error_message)[:1000],
+        )
+    else:
+        try:
+            predicted_value = parse_hand_count_response(sample.output.completion)
+        except ValueError as error:
+            outcome = InvalidResponseSampleOutcome(
+                raw_response=sample.output.completion,
+                response_metadata=response_metadata,
+                parse_error=str(error),
+            )
+        else:
+            outcome = SuccessfulSampleOutcome(
+                raw_response=sample.output.completion,
+                response_metadata=response_metadata,
+                predicted_value=predicted_value,
+            )
+    return EvaluatedSample(
+        frame_id=str(sample.id),
+        source_episode=str(sample_metadata["source_episode"]),
+        expected_value=_sample_expected_value(sample),
+        outcome=outcome,
+    )
 
 
 def _results_from_inspect_logs(
-    log_headers: Sequence[EvalLog], configuration: EvaluationConfiguration
-) -> tuple[list[dict[str, object]], list[str]]:
-    results: list[dict[str, object]] = []
+    log_headers: Sequence[EvalLog],
+) -> tuple[list[EvaluatedSample], list[str]]:
+    results: list[EvaluatedSample] = []
     log_locations: list[str] = []
     for log_header in log_headers:
         log_locations.append(log_header.location)
         completed_log = read_eval_log(log_header.location)
         results.extend(
-            _sample_result(completed_log, sample, configuration)
-            for sample in completed_log.samples or []
+            _sample_result(completed_log, sample) for sample in completed_log.samples or []
         )
     return results, log_locations
 
 
-def _result_integer(result: Mapping[str, object], name: str) -> int:
-    value = result[name]
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"result field {name!r} must be an integer, got {value!r}")
-    return value
-
-
-def _evaluation_result_summary(results: Sequence[dict[str, object]]) -> dict[str, object]:
-    valid_results = [result for result in results if result.get("status") == "ok"]
-    expected_counts = Counter(_result_integer(result, "expected_value") for result in results)
-    predicted_counts = Counter(
-        _result_integer(result, "predicted_value") for result in valid_results
-    )
-    confusion_counts = Counter(
-        (
-            _result_integer(result, "expected_value"),
-            _result_integer(result, "predicted_value"),
-        )
-        for result in valid_results
-    )
+def _evaluation_result_summary(results: Sequence[EvaluatedSample]) -> dict[str, object]:
+    expected_counts = Counter(result.expected_value for result in results)
+    valid_pairs = [
+        (result.expected_value, result.outcome.predicted_value)
+        for result in results
+        if isinstance(result.outcome, SuccessfulSampleOutcome)
+    ]
+    predicted_counts = Counter(predicted_value for _, predicted_value in valid_pairs)
+    confusion_counts = Counter(valid_pairs)
     agreement_count = sum(
-        result["expected_value"] == result["predicted_value"] for result in valid_results
+        expected_value == predicted_value for expected_value, predicted_value in valid_pairs
     )
     per_class_agreement: dict[str, dict[str, int | float | None]] = {}
     valid_class_agreement_fractions: list[float] = []
@@ -1075,14 +1210,14 @@ def _evaluation_result_summary(results: Sequence[dict[str, object]]) -> dict[str
             valid_class_agreement_fractions.append(valid_class_agreement_fraction)
         attempted_class_agreement_fractions.append(attempted_class_agreement_fraction)
     latency_values = [
-        float(latency)
+        float(result.outcome.response_metadata.latency_seconds)
         for result in results
-        if isinstance((latency := result.get("latency_seconds")), int | float)
+        if result.outcome.response_metadata.latency_seconds is not None
     ]
     usage_totals: Counter[str] = Counter()
     for result in results:
-        usage = result.get("usage")
-        if isinstance(usage, dict):
+        usage = result.outcome.response_metadata.usage
+        if usage is not None:
             usage_totals.update(
                 {
                     str(name): float(value)
@@ -1092,13 +1227,17 @@ def _evaluation_result_summary(results: Sequence[dict[str, object]]) -> dict[str
             )
     return {
         "attempted_count": len(results),
-        "valid_count": len(valid_results),
-        "invalid_count": sum(result.get("status") == "invalid" for result in results),
-        "error_count": sum(result.get("status") == "error" for result in results),
+        "valid_count": len(valid_pairs),
+        "invalid_count": sum(
+            isinstance(result.outcome, InvalidResponseSampleOutcome) for result in results
+        ),
+        "error_count": sum(
+            isinstance(result.outcome, ExecutionErrorSampleOutcome) for result in results
+        ),
         "expected_value_counts": dict(sorted(expected_counts.items())),
         "predicted_value_counts": dict(sorted(predicted_counts.items())),
         "agreement_count": agreement_count,
-        "agreement_fraction": agreement_count / len(valid_results) if valid_results else None,
+        "agreement_fraction": agreement_count / len(valid_pairs) if valid_pairs else None,
         "attempted_agreement_fraction": agreement_count / len(results) if results else None,
         "macro_agreement_fraction": (
             sum(valid_class_agreement_fractions) / len(valid_class_agreement_fractions)
@@ -1126,29 +1265,29 @@ def _evaluation_result_summary(results: Sequence[dict[str, object]]) -> dict[str
 
 
 def summarize_evaluation_results(
-    run_metadata: Mapping[str, object], results: Sequence[dict[str, object]]
+    run_metadata: RunMetadata, results: Sequence[EvaluatedSample]
 ) -> dict[str, object]:
-    latest_results = {str(result["frame_id"]): result for result in results}
+    latest_results = {result.frame_id: result for result in results}
     deduplicated_results = list(latest_results.values())
-    source_episodes = sorted({str(result["source_episode"]) for result in deduplicated_results})
+    source_episodes = sorted({result.source_episode for result in deduplicated_results})
     return {
         "schema_version": SCHEMA_VERSION,
-        "label": run_metadata["label"],
-        "fingerprint": run_metadata["fingerprint"],
-        "model": run_metadata["model"],
-        "camera_view": run_metadata["camera_view"],
-        "frame_stride": run_metadata["frame_stride"],
-        "episode_count": run_metadata.get("episode_count"),
-        "samples_per_episode": run_metadata.get("samples_per_episode"),
-        "samples_per_hand_count": run_metadata["samples_per_hand_count"],
-        "sample_seed": run_metadata["sample_seed"],
+        "label": run_metadata.label,
+        "fingerprint": run_metadata.fingerprint,
+        "model": run_metadata.model,
+        "camera_view": run_metadata.camera_view,
+        "frame_stride": run_metadata.frame_stride,
+        "episode_count": run_metadata.episode_count,
+        "samples_per_episode": run_metadata.samples_per_episode,
+        "samples_per_hand_count": run_metadata.samples_per_hand_count,
+        "sample_seed": run_metadata.sample_seed,
         "overall": _evaluation_result_summary(deduplicated_results),
         "episodes": {
             source_episode: _evaluation_result_summary(
                 [
                     result
                     for result in deduplicated_results
-                    if result["source_episode"] == source_episode
+                    if result.source_episode == source_episode
                 ]
             )
             for source_episode in source_episodes
@@ -1215,7 +1354,7 @@ def run_evaluation(configuration: EvaluationConfiguration) -> dict[str, object]:
     inspect_logs_directory.mkdir(parents=True, exist_ok=True)
     task = Task(
         name="egosuite_projected_hand_count",
-        version=str(run_metadata["fingerprint"])[:16],
+        version=run_metadata.fingerprint[:16],
         dataset=_PreparedFrameSampleSource(
             frames=prepared_frames,
             prompt=configuration.prompt,
@@ -1232,7 +1371,7 @@ def run_evaluation(configuration: EvaluationConfiguration) -> dict[str, object]:
             "samples_per_hand_count": configuration.samples_per_hand_count,
             "sample_seed": configuration.sample_seed,
             "prompt_sha256": _sha256_text(configuration.prompt),
-            "run_fingerprint": run_metadata["fingerprint"],
+            "run_fingerprint": run_metadata.fingerprint,
         },
     )
     inserted_placeholder_api_key = api_key is None
@@ -1246,7 +1385,7 @@ def run_evaluation(configuration: EvaluationConfiguration) -> dict[str, object]:
             model_base_url=configuration.base_url,
             model_args={"api_key_var": configuration.api_key_environment_variable},
             metadata={
-                "run_fingerprint": run_metadata["fingerprint"],
+                "run_fingerprint": run_metadata.fingerprint,
                 "label": configuration.label,
             },
             max_connections=configuration.worker_count,
@@ -1263,7 +1402,7 @@ def run_evaluation(configuration: EvaluationConfiguration) -> dict[str, object]:
     finally:
         if inserted_placeholder_api_key:
             os.environ.pop(configuration.api_key_environment_variable, None)
-    results, log_locations = _results_from_inspect_logs(log_headers, configuration)
+    results, log_locations = _results_from_inspect_logs(log_headers)
     summary = summarize_evaluation_results(run_metadata, results)
     summary["inspect_logs"] = log_locations
     summary["reference"] = summarize_reference_labels(

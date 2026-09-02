@@ -2,7 +2,7 @@
 
 Makes episode-level VLM questions work even on single-image models and cuts
 vision tokens (one image instead of N). One of the two VLM-adjacent helpers
-we ship -- there is deliberately no bundled VLM client.
+we ship; generic model clients remain user-owned.
 
 Implementation: a single ffmpeg invocation over the frame files
 (``concat`` + ``scale`` + ``tile``). Timestamp burn-in uses ``drawtext`` when

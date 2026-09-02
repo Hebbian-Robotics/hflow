@@ -25,7 +25,6 @@ import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from posixpath import normpath
-from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -33,6 +32,7 @@ from pydantic import BaseModel, Field
 from hflow.runtime import (
     AirflowClient,
     AirflowClientError,
+    AirflowDagRun,
     client_for_bundle,
     client_for_endpoint,
     load_bundle,
@@ -280,29 +280,28 @@ def optional_string(value: object) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _run_summary(run: dict[str, Any]) -> RuntimeRunSummary:
-    """One master dag run reduced to the fields the Runs page shows.
+def _run_summary(run: AirflowDagRun) -> RuntimeRunSummary:
+    """One master DAG run reduced to the fields the Runs page shows.
 
     The full ``conf`` rides along (it is the trigger's own input); everything
     else Airflow returns stays server-side.
     """
-    conf = run.get("conf")
     return RuntimeRunSummary(
-        dag_run_id=optional_string(run.get("dag_run_id")),
-        state=optional_string(run.get("state")),
-        logical_date=optional_string(run.get("logical_date")),
-        start_date=optional_string(run.get("start_date")),
-        end_date=optional_string(run.get("end_date")),
-        conf=conf if isinstance(conf, dict) else {},
+        dag_run_id=run.dag_run_id,
+        state=run.state,
+        logical_date=run.logical_date,
+        start_date=run.start_date,
+        end_date=run.end_date,
+        conf=run.conf,
     )
 
 
-def _stage_run_summary(run: dict[str, Any]) -> StageRunSummary:
+def _stage_run_summary(run: AirflowDagRun) -> StageRunSummary:
     return StageRunSummary(
-        dag_run_id=optional_string(run.get("dag_run_id")),
-        state=optional_string(run.get("state")),
-        start_date=optional_string(run.get("start_date")),
-        end_date=optional_string(run.get("end_date")),
+        dag_run_id=run.dag_run_id,
+        state=run.state,
+        start_date=run.start_date,
+        end_date=run.end_date,
     )
 
 
@@ -455,8 +454,8 @@ def create_runtime_router(settings: ServerSettings, resolver: RuntimeResolver) -
         except AirflowClientError as error:
             raise airflow_failure_refusal(error, source=runtime.source) from error
         return IngestTriggerResponse(
-            dag_run_id=optional_string(trigger_response.get("dag_run_id")),
-            state=optional_string(trigger_response.get("state")),
+            dag_run_id=trigger_response.dag_run_id,
+            state=trigger_response.state,
         )
 
     return router

@@ -132,7 +132,7 @@ def my_duration(ep: hflow.Episode) -> hflow.CheckResult:
         app = hflow.import_pipeline_application(str(tmp_path / "pipeline.py"))
 
         report = app.test(data_root / "episodes-in" / "episode_0001.mcap")
-        superseded = next(run for run in report.checks if run.check.name == "episode_duration")
+        superseded = report.check("episode_duration")
         assert superseded.status is hflow.CheckStatus.SUPERSEDED
 
         assert create_dataset(app, "with-a-wrapper").row_count == 1
