@@ -458,8 +458,33 @@ def _register_catalog_relations(
         )
 
 
+def _sync_catalog_mirror(catalog_root: "Path | str | StorageRoot") -> None:
+    """Download any catalog table files a bucket mirror lacks.
+
+    Local catalogs are already on disk; bucket catalogs need a fresh sync
+    before polling can see newly appended Parquet files.
+    """
+    location = parse_storage_root(catalog_root)
+    if isinstance(location, BucketStorageRoot):
+        location.sync_into_mirror(tuple(_TABLE_DIRECTORIES.values()))
+
+
+def _completed_append_exists(catalog_root: "Path | str | StorageRoot") -> bool:
+    """Whether a completed catalog append is present.
+
+    ``Catalog.append_episode`` writes the episodes file last, so any
+    ``episodes/*.parquet`` object proves the whole append finished.
+    """
+    location = parse_storage_root(catalog_root)
+    if isinstance(location, BucketStorageRoot):
+        _sync_catalog_mirror(location)
+        episodes_dir = location.mirror / "episodes"
+        return episodes_dir.is_dir() and any(episodes_dir.glob("*.parquet"))
+    return any(location.path.joinpath("episodes").glob("*.parquet"))
+
+
 def _refresh_local_catalog_connection(
-    connection: duckdb.DuckDBPyConnection, catalog_root: Path
+    connection: duckdb.DuckDBPyConnection, catalog_root: "Path | str | StorageRoot"
 ) -> None:
     """Replace an empty catalog surface after its first append completes.
 
@@ -471,14 +496,14 @@ def _refresh_local_catalog_connection(
     transaction lets a long-running local explorer see that first run without
     replacing its DuckDB connection.
 
-    This is intentionally local and unconstrained. Bucket connections have a
-    synced mirror with a separate refresh lifecycle, while constrained
-    connections have locked their configuration and materialized their data.
+    For bucket catalogs the query root is the synced mirror directory; this
+    re-syncs before re-registering views so the first remote append is
+    visible. Constrained connections have locked their configuration and
+    materialized their data and must not call this.
     """
     location = parse_storage_root(catalog_root)
-    if not isinstance(location, LocalStorageRoot):
-        raise ValueError("catalog connection refresh requires a local catalog")
     _verify_catalog_format(location)
+    query_root = _local_query_root(location)
 
     derived_view_names = (
         "episodes",
@@ -509,7 +534,7 @@ def _refresh_local_catalog_connection(
 
         _register_catalog_relations(
             connection,
-            location.path,
+            query_root,
             constrained=False,
             writable_directories=(),
         )

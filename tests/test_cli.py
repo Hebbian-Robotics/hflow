@@ -173,3 +173,73 @@ def test_the_module_form_reports_a_conforming_file(tmp_path: Path) -> None:
     assert module.returncode == 0
     assert module.returncode == script.returncode
     assert module.stdout == script.stdout
+
+
+@pytest.mark.parametrize("scheme", ["s3", "gs", "az"])
+def test_catalog_ui_cli_accepts_bucket_catalog_urls(
+    scheme: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hflow.catalog_ui import CatalogUiSettings
+    from hflow.cli import _command_catalog_ui
+
+    served_catalog_roots: list[str] = []
+
+    def record_serve(settings: CatalogUiSettings) -> None:
+        served_catalog_roots.append(str(settings.catalog_root))
+
+    monkeypatch.setattr("hflow.catalog_ui.serve_catalog_ui", record_serve)
+    parser = _build_parser()
+    catalog_url = f"{scheme}://robot-data/production/catalog"
+    arguments = parser.parse_args(["catalog", "ui", "--no-browser", "--catalog", catalog_url])
+
+    assert _command_catalog_ui(arguments) == 0
+    assert served_catalog_roots == [catalog_url]
+
+
+def test_catalog_ui_cli_reports_a_missing_remote_catalog_marker(
+    monkeypatch: pytest.MonkeyPatch, capsys: CaptureFixture
+) -> None:
+    def raise_missing_marker(_settings: object) -> None:
+        raise FileNotFoundError(
+            "gs://robot-data/production/catalog is not a catalog root "
+            "(no format_version marker); expected the location a Catalog was "
+            "created with, e.g. <data_root>/catalog"
+        )
+
+    monkeypatch.setattr("hflow.catalog_ui.serve_catalog_ui", raise_missing_marker)
+
+    exit_code = main(
+        [
+            "catalog",
+            "ui",
+            "--no-browser",
+            "--catalog",
+            "gs://robot-data/production/catalog",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.err.startswith("catalog ui:")
+    assert "format_version" in captured.err
+
+
+def test_catalog_ui_cli_reports_a_missing_bucket_extra(
+    monkeypatch: pytest.MonkeyPatch, capsys: CaptureFixture
+) -> None:
+    def raise_missing_obstore() -> object:
+        raise ModuleNotFoundError(
+            "bucket storage roots need the optional obstore backend -- install the "
+            'extra: pip install "hflow[bucket]" (uv: uv add "hflow[bucket]")'
+        )
+
+    monkeypatch.setattr("hflow.storage._load_obstore", raise_missing_obstore)
+
+    exit_code = main(
+        ["catalog", "ui", "--no-browser", "--catalog", "s3://robot-data/production/catalog"]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.err.startswith("catalog ui:")
+    assert "hflow[bucket]" in captured.err

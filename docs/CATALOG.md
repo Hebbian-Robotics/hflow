@@ -138,6 +138,25 @@ hflow catalog ui --catalog data/egocentric/catalog
 hflow catalog ui --catalog data/egocentric/catalog --no-browser
 ```
 
+Object-store catalogs work the same way when the optional bucket backend is
+installed (`uv sync --extra bucket`) and provider credentials are available:
+
+```bash
+hflow catalog ui --catalog s3://robot-data/production/catalog --no-browser
+hflow catalog ui --catalog gs://robot-data/production/catalog --no-browser
+```
+
+For bucket catalogs, `catalog ui` validates the existing `format_version`
+marker and never creates or changes objects in the bucket. It syncs append-only
+Parquet table files into the local mirror under `HFLOW_MIRROR_DIR` (or
+`$XDG_CACHE_HOME/hflow/mirrors`) before DuckDB opens, then re-syncs on its poll
+interval so the first and later completed appends become visible in the open UI
+without a restart. DuckDB reads the mirror only and continues to listen on
+loopback. A valid empty bucket catalog -- marker present, no Parquet rows yet --
+starts the UI and waits for its first completed append the same way a local
+empty catalog does. Local catalogs may still be created on startup when the
+directory does not exist yet; remote catalogs must already exist.
+
 DuckDB UI listens on loopback. When HFlow is running on another machine, run
 the second command there and forward the port from your laptop:
 
@@ -151,8 +170,8 @@ assets. DuckDB UI is an unrestricted local SQL explorer, so keep the port on
 loopback and use a tunnel instead of exposing it publicly.
 
 This command is separate from [`hflow serve`](./SERVE.md). `catalog ui` is
-DuckDB's browser over the local catalog. `serve` is HFlow's optional workspace
-REST API and does not ship a browser client.
+DuckDB's browser over the catalog (local or synced from a bucket). `serve` is
+HFlow's optional workspace REST API and does not ship a browser client.
 
 ### Query from Python or the CLI
 
@@ -601,9 +620,11 @@ itself. A catalog root contains the `format_version` marker.
 - The wide view binds its measurement columns to the keys present when the
   connection was opened. `hflow catalog ui` refreshes this surface after an
   initially empty catalog's first append, and `curate()` reopens per call.
-  If a later run introduces brand-new measurement keys into a long-lived UI
-  or `open_catalog_connection()` session, restart that session to add those
-  columns. New rows for existing keys appear without a restart.
+  Bucket-backed UI sessions re-sync newly appended Parquet files on each poll
+  so new rows for existing keys appear without a restart. If a later run
+  introduces brand-new measurement keys into a long-lived UI or
+  `open_catalog_connection()` session, restart that session to add those
+  columns.
 
 ## See also
 

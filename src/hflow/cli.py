@@ -189,20 +189,21 @@ def _build_parser() -> argparse.ArgumentParser:
     catalog_subparsers = catalog_parser.add_subparsers(dest="catalog_command", required=True)
     catalog_ui_parser = catalog_subparsers.add_parser(
         "ui",
-        help="open DuckDB UI over the local catalog",
+        help="open DuckDB UI over a local or bucket-backed catalog",
         description=(
-            "Start DuckDB's browser UI over a local HFlow catalog. The UI starts "
+            "Start DuckDB's browser UI over an HFlow catalog. The UI starts "
             "even when the catalog is empty, then refreshes its views after the "
-            "first completed append."
+            "first completed append. Local catalogs may be created on startup; "
+            "bucket catalogs must already exist and are read-only."
         ),
     )
     catalog_ui_parser.add_argument(
         "--catalog",
         default=_default_catalog_location(),
         help=(
-            "local catalog directory "
-            f"(default: $HFLOW_DATA_ROOT, else {PROJECT_CONFIG_FILE_NAME}'s data_root, "
-            f"else {DEFAULT_DATA_ROOT} -- plus /catalog)"
+            "catalog root: local directory or object-store prefix "
+            f"(s3://, gs://, az://; default: $HFLOW_DATA_ROOT, else "
+            f"{PROJECT_CONFIG_FILE_NAME}'s data_root, else {DEFAULT_DATA_ROOT} -- plus /catalog)"
         ),
     )
     catalog_ui_parser.add_argument(
@@ -1339,30 +1340,36 @@ def _command_catalog_ui(arguments: argparse.Namespace) -> int:
         serve_catalog_ui,
     )
 
-    if is_bucket_url(arguments.catalog):
-        print(
-            "catalog ui: DuckDB UI currently requires a local catalog directory",
-            file=sys.stderr,
-        )
-        return 2
-
-    local_catalog_root = Path(arguments.catalog)
-    if local_catalog_root.exists() and not local_catalog_root.is_dir():
-        print(
-            f"catalog ui: {os.strerror(errno.ENOTDIR)}: {local_catalog_root}",
-            file=sys.stderr,
-        )
-        return 2
+    catalog_location = arguments.catalog
+    if not is_bucket_url(catalog_location):
+        local_catalog_root = Path(catalog_location)
+        if local_catalog_root.exists() and not local_catalog_root.is_dir():
+            print(
+                f"catalog ui: {os.strerror(errno.ENOTDIR)}: {local_catalog_root}",
+                file=sys.stderr,
+            )
+            return 2
     try:
         settings = CatalogUiSettings(
-            catalog_root=local_catalog_root,
+            catalog_root=catalog_location,
             port=arguments.port,
             open_browser=not arguments.no_browser,
         )
         serve_catalog_ui(settings)
-    except (CatalogUiStartupError, OSError, ValueError) as error:
+    except (
+        CatalogUiStartupError,
+        OSError,
+        ValueError,
+        FileNotFoundError,
+        ModuleNotFoundError,
+    ) as error:
         print(f"catalog ui: {error}", file=sys.stderr)
         return 2
+    except Exception as error:
+        if is_bucket_url(catalog_location):
+            print(f"catalog ui: {error}", file=sys.stderr)
+            return 2
+        raise
     return 0
 
 
