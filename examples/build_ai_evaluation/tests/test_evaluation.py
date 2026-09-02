@@ -35,7 +35,8 @@ from examples.build_ai_evaluation.evaluate import (
     main,
     summarize_results,
 )
-from examples.build_ai_evaluation.judgment import (
+from examples.build_ai_evaluation.pipeline import app
+from hflow.build_ai_vlm_checks import (
     ACTIVE_MANIPULATION_RESPONSE_SCHEMA,
     HAND_COUNT_RESPONSE_SCHEMA,
     EvaluationTask,
@@ -48,7 +49,6 @@ from examples.build_ai_evaluation.judgment import (
     parse_active_manipulation_response,
     parse_hand_count_response,
 )
-from examples.build_ai_evaluation.pipeline import VISION_ENDPOINT_ALIAS, app
 
 
 class _FixtureUsage:
@@ -93,25 +93,23 @@ _TASK_VALUE_CONTRACTS: dict[
 }
 
 
-def test_task_schema_value_sets_match_their_parsers() -> None:
-    """Each task's schema must state the value set its parser enforces.
-
-    Both tasks answer from a closed set, so the schema can say so and a
-    provider doing constrained decoding will not emit anything else. When only
-    the parser knows, an out-of-set answer costs a request and lands as an
-    unparsed episode with no prediction (#257).
-    """
+def test_task_schemas_and_parsers_match_the_published_contract() -> None:
+    """Preserve Build AI's schema shapes and enforce its prose vocabulary."""
     executable_tasks = set(EvaluationTask) - {EvaluationTask.BOTH}
     assert set(_TASK_VALUE_CONTRACTS) == executable_tasks
 
     for task, (schema, property_name, parser, rejected_values) in _TASK_VALUE_CONTRACTS.items():
         properties = cast(dict[str, dict[str, object]], schema["properties"])
         property_schema = properties[property_name]
-        assert "enum" in property_schema, (
-            f"{task.value}: {property_name!r} has no 'enum', so its schema does not state the "
-            "value set its parser enforces and the model is free to answer outside it"
+        permitted_values = (
+            [0, 1, 2]
+            if task is EvaluationTask.HAND_COUNT
+            else cast(list[object], property_schema["enum"])
         )
-        permitted_values = cast(list[object], property_schema["enum"])
+        if task is EvaluationTask.HAND_COUNT:
+            # The published schema says INTEGER without an enum. Keeping that
+            # exact shape also avoids Gemini/OpenRouter emitting an empty object.
+            assert property_schema == {"type": "integer"}
         for value in permitted_values:
             assert parser(json.dumps({property_name: value})) == value, (
                 f"{task.value}: the schema permits {value!r} but the parser does not accept it"
@@ -243,9 +241,9 @@ def test_build_ai_pipeline_registers_both_judgments_as_hflow_checks() -> None:
 
     assert set(checks_by_name) == {
         "build_ai_active_manipulation",
-        "build_ai_hand_count",
+        "build_ai_hand_visibility",
     }
-    assert all(check.uses == VISION_ENDPOINT_ALIAS for check in checks_by_name.values())
+    assert all(check.requires == frozenset({"vision-model"}) for check in checks_by_name.values())
 
 
 def test_summary_reports_prevalence_agreement_and_failures_without_counting_failures_negative() -> (

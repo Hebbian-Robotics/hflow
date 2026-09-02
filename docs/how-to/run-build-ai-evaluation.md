@@ -8,7 +8,8 @@ Chat Completions with image inputs.
 The example has two execution paths built around the same judgment contract:
 
 - [`pipeline.py`](../../examples/build_ai_evaluation/pipeline.py) registers
-  hand count and active manipulation as `hflow.App` checks for MCAP episodes.
+  `build_ai_hand_visibility` and `build_ai_active_manipulation` as `hflow.App`
+  checks for MCAP episodes.
   The checks return episode measurements plus timestamped model-output
   observations.
 - [`evaluate.py`](../../examples/build_ai_evaluation/evaluate.py) streams the
@@ -57,19 +58,50 @@ table. The measurements remain as convenient episode summaries; the
 observation is the per-frame record that scales to evaluations sampling more
 than one frame.
 
-Swap prompt files with `BUILD_AI_HAND_COUNT_PROMPT` and
+Swap prompt files with `BUILD_AI_HAND_VISIBILITY_PROMPT` and
 `BUILD_AI_ACTIVE_MANIPULATION_PROMPT`. Other request controls are
 `BUILD_AI_RESPONSE_FORMAT`, `BUILD_AI_TEMPERATURE`, `BUILD_AI_MAX_TOKENS`, and
 `BUILD_AI_MAX_RETRIES`. The registered HFlow check version hashes every
 result-affecting model, prompt, schema, request, camera, and sampling setting so
 different configurations do not claim comparable step versions.
 
-For an unauthenticated self-hosted endpoint, set
-`BUILD_AI_ALLOW_MISSING_API_KEY=1`.
+For an unauthenticated self-hosted endpoint, omit `BUILD_AI_API_KEY_ENV`. Each
+check can use a different service through the
+`BUILD_AI_HAND_VISIBILITY_BASE_URL` / `BUILD_AI_HAND_VISIBILITY_MODEL` /
+`BUILD_AI_HAND_VISIBILITY_API_KEY_ENV` and corresponding
+`BUILD_AI_ACTIVE_MANIPULATION_*` overrides.
+
+The same checks are available directly in any pipeline:
+
+```python
+hflow.build_ai_vlm_checks.register_hand_visibility(
+    app,
+    endpoint="http://localhost:8000/v1",
+    model="Qwen/Qwen3-VL-8B-Instruct",
+)
+hflow.build_ai_vlm_checks.register_active_manipulation(
+    app,
+    endpoint="https://hosted.example/v1",
+    model="hosted-model",
+    api_key_environment_variable="HOSTED_MODEL_API_KEY",
+)
+```
+
+The API key is optional for local unauthenticated servers. Registration is
+opt-in rather than part of `DEFAULT_CHECKS`, because both checks perform model
+calls and users may intentionally choose different models for them.
 
 ## What this reproduces
 
-Build AI's two evaluations use the same disclosed method:
+The original specification is Build AI's
+[Egocentric-10K evaluation release](https://huggingface.co/datasets/builddotai/Egocentric-10K-Evaluation/tree/d74b7883c998dd360e3f051830fcc792a83985e6),
+including its exact
+[hand-visibility prompt](https://huggingface.co/datasets/builddotai/Egocentric-10K-Evaluation/blob/d74b7883c998dd360e3f051830fcc792a83985e6/prompts/hand_count.txt)
+and
+[active-manipulation prompt](https://huggingface.co/datasets/builddotai/Egocentric-10K-Evaluation/blob/d74b7883c998dd360e3f051830fcc792a83985e6/prompts/active_manipulation.txt),
+plus the subsequent
+[Egocentric-100K evaluation release](https://huggingface.co/datasets/builddotai/Egocentric-100K-Evaluation/tree/d0f69a56b0525c1bead80d918dc57ef83dcac899).
+Those two evaluations use the same disclosed method:
 
 1. Randomly select 10,000 frames from each of the Build AI, Ego4D, and
    EPIC-KITCHENS corpora.
@@ -79,11 +111,9 @@ Build AI's two evaluations use the same disclosed method:
 
 The published evaluation Parquet files preserve those selected frames and the
 Gemini 2.5 Flash labels. The runner pins the evaluation repositories to
-immutable revisions, reuses those exact frames, and defaults to copies of the
-upstream prompt files and response schemas:
-
-- [`hand_count.txt`](../../examples/build_ai_evaluation/prompts/hand_count.txt)
-- [`active_manipulation.txt`](../../examples/build_ai_evaluation/prompts/active_manipulation.txt)
+immutable revisions, reuses those exact frames, and defaults to the upstream
+prompts and response schemas exposed by `hflow.build_ai_vlm_checks`. Prompt files
+passed to the CLI override those defaults for comparison runs.
 
 The 10K files include upstream UUID frame IDs. The 100K files do not, so the
 runner assigns deterministic `row-00000`-style IDs in pinned Parquet order for
@@ -267,7 +297,7 @@ agreement with the published labels. Read every percentage next to its valid
 silently counted as negative labels.
 
 Sources: the pinned
-[Egocentric-10K evaluation](https://huggingface.co/datasets/builddotai/Egocentric-10K-Evaluation),
-[Egocentric-100K evaluation](https://huggingface.co/datasets/builddotai/Egocentric-100K-Evaluation),
+[Egocentric-10K evaluation](https://huggingface.co/datasets/builddotai/Egocentric-10K-Evaluation/tree/d74b7883c998dd360e3f051830fcc792a83985e6),
+[Egocentric-100K evaluation](https://huggingface.co/datasets/builddotai/Egocentric-100K-Evaluation/tree/d0f69a56b0525c1bead80d918dc57ef83dcac899),
 and OpenRouter's
 [structured-output contract](https://openrouter.ai/docs/guides/features/structured-outputs).

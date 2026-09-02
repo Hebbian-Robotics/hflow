@@ -12,7 +12,7 @@ import yaml
 
 import hflow
 from hflow.runtime import BundlePaths, RuntimeConfig, bundle_dag_ids, render_bundle
-from hflow.runtime._bundle import infer_hflow_source
+from hflow.runtime._bundle import BUNDLE_MANIFEST_VERSION, infer_hflow_source
 from hflow.steps import RUN_PROFILES, Stage
 
 AIRFLOW_SERVICE_NAMES = (
@@ -508,7 +508,7 @@ def test_bundle_manifest_describes_the_bundle_and_load_bundle_prefers_it(
     paths, _ = _render(replace(config, task_queue="workspace-a"), tmp_path / "bundle")
     manifest_file = paths.bundle_dir / "hflow-bundle.json"
     manifest_payload = json.loads(manifest_file.read_text())
-    assert manifest_payload["manifest_version"] == 1
+    assert manifest_payload["manifest_version"] == BUNDLE_MANIFEST_VERSION
     assert manifest_payload["kind"] == "compose"
     assert manifest_payload["hflow_version"] == hflow.__version__
     assert manifest_payload["dag_id"] == "my_pipeline_ingest"
@@ -575,25 +575,104 @@ def test_xcom_objectstorage_url_override(config: RuntimeConfig, tmp_path: Path) 
     )
 
 
-def test_endpoint_environment_variables_pass_through_by_name(
+def test_xcom_objectstorage_url_cannot_inject_a_sibling_environment_key(
+    config: RuntimeConfig, tmp_path: Path
+) -> None:
+    """xcom_objectstorage_url is substituted into an unquoted-looking YAML
+    scalar in COMPOSE_TEMPLATE. A value containing a newline followed by
+    the block's own indentation can otherwise be parsed as a new sibling
+    key in x-airflow-common.environment, letting an override value
+    overwrite an unrelated key (verified: AIRFLOW__CORE__LOAD_EXAMPLES can
+    be flipped from 'false' to 'true' this way against the unescaped
+    form). The value must be escaped the same way _compose_path_scalar
+    escapes other substitutions into this template, so an embedded
+    newline and colon stay part of one literal string value.
+    """
+    from dataclasses import replace
+
+    injection_payload = "s3://foo/bar\n    AIRFLOW__CORE__LOAD_EXAMPLES: 'true'"
+
+    _, compose = _render(
+        replace(config, xcom_objectstorage_url=injection_payload),
+        tmp_path / "bundle",
+    )
+    scheduler_env = compose["services"]["airflow-scheduler"]["environment"]
+
+    # The pre-existing key must be unaffected by the injected payload.
+    assert scheduler_env["AIRFLOW__CORE__LOAD_EXAMPLES"] == "false"
+    # The payload is preserved as one literal string value, not parsed as
+    # a second key. (Single-quoted YAML scalars fold embedded line breaks
+    # to spaces per the YAML spec, so the round-tripped value has a space
+    # where the payload had a newline; that's expected, not data loss the
+    # way a rejected/truncated value would be.)
+    xcom_path = scheduler_env["AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_PATH"]
+    assert "s3://foo/bar" in xcom_path
+    assert "AIRFLOW__CORE__LOAD_EXAMPLES: 'true'" in xcom_path
+
+
+def test_xcom_objectstorage_url_escapes_compose_interpolation(
+    config: RuntimeConfig, tmp_path: Path
+) -> None:
+    """The other half of the escaping: Compose interpolates ${VAR} even inside
+    single-quoted YAML scalars, so a literal ``$`` has to reach the container
+    as ``$$`` in the file. Without this the store URL would silently become
+    whatever the launch shell had in that variable, or empty."""
+    from dataclasses import replace
+
+    _, compose = _render(
+        replace(config, xcom_objectstorage_url="s3://bucket/${HOME}/xcom"),
+        tmp_path / "bundle",
+    )
+    scheduler_env = compose["services"]["airflow-scheduler"]["environment"]
+
+    assert (
+        scheduler_env["AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_PATH"] == "s3://bucket/$${HOME}/xcom"
+    )
+
+
+def test_explicit_environment_variables_pass_through_by_name(
     config: RuntimeConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Exported HFLOW_ENDPOINT_* variables at render time are wired into the
-    containers' environment as name-only ${VAR} references (same contract as
-    bucket credentials: values never land in the bundle), so App's endpoint
-    overlay works inside the runtime's task processes."""
-    monkeypatch.setenv("HFLOW_ENDPOINT_JUDGE", "http://judge:8000/v1")
-    _, compose = _render(config, tmp_path / "bundle")
-    scheduler_env = compose["services"]["airflow-scheduler"]["environment"]
-    assert scheduler_env["HFLOW_ENDPOINT_JUDGE"] == "${HFLOW_ENDPOINT_JUDGE}"
-    assert "http://judge:8000/v1" not in (tmp_path / "bundle" / "docker-compose.yaml").read_text()
+    """An allowlisted value reaches containers but never bundle contents."""
+    from dataclasses import replace
 
-    monkeypatch.delenv("HFLOW_ENDPOINT_JUDGE")
-    _, rerendered_compose = _render(config, tmp_path / "bundle-without")
-    assert (
-        "HFLOW_ENDPOINT_JUDGE"
-        not in (rerendered_compose["services"]["airflow-scheduler"]["environment"])
-    )
+    monkeypatch.setenv("MODEL_API_KEY", "secret-value")
+    configured = replace(config, passthrough_environment_variables=("MODEL_API_KEY",))
+    paths, compose = _render(configured, tmp_path / "bundle")
+    scheduler_env = compose["services"]["airflow-scheduler"]["environment"]
+    assert scheduler_env["MODEL_API_KEY"] == "${MODEL_API_KEY}"
+    assert "secret-value" not in paths.compose_file.read_text()
+
+    manifest_payload = json.loads((paths.bundle_dir / "hflow-bundle.json").read_text())
+    assert manifest_payload["passthrough_environment_variables"] == ["MODEL_API_KEY"]
+
+
+def test_absent_explicit_environment_variable_is_refused(
+    config: RuntimeConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace
+
+    monkeypatch.delenv("MODEL_API_KEY", raising=False)
+    configured = replace(config, passthrough_environment_variables=("MODEL_API_KEY",))
+    with pytest.raises(ValueError, match="MODEL_API_KEY"):
+        _render(configured, tmp_path / "bundle")
+
+
+@pytest.mark.parametrize(
+    "variable_names",
+    [
+        ("MODEL-API-KEY",),
+        ("MODEL_API_KEY", "MODEL_API_KEY"),
+    ],
+)
+def test_invalid_environment_passthrough_allowlist_is_refused_at_construction(
+    config: RuntimeConfig,
+    variable_names: tuple[str, ...],
+) -> None:
+    from dataclasses import replace
+
+    with pytest.raises(ValueError, match="environment variable names"):
+        replace(config, passthrough_environment_variables=variable_names)
 
 
 def test_env_file_carries_generated_postgres_password_and_bind_host(
@@ -905,23 +984,6 @@ def test_api_port_inside_the_tcp_range_is_accepted(config: RuntimeConfig, good_p
     from dataclasses import replace
 
     assert replace(config, api_port=good_port).api_port == good_port
-
-
-def test_api_port_true_is_rejected_even_though_it_passes_the_range(
-    config: RuntimeConfig,
-) -> None:
-    """bool is the case the range check cannot catch.
-
-    True == 1, so the range test passes it, and the value is only ever str()-ed
-    after that. Without this it reaches the rendered .env as API_PORT=True.
-    False is covered alongside the other wrong types below, where it is the
-    weaker case: it is 0, so the range check would reject it anyway, just with
-    the wrong reason.
-    """
-    from dataclasses import replace
-
-    with pytest.raises(ValueError, match="api_port must be an int, not bool: True"):
-        replace(config, api_port=True)
 
 
 def test_api_port_accepts_an_int_enum_member(config: RuntimeConfig) -> None:

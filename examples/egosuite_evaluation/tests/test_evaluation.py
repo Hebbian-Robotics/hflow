@@ -51,7 +51,6 @@ from examples.egosuite_evaluation.judgment import (
     evaluate_image_with_model,
 )
 from examples.egosuite_evaluation.pipeline import (
-    VISION_ENDPOINT_ALIAS,
     app,
     hand_visibility_check_result,
     labels_for_pipeline_episode,
@@ -261,7 +260,9 @@ def test_pipeline_registers_projected_hand_visibility_as_an_hflow_check() -> Non
     checks_by_name = {check.name: check for check in app.checks}
 
     assert set(checks_by_name) == {"egosuite_projected_hand_visibility"}
-    assert checks_by_name["egosuite_projected_hand_visibility"].uses == VISION_ENDPOINT_ALIAS
+    assert checks_by_name["egosuite_projected_hand_visibility"].requires == frozenset(
+        {"vision-model"}
+    )
 
 
 def test_saved_label_report_selects_exact_frames_for_a_canonical_episode(tmp_path: Path) -> None:

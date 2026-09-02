@@ -343,16 +343,20 @@ imported App's `data_root` differs. The mounted directory is shared both
 ways: the catalog and canonical episodes the containers write are ordinary
 files on your host.
 
-Endpoint aliases resolve the same way: for a pipeline that declares
-`endpoints={"judge": ...}` and `uses="judge"`, exporting
-`HFLOW_ENDPOINT_<ALIAS>` (alias uppercased, non-alphanumerics as `_`, e.g.
-`HFLOW_ENDPOINT_JUDGE`) before `hflow up` makes the renderer forward that
-variable into every container, overriding -- or supplying -- the alias
-without editing the pipeline file. Point the same check at your local Ollama
-in the dev loop and at the team's vLLM box in the runtime, one file, zero
-edits. Forwarding is by name only (values never land in the bundle) and is
-captured at render time, so re-run `up` after changing which variables your
-shell exports.
+Model and service configuration belongs to the step that consumes it. To make
+one of those environment variables available in the Compose runtime, allowlist
+it explicitly and repeat the option as needed:
+
+```bash
+export OPENROUTER_API_KEY="..."
+hflow up --pass-env OPENROUTER_API_KEY
+```
+
+Forwarding is by name only: values never land in `docker-compose.yaml` or
+`hflow-bundle.json`, and a requested variable that is absent from the launch
+environment is refused. `hflow deploy --pass-env NAME` records the names in the
+bundle manifest and generated `DEPLOY.md` so the platform operator knows what
+every task environment must provide.
 
 ## Bucket data roots: `--data-root gs://bucket/prefix`
 

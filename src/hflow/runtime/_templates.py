@@ -94,7 +94,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST: '%{dag_bundle_config_list}'
     AIRFLOW__CORE__XCOM_BACKEND: airflow.providers.common.io.xcom.backend.XComObjectStorageBackend
-    AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_PATH: %{xcom_objectstorage_path}
+    AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_PATH: '%{xcom_objectstorage_path}'
     AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_THRESHOLD: '4096'
     # hflow's pinned ffmpeg (a measuring instrument, downloaded once and
     # sha256-verified) caches under XDG_CACHE_HOME; pointing it into the

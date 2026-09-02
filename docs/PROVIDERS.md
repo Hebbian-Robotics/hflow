@@ -76,19 +76,21 @@ Discovery is one call; the HTTP request stays yours:
 
 ```python
 import httpx  # your client, your dependency
+import os
 
 import hflow
 from hflow.providers import discover_providers
 
 
-@app.check(version="1", uses="judge")
+@app.check(version="1", requires=("vision-model",))
 def grasp_succeeded(ep: hflow.Episode) -> hflow.CheckResult:
     provider = discover_providers()["vllm"]
     payload = provider.prepare_video_request(
         ep.video("wrist_cam"),  # lossless remux, cached
         "Did the gripper grasp the towel? yes/no",
     )
-    response = httpx.post(f"{app.endpoints['judge']}/chat/completions", json=payload)
+    endpoint = os.environ.get("MODEL_BASE_URL", "http://localhost:8000/v1")
+    response = httpx.post(f"{endpoint}/chat/completions", json=payload)
     answer = response.json()["choices"][0]["message"]["content"]
     return hflow.CheckResult(measurements={"grasp_succeeded": "yes" in answer.lower()})
 ```
@@ -102,7 +104,7 @@ The group name `hflow.video_providers` is a fixed literal: it lives in *your* pa
 ## Non-goals
 
 - **No bundled client.** Providers build payloads; sending them is your code, with your retries, timeouts, and auth.
-- **No orchestration of model servers.** Starting, scaling, or health-checking vLLM/Ollama/hosted endpoints is out of scope; `endpoints={...}` on the App only names them so preflight can verify they are configured. ("Provider" in this page means a protocol extension package, like Airflow's provider packages, not an endpoint URL.)
+- **No orchestration of model servers.** Starting, scaling, or health-checking vLLM/Ollama/hosted endpoints is out of scope. A step owns the full client configuration it consumes. ("Provider" in this page means a protocol extension package, like Airflow's provider packages, not an endpoint URL.)
 - **No aggregation policy.** Whether one video-level answer or many frame-level answers make an episode verdict is yours, same as in the frames-only flow.
 
 ## See also

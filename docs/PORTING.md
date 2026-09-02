@@ -26,7 +26,7 @@ def my_check(ep: hflow.Episode) -> hflow.CheckResult:
     return hflow.CheckResult(measurements=result)  # our line: record
 ```
 
-`@app.check(version="1")` takes a required `version=` plus `name=` (defaults to the function name), `critical=`, `requires={...}` (capability set, e.g. `{"gpu"}`), `uses="alias"` (a named endpoint; see the VLM section), and `gate=` (a declarative accept policy the runner evaluates over what the check returned). The version is your compatibility promise: keep it when a refactor preserves the meaning of the results, and bump it when code, configuration, a gate, or a dependency changes that meaning. HFlow stores the value exactly as declared and never inspects the function to derive another identity. Checks that declare no resources run before checks that do, so cheap integrity checks gate expensive model calls. Today `requires`/`uses` record intent, order steps, and let preflight verify named endpoints are configured; they do **not** route the step to a particular worker or GPU pool (per-step compute routing is [deferred](./ARCHITECTURE.md#implementation-status)); a bring-your-own Airflow deployment arranges those resources itself.
+`@app.check(version="1")` takes a required `version=` plus `name=` (defaults to the function name), `critical=`, `requires={...}` (capability set, e.g. `{"gpu"}`), and `gate=` (a declarative accept policy the runner evaluates over what the check returned). The version is your compatibility promise: keep it when a refactor preserves the meaning of the results, and bump it when code, configuration, a gate, or a dependency changes that meaning. HFlow stores the value exactly as declared and never inspects the function to derive another identity. Checks that declare no resources run before checks that do, so cheap integrity checks gate expensive model calls. Today `requires` records intent and orders steps; it does **not** route the step to a particular worker or GPU pool (per-step compute routing is [deferred](./ARCHITECTURE.md#implementation-status)); a bring-your-own Airflow deployment arranges those resources itself.
 
 Every step is called with exactly one argument, an `Episode`, so `@app.check(version="1")`, `@app.enrich(version="1")`, and `@app.derive("/topic", version="1")` refuse a function the runtime could never call: one with a required parameter beyond the episode, or with no positional slot to receive it. That refusal happens at registration, not once per episode, and the error shows the wrapper form to use instead. To pass configuration, bind it in a wrapper (`return action_rate(ep, topics=[...])`) rather than adding a parameter.
 
@@ -125,7 +125,7 @@ statistics = measure_video_frame_statistics(
 
 ## Dialect 3: JPEG frames and your own VLM client
 
-There is deliberately **no bundled VLM client**. Most models behind OpenAI-compatible endpoints do not take video, so the honest unit in v1 is the frame: you declare the sampling rate, you call your own client, and you own how per-frame answers aggregate into an episode-level answer. Any OpenAI-compatible endpoint works: hosted, or vLLM/Ollama you run yourself.
+There is deliberately no generic model-client abstraction. Most models behind OpenAI-compatible endpoints do not take video, so the honest unit in v1 is the frame: you declare the sampling rate, call your client, and own how per-frame answers aggregate into an episode-level answer. Any compatible endpoint works: hosted, or vLLM/Ollama you run yourself. HFlow does include named integrations for the published Build AI hand-visibility and active-manipulation methodology; see the [Build AI guide](./how-to/run-build-ai-evaluation.md).
 
 For a complete executable pipeline using OpenAI's Responses API and a
 timestamped contact sheet, use
@@ -133,22 +133,21 @@ timestamped contact sheet, use
 The lower-level example below uses Chat Completions because that interface is
 widely implemented by locally hosted OpenAI-compatible servers.
 
-Name the endpoint once on the App, declare it on the check with `uses=`, and read it back from `app.endpoints` inside your own client code. The declaration is what lets preflight verify the endpoint is configured before any episode is processed:
+Keep the full client configuration next to the check that consumes it. Include every result-affecting setting in the registered version contract:
 
 ```python
 import base64
+import os
 
-app = hflow.App(
-    "my-pipeline",
-    endpoints={"judge": "http://localhost:8000/v1"},  # vLLM, Ollama, or hosted
-)
+app = hflow.App("my-pipeline")
+model_base_url = os.environ.get("MODEL_BASE_URL", "http://localhost:8000/v1")
 
 
-@app.check(version="1", uses="judge")
+@app.check(version="1", requires=("vision-model",))
 def gripper_reached_target(ep: hflow.Episode) -> hflow.CheckResult:
     from openai import OpenAI  # your client, your dependency
 
-    client = OpenAI(base_url=app.endpoints["judge"], api_key="not-needed-locally")
+    client = OpenAI(base_url=model_base_url, api_key="not-needed-locally")
     answers: list[bool] = []
     for frame in ep.frames("wrist_cam", fps=0.5):  # you declare the rate
         image_b64 = base64.b64encode(frame.path.read_bytes()).decode()
@@ -267,6 +266,7 @@ manually keeping a version string in sync:
 
 ```python
 model_contract = {
+    "endpoint": model_base_url,
     "model": model_name,
     "prompt": prompt,
     "temperature": 0.0,
@@ -276,7 +276,7 @@ model_contract = {
 
 @app.check(
     version=hflow.step_version_from_contract("scene-judge-v1", model_contract),
-    uses="vision",
+    requires=("vision-model",),
 )
 def scene_judge(episode: hflow.Episode) -> hflow.CheckResult: ...
 ```
@@ -351,8 +351,8 @@ The decorator returns the original function, so a check defined with
 the same input shape the pipeline supplies at run time.
 
 This tests the check function only. It does not apply its registered gate,
-produce run status or timing, enforce quarantine and ordering, resolve endpoint
-overrides, or write catalog rows. Follow it with `app.test(...)` when you need to
+produce run status or timing, enforce quarantine and ordering, or write catalog
+rows. Follow it with `app.test(...)` when you need to
 verify those pipeline behaviors; there is currently no check-name selector for
 `app.test()`.
 

@@ -10,6 +10,7 @@ any pipeline result.
 import argparse
 import hashlib
 import json
+import math
 import shutil
 import subprocess
 import tarfile
@@ -18,7 +19,13 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-import hflow
+from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
+from mcap.writer import Writer
+from mcap_protobuf.schema import build_file_descriptor_set
+
+from hflow.ffmpeg import ffmpeg_path, ffmpeg_version
+from hflow.format import EPISODE_KEY_ROBOT_SOFTWARE_VERSION, METADATA_RECORD_EPISODE
+from hflow.video import AccessUnit, split_annex_b_stream
 
 DEFAULT_MANIFEST_PATH = Path(__file__).with_name("manifest.json")
 DEFAULT_SOURCE_ROOT = Path("data/egocentric")
@@ -369,35 +376,185 @@ def _extract_source_videos(
     return source_paths
 
 
-def _video_episode_spec(
+def _fault_frame_range(episode: PlannedEpisode) -> tuple[int, int] | None:
+    if episode.fault_segment_s is None:
+        return None
+    fault_start_s, fault_end_s = episode.fault_segment_s
+    first_frame = math.ceil(fault_start_s * EPISODE_IMAGE_HZ)
+    last_frame = math.ceil(fault_end_s * EPISODE_IMAGE_HZ) - 1
+    return first_frame, last_frame
+
+
+def _video_filter_arguments(episode: PlannedEpisode) -> list[str]:
+    base_filter = (
+        f"fps={EPISODE_IMAGE_HZ:g},"
+        f"scale={EPISODE_IMAGE_WIDTH}:{EPISODE_IMAGE_HEIGHT}:"
+        "force_original_aspect_ratio=decrease:flags=lanczos,"
+        f"pad={EPISODE_IMAGE_WIDTH}:{EPISODE_IMAGE_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black"
+    )
+    fault_frame_range = _fault_frame_range(episode)
+    if episode.fault is FaultKind.NONE:
+        return ["-vf", base_filter]
+    if fault_frame_range is None:
+        raise ValueError(
+            f"episode {episode.episode_id} declares {episode.fault.value} without a segment"
+        )
+
+    first_fault_frame, last_fault_frame = fault_frame_range
+    if episode.fault is FaultKind.BLACKOUT:
+        # drawbox runs before H.264 encoding, so the source is decoded and encoded
+        # exactly once while every selected pixel in the segment becomes black.
+        blackout_filter = (
+            "drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill:"
+            f"enable=between(n\\,{first_fault_frame}\\,{last_fault_frame})"
+        )
+        return ["-vf", f"{base_filter},{blackout_filter}"]
+    if episode.fault is FaultKind.FREEZE:
+        # freezeframes takes a main and replacement input. Splitting the filtered
+        # source lets it replace the interval with its first frame in the same
+        # decode/filter/encode invocation.
+        filter_graph = (
+            f"[0:v]{base_filter},split=2[main][replacement];"
+            "[main][replacement]freezeframes="
+            f"first={first_fault_frame}:last={last_fault_frame}:replace={first_fault_frame}[video]"
+        )
+        return ["-filter_complex", filter_graph, "-map", "[video]"]
+    raise AssertionError(f"unhandled fault kind {episode.fault!r}")
+
+
+def _transcode_episode_to_h264(
+    source_video_path: Path, episode: PlannedEpisode
+) -> list[AccessUnit]:
+    frame_count = round(episode.duration_s * EPISODE_IMAGE_HZ)
+    keyframe_interval = max(1, round(EPISODE_IMAGE_HZ))
+    x264_parameters = (
+        f"keyint={keyframe_interval}:min-keyint={keyframe_interval}:"
+        "scenecut=0:bframes=0:repeat-headers=1:aud=1"
+    )
+    command = [
+        str(ffmpeg_path()),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        f"{episode.source_start_s:g}",
+        "-i",
+        str(source_video_path),
+        *_video_filter_arguments(episode),
+        "-an",
+        "-frames:v",
+        str(frame_count),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "23",
+        "-pix_fmt",
+        "yuv420p",
+        "-x264-params",
+        x264_parameters,
+        "-fps_mode",
+        "passthrough",
+        "-f",
+        "h264",
+        "pipe:1",
+    ]
+    completed = subprocess.run(command, capture_output=True, check=False)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg failed ({' '.join(command)}): {completed.stderr.decode(errors='replace')}"
+        )
+    try:
+        access_units = split_annex_b_stream(completed.stdout)
+    except ValueError as error:
+        raise RuntimeError(
+            f"ffmpeg produced invalid H.264 for {episode.episode_id}: {error}"
+        ) from error
+    if len(access_units) != frame_count:
+        raise RuntimeError(
+            f"expected {frame_count} frames from {source_video_path}, got {len(access_units)}; "
+            "the requested excerpt may extend past the source video"
+        )
+    for frame_index, access_unit in enumerate(access_units):
+        keyframe_expected = frame_index % keyframe_interval == 0
+        if access_unit.is_keyframe != keyframe_expected:
+            raise RuntimeError(
+                f"frame {frame_index} from {source_video_path} has unexpected keyframe state"
+            )
+        if access_unit.is_keyframe and not access_unit.has_parameter_sets:
+            raise RuntimeError(f"keyframe {frame_index} from {source_video_path} lacks SPS/PPS")
+    return access_units
+
+
+def _episode_metadata(manifest: CorpusManifest, episode: PlannedEpisode) -> dict[str, str]:
+    return {
+        "task": episode.task,
+        "operator": "factory_051_worker_001",
+        EPISODE_KEY_ROBOT_SOFTWARE_VERSION: "build-ai-gen-1",
+        "source_dataset": manifest.dataset.repo_id,
+        "source_revision": manifest.dataset.revision,
+        "source_member": episode.source_member,
+        "source_start_s": f"{episode.source_start_s:g}",
+        "source_license": manifest.dataset.license,
+        "injected_fault": episode.fault.value,
+        "task_completion": "unlabeled",
+    }
+
+
+def _write_video_episode(
+    source_video_path: Path,
+    output_path: Path,
     manifest: CorpusManifest,
     episode: PlannedEpisode,
     episode_index: int,
-) -> hflow.testing.VideoEpisodeSpec:
-    return hflow.testing.VideoEpisodeSpec(
-        source_start_s=episode.source_start_s,
-        duration_s=episode.duration_s,
-        image_hz=EPISODE_IMAGE_HZ,
-        image_width=EPISODE_IMAGE_WIDTH,
-        image_height=EPISODE_IMAGE_HEIGHT,
-        camera_name="head_camera",
-        black_segment=(episode.fault_segment_s if episode.fault is FaultKind.BLACKOUT else None),
-        freeze_segment=episode.fault_segment_s if episode.fault is FaultKind.FREEZE else None,
-        start_time_ns=EPISODE_START_TIME_NS + episode_index * 60_000_000_000,
-        task=episode.task,
-        operator="factory_051_worker_001",
-        success=None,
-        robot_software_version="build-ai-gen-1",
-        metadata=(
-            ("source_dataset", manifest.dataset.repo_id),
-            ("source_revision", manifest.dataset.revision),
-            ("source_member", episode.source_member),
-            ("source_start_s", f"{episode.source_start_s:g}"),
-            ("source_license", manifest.dataset.license),
-            ("injected_fault", episode.fault.value),
-            ("task_completion", "unlabeled"),
-        ),
-    )
+) -> None:
+    access_units = _transcode_episode_to_h264(source_video_path, episode)
+    episode_start_time_ns = EPISODE_START_TIME_NS + episode_index * 60_000_000_000
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("wb") as output_stream:
+        writer = Writer(output_stream)
+        writer.start(profile="", library="hflow egocentric source adapter")
+        schema_id = writer.register_schema(
+            name="foxglove.CompressedVideo",
+            encoding="protobuf",
+            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
+        )
+        channel_id = writer.register_channel(
+            topic="/head_camera/compressed",
+            message_encoding="protobuf",
+            schema_id=schema_id,
+        )
+        writer.add_metadata(name=METADATA_RECORD_EPISODE, data=_episode_metadata(manifest, episode))
+        writer.add_metadata(
+            name="source-provenance/v1",
+            data={
+                "converter_version": "1",
+                "ffmpeg_version": ffmpeg_version(),
+                "source_uri": (
+                    f"hf://datasets/{manifest.dataset.repo_id}@{manifest.dataset.revision}/"
+                    f"{episode.source_member}"
+                ),
+            },
+        )
+        for frame_index, access_unit in enumerate(access_units):
+            log_time_ns = episode_start_time_ns + round(
+                frame_index * 1_000_000_000 / EPISODE_IMAGE_HZ
+            )
+            message = CompressedVideo()
+            message.timestamp.FromNanoseconds(log_time_ns)
+            message.frame_id = "head_camera"
+            message.data = access_unit.data
+            message.format = "h264"
+            writer.add_message(
+                channel_id=channel_id,
+                log_time=log_time_ns,
+                data=message.SerializeToString(),
+                publish_time=log_time_ns,
+                sequence=frame_index,
+            )
+        writer.finish()
 
 
 def _write_prepared_manifest(
@@ -449,10 +606,12 @@ def prepare_corpus(manifest_path: Path, source_root: Path, output_root: Path) ->
     prepared_episode_paths: list[Path] = []
     for episode_index, episode in enumerate(manifest.episodes):
         output_path = landing_root / f"{episode.episode_id}.mcap"
-        hflow.testing.write_video_episode(
+        _write_video_episode(
             source_paths[episode.source_member],
             output_path,
-            _video_episode_spec(manifest, episode, episode_index),
+            manifest,
+            episode,
+            episode_index,
         )
         prepared_episode_paths.append(output_path)
         prepared_count = episode_index + 1

@@ -41,6 +41,7 @@ from hflow.runtime._bundle import (
     BundleKind,
     copy_user_project,
     hflow_distribution_requirement,
+    parse_environment_variable_names,
     render_dag_sources,
     sub_dag_id_for_stage,
     warn_if_pipeline_data_root_differs,
@@ -113,6 +114,9 @@ class DeployConfig:
         task -- routes this pipeline's tasks to a dedicated worker pool on
         deployments running more than one (per-team or per-workspace
         workers). ``None`` keeps the executor's default queue.
+    :param passthrough_environment_variables: Explicit names the platform
+        operator must set in every task environment. Values are never written
+        to the generated bundle.
     """
 
     pipeline_file: Path
@@ -122,12 +126,18 @@ class DeployConfig:
     venv_python_path: str = DEFAULT_DEPLOY_VENV_PYTHON
     dag_id: str | None = None
     task_queue: str | None = None
+    passthrough_environment_variables: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         # Parse at the boundary: an invalid data root never becomes a config.
         # The normalized form (no trailing slash) replaces the raw input so
         # every later join has exactly one owner of that fact.
         object.__setattr__(self, "data_root_uri", validate_data_root_uri(self.data_root_uri))
+        object.__setattr__(
+            self,
+            "passthrough_environment_variables",
+            parse_environment_variable_names(self.passthrough_environment_variables),
+        )
 
     def resolved_dag_id(self) -> str:
         if self.dag_id is not None:
@@ -238,6 +248,7 @@ def render_deploy_bundle(config: DeployConfig, output_dir: Path | str) -> Deploy
         requirements_included=requirements_copied,
         task_queue=config.task_queue,
         venv_python=config.venv_python_path,
+        passthrough_environment_variables=config.passthrough_environment_variables,
     )
 
     deploy_md = output_directory / "DEPLOY.md"
@@ -274,6 +285,11 @@ def _render_deploy_md(config: DeployConfig, *, dag_id: str, requirements_copied:
         f"{config.venv_python_path.removesuffix('/python')}/pip install -r user/requirements.txt"
         if requirements_copied
         else "# (no user requirements file was supplied)"
+    )
+    passthrough_environment_rows = "".join(
+        f"| `{variable_name}` | pipeline-defined | required by this pipeline; set on every "
+        "worker's task environment |\n"
+        for variable_name in config.passthrough_environment_variables
     )
     return f"""\
 # Deploying `{dag_id}` to your Airflow 3 deployment
@@ -368,7 +384,7 @@ AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST='{DAG_BUNDLE_CONFIG_LIST_JSON}'
 | variable | value | why |
 | --- | --- | --- |
 | `HFLOW_USER_DIR` | absolute path of `user/` on the workers | where the tasks import `{pipeline_filename}` from (default `{USER_DIRECTORY_DEFAULT}`) |
-| `HFLOW_ENDPOINT_<ALIAS>` | endpoint URL per alias the pipeline declares with `uses=` | optional: overrides (or supplies) endpoint aliases without editing the pipeline file -- set on every worker's task environment |
+{passthrough_environment_rows}
 
 Data root: episode URIs in the trigger conf resolve under
 `{config.data_root_uri}`. Construct your pipeline's App WITHOUT a

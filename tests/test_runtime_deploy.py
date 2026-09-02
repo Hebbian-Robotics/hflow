@@ -365,8 +365,30 @@ def test_deploy_bundle_manifest_describes_the_bundle(config: DeployConfig, tmp_p
     assert manifest_payload["data_root"] == DATA_ROOT_PATH
     assert manifest_payload["venv_python"] == DEFAULT_DEPLOY_VENV_PYTHON
     assert manifest_payload["task_queue"] == "workspace-a"
+    assert manifest_payload["passthrough_environment_variables"] == []
     for sub_dag_file in paths.sub_dag_files:
         assert ", queue='workspace-a')" in sub_dag_file.read_text()
+
+
+def test_deploy_bundle_documents_explicit_environment_requirements(
+    config: DeployConfig, tmp_path: Path
+) -> None:
+    import json
+
+    configured = replace(
+        config,
+        passthrough_environment_variables=("MODEL_BASE_URL", "MODEL_API_KEY"),
+    )
+    paths = _render(configured, tmp_path / "deploy")
+
+    manifest_payload = json.loads((paths.output_dir / "hflow-bundle.json").read_text())
+    assert manifest_payload["passthrough_environment_variables"] == [
+        "MODEL_BASE_URL",
+        "MODEL_API_KEY",
+    ]
+    deploy_instructions = paths.deploy_md.read_text()
+    assert "`MODEL_BASE_URL`" in deploy_instructions
+    assert "`MODEL_API_KEY`" in deploy_instructions
 
 
 def test_rerender_overwrites_generated_files(config: DeployConfig, tmp_path: Path) -> None:
@@ -430,12 +452,15 @@ def test_cli_deploy_honors_requirements_and_venv_python(tmp_path: Path) -> None:
             str(requirements_file),
             "--venv-python",
             "/custom/venv/bin/python",
+            "--pass-env",
+            "MODEL_API_KEY",
         ]
     )
     assert exit_code == 0
     assert (output_dir / "user" / "requirements.txt").read_text() == "scipy>=1\n"
     dag_source = (output_dir / "dags" / "demo_pipeline_meta.py").read_text()
     assert dag_source.count("@task.external_python(python='/custom/venv/bin/python'") == 3
+    assert "`MODEL_API_KEY`" in (output_dir / "DEPLOY.md").read_text()
 
 
 def test_cli_deploy_rejects_relative_data_root(

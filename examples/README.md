@@ -272,6 +272,51 @@ Output: one canonical MCAP per episode at
 - Public API: [`hflow.importers.lerobot`](../src/hflow/importers/lerobot.py)
 - Compatibility wrapper: [`lerobot/prepare.py`](./lerobot/prepare.py)
 
+### Exporting a curated selection back to LeRobot Dataset v3
+
+`lerobot/export.py` turns an HFlow curation selection (a `hflow curate`
+manifest parquet, or a SQL query over the catalog) into a loadable local
+LeRobot Dataset v3 repository containing exactly the selected episodes.
+Episode provenance stamped by the converter (`source_dataset`,
+`source_revision`, `source_episode_index` in `episode/v1` metadata) is
+resolved back to the source; the exporter copies the source video chunks
+byte-for-byte (each source (chunk, file) keeping its identity in the
+destination path) and slices the selected data rows from the source chunk
+parquets, so cameras, feature schema, dtypes, shapes, and frame timing
+match the source. Episode indexes are renumbered sequentially in selection
+order. The exporter drives the public `hflow import lerobot` entry point to
+materialize the source archive (meta, data chunks, video chunks) and copies
+those chunks byte-for-byte. A dataset-card draft (`README.md`) and
+`export-provenance.json` record the source repository, source commit,
+exporter version, selection SQL/manifest, and selected source episode
+indexes.
+
+From a curation manifest:
+
+```
+uv run python examples/lerobot/export.py \
+  --manifest ./manifest.parquet \
+  --destination ./data/curated_lerobot \
+  --camera-keys observation.images.up,observation.images.side
+```
+
+From a SQL query over the catalog:
+
+```
+uv run python examples/lerobot/export.py \
+  --sql "SELECT episode_id, metadata_json FROM episodes_latest WHERE status = 'ok'" \
+  --destination ./data/curated_lerobot \
+  --camera-keys observation.images.up,observation.images.side
+```
+
+Failures abort before any output is published: mixed source repositories
+or revisions, non-immutable revisions, missing provenance, missing source
+episodes, duplicate selections, and a staged dataset that fails structural
+or (when `lerobot` is installed) official-API validation never replace a
+previously valid destination.
+
+Code: [`lerobot/export.py`](./lerobot/export.py)
+
 
 ## Example requirements
 
