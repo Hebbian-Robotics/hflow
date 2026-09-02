@@ -1366,10 +1366,14 @@ def _command_catalog_ui(arguments: argparse.Namespace) -> int:
         print(f"catalog ui: {error}", file=sys.stderr)
         return 2
     except Exception as error:
-        if is_bucket_url(catalog_location):
-            print(f"catalog ui: {error}", file=sys.stderr)
-            return 2
-        raise
+        if not is_bucket_url(catalog_location):
+            raise
+        from obstore.exceptions import BaseError as BucketStorageError
+
+        if not isinstance(error, BucketStorageError):
+            raise
+        print(f"catalog ui: {error}", file=sys.stderr)
+        return 2
     return 0
 
 

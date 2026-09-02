@@ -243,3 +243,34 @@ def test_catalog_ui_cli_reports_a_missing_bucket_extra(
     assert exit_code == 2
     assert captured.err.startswith("catalog ui:")
     assert "hflow[bucket]" in captured.err
+
+
+def test_catalog_ui_cli_reports_a_bucket_credentials_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: CaptureFixture
+) -> None:
+    from obstore.exceptions import UnauthenticatedError
+
+    def raise_credentials_error(_settings: object) -> None:
+        raise UnauthenticatedError("provider credentials are unavailable")
+
+    monkeypatch.setattr("hflow.catalog_ui.serve_catalog_ui", raise_credentials_error)
+
+    exit_code = main(
+        ["catalog", "ui", "--no-browser", "--catalog", "s3://robot-data/production/catalog"]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.err == "catalog ui: provider credentials are unavailable\n"
+
+
+def test_catalog_ui_cli_does_not_hide_programming_errors_for_bucket_catalogs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_programming_error(_settings: object) -> None:
+        raise RuntimeError("unexpected implementation bug")
+
+    monkeypatch.setattr("hflow.catalog_ui.serve_catalog_ui", raise_programming_error)
+
+    with pytest.raises(RuntimeError, match="unexpected implementation bug"):
+        main(["catalog", "ui", "--no-browser", "--catalog", "gs://robot-data/catalog"])
