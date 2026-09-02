@@ -610,6 +610,26 @@ def test_xcom_objectstorage_url_cannot_inject_a_sibling_environment_key(
     assert "AIRFLOW__CORE__LOAD_EXAMPLES: 'true'" in xcom_path
 
 
+def test_xcom_objectstorage_url_escapes_compose_interpolation(
+    config: RuntimeConfig, tmp_path: Path
+) -> None:
+    """The other half of the escaping: Compose interpolates ${VAR} even inside
+    single-quoted YAML scalars, so a literal ``$`` has to reach the container
+    as ``$$`` in the file. Without this the store URL would silently become
+    whatever the launch shell had in that variable, or empty."""
+    from dataclasses import replace
+
+    _, compose = _render(
+        replace(config, xcom_objectstorage_url="s3://bucket/${HOME}/xcom"),
+        tmp_path / "bundle",
+    )
+    scheduler_env = compose["services"]["airflow-scheduler"]["environment"]
+
+    assert (
+        scheduler_env["AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_PATH"] == "s3://bucket/$${HOME}/xcom"
+    )
+
+
 def test_endpoint_environment_variables_pass_through_by_name(
     config: RuntimeConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
