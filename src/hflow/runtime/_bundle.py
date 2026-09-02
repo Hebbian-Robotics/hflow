@@ -409,8 +409,13 @@ def _render_compose(
             )
     if xcom_objectstorage_url is not None:
         # A multi-machine executor needs an XCom store every host reaches;
-        # the file:// defaults above are single-host by construction.
-        xcom_objectstorage_path = xcom_objectstorage_url
+        # the file:// defaults above are single-host by construction. The
+        # template slot is a single-quoted YAML scalar (see COMPOSE_TEMPLATE),
+        # so this value needs the same two escapes _compose_path_scalar
+        # applies elsewhere in this file: YAML's embedded-quote doubling,
+        # and Compose's own ${VAR} interpolation, which still runs inside
+        # single-quoted YAML scalars.
+        xcom_objectstorage_path = xcom_objectstorage_url.replace("$", "$$").replace("'", "''")
     # Endpoint-alias overrides ride the same passthrough slot as bucket
     # credentials, in BOTH modes -- names only, values from the launch shell.
     environment_passthrough = bucket_credentials_env + _endpoint_environment_passthrough_lines()
