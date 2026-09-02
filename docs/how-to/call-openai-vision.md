@@ -45,30 +45,27 @@ Do not put API keys in a pipeline file, runtime bundle, or committed `.env`
 file. The local process and Airflow worker should receive them through their
 secret-management environment.
 
-## 3. Declare and use the endpoint
+## 3. Configure the client in the check
 
-The App maps a stable capability name to the configured URL:
+The App owns orchestration, not model-client configuration:
 
 ```python
 app = hflow.App(
     "openai-vision-example",
     data_root="./data/openai-vision",
-    endpoints={"vision": OPENAI_BASE_URL},
 )
 ```
 
-The check declares `uses="vision"`. Preflight can then reject a missing alias
-before processing any episode. At run start an exported
-`HFLOW_ENDPOINT_VISION` variable overrides (or supplies) the alias, so the
-same file can point at a different endpoint without editing it. Inside the
-step, the endpoint remains an ordinary OpenAI SDK option:
+The check declares the expensive capability through `requires=` and passes its
+endpoint directly to the ordinary SDK client. This keeps endpoint, model,
+credentials, retry policy, and other client settings under one owner:
 
 ```python
-@app.check(uses="vision", version="responses-contact-sheet-v1")
+@app.check(requires=("vision-model",), version="responses-contact-sheet-v1")
 def describe_activity(episode: hflow.Episode) -> hflow.CheckResult:
     client = OpenAI(
         api_key=os.environ["OPENAI_API_KEY"],
-        base_url=app.endpoints["vision"],
+        base_url=OPENAI_BASE_URL,
     )
     response = client.responses.create(
         model=os.environ["OPENAI_MODEL"],

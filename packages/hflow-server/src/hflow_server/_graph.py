@@ -13,7 +13,7 @@ other:
   App, which have NO dependency edges on each other. They all run INSIDE one
   ``process_batch`` task of the stage that owns their kind, ordered only by
   the engine's two-tier cheap-first policy (:meth:`hflow.App._ordered_checks`:
-  a step declaring ``requires`` or ``uses`` runs in the second tier). Drawing
+  a step declaring ``requires`` runs in the second tier). Drawing
   arrows between them would be a lie; the payload states the tiers instead.
 
 The one real cross-step edge is the quarantine gate, and it is served as its

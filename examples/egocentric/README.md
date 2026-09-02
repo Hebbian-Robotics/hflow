@@ -12,7 +12,9 @@ The source is one pinned, hash-verified shard of
 (Apache-2.0): genuine factory footage spanning navigation, machine
 interaction, material handling, component sorting, tray handling, and tool
 setup. From it, [`prepare.py`](./prepare.py) deterministically generates 96
-20-second, 640×360, 10 FPS input episodes:
+20-second, 640×360, 10 FPS input episodes. Each source excerpt is decoded once
+and transcoded directly from HEVC to in-band H.264
+`foxglove.CompressedVideo`; there is no intermediate per-frame JPEG stage:
 
 - 90 unmodified excerpts;
 - three with an injected three-second **camera blackout**
@@ -30,8 +32,9 @@ declared data you can edit (see [inject your own faults](#inject-your-own-faults
 - A Hugging Face account that has accepted the dataset's access terms, and the
   `hf` CLI, authenticated: `uv tool install -U huggingface_hub` then
   `hf auth login`.
-- Network access and disk: a ~1 GB download, about 2.5 GB total once the
-  sources are extracted and the 96 episodes (~640 MB) are written.
+- Network access and disk: a ~950 MB download, plus the extracted sources and
+  about 320 MB of landing episodes (measured over the pinned shard: 96
+  episodes, 2.45-4.75 MB each).
 - Docker with Compose v2 (only for the [Airflow path](#run-it-under-airflow)).
 
 All media stays under the gitignored `data/` directory; the repository tracks
@@ -45,7 +48,12 @@ uv run python examples/egocentric/prepare.py
 ```
 
 The script downloads the pinned shard once, verifies every hash, extracts the
-11 source videos, and writes the episodes:
+11 source videos, and writes the episodes. Its one ffmpeg invocation per episode
+applies `fps`, `scale`, and `pad`, injects blackouts with `drawbox` or freezes
+with `freezeframes`, and encodes Annex B H.264 with one AUD-delimited access
+unit per message plus SPS/PPS on each keyframe. Because that already meets the
+canonical video contract, HFlow's transform passes the encoded media bytes
+through instead of re-encoding them:
 
 ```text
 data/egocentric/
@@ -57,6 +65,11 @@ data/egocentric/
 
 Re-running is safe: the download and extraction are skipped when the verified
 files already exist, and the generated episodes are deterministic.
+
+If the download stalls part-way, retry with `HF_HUB_DISABLE_XET=1` set. Hugging
+Face's Xet transfer has been seen to hang on this shard; the plain path
+completes. Partial files fail the hash check rather than being used, so a
+stalled attempt costs time and nothing else.
 
 ## Run the pipeline locally
 

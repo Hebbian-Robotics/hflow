@@ -574,7 +574,6 @@ class PipelineStepManifest(BaseModel):
     version: str = Field(description="Author-declared version of the step.")
     critical: bool
     requires: list[str]
-    uses: str | None
     gate: PipelineGate | None = Field(
         default=None,
         description=(
@@ -591,7 +590,6 @@ class PipelineStepManifest(BaseModel):
             version=step.version,
             critical=step.critical,
             requires=list(step.requires),
-            uses=step.uses,
             gate=(
                 PipelineGate(
                     accept_when=[
@@ -674,7 +672,7 @@ class PipelineUserStep(PipelineStepManifest):
     """A registered step as the graph endpoint serves it.
 
     ``tier`` mirrors ``hflow.App._ordered_checks``: tier 2 is exactly the steps
-    declaring ``requires`` or ``uses``. Steps within a tier have NO ordering.
+    declaring ``requires``. Steps within a tier have NO ordering.
     """
 
     tier: StepTier

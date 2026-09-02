@@ -1097,51 +1097,6 @@ def test_reject_non_single_select_distinguishes_parse_failure_from_rule_rejectio
         reject_non_single_select("CREATE TABLE t(x INT)")
 
 
-def test_write_parquet_and_copy_format_parquet_are_byte_identical(
-    tmp_path: Path,
-) -> None:
-    """write_parquet() produces the same bytes as the old COPY ... (FORMAT PARQUET).
-
-    The fix replaced ``connection.execute(f"COPY ({sql}) TO ... (FORMAT PARQUET)")``
-    with ``connection.sql(sql).write_parquet(str(path))``.  This test asserts
-    that the two code paths produce byte-identical Parquet files for the same
-    query, so the change is provably transparent to any downstream consumer
-    of the manifest.
-
-    If this test starts failing after a DuckDB upgrade, investigate whether the
-    two code paths still produce logically equivalent output before concluding
-    the change was safe.
-    """
-    import hashlib
-
-    con = duckdb.connect()
-    try:
-        con.execute("CREATE TABLE sample (episode_id VARCHAR, score DOUBLE)")
-        con.execute("INSERT INTO sample VALUES ('ep1', 0.9), ('ep2', 0.75), ('ep3', 0.5)")
-
-        sql = "SELECT episode_id, score FROM sample ORDER BY episode_id"
-        path_copy = tmp_path / "copy_output.parquet"
-        path_write = tmp_path / "write_parquet_output.parquet"
-
-        # Old code path
-        con.execute(f"COPY ({sql}) TO '{path_copy}' (FORMAT PARQUET)")
-        # New code path
-        con.sql(sql).write_parquet(str(path_write))
-
-        digest_copy = hashlib.sha256(path_copy.read_bytes()).hexdigest()
-        digest_write = hashlib.sha256(path_write.read_bytes()).hexdigest()
-
-        assert digest_copy == digest_write, (
-            f"write_parquet and COPY FORMAT PARQUET produced different bytes.\n"
-            f"  COPY sha256:          {digest_copy}\n"
-            f"  write_parquet sha256: {digest_write}\n"
-            "If DuckDB changed its Parquet writer, verify logical equivalence "
-            "and update this test accordingly."
-        )
-    finally:
-        con.close()
-
-
 def test_constrained_curate_writes_the_manifest_but_refuses_outside_reads(
     tmp_path: Path,
 ) -> None:

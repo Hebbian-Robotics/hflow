@@ -24,12 +24,12 @@ import sys
 import tempfile
 import time
 import traceback
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from types import MappingProxyType, ModuleType
+from types import ModuleType
 from typing import TYPE_CHECKING, Generic, NewType, TypeVar, assert_never
 
 if TYPE_CHECKING:
@@ -172,18 +172,6 @@ DEFAULT_DATA_ROOT = "./data"
 # because the CLI, the bundle renderer, and the generated DAG tasks all have
 # to agree on it.
 DEFAULT_APP_VARIABLE = "app"
-
-# Environment overrides for endpoint aliases (see App(endpoints=...)):
-# HFLOW_ENDPOINT_<ALIAS>, the alias uppercased with every non-alphanumeric
-# character replaced by "_". The deployment exports the variable; the
-# pipeline file stays environment-portable.
-ENDPOINT_ENVIRONMENT_VARIABLE_PREFIX = "HFLOW_ENDPOINT_"
-
-
-def endpoint_environment_variable_name(alias: str) -> str:
-    """The environment variable that overrides one endpoint alias."""
-    sanitized_alias = re.sub(r"[^A-Za-z0-9]", "_", alias).upper()
-    return f"{ENDPOINT_ENVIRONMENT_VARIABLE_PREFIX}{sanitized_alias}"
 
 
 def default_data_root() -> "Path | str | StorageRoot":
@@ -1268,18 +1256,6 @@ class App:
         ``None`` enables the whole automatic baseline; an empty iterable
         disables it. Register pipeline-authored checks with
         ``app.check(version=...)`` instead.
-    :param endpoints: Named endpoint aliases (e.g. ``{"judge": "http://..."}``)
-        that checks declare with ``uses="judge"`` and resolve via
-        ``app.endpoints["judge"]`` in their own client code. At run start,
-        an ``HFLOW_ENDPOINT_<ALIAS>`` environment variable overrides (or
-        supplies) an alias's value, so deployments inject their own endpoints
-        without editing pipeline code. The resolved ``app.endpoints`` mapping
-        is read-only and rebuilt at every run start -- supply or override
-        aliases through this parameter or the environment variable, never by
-        mutating the mapping. (Named ``endpoints``, not "providers": in the
-        Airflow ecosystem "provider" means a plugin package, and
-        ``hflow.providers`` already means the video-protocol extension
-        point.)
     """
 
     def __init__(
@@ -1288,7 +1264,6 @@ class App:
         data_root: Path | str | StorageRoot | None = None,
         *,
         transform: TransformConfig | None = None,
-        endpoints: dict[str, str] | None = None,
         default_checks: Iterable[CheckFunction] | None = None,
     ) -> None:
         self.name = name
@@ -1300,15 +1275,6 @@ class App:
             else self.storage_root.url
         )
         self.transform_config = transform if transform is not None else TransformConfig()
-        # The constructor literals stay pristine; ``endpoints`` is the
-        # RESOLVED mapping, rebuilt (literals overlaid with the current
-        # environment) at every run start so overrides set, changed, or
-        # unset between runs all take effect. Read-only on purpose: a direct
-        # mutation would be silently discarded by the next rebuild, so it
-        # refuses loudly instead -- supply aliases via App(endpoints=...) or
-        # HFLOW_ENDPOINT_<ALIAS>.
-        self._endpoint_literals: dict[str, str] = dict(endpoints) if endpoints else {}
-        self.endpoints: Mapping[str, str] = MappingProxyType(dict(self._endpoint_literals))
         self.checks: list[RegisteredCheck] = []
         self.enrichments: list[RegisteredEnrichment] = []
         self.derived: list[DerivedChannel] = []
@@ -1636,7 +1602,7 @@ class App:
 
     def manifest(self) -> PipelineManifest:
         """This pipeline's JSON-able description: step names, explicit
-        versions, gate flags, endpoint aliases, and version stamps.
+        versions, gate flags, resource requirements, and version stamps.
 
         The metadata a pipeline crosses a control boundary as (`hflow
         manifest` on the CLI): a service can display, diff, and validate
@@ -1663,9 +1629,6 @@ class App:
                 DerivedChannelManifest(topic=channel.topic, version=channel.version)
                 for channel in self.derived
             ),
-            endpoint_aliases=tuple(
-                sorted(set(self._endpoint_literals) | self._used_endpoint_aliases())
-            ),
             has_transform_override=self.transform_override is not None,
         )
 
@@ -1676,7 +1639,6 @@ class App:
         name: str | None = None,
         critical: bool = False,
         requires: Iterable[str] | None = None,
-        uses: str | None = None,
         gate: Gate | None = None,
     ) -> Callable[[CheckFunction], CheckFunction]:
         """Register a check function. See ``hflow.steps.CheckResult``.
@@ -1729,7 +1691,6 @@ class App:
                     function=function,
                     critical=critical,
                     requires=requires_set,
-                    uses=uses,
                     version=step_version,
                     gate=gate,
                 )
@@ -1744,7 +1705,6 @@ class App:
         version: str,
         name: str | None = None,
         requires: Iterable[str] | None = None,
-        uses: str | None = None,
     ) -> Callable[[EnrichmentFunction], EnrichmentFunction]:
         """Register an enrichment. See ``hflow.steps.EnrichmentResult``.
 
@@ -1772,7 +1732,6 @@ class App:
                     name=enrichment_name,
                     function=function,
                     requires=requires_set,
-                    uses=uses,
                     version=step_version,
                 )
             )
@@ -1866,77 +1825,6 @@ class App:
             f"a key under the data root {self.storage_root}"
         )
 
-    def _used_endpoint_aliases(
-        self,
-        step_selection: RegisteredStepSelection = ALL_REGISTERED_STEPS,
-    ) -> set[str]:
-        return {
-            registered.uses
-            for registered in [*self.checks, *self.enrichments]
-            if registered.uses is not None
-            and registered_step_is_selected(step_selection, registered.name)
-        }
-
-    def _resolve_endpoint_overrides(self) -> None:
-        """Rebuild ``endpoints``: literals overlaid with the environment.
-
-        The environment wins over a literal in the pipeline file, and an
-        alias supplied ONLY by the environment satisfies steps' ``uses=``
-        preflight -- this is how a deployment (or a control plane) injects
-        per-workspace endpoints without editing customer code. Runs at
-        preflight, after every registration, so ``app.endpoints[alias]``
-        inside a running step always sees the resolved value; rebuilding
-        from the pristine literals each time means an override set, changed,
-        or UNSET between runs in one process always takes effect.
-
-        The environment naming is lossy (non-alphanumerics collapse to
-        ``_``), so two aliases that map to one variable would be silently
-        co-overridden -- refused loudly here instead.
-        """
-        aliases = sorted(set(self._endpoint_literals) | self._used_endpoint_aliases())
-        aliases_by_variable: dict[str, list[str]] = {}
-        for alias in aliases:
-            aliases_by_variable.setdefault(endpoint_environment_variable_name(alias), []).append(
-                alias
-            )
-        colliding = {
-            variable: names for variable, names in aliases_by_variable.items() if len(names) > 1
-        }
-        if colliding:
-            raise ValueError(
-                "endpoint aliases are indistinguishable under HFLOW_ENDPOINT_* naming: "
-                + "; ".join(
-                    f"{variable} would override all of {names}"
-                    for variable, names in sorted(colliding.items())
-                )
-                + " -- rename an alias so each maps to a distinct environment variable"
-            )
-        resolved = dict(self._endpoint_literals)
-        for alias in aliases:
-            environment_override = os.environ.get(endpoint_environment_variable_name(alias))
-            if environment_override:
-                resolved[alias] = environment_override
-        self.endpoints = MappingProxyType(resolved)
-
-    def _preflight(
-        self,
-        step_selection: RegisteredStepSelection = ALL_REGISTERED_STEPS,
-    ) -> None:
-        self._resolve_endpoint_overrides()
-        missing = sorted(
-            {
-                alias
-                for alias in self._used_endpoint_aliases(step_selection)
-                if alias not in self.endpoints
-            }
-        )
-        if missing:
-            raise ValueError(
-                f"steps declare endpoint aliases {missing} but App(endpoints=...) "
-                f"defines only {sorted(self.endpoints)} -- pass the alias there, or export "
-                + ", ".join(endpoint_environment_variable_name(alias) for alias in missing)
-            )
-
     def _prepare_process_configuration(
         self,
         *,
@@ -1944,7 +1832,7 @@ class App:
         step_names: Iterable[str] | None,
         registered_step_selection: RegisteredStepSelection | None = None,
     ) -> _PreparedProcessConfiguration:
-        """Parse one run request and resolve endpoints before episode I/O."""
+        """Parse one run request before episode I/O."""
 
         enabled_stages = _resolve_stages(stages)
         if registered_step_selection is not None:
@@ -1956,7 +1844,6 @@ class App:
                 step_names,
                 enabled_stages,
             )
-        self._preflight(resolved_step_selection)
         return _PreparedProcessConfiguration(
             enabled_stages=enabled_stages,
             registered_step_selection=resolved_step_selection,
@@ -1964,7 +1851,7 @@ class App:
 
     def _ordered_checks(self) -> list[RegisteredCheck]:
         # Cheap-first: steps that need no special resources run before steps
-        # declaring requires/uses. Within each class, the pipeline's own
+        # declaring requirements. Within each class, the pipeline's own
         # steps run before the automatic defaults -- so a wrapper registered
         # under its own name with non-default parameters has a chance to
         # emit its measurement keys before the default would run, and the
@@ -1974,7 +1861,7 @@ class App:
         return sorted(
             self.checks,
             key=lambda registered: (
-                bool(registered.requires) or registered.uses is not None,
+                bool(registered.requires),
                 registered.name in self._default_check_names,
             ),
         )
@@ -1982,7 +1869,7 @@ class App:
     def _ordered_enrichments(self) -> list[RegisteredEnrichment]:
         return sorted(
             self.enrichments,
-            key=lambda registered: bool(registered.requires) or registered.uses is not None,
+            key=lambda registered: bool(registered.requires),
         )
 
     def test(
@@ -2621,7 +2508,6 @@ class App:
                     name=MEDIA_CONTACT_SHEET_STEP_NAME,
                     function=render_contact_sheets,
                     requires=frozenset(),
-                    uses=None,
                     # HFlow owns this built-in, so a renderer behavior change
                     # must bump the explicit constant above.
                     version=media_contact_sheet_step_version(),

@@ -112,7 +112,6 @@ class TestPipelineManifest:
         app = hflow.App(
             "kitchen",
             data_root=tmp_path,
-            endpoints={"judge": "http://judge:8000"},
             default_checks=(),
         )
 
@@ -120,7 +119,7 @@ class TestPipelineManifest:
         def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
             return hflow.CheckResult()
 
-        @app.enrich(version="1", uses="judge", requires=("gpu",))
+        @app.enrich(version="1", requires=("gpu",))
         def caption(ep: hflow.Episode) -> hflow.EnrichmentResult:
             return hflow.EnrichmentResult()
 
@@ -145,13 +144,11 @@ class TestPipelineManifest:
         (enrichment_entry,) = manifest_payload["enrichments"]
         assert enrichment_entry["name"] == "caption"
         assert enrichment_entry["kind"] == "enrichment"
-        assert enrichment_entry["uses"] == "judge"
         assert enrichment_entry["requires"] == ["gpu"]
 
         (derived_entry,) = manifest_payload["derived_channels"]
         assert derived_entry["topic"] == "/derived/speed"
 
-        assert manifest_payload["endpoint_aliases"] == ["judge"]
         assert manifest_payload["has_transform_override"] is False
 
     def test_manifest_carries_the_gate_policy_a_step_rejects_on(self, tmp_path: Path) -> None:

@@ -5,7 +5,7 @@ boundary as (docs/ARCHITECTURE.md "Tenancy": only metadata, states, and
 pointers cross -- never episode bytes, and a service should not need to
 execute customer code just to display or diff a pipeline). It carries the
 pipeline's identity facts: step names and author-declared versions, gate
-configuration, endpoint aliases, and the pipeline/schema versions the
+configuration, resource requirements, and the pipeline/schema versions the
 catalog will stamp.
 
 Honesty boundary: producing a manifest REQUIRES importing the pipeline file,
@@ -27,7 +27,9 @@ from hflow.steps import Gate, RegisteredCheck, RegisteredEnrichment, StepVersion
 #    rejected an episode rather than only that some critical check did.
 # 3: step versions are explicit pipeline-author promises rather than
 #    engine-derived identifiers.
-PIPELINE_MANIFEST_VERSION = 3
+# 4: endpoint aliases were removed; external-service configuration belongs to
+#    the step that calls the service rather than the App orchestration layer.
+PIPELINE_MANIFEST_VERSION = 4
 
 
 class StepKind(StrEnum):
@@ -49,7 +51,6 @@ class StepManifest:
     version: StepVersion
     critical: bool
     requires: tuple[str, ...]
-    uses: str | None
     # The policy this step gates on, when it declares one. ``critical`` alone
     # says a gate exists; this says what it is, which is the difference between
     # a service reporting "a critical check failed" and reporting which
@@ -64,7 +65,6 @@ class StepManifest:
             version=registered.version,
             critical=registered.critical,
             requires=tuple(sorted(registered.requires)),
-            uses=registered.uses,
             gate=registered.gate,
         )
 
@@ -78,7 +78,6 @@ class StepManifest:
             version=registered.version,
             critical=False,
             requires=tuple(sorted(registered.requires)),
-            uses=registered.uses,
         )
 
     def to_json_dict(self) -> dict[str, object]:
@@ -88,7 +87,6 @@ class StepManifest:
             "version": self.version,
             "critical": self.critical,
             "requires": list(self.requires),
-            "uses": self.uses,
             "gate": _gate_json(self.gate),
         }
 
@@ -117,7 +115,7 @@ class DerivedChannelManifest:
 class PipelineManifest:
     """Everything a service needs to display, diff, and validate a pipeline
     without holding the code: names, explicit versions, gate flags, and
-    the endpoint aliases the steps declare."""
+    resource requirements."""
 
     pipeline_name: str
     hflow_version: str
@@ -126,7 +124,6 @@ class PipelineManifest:
     checks: tuple[StepManifest, ...]
     enrichments: tuple[StepManifest, ...]
     derived_channels: tuple[DerivedChannelManifest, ...]
-    endpoint_aliases: tuple[str, ...]
     has_transform_override: bool
 
     def to_json_dict(self) -> dict[str, object]:
@@ -139,7 +136,6 @@ class PipelineManifest:
             "checks": [step.to_json_dict() for step in self.checks],
             "enrichments": [step.to_json_dict() for step in self.enrichments],
             "derived_channels": [channel.to_json_dict() for channel in self.derived_channels],
-            "endpoint_aliases": list(self.endpoint_aliases),
             "has_transform_override": self.has_transform_override,
         }
 

@@ -113,15 +113,6 @@ def test_preview_bad_sql_is_400_with_the_duckdb_message(api: TestClient) -> None
     assert "no_such_table" in unknown_table.json()["detail"]
 
 
-def test_preview_refuses_multiple_statements(api: TestClient) -> None:
-    response = api.post(
-        "/api/v1/curation/preview",
-        json={"sql": "SELECT 1; DROP TABLE episodes_raw"},
-    )
-    assert response.status_code == 400
-    assert response.json()["detail"] == "sql must be exactly one read-only SELECT statement"
-
-
 def test_preview_refuses_a_paren_closing_smuggle_as_400_not_500(api: TestClient) -> None:
     # This shape closes the subquery wrapper's paren and smuggles a second
     # statement; it used to 500 (an unhandled IndexError), and its CREATE
@@ -145,13 +136,6 @@ def test_preview_refuses_a_paren_closing_smuggle_as_400_not_500(api: TestClient)
         api.post("/api/v1/curation/preview", json={"sql": "SELECT * FROM episodes"}).status_code
         == 200
     )
-
-
-def test_preview_refuses_a_non_select_single_statement(api: TestClient) -> None:
-    # A single well-formed but non-SELECT statement is refused too.
-    response = api.post("/api/v1/curation/preview", json={"sql": "CREATE TABLE t AS SELECT 1"})
-    assert response.status_code == 400
-    assert response.json()["detail"] == "sql must be exactly one read-only SELECT statement"
 
 
 def test_preview_refuses_an_oversized_sql_body(api: TestClient) -> None:

@@ -15,13 +15,13 @@ from hflow_server import ServerSettings, create_app
 from hflow.runtime import RuntimeConfig, render_bundle
 from hflow.steps import RUN_PROFILES, Stage
 
-# Mixed tiers on purpose: `cheap_check` declares neither requires nor uses
-# (tier 1), `needs_channel` declares requires, `needs_endpoint` declares uses
-# -- and both are registered BEFORE the cheap one, so a payload that merely
+# Mixed tiers on purpose: `cheap_check` declares no requirements (tier 1),
+# while `needs_channel`, `needs_endpoint`, and `rich_caption` declare them --
+# and all are registered BEFORE cheap peers, so a payload that merely
 # echoed registration order would fail the ordering assertions.
 TIERED_PIPELINE_SOURCE = """import hflow
 
-app = hflow.App("tiered-demo", endpoints={"vlm": "http://vlm.invalid"}, default_checks=())
+app = hflow.App("tiered-demo", default_checks=())
 
 
 @app.check(version="1", name="needs_channel", requires=["/camera/wrist"], critical=True)
@@ -29,7 +29,7 @@ def needs_channel(episode):
     return hflow.CheckResult(measurements={"frames": 1.0})
 
 
-@app.check(version="1", name="needs_endpoint", uses="vlm")
+@app.check(version="1", name="needs_endpoint", requires=["vision-model"])
 def needs_endpoint(episode):
     return hflow.CheckResult(measurements={"score": 1.0})
 
@@ -39,7 +39,7 @@ def cheap_check(episode):
     return hflow.CheckResult(verdict=True)
 
 
-@app.enrich(version="1", name="rich_caption", uses="vlm")
+@app.enrich(version="1", name="rich_caption", requires=["vision-model"])
 def rich_caption(episode):
     return hflow.EnrichmentResult(labels={"caption": "x"})
 
@@ -230,7 +230,7 @@ def test_graph_user_step_tiers_match_the_app_ordering(
     stages_by_name = {stage["stage"]: stage for stage in payload["stages"]}
     meta_steps = stages_by_name["meta"]["user_steps"]
     # Cheap-first: the tier-1 check leads even though it registered last, and
-    # tier 2 keeps registration order (requires before uses).
+    # Tier 2 keeps registration order between distinct requirements.
     assert [(step["name"], step["tier"]) for step in meta_steps] == [
         ("cheap_check", 1),
         ("needs_channel", 2),
@@ -238,7 +238,6 @@ def test_graph_user_step_tiers_match_the_app_ordering(
     ]
     needs_channel = next(step for step in meta_steps if step["name"] == "needs_channel")
     assert needs_channel["requires"] == ["/camera/wrist"]
-    assert needs_channel["uses"] is None
     assert needs_channel["critical"] is True
     assert needs_channel["kind"] == "check"
     assert needs_channel["version"]
@@ -248,7 +247,9 @@ def test_graph_user_step_tiers_match_the_app_ordering(
         ("cheap_label", 1),
         ("rich_caption", 2),
     ]
-    assert next(step for step in labels_steps if step["name"] == "rich_caption")["uses"] == "vlm"
+    assert next(step for step in labels_steps if step["name"] == "rich_caption")["requires"] == [
+        "vision-model"
+    ]
     # Enrichments are never critical (only checks carry the gate flag).
     assert all(step["critical"] is False for step in labels_steps)
     # Sync and media carry no user-registered steps at all.

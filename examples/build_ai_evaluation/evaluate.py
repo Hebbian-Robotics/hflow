@@ -48,8 +48,7 @@ REPOSITORY_ROOT = str(Path(__file__).resolve().parents[2])
 if REPOSITORY_ROOT not in sys.path:
     sys.path.insert(0, REPOSITORY_ROOT)
 
-from examples.build_ai_evaluation.judgment import (  # noqa: E402
-    DEFAULT_PROMPTS_DIRECTORY,
+from hflow.build_ai_vlm_checks import (  # noqa: E402
     EvaluationTask,
     ResponseFormat,
     TaskDefinition,
@@ -1063,12 +1062,12 @@ def _argument_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--hand-count-prompt",
         type=Path,
-        default=DEFAULT_PROMPTS_DIRECTORY / "hand_count.txt",
+        default=None,
     )
     run_parser.add_argument(
         "--active-manipulation-prompt",
         type=Path,
-        default=DEFAULT_PROMPTS_DIRECTORY / "active_manipulation.txt",
+        default=None,
     )
 
     compare_parser = subparsers.add_parser("compare", help="compare completed run summaries")
