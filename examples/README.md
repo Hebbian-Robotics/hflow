@@ -280,7 +280,8 @@ LeRobot Dataset v3 repository containing exactly the selected episodes.
 Episode provenance stamped by the converter (`source_dataset`,
 `source_revision`, `source_episode_index` in `episode/v1` metadata) is
 resolved back to the source; the exporter copies the source video chunks
-byte-for-byte and slices the selected data rows from the source chunk
+byte-for-byte (each source (chunk, file) keeping its identity in the
+destination path) and slices the selected data rows from the source chunk
 parquets, so cameras, feature schema, dtypes, shapes, and frame timing
 match the source. Episode indexes are renumbered sequentially in selection
 order. The exporter drives the public `hflow import lerobot` entry point to

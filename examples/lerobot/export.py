@@ -10,7 +10,10 @@ containing exactly the selected episodes.
 Byte-faithful: source video chunks are copied unchanged and the selected
 episode data rows are sliced from their source chunk parquets, so camera
 content, feature schema, dtypes, shapes, and frame timing match the source
-exactly. Episode indexes are renumbered sequentially in selection order.
+exactly. Videos keep their source (chunk, file) identity in the
+destination path, so a selection spanning several source files lands in
+distinct output files; one data parquet is written per selected episode.
+Episode indexes are renumbered sequentially in selection order.
 
 The source archive is materialized through the public
 ``hflow.import_lerobot_dataset`` entry point (``hflow import lerobot``) and
@@ -145,6 +148,25 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _window_index(vw: dict, field: str, cam: str) -> int:
+    """The source video window's chunk/file index as an int; gaps are loud."""
+    raw = vw.get(field)
+    if raw is None or str(raw).strip() == "":
+        raise ValueError(f"source video window for {cam} has no {field}")
+    try:
+        return int(str(raw))
+    except ValueError:
+        raise ValueError(f"source video window for {cam} has non-integer {field} {raw!r}") from None
+
+
+def _format_ref(template: str, **values: int | str | None) -> str:
+    """Resolve a v3 path template with an episode row's index fields."""
+    try:
+        return template.format(**values)
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError(f"template {template!r} cannot format references {values!r}: {e}") from e
+
+
 def _read_corpus_from_cache(cache_dir: Path) -> dict:
     """Reconstruct the source corpus from the importer's materialized archive.
 
@@ -202,9 +224,11 @@ def _read_corpus_from_cache(cache_dir: Path) -> dict:
                 for col in cols:
                     if col.startswith("videos/") and col.endswith("/from_timestamp"):
                         cam = col.split("/")[1]
+                        raw_chunk = d.get(f"videos/{cam}/chunk_index")
+                        raw_file = d.get(f"videos/{cam}/file_index")
                         cam_windows[cam] = {
-                            "chunk_index": str(d.get(f"videos/{cam}/chunk_index") or ""),
-                            "file_index": str(d.get(f"videos/{cam}/file_index") or ""),
+                            "chunk_index": "" if raw_chunk is None else str(raw_chunk),
+                            "file_index": "" if raw_file is None else str(raw_file),
                             "from_timestamp": float(d.get(f"videos/{cam}/from_timestamp") or 0.0),
                             "to_timestamp": float(d.get(f"videos/{cam}/to_timestamp") or 0.0),
                         }
@@ -283,13 +307,14 @@ def _write_v3_repository(
             raise FileNotFoundError(f"source data chunk missing: {local}")
         return local
 
-    def _fetch_video(cam: str, vw: dict, ep: dict) -> Path:
-        chunk = (
-            int(vw["chunk_index"])
-            if str(vw.get("chunk_index", "")).isdigit()
-            else int(ep["data_chunk"])
+    def _fetch_video(cam: str, vw: dict) -> Path:
+        chunk = _window_index(vw, "chunk_index", cam)
+        file = _window_index(vw, "file_index", cam)
+        local = (
+            cache_dir
+            / "videos"
+            / f"{cam.replace('/', '_').replace('.', '_')}-chunk{chunk}-file{file}.mp4"
         )
-        local = cache_dir / "videos" / f"{cam.replace('/', '_').replace('.', '_')}-chunk{chunk}.mp4"
         if not local.exists():
             raise FileNotFoundError(f"source video chunk missing: {local}")
         return local
@@ -304,6 +329,7 @@ def _write_v3_repository(
     data_frames: list[dict] = []
     total_frames = 0
     video_paths: list[Path] = []
+    copied_videos: set[tuple[str, int, int]] = set()
 
     for new_idx, sel in enumerate(selections):
         src = src_by_index[sel.source_episode_index]
@@ -320,7 +346,13 @@ def _write_v3_repository(
                     f"SELECT * FROM read_parquet('{escaped}') LIMIT 0"
                 ).description
             ]
-            index_col = "index" if "index" in cols else "frame_index"
+            if "index" not in cols:
+                raise ValueError(
+                    f"source data parquet {data_local.name} has no 'index' "
+                    "column; selections can only be renumbered from LeRobot "
+                    "v3 sources"
+                )
+            index_col = "index"
             d_from, d_to = int(src["data_from"]), int(src["data_to"])
             rows = conn.execute(
                 f"SELECT * FROM read_parquet('{escaped}') "
@@ -339,15 +371,18 @@ def _write_v3_repository(
                 f"found {len(rows)}"
             )
 
+        frame_rows: list[dict] = []
         for local_frame, row in enumerate(rows):
             d = dict(zip(cols, row, strict=True))
             d["episode_index"] = new_idx
             d["frame_index"] = local_frame
             d[index_col] = len(data_frames)
             data_frames.append(d)
+            frame_rows.append(d)
         total_frames += length
+        pq.write_table(pa.Table.from_pylist(frame_rows), data_dir / f"file-{new_idx:03d}.parquet")
 
-        # videos: copy the chunk files byte-exact, windows preserved
+        # keep the source (chunk, file) identity in the destination path
         ep_video_refs: dict[str, dict] = {}
         for cam in camera_keys:
             vw = (src.get("video_windows") or {}).get(cam)
@@ -356,16 +391,20 @@ def _write_v3_repository(
                     f"source episode {sel.source_episode_index} has no video window "
                     f"for camera {cam}"
                 )
-            vlocal = _fetch_video(cam, vw, src)
-            dst_dir = destination / "videos" / cam / "chunk-000"
+            vlocal = _fetch_video(cam, vw)
+            vchunk = _window_index(vw, "chunk_index", cam)
+            vfile = _window_index(vw, "file_index", cam)
+            key = (cam, vchunk, vfile)
+            dst_dir = destination / "videos" / cam / f"chunk-{vchunk:03d}"
             dst_dir.mkdir(parents=True, exist_ok=True)
-            dst = dst_dir / "file-000.mp4"
-            if not dst.exists():  # same chunk reused across episodes: copy once
+            dst = dst_dir / f"file-{vfile:03d}.mp4"
+            if key not in copied_videos:
                 shutil.copy2(vlocal, dst)
+                copied_videos.add(key)
                 video_paths.append(dst)
             ep_video_refs[cam] = {
-                "chunk_index": "chunk-000",
-                "file_index": "file-000",
+                "chunk_index": vchunk,
+                "file_index": vfile,
                 "from_timestamp": float(vw.get("from_timestamp", 0.0)),
                 "to_timestamp": float(vw.get("to_timestamp", 0.0)),
             }
@@ -374,8 +413,8 @@ def _write_v3_repository(
             "episode_index": new_idx,
             "length": length,
             "tasks": [sel.task] if sel.task else [],
-            "data/chunk_index": "chunk-000",
-            "data/file_index": f"file-{new_idx:03d}.parquet",
+            "data/chunk_index": 0,
+            "data/file_index": new_idx,
             "dataset_from_index": (total_frames - length),
             "dataset_to_index": total_frames,
         }
@@ -386,12 +425,6 @@ def _write_v3_repository(
             ep_out[f"videos/{cam}/from_timestamp"] = v["from_timestamp"]
             ep_out[f"videos/{cam}/to_timestamp"] = v["to_timestamp"]
         ep_rows_out.append(ep_out)
-
-    # write the single data parquet (all selected frames, renumbered, in order)
-    if not data_frames:
-        raise ValueError("selection produced no data frames")
-    data_table = pa.Table.from_pylist(data_frames)
-    pq.write_table(data_table, data_dir / "file-000.parquet")
 
     # write per-episode parquet rows
     ep_table = pa.Table.from_pylist(ep_rows_out)
@@ -411,7 +444,7 @@ def _write_v3_repository(
         "code": "LeRobotDataset/v3",
         "total_episodes": len(selections),
         "total_frames": total_frames,
-        "total_videos": len(camera_keys) * len(selections),
+        "total_videos": len(video_paths),
         "robot_type": selections[0].embodiment or info.get("robot_type", "unknown"),
         "fps": info.get("fps", 30),
         "splits": {"train": [f"episode_{i:06d}" for i in range(len(selections))]},
@@ -430,20 +463,31 @@ def _write_v3_repository(
         "output_episode_count": len(selections),
         "output_frames": total_frames,
         "cameras": list(camera_keys),
-        "video_sha256": {cam: _sha256(video_paths[i]) for i, cam in enumerate(camera_keys)},
-        "data_parquet_sha256": _sha256(data_dir / "file-000.parquet"),
+        "video_sha256": {
+            cam: {
+                str(p.relative_to(destination)): _sha256(p)
+                for p in video_paths
+                if p.parent.parent.name == cam
+            }
+            for cam in camera_keys
+        },
+        "data_parquet_sha256": {
+            str(p.relative_to(destination)): _sha256(p)
+            for p in sorted((destination / "data").rglob("*.parquet"))
+        },
     }
 
 
 def _validate_v3(dataset_dir: Path) -> None:
     """Validate the staged repository is a loadable LeRobot Dataset v3.
 
-    Structural checks run always (meta/info.json present and coherent, episode
-    and data parquets readable, per-episode windows within the data file,
-    video files present for every referenced camera). When the official
-    ``lerobot`` package is installed the staged directory is additionally
-    loaded through its LeRobotDataset API; without it, the structural checks
-    are the validation (CI installs lerobot for the official-API pass).
+    Structural checks are the validation: meta/info.json present and
+    coherent, episode and data parquets readable, per-episode windows equal
+    the row counts, and every episode's data and camera references resolve
+    through the dataset's ``data_path`` / ``video_path`` templates to files
+    that exist. Index fields must be values the templates can format (plain
+    integers), which is what makes the staged directory loadable by the
+    official ``lerobot`` package.
     """
     meta_path = dataset_dir / "meta" / "info.json"
     if not meta_path.exists():
@@ -479,26 +523,29 @@ def _validate_v3(dataset_dir: Path) -> None:
                 for cam in info.get("features") or {}:
                     if not str(cam).startswith("observation.images."):
                         continue
-                    vkey = f"videos/{cam}/file_index"
-                    if vkey not in d:
-                        raise ValueError(f"episode {ep} lacks video reference for {cam}")
-                    vfile = dataset_dir / "videos" / cam / "chunk-000" / f"{d[vkey]}.mp4"
-                    if not vfile.exists():
-                        raise ValueError(f"episode {ep} references missing video {vfile}")
+                    vrel = _format_ref(
+                        info["video_path"],
+                        video_key=cam,
+                        chunk_index=d.get(f"videos/{cam}/chunk_index"),
+                        file_index=d.get(f"videos/{cam}/file_index"),
+                    )
+                    vpath = dataset_dir / vrel
+                    if not vpath.exists():
+                        raise ValueError(f"episode {ep} references missing video {vpath}")
+                drel = _format_ref(
+                    info["data_path"],
+                    chunk_index=d.get("data/chunk_index"),
+                    file_index=d.get("data/file_index"),
+                )
+                dpath = dataset_dir / drel
+                if not dpath.exists():
+                    raise ValueError(f"episode {ep} references missing data file {dpath}")
     finally:
         conn.close()
 
     data_pqs = sorted((dataset_dir / "data").rglob("*.parquet"))
     if not data_pqs:
         raise ValueError("staged dataset has no data parquets")
-
-    try:
-        import lerobot.common.datasets.lerobot_dataset as _lerobot_ds  # ty: ignore
-
-        LeRobotDataset = _lerobot_ds.LeRobotDataset
-        LeRobotDataset(dataset_dir)
-    except ImportError:
-        pass  # structural validation above stands in for the API pass
 
 
 def _write_dataset_card(
