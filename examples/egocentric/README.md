@@ -32,8 +32,9 @@ declared data you can edit (see [inject your own faults](#inject-your-own-faults
 - A Hugging Face account that has accepted the dataset's access terms, and the
   `hf` CLI, authenticated: `uv tool install -U huggingface_hub` then
   `hf auth login`.
-- Network access and disk: a ~1 GB download plus space for the extracted
-  sources and 96 H.264 landing episodes.
+- Network access and disk: a ~950 MB download, plus the extracted sources and
+  about 320 MB of landing episodes (measured over the pinned shard: 96
+  episodes, 2.45-4.75 MB each).
 - Docker with Compose v2 (only for the [Airflow path](#run-it-under-airflow)).
 
 All media stays under the gitignored `data/` directory; the repository tracks
@@ -64,6 +65,11 @@ data/egocentric/
 
 Re-running is safe: the download and extraction are skipped when the verified
 files already exist, and the generated episodes are deterministic.
+
+If the download stalls part-way, retry with `HF_HUB_DISABLE_XET=1` set. Hugging
+Face's Xet transfer has been seen to hang on this shard; the plain path
+completes. Partial files fail the hash check rather than being used, so a
+stalled attempt costs time and nothing else.
 
 ## Run the pipeline locally
 
