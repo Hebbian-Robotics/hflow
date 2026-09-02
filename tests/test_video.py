@@ -448,6 +448,24 @@ def test_first_mb_failure_message_names_both_failure_kinds() -> None:
     )
 
 
+def test_a_truncated_slice_type_still_counts_but_cannot_be_classified() -> None:
+    """The two readers disagree about which field failing matters, and the
+    shared walk has to keep that disagreement.
+
+    ``0x80`` is ``first_mb_in_slice`` = ue(0) followed by seven zero bits, so
+    the first field decodes and the second never terminates.
+    ``count_h264_pictures`` reads only the first and must still count the
+    picture, exactly as it did when it had its own single-field decoder;
+    the scan needs both and must refuse. Collapsing the walk's two
+    per-field ``is None`` checks into one would pass every other test here.
+    """
+    truncated_slice_type = b"\x00\x00\x00\x01\x41\x80"
+
+    assert count_h264_pictures(truncated_slice_type) == 1
+    with pytest.raises(ValueError, match="cannot be classified"):
+        scan_picture_coding_types(truncated_slice_type)
+
+
 def test_scan_refuses_a_truncated_slice_with_the_existing_fail_closed_message() -> None:
     """A NAL whose head runs out before both Exp-Golomb values finish must
     still fail closed with the same message the unoptimized path produced.
