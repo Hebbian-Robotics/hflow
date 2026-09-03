@@ -206,6 +206,7 @@ hflow curate --sql-file query.sql \
 
 Pass exactly one of the positional SQL string or `--sql-file`; passing both or
 neither is an error.
+The curate() function accepts exactly one SELECT statement
 
 The manifest is written **manifest-last**: to a temp file, renamed into place
 only after the query completed, so a partial manifest is unreachable.

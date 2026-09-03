@@ -995,6 +995,21 @@ _MULTI_STATEMENT_PAYLOADS = [
         False,
         id="legitimate-single-select",
     ),
+    pytest.param(
+        "PIVOT episodes ON status USING count(*)",
+        True,
+        id="pivot",  # DuckDB secretly expands this to CREATE then SELECT
+    ),
+    pytest.param(
+        "DESCRIBE SELECT episode_id FROM episodes",
+        False,
+        id="describe",
+    ),
+    pytest.param(
+        "SUMMARIZE SELECT episode_id FROM episodes",
+        False,
+        id="summarize",
+    ),
 ]
 
 
