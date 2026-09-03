@@ -326,8 +326,9 @@ def test_video_cache_distinguishes_file_indices_and_reuses_same_source(
         lambda source_path, output_path, *_args, **_kwargs: shutil.copy(source_path, output_path),
     )
 
+    published_uris: list[str] = []
     for episode_index in (0, 1, 0):
-        prep._convert_single_episode(
+        uri = prep._convert_single_episode(
             source_archive=source_archive,
             dataset_source=dataset_source,
             storage=LocalStorageRoot(tmp_path / "output"),
@@ -336,6 +337,10 @@ def test_video_cache_distinguishes_file_indices_and_reuses_same_source(
             numeric_schemas=numeric_schemas,
             frames_per_second=30,
         )
+        published_uris.append(uri)
+
+    assert published_uris[0].endswith("landing/lerobot_episode_0001.mcap")
+    assert published_uris[1].endswith("landing/lerobot_episode_0002.mcap")
 
     video_urls = [
         "https://huggingface.co/datasets/fake/repo/resolve/abc/videos/"
