@@ -1349,6 +1349,19 @@ def _command_catalog_ui(arguments: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
+    bucket_catalog = is_bucket_url(catalog_location)
+    bucket_storage_error: type[BaseException] | None = None
+    if bucket_catalog:
+        # Import while the optional extra is already known to be required for
+        # this path, so a later handler cannot mask an unrelated failure with
+        # ModuleNotFoundError from this import.
+        try:
+            from obstore.exceptions import BaseError as BucketStorageError
+        except ModuleNotFoundError:
+            bucket_storage_error = None
+        else:
+            bucket_storage_error = BucketStorageError
+
     try:
         settings = CatalogUiSettings(
             catalog_root=catalog_location,
@@ -1360,20 +1373,15 @@ def _command_catalog_ui(arguments: argparse.Namespace) -> int:
         CatalogUiStartupError,
         OSError,
         ValueError,
-        FileNotFoundError,
         ModuleNotFoundError,
     ) as error:
         print(f"catalog ui: {error}", file=sys.stderr)
         return 2
     except Exception as error:
-        if not is_bucket_url(catalog_location):
-            raise
-        from obstore.exceptions import BaseError as BucketStorageError
-
-        if not isinstance(error, BucketStorageError):
-            raise
-        print(f"catalog ui: {error}", file=sys.stderr)
-        return 2
+        if bucket_storage_error is not None and isinstance(error, bucket_storage_error):
+            print(f"catalog ui: {error}", file=sys.stderr)
+            return 2
+        raise
     return 0
 
 

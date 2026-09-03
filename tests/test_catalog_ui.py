@@ -52,6 +52,20 @@ def _append_remote_episode(
     )
 
 
+def _writer_catalog_root(tmp_path: Path, remote_dir: Path) -> "BucketStorageRoot":
+    """A catalog writer with its own mirror over the same bucket as the UI.
+
+    Production ingest is a separate process with a separate mirror. Sharing the
+    UI's mirror would let appends prime DuckDB without exercising sync.
+    """
+    from hflow.storage import BucketStorageRoot
+
+    return BucketStorageRoot(
+        f"file://{remote_dir}",
+        mirror=tmp_path / "writer-mirror",
+    ).child("catalog")
+
+
 def test_catalog_ui_starts_empty_then_exposes_the_first_completed_append(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -460,9 +474,10 @@ def test_catalog_ui_waits_for_the_first_remote_append(
     bucket_over_tmp: tuple["BucketStorageRoot", Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    data_root, _remote_dir = bucket_over_tmp
-    catalog_root = data_root.child("catalog")
-    _write_remote_catalog_marker(catalog_root)
+    data_root, remote_dir = bucket_over_tmp
+    ui_catalog_root = data_root.child("catalog")
+    writer_catalog_root = _writer_catalog_root(tmp_path, remote_dir)
+    _write_remote_catalog_marker(writer_catalog_root)
     shutdown_event = Event()
     server_started_event = Event()
     empty_catalog_ready_event = Event()
@@ -471,7 +486,7 @@ def test_catalog_ui_waits_for_the_first_remote_append(
     catalog_connections: list[duckdb.DuckDBPyConnection] = []
 
     catalog_ui_thread = _run_bucket_catalog_ui_in_thread(
-        catalog_root,
+        ui_catalog_root,
         shutdown_event=shutdown_event,
         background_failures=background_failures,
         monkeypatch=monkeypatch,
@@ -486,7 +501,7 @@ def test_catalog_ui_waits_for_the_first_remote_append(
         (catalog_connection,) = catalog_connections
         assert catalog_connection.execute("SELECT count(*) FROM episodes").fetchone() == (0,)
 
-        _append_remote_episode(tmp_path, catalog_root, task="remote-first")
+        _append_remote_episode(tmp_path, writer_catalog_root, task="remote-first")
 
         assert catalog_refreshed_event.wait(timeout=2)
         assert catalog_connection.execute(
@@ -505,9 +520,10 @@ def test_catalog_ui_sees_a_later_remote_append_without_restart(
     bucket_over_tmp: tuple["BucketStorageRoot", Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    data_root, _remote_dir = bucket_over_tmp
-    catalog_root = data_root.child("catalog")
-    _append_remote_episode(tmp_path, catalog_root, task="first")
+    data_root, remote_dir = bucket_over_tmp
+    ui_catalog_root = data_root.child("catalog")
+    writer_catalog_root = _writer_catalog_root(tmp_path, remote_dir)
+    _append_remote_episode(tmp_path, writer_catalog_root, task="first")
     shutdown_event = Event()
     server_started_event = Event()
     background_failures: list[BaseException] = []
@@ -515,7 +531,7 @@ def test_catalog_ui_sees_a_later_remote_append_without_restart(
     catalog_ready_event = Event()
 
     catalog_ui_thread = _run_bucket_catalog_ui_in_thread(
-        catalog_root,
+        ui_catalog_root,
         shutdown_event=shutdown_event,
         background_failures=background_failures,
         monkeypatch=monkeypatch,
@@ -531,7 +547,7 @@ def test_catalog_ui_sees_a_later_remote_append_without_restart(
 
         _append_remote_episode(
             tmp_path,
-            catalog_root,
+            writer_catalog_root,
             task="second",
             canonical_bytes=b"another canonical episode",
         )

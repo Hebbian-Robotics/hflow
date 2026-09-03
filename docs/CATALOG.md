@@ -151,11 +151,14 @@ marker and never creates or changes objects in the bucket. It syncs append-only
 Parquet table files into the local mirror under `HFLOW_MIRROR_DIR` (or
 `$XDG_CACHE_HOME/hflow/mirrors`) before DuckDB opens, then re-syncs on its poll
 interval so the first and later completed appends become visible in the open UI
-without a restart. DuckDB reads the mirror only and continues to listen on
-loopback. A valid empty bucket catalog -- marker present, no Parquet rows yet --
-starts the UI and waits for its first completed append the same way a local
-empty catalog does. Local catalogs may still be created on startup when the
-directory does not exist yet; remote catalogs must already exist.
+without a restart. The default poll interval is 0.5 seconds; each tick lists the
+catalog table prefixes and downloads only the files the mirror still lacks,
+which is fine for an interactive laptop session. DuckDB reads the mirror only
+and continues to listen on loopback. A valid empty bucket catalog -- marker
+present, no Parquet rows yet -- starts the UI and waits for its first completed
+append the same way a local empty catalog does. Local catalogs may still be
+created on startup when the directory does not exist yet; remote catalogs must
+already exist.
 
 DuckDB UI listens on loopback. When HFlow is running on another machine, run
 the second command there and forward the port from your laptop:
