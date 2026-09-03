@@ -1,9 +1,9 @@
-# HFlow MCAP storage and read benchmarks
+# HFlow storage, read, and camera-check benchmarks
 
-These reproducible benchmarks measure the two performance decisions in HFlow's
-canonical MCAP writer: in-band video compression and topic-group chunking.
-They report what the current implementation achieves at honest small scale
-alongside the million-hour results Dyna published in
+These reproducible benchmarks measure HFlow's in-band video compression,
+topic-group chunking, and cold camera-evidence throughput. They report what the
+current implementation achieves at honest small scale alongside the
+million-hour results Dyna published in
 [Training Dyna-2 at million-hour scale, repeatably](https://www.dyna.co/research/dyna-2-infrastructure)
 (Figure 3). Every number below comes from a real run of the scripts in
 [`benchmarks/`](../benchmarks); nothing is extrapolated.
@@ -13,6 +13,7 @@ alongside the million-hour results Dyna published in
 | Workload | Measured result | Why it matters |
 | --- | --- | --- |
 | Six-camera real footage | **48-50.5% less video payload** than the source JPEG payloads | Quantifies the storage effect without relying on synthetic test patterns |
+| One-camera 1080p30 evidence pass | **4.90 s median** to inspect every frame of a 30 s episode | Establishes the cold `camera_frame_stats` cost without mixing in transform or cache time |
 | Four-camera synthetic training windows | **2.42x fewer chunk fetches** than per-topic chunking | Shows how grouping topics by read pattern reduces sample assembly work |
 | Six-camera real footage with 8 MB chunks | **2.81x fewer fetches and 3.21x fewer bytes fetched** than per-topic chunking | Demonstrates that chunk size and grouping policy must be tuned together |
 | Selective state scans | Naive schema grouping fetched **230 MB** for a 0.2 MB `/imu` stream | Shows why HFlow exposes per-topic group overrides instead of treating grouping as a fixed schema rule |
@@ -29,6 +30,8 @@ sections for the reference datasets):
 ```bash
 uv run python benchmarks/storage_benchmark.py
 uv run python benchmarks/read_benchmark.py
+uv run python benchmarks/camera_frame_stats_benchmark.py
+uv run python benchmarks/camera_frame_stats_benchmark.py --profile-filters
 uv run python benchmarks/storage_benchmark.py --input nuscenes-mini-sample.mcap
 uv run python benchmarks/read_benchmark.py --input nuscenes-mini-sample.mcap \
     --grouping read-pattern --chunk-size-bytes 8000000
@@ -51,10 +54,73 @@ uv run python benchmarks/read_benchmark.py --input robotis-button-push-107.mcap 
 - Scale: 11.6-60 s episodes, not the forty-three million of Dyna's corpus. The
   point is that the mechanisms behave as Dyna's article describes, not that
   the ratios match.
+- Camera-check wall time is machine- and content-dependent. Its benchmark uses
+  a fresh `Episode` workdir for every repetition, so neither the remuxed MP4 nor
+  the persistent FFmpeg instrument cache can turn a cold run into a cache hit.
 - Storage reductions compare **video payload bytes** (the codec effect, the
   number comparable to Dyna's ~68%). File sizes are shown alongside but carry
   every non-camera channel passed through byte-for-byte; on a lidar-heavy
   recording those dwarf the cameras and would swamp a file-level comparison.
+
+## Camera evidence: cold per-frame throughput (issue #365)
+
+`camera_frame_stats` measures blackout, freeze, luma, frame-difference,
+temporal-outlier, and broadcast-range evidence for every decoded frame. The
+implementation already shares one FFmpeg filter graph between those
+measurements and caches its instrument output, so this benchmark measures the
+remaining first-run cost rather than reintroducing the repeated decode removed
+by #175.
+
+The script first transforms one deterministic synthetic episode, reports that
+time separately, then runs the check three times with a new workdir each time:
+
+```bash
+uv run python benchmarks/camera_frame_stats_benchmark.py
+# --quick uses a 3 s, 320x180 development fixture
+```
+
+Measured on a Ryzen 9 8945H (8 cores/16 threads), 32 GB RAM, Linux x86_64, and
+FFmpeg `n8.1.2-50-g1a748fe2cd-20260901` at commit `050d145`:
+
+| phase | wall-clock | decoded frames | instrument cache |
+|---|---:|---:|---:|
+| transform to canonical | 3.510 s | - | - |
+| cold `camera_frame_stats` #1 | 4.897 s | 900 | 840.3 KB |
+| cold `camera_frame_stats` #2 | 4.940 s | 900 | 840.3 KB |
+| cold `camera_frame_stats` #3 | 4.797 s | 900 | 840.3 KB |
+
+The cold median is **4.897 s per camera** for 30 seconds of 1920x1080 video at
+30 FPS. All three runs decoded all 900 frames. This synthetic result matches
+the shape of the separately reported real Egocentric-10K control in #365:
+seconds per camera, stable across cold repetitions, and independent of whether
+the canonical H.264 arrived directly or through a JPEG transform.
+
+### Where the time goes
+
+`--profile-filters` runs one-variable FFmpeg controls against the same
+canonical MP4 to isolate the cost:
+
+| filter path | wall-clock |
+|---|---:|
+| decode only | 0.422 s |
+| decode + `format=yuv420p` | 0.518 s |
+| decode + `blackframe` | 0.537 s |
+| decode + `freezedetect` | 0.508 s |
+| decode + `signalstats=stat=tout+brng` | 4.536 s |
+| complete shipped graph | 4.711 s |
+
+`signalstats` is the bottleneck, not H.264 decoding. The additional controls
+recorded in #365 found no repeatable gain from overriding FFmpeg's automatic
+filter threading, splitting the graph into parallel branches, or using NVDEC
+before the software-only evidence filters. A luma-only input is not equivalent
+either: FFmpeg's `BRNG` statistic deliberately evaluates the Y, U, and V
+planes, so removing chroma would silently weaken the recorded evidence.
+
+**Conclusion: keep the measurement path unchanged.** The tested changes do not
+produce a repeatable win without changing evidence or adding complexity that
+outweighs noise-level movement. The benchmark is the durable outcome: future
+FFmpeg releases or alternative instruments now have a reproducible baseline
+and must beat it while preserving every per-frame result.
 
 ## Storage: per-frame JPEG vs canonical MCAP by GOP preset (issue #26)
 
