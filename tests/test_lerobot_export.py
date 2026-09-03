@@ -404,6 +404,21 @@ def test_export_duplicate_episode_fails(fake_corpus: dict, tmp_path: Path) -> No
     assert not dest.exists()
 
 
+def test_export_missing_index_column_fails(fake_corpus: dict, tmp_path: Path) -> None:
+    """A source data parquet without an 'index' column is refused by message."""
+    import pyarrow.parquet as pq
+
+    src = Path(fake_corpus["cache_dir"]) / "data" / "chunk-000" / "file-000.parquet"
+    table = pq.read_table(src).drop_columns(["index"])
+    pq.write_table(table, src)
+
+    manifest = _fake_manifest(tmp_path, [{"metadata_json": _provenance_meta(0)}])
+    dest = tmp_path / "out"
+    with pytest.raises(ValueError, match=r"has no 'index' column"):
+        export.export(dest, manifest=manifest, camera_keys=CAMS)
+    assert not dest.exists()
+
+
 def test_export_sql_selection(fake_corpus: dict, tmp_path: Path) -> None:
     """SQL selection path: same outcome via a duckdb query string."""
     _make_data_local(fake_corpus)
