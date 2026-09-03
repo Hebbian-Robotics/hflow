@@ -37,6 +37,8 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
     task_instance_pages_served: ClassVar[list[tuple[int, int]]] = []
     fail_task_instances_at_offset: ClassVar[int | None] = None
     task_instance_page_overlap: ClassVar[int] = 0
+    task_instance_max_page_limit: ClassVar[int | None] = None
+    task_instance_omit_total: ClassVar[bool] = False
 
     def _read_json(self) -> dict[str, Any] | None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -97,6 +99,10 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(request_query)
         limit = int(query.get("limit", ["50"])[0])
         offset = int(query.get("offset", ["0"])[0])
+        # Airflow clamps limit to api.maximum_page_limit and does not error.
+        ceiling = type(self).task_instance_max_page_limit
+        if ceiling is not None:
+            limit = min(limit, ceiling)
         type(self).task_instance_pages_served.append((limit, offset))
         if offset == type(self).fail_task_instances_at_offset:
             return None
@@ -105,10 +111,10 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
             for index in range(type(self).mapped_instance_count)
         ]
         start = max(0, offset - type(self).task_instance_page_overlap)
-        return {
-            "task_instances": every_instance[start : start + limit],
-            "total_entries": len(every_instance),
-        }
+        page: dict[str, Any] = {"task_instances": every_instance[start : start + limit]}
+        if not type(self).task_instance_omit_total:
+            page["total_entries"] = len(every_instance)
+        return page
 
     def do_GET(self) -> None:
         authorization = self._record(None)
@@ -209,6 +215,8 @@ def _reset_stub_airflow_state() -> None:
     _StubAirflowHandler.task_instance_pages_served = []
     _StubAirflowHandler.fail_task_instances_at_offset = None
     _StubAirflowHandler.task_instance_page_overlap = 0
+    _StubAirflowHandler.task_instance_max_page_limit = None
+    _StubAirflowHandler.task_instance_omit_total = False
 
 
 @pytest.fixture(scope="module")
@@ -791,6 +799,36 @@ def test_task_instances_returns_every_page_of_a_wide_fan_out(stub_server: str) -
     mapped = [entry.map_index for entry in instances if entry.task_id == "process_batch"]
     assert sorted(mapped) == list(range(250))
     assert len(mapped) == len(set(mapped))
+
+
+def test_task_instances_completes_when_the_server_clamps_the_page_limit(
+    stub_server: str,
+) -> None:
+    # api.maximum_page_limit below the limit the client asks for: every page
+    # comes back short, so a short page cannot mean the run is exhausted.
+    _StubAirflowHandler.mapped_instance_count = 250
+    _StubAirflowHandler.task_instance_max_page_limit = 25
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    instances = client.task_instances("pipeline_ingest", "manual__1")
+
+    assert len(instances) == 251
+    assert len(_StubAirflowHandler.task_instance_pages_served) == 11
+
+
+def test_task_instances_stops_on_a_short_page_when_no_total_is_reported(
+    stub_server: str,
+) -> None:
+    # Without total_entries a short page is the only exhaustion signal left,
+    # so one under-full page has to end the run in a single request.
+    _StubAirflowHandler.mapped_instance_count = 9
+    _StubAirflowHandler.task_instance_omit_total = True
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    instances = client.task_instances("pipeline_ingest", "manual__1")
+
+    assert len(instances) == 10
+    assert len(_StubAirflowHandler.task_instance_pages_served) == 1
 
 
 def test_task_instances_asks_for_each_page_in_turn(stub_server: str) -> None:

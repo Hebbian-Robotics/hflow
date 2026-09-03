@@ -443,17 +443,25 @@ class AirflowClient:
                 seen.add(identity)
                 collected.append(parsed)
                 added += 1
-            # Three independent stops, because a server that disagrees with
-            # its own metadata must not be able to spin here: a page that
-            # added nothing new, a page shorter than the one we asked for,
-            # and the reported total being reached.
-            if added == 0 or len(page) < _TASK_INSTANCE_PAGE_SIZE:
-                break
             offset += len(page)
             total_entries = response.get("total_entries")
-            # Counted against what was kept, not what was asked for: overlapping
-            # pages advance the offset past entries we have not seen yet.
-            if isinstance(total_entries, int) and len(collected) >= total_entries:
+            # A page that added nothing new is the guard against a server that
+            # disagrees with its own metadata: it stops the loop whatever the
+            # other two say.
+            if added == 0:
+                break
+            if isinstance(total_entries, int):
+                # Counted against what was kept, not what was asked for:
+                # overlapping pages advance the offset past entries we have not
+                # seen yet.
+                if len(collected) >= total_entries:
+                    break
+            elif len(page) < _TASK_INSTANCE_PAGE_SIZE:
+                # A short page only means exhaustion when there is no total to
+                # check against. Airflow clamps ``limit`` to
+                # ``api.maximum_page_limit`` without erroring, so a deployment
+                # configured below the page size we ask for serves short pages
+                # all the way through the run.
                 break
         return collected
 
