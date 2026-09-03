@@ -15,10 +15,11 @@ v1 behavior:
 - Channels already carrying ``foxglove.CompressedVideo`` pass through after
   every message is validated against the canonical video constraints
   (``format="h264"``, one AUD-delimited access unit per message, SPS+PPS on
-  keyframes, each channel starts on a keyframe). A missing AUD is prepended
-  losslessly because the message already supplies the access-unit boundary;
-  conforming messages remain byte-for-byte identical. Other violations fail
-  loudly because the provenance stamp asserts conformance.
+  keyframes, no B-frames, each channel starts on a keyframe, fixed GOP). A
+  missing AUD is prepended losslessly because the message already supplies the
+  access-unit boundary; conforming messages remain byte-for-byte identical.
+  Other violations fail loudly because the provenance stamp asserts
+  conformance.
   Raw ``sensor_msgs/msg/Image``/``foxglove.RawImage`` is not supported in v1
   (explicit error).
 - Every other channel passes through byte-for-byte with its original schema.
@@ -478,7 +479,7 @@ def _insert_missing_passthrough_video_aud(
 
 def _validate_passthrough_video_payload(
     topic: str, message: _PassthroughVideoMessage, *, is_first_message: bool
-) -> None:
+) -> bool:
     """Enforce the canonical video constraints on a pass-through message.
 
     The provenance stamp asserts the whole file conforms (FORMAT.md), so a
@@ -517,6 +518,7 @@ def _validate_passthrough_video_payload(
             "bframes=0 because a -c:v copy MP4 remux drops the reorder tail "
             "(measured 301 of 303 in #250) -- re-encode upstream with bframes=0"
         )
+    return access_unit.is_keyframe
 
 
 def _decode_compressed_images(
@@ -625,6 +627,12 @@ def write_canonical_episode(
         passthrough_video_decoders: dict[int, Callable[[bytes], Any]] = {}
         passthrough_video_encoders: dict[int, Callable[[Any, bytes], bytes]] = {}
         passthrough_video_channels_with_messages: set[int] = set()
+        passthrough_video_log_times: dict[int, list[int]] = {
+            channel_id: [] for channel_id in passthrough_video_channel_ids
+        }
+        passthrough_video_keyframes: dict[int, list[bool]] = {
+            channel_id: [] for channel_id in passthrough_video_channel_ids
+        }
         for batch in reader.iter_batches():
             if batch.channel_id in camera_payloads:
                 camera_log_times[batch.channel_id].extend(int(t) for t in batch.log_times)
@@ -638,7 +646,7 @@ def write_canonical_episode(
                         )
                     decode = passthrough_video_decoders[batch.channel_id]
                     canonical_payloads: list[bytes] = []
-                    for payload in batch.data:
+                    for batch_index, payload in enumerate(batch.data):
                         is_first_message = (
                             batch.channel_id not in passthrough_video_channels_with_messages
                         )
@@ -649,7 +657,7 @@ def write_canonical_episode(
                         repaired_video_message = _insert_missing_passthrough_video_aud(
                             batch.topic, video_message
                         )
-                        _validate_passthrough_video_payload(
+                        is_keyframe = _validate_passthrough_video_payload(
                             batch.topic,
                             repaired_video_message,
                             is_first_message=is_first_message,
@@ -663,6 +671,10 @@ def write_canonical_episode(
                                 decoded_message, repaired_video_message.data
                             )
                         canonical_payloads.append(payload)
+                        passthrough_video_log_times[batch.channel_id].append(
+                            int(batch.log_times[batch_index])
+                        )
+                        passthrough_video_keyframes[batch.channel_id].append(is_keyframe)
                         passthrough_video_channels_with_messages.add(batch.channel_id)
                 else:
                     canonical_payloads = batch.data
@@ -675,6 +687,32 @@ def write_canonical_episode(
                     )
                     for index, payload in enumerate(canonical_payloads)
                 )
+
+        for channel_id in sorted(passthrough_video_channel_ids):
+            keyframes = passthrough_video_keyframes[channel_id]
+            if not keyframes:
+                continue
+            topic = infos[channel_id].topic
+            log_times = passthrough_video_log_times[channel_id]
+            if len(log_times) >= 2:
+                try:
+                    fps = video_module.estimate_fps_from_log_times(log_times, topic=topic)
+                except ValueError as error:
+                    raise SourceNotConforming(
+                        f"pass-through video topic {topic!r} channel {channel_id} cannot prove "
+                        f"fixed GOP cadence: {error}"
+                    ) from error
+            else:
+                fps = 1.0
+            gop_frames = max(1, round(gop_seconds * fps))
+            for message_index, is_keyframe in enumerate(keyframes):
+                keyframe_expected = message_index % gop_frames == 0
+                if is_keyframe != keyframe_expected:
+                    raise SourceNotConforming(
+                        f"pass-through video topic {topic!r} channel {channel_id} message "
+                        f"{message_index}: is_keyframe={is_keyframe}, expected "
+                        f"{keyframe_expected} (gop_frames={gop_frames})"
+                    )
 
         from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
 

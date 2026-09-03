@@ -150,7 +150,7 @@ A file claiming this convention must satisfy, in increasing strictness:
 1. **It is valid MCAP**: readable by the stock [`mcap` package](https://mcap.dev/docs/python/) with CRC validation on, with a complete summary section.
 2. **It opens in the standard viewers**: [Foxglove](https://foxglove.dev/) and [Rerun](https://rerun.io/). Opening in both is the acceptance test for every file the pipeline writes.
 3. **Chunk purity**: for every `ChunkIndex`, the channel IDs in `message_index_offsets` belong to exactly one group; each group's chunk sequence is time-ordered.
-4. **Video constraints**: every `foxglove.CompressedVideo` message is one Annex B access unit beginning with an AUD; every IDR access unit contains SPS and PPS; no B-frames; `format="h264"`.
+4. **Video constraints**: every `foxglove.CompressedVideo` message is one Annex B access unit beginning with an AUD; every IDR access unit contains SPS and PPS; no B-frames; keyframes match the fixed-GOP grid derived from `gop_seconds` and the channel's measured frame rate; `format="h264"`.
 5. **Stamps**: `provenance/v1` present with `schema_version` and `pipeline_version`.
 
 The no-B-frame constraint is enforced by refusal at two boundaries, because a `-c:v copy` remux
@@ -162,13 +162,21 @@ the observed reorder depth and the frames at risk. `hflow doctor` reports any B 
 classifies in a video message as the `video-b-picture` error finding (below), so a clean
 report now covers this constraint alongside the refusals.
 
+The fixed-GOP constraint is enforced on pass-through video before provenance is
+written. The transform measures each channel's frame rate from its log times,
+computes `gop_frames = max(1, round(gop_seconds × fps))`, and refuses a stream
+when either an extra keyframe or a missing scheduled keyframe falls off that
+message-index grid. `hflow doctor` performs the same comparison against the
+stamped `gop_seconds` and reports a mismatch as `video-keyframe-cadence`.
+
 `hflow doctor <file.mcap> [more.mcap ...]` checks every file given and prints
 one report each in argument order; its aggregate result follows the
 [exit code rules](#exit-codes). It validates the container, summary, indexes,
 stamps, chunk purity (against the file's own group map, or a video-versus-state
 approximation when it has none), per-topic time order, per-group chunk time
-order, and the H.264 access-unit properties listed below. It classifies H.264
-picture coding types to detect B-frames as the `video-b-picture` error finding.
+order, and the H.264 access-unit properties listed below, including fixed-GOP
+cadence when a valid `gop_seconds` stamp is present. It classifies H.264 picture
+coding types to detect B-frames as the `video-b-picture` error finding.
 A payload whose slice headers cannot be parsed still cannot be classified, and
 is reported as `video-invalid-slice-header` instead. The doctor does not reject
 non-VCL NAL units before the first AUD, so a clean report does not prove the
@@ -203,6 +211,7 @@ automation. An `error` breaks the canonical convention (or the MCAP spec); a
 | `video-not-aud-delimited` | error | No AUD is present, or VCL data precedes the first AUD. |
 | `video-keyframe-missing-parameter-sets` | error | A keyframe does not carry both SPS and PPS. |
 | `video-stream-starts-mid-gop` | error | A video channel's first message is not a keyframe. |
+| `video-keyframe-cadence` | error | A structurally valid video channel's keyframes do not match the message-index grid derived from stamped `gop_seconds` and its measured frame rate, or that frame rate cannot be inferred from a populated multi-message channel. |
 | `read-failed` | error | Full message reading, CRC validation, or video decoding fails. |
 
 At most three findings with the same code are printed. The report then gives
