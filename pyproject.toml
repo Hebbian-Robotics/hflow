@@ -23,6 +23,7 @@ requires-python = ">=3.11"
 dependencies = [
     "duckdb>=1.5.5",
     "foxglove-schemas-protobuf>=0.4.0",
+    "httpx2>=2.12.0",
     "mcap>=1.4.0",
     "mcap-protobuf-support>=0.5.4",
     "mcap-ros2-support>=0.5.7",
@@ -62,9 +63,6 @@ hflow = "hflow.cli:main"
 [dependency-groups]
 dev = [
     "hflow-server", # the workspace API package, present in dev so the suite tests it
-    # Starlette's TestClient transport for the hflow-server suite. httpx2, not
-    # httpx: starlette 1.6 deprecates the httpx transport in its favour.
-    "httpx2>=2.12.0",
     "obstore>=0.11.1", # the bucket extra, present in dev so the suite tests it
     # the motion extra, present in dev so the suite tests it rather than
     # skipping the one check that cannot be verified any other way

@@ -148,6 +148,11 @@ Airflow. To use your own recording:
 uv run python examples/quickstart.py path/to/episode.mcap
 ```
 
+For the recommended first run on real egocentric footage, follow
+[Evaluate your first egocentric episode](./docs/tutorials/evaluate-an-egocentric-episode.md).
+It runs HFlow's local deterministic quality baseline and two hosted semantic
+checks together, without requiring an account, API key, or model server.
+
 Use `uv run hflow --help` to see the CLI. When you are ready to schedule the
 same pipeline, continue with the [runtime guide](https://github.com/Hebbian-Robotics/hflow/blob/main/docs/RUNTIME.md). Developers
 and contributors should start with [CONTRIBUTING.md](https://github.com/Hebbian-Robotics/hflow/blob/main/CONTRIBUTING.md). Browse

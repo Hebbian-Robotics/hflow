@@ -249,8 +249,8 @@ explicitly (`ep.frames(fps=...)`), calls its own client (hosted or self-run vLLM
 its endpoint, credentials, model, prompt, and aggregation policy. The opt-in
 `hflow.build_ai_vlm_checks.register_hand_visibility` and
 `register_active_manipulation` integrations bundle one published methodology
-on top of the optional OpenAI-compatible client; they still require the caller
-to supply endpoint and model configuration per check. Two helpers survive
+with a per-check execution choice: either a caller-configured OpenAI-compatible
+model or HFlow's fixed hosted check API. Two helpers survive
 because they encode non-obvious value: the **contact sheet** (N timestamped frames composited
 into one image; works even on single-image models, cheap on vision tokens) and frame extraction
 itself. Missing/occluded hand positions -- one of the issue classes Dyna's article names -- is

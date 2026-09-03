@@ -4,9 +4,8 @@ Ingest, quality-check, enrich, and curate robot episode data. See README.md
 for orientation and docs/ARCHITECTURE.md for the design and its references.
 """
 
-from importlib.metadata import PackageNotFoundError, version
-
 from hflow import build_ai_vlm_checks, checks, ffmpeg, providers, testing
+from hflow._version import __version__
 from hflow.app import (
     App,
     CheckOutcome,
@@ -105,11 +104,6 @@ from hflow.storage import (
 )
 from hflow.transform import EpisodeStamps, TransformConfig, write_canonical_episode
 from hflow.workspace import Workspace, WorkspaceIdentity
-
-try:
-    __version__ = version("hflow")
-except PackageNotFoundError:  # running from a source tree without an install
-    __version__ = "0.0.0"
 
 __all__ = [
     "DATASET_SNAPSHOT_FORMAT_NAME",

@@ -2,8 +2,8 @@
 
 The prompts, schemas, response parsing, and HFlow evidence adapter live here
 so an episode pipeline and a corpus evaluation can share one methodology.
-Model execution stays user-configured through any OpenAI-compatible endpoint;
-each registered check owns its endpoint and model independently.
+Execution is selected per registered check: callers can provide an
+OpenAI-compatible model configuration or use HFlow's fixed hosted check API.
 
 Original methodology and released evaluation inputs:
 https://huggingface.co/datasets/builddotai/Egocentric-10K-Evaluation
@@ -25,6 +25,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, assert_never
 from urllib.parse import urlsplit
 
+import httpx2
+
+from hflow._version import __version__
 from hflow.episode import Episode
 from hflow.fingerprints import step_version_from_contract
 from hflow.steps import CheckFunction, CheckResult, MeasurementValue, Observation, StepVersion
@@ -65,6 +68,13 @@ Rules:
 
 BUILD_AI_HAND_VISIBILITY_CHECK_NAME = "build_ai_hand_visibility"
 BUILD_AI_ACTIVE_MANIPULATION_CHECK_NAME = "build_ai_active_manipulation"
+DEFAULT_HFLOW_HOSTED_BASE_URL = "https://api.hflow.dev"
+
+_HFLOW_HOSTED_TRANSPORT_VERSION = 1
+_DEFAULT_HFLOW_HOSTED_CHECK_VERSION = 1
+_MAX_HFLOW_HOSTED_IMAGE_BYTES = 10 * 1024 * 1024
+_MAX_HFLOW_HOSTED_RESPONSE_BYTES = 64 * 1024
+_HFLOW_HOSTED_USER_AGENT = f"hflow/{__version__} (+https://hflow.dev)"
 
 
 class EvaluationTask(StrEnum):
@@ -121,30 +131,23 @@ ACTIVE_MANIPULATION_RESPONSE_SCHEMA: dict[str, object] = {
 
 
 @dataclass(frozen=True)
-class _RegisteredModelCheckConfiguration:
+class OpenAICompatibleExecution:
+    """Run a Build AI check through one caller-selected model endpoint."""
+
     endpoint: str
     model: str
-    task_definition: TaskDefinition
-    api_key_environment_variable: str | None
-    response_format: ResponseFormat
-    temperature: float | None
-    max_tokens: int
-    max_retries: int
-    camera: str | None
-    frame_time_seconds: float
+    api_key_environment_variable: str | None = None
+    response_format: ResponseFormat = ResponseFormat.JSON_SCHEMA
+    temperature: float | None = None
+    max_tokens: int = 32
+    max_retries: int = 5
 
     def __post_init__(self) -> None:
-        if self.endpoint != self.endpoint.strip():
-            raise ValueError("endpoint must not have leading or trailing whitespace")
-        parsed_endpoint = urlsplit(self.endpoint)
-        if parsed_endpoint.scheme not in {"http", "https"} or not parsed_endpoint.netloc:
-            raise ValueError(f"endpoint must be an absolute http(s) URL, got {self.endpoint!r}")
+        _require_absolute_http_url(self.endpoint, name="endpoint")
         if not self.model.strip():
             raise ValueError("model must not be empty")
         if self.model != self.model.strip():
             raise ValueError("model must not have leading or trailing whitespace")
-        if not self.task_definition.prompt.strip():
-            raise ValueError("prompt must not be empty")
         if not isinstance(self.response_format, ResponseFormat):
             raise ValueError("response_format must be an hflow.build_ai_vlm_checks.ResponseFormat")
         if (
@@ -164,12 +167,74 @@ class _RegisteredModelCheckConfiguration:
             raise ValueError("max_retries must not be negative")
         if self.temperature is not None and not math.isfinite(self.temperature):
             raise ValueError("temperature must be finite")
+
+
+@dataclass(frozen=True)
+class HFlowHostedExecution:
+    """Run a fixed, versioned Build AI check through HFlow's hosted API."""
+
+    base_url: str = DEFAULT_HFLOW_HOSTED_BASE_URL
+    check_version: int = _DEFAULT_HFLOW_HOSTED_CHECK_VERSION
+    request_timeout_seconds: float = 60.0
+
+    def __post_init__(self) -> None:
+        _require_absolute_http_url(self.base_url, name="base_url")
+        parsed_base_url = urlsplit(self.base_url)
+        if parsed_base_url.query or parsed_base_url.fragment:
+            raise ValueError("base_url must not contain a query string or fragment")
+        if not isinstance(self.check_version, int) or isinstance(self.check_version, bool):
+            raise ValueError("check_version must be an integer")
+        if self.check_version <= 0:
+            raise ValueError("check_version must be greater than zero")
+        if (
+            isinstance(self.request_timeout_seconds, bool)
+            or not isinstance(self.request_timeout_seconds, int | float)
+            or not math.isfinite(self.request_timeout_seconds)
+            or self.request_timeout_seconds <= 0
+        ):
+            raise ValueError("request_timeout_seconds must be finite and greater than zero")
+
+
+BuildAIExecution = OpenAICompatibleExecution | HFlowHostedExecution
+
+
+@dataclass(frozen=True)
+class _RegisteredBuildAICheckConfiguration:
+    execution: BuildAIExecution
+    task_definition: TaskDefinition
+    published_prompt: str
+    camera: str | None
+    frame_time_seconds: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.execution, OpenAICompatibleExecution | HFlowHostedExecution):
+            raise ValueError(
+                "execution must be an OpenAICompatibleExecution or HFlowHostedExecution"
+            )
+        if not self.task_definition.prompt.strip():
+            raise ValueError("prompt must not be empty")
+        if (
+            isinstance(self.execution, HFlowHostedExecution)
+            and self.task_definition.prompt != self.published_prompt
+        ):
+            raise ValueError(
+                "HFlowHostedExecution uses the hosted check's fixed prompt and does not support "
+                "prompt overrides"
+            )
         if isinstance(self.frame_time_seconds, bool) or not math.isfinite(self.frame_time_seconds):
             raise ValueError("frame_time_seconds must be finite and non-negative")
         if self.frame_time_seconds < 0:
             raise ValueError("frame_time_seconds must be finite and non-negative")
         if self.camera == "":
             raise ValueError("camera must be None or a non-empty topic name")
+
+
+def _require_absolute_http_url(value: str, *, name: str) -> None:
+    if value != value.strip():
+        raise ValueError(f"{name} must not have leading or trailing whitespace")
+    parsed_url = urlsplit(value)
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+        raise ValueError(f"{name} must be an absolute http(s) URL, got {value!r}")
 
 
 def _strip_markdown_code_fence(response_text: str) -> str:
@@ -442,41 +507,200 @@ def evaluate_image_with_model(
     )
 
 
-def _check_version(configuration: _RegisteredModelCheckConfiguration) -> StepVersion:
-    return step_version_from_contract(
-        "build-ai-single-frame-v1",
-        {
-            "task": configuration.task_definition.task.value,
-            "prompt": configuration.task_definition.prompt,
-            "response_schema": configuration.task_definition.response_schema,
-            "endpoint": configuration.endpoint,
-            "model": configuration.model,
-            "response_format": configuration.response_format.value,
-            "temperature": configuration.temperature,
-            "max_tokens": configuration.max_tokens,
-            "camera": configuration.camera,
-            "frame_time_seconds": configuration.frame_time_seconds,
-        },
+def _check_name_for_task(task: EvaluationTask) -> str:
+    match task:
+        case EvaluationTask.HAND_COUNT:
+            return BUILD_AI_HAND_VISIBILITY_CHECK_NAME
+        case EvaluationTask.ACTIVE_MANIPULATION:
+            return BUILD_AI_ACTIVE_MANIPULATION_CHECK_NAME
+        case EvaluationTask.BOTH:
+            raise AssertionError("BOTH is a CLI selection, not an executable task")
+
+
+def _hosted_check_endpoint(execution: HFlowHostedExecution, task: EvaluationTask) -> str:
+    check_name = _check_name_for_task(task)
+    return (
+        f"{execution.base_url.rstrip('/')}/v{_HFLOW_HOSTED_TRANSPORT_VERSION}/checks/"
+        f"{check_name}/versions/{execution.check_version}/evaluate"
     )
 
 
-def _register_model_check(
+def _hosted_execution_label(execution: HFlowHostedExecution, task: EvaluationTask) -> str:
+    return f"hflow-hosted/{_check_name_for_task(task)}@{execution.check_version}"
+
+
+def _hosted_observation_upload(image_bytes: bytes) -> tuple[str, bytes, str]:
+    image_mime_type = _mime_type_for_image(image_bytes)
+    image_extension_by_mime_type = {
+        "image/jpeg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+    }
+    filename = f"observation.{image_extension_by_mime_type[image_mime_type]}"
+    return filename, image_bytes, image_mime_type
+
+
+def _read_bounded_hosted_response(response: httpx2.Response) -> bytes:
+    response_body = bytearray()
+    for response_chunk in response.iter_bytes():
+        if len(response_body) + len(response_chunk) > _MAX_HFLOW_HOSTED_RESPONSE_BYTES:
+            raise RuntimeError("HFlow hosted check response exceeds the 64 KiB limit")
+        response_body.extend(response_chunk)
+    return bytes(response_body)
+
+
+def _parse_hosted_prediction(task: EvaluationTask, value: object) -> int | str:
+    match task:
+        case EvaluationTask.HAND_COUNT:
+            if isinstance(value, bool) or not isinstance(value, int) or value not in {0, 1, 2}:
+                raise RuntimeError(
+                    "HFlow hosted hand-visibility check returned a parsed prediction "
+                    "outside 0, 1, or 2"
+                )
+            return value
+        case EvaluationTask.ACTIVE_MANIPULATION:
+            if not isinstance(value, str) or value not in {"yes", "no"}:
+                raise RuntimeError(
+                    "HFlow hosted active-manipulation check returned a parsed prediction other "
+                    'than "yes" or "no"'
+                )
+            return value
+        case EvaluationTask.BOTH:
+            raise AssertionError("BOTH is a CLI selection, not an executable task")
+
+
+def _parse_hosted_check_response(
+    task: EvaluationTask,
+    response_payload: object,
+) -> VisionModelOutcome:
+    if not isinstance(response_payload, dict):
+        raise RuntimeError("HFlow hosted check returned JSON that is not an object")
+    raw_response = response_payload.get("raw_response")
+    if not isinstance(raw_response, str):
+        raise RuntimeError("HFlow hosted check response is missing string field 'raw_response'")
+    response_metadata = ModelResponseMetadata(response_model=None, usage={})
+    outcome_kind = response_payload.get("outcome")
+    match outcome_kind:
+        case "parsed":
+            predicted_value = _parse_hosted_prediction(task, response_payload.get("prediction"))
+            return ParsedVisionModelOutcome(
+                raw_response=raw_response,
+                response_metadata=response_metadata,
+                predicted_value=predicted_value,
+            )
+        case "unparsed":
+            parse_error = response_payload.get("parse_error")
+            if not isinstance(parse_error, str) or not parse_error:
+                raise RuntimeError(
+                    "HFlow hosted unparsed outcome is missing non-empty string field 'parse_error'"
+                )
+            return UnparsedVisionModelOutcome(
+                raw_response=raw_response,
+                response_metadata=response_metadata,
+                parse_error=parse_error,
+            )
+        case _:
+            raise RuntimeError(
+                "HFlow hosted check response field 'outcome' must be 'parsed' or 'unparsed'"
+            )
+
+
+def _evaluate_image_with_hflow_hosted_service(
+    *,
+    execution: HFlowHostedExecution,
+    task: EvaluationTask,
+    image_bytes: bytes,
+) -> VisionModelOutcome:
+    if len(image_bytes) > _MAX_HFLOW_HOSTED_IMAGE_BYTES:
+        raise ValueError("HFlow hosted check observation exceeds the 10 MiB image limit")
+    endpoint = _hosted_check_endpoint(execution, task)
+    try:
+        with httpx2.stream(
+            "POST",
+            endpoint,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": _HFLOW_HOSTED_USER_AGENT,
+            },
+            files={"observation": _hosted_observation_upload(image_bytes)},
+            timeout=execution.request_timeout_seconds,
+            # An image-bearing API request must never follow a redirect to another origin.
+            follow_redirects=False,
+        ) as response:
+            response.raise_for_status()
+            response_bytes = _read_bounded_hosted_response(response)
+    except httpx2.HTTPStatusError as error:
+        retry_after = error.response.headers.get("Retry-After")
+        retry_after_suffix = f"; retry after {retry_after}" if retry_after else ""
+        raise RuntimeError(
+            f"HFlow hosted check request failed with HTTP "
+            f"{error.response.status_code}{retry_after_suffix}"
+        ) from error
+    except httpx2.RequestError as error:
+        raise RuntimeError(f"HFlow hosted check endpoint is unreachable: {error}") from error
+    try:
+        response_text = response_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise RuntimeError("HFlow hosted check returned invalid UTF-8") from error
+    try:
+        response_payload = json.loads(response_text)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("HFlow hosted check returned malformed JSON") from error
+    return _parse_hosted_check_response(task, response_payload)
+
+
+def _check_version(configuration: _RegisteredBuildAICheckConfiguration) -> StepVersion:
+    version_contract: dict[str, object] = {
+        "task": configuration.task_definition.task.value,
+        "prompt": configuration.task_definition.prompt,
+        "response_schema": configuration.task_definition.response_schema,
+        "camera": configuration.camera,
+        "frame_time_seconds": configuration.frame_time_seconds,
+    }
+    match configuration.execution:
+        case OpenAICompatibleExecution() as execution:
+            # Keep the existing contract shape so migrating to the explicit
+            # execution value does not invalidate otherwise identical results.
+            version_contract.update(
+                {
+                    "endpoint": execution.endpoint,
+                    "model": execution.model,
+                    "response_format": execution.response_format.value,
+                    "temperature": execution.temperature,
+                    "max_tokens": execution.max_tokens,
+                }
+            )
+        case HFlowHostedExecution() as execution:
+            version_contract.update(
+                {
+                    "execution": "hflow-hosted",
+                    "hosted_check_endpoint": _hosted_check_endpoint(
+                        execution, configuration.task_definition.task
+                    ),
+                }
+            )
+        case unexpected_execution:
+            assert_never(unexpected_execution)
+    return step_version_from_contract("build-ai-single-frame-v1", version_contract)
+
+
+def _register_build_ai_check(
     application: App,
     *,
-    check_name: str,
-    configuration: _RegisteredModelCheckConfiguration,
+    configuration: _RegisteredBuildAICheckConfiguration,
 ) -> CheckFunction:
     client_for_thread = threading.local()
 
-    def model_client() -> Any:
+    def model_client(execution: OpenAICompatibleExecution) -> Any:
         api_key = None
-        if configuration.api_key_environment_variable is not None:
-            api_key = os.environ.get(configuration.api_key_environment_variable)
+        if execution.api_key_environment_variable is not None:
+            api_key = os.environ.get(execution.api_key_environment_variable)
             if not api_key:
                 raise ValueError(
-                    f"{configuration.api_key_environment_variable} is required by {check_name}"
+                    f"{execution.api_key_environment_variable} is required by "
+                    f"{_check_name_for_task(configuration.task_definition.task)}"
                 )
-        cache_key = (configuration.endpoint, api_key)
+        cache_key = (execution.endpoint, api_key, execution.max_retries)
         if getattr(client_for_thread, "cache_key", None) != cache_key:
             try:
                 openai_module = importlib.import_module("openai")
@@ -487,8 +711,8 @@ def _register_model_check(
                 ) from error
             client_for_thread.client = openai_module.OpenAI(
                 api_key=api_key or "not-needed",
-                base_url=configuration.endpoint,
-                max_retries=configuration.max_retries,
+                base_url=execution.endpoint,
+                max_retries=execution.max_retries,
             )
             client_for_thread.cache_key = cache_key
         return client_for_thread.client
@@ -506,25 +730,40 @@ def _register_model_check(
                 f"camera {configuration.camera!r}"
             )
         selected_frame = extracted_frames[0]
-        outcome = evaluate_image_with_model(
-            client=model_client(),
-            model=configuration.model,
-            task_definition=configuration.task_definition,
-            image_data_url=image_file_data_url(selected_frame.path),
-            response_format=configuration.response_format,
-            temperature=configuration.temperature,
-            max_tokens=configuration.max_tokens,
-        )
+        image_bytes = selected_frame.path.read_bytes()
+        match configuration.execution:
+            case OpenAICompatibleExecution() as execution:
+                outcome = evaluate_image_with_model(
+                    client=model_client(execution),
+                    model=execution.model,
+                    task_definition=configuration.task_definition,
+                    image_data_url=image_bytes_data_url(image_bytes),
+                    response_format=execution.response_format,
+                    temperature=execution.temperature,
+                    max_tokens=execution.max_tokens,
+                )
+                requested_model = execution.model
+            case HFlowHostedExecution() as execution:
+                outcome = _evaluate_image_with_hflow_hosted_service(
+                    execution=execution,
+                    task=configuration.task_definition.task,
+                    image_bytes=image_bytes,
+                )
+                requested_model = _hosted_execution_label(
+                    execution, configuration.task_definition.task
+                )
+            case unexpected_execution:
+                assert_never(unexpected_execution)
         return model_output_check_result(
             task=configuration.task_definition.task,
-            requested_model=configuration.model,
+            requested_model=requested_model,
             outcome=outcome,
             observation_id=f"frame:{selected_frame.log_time_ns}",
             timestamp_ns=selected_frame.log_time_ns,
         )
 
     return application.check(
-        name=check_name,
+        name=_check_name_for_task(configuration.task_definition.task),
         version=_check_version(configuration),
         requires=("vision-model",),
     )(evaluate_build_ai_check)
@@ -533,34 +772,22 @@ def _register_model_check(
 def register_hand_visibility(
     application: App,
     *,
-    endpoint: str,
-    model: str,
-    api_key_environment_variable: str | None = None,
-    response_format: ResponseFormat = ResponseFormat.JSON_SCHEMA,
-    temperature: float | None = None,
-    max_tokens: int = 32,
-    max_retries: int = 5,
+    execution: BuildAIExecution,
     camera: str | None = None,
     frame_time_seconds: float = 0.0,
     prompt: str = BUILD_AI_HAND_VISIBILITY_PROMPT,
 ) -> CheckFunction:
-    """Register Build AI's hand-visibility methodology on one model endpoint."""
-    return _register_model_check(
+    """Register Build AI's hand-visibility methodology with one execution strategy."""
+    return _register_build_ai_check(
         application,
-        check_name=BUILD_AI_HAND_VISIBILITY_CHECK_NAME,
-        configuration=_RegisteredModelCheckConfiguration(
-            endpoint=endpoint,
-            model=model,
+        configuration=_RegisteredBuildAICheckConfiguration(
+            execution=execution,
             task_definition=TaskDefinition(
                 task=EvaluationTask.HAND_COUNT,
                 prompt=prompt,
                 response_schema=HAND_COUNT_RESPONSE_SCHEMA,
             ),
-            api_key_environment_variable=api_key_environment_variable,
-            response_format=response_format,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            max_retries=max_retries,
+            published_prompt=BUILD_AI_HAND_VISIBILITY_PROMPT,
             camera=camera,
             frame_time_seconds=frame_time_seconds,
         ),
@@ -570,34 +797,22 @@ def register_hand_visibility(
 def register_active_manipulation(
     application: App,
     *,
-    endpoint: str,
-    model: str,
-    api_key_environment_variable: str | None = None,
-    response_format: ResponseFormat = ResponseFormat.JSON_SCHEMA,
-    temperature: float | None = None,
-    max_tokens: int = 32,
-    max_retries: int = 5,
+    execution: BuildAIExecution,
     camera: str | None = None,
     frame_time_seconds: float = 0.0,
     prompt: str = BUILD_AI_ACTIVE_MANIPULATION_PROMPT,
 ) -> CheckFunction:
-    """Register Build AI's active-manipulation methodology on one endpoint."""
-    return _register_model_check(
+    """Register Build AI's active-manipulation methodology with one execution strategy."""
+    return _register_build_ai_check(
         application,
-        check_name=BUILD_AI_ACTIVE_MANIPULATION_CHECK_NAME,
-        configuration=_RegisteredModelCheckConfiguration(
-            endpoint=endpoint,
-            model=model,
+        configuration=_RegisteredBuildAICheckConfiguration(
+            execution=execution,
             task_definition=TaskDefinition(
                 task=EvaluationTask.ACTIVE_MANIPULATION,
                 prompt=prompt,
                 response_schema=ACTIVE_MANIPULATION_RESPONSE_SCHEMA,
             ),
-            api_key_environment_variable=api_key_environment_variable,
-            response_format=response_format,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            max_retries=max_retries,
+            published_prompt=BUILD_AI_ACTIVE_MANIPULATION_PROMPT,
             camera=camera,
             frame_time_seconds=frame_time_seconds,
         ),
