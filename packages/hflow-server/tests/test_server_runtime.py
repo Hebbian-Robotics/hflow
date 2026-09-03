@@ -344,7 +344,15 @@ def test_ingest_rejects_absolute_and_escaping_uris_before_any_runtime(
     data_root = tmp_path / "bare-root"
     data_root.mkdir()
     client = _client_over(data_root, unbuilt_assets_dir)
-    for hostile_uri in ("/etc/passwd", "../../etc/shadow", "sub/../../escape.mcap"):
+    for hostile_uri in (
+        ".",
+        "./",
+        "a/..",
+        "a/b/../..",
+        "/etc/passwd",
+        "../../etc/shadow",
+        "sub/../../escape.mcap",
+    ):
         response = client.post(
             "/api/v1/runtime/ingest",
             json={"uris": [hostile_uri], "profile": "full", "mode": "batch"},

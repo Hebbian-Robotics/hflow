@@ -376,6 +376,10 @@ def test_ingest_refuses_a_batch_count_the_run_could_not_honour(stub_server: str)
     "uri",
     [
         "   ",
+        ".",
+        "./",
+        "a/..",
+        "a/b/../..",
         "/etc/passwd",
         "../outside.mcap",
         r"\episodes-in\a.mcap",

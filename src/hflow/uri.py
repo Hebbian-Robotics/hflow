@@ -30,7 +30,7 @@ def parse_data_root_relative_uri(uri: str) -> DataRootRelativeUri:
 
     # Preserve the candidate itself; normalize only this containment check.
     normalized = normpath(candidate)
-    if normalized == ".." or normalized.startswith("../"):
+    if normalized == "." or normalized == ".." or normalized.startswith("../"):
         raise ValueError(f"{candidate!r} is not relative to the data root")
 
     return DataRootRelativeUri(candidate)

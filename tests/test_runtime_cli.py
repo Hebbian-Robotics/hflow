@@ -916,7 +916,7 @@ def test_ingest_rejects_unknown_profile(pipeline_file: Path, tmp_path: Path) -> 
     assert exit_info.value.code == 2
 
 
-@pytest.mark.parametrize("uri", ["/abs/x.mcap", "../x.mcap"])
+@pytest.mark.parametrize("uri", [".", "./", "a/..", "a/b/../..", "/abs/x.mcap", "../x.mcap"])
 def test_ingest_rejects_uris_outside_data_root(
     uri: str,
     pipeline_file: Path,
