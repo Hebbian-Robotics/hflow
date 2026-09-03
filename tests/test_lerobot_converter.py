@@ -7,18 +7,19 @@ implementation details or touching the network.
 
 import io
 import json
+import re
 import shutil
 import subprocess
 import urllib.request
 from pathlib import Path
-from typing import cast
 
 import pytest
+from mcap.reader import make_reader
 
 import hflow.importers.lerobot as prep
 from hflow.cli import main as cli_main
 
-_DERIVE = prep._derive_numeric_schema
+_PARSE = prep._parse_dataset_information
 _ENCODE = prep._encode_cdr_float32_array
 
 _FFMPEG = shutil.which("ffmpeg")
@@ -32,9 +33,8 @@ _requires_system_ffmpeg = pytest.mark.skipif(
 )
 
 
-def _build_fake_corpus(tmp_path: Path) -> dict:
-    """Synthetic v3 metadata: 4 episodes, 2 cameras, 6-dim state/action."""
-    info = {
+def _valid_info() -> dict:
+    return {
         "fps": 30,
         "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
         "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
@@ -47,6 +47,11 @@ def _build_fake_corpus(tmp_path: Path) -> dict:
         },
         "robot_type": "so101",
     }
+
+
+def _build_fake_corpus(tmp_path: Path) -> dict:
+    """Synthetic v3 metadata: 4 episodes, 2 cameras, 6-dim state/action."""
+    info = _valid_info()
     (tmp_path / "meta").mkdir(parents=True, exist_ok=True)
     (tmp_path / "meta" / "info.json").write_text(json.dumps(info))
 
@@ -145,32 +150,80 @@ def _build_fake_corpus(tmp_path: Path) -> dict:
     }
 
 
-def test_derive_numeric_schema_float32_vector() -> None:
-    schema = _DERIVE("observation.state", {"dtype": "float32", "shape": [6]})
-    assert schema.name == "observation.state"
-    assert schema.dim == 6
+def test_parse_dataset_information_returns_typed_supported_metadata() -> None:
+    info = _valid_info()
+    info["unknown_top_level"] = {"future": True}
+    info["features"]["action"]["unused_upstream_field"] = "ignored"
+
+    parsed = _PARSE(info)
+
+    assert parsed.fps == 30
+    assert parsed.data_path_template == info["data_path"]
+    assert parsed.video_path_template == info["video_path"]
+    assert parsed.robot_type == "so101"
+    assert parsed.video_feature_names == (
+        "observation.images.side",
+        "observation.images.up",
+    )
+    assert {feature.feature_name: feature.dimension for feature in parsed.numeric_features} == {
+        "action": 6,
+        "observation.state": 6,
+    }
+    assert isinstance(parsed.numeric_features, tuple)
 
 
-def test_derive_numeric_schema_rejects_unsupported() -> None:
-    with pytest.raises(ValueError, match="unsupported feature"):
-        _DERIVE("action", {"dtype": "float64", "shape": [6]})
-    with pytest.raises(ValueError, match="unsupported feature"):
-        _DERIVE("observation.state", {"dtype": "float32", "shape": [2, 3]})
-    with pytest.raises(ValueError, match="unsupported feature"):
-        _DERIVE("observation.state", {"dtype": "float32", "shape": []})
-    for shape in ([True], [False]):
-        with pytest.raises(
-            ValueError,
-            match=rf"unsupported feature action: dtype=float32, shape=\[{shape[0]}\]",
-        ):
-            _DERIVE("action", {"dtype": "float32", "shape": shape})
+@pytest.mark.parametrize("shape", [[2, 3], [], [True], [False]])
+def test_parse_dataset_information_rejects_unsupported_numeric_shape(shape: list[object]) -> None:
+    info = _valid_info()
+    info["features"]["action"]["shape"] = shape
+
+    with pytest.raises(
+        ValueError,
+        match=rf"unsupported feature action: dtype=float32, shape={re.escape(str(shape))}",
+    ):
+        _PARSE(info)
 
 
-def test_import_rejects_required_boolean_dimension_without_dataset_output(
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("data_path", "", "non-empty data_path"),
+        ("data_path", None, "non-empty data_path"),
+        ("video_path", "", "non-empty video_path"),
+        ("video_path", 3, "non-empty video_path"),
+        ("robot_type", 3, "robot_type must be a string or null"),
+    ],
+)
+def test_parse_dataset_information_rejects_invalid_supported_fields(
+    field: str, value: object, message: str
+) -> None:
+    info = _valid_info()
+    info[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        _PARSE(info)
+
+
+def test_parse_dataset_information_accepts_null_robot_type_and_default_video_path() -> None:
+    info = _valid_info()
+    info["robot_type"] = None
+    info.pop("video_path")
+
+    parsed = _PARSE(info)
+
+    assert parsed.robot_type is None
+    assert parsed.video_path_template == (
+        "videos/{camera_key}/{chunk_index:06d}/{file_index:06d}.mp4"
+    )
+
+
+def test_import_rejects_required_unsupported_dtype_without_dataset_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     output_dir = tmp_path / "out"
     dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
+    info = _valid_info()
+    info["features"]["action"]["dtype"] = "float64"
     monkeypatch.setattr(
         prep,
         "_hf_repo_info",
@@ -179,22 +232,23 @@ def test_import_rejects_required_boolean_dimension_without_dataset_output(
     monkeypatch.setattr(
         prep,
         "_ensure_source_archive",
-        lambda source, cache_dir: {
-            "numeric_features": {
-                "action": {"dtype": "float32", "shape": [True]},
-                "observation.state": {"dtype": "float32", "shape": [6]},
-            },
-            "video_keys": [prep.DEFAULT_CAMERA_KEY],
-            "episodes": [],
-            "dataset": dataset_source,
-        },
+        lambda source, cache_dir: prep._SourceArchive(
+            dataset_information=_PARSE(info),
+            episodes=(),
+            cache_dir=cache_dir,
+            dataset=dataset_source,
+        ),
     )
 
     with pytest.raises(
         ValueError,
-        match=r"unsupported feature action: dtype=float32, shape=\[True\]",
+        match=r"missing supported required features: action",
     ):
-        prep.import_lerobot_dataset(dataset_repo="fake/repo", output_dir=output_dir)
+        prep.import_lerobot_dataset(
+            dataset_repo="fake/repo",
+            output_dir=output_dir,
+            camera_keys="observation.images.up",
+        )
 
     assert not (output_dir / "landing").exists()
     assert not (output_dir / "prepared-manifest.json").exists()
@@ -247,54 +301,66 @@ def test_index_discovery_multi_camera_metadata(
 
     ds = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
     found = prep._ensure_source_archive(ds, tmp_path)
-    assert len(found["episodes"]) == 4
-    assert found["episodes"][0]["length"] == 60
-    assert found["episodes"][1]["length"] == 65
-    assert found["episodes"][0]["data_from"] == 0
-    assert found["episodes"][0]["data_to"] == 60
-    assert set(found["video_keys"]) == {"observation.images.up", "observation.images.side"}
-    assert found["episodes"][0]["video_windows"]["observation.images.up"][
-        "to_timestamp"
+    assert len(found.episodes) == 4
+    assert found.episodes[0].length == 60
+    assert found.episodes[1].length == 65
+    assert found.episodes[0].data_from == 0
+    assert found.episodes[0].data_to == 60
+    assert set(found.dataset_information.video_feature_names) == {
+        "observation.images.up",
+        "observation.images.side",
+    }
+    assert isinstance(found.episodes, tuple)
+    assert isinstance(found.episodes[0].video_windows, tuple)
+    assert {window.camera_key: window.to_timestamp for window in found.episodes[0].video_windows}[
+        "observation.images.up"
     ] == pytest.approx(2.0)
 
 
+@pytest.mark.parametrize(
+    ("robot_type", "expected_embodiment"),
+    [("so101", "so101"), (None, "unknown")],
+)
 def test_video_cache_distinguishes_file_indices_and_reuses_same_source(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    robot_type: str | None,
+    expected_embodiment: str,
 ) -> None:
     corpus = _build_fake_corpus(tmp_path)
+    corpus["info"]["robot_type"] = robot_type
     camera_key = "observation.images.up"
     dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
 
-    def episode_row(episode_index: int, video_file_index: int) -> dict:
-        return {
-            "episode_index": episode_index,
-            "task": f"task-{episode_index}",
-            "length": 1,
-            "data_chunk": "000",
-            "data_file": "000",
-            "data_from": 0,
-            "data_to": 1,
-            "video_windows": {
-                camera_key: {
-                    "chunk_index": "000",
-                    "file_index": f"{video_file_index:03d}",
-                    "from_timestamp": 0.0,
-                    "to_timestamp": 0.0,
-                }
-            },
-        }
+    def episode_row(episode_index: int, video_file_index: int) -> prep._EpisodeRow:
+        return prep._EpisodeRow(
+            episode_index=episode_index,
+            task=f"task-{episode_index}",
+            length=1,
+            data_chunk="000",
+            data_file="000",
+            data_from=0,
+            data_to=1,
+            video_windows=(
+                prep._VideoWindow(
+                    camera_key=camera_key,
+                    chunk_index="000",
+                    file_index=f"{video_file_index:03d}",
+                    from_timestamp=0.0,
+                    to_timestamp=0.0,
+                ),
+            ),
+        )
 
-    source_archive = cast(
-        prep._SourceArchive,
-        {
-            **corpus,
-            "episodes": [episode_row(0, 0), episode_row(1, 1)],
-            "video_keys": [camera_key],
-        },
+    source_archive = prep._SourceArchive(
+        dataset_information=_PARSE(corpus["info"]),
+        episodes=(episode_row(0, 0), episode_row(1, 1)),
+        cache_dir=tmp_path,
+        dataset=dataset_source,
     )
-    numeric_schemas = {
-        "observation.state": prep._NumericSchema(name="observation.state", dim=6),
-        "action": prep._NumericSchema(name="action", dim=6),
+    numeric_features = {
+        feature.feature_name: feature
+        for feature in source_archive.dataset_information.numeric_features
     }
     video_downloaded_urls: set[str] = set()
     cache_path_by_url: dict[str, Path] = {}
@@ -332,7 +398,7 @@ def test_video_cache_distinguishes_file_indices_and_reuses_same_source(
             output_dir=tmp_path / "output",
             episode_index=episode_index,
             camera_keys=(camera_key,),
-            numeric_schemas=numeric_schemas,
+            numeric_features=numeric_features,
             frames_per_second=30,
         )
 
@@ -348,6 +414,26 @@ def test_video_cache_distinguishes_file_indices_and_reuses_same_source(
         video_urls[0].encode(),
     ]
     assert cache_path_by_url[video_urls[0]] != cache_path_by_url[video_urls[1]]
+
+    output_path = tmp_path / "output" / "landing" / "lerobot_episode_0001.mcap"
+    with output_path.open("rb") as stream:
+        reader = make_reader(stream, validate_crcs=True)
+        summary = reader.get_summary()
+        metadata_records = {record.name: record.metadata for record in reader.iter_metadata()}
+    assert summary is not None
+    schemas_by_name = {schema.name: schema.data for schema in summary.schemas.values()}
+    assert schemas_by_name["lerobot_msgs/msg/State"] == b"float32[6] position"
+    assert schemas_by_name["lerobot_msgs/msg/Action"] == b"float32[6] action"
+    assert metadata_records["episode/v1"] == {
+        "task": "task-0",
+        "operator": "lerobot_converter",
+        "success": "true",
+        "embodiment": expected_embodiment,
+        "source_dataset": "fake/repo",
+        "source_revision": "abc",
+        "source_episode_index": "0",
+        "converter_version": prep.CONVERTER_VERSION,
+    }
 
 
 def test_camera_selection_validates_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -413,26 +499,32 @@ def test_import_namespaces_source_cache_by_resolved_revision(
         lambda repo, revision: {"sha": resolved_shas[revision], "license": "apache-2.0"},
     )
 
-    def fake_ensure_source_archive(dataset_source: prep.DatasetSource, cache_dir: Path) -> dict:
+    def fake_ensure_source_archive(
+        dataset_source: prep.DatasetSource, cache_dir: Path
+    ) -> prep._SourceArchive:
         cache_dir.mkdir(parents=True, exist_ok=True)
         source_marker = cache_dir / "source-marker.txt"
         if not source_marker.exists():
             source_marker.write_text(dataset_source.revision)
         cache_observations.append((dataset_source.revision, cache_dir, source_marker.read_text()))
-        return {
-            "info": {},
-            "fps": 30,
-            "data_path": "data/{chunk_index}/{file_index}.parquet",
-            "video_path": "videos/{camera_key}/{chunk_index}/{file_index}.mp4",
-            "episodes": [],
-            "video_keys": [prep.DEFAULT_CAMERA_KEY],
-            "numeric_features": {
-                "action": {"dtype": "float32", "shape": [1]},
-                "observation.state": {"dtype": "float32", "shape": [1]},
-            },
-            "cache_dir": cache_dir,
-            "dataset": dataset_source,
-        }
+        return prep._SourceArchive(
+            dataset_information=_PARSE(
+                {
+                    "fps": 30,
+                    "data_path": "data/{chunk_index}/{file_index}.parquet",
+                    "video_path": "videos/{camera_key}/{chunk_index}/{file_index}.mp4",
+                    "features": {
+                        "action": {"dtype": "float32", "shape": [1]},
+                        "observation.state": {"dtype": "float32", "shape": [1]},
+                        prep.DEFAULT_CAMERA_KEY: {"dtype": "video"},
+                    },
+                    "robot_type": "so101",
+                }
+            ),
+            episodes=(),
+            cache_dir=cache_dir,
+            dataset=dataset_source,
+        )
 
     monkeypatch.setattr(prep, "_ensure_source_archive", fake_ensure_source_archive)
 
@@ -450,6 +542,17 @@ def test_import_namespaces_source_cache_by_resolved_revision(
         sha_a,
         sha_b,
     ]
+    assert json.loads((tmp_path / "prepared-manifest.json").read_text()) == {
+        "schema_version": 2,
+        "dataset": {
+            "repo_id": "fake/repo",
+            "revision": sha_a,
+            "license": "apache-2.0",
+        },
+        "camera_keys": [prep.DEFAULT_CAMERA_KEY],
+        "episodes_converted": 0,
+        "converter_version": prep.CONVERTER_VERSION,
+    }
 
 
 @pytest.mark.parametrize("resolved_sha", ["../../evil", "/tmp/probe-328-absolute"])
@@ -711,6 +814,26 @@ def test_fetch_info_json_malformed_json_raises_contextual_value_error(
     assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
 
 
+def test_fetch_info_json_caches_original_json_document(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    info = _valid_info()
+    info["unknown_top_level"] = {"preserve": [1, True, None]}
+    tree_body = json.dumps([{"path": "meta/info.json", "type": "file"}]).encode()
+    _stub_urlopen(
+        monkeypatch,
+        {
+            "recursive=true": tree_body,
+            "meta/info.json": json.dumps(info).encode(),
+        },
+    )
+
+    fetched = prep._fetch_info_json("lerobot/pusht", "main", tmp_path)
+
+    assert fetched == info
+    assert json.loads((tmp_path / "meta" / "info.json").read_text()) == info
+
+
 def test_hf_repo_info_valid_json_still_resolves(monkeypatch: pytest.MonkeyPatch) -> None:
     # A real resolved commit sha: at least the 7 hex characters the sha
     # validation requires, since a cache directory is named after it.
@@ -889,6 +1012,28 @@ def test_info_json_refuses_non_finite_or_non_positive_fps(
     assert not cache_dir.exists() or not (cache_dir / "meta" / "episodes").exists()
 
 
+def test_info_json_refuses_unsupported_numeric_shape_before_episode_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    info = _valid_info()
+    info["features"]["action"]["shape"] = [True]
+    monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: info)
+
+    def fail_tree(repo: str, rev: str, path: str) -> list[dict]:
+        raise AssertionError("episode metadata discovery must not run after invalid shape")
+
+    monkeypatch.setattr(prep, "_hf_tree", fail_tree)
+
+    dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
+    cache_dir = tmp_path / "cache"
+    with pytest.raises(
+        ValueError, match=r"unsupported feature action: dtype=float32, shape=\[True\]"
+    ):
+        prep._ensure_source_archive(dataset_source, cache_dir)
+
+    assert not cache_dir.exists() or not (cache_dir / "meta" / "episodes").exists()
+
+
 def test_info_json_accepts_normal_positive_fps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -921,4 +1066,4 @@ def test_info_json_accepts_normal_positive_fps(
 
     dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
     source_archive = prep._ensure_source_archive(dataset_source, tmp_path / "cache")
-    assert source_archive["fps"] == 30
+    assert source_archive.dataset_information.fps == 30
