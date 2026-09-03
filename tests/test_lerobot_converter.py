@@ -393,7 +393,18 @@ def test_camera_selection_validates_keys(tmp_path: Path, monkeypatch: pytest.Mon
 def test_import_namespaces_source_cache_by_resolved_revision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    resolved_shas = {"branch-a": "sha-a", "branch-b": "sha-b", "tag-a": "sha-a"}
+    # Realistic valid shas the production validator at
+    # src/hflow/importers/lerobot.py would accept: 40-character hexadecimal,
+    # visibly distinct at the start so a reader can tell them apart at a
+    # glance. ``branch-a`` and ``tag-a`` resolve to the same sha on purpose:
+    # they are the two-revisions-one-cache leg of the contract.
+    sha_a = "a1b2c3d4e5f60718293a4b5c6d7e8f9001020304"
+    sha_b = "f0e1d2c3b4a5968778695a4b3c2d1e0f00112233"
+    resolved_shas = {
+        "branch-a": sha_a,
+        "branch-b": sha_b,
+        "tag-a": sha_a,
+    }
     cache_observations: list[tuple[str, Path, str]] = []
 
     monkeypatch.setattr(
@@ -431,13 +442,13 @@ def test_import_namespaces_source_cache_by_resolved_revision(
         )
 
     assert cache_observations == [
-        ("sha-a", tmp_path / "_lerobot_cache" / "sha-a", "sha-a"),
-        ("sha-b", tmp_path / "_lerobot_cache" / "sha-b", "sha-b"),
-        ("sha-a", tmp_path / "_lerobot_cache" / "sha-a", "sha-a"),
+        (sha_a, tmp_path / "_lerobot_cache" / sha_a, sha_a),
+        (sha_b, tmp_path / "_lerobot_cache" / sha_b, sha_b),
+        (sha_a, tmp_path / "_lerobot_cache" / sha_a, sha_a),
     ]
     assert sorted(path.name for path in (tmp_path / "_lerobot_cache").iterdir()) == [
-        "sha-a",
-        "sha-b",
+        sha_a,
+        sha_b,
     ]
 
 
