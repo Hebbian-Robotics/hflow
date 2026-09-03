@@ -395,10 +395,14 @@ def create_runtime_router(settings: ServerSettings, resolver: RuntimeResolver) -
                     recent_runs = runtime.client.dag_runs(
                         stage_dag_id, limit=_RECENT_STAGE_RUN_LIMIT, order_by="-id"
                     )
-                except AirflowClientError:
-                    # A stage sub-DAG that has not registered (or errored) is
-                    # an empty strip, not a failed page.
-                    recent_runs = []
+                except AirflowClientError as error:
+                    # A stage sub-DAG that has not registered is an empty
+                    # strip; other upstream failures use the route's shared
+                    # browser-safe 502 response.
+                    if error.status == 404:
+                        recent_runs = []
+                    else:
+                        raise airflow_failure_refusal(error, source=runtime.source) from error
                 stages.append(
                     StageRecentRuns(
                         stage=stage_name,

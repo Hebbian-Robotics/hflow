@@ -59,6 +59,7 @@ from hflow_server._contract import (
     RunGraphResponse,
     RunGraphStage,
     RunTaskInstance,
+    RuntimeSource,
     StageRunMatch,
 )
 from hflow_server._pipeline import PipelineLoaded, PipelineState, registered_steps_by_stage
@@ -440,16 +441,18 @@ def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver
     router = APIRouter(prefix="/api/v1")
 
     def stage_task_instances(
-        client: AirflowClient, dag_id: str, dag_run_id: str
+        client: AirflowClient, dag_id: str, dag_run_id: str, *, source: RuntimeSource
     ) -> list[AirflowTaskInstance]:
         try:
             return client.task_instances(dag_id, dag_run_id)
-        except AirflowClientError:
+        except AirflowClientError as error:
             # A stage sub-DAG that vanished (or a run Airflow expired) leaves
             # that lane without task detail; the master's own state -- the
             # page's point -- is already in hand, so this is a thinner
             # drawing, not a failed request.
-            return []
+            if error.status == 404:
+                return []
+            raise airflow_failure_refusal(error, source=source) from error
 
     @router.get("/pipeline/graph")
     def read_pipeline_graph() -> PipelineGraphResponse:
@@ -514,10 +517,13 @@ def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver
                 stage_runs = runtime.client.dag_runs(
                     stage_dag_id, limit=_STAGE_RUN_SEARCH_LIMIT, order_by="-id"
                 )
-            except AirflowClientError:
+            except AirflowClientError as error:
                 # An unregistered stage sub-DAG (a partial profile, or a
                 # bundle mid-render) is a stage that never ran here.
-                stage_runs = []
+                if error.status == 404:
+                    stage_runs = []
+                else:
+                    raise airflow_failure_refusal(error, source=runtime.source) from error
             matched = _matched_stage_run(stage_runs, master_window)
             if matched is None:
                 stages.append(_empty_stage_graph(stage_topology))
@@ -525,7 +531,9 @@ def create_graph_router(pipeline_state: PipelineState, resolver: RuntimeResolver
             stage_run_id = matched.run.dag_run_id
             stage_tasks = (
                 _sorted_task_instances(
-                    stage_task_instances(runtime.client, stage_dag_id, stage_run_id),
+                    stage_task_instances(
+                        runtime.client, stage_dag_id, stage_run_id, source=runtime.source
+                    ),
                     stage_topology.dag,
                 )
                 if stage_run_id is not None

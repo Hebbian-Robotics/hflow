@@ -467,6 +467,84 @@ def test_run_graph_tolerates_unregistered_stage_sub_dags(
     assert all(stage["dag_run_id"] is None for stage in payload["stages"])
 
 
+def test_run_graph_tolerates_missing_task_detail_for_a_matched_stage_run(
+    bundle_api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stubbed_airflow(
+        monkeypatch,
+        master_run={
+            "dag_run_id": MASTER_RUN_ID,
+            "state": "success",
+            "start_date": MASTER_STARTED_AT,
+        },
+        stage_runs={
+            "demo_pipeline_sync": [
+                {
+                    "dag_run_id": "sync__expired_tasks",
+                    "state": "success",
+                    "start_date": "2026-08-21T10:00:05+00:00",
+                }
+            ]
+        },
+        task_instances={},
+    )
+
+    def task_instances_with_expired_stage_run(
+        self: AirflowClient, dag_id: str, dag_run_id: str
+    ) -> list[AirflowTaskInstance]:
+        if dag_id == "demo_pipeline_sync":
+            raise AirflowClientError(
+                f"GET /dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances failed with HTTP 404",
+                status=404,
+            )
+        return []
+
+    monkeypatch.setattr(AirflowClient, "task_instances", task_instances_with_expired_stage_run)
+    response = bundle_api.get(f"/api/v1/runtime/runs/{MASTER_RUN_ID}/graph")
+    assert response.status_code == 200
+    sync_stage = next(stage for stage in response.json()["stages"] if stage["stage"] == "sync")
+    assert sync_stage["dag_run_id"] == "sync__expired_tasks"
+    assert sync_stage["state"] == "success"
+    assert sync_stage["match"] == "heuristic"
+    assert sync_stage["tasks"] == []
+    assert sync_stage["mapped_summary"] is None
+
+
+def test_run_graph_stage_task_failure_without_status_maps_to_502(
+    bundle_api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stubbed_airflow(
+        monkeypatch,
+        master_run={
+            "dag_run_id": MASTER_RUN_ID,
+            "state": "running",
+            "start_date": MASTER_STARTED_AT,
+        },
+        stage_runs={
+            "demo_pipeline_sync": [
+                {
+                    "dag_run_id": "sync__running",
+                    "state": "running",
+                    "start_date": "2026-08-21T10:00:05+00:00",
+                }
+            ]
+        },
+        task_instances={},
+    )
+
+    def failing_stage_tasks(
+        self: AirflowClient, dag_id: str, dag_run_id: str
+    ) -> list[AirflowTaskInstance]:
+        if dag_id == "demo_pipeline_sync":
+            raise AirflowClientError("stage task-instance request lost its connection")
+        return []
+
+    monkeypatch.setattr(AirflowClient, "task_instances", failing_stage_tasks)
+    response = bundle_api.get(f"/api/v1/runtime/runs/{MASTER_RUN_ID}/graph")
+    assert response.status_code == 502
+    assert "stage task-instance request lost its connection" in response.json()["detail"]
+
+
 def test_run_graph_unknown_run_is_a_404(
     bundle_api: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -516,6 +594,48 @@ def test_run_graph_remote_failure_does_not_leak_the_base_url(
     response = _client_over(data_root, unbuilt_assets_dir).get("/api/v1/runtime/runs/x/graph")
     assert response.status_code == 502
     assert "airflow.internal.corp" not in response.text
+
+
+def test_run_graph_remote_stage_listing_failure_is_a_sanitized_502(
+    runtime_free_cwd: Path,
+    tmp_path: Path,
+    unbuilt_assets_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HFLOW_AIRFLOW_URL", "https://airflow.internal.corp:8443")
+    monkeypatch.setenv("HFLOW_AIRFLOW_DAG_ID", "kitchen_ingest")
+    monkeypatch.setenv("HFLOW_AIRFLOW_TOKEN", "minted-token")
+    monkeypatch.setattr(
+        AirflowClient,
+        "dag_run",
+        lambda self, dag_id, dag_run_id: _dag_run(
+            {
+                "dag_run_id": dag_run_id,
+                "state": "running",
+                "start_date": MASTER_STARTED_AT,
+            }
+        ),
+    )
+    monkeypatch.setattr(AirflowClient, "task_instances", lambda self, dag_id, dag_run_id: [])
+
+    def failing_stage_runs(
+        self: AirflowClient, dag_id: str, *, limit: int = 100, order_by: str | None = None
+    ) -> list[AirflowDagRun]:
+        raise AirflowClientError(
+            "GET https://airflow.internal.corp:8443/api/v2/dags/"
+            f"{dag_id}/dagRuns failed with HTTP 503: minted-token Traceback: upstream failed",
+            status=503,
+        )
+
+    monkeypatch.setattr(AirflowClient, "dag_runs", failing_stage_runs)
+    data_root = tmp_path / "bare-root"
+    data_root.mkdir()
+    response = _client_over(data_root, unbuilt_assets_dir).get("/api/v1/runtime/runs/r1/graph")
+    assert response.status_code == 502
+    assert "status 503" in response.json()["detail"]
+    assert "airflow.internal.corp" not in response.text
+    assert "minted-token" not in response.text
+    assert "Traceback" not in response.text
 
 
 def test_run_graph_over_a_remote_runtime_derives_the_stage_dag_ids(
