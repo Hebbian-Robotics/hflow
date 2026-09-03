@@ -167,14 +167,14 @@ one report each in argument order; its aggregate result follows the
 [exit code rules](#exit-codes). It validates the container, summary, indexes,
 stamps, chunk purity (against the file's own group map, or a video-versus-state
 approximation when it has none), per-topic time order, per-group chunk time
-order, and the H.264 access-unit properties listed below. It classifies
-H.264 picture coding types to detect
-B-frames as the `video-b-picture` error finding. A payload whose slice headers cannot be
-parsed still cannot be classified and is reported as
-`video-invalid-slice-header`. The doctor also does not reject non-VCL NAL units before the first
-AUD, so a clean report does not prove the canonical AUD-first constraint. An
-unreadable or unparseable path is reported in place, in the same per-file shape
-(`[error] unreadable: ...`), and the run continues with the remaining files.
+order, and the H.264 access-unit properties listed below. It classifies H.264
+picture coding types to detect B-frames as the `video-b-picture` error finding.
+A payload whose slice headers cannot be parsed still cannot be classified, and
+is reported as `video-invalid-slice-header` instead. The doctor does not reject
+non-VCL NAL units before the first AUD, so a clean report does not prove the
+canonical AUD-first constraint. An unreadable or unparseable path is reported
+in place, in the same per-file shape (`[error] unreadable: ...`), and the run
+continues with the remaining files.
 
 ### Doctor finding codes
 
