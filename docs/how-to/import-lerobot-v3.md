@@ -33,6 +33,24 @@ Re-running against the same output directory reuses downloaded source files.
 Run `uv run hflow doctor ./data/lerobot_pusht/landing/*.mcap` to print the
 canonical-format report.
 
+Object-store data roots work the same way when the optional bucket backend is
+installed (`uv sync --extra bucket`) and provider credentials are available:
+
+```bash
+uv run hflow import lerobot \
+  --repo lerobot/pusht \
+  --revision main \
+  --camera observation.image \
+  --episode-index 0 \
+  --output-dir gs://robot-data/production
+```
+
+Durable outputs land as `landing/*.mcap` and `prepared-manifest.json` under
+that prefix. Hugging Face downloads stay in the local mirror under
+`_lerobot_cache/` (`HFLOW_MIRROR_DIR`, or `$XDG_CACHE_HOME/hflow/mirrors`) and
+are never uploaded into the bucket. The success manifest is published only
+after every selected episode object has been written.
+
 For a gated or private repository, export a read token as `HF_TOKEN` (or
 `HUGGING_FACE_HUB_TOKEN`) before running the command. HFlow sends the token
 only to Hugging Face requests and never records it in an episode or manifest.
@@ -92,8 +110,9 @@ episodes = hflow.import_lerobot_dataset(
 )
 ```
 
-The return value is the list of canonical MCAP paths written under
-`output_dir / "landing"`.
+The return value is the list of published episode URIs under
+`landing/` -- absolute path strings for a local data root, or `s3://` /
+`gs://` / `az://` object URIs for a bucket root.
 
 This command imports source data into HFlow. It does not upload data, train a
 policy, or export a curated HFlow manifest back to LeRobot Dataset v3.

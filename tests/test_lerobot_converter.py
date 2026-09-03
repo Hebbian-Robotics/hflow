@@ -17,6 +17,7 @@ import pytest
 
 import hflow.importers.lerobot as prep
 from hflow.cli import main as cli_main
+from hflow.storage import LocalStorageRoot, StorageRoot
 
 _DERIVE = prep._derive_numeric_schema
 _ENCODE = prep._encode_cdr_float32_array
@@ -329,7 +330,7 @@ def test_video_cache_distinguishes_file_indices_and_reuses_same_source(
         prep._convert_single_episode(
             source_archive=source_archive,
             dataset_source=dataset_source,
-            output_dir=tmp_path / "output",
+            storage=LocalStorageRoot(tmp_path / "output"),
             episode_index=episode_index,
             camera_keys=(camera_key,),
             numeric_schemas=numeric_schemas,
@@ -911,3 +912,180 @@ def test_info_json_accepts_normal_positive_fps(
     dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
     source_archive = prep._ensure_source_archive(dataset_source, tmp_path / "cache")
     assert source_archive["fps"] == 30
+
+
+def _stub_single_episode_source_archive(
+    dataset_source: prep.DatasetSource, cache_dir: Path
+) -> dict:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        "info": {"robot_type": "pusht"},
+        "fps": 30,
+        "data_path": "data/{chunk_index}/{file_index}.parquet",
+        "video_path": "videos/{camera_key}/{chunk_index}/{file_index}.mp4",
+        "episodes": [
+            {
+                "episode_index": 0,
+                "task": "push",
+                "length": 1,
+                "data_chunk": "000",
+                "data_file": "000",
+                "data_from": 0,
+                "data_to": 1,
+            }
+        ],
+        "video_keys": [prep.DEFAULT_CAMERA_KEY],
+        "numeric_features": {
+            "action": {"dtype": "float32", "shape": [1]},
+            "observation.state": {"dtype": "float32", "shape": [1]},
+        },
+        "cache_dir": cache_dir,
+        "dataset": dataset_source,
+    }
+
+
+def _install_publish_through_convert(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[str]:
+    """Exercise StorageRoot.publish without running the video converter."""
+
+    published_keys: list[str] = []
+
+    def fake_convert(
+        *,
+        source_archive: object,
+        dataset_source: object,
+        storage: StorageRoot,
+        episode_index: int,
+        camera_keys: object,
+        numeric_schemas: object,
+        frames_per_second: object,
+    ) -> str:
+        del source_archive, dataset_source, camera_keys, numeric_schemas, frames_per_second
+        relative_key = f"landing/lerobot_episode_{episode_index + 1:04d}.mcap"
+        staged = tmp_path / f"staged-{episode_index}.mcap"
+        staged.write_bytes(f"episode-{episode_index}".encode())
+        published_keys.append(relative_key)
+        return storage.publish(staged, relative_key)
+
+    monkeypatch.setattr(prep, "_convert_single_episode", fake_convert)
+    return published_keys
+
+
+def test_import_returns_local_uris_and_keeps_cache_beside_landing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_dir = tmp_path / "out"
+    monkeypatch.setattr(
+        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
+    )
+    monkeypatch.setattr(prep, "_ensure_source_archive", _stub_single_episode_source_archive)
+    _install_publish_through_convert(monkeypatch, tmp_path)
+
+    episode_uris = prep.import_lerobot_dataset(
+        dataset_repo="fake/repo",
+        revision="main",
+        output_dir=output_dir,
+        episode_index=0,
+    )
+
+    assert episode_uris == [str((output_dir / "landing" / "lerobot_episode_0001.mcap").resolve())]
+    assert Path(episode_uris[0]).is_file()
+    assert (output_dir / "prepared-manifest.json").is_file()
+    assert (output_dir / "_lerobot_cache" / "abc").is_dir()
+
+
+def test_import_publishes_into_a_bucket_data_root_without_uploading_cache(
+    tmp_path: Path,
+    bucket_over_tmp: tuple[object, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hflow.storage import BucketStorageRoot
+
+    data_root, remote_dir = bucket_over_tmp
+    assert isinstance(data_root, BucketStorageRoot)
+    monkeypatch.setattr(
+        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
+    )
+    monkeypatch.setattr(prep, "_ensure_source_archive", _stub_single_episode_source_archive)
+    _install_publish_through_convert(monkeypatch, tmp_path)
+
+    episode_uris = prep.import_lerobot_dataset(
+        dataset_repo="fake/repo",
+        revision="main",
+        output_dir=data_root,
+        episode_index=0,
+    )
+
+    assert episode_uris == [f"{data_root.url}/landing/lerobot_episode_0001.mcap"]
+    assert all(isinstance(uri, str) for uri in episode_uris)
+    assert not isinstance(episode_uris[0], Path)
+    assert (remote_dir / "landing" / "lerobot_episode_0001.mcap").is_file()
+    assert (remote_dir / "prepared-manifest.json").is_file()
+    assert data_root.list_names() == [
+        "landing/lerobot_episode_0001.mcap",
+        "prepared-manifest.json",
+    ]
+    assert not any(name.startswith("_lerobot_cache") for name in data_root.list_names())
+    assert (data_root.mirror / "_lerobot_cache" / "abc").is_dir()
+
+
+def test_import_skips_bucket_manifest_when_an_episode_publish_fails(
+    tmp_path: Path,
+    bucket_over_tmp: tuple[object, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hflow.storage import BucketStorageRoot
+
+    data_root, remote_dir = bucket_over_tmp
+    assert isinstance(data_root, BucketStorageRoot)
+
+    def ensure_two_episodes(dataset_source: prep.DatasetSource, cache_dir: Path) -> dict:
+        archive = _stub_single_episode_source_archive(dataset_source, cache_dir)
+        archive["episodes"] = [
+            archive["episodes"][0],
+            {
+                **archive["episodes"][0],
+                "episode_index": 1,
+                "task": "second",
+            },
+        ]
+        return archive
+
+    convert_calls = 0
+
+    def fail_on_second_episode(
+        *,
+        source_archive: object,
+        dataset_source: object,
+        storage: StorageRoot,
+        episode_index: int,
+        camera_keys: object,
+        numeric_schemas: object,
+        frames_per_second: object,
+    ) -> str:
+        nonlocal convert_calls
+        del source_archive, dataset_source, camera_keys, numeric_schemas, frames_per_second
+        convert_calls += 1
+        if episode_index == 1:
+            raise RuntimeError("forced publish failure")
+        relative_key = f"landing/lerobot_episode_{episode_index + 1:04d}.mcap"
+        staged = tmp_path / f"staged-{episode_index}.mcap"
+        staged.write_bytes(b"first")
+        return storage.publish(staged, relative_key)
+
+    monkeypatch.setattr(
+        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
+    )
+    monkeypatch.setattr(prep, "_ensure_source_archive", ensure_two_episodes)
+    monkeypatch.setattr(prep, "_convert_single_episode", fail_on_second_episode)
+
+    with pytest.raises(RuntimeError, match="forced publish failure"):
+        prep.import_lerobot_dataset(
+            dataset_repo="fake/repo",
+            revision="main",
+            output_dir=data_root,
+        )
+
+    assert convert_calls == 2
+    assert (remote_dir / "landing" / "lerobot_episode_0001.mcap").is_file()
+    assert not (remote_dir / "prepared-manifest.json").exists()
+    assert "prepared-manifest.json" not in data_root.list_names()

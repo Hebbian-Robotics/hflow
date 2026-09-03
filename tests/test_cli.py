@@ -274,3 +274,83 @@ def test_catalog_ui_cli_does_not_hide_programming_errors_for_bucket_catalogs(
 
     with pytest.raises(RuntimeError, match="unexpected implementation bug"):
         main(["catalog", "ui", "--no-browser", "--catalog", "gs://robot-data/catalog"])
+
+
+def test_import_lerobot_cli_reports_a_missing_bucket_extra(
+    monkeypatch: pytest.MonkeyPatch, capsys: CaptureFixture
+) -> None:
+    def raise_missing_obstore(**_kwargs: object) -> list[str]:
+        raise ModuleNotFoundError(
+            "bucket storage roots need the optional obstore backend -- install the "
+            'extra: pip install "hflow[bucket]" (uv: uv add "hflow[bucket]")'
+        )
+
+    monkeypatch.setattr("hflow.importers.lerobot.import_lerobot_dataset", raise_missing_obstore)
+
+    exit_code = main(
+        [
+            "import",
+            "lerobot",
+            "--repo",
+            "lerobot/pusht",
+            "--output-dir",
+            "s3://robot-data/production",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.err.startswith("import lerobot:")
+    assert "hflow[bucket]" in captured.err
+
+
+def test_import_lerobot_cli_reports_a_bucket_credentials_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: CaptureFixture
+) -> None:
+    from obstore.exceptions import UnauthenticatedError
+
+    def raise_credentials_error(**_kwargs: object) -> list[str]:
+        raise UnauthenticatedError("provider credentials are unavailable")
+
+    monkeypatch.setattr("hflow.importers.lerobot.import_lerobot_dataset", raise_credentials_error)
+
+    exit_code = main(
+        [
+            "import",
+            "lerobot",
+            "--repo",
+            "lerobot/pusht",
+            "--output-dir",
+            "s3://robot-data/production",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.err == "import lerobot: provider credentials are unavailable\n"
+
+
+def test_import_lerobot_cli_accepts_bucket_output_dir_strings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received: list[str] = []
+
+    def record_import(**kwargs: object) -> list[str]:
+        received.append(str(kwargs["output_dir"]))
+        return ["s3://robot-data/production/landing/lerobot_episode_0001.mcap"]
+
+    monkeypatch.setattr("hflow.importers.lerobot.import_lerobot_dataset", record_import)
+
+    exit_code = main(
+        [
+            "import",
+            "lerobot",
+            "--repo",
+            "lerobot/pusht",
+            "--output-dir",
+            "s3://robot-data/production",
+        ]
+    )
+
+    assert exit_code == 0
+    assert received == ["s3://robot-data/production"]

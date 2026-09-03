@@ -297,9 +297,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     lerobot_import_parser.add_argument(
         "--output-dir",
-        type=Path,
         required=True,
-        help="local destination; episodes are written under its landing/ directory",
+        help=(
+            "destination data root: local directory or object-store prefix "
+            "(s3://, gs://, az://); episodes publish under landing/"
+        ),
     )
     lerobot_import_parser.add_argument(
         "--camera",
@@ -853,18 +855,37 @@ def _command_import_lerobot(arguments: argparse.Namespace) -> int:
     from hflow.importers.lerobot import DEFAULT_CAMERA_KEY, import_lerobot_dataset
 
     camera_keys = arguments.camera_keys or [DEFAULT_CAMERA_KEY]
+    output_location = arguments.output_dir
+    bucket_destination = is_bucket_url(output_location)
+    bucket_storage_error: type[BaseException] | None = None
+    if bucket_destination:
+        # Import while the optional extra is already known to be required for
+        # this path, so a later handler cannot mask an unrelated failure with
+        # ModuleNotFoundError from this import.
+        try:
+            from obstore.exceptions import BaseError as BucketStorageError
+        except ModuleNotFoundError:
+            bucket_storage_error = None
+        else:
+            bucket_storage_error = BucketStorageError
+
     try:
-        output_paths = import_lerobot_dataset(
+        output_uris = import_lerobot_dataset(
             dataset_repo=arguments.repo,
             revision=arguments.revision,
-            output_dir=arguments.output_dir,
+            output_dir=output_location,
             episode_index=arguments.episode_index,
             camera_keys=camera_keys,
         )
-    except (ValueError, RuntimeError, OSError) as error:
+    except (ValueError, RuntimeError, OSError, ModuleNotFoundError) as error:
         print(f"import lerobot: {error}", file=sys.stderr)
         return 2
-    print(f"import lerobot: converted {len(output_paths)} episode(s)")
+    except Exception as error:
+        if bucket_storage_error is not None and isinstance(error, bucket_storage_error):
+            print(f"import lerobot: {error}", file=sys.stderr)
+            return 2
+        raise
+    print(f"import lerobot: converted {len(output_uris)} episode(s)")
     return 0
 
 
