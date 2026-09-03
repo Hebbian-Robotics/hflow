@@ -11,6 +11,7 @@ from hflow.video import (
     AccessUnit,
     PictureCodingScan,
     VideoEncodeError,
+    _enforce_encode_guarantees,
     _first_mb_failure_message,
     _remove_emulation_prevention_bytes,
     _unescape_ebsp_head,
@@ -233,6 +234,68 @@ def test_remux_refuses_a_b_frame_stream_naming_the_tail(
     # The refusal fires before ffmpeg runs, so no partial MP4 is left behind.
     assert not output_path.exists()
     assert not output_path.with_name(output_path.name + ".tmp").exists()
+
+
+def test_encode_guarantees_accept_a_conforming_stream(
+    encoded_units: list[AccessUnit],
+) -> None:
+    _enforce_encode_guarantees(
+        encoded_units, expected_frame_count=len(encoded_units), gop_frames=GOP_FRAMES
+    )
+
+
+def test_encode_guarantees_raise_on_a_b_picture_naming_the_unit() -> None:
+    # A keyframe lead (passing the cadence check), then a B picture
+    # (slice_type 1), then a P picture. The guarantee must name access unit 1.
+    aud = b"\x00\x00\x00\x01\x09\x10"
+    non_idr_nal = b"\x00\x00\x00\x01\x41"
+    units = [
+        AccessUnit(
+            data=aud + b"\x00\x00\x00\x01\x65" + _slice_header_rbsp(0, 2),
+            is_keyframe=True,
+            has_parameter_sets=True,
+        ),
+        AccessUnit(
+            data=aud + non_idr_nal + _slice_header_rbsp(0, 1),
+            is_keyframe=False,
+            has_parameter_sets=False,
+        ),
+        AccessUnit(
+            data=aud + non_idr_nal + _slice_header_rbsp(0, 0),
+            is_keyframe=False,
+            has_parameter_sets=False,
+        ),
+    ]
+
+    with pytest.raises(VideoEncodeError, match=r"access unit 1") as error:
+        _enforce_encode_guarantees(units, expected_frame_count=len(units), gop_frames=3)
+
+    assert "B picture" in str(error.value)
+
+
+def test_encode_guarantees_find_a_b_picture_in_a_later_unit() -> None:
+    # A B picture in the final unit must still be named, proving the joined
+    # scan covers the whole stream rather than stopping early.
+    aud = b"\x00\x00\x00\x01\x09\x10"
+    non_idr_nal = b"\x00\x00\x00\x01\x41"
+    units = [
+        AccessUnit(
+            data=aud + b"\x00\x00\x00\x01\x65" + _slice_header_rbsp(0, 2),
+            is_keyframe=True,
+            has_parameter_sets=True,
+        ),
+        AccessUnit(
+            data=aud + non_idr_nal + _slice_header_rbsp(0, 1),
+            is_keyframe=False,
+            has_parameter_sets=False,
+        ),
+    ]
+
+    with pytest.raises(VideoEncodeError, match=r"access unit 1"):
+        _enforce_encode_guarantees(units, expected_frame_count=len(units), gop_frames=2)
+
+    with pytest.raises(VideoEncodeError, match=r"access unit 1"):
+        _enforce_encode_guarantees(units, expected_frame_count=len(units), gop_frames=2)
 
 
 def test_split_rejects_garbage_without_aud() -> None:

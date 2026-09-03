@@ -158,18 +158,20 @@ to MP4 cannot represent the reorder tail: the trailing B frames are silently und
 the muxed file (measured in [#250](https://github.com/Hebbian-Robotics/hflow/issues/250): 303
 samples in, 301 decoded). The transform refuses pass-through video that carries B-frames, and
 the MP4 remux behind `Episode.video` refuses any B-frame payload outright, with an error naming
-the observed reorder depth and the frames at risk. `hflow doctor` still does not classify
-picture coding types (below), so a clean report does not prove this constraint; the refusals do.
+the observed reorder depth and the frames at risk. `hflow doctor` reports any B picture it
+classifies in a video message as the `video-b-picture` error finding (below), so a clean
+report now covers this constraint alongside the refusals.
 
 `hflow doctor <file.mcap> [more.mcap ...]` checks every file given and prints
 one report each in argument order; its aggregate result follows the
 [exit code rules](#exit-codes). It validates the container, summary, indexes,
 stamps, chunk purity (against the file's own group map, or a video-versus-state
 approximation when it has none), per-topic time order, per-group chunk time
-order, and the H.264 access-unit properties listed below. It does not
-currently classify H.264 picture coding types to detect
-B-frames, so a clean report is not proof of the unchecked no-B-frame
-constraint. The doctor also does not reject non-VCL NAL units before the first
+order, and the H.264 access-unit properties listed below. It classifies
+H.264 picture coding types to detect
+B-frames as the `video-b-picture` error finding. A payload whose slice headers cannot be
+parsed still cannot be classified and is reported as
+`video-invalid-slice-header`. The doctor also does not reject non-VCL NAL units before the first
 AUD, so a clean report does not prove the canonical AUD-first constraint. An
 unreadable or unparseable path is reported in place, in the same per-file shape
 (`[error] unreadable: ...`), and the run continues with the remaining files.
@@ -196,6 +198,7 @@ automation. An `error` breaks the canonical convention (or the MCAP spec); a
 | `topic-time-order` | error | A channel's `log_time` decreases between messages. |
 | `video-format` | error | A supported video message does not declare `format="h264"`. |
 | `video-invalid-slice-header` | error | The H.264 payload's picture count cannot be determined from its slice headers. |
+| `video-b-picture` | error | A video message's slice headers classify at least one picture as a B picture; canonical video requires no B-frames. |
 | `video-multiple-access-units` | error | A video message contains more than one picture or access unit. |
 | `video-not-aud-delimited` | error | No AUD is present, or VCL data precedes the first AUD. |
 | `video-keyframe-missing-parameter-sets` | error | A keyframe does not carry both SPS and PPS. |

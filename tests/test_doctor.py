@@ -107,6 +107,92 @@ def test_nonconforming_ros2_video_is_reported(tmp_path: Path) -> None:
     assert "video-not-aud-delimited" in codes
 
 
+def _write_video_message_mcap(path: Path, payload: bytes) -> None:
+    """One ``foxglove.CompressedVideo`` message carrying ``payload`` on /cam."""
+    with path.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        schema_id = writer.register_schema(
+            name="foxglove.CompressedVideo",
+            encoding="protobuf",
+            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
+        )
+        channel_id = writer.register_channel(
+            topic="/cam", message_encoding="protobuf", schema_id=schema_id
+        )
+        message = CompressedVideo()
+        message.timestamp.FromNanoseconds(10**9)
+        message.frame_id = "cam"
+        message.data = payload
+        message.format = "h264"
+        writer.add_message(
+            channel_id, log_time=10**9, data=message.SerializeToString(), publish_time=10**9
+        )
+        writer.finish()
+
+
+def test_doctor_reports_a_b_picture_from_slice_headers(tmp_path: Path) -> None:
+    # Slice header RBSP 0xa8: first_mb_in_slice = 0 (ue "1"), slice_type = 1
+    # (ue "010", B in H.264 Table 7-6), stop bit, zero padding. The payload is
+    # AUD-first with exactly one picture, so the B classification is the only
+    # non-conformance besides the first-message keyframe rule.
+    path = tmp_path / "b_picture.mcap"
+    _write_video_message_mcap(path, b"\x00\x00\x00\x01\x09\x10\x00\x00\x00\x01\x41\xa8")
+
+    report = diagnose(path)
+
+    assert not report.conforming
+    b_finding = next(finding for finding in report.findings if finding.code == "video-b-picture")
+    assert "1 B picture" in b_finding.message
+    assert "no B-frames" in b_finding.message
+    assert "video-invalid-slice-header" not in {finding.code for finding in report.findings}
+
+
+def test_doctor_keeps_both_pinned_count_messages_when_the_scan_refuses(
+    tmp_path: Path,
+) -> None:
+    # The scan fails closed on both payloads; the doctor delegates the count
+    # on that error path, so the emitted text is count_h264_pictures' own.
+    malformed_first_byte_to_pinned_message = {
+        b"\x00": "slice header has no complete first_mb_in_slice value",
+        b"\x04": "slice header truncates its first_mb_in_slice value",
+    }
+    for message_index, (malformed_rbsp, pinned_message) in enumerate(
+        malformed_first_byte_to_pinned_message.items()
+    ):
+        path = tmp_path / f"malformed_{message_index}.mcap"
+        _write_video_message_mcap(
+            path, b"\x00\x00\x00\x01\x09\x10\x00\x00\x00\x01\x65" + malformed_rbsp
+        )
+
+        report = diagnose(path)
+
+        finding = next(
+            finding for finding in report.findings if finding.code == "video-invalid-slice-header"
+        )
+        assert finding.message.endswith(pinned_message)
+        assert not any(finding.code == "video-b-picture" for finding in report.findings)
+
+
+def test_doctor_reports_invalid_slice_header_over_b_picture_when_a_header_is_malformed(
+    tmp_path: Path,
+) -> None:
+    # A B slice follows a malformed first slice. The scan refuses before any
+    # picture is classified, so the count message wins and no B code appears.
+    path = tmp_path / "b_after_malformed.mcap"
+    _write_video_message_mcap(
+        path, b"\x00\x00\x00\x01\x09\x10\x00\x00\x00\x01\x65\x00\x00\x00\x00\x01\x41\xa8"
+    )
+
+    report = diagnose(path)
+
+    finding = next(
+        finding for finding in report.findings if finding.code == "video-invalid-slice-header"
+    )
+    assert finding.message.endswith("slice header has no complete first_mb_in_slice value")
+    assert not any(finding.code == "video-b-picture" for finding in report.findings)
+
+
 def test_not_an_mcap_file(tmp_path: Path) -> None:
     bogus = tmp_path / "bogus.mcap"
     bogus.write_bytes(b"definitely not mcap")
