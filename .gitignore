@@ -26,4 +26,4 @@ packages/hflow-server/src/hflow_server/static/
 # Transient: `pnpm gen:api` dumps the schema here on its way to src/apiSchema.ts.
 .openapi.json
 
-**/node_modules/*
+**/node_modules/*.zcode/
