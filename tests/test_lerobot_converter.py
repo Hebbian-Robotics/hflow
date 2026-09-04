@@ -1866,3 +1866,247 @@ def test_import_full_reuse_reports_zero_episodes_converted(
     manifest = json.loads((output_dir / "prepared-manifest.json").read_text())
     assert manifest["episodes_converted"] == 0
     assert len(manifest["episodes"]) == 2
+
+
+# --- success label: read the collector's outcome, never invent it (#395) -----
+
+
+def _build_success_label_corpus(root: Path, outcome_mode: str) -> dict:
+    """One two-frame episode.
+
+    outcome_mode: 'transition', 'all-false', 'empty-aggregate', or 'none'.
+    """
+    has_outcome = outcome_mode != "none"
+    info = {
+        "fps": 30,
+        "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+        "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+        "features": {
+            "action": {"dtype": "float32", "shape": [1]},
+            "observation.state": {"dtype": "float32", "shape": [1]},
+            "observation.images.up": {"dtype": "video", "shape": [480, 640, 3]},
+            "timestamp": {"dtype": "float32", "shape": [1]},
+        },
+        "robot_type": "so101",
+    }
+    if has_outcome:
+        info["features"]["next.success"] = {"dtype": "bool", "shape": [1]}
+    (root / "meta").mkdir(parents=True, exist_ok=True)
+    (root / "meta" / "info.json").write_text(json.dumps(info))
+
+    import duckdb
+
+    conn = duckdb.connect()
+    ep_cols = [
+        "episode_index",
+        "length",
+        "data/chunk_index",
+        "data/file_index",
+        "dataset_from_index",
+        "dataset_to_index",
+        "videos/observation.images.up/chunk_index",
+        "videos/observation.images.up/file_index",
+        "videos/observation.images.up/from_timestamp",
+        "videos/observation.images.up/to_timestamp",
+        "tasks",
+    ]
+    row: list[object] = [0, 2, "000", "000", 0, 2, "000", "000", 0.0, 0.0, ["push the block"]]
+    if has_outcome:
+        if outcome_mode == "transition":
+            stats_min, stats_max = [False], [True]
+        elif outcome_mode == "empty-aggregate":
+            # The column exists but carries no value for this episode, which
+            # is a declared feature with nothing recorded rather than a label.
+            stats_min, stats_max = [], []
+        else:
+            stats_min, stats_max = [False], [False]
+        ep_cols += ["stats/next.success/min", "stats/next.success/max"]
+        row += [stats_min, stats_max]
+    ep_path = root / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    ep_path.parent.mkdir(parents=True, exist_ok=True)
+    vals = (
+        "("
+        + ",".join(
+            "[" + ",".join(str(bool(item)) for item in value) + "]"
+            if isinstance(value, list) and value and all(isinstance(item, bool) for item in value)
+            else "[" + ",".join(f"'{item}'" for item in value) + "]"
+            if isinstance(value, list)
+            else f"'{value}'"
+            if isinstance(value, str)
+            else str(value)
+            for value in row
+        )
+        + ")"
+    )
+    conn.execute(
+        f"COPY (SELECT * FROM (VALUES {vals}) AS t({','.join(chr(34) + c + chr(34) for c in ep_cols)})) "
+        f"TO '{str(ep_path).replace(chr(39), chr(39) * 2)}' (FORMAT parquet)"
+    )
+
+    frame_outcomes = [False, True] if outcome_mode == "transition" else [False, False]
+    data_cols = 'index, episode_index, frame_index, timestamp, "observation.state", action'
+    data_rows = [
+        f"({index}, 0, {frame_index}, 0.0, [0.0], [0.5]"
+        for index, frame_index in enumerate(range(2))
+    ]
+    if has_outcome:
+        data_cols += ', "next.success"'
+        data_rows = [
+            data_row + f", {str(frame_outcomes[frame_index]).lower()})"
+            for frame_index, data_row in enumerate(data_rows)
+        ]
+    else:
+        data_rows = [data_row + ")" for data_row in data_rows]
+    data_path = root / "data" / "chunk-000" / "file-000.parquet"
+    data_path.parent.mkdir(parents=True, exist_ok=True)
+    conn.execute(
+        f"COPY (SELECT * FROM (VALUES {','.join(data_rows)}) AS t({data_cols})) "
+        f"TO '{str(data_path).replace(chr(39), chr(39) * 2)}' (FORMAT parquet)"
+    )
+    conn.close()
+    return {"info": info}
+
+
+def _import_success_label_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome_mode: str
+) -> Path:
+    root = tmp_path / "corpus"
+    corpus = _build_success_label_corpus(root, outcome_mode)
+    output_dir = tmp_path / "out"
+
+    monkeypatch.setattr(
+        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc1234", "license": "apache-2.0"}
+    )
+    monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: corpus["info"])
+    monkeypatch.setattr(
+        prep,
+        "_hf_tree",
+        lambda repo, rev, path: (
+            [{"path": "meta/episodes/chunk-000/file-000.parquet", "type": "file"}]
+            if "episodes" in path
+            else [{"path": "meta/info.json", "type": "file"}]
+        ),
+    )
+
+    def fake_download(url: str, dest: Path, **_kwargs: object) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if "meta/episodes" in url:
+            shutil.copy(root / "meta" / "episodes" / "chunk-000" / "file-000.parquet", dest)
+        elif url.endswith("info.json"):
+            shutil.copy(root / "meta" / "info.json", dest)
+        else:
+            shutil.copy(root / "data" / "chunk-000" / "file-000.parquet", dest)
+
+    monkeypatch.setattr(prep, "_download_file", fake_download)
+    monkeypatch.setattr(
+        prep,
+        "_transcode_mp4_to_h264",
+        lambda mp4_path, gop, fps: (
+            [
+                b"\x00\x00\x00\x01\x09\x10\x00\x00\x00\x01\x67\x42\x00"
+                b"\x00\x00\x00\x01\x68\x88\x80\x00\x00\x00\x01\x65\x88"
+            ]
+            * 2
+        ),
+    )
+    monkeypatch.setattr(prep, "_get_video_pts_times", lambda path: [0, 0])
+    monkeypatch.setattr(prep, "ffmpeg_version", lambda: "test-ffmpeg")
+
+    prep.import_lerobot_dataset(
+        dataset_repo="fake/repo",
+        output_dir=output_dir,
+        camera_keys=("observation.images.up",),
+    )
+    return output_dir
+
+
+def test_success_label_reports_max_over_episode_frames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MAX over the collector's next.success frames: a False frame followed
+    by a True frame makes the episode a success, even though the LAST frame
+    is False. The derivation is stamped so the methodology travels."""
+    from hflow.episode import Episode
+
+    output_dir = _import_success_label_corpus(tmp_path, monkeypatch, "transition")
+    landing = sorted((output_dir / "landing").glob("*.mcap"))
+    with Episode(landing[0]) as episode:
+        record = episode.metadata_records["episode/v1"]
+    assert record["success"] == "true"
+    assert record["success_derivation"] == "max(stats/next.success)"
+
+
+def test_success_label_reports_false_when_source_is_all_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An all-false source label ships as 'false', never as an invented
+    'true': the collector's judgment, reported verbatim."""
+    from hflow.episode import Episode
+
+    output_dir = _import_success_label_corpus(tmp_path, monkeypatch, "all-false")
+    landing = sorted((output_dir / "landing").glob("*.mcap"))
+    with Episode(landing[0]) as episode:
+        record = episode.metadata_records["episode/v1"]
+    assert record["success"] == "false"
+    assert record["success_derivation"] == "max(stats/next.success)"
+
+
+def test_success_label_omitted_when_the_outcome_aggregate_is_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A declared outcome feature with nothing recorded is not a label.
+
+    Dropping the length check stamps ``success: "false"`` here, because
+    ``any([])`` is False. That is the same invention the hardcoded ``"true"``
+    was, one value over, so the empty aggregate needs its own case rather than
+    riding on the no-feature one.
+    """
+    from hflow.episode import Episode
+
+    output_dir = _import_success_label_corpus(tmp_path, monkeypatch, "empty-aggregate")
+    landing = sorted((output_dir / "landing").glob("*.mcap"))
+    with Episode(landing[0]) as episode:
+        record = episode.metadata_records["episode/v1"]
+    assert "success" not in record
+    assert "success_derivation" not in record
+
+
+def test_success_label_omitted_when_source_has_no_outcome_feature(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corpus without the outcome feature is normal, not malformed: the key
+    is omitted (never substituted), the import succeeds, and the catalog
+    promotion renders the omitted key as SQL NULL (catalog.py:886)."""
+    import duckdb
+
+    from hflow.catalog import Catalog
+    from hflow.episode import Episode
+    from hflow.transform import stamps_from_provenance
+
+    output_dir = _import_success_label_corpus(tmp_path, monkeypatch, "none")
+    landing = sorted((output_dir / "landing").glob("*.mcap"))
+    with Episode(landing[0]) as episode:
+        record = episode.metadata_records["episode/v1"]
+        assert "success" not in record
+        assert "success_derivation" not in record
+
+        catalog_root = tmp_path / "catalog"
+        catalog = Catalog(catalog_root)
+        catalog.append_episode(
+            canonical_path=landing[0],
+            stamps=stamps_from_provenance(episode.metadata),
+            episode_metadata=dict(episode.metadata),
+            check_rows=[],
+        )
+
+    rows = duckdb.sql(
+        f"SELECT success FROM read_parquet('{catalog_root / 'episodes' / '*.parquet'}')"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] is None
+
+
+def test_converter_version_bumped_with_the_label_support() -> None:
+    """The label changes episode/v1 bytes, which content_episode_id hashes:
+    the converter version moves with the change, not after it."""
+    assert prep.CONVERTER_VERSION == "lerobot-converter-v7"
