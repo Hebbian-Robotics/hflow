@@ -416,7 +416,7 @@ def _normalized_scalar_values(
 
 
 def _normalized_intervals(check_name: str, intervals: list[Interval]) -> list[Interval]:
-    """Coerce NumPy scalar interval bounds to Python ints; refuse the rest.
+    """Validate the label, coerce NumPy scalar bounds to ints, refuse the rest.
 
     A user check computing segment boundaries from ``channel.to_numpy()``
     gets ``np.int64`` bounds from plain indexing, and those reach the run
@@ -429,6 +429,29 @@ def _normalized_intervals(check_name: str, intervals: list[Interval]) -> list[In
     """
     normalized: list[Interval] = []
     for interval in intervals:
+        # The label first: the bound errors below interpolate it, and it
+        # reaches the run fingerprint, where it is sorted against the other
+        # intervals' labels. A non-string only meets one when two intervals
+        # share both bounds, so the TypeError it raises there fires on some
+        # corpora and not others, several frames from the check that caused
+        # it and naming neither the check nor the field.
+        #
+        # Empty is the dataclass default and stays legal. Padding is refused
+        # for the reason an observation id is: both are stored verbatim, so
+        # " freeze " and "freeze" would be two labels for one thing.
+        label = interval.label
+        if not isinstance(label, str):
+            raise ValueError(
+                f"check {check_name!r} set an interval label as "
+                f"{type(label).__name__} (start_ns={interval.start_ns!r}, "
+                f"end_ns={interval.end_ns!r}): interval labels are strings"
+            )
+        if label != label.strip():
+            raise ValueError(
+                f"check {check_name!r} set interval label {label!r} with leading "
+                "or trailing whitespace: interval labels are stored verbatim"
+            )
+
         bounds: dict[str, int] = {}
         for bound_name in ("start_ns", "end_ns"):
             value = getattr(interval, bound_name)

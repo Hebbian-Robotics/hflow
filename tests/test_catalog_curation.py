@@ -1473,6 +1473,91 @@ def test_a_negative_interval_bound_is_refused(tmp_path: Path) -> None:
         _appended_with_interval(tmp_path, hflow.Interval(start_ns=-5, end_ns=-1, label="gap"))
 
 
+def test_a_non_string_interval_label_is_refused_naming_the_check(tmp_path: Path) -> None:
+    """A label that is not a string reaches the run fingerprint and breaks its sort.
+
+    The failure it replaces was data dependent: the fingerprint sorts
+    ``(start_ns, end_ns, label)`` tuples, so a bad label is only ever compared
+    against another when two intervals share both bounds. One interval stored
+    fine, two colliding ones raised a ``TypeError`` several frames inside
+    ``append_episode`` naming neither the check nor the field (#392).
+    """
+    with pytest.raises(ValueError, match=r"segment_check.*NoneType.*labels are strings"):
+        _appended_with_interval(
+            # cast: the misuse this test exists to refuse.
+            tmp_path,
+            hflow.Interval(start_ns=0, end_ns=10, label=cast(str, None)),
+        )
+    assert list((tmp_path / "catalog" / "episodes").glob("*.parquet")) == []
+
+
+def test_colliding_intervals_with_a_bad_label_are_refused_not_crashed(tmp_path: Path) -> None:
+    """The case that used to raise TypeError from inside the fingerprint sort.
+
+    Two intervals sharing both bounds are the only shape that reaches the label
+    comparison, so this is the arrangement the old code died on rather than
+    stored.
+    """
+    canonical = tmp_path / "e.canonical.mcap"
+    canonical.write_bytes(b"episode-bytes")
+    row = CheckRunRow(
+        check_name="segment_check",
+        check_version="v1",
+        critical=False,
+        status=hflow.CheckStatus.MEASURED,
+        duration_s=0.1,
+        intervals=[
+            hflow.Interval(start_ns=0, end_ns=10, label="freeze"),
+            # cast: the misuse this test exists to refuse.
+            hflow.Interval(start_ns=0, end_ns=10, label=cast(str, None)),
+        ],
+    )
+    with pytest.raises(ValueError, match=r"segment_check.*NoneType.*labels are strings"):
+        Catalog(tmp_path / "catalog").append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[row],
+        )
+
+
+def test_a_non_serializable_interval_label_is_refused_before_the_fingerprint(
+    tmp_path: Path,
+) -> None:
+    """An unserializable label used to surface as a json.dumps TypeError.
+
+    That one fired whatever the bounds were, because the fingerprint payload is
+    serialized after the sort. It is now refused where the bounds are, so the
+    message names the check.
+    """
+    with pytest.raises(ValueError, match=r"segment_check.*object.*labels are strings"):
+        _appended_with_interval(
+            # cast: the misuse this test exists to refuse.
+            tmp_path,
+            hflow.Interval(start_ns=0, end_ns=10, label=cast(str, object())),
+        )
+
+
+def test_a_padded_interval_label_is_refused(tmp_path: Path) -> None:
+    """Labels are stored verbatim, so " freeze " and "freeze" would be two names
+    for one thing. The same rule an observation id already carries."""
+    with pytest.raises(ValueError, match=r"segment_check.*' freeze '.*stored verbatim"):
+        _appended_with_interval(tmp_path, hflow.Interval(start_ns=0, end_ns=10, label=" freeze "))
+
+
+def test_an_empty_interval_label_is_allowed(tmp_path: Path) -> None:
+    """``label: str = ""`` is the dataclass default, so empty is a real value
+    rather than an omission. Pinned so the padding rule above cannot grow into
+    refusing it."""
+    _appended_with_interval(tmp_path, hflow.Interval(start_ns=0, end_ns=10))
+
+    connection = open_catalog_connection(tmp_path / "catalog")
+    try:
+        assert connection.execute("SELECT label FROM intervals").fetchall() == [("",)]
+    finally:
+        connection.close()
+
+
 def test_a_zero_length_interval_is_allowed(tmp_path: Path) -> None:
     """An instant is a real thing to record, so only end < start is refused.
 
