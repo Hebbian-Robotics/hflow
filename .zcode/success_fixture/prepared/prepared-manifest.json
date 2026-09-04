@@ -1,0 +1,26 @@
+{
+  "schema_version": 3,
+  "dataset": {
+    "repo_id": "fake/repo",
+    "revision": "abc1234",
+    "license": "apache-2.0"
+  },
+  "camera_keys": [
+    "observation.images.up",
+    "observation.images.side"
+  ],
+  "episodes_converted": 2,
+  "episodes": [
+    {
+      "uri": "/mnt/c/Users/Sagar/AppData/Local/Temp/hflow-wt-379/.zcode/success_fixture/prepared/landing/lerobot_episode_0001.mcap",
+      "content_id": "e9e1a9ad1306d39d",
+      "size_bytes": 4626
+    },
+    {
+      "uri": "/mnt/c/Users/Sagar/AppData/Local/Temp/hflow-wt-379/.zcode/success_fixture/prepared/landing/lerobot_episode_0002.mcap",
+      "content_id": "ba19d7fb94cdba01",
+      "size_bytes": 4626
+    }
+  ],
+  "converter_version": "lerobot-converter-v5"
+}

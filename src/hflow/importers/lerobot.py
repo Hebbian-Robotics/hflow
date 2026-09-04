@@ -54,7 +54,7 @@ DEFAULT_CAMERA_KEY = "observation.image"
 # can prove a landing file belongs to this exact selection (#303). Those
 # fields change the canonical bytes that content_episode_id hashes, so v5
 # and v6 outputs must not share a converter identity.
-CONVERTER_VERSION = "lerobot-converter-v6"
+CONVERTER_VERSION = "lerobot-converter-v7"
 # Canonical transform knobs that affect published bytes for this importer.
 IMPORT_GOP_SECONDS = 1.0
 PRESENTATION_TIMESTAMP_EPSILON_S = 0.050
@@ -75,6 +75,9 @@ class _EpisodeRow(TypedDict):
     data_from: int
     data_to: int
     video_windows: NotRequired[dict[str, "_VideoWindow"]]
+    # MAX of the episode's collector-labeled next.success frames, present only
+    # when the source declares that outcome feature at all.
+    success_outcome: NotRequired[bool]
 
 
 class _VideoWindow(TypedDict):
@@ -584,12 +587,25 @@ def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _S
     )
     connection = duckdb.connect()
     try:
+        # Column discovery first: the outcome aggregate is optional in v3
+        # (not every corpus declares a collector-labeled next.success), and
+        # naming a missing column would fail the read. A corpus without one
+        # is normal, not malformed.
+        episodes_columns = [
+            column_description[0]
+            for column_description in connection.execute(
+                f"SELECT * FROM {episode_metadata_relation} LIMIT 1"
+            ).description
+        ]
+        has_outcome_aggregate = "stats/next.success/max" in episodes_columns
+
         episode_rows: list[_EpisodeRow] = []
         parquet_episode_rows = connection.execute(
             f"""
             SELECT "episode_index", "tasks", "length",
                    "data/chunk_index", "data/file_index",
                    "dataset_from_index", "dataset_to_index"
+                   {"," + chr(34) + "stats/next.success/max" + chr(34) if has_outcome_aggregate else ""}
             FROM {episode_metadata_relation}
             ORDER BY "episode_index"
             """
@@ -597,17 +613,25 @@ def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _S
         for parquet_episode_row in parquet_episode_rows:
             tasks = parquet_episode_row[1]
             task = (str(tasks[0]) if tasks else "") if isinstance(tasks, list) else str(tasks or "")
-            episode_rows.append(
-                {
-                    "episode_index": int(parquet_episode_row[0]),
-                    "task": task,
-                    "length": int(parquet_episode_row[2]),
-                    "data_chunk": str(parquet_episode_row[3]).split("/")[-1],
-                    "data_file": str(parquet_episode_row[4]).split("/")[-1],
-                    "data_from": int(parquet_episode_row[5]),
-                    "data_to": int(parquet_episode_row[6]),
-                }
-            )
+            episode_row_value: _EpisodeRow = {
+                "episode_index": int(parquet_episode_row[0]),
+                "task": task,
+                "length": int(parquet_episode_row[2]),
+                "data_chunk": str(parquet_episode_row[3]).split("/")[-1],
+                "data_file": str(parquet_episode_row[4]).split("/")[-1],
+                "data_from": int(parquet_episode_row[5]),
+                "data_to": int(parquet_episode_row[6]),
+            }
+            if has_outcome_aggregate:
+                # Episode outcome = MAX over the episode's collector-labeled
+                # next.success frames: any success frame makes the episode a
+                # success. An empty aggregate carries no label either way.
+                outcome_frames = parquet_episode_row[7]
+                if outcome_frames is not None and len(outcome_frames) > 0:
+                    episode_row_value["success_outcome"] = any(
+                        bool(value) for value in outcome_frames
+                    )
+            episode_rows.append(episode_row_value)
 
         # Video window columns: videos/<camera>/{chunk_index,file_index,from_timestamp,to_timestamp}
         flattened_column_names = [
@@ -1193,20 +1217,30 @@ def _convert_single_episode(
                     sequence=frame_index,
                 )
 
+            episode_record: dict[str, str] = {
+                "task": str(episode_row["task"] or ""),
+                "operator": "lerobot_converter",
+                "embodiment": str(source_archive["info"].get("robot_type") or "unknown"),
+                "source_dataset": dataset_source.repo_id,
+                "source_revision": dataset_source.revision,
+                "source_episode_index": str(episode_index),
+                "converter_version": CONVERTER_VERSION,
+                "camera_keys": _encode_camera_keys(camera_keys),
+                "gop_seconds": f"{IMPORT_GOP_SECONDS:g}",
+            }
+            # success is the collector's label, never ours: when the source
+            # declares the outcome feature, report MAX over the episode's
+            # frames and name the derivation so the methodology travels with
+            # the data; when it does not, the key is omitted rather than
+            # invented (FORMAT.md: every episode/v1 key is optional and the
+            # record is copied/merged from the source recording).
+            success_outcome = episode_row.get("success_outcome")
+            if success_outcome is not None:
+                episode_record["success"] = "true" if success_outcome else "false"
+                episode_record["success_derivation"] = "max(stats/next.success)"
             mcap_writer.add_metadata(
                 name="episode/v1",
-                data={
-                    "task": str(episode_row["task"] or ""),
-                    "operator": "lerobot_converter",
-                    "success": "true",
-                    "embodiment": str(source_archive["info"].get("robot_type") or "unknown"),
-                    "source_dataset": dataset_source.repo_id,
-                    "source_revision": dataset_source.revision,
-                    "source_episode_index": str(episode_index),
-                    "converter_version": CONVERTER_VERSION,
-                    "camera_keys": _encode_camera_keys(camera_keys),
-                    "gop_seconds": f"{IMPORT_GOP_SECONDS:g}",
-                },
+                data=episode_record,
             )
             mcap_writer.add_metadata(
                 name="source-provenance/v1",
