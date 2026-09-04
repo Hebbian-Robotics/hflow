@@ -76,11 +76,10 @@ def describe_activity(episode: hflow.Episode) -> hflow.CheckResult:
 
 @app.check(requires=("vision-model",), version="hand-visibility-contact-sheet-v1")
 def hand_visibility(episode: hflow.Episode) -> hflow.CheckResult:
-    """Missing/occluded hand positions, a quality issue named in Dyna's article.
+    """Measure hand visibility as a model judgment rather than a signal statistic.
 
-    Hand visibility is a model judgment, not a signal statistic, so it lives
-    on the VLM extension surface: sample frames, ask the model, record the
-    fraction as evidence. The keep/drop threshold stays a curation query.
+    The check samples frames, asks the model, and records the visible fraction
+    as evidence. The keep/drop threshold stays a curation query.
     """
     contact_sheet = hflow.ffmpeg.contact_sheet(
         episode.frames(fps=0.5),

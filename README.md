@@ -78,7 +78,7 @@ collection --> ingestion ---------------> curation ------> delivery
 </p>
 
 - **Your processing code stays yours.** Transformations, quality checks, labels, and enrichments are plain Python functions in your own environment. Existing code plugs in through small adapters instead of being rewritten for a proprietary framework.
-- **Episodes are MCAP**, the container that ROS 2 records natively and [Foxglove](https://foxglove.dev/)/[Rerun](https://rerun.io/) open directly, written with two tunings described in Dyna's article: in-band H.264 with GOP length matched to how the data is read, and **topic-group chunking** (camera streams and state streams never share a chunk, so a training sample costs one read per group instead of one per topic).
+- **Episodes are MCAP**, the container that ROS 2 records natively and [Foxglove](https://foxglove.dev/)/[Rerun](https://rerun.io/) open directly, written with in-band H.264 whose GOP length matches how the data is read and **topic-group chunking** (camera streams and state streams never share a chunk, so a training sample costs one read per group instead of one per topic).
 - **Processed episodes carry their provenance.** The file itself records the schema, pipeline, and tool versions that produced it, plus its source URI when available. Catalog records connect measurements and outcomes to step versions, making it easier to trace a bad result back to its origin.
 - **The pipeline is visible as a graph.** HFlow renders Airflow DAGs so you can see how stages connect and monitor task status, logs, retries, and reruns.
 - **Quality checks produce reusable evidence.** Accessors extract the inputs existing processing code expects (numpy arrays, MP4 paths, JPEG frames), and results land as queryable measurements rather than hardcoded verdicts. Different datasets can apply different thresholds without processing the media again.
@@ -147,6 +147,11 @@ Airflow. To use your own recording:
 ```bash
 uv run python examples/quickstart.py path/to/episode.mcap
 ```
+
+For the recommended first run on real egocentric footage, follow
+[Evaluate your first egocentric episode](./docs/tutorials/evaluate-an-egocentric-episode.md).
+It runs HFlow's local deterministic quality baseline and two hosted semantic
+checks together, without requiring an account, API key, or model server.
 
 Use `uv run hflow --help` to see the CLI. When you are ready to schedule the
 same pipeline, continue with the [runtime guide](https://github.com/Hebbian-Robotics/hflow/blob/main/docs/RUNTIME.md). Developers
@@ -250,8 +255,6 @@ WHERE task = 'fold_napkin'
 
 ## References
 
-
-- Dyna Robotics, [Training Dyna-2 at million-hour scale, repeatably](https://www.dyna.co/research/dyna-2-infrastructure)
 - [MCAP specification](https://mcap.dev/spec) and [Python libraries](https://mcap.dev/docs/python/) (Foxglove)
 - [foxglove.CompressedVideo schema](https://docs.foxglove.dev/docs/sdk/schemas/compressed-video): in-band H.264/H.265/VP9/AV1 video in MCAP
 - [Apache Airflow](https://airflow.apache.org/)

@@ -392,8 +392,7 @@ class EnrichmentResult:
     """What an enrichment returns: derived labels and artifacts, no verdicts.
 
     Enrichments are the "Labels & artifacts" stage family: performance
-    labels, video captions, segmentations (the examples named in Dyna's
-    article). They never gate anything -- gate semantics belong to critical
+    labels, video captions, and segmentations. They never gate anything -- gate semantics belong to critical
     checks -- and they never run on a quarantined episode (no enrichment
     spend on an episode with a dead camera).
 

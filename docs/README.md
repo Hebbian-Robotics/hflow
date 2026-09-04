@@ -19,7 +19,10 @@ and tradeoffs.
 
 ## Start here
 
-- **Run a pipeline locally:** follow the
+- **Evaluate real egocentric video:** follow the recommended
+  [first-episode tutorial](./tutorials/evaluate-an-egocentric-episode.md) to run
+  local deterministic checks and hosted model checks together.
+- **Run entirely offline:** follow the
   [five-minute quickstart](../examples/README.md#five-minute-quickstart).
 - **Understand the project first:** read the [architecture](./ARCHITECTURE.md),
   especially [what is implemented](./ARCHITECTURE.md#implementation-status).
@@ -37,6 +40,9 @@ the whole workflow before adapting it.
 - [Five-minute local quickstart](../examples/README.md#five-minute-quickstart):
   synthesize a small episode and run transform, checks, and reporting without
   Docker.
+- [Evaluate your first egocentric episode](./tutorials/evaluate-an-egocentric-episode.md):
+  download a real MCAP and combine HFlow's deterministic baseline with hosted
+  hand-visibility and active-manipulation checks.
 - [Egocentric factory corpus](../examples/egocentric/README.md): prepare real
   head-mounted video, inject known defects, run locally or in Airflow, inspect
   the results, and cut a curated manifest.

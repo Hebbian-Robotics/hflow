@@ -223,7 +223,8 @@ uvx pre-commit run --all-files
 
 Hooks enforce the same style gates documented above: `ruff check --fix` and `ruff format`.
 
-When Markdown changes, run the same link check as CI:
+When Markdown changes, run the local link check. It accesses external sites, so
+it is deliberately not part of CI:
 
 ```bash
 lychee --no-progress --include-fragments \

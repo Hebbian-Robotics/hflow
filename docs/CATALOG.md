@@ -3,9 +3,8 @@
 HFlow's answer to "which episodes go in the dataset?" is a SQL query over
 plain files: every processed episode appends rows to **plain Parquet files
 under your data root**, and [DuckDB](https://duckdb.org/) queries them
-directly. Researcher-facing SQL, zero services (Dyna's article describes the
-same query interface backed by a warehouse at their scale). A curation is a
-query; its output is `manifest.parquet`.
+directly. This gives researchers a SQL interface without requiring a database
+service. A curation is a query; its output is `manifest.parquet`.
 
 Nothing on this page is a gate. The catalog is ordinary Parquet: point
 DuckDB, pandas, or polars at the files and ignore our helpers entirely.

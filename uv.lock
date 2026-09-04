@@ -966,6 +966,7 @@ source = { editable = "." }
 dependencies = [
     { name = "duckdb" },
     { name = "foxglove-schemas-protobuf" },
+    { name = "httpx2" },
     { name = "mcap" },
     { name = "mcap-protobuf-support" },
     { name = "mcap-ros2-support" },
@@ -994,7 +995,6 @@ openai = [
 [package.dev-dependencies]
 dev = [
     { name = "hflow-server" },
-    { name = "httpx2" },
     { name = "obstore" },
     { name = "opencv-python-headless" },
     { name = "pyarrow" },
@@ -1008,6 +1008,7 @@ dev = [
 requires-dist = [
     { name = "duckdb", specifier = ">=1.5.5" },
     { name = "foxglove-schemas-protobuf", specifier = ">=0.4.0" },
+    { name = "httpx2", specifier = ">=2.12.0" },
     { name = "mcap", specifier = ">=1.4.0" },
     { name = "mcap-protobuf-support", specifier = ">=0.5.4" },
     { name = "mcap-ros2-support", specifier = ">=0.5.7" },
@@ -1024,7 +1025,6 @@ provides-extras = ["arrow", "bucket", "mediapipe", "motion", "openai"]
 [package.metadata.requires-dev]
 dev = [
     { name = "hflow-server", editable = "packages/hflow-server" },
-    { name = "httpx2", specifier = ">=2.12.0" },
     { name = "obstore", specifier = ">=0.11.1" },
     { name = "opencv-python-headless", specifier = ">=5.0.0.93" },
     { name = "pyarrow", specifier = ">=25.0.1" },

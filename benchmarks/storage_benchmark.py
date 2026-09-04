@@ -1,8 +1,7 @@
 """Benchmark (issue #26): per-frame JPEG storage vs canonical MCAP by GOP preset.
 
 Measures the per-frame-JPEG vs canonical-MCAP storage effect at honest
-small scale, alongside the ~68% reduction Dyna's article reports (its
-Figure 3, first panel) for the same move to in-band H.264 with tuned GOPs. The sum of the recording's JPEG payload bytes is the
+small scale. The sum of the recording's JPEG payload bytes is the
 per-frame-JPEG baseline (the storage floor of an H5-of-JPEGs layout),
 compared against the canonical MCAP file size under each GOP preset.
 
@@ -36,8 +35,8 @@ class StorageRow:
     label: str
     file_bytes: int
     video_payload_bytes: int
-    # Video PAYLOAD vs the JPEG payload baseline -- the codec effect, and the
-    # number comparable to Dyna's ~68% measurement. File sizes are shown alongside
+    # Video PAYLOAD vs the JPEG payload baseline isolates the codec effect.
+    # File sizes are shown alongside
     # but are not the reduction metric: a real recording can carry hundreds of
     # MB of non-camera channels (lidar/radar/diagnostics) that pass through
     # into the canonical file and would swamp a file-level comparison.

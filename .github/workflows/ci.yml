@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Floor and current: catches accidental >3.11 syntax and new-runtime breakage.
+        # Test the supported floor and current runtime. Static analysis runs once below.
         python-version: ["3.11", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -33,10 +33,13 @@ jobs:
         # separately against the environments they own.
         run: uv sync --locked
       - name: Lint
+        if: matrix.python-version == '3.14'
         run: uv run ruff check
       - name: Format check
+        if: matrix.python-version == '3.14'
         run: uv run ruff format --check
       - name: Typecheck
+        if: matrix.python-version == '3.14'
         run: uv run ty check
       - name: Tests
         run: uv run pytest -q
@@ -59,23 +62,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Lint
+        if: matrix.python-version == '3.14'
         run: uv run --locked --project "$WORKSPACE_EXAMPLE_PROJECT" ruff check "$WORKSPACE_EXAMPLE_PROJECT"
       - name: Format check
+        if: matrix.python-version == '3.14'
         run: uv run --locked --project "$WORKSPACE_EXAMPLE_PROJECT" ruff format --check "$WORKSPACE_EXAMPLE_PROJECT"
       - name: Typecheck
+        if: matrix.python-version == '3.14'
         run: uv run --locked --project "$WORKSPACE_EXAMPLE_PROJECT" ty check --project "$WORKSPACE_EXAMPLE_PROJECT" --extra-search-path . "$WORKSPACE_EXAMPLE_PROJECT"
       - name: Tests
         run: uv run --locked --project "$WORKSPACE_EXAMPLE_PROJECT" pytest -q "$WORKSPACE_EXAMPLE_PROJECT/tests"
-
-  links:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Check markdown links
-        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2
-        with:
-          # references/ holds mirrored third-party docs whose links we don't own.
-          args: --no-progress --include-fragments --exclude '^https://github\.com/Hebbian-Robotics/hflow/(issues|security/advisories/new)$' --exclude-path references/mcap-spec.md --exclude-path references/foxglove-CompressedVideo.proto .
-          fail: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
