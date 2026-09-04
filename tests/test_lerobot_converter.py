@@ -182,6 +182,15 @@ def test_import_rejects_required_boolean_dimension_without_dataset_output(
         prep,
         "_ensure_source_archive",
         lambda source, cache_dir: {
+            "info": {
+                "features": {
+                    prep.DEFAULT_CAMERA_KEY: {
+                        "dtype": "video",
+                        "shape": [480, 640, 3],
+                        "info": {"is_depth_map": False},
+                    }
+                }
+            },
             "numeric_features": {
                 "action": {"dtype": "float32", "shape": [True]},
                 "observation.state": {"dtype": "float32", "shape": [6]},
@@ -1045,7 +1054,16 @@ def _stub_single_episode_source_archive(
 ) -> dict:
     cache_dir.mkdir(parents=True, exist_ok=True)
     return {
-        "info": {"robot_type": "pusht"},
+        "info": {
+            "robot_type": "pusht",
+            "features": {
+                prep.DEFAULT_CAMERA_KEY: {
+                    "dtype": "video",
+                    "shape": [480, 640, 3],
+                    "info": {"is_depth_map": False},
+                }
+            },
+        },
         "fps": 30,
         "data_path": "data/{chunk_index}/{file_index}.parquet",
         "video_path": "videos/{camera_key}/{chunk_index}/{file_index}.mp4",
@@ -1099,6 +1117,61 @@ def _install_publish_through_convert(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 
     monkeypatch.setattr(prep, "_convert_single_episode", fake_convert)
     return published_keys
+
+
+@pytest.mark.parametrize(
+    "depth_metadata",
+    [
+        {"info": {"is_depth_map": True}},
+        {"info": {"video.is_depth_map": True}},
+        {"video_info": {"video.is_depth_map": True}},
+        # LeRobot's own is_depth_map() is truthy, not an identity test, so a
+        # corpus marked with a string or an int is depth to LeRobot and must
+        # not be RGB to us. An `is True` check here would send exactly these
+        # down the H.264 path.
+        {"info": {"is_depth_map": "true"}},
+        {"info": {"is_depth_map": 1}},
+        {"info": {"video.is_depth_map": "yes"}},
+        {"video_info": {"video.is_depth_map": 1}},
+    ],
+)
+def test_import_refuses_a_depth_video_before_publishing_dataset_output(
+    depth_metadata: dict,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "out"
+
+    def ensure_depth_archive(dataset_source: prep.DatasetSource, cache_dir: Path) -> dict:
+        archive = _stub_single_episode_source_archive(dataset_source, cache_dir)
+        archive["info"]["features"] = {
+            prep.DEFAULT_CAMERA_KEY: {
+                "dtype": "video",
+                "shape": [24, 32, 1],
+                **depth_metadata,
+            }
+        }
+        return archive
+
+    monkeypatch.setattr(
+        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
+    )
+    monkeypatch.setattr(prep, "_ensure_source_archive", ensure_depth_archive)
+    _install_publish_through_convert(monkeypatch, tmp_path)
+
+    with pytest.raises(
+        ValueError,
+        match=r"observation\.image.*depth-map video.*cannot preserve depth values",
+    ):
+        prep.import_lerobot_dataset(
+            dataset_repo="fake/repo",
+            revision="main",
+            output_dir=output_dir,
+            episode_index=0,
+        )
+
+    assert not (output_dir / "landing").exists()
+    assert not (output_dir / "prepared-manifest.json").exists()
 
 
 def test_import_returns_local_uris_and_keeps_cache_beside_landing(

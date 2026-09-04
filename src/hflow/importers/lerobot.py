@@ -2,7 +2,7 @@
 
 The converter reads repository metadata (feature schema, fps, episode
 boundaries, video paths) instead of encoding dataset-specific assumptions.
-Every selected camera is converted into its own foxglove.CompressedVideo
+Every selected RGB camera is converted into its own foxglove.CompressedVideo
 channel; numeric state and action schemas are derived from the declared
 dtype and shape, failing loud before conversion when a feature is
 unsupported.
@@ -705,6 +705,39 @@ class _NumericSchema:
     dim: int
 
 
+def _is_depth_map_feature(feature_specification: object) -> bool:
+    """Whether LeRobot marks this feature as depth, by its own definition.
+
+    Deliberately truthy rather than ``is True``, matching LeRobot's own
+    ``is_depth_map()`` in ``lerobot/configs/video.py``, which returns
+    ``bool(info.get("is_depth_map") or ...)``. Anything LeRobot calls depth
+    must be refused here; a stricter test would let a corpus carrying
+    ``"is_depth_map": "true"`` or ``1`` through the RGB path, which is the
+    outcome the refusal exists to prevent.
+
+    Canonically ``feature["info"]["is_depth_map"]``, with the legacy
+    ``video.is_depth_map`` spelling in either ``info`` or a separate
+    ``video_info`` dict.
+    """
+    if not isinstance(feature_specification, dict):
+        return False
+    feature_information = feature_specification.get("info")
+    legacy_video_information = feature_specification.get("video_info")
+    return bool(
+        (
+            isinstance(feature_information, dict)
+            and (
+                feature_information.get("is_depth_map")
+                or feature_information.get("video.is_depth_map")
+            )
+        )
+        or (
+            isinstance(legacy_video_information, dict)
+            and legacy_video_information.get("video.is_depth_map")
+        )
+    )
+
+
 def _derive_numeric_schema(feature_name: str, feature_specification: dict) -> _NumericSchema:
     declared_dtype = feature_specification.get("dtype")
     declared_shape = feature_specification.get("shape") or []
@@ -758,9 +791,10 @@ def import_lerobot_dataset(
     or the bucket mirror under ``HFLOW_MIRROR_DIR`` -- and is never uploaded
     into a bucket root.
 
-    Dataset v3 video features and one-dimensional, fixed-width float32 state
-    and action vectors are supported. Unsupported feature layouts fail before
-    any episode is published. The returned values are the published episode
+    Dataset v3 RGB video features and one-dimensional, fixed-width float32
+    state and action vectors are supported. Depth-marked videos and other
+    unsupported feature layouts fail before any episode is published. The
+    returned values are the published episode
     URIs (absolute path strings for local roots; ``s3://`` / ``gs://`` /
     ``az://`` object URIs for buckets).
     """
@@ -812,6 +846,15 @@ def import_lerobot_dataset(
                 f"camera key '{camera_key}' not found in dataset. "
                 f"Available: {source_archive['video_keys']}"
             )
+
+    dataset_features = source_archive["info"].get("features")
+    if isinstance(dataset_features, dict):
+        for camera_key in resolved_camera_keys:
+            if _is_depth_map_feature(dataset_features.get(camera_key)):
+                raise ValueError(
+                    f"LeRobot feature '{camera_key}' is a depth-map video; HFlow's RGB H.264 "
+                    "conversion cannot preserve depth values"
+                )
 
     # Numeric schemas derived from metadata (fail before any conversion)
     numeric_schemas = {

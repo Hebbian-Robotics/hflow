@@ -92,17 +92,24 @@ channels named `/observation.state` and `/action`.
 
 | Feature | Support |
 |---|---|
-| Video features with `dtype: video` | Supported; select them with `--camera` |
+| RGB video features with `dtype: video` | Supported; select them with `--camera` |
 | One-dimensional fixed-width `float32` observation state | Supported |
 | One-dimensional fixed-width `float32` action | Supported |
 | Image-only features | Not supported |
-| Language tensors, depth maps, or arbitrary nested features | Not supported |
+| Video depth maps | Refused before publication; the RGB H.264 path cannot preserve their values |
+| Language tensors, image depth maps, or arbitrary nested features | Not supported |
 
 The importer reads `meta/info.json`, the episode index, Parquet feature
 columns, frame rate, episode boundaries, and video-path templates. Episode
 metadata split across several `meta/episodes` shards is read in full, so
 every episode keeps its own video window. It refuses an unsupported or
 missing required feature before publishing an episode.
+
+Depth video features are detected through LeRobot's current
+`info.is_depth_map` marker and its legacy `info["video.is_depth_map"]` and
+`video_info["video.is_depth_map"]` spellings. Selecting one fails before an
+episode or prepared manifest is published. Converting it through the RGB path
+would discard the depth quantization and physical-unit semantics.
 
 Every output records the source repository, resolved commit, source episode
 index, task, embodiment, importer version, and FFmpeg build. Video is encoded
