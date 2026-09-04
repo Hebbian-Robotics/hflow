@@ -29,11 +29,13 @@ from pathlib import Path
 from typing import NotRequired, TypedDict
 from urllib.parse import urlsplit
 
+from mcap.exceptions import McapError
 from mcap.writer import Writer as McapWriter
 
+from hflow.episode import Episode
 from hflow.ffmpeg import ffmpeg_path, ffmpeg_version, ffprobe_path
 from hflow.storage import LocalStorageRoot, StorageRoot, parse_storage_root
-from hflow.transform import TransformConfig, write_canonical_episode
+from hflow.transform import TransformConfig, compute_pipeline_version, write_canonical_episode
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,7 @@ DEFAULT_CAMERA_KEY = "observation.image"
 
 CONVERTER_VERSION = "lerobot-converter-v4"
 PRESENTATION_TIMESTAMP_EPSILON_S = 0.050
+_LEROBOT_TRANSFORM_CONFIG = TransformConfig(gop_seconds=1.0)
 
 # Timestamp handling
 NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -74,6 +77,58 @@ class DatasetSource:
     repo_id: str
     revision: str
     license: str
+
+
+@dataclass(frozen=True)
+class _CompletedEpisodeIdentity:
+    dataset_repo: str
+    source_revision: str
+    source_episode_index: int
+    camera_topics: frozenset[str]
+    converter_version: str
+    canonical_pipeline_version: str
+
+
+def _landing_relative_key(episode_index: int) -> str:
+    return f"landing/lerobot_episode_{episode_index + 1:04d}.mcap"
+
+
+def _completed_episode_uri(
+    storage: StorageRoot,
+    identity: _CompletedEpisodeIdentity,
+) -> str | None:
+    landing_relative_key = _landing_relative_key(identity.source_episode_index)
+    try:
+        candidate_path = storage.fetch(landing_relative_key)
+    except FileNotFoundError:
+        return None
+
+    try:
+        with Episode(candidate_path) as episode:
+            camera_topics = frozenset(episode.cameras)
+            metadata_records = episode.metadata_records
+    except (McapError, UnicodeDecodeError, ValueError, struct.error) as error:
+        logger.info(
+            "existing LeRobot episode %s is not reusable: %s",
+            storage.uri_for(landing_relative_key),
+            error,
+        )
+        return None
+
+    episode_metadata = metadata_records.get("episode/v1", {})
+    source_provenance = metadata_records.get("source-provenance/v1", {})
+    canonical_provenance = metadata_records.get("provenance/v1", {})
+    matches_identity = (
+        episode_metadata.get("source_dataset") == identity.dataset_repo
+        and episode_metadata.get("source_revision") == identity.source_revision
+        and episode_metadata.get("source_episode_index") == str(identity.source_episode_index)
+        and source_provenance.get("converter_version") == identity.converter_version
+        and camera_topics == identity.camera_topics
+        and canonical_provenance.get("pipeline_version") == identity.canonical_pipeline_version
+    )
+    if not matches_identity:
+        return None
+    return storage.uri_for(landing_relative_key)
 
 
 class _DatasetRepositoryInformation(TypedDict):
@@ -593,7 +648,8 @@ def import_lerobot_dataset(
     prefix (``s3://``, ``gs://``, ``az://``). Hugging Face downloads and MCAP
     construction use local staging under the root's workspace. Durable outputs
     are published as ``landing/*.mcap`` plus ``prepared-manifest.json`` after
-    every selected episode succeeds. The source cache (``_lerobot_cache``) stays
+    every selected episode is either verified as reusable or converted successfully.
+    The source cache (``_lerobot_cache``) stays
     in the workspace -- the local directory itself, or the bucket mirror under
     ``HFLOW_MIRROR_DIR`` -- and is never uploaded into a bucket root.
 
@@ -675,11 +731,26 @@ def import_lerobot_dataset(
         [episode_index] if episode_index is not None else list(range(len(episode_rows)))
     )
     published_episode_uris: list[str] = []
+    completed_episodes: list[dict[str, int | str]] = []
 
     dataset_source = source_archive["dataset"]
+    canonical_pipeline_version = compute_pipeline_version(_LEROBOT_TRANSFORM_CONFIG)
+    camera_topics = frozenset(f"/{camera_key}" for camera_key in resolved_camera_keys)
     for selected_episode_index in selected_episode_indexes:
-        published_episode_uris.append(
-            _convert_single_episode(
+        landing_relative_key = _landing_relative_key(selected_episode_index)
+        completed_episode_uri = _completed_episode_uri(
+            storage,
+            _CompletedEpisodeIdentity(
+                dataset_repo=dataset_source.repo_id,
+                source_revision=dataset_source.revision,
+                source_episode_index=selected_episode_index,
+                camera_topics=camera_topics,
+                converter_version=CONVERTER_VERSION,
+                canonical_pipeline_version=canonical_pipeline_version,
+            ),
+        )
+        if completed_episode_uri is None:
+            completed_episode_uri = _convert_single_episode(
                 source_archive=source_archive,
                 dataset_source=dataset_source,
                 storage=storage,
@@ -688,11 +759,17 @@ def import_lerobot_dataset(
                 numeric_schemas=numeric_schemas,
                 frames_per_second=int(source_archive["fps"]),
             )
+        published_episode_uris.append(completed_episode_uri)
+        completed_episodes.append(
+            {
+                "source_episode_index": selected_episode_index,
+                "output_key": landing_relative_key,
+            }
         )
 
     manifest_contents = json.dumps(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "dataset": {
                 "repo_id": dataset_source.repo_id,
                 "revision": dataset_source.revision,
@@ -701,6 +778,8 @@ def import_lerobot_dataset(
             "camera_keys": list(resolved_camera_keys),
             "episodes_converted": len(published_episode_uris),
             "converter_version": CONVERTER_VERSION,
+            "canonical_pipeline_version": canonical_pipeline_version,
+            "completed_episodes": completed_episodes,
         },
         indent=2,
     )
@@ -894,7 +973,7 @@ def _convert_single_episode(
 
     # Write MCAP into local staging, then publish the complete file.
     output_file_name = f"lerobot_episode_{episode_index + 1:04d}.mcap"
-    landing_relative_key = f"landing/{output_file_name}"
+    landing_relative_key = _landing_relative_key(episode_index)
 
     from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
     from mcap_protobuf.schema import build_file_descriptor_set
@@ -1000,7 +1079,7 @@ def _convert_single_episode(
         write_canonical_episode(
             source_episode_path,
             canonical_episode_path,
-            TransformConfig(gop_seconds=1.0),
+            _LEROBOT_TRANSFORM_CONFIG,
             source_uri=source_uri,
         )
         published_uri = storage.publish(canonical_episode_path, landing_relative_key)

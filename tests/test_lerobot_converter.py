@@ -16,7 +16,9 @@ from typing import cast
 import pytest
 
 import hflow.importers.lerobot as prep
+from hflow._grouped_mcap_writer import GroupedMcapWriter
 from hflow.cli import main as cli_main
+from hflow.episode import Episode
 from hflow.storage import LocalStorageRoot, StorageRoot
 
 _DERIVE = prep._derive_numeric_schema
@@ -960,6 +962,72 @@ def _stub_single_episode_source_archive(
     }
 
 
+def _write_completed_test_episode(
+    output_path: Path,
+    *,
+    dataset_source: prep.DatasetSource,
+    episode_index: int,
+    camera_keys: tuple[str, ...] = (prep.DEFAULT_CAMERA_KEY,),
+    source_revision: str | None = None,
+    conversion_marker: str = "test",
+) -> None:
+    """Write the minimal readable MCAP needed to exercise resume identity."""
+
+    with GroupedMcapWriter(output_path) as writer:
+        video_schema_id = writer.register_schema(
+            name="foxglove.CompressedVideo",
+            encoding="protobuf",
+            data=b"",
+        )
+        for camera_key in camera_keys:
+            writer.register_channel(
+                f"/{camera_key}",
+                message_encoding="protobuf",
+                schema_id=video_schema_id,
+                group="cameras",
+            )
+        writer.add_metadata(
+            "episode/v1",
+            {
+                "source_dataset": dataset_source.repo_id,
+                "source_revision": source_revision or dataset_source.revision,
+                "source_episode_index": str(episode_index),
+            },
+        )
+        writer.add_metadata(
+            "source-provenance/v1",
+            {"converter_version": prep.CONVERTER_VERSION},
+        )
+        writer.add_metadata(
+            "provenance/v1",
+            {
+                "schema_version": "1",
+                "pipeline_version": prep.compute_pipeline_version(prep._LEROBOT_TRANSFORM_CONFIG),
+            },
+        )
+        writer.add_metadata("test-conversion/v1", {"marker": conversion_marker})
+
+
+def _publish_completed_test_episode(
+    *,
+    storage: StorageRoot,
+    staging_dir: Path,
+    dataset_source: prep.DatasetSource,
+    episode_index: int,
+    camera_keys: tuple[str, ...],
+    conversion_marker: str,
+) -> str:
+    staged = staging_dir / f"staged-{episode_index}-{conversion_marker}.mcap"
+    _write_completed_test_episode(
+        staged,
+        dataset_source=dataset_source,
+        episode_index=episode_index,
+        camera_keys=camera_keys,
+        conversion_marker=conversion_marker,
+    )
+    return storage.publish(staged, prep._landing_relative_key(episode_index))
+
+
 def _install_publish_through_convert(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[str]:
     """Exercise StorageRoot.publish without running the video converter."""
 
@@ -1044,7 +1112,7 @@ def test_import_publishes_into_a_bucket_data_root_without_uploading_cache(
     assert (data_root.mirror / "_lerobot_cache" / "abc").is_dir()
 
 
-def test_import_skips_bucket_manifest_when_an_episode_publish_fails(
+def test_import_resumes_bucket_after_an_episode_publish_fails(
     tmp_path: Path,
     bucket_over_tmp: tuple[object, Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -1066,33 +1134,39 @@ def test_import_skips_bucket_manifest_when_an_episode_publish_fails(
         ]
         return archive
 
-    convert_calls = 0
+    first_failure_pending = True
+    conversion_attempt = 0
 
-    def fail_on_second_episode(
+    def fail_once_on_second_episode(
         *,
         source_archive: object,
-        dataset_source: object,
+        dataset_source: prep.DatasetSource,
         storage: StorageRoot,
         episode_index: int,
-        camera_keys: object,
+        camera_keys: tuple[str, ...],
         numeric_schemas: object,
         frames_per_second: object,
     ) -> str:
-        nonlocal convert_calls
-        del source_archive, dataset_source, camera_keys, numeric_schemas, frames_per_second
-        convert_calls += 1
-        if episode_index == 1:
+        nonlocal conversion_attempt, first_failure_pending
+        del source_archive, numeric_schemas, frames_per_second
+        conversion_attempt += 1
+        if episode_index == 1 and first_failure_pending:
+            first_failure_pending = False
             raise RuntimeError("forced publish failure")
-        relative_key = f"landing/lerobot_episode_{episode_index + 1:04d}.mcap"
-        staged = tmp_path / f"staged-{episode_index}.mcap"
-        staged.write_bytes(b"first")
-        return storage.publish(staged, relative_key)
+        return _publish_completed_test_episode(
+            storage=storage,
+            staging_dir=tmp_path,
+            dataset_source=dataset_source,
+            episode_index=episode_index,
+            camera_keys=camera_keys,
+            conversion_marker=f"attempt-{conversion_attempt}",
+        )
 
     monkeypatch.setattr(
         prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
     )
     monkeypatch.setattr(prep, "_ensure_source_archive", ensure_two_episodes)
-    monkeypatch.setattr(prep, "_convert_single_episode", fail_on_second_episode)
+    monkeypatch.setattr(prep, "_convert_single_episode", fail_once_on_second_episode)
 
     with pytest.raises(RuntimeError, match="forced publish failure"):
         prep.import_lerobot_dataset(
@@ -1101,7 +1175,138 @@ def test_import_skips_bucket_manifest_when_an_episode_publish_fails(
             output_dir=data_root,
         )
 
-    assert convert_calls == 2
-    assert (remote_dir / "landing" / "lerobot_episode_0001.mcap").is_file()
+    first_episode_path = remote_dir / "landing" / "lerobot_episode_0001.mcap"
+    first_episode_bytes = first_episode_path.read_bytes()
+    assert first_episode_path.is_file()
     assert not (remote_dir / "prepared-manifest.json").exists()
     assert "prepared-manifest.json" not in data_root.list_names()
+
+    episode_uris = prep.import_lerobot_dataset(
+        dataset_repo="fake/repo",
+        revision="main",
+        output_dir=data_root,
+    )
+
+    assert first_episode_path.read_bytes() == first_episode_bytes
+    assert episode_uris == [
+        f"{data_root.url}/landing/lerobot_episode_0001.mcap",
+        f"{data_root.url}/landing/lerobot_episode_0002.mcap",
+    ]
+    assert (remote_dir / "landing" / "lerobot_episode_0002.mcap").is_file()
+    manifest = json.loads((remote_dir / "prepared-manifest.json").read_text())
+    assert manifest == {
+        "schema_version": 3,
+        "dataset": {
+            "repo_id": "fake/repo",
+            "revision": "abc",
+            "license": "apache-2.0",
+        },
+        "camera_keys": [prep.DEFAULT_CAMERA_KEY],
+        "episodes_converted": 2,
+        "converter_version": prep.CONVERTER_VERSION,
+        "canonical_pipeline_version": prep.compute_pipeline_version(prep._LEROBOT_TRANSFORM_CONFIG),
+        "completed_episodes": [
+            {
+                "source_episode_index": 0,
+                "output_key": "landing/lerobot_episode_0001.mcap",
+            },
+            {
+                "source_episode_index": 1,
+                "output_key": "landing/lerobot_episode_0002.mcap",
+            },
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "candidate_kind",
+    ["invalid-magic", "truncated", "no-summary", "identity-mismatch"],
+)
+def test_import_replaces_unreadable_or_identity_mismatched_completed_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, candidate_kind: str
+) -> None:
+    output_dir = tmp_path / "out"
+    dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
+    landing_path = output_dir / "landing" / "lerobot_episode_0001.mcap"
+    landing_path.parent.mkdir(parents=True)
+
+    if candidate_kind == "invalid-magic":
+        landing_path.write_bytes(b"not an mcap")
+    elif candidate_kind == "truncated":
+        complete_path = tmp_path / "complete-before-truncation.mcap"
+        _write_completed_test_episode(complete_path, dataset_source=dataset_source, episode_index=0)
+        landing_path.write_bytes(complete_path.read_bytes()[:-4])
+    elif candidate_kind == "no-summary":
+        from mcap.writer import IndexType
+
+        with landing_path.open("wb") as stream:
+            writer = prep.McapWriter(
+                stream,
+                index_types=IndexType.NONE,
+                repeat_channels=False,
+                repeat_schemas=False,
+                use_statistics=False,
+                use_summary_offsets=False,
+            )
+            writer.start(profile="", library="test")
+            writer.finish()
+    elif candidate_kind == "identity-mismatch":
+        _write_completed_test_episode(
+            landing_path,
+            dataset_source=dataset_source,
+            episode_index=0,
+            source_revision="different-revision",
+            conversion_marker="stale",
+        )
+    else:
+        raise AssertionError(f"unknown candidate kind: {candidate_kind}")
+
+    candidate_bytes = landing_path.read_bytes()
+
+    monkeypatch.setattr(
+        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
+    )
+    monkeypatch.setattr(prep, "_ensure_source_archive", _stub_single_episode_source_archive)
+
+    def replace_candidate(
+        *,
+        source_archive: object,
+        dataset_source: prep.DatasetSource,
+        storage: StorageRoot,
+        episode_index: int,
+        camera_keys: tuple[str, ...],
+        numeric_schemas: object,
+        frames_per_second: object,
+    ) -> str:
+        del source_archive, numeric_schemas, frames_per_second
+        return _publish_completed_test_episode(
+            storage=storage,
+            staging_dir=tmp_path,
+            dataset_source=dataset_source,
+            episode_index=episode_index,
+            camera_keys=camera_keys,
+            conversion_marker="replacement",
+        )
+
+    monkeypatch.setattr(prep, "_convert_single_episode", replace_candidate)
+
+    episode_uris = prep.import_lerobot_dataset(
+        dataset_repo="fake/repo",
+        revision="main",
+        output_dir=output_dir,
+        episode_index=0,
+    )
+
+    assert episode_uris == [str(landing_path.resolve())]
+    assert landing_path.read_bytes() != candidate_bytes
+    with Episode(landing_path) as episode:
+        assert episode.metadata_records["episode/v1"]["source_revision"] == "abc"
+        assert episode.metadata_records["test-conversion/v1"] == {"marker": "replacement"}
+    manifest = json.loads((output_dir / "prepared-manifest.json").read_text())
+    assert manifest["schema_version"] == 3
+    assert manifest["completed_episodes"] == [
+        {
+            "source_episode_index": 0,
+            "output_key": "landing/lerobot_episode_0001.mcap",
+        }
+    ]

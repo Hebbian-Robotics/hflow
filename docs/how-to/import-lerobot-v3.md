@@ -29,7 +29,19 @@ data/lerobot_pusht/
 └── prepared-manifest.json          # source commit and import summary
 ```
 
-Re-running against the same output directory reuses downloaded source files.
+Re-running against the same output directory reuses downloaded source files. It also
+reuses a completed canonical episode when the resolved dataset commit, source episode,
+selected camera set, converter version, and canonical pipeline version all match the
+requested import. This makes an all-episodes import resumable at episode boundaries: if a
+later episode fails, retrying the same import keeps already completed episode bytes and
+converts only the remaining work.
+
+An existing landing file is reused only when it is a readable MCAP with a complete summary
+and matching identity metadata. Truncated, unreadable, or identity-mismatched files are
+converted again and atomically replaced only after the new episode succeeds. A branch or tag
+that resolves to a different commit is a different import identity, even when the revision
+name is unchanged.
+
 Run `uv run hflow doctor ./data/lerobot_pusht/landing/*.mcap` to print the
 canonical-format report.
 
@@ -49,7 +61,11 @@ Durable outputs land as `landing/*.mcap` and `prepared-manifest.json` under
 that prefix. Hugging Face downloads stay in the local mirror under
 `_lerobot_cache/` (`HFLOW_MIRROR_DIR`, or `$XDG_CACHE_HOME/hflow/mirrors`) and
 are never uploaded into the bucket. The success manifest is published only
-after every selected episode object has been written.
+after every selected episode object has been written or verified as reusable. Its schema-v3
+episode list records each completed source episode and landing output key alongside the
+resolved dataset, camera selection, converter version, and canonical pipeline version. A
+failed mid-batch attempt therefore leaves completed episode objects in place but does not
+publish a success manifest for an incomplete selected set.
 
 For a gated or private repository, export a read token as `HF_TOKEN` (or
 `HUGGING_FACE_HUB_TOKEN`) before running the command. HFlow sends the token
