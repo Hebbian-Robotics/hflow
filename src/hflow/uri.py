@@ -5,6 +5,7 @@ from posixpath import normpath
 from typing import NewType
 
 DataRootRelativeUri = NewType("DataRootRelativeUri", str)
+DataRootRelativeUri.__module__ = __name__
 
 
 def parse_data_root_relative_uri(uri: str) -> DataRootRelativeUri:

@@ -36,6 +36,7 @@ def test_runtime_command_help_has_a_description(
         ("catalog", "Group commands for inspecting and exploring the append-only"),
         ("dataset", "Group commands that turn the pipeline's policy into version-pinned"),
         ("export", "Group commands for exporting catalog selections in portable downstream"),
+        ("package", "Compile Python implementation modules into a runtime-only"),
         ("serve", "Serve this workspace over HTTP with REST endpoints over the catalog"),
     ],
 )

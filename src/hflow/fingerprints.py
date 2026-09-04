@@ -11,6 +11,7 @@ from typing import NewType, TypeAlias
 from hflow.steps import StepVersion, parse_step_version
 
 ContractFingerprint = NewType("ContractFingerprint", str)
+ContractFingerprint.__module__ = __name__
 ContractScalar: TypeAlias = str | int | float | bool | None
 NormalizedContractValue: TypeAlias = (
     ContractScalar | list["NormalizedContractValue"] | dict[str, "NormalizedContractValue"]

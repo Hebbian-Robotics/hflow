@@ -32,6 +32,7 @@ MeasurementValue = float | int | str | bool
 # implementation details. Keeping it distinct after boundary parsing prevents
 # internal code from accidentally substituting an arbitrary string.
 StepVersion = NewType("StepVersion", str)
+StepVersion.__module__ = __name__
 
 
 def parse_step_version(version: str) -> StepVersion:

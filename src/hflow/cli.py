@@ -1,7 +1,7 @@
 """Command-line entry point.
 
 Subcommands: ``curate``, ``catalog ui``, ``dataset create``, ``import lerobot``,
-``export snapshot``, ``stale``, ``doctor``, ``manifest``, the Compose runtime family
+``export snapshot``, ``stale``, ``doctor``, ``manifest``, ``package``, the Compose runtime family
 ``up``/``down``/``ingest``/``status``, ``deploy`` for bring-your-own Airflow,
 and ``serve`` for the workspace HTTP server (a separate ``hflow-server``
 package, imported only when invoked).
@@ -458,6 +458,77 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    package_parser = subparsers.add_parser(
+        "package",
+        help="build, verify, and apply target-bound native runtime overlays",
+        description=(
+            "Compile Python implementation modules into a runtime-only, target-bound Cython "
+            "overlay while preserving the installed wheel's package adapters, "
+            "metadata, entry points, and licenses."
+        ),
+    )
+    package_subparsers = package_parser.add_subparsers(
+        dest="package_command",
+        required=True,
+    )
+    package_build_parser = package_subparsers.add_parser(
+        "build",
+        help="compile a package's implementation modules into a fresh overlay",
+        description=(
+            "Build a verified Cython extension overlay for the current CPython "
+            "ABI and Linux platform. The package itself is not modified."
+        ),
+    )
+    package_build_parser.add_argument(
+        "--package-root",
+        type=Path,
+        required=True,
+        help="directory containing the installed or source Python package",
+    )
+    package_build_parser.add_argument(
+        "--package-name",
+        default=None,
+        help="fully qualified import package (default: package-root directory name)",
+    )
+    package_build_parser.add_argument(
+        "--module",
+        dest="module_names",
+        action="append",
+        default=None,
+        help=(
+            "fully qualified implementation module to compile; repeat to select "
+            "several (default: every .py except __init__.py and __main__.py)"
+        ),
+    )
+    package_build_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+        help="new directory to create for the overlay",
+    )
+    package_verify_parser = package_subparsers.add_parser(
+        "verify",
+        help="verify an overlay and optionally its applied package",
+    )
+    package_verify_parser.add_argument("overlay_dir", type=Path)
+    package_verify_parser.add_argument(
+        "--target-package-root",
+        type=Path,
+        default=None,
+        help="also verify that this package has the overlay applied",
+    )
+    package_apply_parser = package_subparsers.add_parser(
+        "apply",
+        help="safely apply a verified overlay to an exact package tree",
+    )
+    package_apply_parser.add_argument("overlay_dir", type=Path)
+    package_apply_parser.add_argument(
+        "--target-package-root",
+        type=Path,
+        required=True,
+        help="installed package directory whose matching sources will be replaced",
+    )
+
     up_parser = subparsers.add_parser(
         "up",
         help="render the Compose bundle and start the local Airflow runtime",
@@ -897,6 +968,75 @@ def _command_manifest(arguments: argparse.Namespace) -> int:
         return 2
     sys.stdout.write(app.manifest().to_json())
     return 0
+
+
+def _command_package(arguments: argparse.Namespace) -> int:
+    from hflow.packaging import (
+        CythonOverlayApplyError,
+        CythonOverlayBuildConfig,
+        CythonOverlayBuildError,
+        CythonOverlayManifestError,
+        apply_cython_overlay,
+        build_cython_overlay,
+        verify_cython_overlay,
+    )
+
+    try:
+        if arguments.package_command == "build":
+            manifest = build_cython_overlay(
+                CythonOverlayBuildConfig(
+                    package_root=arguments.package_root,
+                    package_name=arguments.package_name,
+                    module_names=(
+                        tuple(arguments.module_names)
+                        if arguments.module_names is not None
+                        else None
+                    ),
+                ),
+                arguments.output_dir,
+            )
+            print(
+                f"native overlay: {arguments.output_dir} "
+                f"({len(manifest.artifacts)} modules, {manifest.bundle_digest})"
+            )
+            return 0
+        if arguments.package_command == "verify":
+            outcome = verify_cython_overlay(
+                arguments.overlay_dir,
+                target_package_root=arguments.target_package_root,
+            )
+            if outcome.succeeded:
+                checked_target = (
+                    f" and applied package {arguments.target_package_root}"
+                    if arguments.target_package_root is not None
+                    else ""
+                )
+                print(f"native overlay verified: {arguments.overlay_dir}{checked_target}")
+                return 0
+            for issue in outcome.issues:
+                issue_context = f": {issue.path}" if issue.path is not None else ""
+                print(f"package verify: {issue.code.value}{issue_context}", file=sys.stderr)
+            return 1
+        if arguments.package_command == "apply":
+            manifest = apply_cython_overlay(
+                arguments.overlay_dir,
+                arguments.target_package_root,
+            )
+            print(
+                f"native overlay applied: {arguments.target_package_root} "
+                f"({len(manifest.artifacts)} modules, {manifest.bundle_digest})"
+            )
+            return 0
+        raise AssertionError(f"unhandled package command {arguments.package_command!r}")
+    except (
+        CythonOverlayApplyError,
+        CythonOverlayBuildError,
+        CythonOverlayManifestError,
+        FileExistsError,
+        OSError,
+    ) as error:
+        print(f"package {arguments.package_command}: {error}", file=sys.stderr)
+        return 2
 
 
 def _command_stale(arguments: argparse.Namespace) -> int:
@@ -1510,6 +1650,8 @@ def main(argv: list[str] | None = None) -> int:
         return _command_doctor(arguments)
     if arguments.command == "manifest":
         return _command_manifest(arguments)
+    if arguments.command == "package":
+        return _command_package(arguments)
     if arguments.command == "up":
         return _command_up(arguments)
     if arguments.command == "deploy":

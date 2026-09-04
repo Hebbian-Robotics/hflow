@@ -30,9 +30,21 @@ jobs:
         run: |
           uv venv --python 3.11 .release-venv
           wheel_path="$(printf '%s\n' dist/*.whl)"
-          uv pip install --python .release-venv/bin/python "${wheel_path}"
+          uv pip install --python .release-venv/bin/python "${wheel_path}[native-build]"
           .release-venv/bin/hflow --help
           .release-venv/bin/python scripts/smoke_test_installed_wheel.py
+          package_root="$(.release-venv/bin/python -c \
+            'from pathlib import Path; import hflow; print(Path(hflow.__file__).parent)')"
+          .release-venv/bin/hflow package build \
+            --package-root "${package_root}" \
+            --module hflow.uri \
+            --output-dir .release-native-overlay
+          .release-venv/bin/hflow package apply .release-native-overlay \
+            --target-package-root "${package_root}"
+          .release-venv/bin/hflow package verify .release-native-overlay \
+            --target-package-root "${package_root}"
+          .release-venv/bin/python -c \
+            'import hflow.uri; assert hflow.uri.__file__.endswith(".so")'
       - name: Upload distributions for publishing
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
