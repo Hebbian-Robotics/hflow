@@ -16,6 +16,7 @@ from typing import cast
 import pytest
 
 import hflow.importers.lerobot as prep
+from hflow.catalog import content_episode_id
 from hflow.cli import main as cli_main
 from hflow.storage import LocalStorageRoot, StorageRoot
 
@@ -328,7 +329,7 @@ def test_video_cache_distinguishes_file_indices_and_reuses_same_source(
 
     published_uris: list[str] = []
     for episode_index in (0, 1, 0):
-        uri = prep._convert_single_episode(
+        published_episode = prep._convert_single_episode(
             source_archive=source_archive,
             dataset_source=dataset_source,
             storage=LocalStorageRoot(tmp_path / "output"),
@@ -337,7 +338,7 @@ def test_video_cache_distinguishes_file_indices_and_reuses_same_source(
             numeric_schemas=numeric_schemas,
             frames_per_second=30,
         )
-        published_uris.append(uri)
+        published_uris.append(published_episode.published_uri)
 
     assert published_uris[0].endswith("landing/lerobot_episode_0001.mcap")
     assert published_uris[1].endswith("landing/lerobot_episode_0002.mcap")
@@ -960,6 +961,60 @@ def _stub_single_episode_source_archive(
     }
 
 
+def _stub_three_one_frame_source_archive(
+    dataset_source: prep.DatasetSource, cache_dir: Path
+) -> dict:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    data_path = cache_dir / "data" / "chunk-000000-file-000000.parquet"
+    data_path.parent.mkdir(parents=True, exist_ok=True)
+    escaped_data_path = str(data_path).replace("'", "''")
+
+    import duckdb
+
+    connection = duckdb.connect()
+    try:
+        connection.execute(
+            "COPY (SELECT * FROM (VALUES "
+            "(0, 0, 0, 0.0::DOUBLE, [1.0], [1.5]), "
+            "(1, 1, 0, 0.0::DOUBLE, [2.0], [2.5]), "
+            "(2, 2, 0, 0.0::DOUBLE, [3.0], [3.5])) "
+            'AS t(index, episode_index, frame_index, timestamp, "observation.state", action)) '
+            f"TO '{escaped_data_path}' (FORMAT parquet)"
+        )
+    finally:
+        connection.close()
+
+    video_path = cache_dir / "videos" / "observation_image-chunk000-file000.mp4"
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    video_path.write_bytes(b"stub-video")
+
+    return {
+        "info": {"robot_type": "pusht"},
+        "fps": 30,
+        "data_path": "data/{chunk_index}/{file_index}.parquet",
+        "video_path": "videos/{camera_key}/{chunk_index}/{file_index}.mp4",
+        "episodes": [
+            {
+                "episode_index": episode_index,
+                "task": f"push-{episode_index}",
+                "length": 1,
+                "data_chunk": "000",
+                "data_file": "000",
+                "data_from": episode_index,
+                "data_to": episode_index + 1,
+            }
+            for episode_index in range(3)
+        ],
+        "video_keys": [prep.DEFAULT_CAMERA_KEY],
+        "numeric_features": {
+            "action": {"dtype": "float32", "shape": [1]},
+            "observation.state": {"dtype": "float32", "shape": [1]},
+        },
+        "cache_dir": cache_dir,
+        "dataset": dataset_source,
+    }
+
+
 def _install_publish_through_convert(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[str]:
     """Exercise StorageRoot.publish without running the video converter."""
 
@@ -974,13 +1029,21 @@ def _install_publish_through_convert(monkeypatch: pytest.MonkeyPatch, tmp_path: 
         camera_keys: object,
         numeric_schemas: object,
         frames_per_second: object,
-    ) -> str:
+    ) -> prep._PublishedEpisode:
         del source_archive, dataset_source, camera_keys, numeric_schemas, frames_per_second
         relative_key = f"landing/lerobot_episode_{episode_index + 1:04d}.mcap"
         staged = tmp_path / f"staged-{episode_index}.mcap"
         staged.write_bytes(f"episode-{episode_index}".encode())
         published_keys.append(relative_key)
-        return storage.publish(staged, relative_key)
+        episode_content_id = content_episode_id(staged)
+        episode_size_bytes = staged.stat().st_size
+        published_uri = storage.publish(staged, relative_key)
+        return prep._PublishedEpisode(
+            published_uri=published_uri,
+            filename=Path(relative_key).name,
+            content_id=episode_content_id,
+            size_bytes=episode_size_bytes,
+        )
 
     monkeypatch.setattr(prep, "_convert_single_episode", fake_convert)
     return published_keys
@@ -1007,6 +1070,59 @@ def test_import_returns_local_uris_and_keeps_cache_beside_landing(
     assert Path(episode_uris[0]).is_file()
     assert (output_dir / "prepared-manifest.json").is_file()
     assert (output_dir / "_lerobot_cache" / "abc").is_dir()
+
+
+def test_import_manifest_v3_records_each_published_episode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_dir = tmp_path / "out"
+    dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
+    source_archive = _stub_three_one_frame_source_archive(dataset_source, tmp_path / "cache")
+
+    monkeypatch.setattr(
+        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
+    )
+    monkeypatch.setattr(prep, "_ensure_source_archive", lambda source, cache_dir: source_archive)
+    monkeypatch.setattr(prep, "_transcode_mp4_to_h264", lambda path, *args: [b"access-unit"])
+    monkeypatch.setattr(prep, "_get_video_pts_times", lambda path: [0.0])
+    monkeypatch.setattr(prep, "ffmpeg_version", lambda: "test-ffmpeg")
+    monkeypatch.setattr(
+        prep,
+        "write_canonical_episode",
+        lambda source_path, output_path, *_args, **_kwargs: shutil.copy(source_path, output_path),
+    )
+
+    episode_uris = prep.import_lerobot_dataset(
+        dataset_repo="fake/repo",
+        revision="main",
+        output_dir=output_dir,
+    )
+
+    landing_paths = sorted((output_dir / "landing").glob("*.mcap"))
+    assert episode_uris == [str(path.resolve()) for path in landing_paths]
+    assert [path.name for path in landing_paths] == [
+        "lerobot_episode_0001.mcap",
+        "lerobot_episode_0002.mcap",
+        "lerobot_episode_0003.mcap",
+    ]
+
+    manifest = json.loads((output_dir / "prepared-manifest.json").read_text())
+    manifest_episodes = manifest["episodes"]
+    assert manifest["schema_version"] == 3
+    assert manifest["dataset"] == {
+        "repo_id": "fake/repo",
+        "revision": "abc",
+        "license": "apache-2.0",
+    }
+    assert manifest["camera_keys"] == [prep.DEFAULT_CAMERA_KEY]
+    assert manifest["episodes_converted"] == len(manifest_episodes) == 3
+    assert manifest["converter_version"] == prep.CONVERTER_VERSION
+    assert [episode["filename"] for episode in manifest_episodes] == [
+        path.name for path in landing_paths
+    ]
+    for manifest_episode, landing_path in zip(manifest_episodes, landing_paths, strict=True):
+        assert manifest_episode["size_bytes"] == landing_path.stat().st_size
+        assert manifest_episode["content_id"] == content_episode_id(landing_path)
 
 
 def test_import_publishes_into_a_bucket_data_root_without_uploading_cache(
@@ -1077,7 +1193,7 @@ def test_import_skips_bucket_manifest_when_an_episode_publish_fails(
         camera_keys: object,
         numeric_schemas: object,
         frames_per_second: object,
-    ) -> str:
+    ) -> prep._PublishedEpisode:
         nonlocal convert_calls
         del source_archive, dataset_source, camera_keys, numeric_schemas, frames_per_second
         convert_calls += 1
@@ -1086,7 +1202,15 @@ def test_import_skips_bucket_manifest_when_an_episode_publish_fails(
         relative_key = f"landing/lerobot_episode_{episode_index + 1:04d}.mcap"
         staged = tmp_path / f"staged-{episode_index}.mcap"
         staged.write_bytes(b"first")
-        return storage.publish(staged, relative_key)
+        episode_content_id = content_episode_id(staged)
+        episode_size_bytes = staged.stat().st_size
+        published_uri = storage.publish(staged, relative_key)
+        return prep._PublishedEpisode(
+            published_uri=published_uri,
+            filename=Path(relative_key).name,
+            content_id=episode_content_id,
+            size_bytes=episode_size_bytes,
+        )
 
     monkeypatch.setattr(
         prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}

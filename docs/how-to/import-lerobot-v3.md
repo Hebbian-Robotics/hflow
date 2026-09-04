@@ -26,7 +26,7 @@ data/lerobot_pusht/
 ├── _lerobot_cache/                 # downloaded metadata, Parquet, and video
 ├── landing/
 │   └── lerobot_episode_0001.mcap   # canonical episode
-└── prepared-manifest.json          # source commit and import summary
+└── prepared-manifest.json          # source commit, import summary, and episode receipts
 ```
 
 Re-running against the same output directory reuses downloaded source files.
@@ -50,6 +50,37 @@ that prefix. Hugging Face downloads stay in the local mirror under
 `_lerobot_cache/` (`HFLOW_MIRROR_DIR`, or `$XDG_CACHE_HOME/hflow/mirrors`) and
 are never uploaded into the bucket. The success manifest is published only
 after every selected episode object has been written.
+
+`prepared-manifest.json` uses schema version 3. It keeps the dataset source,
+selected camera keys, converted episode count, and converter version, and adds
+one receipt for every published canonical MCAP:
+
+```json
+{
+  "schema_version": 3,
+  "dataset": {
+    "repo_id": "lerobot/pusht",
+    "revision": "0123456789abcdef0123456789abcdef01234567",
+    "license": "apache-2.0"
+  },
+  "camera_keys": ["observation.image"],
+  "episodes_converted": 1,
+  "episodes": [
+    {
+      "filename": "lerobot_episode_0001.mcap",
+      "content_id": "0123456789abcdef",
+      "size_bytes": 123456
+    }
+  ],
+  "converter_version": "lerobot-converter-v4"
+}
+```
+
+Each `content_id` is HFlow's canonical episode content ID (the first 16 hex
+characters of the SHA-256 over the published MCAP bytes), and `size_bytes` is
+the file size in bytes. `episodes_converted` remains equal to the number of
+entries in `episodes`, so readers that use the existing import summary fields
+can continue to do so while newer readers can identify each delivered file.
 
 For a gated or private repository, export a read token as `HF_TOKEN` (or
 `HUGGING_FACE_HUB_TOKEN`) before running the command. HFlow sends the token

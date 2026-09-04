@@ -31,6 +31,7 @@ from urllib.parse import urlsplit
 
 from mcap.writer import Writer as McapWriter
 
+from hflow.catalog import content_episode_id
 from hflow.ffmpeg import ffmpeg_path, ffmpeg_version, ffprobe_path
 from hflow.storage import LocalStorageRoot, StorageRoot, parse_storage_root
 from hflow.transform import TransformConfig, write_canonical_episode
@@ -74,6 +75,14 @@ class DatasetSource:
     repo_id: str
     revision: str
     license: str
+
+
+@dataclass(frozen=True)
+class _PublishedEpisode:
+    published_uri: str
+    filename: str
+    content_id: str
+    size_bytes: int
 
 
 class _DatasetRepositoryInformation(TypedDict):
@@ -674,11 +683,11 @@ def import_lerobot_dataset(
     selected_episode_indexes = (
         [episode_index] if episode_index is not None else list(range(len(episode_rows)))
     )
-    published_episode_uris: list[str] = []
+    published_episodes: list[_PublishedEpisode] = []
 
     dataset_source = source_archive["dataset"]
     for selected_episode_index in selected_episode_indexes:
-        published_episode_uris.append(
+        published_episodes.append(
             _convert_single_episode(
                 source_archive=source_archive,
                 dataset_source=dataset_source,
@@ -692,14 +701,22 @@ def import_lerobot_dataset(
 
     manifest_contents = json.dumps(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "dataset": {
                 "repo_id": dataset_source.repo_id,
                 "revision": dataset_source.revision,
                 "license": dataset_source.license,
             },
             "camera_keys": list(resolved_camera_keys),
-            "episodes_converted": len(published_episode_uris),
+            "episodes_converted": len(published_episodes),
+            "episodes": [
+                {
+                    "filename": episode.filename,
+                    "content_id": episode.content_id,
+                    "size_bytes": episode.size_bytes,
+                }
+                for episode in published_episodes
+            ],
             "converter_version": CONVERTER_VERSION,
         },
         indent=2,
@@ -710,7 +727,7 @@ def import_lerobot_dataset(
         temporary_manifest_path.write_text(manifest_contents + "\n", encoding="utf-8")
         published_manifest_uri = storage.publish(temporary_manifest_path, "prepared-manifest.json")
     logger.info("wrote LeRobot import manifest %s", published_manifest_uri)
-    return published_episode_uris
+    return [episode.published_uri for episode in published_episodes]
 
 
 def _convert_single_episode(
@@ -721,10 +738,10 @@ def _convert_single_episode(
     camera_keys: tuple[str, ...],
     numeric_schemas: dict[str, _NumericSchema],
     frames_per_second: int,
-) -> str:
+) -> _PublishedEpisode:
     """Convert a single episode to canonical MCAP and publish it.
 
-    Returns the published episode URI under ``landing/``.
+    Returns the published episode receipt under ``landing/``.
     """
     import duckdb
 
@@ -1003,15 +1020,21 @@ def _convert_single_episode(
             TransformConfig(gop_seconds=1.0),
             source_uri=source_uri,
         )
-        published_uri = storage.publish(canonical_episode_path, landing_relative_key)
+        episode_content_id = content_episode_id(canonical_episode_path)
         episode_size_bytes = canonical_episode_path.stat().st_size
+        published_uri = storage.publish(canonical_episode_path, landing_relative_key)
 
     logger.info(
         "wrote canonical LeRobot episode %s (%.2f MB)",
         published_uri,
         episode_size_bytes / 1_000_000,
     )
-    return published_uri
+    return _PublishedEpisode(
+        published_uri=published_uri,
+        filename=output_file_name,
+        content_id=episode_content_id,
+        size_bytes=episode_size_bytes,
+    )
 
 
 __all__ = ["import_lerobot_dataset"]
