@@ -17,6 +17,7 @@ import pytest
 
 import hflow.importers.lerobot as prep
 from hflow.cli import main as cli_main
+from hflow.reader import open_reader
 from hflow.storage import LocalStorageRoot, StorageRoot
 
 _DERIVE = prep._derive_numeric_schema
@@ -1105,7 +1106,88 @@ def test_import_returns_local_uris_and_keeps_cache_beside_landing(
     assert episode_uris == [str((output_dir / "landing" / "lerobot_episode_0001.mcap").resolve())]
     assert Path(episode_uris[0]).is_file()
     assert (output_dir / "prepared-manifest.json").is_file()
+    manifest_payload = json.loads((output_dir / "prepared-manifest.json").read_text())
+    assert manifest_payload == {
+        "schema_version": 2,
+        "dataset": {
+            "repo_id": "fake/repo",
+            "revision": "abc",
+            "license": "apache-2.0",
+        },
+        "camera_keys": [prep.DEFAULT_CAMERA_KEY],
+        "episodes_converted": 1,
+        "converter_version": prep.CONVERTER_VERSION,
+    }
     assert (output_dir / "_lerobot_cache" / "abc").is_dir()
+
+
+def test_converter_version_reaches_the_canonical_episode_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    corpus = _build_fake_corpus(tmp_path)
+    camera_key = "observation.images.up"
+    dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
+    source_archive = cast(
+        prep._SourceArchive,
+        {
+            **corpus,
+            "episodes": [
+                {
+                    "episode_index": 0,
+                    "task": "pick-and-place",
+                    "length": 1,
+                    "data_chunk": "000",
+                    "data_file": "000",
+                    "data_from": 0,
+                    "data_to": 1,
+                    "video_windows": {
+                        camera_key: {
+                            "chunk_index": "000",
+                            "file_index": "000",
+                            "from_timestamp": 0.0,
+                            "to_timestamp": 0.0,
+                        }
+                    },
+                }
+            ],
+            "video_keys": [camera_key],
+        },
+    )
+    numeric_schemas = {
+        "observation.state": prep._NumericSchema(name="observation.state", dim=6),
+        "action": prep._NumericSchema(name="action", dim=6),
+    }
+
+    def fake_download(url: str, destination_path: Path, **_kwargs: object) -> None:
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        if "/videos/" in url:
+            destination_path.write_bytes(url.encode())
+            return
+        shutil.copy(tmp_path / "data" / "chunk-000" / "file-000.parquet", destination_path)
+
+    monkeypatch.setattr(prep, "_download_file", fake_download)
+    monkeypatch.setattr(prep, "_transcode_mp4_to_h264", lambda *args, **kwargs: [b"access-unit"])
+    monkeypatch.setattr(prep, "_get_video_pts_times", lambda path: [0])
+    monkeypatch.setattr(prep, "ffmpeg_version", lambda: "test-ffmpeg")
+    monkeypatch.setattr(
+        prep,
+        "write_canonical_episode",
+        lambda source_path, output_path, *args, **kwargs: shutil.copy(source_path, output_path),
+    )
+
+    uri = prep._convert_single_episode(
+        source_archive=source_archive,
+        dataset_source=dataset_source,
+        storage=LocalStorageRoot(tmp_path / "output"),
+        episode_index=0,
+        camera_keys=(camera_key,),
+        numeric_schemas=numeric_schemas,
+        frames_per_second=30,
+    )
+
+    episode_metadata = open_reader(uri).metadata()
+    assert episode_metadata["episode/v1"]["converter_version"] == prep.CONVERTER_VERSION
+    assert episode_metadata["source-provenance/v1"]["converter_version"] == prep.CONVERTER_VERSION
 
 
 def test_import_publishes_into_a_bucket_data_root_without_uploading_cache(
