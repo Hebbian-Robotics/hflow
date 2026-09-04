@@ -18,9 +18,22 @@ You need:
 
 - Git and [uv](https://docs.astral.sh/uv/)
 - Python 3.11 or newer
+- A system C compiler/toolchain that provides `cc` for the native-overlay tests
 - ffmpeg and ffprobe on `PATH` for the test suite
 - Docker with Compose v2 only when working on the Airflow runtime integration
 - [lychee](https://github.com/lycheeverse/lychee) when editing Markdown links
+
+`uv sync --locked` installs the Python-side native-build dependencies, including
+Cython and setuptools, but it cannot install the system compiler they invoke.
+Before running the default suite, confirm that a compiler is available:
+
+```bash
+command -v cc
+```
+
+On Ubuntu (including WSL2), install the toolchain with
+`sudo apt-get install build-essential` if that command prints nothing. On
+macOS, install the Xcode Command Line Tools with `xcode-select --install`.
 
 ## Platform support
 
