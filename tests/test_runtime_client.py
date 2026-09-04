@@ -39,6 +39,7 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
     task_instance_page_overlap: ClassVar[int] = 0
     task_instance_max_page_limit: ClassVar[int | None] = None
     task_instance_omit_total: ClassVar[bool] = False
+    task_instance_ignores_offset: ClassVar[bool] = False
 
     def _read_json(self) -> dict[str, Any] | None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -111,6 +112,15 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
             for index in range(type(self).mapped_instance_count)
         ]
         start = max(0, offset - type(self).task_instance_page_overlap)
+        if type(self).task_instance_ignores_offset:
+            # Serves the first page whatever the offset, while total_entries
+            # still claims there is more. Nothing new ever arrives and the
+            # response is never empty, so the offset and the total both fail as
+            # stopping conditions. Bounded at six pages so a client that cannot
+            # stop fails its test rather than hanging the suite.
+            start = 0
+            if len(type(self).task_instance_pages_served) > 6:
+                return {"task_instances": [], "total_entries": len(every_instance)}
         page: dict[str, Any] = {"task_instances": every_instance[start : start + limit]}
         if not type(self).task_instance_omit_total:
             page["total_entries"] = len(every_instance)
@@ -217,6 +227,7 @@ def _reset_stub_airflow_state() -> None:
     _StubAirflowHandler.task_instance_page_overlap = 0
     _StubAirflowHandler.task_instance_max_page_limit = None
     _StubAirflowHandler.task_instance_omit_total = False
+    _StubAirflowHandler.task_instance_ignores_offset = False
 
 
 @pytest.fixture(scope="module")
@@ -884,6 +895,23 @@ def test_task_instances_keeps_paging_when_pages_overlap(stub_server: str) -> Non
     mapped = {entry.map_index for entry in instances if entry.task_id == "process_batch"}
     assert mapped == set(range(250))
     assert len(instances) == 251
+
+
+def test_task_instances_stops_when_a_page_repeats_what_was_already_read(
+    stub_server: str,
+) -> None:
+    # A server that ignores offset and reports a total it never delivers: the
+    # offset never catches the total and no page is ever empty, so the only
+    # thing that ends the loop is the page that added nothing new.
+    _StubAirflowHandler.mapped_instance_count = 250
+    _StubAirflowHandler.task_instance_ignores_offset = True
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    instances = client.task_instances("pipeline_ingest", "manual__1")
+
+    assert len(_StubAirflowHandler.task_instance_pages_served) == 2
+    # What it did read comes back whole rather than duplicated.
+    assert len(instances) == len({(entry.task_id, entry.map_index) for entry in instances})
 
 
 def test_task_instances_raises_when_a_page_carries_no_list(stub_server: str) -> None:
