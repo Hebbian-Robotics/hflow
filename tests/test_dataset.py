@@ -8,8 +8,14 @@ import pytest
 
 import hflow
 from hflow.cli import main as cli_main
-from hflow.dataset import create_dataset, dataset_slug, default_dataset_sql
+from hflow.dataset import (
+    DATASET_MANIFEST_VERSION,
+    create_dataset,
+    dataset_slug,
+    default_dataset_sql,
+)
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
+from hflow.workspace import Workspace
 
 PIPELINE_SOURCE = """
 import hflow
@@ -145,7 +151,16 @@ class TestArtifacts:
         _ingest(ingested_project, monkeypatch)
         app = hflow.import_pipeline_application(str(ingested_project / "pipeline.py"))
 
-        dataset = create_dataset(app, "Clean Corpus!")
+        # Minted here because ingest does not mint one, and the assertion is
+        # only worth making against a real id: with none stored the field is
+        # None, which is also what dropping it from the payload would look like.
+        workspace_id = Workspace(app.storage_root).ensure_identity().workspace_id
+
+        # Passed rather than defaulted, so the assertion below pins that the
+        # sidecar records the caller's stamp and not a second now() taken inside
+        # _sidecar_payload.
+        stamped_at = "2026-01-02T03:04:05+00:00"
+        dataset = create_dataset(app, "Clean Corpus!", created_at=stamped_at)
 
         manifest_file = Path(dataset.manifest_path)
         sidecar_file = Path(dataset.sidecar_path)
@@ -160,12 +175,30 @@ class TestArtifacts:
         assert len(episode_ids) == 1
 
         provenance = json.loads(sidecar_file.read_text())
-        assert provenance["name"] == "Clean Corpus!"
-        assert provenance["sql"] == dataset.sql
-        assert provenance["row_count"] == 1
         assert provenance["pipeline"]["pipeline_name"] == "dataset-demo"
         assert provenance["pipeline"]["pipeline_version"] == app.pipeline_version
         assert [check["name"] for check in provenance["pipeline"]["checks"]] == ["duration"]
+
+        # The rest of the payload as one dict, so a key going missing fails here
+        # as loudly as a key holding the wrong value. `pipeline` is compared
+        # above instead: it is the whole manifest, and pinning it whole would
+        # mean restating every check on every pipeline change.
+        assert provenance.pop("pipeline")
+        assert provenance == {
+            # Imported rather than written as a literal, so bumping the schema
+            # moves this test and a bump nobody meant fails it.
+            "dataset_manifest_version": DATASET_MANIFEST_VERSION,
+            "name": "Clean Corpus!",
+            "created_at": stamped_at,
+            "sql": dataset.sql,
+            "row_count": 1,
+            "total_episodes": 1,
+            # Real numbers, not merely a non-empty list: the auditability claim
+            # is that this says how many episodes each check actually ran on,
+            # and an empty list reads the same as a full one without them.
+            "coverage": [{"check_name": "duration", "episodes_ran": 1, "total_episodes": 1}],
+            "workspace_id": workspace_id,
+        }
 
     def test_two_datasets_of_one_name_never_overwrite(
         self, ingested_project: Path, monkeypatch: pytest.MonkeyPatch
