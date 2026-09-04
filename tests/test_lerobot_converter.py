@@ -427,6 +427,7 @@ def test_video_cache_distinguishes_file_indices_and_reuses_same_source(
     )
 
     published_uris: list[str] = []
+    receipts: list[prep._PublishedEpisode] = []
     for episode_index in (0, 1, 0):
         receipt = prep._convert_single_episode(
             source_archive=source_archive,
@@ -438,9 +439,18 @@ def test_video_cache_distinguishes_file_indices_and_reuses_same_source(
             frames_per_second=30,
         )
         published_uris.append(receipt["uri"])
+        receipts.append(receipt)
 
     assert published_uris[0].endswith("landing/lerobot_episode_0001.mcap")
     assert published_uris[1].endswith("landing/lerobot_episode_0002.mcap")
+
+    # The manifest tests build their receipts in the convert stub, so this is
+    # the only place the real function's receipt is checked against the object
+    # it published rather than against a value the test wrote itself.
+    for receipt in receipts:
+        landed_path = Path(receipt["uri"])
+        assert receipt["content_id"] == prep.content_episode_id(landed_path)
+        assert receipt["size_bytes"] == landed_path.stat().st_size
 
     video_urls = [
         "https://huggingface.co/datasets/fake/repo/resolve/abc/videos/"
@@ -1112,8 +1122,9 @@ def test_import_returns_local_uris_and_keeps_cache_beside_landing(
     assert Path(episode_uris[0]).is_file()
     assert (output_dir / "prepared-manifest.json").is_file()
     manifest_payload = json.loads((output_dir / "prepared-manifest.json").read_text())
+    landed_episode_path = output_dir / "landing" / "lerobot_episode_0001.mcap"
     assert manifest_payload == {
-        "schema_version": 2,
+        "schema_version": 3,
         "dataset": {
             "repo_id": "fake/repo",
             "revision": "abc",
@@ -1121,6 +1132,13 @@ def test_import_returns_local_uris_and_keeps_cache_beside_landing(
         },
         "camera_keys": [prep.DEFAULT_CAMERA_KEY],
         "episodes_converted": 1,
+        "episodes": [
+            {
+                "uri": episode_uris[0],
+                "content_id": prep.content_episode_id(landed_episode_path),
+                "size_bytes": landed_episode_path.stat().st_size,
+            }
+        ],
         "converter_version": prep.CONVERTER_VERSION,
     }
     assert (output_dir / "_lerobot_cache" / "abc").is_dir()
@@ -1191,7 +1209,7 @@ def test_converter_version_reaches_the_canonical_episode_provenance(
         lambda source_path, output_path, *args, **kwargs: shutil.copy(source_path, output_path),
     )
 
-    uri = prep._convert_single_episode(
+    receipt = prep._convert_single_episode(
         source_archive=source_archive,
         dataset_source=dataset_source,
         storage=LocalStorageRoot(tmp_path / "output"),
@@ -1201,7 +1219,7 @@ def test_converter_version_reaches_the_canonical_episode_provenance(
         frames_per_second=30,
     )
 
-    episode_metadata = open_reader(uri).metadata()
+    episode_metadata = open_reader(receipt["uri"]).metadata()
     assert episode_metadata["episode/v1"]["converter_version"] == prep.CONVERTER_VERSION
     assert episode_metadata["source-provenance/v1"]["converter_version"] == prep.CONVERTER_VERSION
 
