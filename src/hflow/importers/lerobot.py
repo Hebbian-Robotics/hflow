@@ -33,6 +33,8 @@ from mcap.writer import Writer as McapWriter
 
 from hflow.catalog import content_episode_id
 from hflow.ffmpeg import ffmpeg_path, ffmpeg_version, ffprobe_path
+from hflow.format import METADATA_RECORD_EPISODE, METADATA_RECORD_PROVENANCE
+from hflow.reader import open_reader
 from hflow.storage import LocalStorageRoot, StorageRoot, parse_storage_root
 from hflow.transform import TransformConfig, write_canonical_episode
 
@@ -48,7 +50,13 @@ DEFAULT_CAMERA_KEY = "observation.image"
 # Multi-shard corpora previously published episodes with the wrong video
 # window or the wrong source episode, so their outputs must not share an
 # identity with the corrected ones.
-CONVERTER_VERSION = "lerobot-converter-v5"
+# "v6": episode/v1 records camera_keys and gop_seconds so a resumable import
+# can prove a landing file belongs to this exact selection (#303). Those
+# fields change the canonical bytes that content_episode_id hashes, so v5
+# and v6 outputs must not share a converter identity.
+CONVERTER_VERSION = "lerobot-converter-v6"
+# Canonical transform knobs that affect published bytes for this importer.
+IMPORT_GOP_SECONDS = 1.0
 PRESENTATION_TIMESTAMP_EPSILON_S = 0.050
 EPISODE_METADATA_TREE_PREFIX = PurePosixPath("meta/episodes")
 
@@ -113,6 +121,101 @@ class _SourceArchive(TypedDict):
     numeric_features: dict[str, dict]
     cache_dir: Path
     dataset: DatasetSource
+
+
+def _landing_relative_key(episode_index: int) -> str:
+    return f"landing/lerobot_episode_{episode_index + 1:04d}.mcap"
+
+
+def _encode_camera_keys(camera_keys: Sequence[str]) -> str:
+    return json.dumps(list(camera_keys), separators=(",", ":"))
+
+
+def _decode_camera_keys(encoded: str) -> tuple[str, ...] | None:
+    try:
+        decoded = json.loads(encoded)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(decoded, list) or not all(isinstance(key, str) for key in decoded):
+        return None
+    return tuple(decoded)
+
+
+def _episode_identity_matches(
+    local_episode_path: Path,
+    *,
+    dataset_source: DatasetSource,
+    episode_index: int,
+    camera_keys: tuple[str, ...],
+) -> bool:
+    """True when a published landing file belongs to this exact import."""
+    from mcap.exceptions import McapError
+
+    reader = None
+    try:
+        if local_episode_path.stat().st_size < 1:
+            return False
+        reader = open_reader(local_episode_path)
+        metadata_records = reader.metadata()
+    except (OSError, McapError, ValueError):
+        # Damaged, truncated, or non-MCAP landing files are not completed work.
+        # Broader exceptions (bugs in the reader) must still surface.
+        return False
+    finally:
+        if reader is not None:
+            reader.close()
+
+    episode_metadata = metadata_records.get(METADATA_RECORD_EPISODE, {})
+    # write_canonical_episode preserves source episode/v1 and stamps
+    # provenance/v1 with the transform's gop_seconds; source-provenance/v1
+    # is copied through from the importer.
+    provenance_metadata = metadata_records.get(METADATA_RECORD_PROVENANCE, {})
+    source_provenance = metadata_records.get("source-provenance/v1", {})
+    recorded_camera_keys = _decode_camera_keys(episode_metadata.get("camera_keys", ""))
+    if recorded_camera_keys is None:
+        return False
+    expected_gop = f"{IMPORT_GOP_SECONDS:g}"
+    return (
+        episode_metadata.get("source_dataset") == dataset_source.repo_id
+        and episode_metadata.get("source_revision") == dataset_source.revision
+        and episode_metadata.get("source_episode_index") == str(episode_index)
+        and episode_metadata.get("converter_version") == CONVERTER_VERSION
+        and source_provenance.get("converter_version") == CONVERTER_VERSION
+        and recorded_camera_keys == camera_keys
+        and episode_metadata.get("gop_seconds") == expected_gop
+        and provenance_metadata.get("gop_seconds") == expected_gop
+    )
+
+
+def _try_reuse_completed_episode(
+    storage: StorageRoot,
+    *,
+    dataset_source: DatasetSource,
+    episode_index: int,
+    camera_keys: tuple[str, ...],
+) -> _PublishedEpisode | None:
+    """Reuse a matching landing episode, or None when it must be converted."""
+    relative_key = _landing_relative_key(episode_index)
+    if not storage.exists(relative_key):
+        return None
+    try:
+        if storage.file_size(relative_key) < 1:
+            return None
+        local_episode_path = storage.fetch(relative_key)
+    except (OSError, FileNotFoundError, ValueError):
+        return None
+    if not _episode_identity_matches(
+        local_episode_path,
+        dataset_source=dataset_source,
+        episode_index=episode_index,
+        camera_keys=camera_keys,
+    ):
+        return None
+    return {
+        "uri": storage.uri_for(relative_key),
+        "content_id": content_episode_id(local_episode_path),
+        "size_bytes": local_episode_path.stat().st_size,
+    }
 
 
 def _encode_cdr_float32_array(values: list[float] | tuple[float, ...]) -> bytes:
@@ -645,9 +748,15 @@ def import_lerobot_dataset(
     prefix (``s3://``, ``gs://``, ``az://``). Hugging Face downloads and MCAP
     construction use local staging under the root's workspace. Durable outputs
     are published as ``landing/*.mcap`` plus ``prepared-manifest.json`` after
-    every selected episode succeeds. The source cache (``_lerobot_cache``) stays
-    in the workspace -- the local directory itself, or the bucket mirror under
-    ``HFLOW_MIRROR_DIR`` -- and is never uploaded into a bucket root.
+    every selected episode succeeds. Matching episodes already published under
+    ``landing/`` are reused when their recorded identity matches this import
+    (resolved commit, source episode, camera keys, converter version, and the
+    importer's canonical GOP setting), so a mid-batch failure can resume
+    without rewriting completed work. ``episodes_converted`` in the manifest
+    counts episodes converted on this run, not ones reused. The source cache
+    (``_lerobot_cache``) stays in the workspace -- the local directory itself,
+    or the bucket mirror under ``HFLOW_MIRROR_DIR`` -- and is never uploaded
+    into a bucket root.
 
     Dataset v3 video features and one-dimensional, fixed-width float32 state
     and action vectors are supported. Unsupported feature layouts fail before
@@ -727,9 +836,20 @@ def import_lerobot_dataset(
         [episode_index] if episode_index is not None else list(range(len(episode_rows)))
     )
     published_episodes: list[_PublishedEpisode] = []
+    episodes_converted = 0
 
     dataset_source = source_archive["dataset"]
     for selected_episode_index in selected_episode_indexes:
+        reused_episode = _try_reuse_completed_episode(
+            storage,
+            dataset_source=dataset_source,
+            episode_index=selected_episode_index,
+            camera_keys=resolved_camera_keys,
+        )
+        if reused_episode is not None:
+            logger.info("reusing completed LeRobot episode %s", reused_episode["uri"])
+            published_episodes.append(reused_episode)
+            continue
         published_episodes.append(
             _convert_single_episode(
                 source_archive=source_archive,
@@ -741,6 +861,7 @@ def import_lerobot_dataset(
                 frames_per_second=int(source_archive["fps"]),
             )
         )
+        episodes_converted += 1
 
     manifest_contents = json.dumps(
         {
@@ -751,7 +872,7 @@ def import_lerobot_dataset(
                 "license": dataset_source.license,
             },
             "camera_keys": list(resolved_camera_keys),
-            "episodes_converted": len(published_episodes),
+            "episodes_converted": episodes_converted,
             "episodes": list(published_episodes),
             "converter_version": CONVERTER_VERSION,
         },
@@ -914,13 +1035,15 @@ def _convert_single_episode(
                     temporary_video_path,
                 )
                 access_units = _transcode_mp4_to_h264(
-                    sliced_video_path, 1.0, float(frames_per_second)
+                    sliced_video_path, IMPORT_GOP_SECONDS, float(frames_per_second)
                 )
                 presentation_timestamps = _get_video_pts_times(sliced_video_path)
             finally:
                 temporary_video_path.unlink(missing_ok=True)
         else:
-            access_units = _transcode_mp4_to_h264(local_video_path, 1.0, float(frames_per_second))
+            access_units = _transcode_mp4_to_h264(
+                local_video_path, IMPORT_GOP_SECONDS, float(frames_per_second)
+            )
             presentation_timestamps = _get_video_pts_times(local_video_path)
 
         if len(access_units) != frame_count:
@@ -947,8 +1070,8 @@ def _convert_single_episode(
         video_data_by_camera[camera_key] = (access_units, presentation_timestamps)
 
     # Write MCAP into local staging, then publish the complete file.
-    output_file_name = f"lerobot_episode_{episode_index + 1:04d}.mcap"
-    landing_relative_key = f"landing/{output_file_name}"
+    landing_relative_key = _landing_relative_key(episode_index)
+    output_file_name = Path(landing_relative_key).name
 
     from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
     from mcap_protobuf.schema import build_file_descriptor_set
@@ -1038,6 +1161,8 @@ def _convert_single_episode(
                     "source_revision": dataset_source.revision,
                     "source_episode_index": str(episode_index),
                     "converter_version": CONVERTER_VERSION,
+                    "camera_keys": _encode_camera_keys(camera_keys),
+                    "gop_seconds": f"{IMPORT_GOP_SECONDS:g}",
                 },
             )
             mcap_writer.add_metadata(
@@ -1054,7 +1179,7 @@ def _convert_single_episode(
         write_canonical_episode(
             source_episode_path,
             canonical_episode_path,
-            TransformConfig(gop_seconds=1.0),
+            TransformConfig(gop_seconds=IMPORT_GOP_SECONDS),
             source_uri=source_uri,
         )
         # Hash and size the canonical file while it is still on local disk,

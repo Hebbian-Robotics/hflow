@@ -30,6 +30,16 @@ data/lerobot_pusht/
 ```
 
 Re-running against the same output directory reuses downloaded source files.
+Matching landing episodes are also reused when their recorded identity matches
+this import: resolved Hugging Face commit, source episode index, selected
+camera keys, converter version, and the importer's canonical GOP setting.
+A mid-batch failure leaves completed `landing/*.mcap` files in place without
+`prepared-manifest.json`; retrying the same import finishes the remaining
+episodes, keeps earlier bytes unchanged, and publishes the manifest only when
+every selected episode is present. Partial, unreadable, or identity-mismatched
+landing files are never treated as completed work. `episodes_converted` counts
+episodes converted on that run; reused episodes still appear under `episodes`.
+
 Run `uv run hflow doctor ./data/lerobot_pusht/landing/*.mcap` to print the
 canonical-format report.
 
