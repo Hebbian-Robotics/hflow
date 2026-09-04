@@ -259,6 +259,105 @@ def test_index_discovery_multi_camera_metadata(
     ] == pytest.approx(2.0)
 
 
+@pytest.mark.parametrize(
+    "second_shard_path",
+    [
+        # Distinct basenames in one chunk directory: how lerobot/droid_1.0.1
+        # ships its seven metadata shards.
+        "meta/episodes/chunk-000/file-001.parquet",
+        # The same basename in the next chunk directory, which a cache keyed
+        # by basename alone would collapse onto the first shard.
+        "meta/episodes/chunk-001/file-000.parquet",
+    ],
+)
+def test_index_discovery_reads_every_metadata_shard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, second_shard_path: str
+) -> None:
+    """Episodes and video windows come from every ``meta/episodes`` shard (#293).
+
+    The corpus is split the way Dataset v3 shards it: a different pair of
+    episodes in each file and a distinct video window per episode.
+    """
+    corpus = _build_fake_corpus(tmp_path)
+    single_shard = tmp_path / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    shard_paths = ("meta/episodes/chunk-000/file-000.parquet", second_shard_path)
+    import duckdb
+
+    conn = duckdb.connect()
+    conn.execute(
+        "CREATE TABLE all_episodes AS SELECT * FROM read_parquet('"
+        + str(single_shard).replace("'", "''")
+        + "')"
+    )
+    for shard_path, episode_indexes in zip(shard_paths, ((0, 1), (2, 3)), strict=True):
+        shard_file = tmp_path / shard_path
+        shard_file.parent.mkdir(parents=True, exist_ok=True)
+        conn.execute(
+            f"COPY (SELECT * FROM all_episodes WHERE episode_index IN {episode_indexes}) "
+            f"TO '{str(shard_file).replace(chr(39), chr(39) * 2)}' (FORMAT parquet)"
+        )
+    conn.close()
+
+    monkeypatch.setattr(
+        prep, "_hf_repo_info", lambda repo, rev: {"sha": rev, "license": "apache-2.0"}
+    )
+    monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: corpus["info"])
+    monkeypatch.setattr(
+        prep,
+        "_hf_tree",
+        lambda repo, rev, path: (
+            [{"path": shard_path, "type": "file"} for shard_path in shard_paths]
+            if "episodes" in path
+            else [{"path": "meta/info.json", "type": "file"}]
+        ),
+    )
+    downloaded_destinations: dict[str, Path] = {}
+
+    def fake_download(url: str, dest: Path, **kw: object) -> None:
+        relative_path = url.split("/resolve/abc/", 1)[1]
+        assert relative_path not in downloaded_destinations, f"downloaded twice: {url}"
+        downloaded_destinations[relative_path] = dest
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(tmp_path / relative_path, dest)
+
+    monkeypatch.setattr(prep, "_download_file", fake_download)
+
+    ds = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
+    cache_dir = tmp_path / "cache"
+    found = prep._ensure_source_archive(ds, cache_dir)
+    # A second discovery reuses each shard's own cache entry instead of
+    # re-downloading or colliding with the other shard.
+    prep._ensure_source_archive(ds, cache_dir)
+
+    assert set(downloaded_destinations) == set(shard_paths)
+    assert len(set(downloaded_destinations.values())) == len(shard_paths)
+    assert [episode["episode_index"] for episode in found["episodes"]] == [0, 1, 2, 3]
+    assert set(found["video_keys"]) == {"observation.images.up", "observation.images.side"}
+    for episode in found["episodes"]:
+        episode_index = episode["episode_index"]
+        assert episode["length"] == 60 + episode_index * 5
+        for camera_key in found["video_keys"]:
+            window = episode["video_windows"][camera_key]
+            assert window["chunk_index"] == "chunk-000"
+            assert window["to_timestamp"] == pytest.approx(2.0 + episode_index * 0.2)
+
+
+@pytest.mark.parametrize(
+    "tree_entry_path",
+    [
+        "meta/episodes/../../data/chunk-000/file-000.parquet",
+        "/tmp/probe-293-absolute.parquet",
+        "meta/episodes",
+        "meta/other/file-000.parquet",
+    ],
+)
+def test_episode_metadata_cache_path_refuses_entries_outside_the_metadata_tree(
+    tmp_path: Path, tree_entry_path: str
+) -> None:
+    with pytest.raises(ValueError, match="not a file below meta/episodes/"):
+        prep._episode_metadata_cache_path(tmp_path, tree_entry_path, repo_id="fake/repo")
+
+
 def test_video_cache_distinguishes_file_indices_and_reuses_same_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

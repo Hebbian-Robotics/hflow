@@ -25,7 +25,7 @@ import tempfile
 import urllib.request
 from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import NotRequired, TypedDict
 from urllib.parse import urlsplit
 
@@ -42,8 +42,14 @@ DEFAULT_REVISION = "main"
 DEFAULT_OUTPUT_DIR = Path("./data/lerobot_pusht")
 DEFAULT_CAMERA_KEY = "observation.image"
 
-CONVERTER_VERSION = "lerobot-converter-v4"
+# "v5": episode metadata is read from every meta/episodes shard, not only the
+# first, and shards are cached under their own chunk directory (#293).
+# Multi-shard corpora previously published episodes with the wrong video
+# window or the wrong source episode, so their outputs must not share an
+# identity with the corrected ones.
+CONVERTER_VERSION = "lerobot-converter-v5"
 PRESENTATION_TIMESTAMP_EPSILON_S = 0.050
+EPISODE_METADATA_TREE_PREFIX = PurePosixPath("meta/episodes")
 
 # Timestamp handling
 NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -371,6 +377,32 @@ def _download_file(url: str, destination_path: Path, chunk_size: int = 1 << 20) 
             raise
 
 
+def _episode_metadata_cache_path(
+    episodes_metadata_directory: Path, tree_entry_path: str, *, repo_id: str
+) -> Path:
+    """Where one ``meta/episodes`` tree entry lands in the local cache.
+
+    The path below ``meta/episodes`` is kept rather than flattened to its
+    basename. Dataset v3 shards episode metadata as
+    ``chunk-XXX/file-YYY.parquet`` and reuses file names across chunk
+    directories, so two shards flattened to one cache file would make the
+    second look already downloaded and its episodes vanish (#293). The tree
+    listing is remote input, so an entry that would land outside the
+    metadata directory is refused rather than joined.
+    """
+    tree_path = PurePosixPath(tree_entry_path)
+    try:
+        relative_path = tree_path.relative_to(EPISODE_METADATA_TREE_PREFIX)
+    except ValueError:
+        relative_path = None
+    if relative_path is None or not relative_path.parts or ".." in relative_path.parts:
+        raise ValueError(
+            f"Hugging Face tree response for {repo_id} lists {tree_entry_path!r}, which is "
+            f"not a file below {EPISODE_METADATA_TREE_PREFIX}/"
+        )
+    return episodes_metadata_directory / relative_path
+
+
 def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _SourceArchive:
     """Download the corpus parquets and video chunks needed for the given episodes."""
     import duckdb
@@ -410,7 +442,9 @@ def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _S
     entries = _hf_tree(dataset_source.repo_id, dataset_source.revision, "meta/episodes")
     for entry in entries:
         if entry.get("type") == "file" and entry["path"].endswith(".parquet"):
-            destination_path = episodes_metadata_directory / Path(entry["path"]).name
+            destination_path = _episode_metadata_cache_path(
+                episodes_metadata_directory, entry["path"], repo_id=dataset_source.repo_id
+            )
             if not destination_path.exists():
                 _download_file(f"{dataset_base_url}/{entry['path']}", destination_path)
             episode_metadata_files.append(destination_path)
@@ -418,46 +452,49 @@ def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _S
     if not episode_metadata_files:
         raise RuntimeError("no meta/episodes parquet files found")
 
-    # Index of per-episode data windows across chunks
+    # Index of per-episode data windows across chunks. Every shard is one
+    # relation: v3 splits episode metadata by size, so an episode and its
+    # video window can sit in any file, not only the first (#293).
+    episode_metadata_relation = (
+        "read_parquet(["
+        + ", ".join(
+            "'" + str(episode_metadata_file).replace("'", "''") + "'"
+            for episode_metadata_file in episode_metadata_files
+        )
+        + "], union_by_name=true)"
+    )
     connection = duckdb.connect()
     try:
         episode_rows: list[_EpisodeRow] = []
-        for episode_metadata_file in episode_metadata_files:
-            parquet_episode_rows = connection.execute(
-                f"""
-                SELECT "episode_index", "tasks", "length",
-                       "data/chunk_index", "data/file_index",
-                       "dataset_from_index", "dataset_to_index"
-                FROM read_parquet('{str(episode_metadata_file).replace("'", "''")}')
-                ORDER BY "episode_index"
-                """
-            ).fetchall()
-            for parquet_episode_row in parquet_episode_rows:
-                tasks = parquet_episode_row[1]
-                if isinstance(tasks, list):
-                    task = str(tasks[0]) if tasks else ""
-                else:
-                    task = str(tasks or "")
-                episode_rows.append(
-                    {
-                        "episode_index": int(parquet_episode_row[0]),
-                        "task": task,
-                        "length": int(parquet_episode_row[2]),
-                        "data_chunk": str(parquet_episode_row[3]).split("/")[-1],
-                        "data_file": str(parquet_episode_row[4]).split("/")[-1],
-                        "data_from": int(parquet_episode_row[5]),
-                        "data_to": int(parquet_episode_row[6]),
-                    }
-                )
-        episode_rows.sort(key=lambda episode: episode["episode_index"])
+        parquet_episode_rows = connection.execute(
+            f"""
+            SELECT "episode_index", "tasks", "length",
+                   "data/chunk_index", "data/file_index",
+                   "dataset_from_index", "dataset_to_index"
+            FROM {episode_metadata_relation}
+            ORDER BY "episode_index"
+            """
+        ).fetchall()
+        for parquet_episode_row in parquet_episode_rows:
+            tasks = parquet_episode_row[1]
+            task = (str(tasks[0]) if tasks else "") if isinstance(tasks, list) else str(tasks or "")
+            episode_rows.append(
+                {
+                    "episode_index": int(parquet_episode_row[0]),
+                    "task": task,
+                    "length": int(parquet_episode_row[2]),
+                    "data_chunk": str(parquet_episode_row[3]).split("/")[-1],
+                    "data_file": str(parquet_episode_row[4]).split("/")[-1],
+                    "data_from": int(parquet_episode_row[5]),
+                    "data_to": int(parquet_episode_row[6]),
+                }
+            )
 
         # Video window columns: videos/<camera>/{chunk_index,file_index,from_timestamp,to_timestamp}
         flattened_column_names = [
             column_description[0]
             for column_description in connection.execute(
-                "SELECT * FROM read_parquet('"
-                + str(episode_metadata_files[0]).replace("'", "''")
-                + "') LIMIT 1"
+                f"SELECT * FROM {episode_metadata_relation} LIMIT 1"
             ).description
         ]
         video_keys = sorted(
@@ -479,9 +516,8 @@ def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _S
                 f'"videos/{camera_key}/to_timestamp" as "vto_{camera_key}",',
             ]
         video_window_select_sql = "episode_index, " + " ".join(video_window_selectors).rstrip(",")
-        first_episode_metadata_file = str(episode_metadata_files[0]).replace("'", "''")
         video_window_rows = connection.execute(
-            f"SELECT {video_window_select_sql} FROM read_parquet('{first_episode_metadata_file}')"
+            f"SELECT {video_window_select_sql} FROM {episode_metadata_relation}"
         ).fetchall()
         video_window_column_names = [
             column_description[0] for column_description in connection.description

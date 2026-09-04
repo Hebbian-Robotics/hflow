@@ -84,8 +84,10 @@ channels named `/observation.state` and `/action`.
 | Language tensors, depth maps, or arbitrary nested features | Not supported |
 
 The importer reads `meta/info.json`, the episode index, Parquet feature
-columns, frame rate, episode boundaries, and video-path templates. It refuses
-an unsupported or missing required feature before publishing an episode.
+columns, frame rate, episode boundaries, and video-path templates. Episode
+metadata split across several `meta/episodes` shards is read in full, so
+every episode keeps its own video window. It refuses an unsupported or
+missing required feature before publishing an episode.
 
 Every output records the source repository, resolved commit, source episode
 index, task, embodiment, importer version, and FFmpeg build. Video is encoded
