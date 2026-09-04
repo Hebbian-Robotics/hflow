@@ -62,6 +62,7 @@ Use these when you already know the outcome you need.
 - [Measure hand presence with MediaPipe](./how-to/measure-hand-presence-with-mediapipe.md)
 - [Run and operate the local Airflow runtime](./RUNTIME.md)
 - [Deploy into an existing Airflow environment](./RUNTIME.md#bring-your-own-airflow-hflow-deploy)
+- [Compile implementation modules for deployment](./how-to/build-native-overlay.md)
 - [Query quality evidence and create a manifest](./CATALOG.md)
 - [Export a portable dataset snapshot](./how-to/export-dataset-snapshot.md)
 - [Find and reprocess stale episodes](./CATALOG.md#finding-stale-episodes-to-reprocess)
