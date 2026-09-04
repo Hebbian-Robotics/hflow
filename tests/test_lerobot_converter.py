@@ -1416,8 +1416,16 @@ def _write_identity_matching_landing_mcap(
     episode_index: int,
     camera_keys: tuple[str, ...],
     marker: str,
+    episode_record_overrides: dict[str, str] | None = None,
+    source_provenance_overrides: dict[str, str] | None = None,
+    provenance_overrides: dict[str, str] | None = None,
 ) -> None:
-    """Write a landing MCAP whose metadata satisfies import resume identity."""
+    """Write a landing MCAP whose metadata satisfies import resume identity.
+
+    The three override hooks exist so a caller can break exactly one identity
+    field and leave the rest matching, which is what separates the individual
+    comparisons in ``_episode_identity_matches`` from each other.
+    """
     from mcap.writer import Writer
 
     from hflow.format import METADATA_RECORD_EPISODE, METADATA_RECORD_PROVENANCE
@@ -1439,6 +1447,7 @@ def _write_identity_matching_landing_mcap(
                 "converter_version": prep.CONVERTER_VERSION,
                 "camera_keys": prep._encode_camera_keys(camera_keys),
                 "gop_seconds": f"{prep.IMPORT_GOP_SECONDS:g}",
+                **(episode_record_overrides or {}),
             },
         )
         writer.add_metadata(
@@ -1447,6 +1456,7 @@ def _write_identity_matching_landing_mcap(
                 "converter_version": prep.CONVERTER_VERSION,
                 "ffmpeg_version": "test-ffmpeg",
                 "source_uri": (f"hf://datasets/{dataset_source.repo_id}@{dataset_source.revision}"),
+                **(source_provenance_overrides or {}),
             },
         )
         writer.add_metadata(
@@ -1458,9 +1468,132 @@ def _write_identity_matching_landing_mcap(
                 "gop_preset": "custom",
                 "gop_seconds": f"{prep.IMPORT_GOP_SECONDS:g}",
                 "marker": marker,
+                **(provenance_overrides or {}),
             },
         )
         writer.finish()
+
+
+_MATCHING_CAMERA_KEYS = (prep.DEFAULT_CAMERA_KEY,)
+_MATCHING_SOURCE = prep.DatasetSource("fake/repo", "abc", "apache-2.0")
+
+
+@pytest.mark.parametrize(
+    ("episode_record_overrides", "source_provenance_overrides", "provenance_overrides"),
+    [
+        pytest.param({"source_dataset": "other/repo"}, None, None, id="source-dataset"),
+        pytest.param({"source_revision": "deadbeef"}, None, None, id="source-revision"),
+        pytest.param({"source_episode_index": "7"}, None, None, id="source-episode-index"),
+        pytest.param(
+            {"camera_keys": prep._encode_camera_keys(("observation.images.other",))},
+            None,
+            None,
+            id="camera-selection",
+        ),
+        pytest.param({"camera_keys": "not-json"}, None, None, id="unparseable-camera-keys"),
+        pytest.param({"camera_keys": '{"a": 1}'}, None, None, id="camera-keys-not-a-list"),
+        pytest.param({"camera_keys": "[1, 2]"}, None, None, id="camera-keys-not-strings"),
+        pytest.param(
+            {"converter_version": "lerobot-converter-v5"}, None, None, id="episode-converter"
+        ),
+        pytest.param(
+            None, {"converter_version": "lerobot-converter-v5"}, None, id="provenance-converter"
+        ),
+        pytest.param({"gop_seconds": "2"}, None, None, id="episode-gop"),
+        pytest.param(None, None, {"gop_seconds": "2"}, id="transform-gop"),
+    ],
+)
+def test_reuse_refuses_a_landing_episode_differing_in_one_identity_field(
+    tmp_path: Path,
+    episode_record_overrides: dict[str, str] | None,
+    source_provenance_overrides: dict[str, str] | None,
+    provenance_overrides: dict[str, str] | None,
+) -> None:
+    """Each identity comparison, on its own.
+
+    The import-level mismatch test differs in two fields at once, so any one
+    comparison still catches it and the other five carry no weight. Reuse is
+    the direction where trusting too much is dangerous: a landing file from
+    another revision or another camera selection served as completed work is
+    wrong data delivered silently, so each field earns its own case.
+    """
+    data_root = LocalStorageRoot(tmp_path / "out")
+    landing = tmp_path / "out" / "landing" / "lerobot_episode_0001.mcap"
+    _write_identity_matching_landing_mcap(
+        landing,
+        dataset_source=_MATCHING_SOURCE,
+        episode_index=0,
+        camera_keys=_MATCHING_CAMERA_KEYS,
+        marker="one-field-off",
+        episode_record_overrides=episode_record_overrides,
+        source_provenance_overrides=source_provenance_overrides,
+        provenance_overrides=provenance_overrides,
+    )
+
+    assert (
+        prep._try_reuse_completed_episode(
+            data_root,
+            dataset_source=_MATCHING_SOURCE,
+            episode_index=0,
+            camera_keys=_MATCHING_CAMERA_KEYS,
+        )
+        is None
+    )
+
+
+def test_reuse_accepts_the_landing_episode_the_overrides_are_measured_against(
+    tmp_path: Path,
+) -> None:
+    """The control: without an override the same fixture is reused.
+
+    Without this, every case above could pass because the fixture never
+    matches at all rather than because the one changed field was compared.
+    """
+    data_root = LocalStorageRoot(tmp_path / "out")
+    landing = tmp_path / "out" / "landing" / "lerobot_episode_0001.mcap"
+    _write_identity_matching_landing_mcap(
+        landing,
+        dataset_source=_MATCHING_SOURCE,
+        episode_index=0,
+        camera_keys=_MATCHING_CAMERA_KEYS,
+        marker="all-fields-matching",
+    )
+
+    reused = prep._try_reuse_completed_episode(
+        data_root,
+        dataset_source=_MATCHING_SOURCE,
+        episode_index=0,
+        camera_keys=_MATCHING_CAMERA_KEYS,
+    )
+
+    assert reused is not None
+    assert reused["uri"] == data_root.uri_for("landing/lerobot_episode_0001.mcap")
+    assert reused["content_id"] == prep.content_episode_id(landing)
+    assert reused["size_bytes"] == landing.stat().st_size
+
+
+def test_reuse_refuses_an_empty_landing_episode(tmp_path: Path) -> None:
+    """A zero-byte landing file is an interrupted publish, not completed work.
+
+    Removing both ``< 1`` size checks leaves this passing: an empty file is
+    not a readable MCAP, so the reader refusal already covers it. The size
+    check before ``storage.fetch`` still earns its place by not downloading a
+    zero-byte object to learn that, but it is not what this test holds.
+    """
+    data_root = LocalStorageRoot(tmp_path / "out")
+    landing = tmp_path / "out" / "landing" / "lerobot_episode_0001.mcap"
+    landing.parent.mkdir(parents=True, exist_ok=True)
+    landing.write_bytes(b"")
+
+    assert (
+        prep._try_reuse_completed_episode(
+            data_root,
+            dataset_source=_MATCHING_SOURCE,
+            episode_index=0,
+            camera_keys=_MATCHING_CAMERA_KEYS,
+        )
+        is None
+    )
 
 
 def _ensure_two_episode_archive(dataset_source: prep.DatasetSource, cache_dir: Path) -> dict:
