@@ -962,6 +962,11 @@ def _validate_manifest(manifest: CythonOverlayManifest) -> CythonOverlayManifest
             raise CythonOverlayManifestError(
                 f"artifact_path does not match module_name for {artifact.module_name}"
             )
+        # These two equalities are what make paths unique, given the
+        # module-name uniqueness checked above: both derivations are injective
+        # in the module name, so distinct names cannot converge on one path.
+        # Relaxing either equality (allowing a caller-chosen path, say) brings
+        # back the need for an explicit path-uniqueness refusal here.
         _require_relative_path(artifact.source_path, "source_path")
         _require_relative_path(artifact.artifact_path, "artifact_path")
         _require_sha256(artifact.source_sha256, "source_sha256")
