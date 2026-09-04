@@ -943,8 +943,6 @@ def _validate_manifest(manifest: CythonOverlayManifest) -> CythonOverlayManifest
     module_names = [artifact.module_name for artifact in manifest.artifacts]
     if len(module_names) != len(set(module_names)):
         raise CythonOverlayManifestError("artifact module names must be unique")
-    artifact_paths: set[str] = set()
-    source_paths: set[str] = set()
     for artifact in manifest.artifacts:
         _require_dotted_name(artifact.module_name, "module_name")
         expected_source_path = _source_relative_path(manifest.package_name, artifact.module_name)
@@ -970,10 +968,6 @@ def _validate_manifest(manifest: CythonOverlayManifest) -> CythonOverlayManifest
         _require_nonnegative_integer(artifact.source_size_bytes, "source_size_bytes")
         _require_sha256(artifact.artifact_sha256, "artifact_sha256")
         _require_positive_integer(artifact.artifact_size_bytes, "artifact_size_bytes")
-        if artifact.source_path in source_paths or artifact.artifact_path in artifact_paths:
-            raise CythonOverlayManifestError("artifact paths must be unique")
-        source_paths.add(artifact.source_path)
-        artifact_paths.add(artifact.artifact_path)
     expected_bundle_digest = _calculate_bundle_digest(
         package_name=manifest.package_name,
         target=manifest.target,
