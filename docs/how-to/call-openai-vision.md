@@ -11,8 +11,7 @@ It follows the official OpenAI
 [images and vision guide](https://developers.openai.com/api/docs/guides/images-vision):
 the image is sent to the Responses API as a base64 data URL and the text result
 is read from `response.output_text`. The example ships two such checks: the
-activity description walked through below, and a hand-visibility check
-(missing or occluded hand positions, a defect Dyna's article calls out) that
+activity description walked through below, and a hand-visibility check that
 turns the model's tile count into a `hands_visible_fraction` measurement.
 
 ## 1. Install the optional client

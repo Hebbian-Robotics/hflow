@@ -236,9 +236,8 @@ See [the catalog guide](./CATALOG.md) for the views and the query patterns.
 ## The five ingest DAGs: a master and four stage sub-DAGs
 
 > **The ingest stage graph.** A master DAG resolves the run profile and
-> triggers only the sub-DAGs it enables -- the ingestion shape Dyna's article
-> describes. Two trigger lanes lead in: online (per-episode, latency-first)
-> and batch (per-shard, staggered).
+> triggers only the sub-DAGs it enables. Two trigger lanes lead in: online
+> (per-episode, latency-first) and batch (per-shard, staggered).
 
 **The master (`<stem>_ingest`)** runs entirely in Airflow's own environment:
 no user venv, no hflow import. A `resolve_profile` task validates

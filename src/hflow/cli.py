@@ -1,7 +1,7 @@
 """Command-line entry point.
 
 Subcommands: ``curate``, ``catalog ui``, ``dataset create``, ``import lerobot``,
-``export snapshot``, ``stale``, ``doctor``, ``manifest``, the Compose runtime family
+``export snapshot``, ``stale``, ``doctor``, ``manifest``, ``package``, the Compose runtime family
 ``up``/``down``/``ingest``/``status``, ``deploy`` for bring-your-own Airflow,
 and ``serve`` for the workspace HTTP server (a separate ``hflow-server``
 package, imported only when invoked).
@@ -189,20 +189,21 @@ def _build_parser() -> argparse.ArgumentParser:
     catalog_subparsers = catalog_parser.add_subparsers(dest="catalog_command", required=True)
     catalog_ui_parser = catalog_subparsers.add_parser(
         "ui",
-        help="open DuckDB UI over the local catalog",
+        help="open DuckDB UI over a local or bucket-backed catalog",
         description=(
-            "Start DuckDB's browser UI over a local HFlow catalog. The UI starts "
+            "Start DuckDB's browser UI over an HFlow catalog. The UI starts "
             "even when the catalog is empty, then refreshes its views after the "
-            "first completed append."
+            "first completed append. Local catalogs may be created on startup; "
+            "bucket catalogs must already exist and are read-only."
         ),
     )
     catalog_ui_parser.add_argument(
         "--catalog",
         default=_default_catalog_location(),
         help=(
-            "local catalog directory "
-            f"(default: $HFLOW_DATA_ROOT, else {PROJECT_CONFIG_FILE_NAME}'s data_root, "
-            f"else {DEFAULT_DATA_ROOT} -- plus /catalog)"
+            "catalog root: local directory or object-store prefix "
+            f"(s3://, gs://, az://; default: $HFLOW_DATA_ROOT, else "
+            f"{PROJECT_CONFIG_FILE_NAME}'s data_root, else {DEFAULT_DATA_ROOT} -- plus /catalog)"
         ),
     )
     catalog_ui_parser.add_argument(
@@ -296,9 +297,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     lerobot_import_parser.add_argument(
         "--output-dir",
-        type=Path,
         required=True,
-        help="local destination; episodes are written under its landing/ directory",
+        help=(
+            "destination data root: local directory or object-store prefix "
+            "(s3://, gs://, az://); episodes publish under landing/"
+        ),
     )
     lerobot_import_parser.add_argument(
         "--camera",
@@ -453,6 +456,77 @@ def _build_parser() -> argparse.ArgumentParser:
             "path/to/pipeline.py[:app]. Defaults to hflow.toml's `pipeline`, "
             f"else ./{DEFAULT_PIPELINE_FILE_NAME}"
         ),
+    )
+
+    package_parser = subparsers.add_parser(
+        "package",
+        help="build, verify, and apply target-bound native runtime overlays",
+        description=(
+            "Compile Python implementation modules into a runtime-only, target-bound Cython "
+            "overlay while preserving the installed wheel's package adapters, "
+            "metadata, entry points, and licenses."
+        ),
+    )
+    package_subparsers = package_parser.add_subparsers(
+        dest="package_command",
+        required=True,
+    )
+    package_build_parser = package_subparsers.add_parser(
+        "build",
+        help="compile a package's implementation modules into a fresh overlay",
+        description=(
+            "Build a verified Cython extension overlay for the current CPython "
+            "ABI and Linux platform. The package itself is not modified."
+        ),
+    )
+    package_build_parser.add_argument(
+        "--package-root",
+        type=Path,
+        required=True,
+        help="directory containing the installed or source Python package",
+    )
+    package_build_parser.add_argument(
+        "--package-name",
+        default=None,
+        help="fully qualified import package (default: package-root directory name)",
+    )
+    package_build_parser.add_argument(
+        "--module",
+        dest="module_names",
+        action="append",
+        default=None,
+        help=(
+            "fully qualified implementation module to compile; repeat to select "
+            "several (default: every .py except __init__.py and __main__.py)"
+        ),
+    )
+    package_build_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+        help="new directory to create for the overlay",
+    )
+    package_verify_parser = package_subparsers.add_parser(
+        "verify",
+        help="verify an overlay and optionally its applied package",
+    )
+    package_verify_parser.add_argument("overlay_dir", type=Path)
+    package_verify_parser.add_argument(
+        "--target-package-root",
+        type=Path,
+        default=None,
+        help="also verify that this package has the overlay applied",
+    )
+    package_apply_parser = package_subparsers.add_parser(
+        "apply",
+        help="safely apply a verified overlay to an exact package tree",
+    )
+    package_apply_parser.add_argument("overlay_dir", type=Path)
+    package_apply_parser.add_argument(
+        "--target-package-root",
+        type=Path,
+        required=True,
+        help="installed package directory whose matching sources will be replaced",
     )
 
     up_parser = subparsers.add_parser(
@@ -852,18 +926,37 @@ def _command_import_lerobot(arguments: argparse.Namespace) -> int:
     from hflow.importers.lerobot import DEFAULT_CAMERA_KEY, import_lerobot_dataset
 
     camera_keys = arguments.camera_keys or [DEFAULT_CAMERA_KEY]
+    output_location = arguments.output_dir
+    bucket_destination = is_bucket_url(output_location)
+    bucket_storage_error: type[BaseException] | None = None
+    if bucket_destination:
+        # Import while the optional extra is already known to be required for
+        # this path, so a later handler cannot mask an unrelated failure with
+        # ModuleNotFoundError from this import.
+        try:
+            from obstore.exceptions import BaseError as BucketStorageError
+        except ModuleNotFoundError:
+            bucket_storage_error = None
+        else:
+            bucket_storage_error = BucketStorageError
+
     try:
-        output_paths = import_lerobot_dataset(
+        output_uris = import_lerobot_dataset(
             dataset_repo=arguments.repo,
             revision=arguments.revision,
-            output_dir=arguments.output_dir,
+            output_dir=output_location,
             episode_index=arguments.episode_index,
             camera_keys=camera_keys,
         )
-    except (ValueError, RuntimeError, OSError) as error:
+    except (ValueError, RuntimeError, OSError, ModuleNotFoundError) as error:
         print(f"import lerobot: {error}", file=sys.stderr)
         return 2
-    print(f"import lerobot: converted {len(output_paths)} episode(s)")
+    except Exception as error:
+        if bucket_storage_error is not None and isinstance(error, bucket_storage_error):
+            print(f"import lerobot: {error}", file=sys.stderr)
+            return 2
+        raise
+    print(f"import lerobot: converted {len(output_uris)} episode(s)")
     return 0
 
 
@@ -875,6 +968,75 @@ def _command_manifest(arguments: argparse.Namespace) -> int:
         return 2
     sys.stdout.write(app.manifest().to_json())
     return 0
+
+
+def _command_package(arguments: argparse.Namespace) -> int:
+    from hflow.packaging import (
+        CythonOverlayApplyError,
+        CythonOverlayBuildConfig,
+        CythonOverlayBuildError,
+        CythonOverlayManifestError,
+        apply_cython_overlay,
+        build_cython_overlay,
+        verify_cython_overlay,
+    )
+
+    try:
+        if arguments.package_command == "build":
+            manifest = build_cython_overlay(
+                CythonOverlayBuildConfig(
+                    package_root=arguments.package_root,
+                    package_name=arguments.package_name,
+                    module_names=(
+                        tuple(arguments.module_names)
+                        if arguments.module_names is not None
+                        else None
+                    ),
+                ),
+                arguments.output_dir,
+            )
+            print(
+                f"native overlay: {arguments.output_dir} "
+                f"({len(manifest.artifacts)} modules, {manifest.bundle_digest})"
+            )
+            return 0
+        if arguments.package_command == "verify":
+            outcome = verify_cython_overlay(
+                arguments.overlay_dir,
+                target_package_root=arguments.target_package_root,
+            )
+            if outcome.succeeded:
+                checked_target = (
+                    f" and applied package {arguments.target_package_root}"
+                    if arguments.target_package_root is not None
+                    else ""
+                )
+                print(f"native overlay verified: {arguments.overlay_dir}{checked_target}")
+                return 0
+            for issue in outcome.issues:
+                issue_context = f": {issue.path}" if issue.path is not None else ""
+                print(f"package verify: {issue.code.value}{issue_context}", file=sys.stderr)
+            return 1
+        if arguments.package_command == "apply":
+            manifest = apply_cython_overlay(
+                arguments.overlay_dir,
+                arguments.target_package_root,
+            )
+            print(
+                f"native overlay applied: {arguments.target_package_root} "
+                f"({len(manifest.artifacts)} modules, {manifest.bundle_digest})"
+            )
+            return 0
+        raise AssertionError(f"unhandled package command {arguments.package_command!r}")
+    except (
+        CythonOverlayApplyError,
+        CythonOverlayBuildError,
+        CythonOverlayManifestError,
+        FileExistsError,
+        OSError,
+    ) as error:
+        print(f"package {arguments.package_command}: {error}", file=sys.stderr)
+        return 2
 
 
 def _command_stale(arguments: argparse.Namespace) -> int:
@@ -1339,30 +1501,48 @@ def _command_catalog_ui(arguments: argparse.Namespace) -> int:
         serve_catalog_ui,
     )
 
-    if is_bucket_url(arguments.catalog):
-        print(
-            "catalog ui: DuckDB UI currently requires a local catalog directory",
-            file=sys.stderr,
-        )
-        return 2
+    catalog_location = arguments.catalog
+    if not is_bucket_url(catalog_location):
+        local_catalog_root = Path(catalog_location)
+        if local_catalog_root.exists() and not local_catalog_root.is_dir():
+            print(
+                f"catalog ui: {os.strerror(errno.ENOTDIR)}: {local_catalog_root}",
+                file=sys.stderr,
+            )
+            return 2
+    bucket_catalog = is_bucket_url(catalog_location)
+    bucket_storage_error: type[BaseException] | None = None
+    if bucket_catalog:
+        # Import while the optional extra is already known to be required for
+        # this path, so a later handler cannot mask an unrelated failure with
+        # ModuleNotFoundError from this import.
+        try:
+            from obstore.exceptions import BaseError as BucketStorageError
+        except ModuleNotFoundError:
+            bucket_storage_error = None
+        else:
+            bucket_storage_error = BucketStorageError
 
-    local_catalog_root = Path(arguments.catalog)
-    if local_catalog_root.exists() and not local_catalog_root.is_dir():
-        print(
-            f"catalog ui: {os.strerror(errno.ENOTDIR)}: {local_catalog_root}",
-            file=sys.stderr,
-        )
-        return 2
     try:
         settings = CatalogUiSettings(
-            catalog_root=local_catalog_root,
+            catalog_root=catalog_location,
             port=arguments.port,
             open_browser=not arguments.no_browser,
         )
         serve_catalog_ui(settings)
-    except (CatalogUiStartupError, OSError, ValueError) as error:
+    except (
+        CatalogUiStartupError,
+        OSError,
+        ValueError,
+        ModuleNotFoundError,
+    ) as error:
         print(f"catalog ui: {error}", file=sys.stderr)
         return 2
+    except Exception as error:
+        if bucket_storage_error is not None and isinstance(error, bucket_storage_error):
+            print(f"catalog ui: {error}", file=sys.stderr)
+            return 2
+        raise
     return 0
 
 
@@ -1470,6 +1650,8 @@ def main(argv: list[str] | None = None) -> int:
         return _command_doctor(arguments)
     if arguments.command == "manifest":
         return _command_manifest(arguments)
+    if arguments.command == "package":
+        return _command_package(arguments)
     if arguments.command == "up":
         return _command_up(arguments)
     if arguments.command == "deploy":

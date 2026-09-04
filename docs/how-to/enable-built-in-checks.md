@@ -27,6 +27,12 @@ HFlow owns explicit versions for these automatic registrations. Once you
 register or wrap a check yourself, the version in your pipeline is the one
 that controls compatibility.
 
+Checks that send data to a network service are deliberately not automatic.
+The recommended
+[real-episode tutorial](../tutorials/evaluate-an-egocentric-episode.md) shows
+how to keep this deterministic baseline and explicitly add HFlow's hosted
+hand-visibility and active-manipulation checks.
+
 To change the set, pass it:
 
 ```python

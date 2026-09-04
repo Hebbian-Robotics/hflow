@@ -19,7 +19,10 @@ and tradeoffs.
 
 ## Start here
 
-- **Run a pipeline locally:** follow the
+- **Evaluate real egocentric video:** follow the recommended
+  [first-episode tutorial](./tutorials/evaluate-an-egocentric-episode.md) to run
+  local deterministic checks and hosted model checks together.
+- **Run entirely offline:** follow the
   [five-minute quickstart](../examples/README.md#five-minute-quickstart).
 - **Understand the project first:** read the [architecture](./ARCHITECTURE.md),
   especially [what is implemented](./ARCHITECTURE.md#implementation-status).
@@ -37,6 +40,9 @@ the whole workflow before adapting it.
 - [Five-minute local quickstart](../examples/README.md#five-minute-quickstart):
   synthesize a small episode and run transform, checks, and reporting without
   Docker.
+- [Evaluate your first egocentric episode](./tutorials/evaluate-an-egocentric-episode.md):
+  download a real MCAP and combine HFlow's deterministic baseline with hosted
+  hand-visibility and active-manipulation checks.
 - [Egocentric factory corpus](../examples/egocentric/README.md): prepare real
   head-mounted video, inject known defects, run locally or in Airflow, inspect
   the results, and cut a curated manifest.
@@ -56,6 +62,7 @@ Use these when you already know the outcome you need.
 - [Measure hand presence with MediaPipe](./how-to/measure-hand-presence-with-mediapipe.md)
 - [Run and operate the local Airflow runtime](./RUNTIME.md)
 - [Deploy into an existing Airflow environment](./RUNTIME.md#bring-your-own-airflow-hflow-deploy)
+- [Compile implementation modules for deployment](./how-to/build-native-overlay.md)
 - [Query quality evidence and create a manifest](./CATALOG.md)
 - [Export a portable dataset snapshot](./how-to/export-dataset-snapshot.md)
 - [Find and reprocess stale episodes](./CATALOG.md#finding-stale-episodes-to-reprocess)

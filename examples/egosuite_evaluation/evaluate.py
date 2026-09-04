@@ -69,6 +69,7 @@ PROJECTED_HAND_LABEL_TYPE = "projected-hand-joints"
 EXPECTED_HAND_JOINT_COUNT = 21
 DEFAULT_RUNS_DIRECTORY = Path("data/egosuite-evaluation/runs")
 DEFAULT_LABELS_DIRECTORY = Path("data/egosuite-evaluation/labels")
+DEFAULT_HFLOW_DATA_ROOT = Path("data/egosuite-evaluation/hflow")
 INSPECT_LOGS_DIRECTORY_NAME = "logs"
 RUN_METADATA_FILE_NAME = "run.json"
 SUMMARY_FILE_NAME = "summary.json"
@@ -110,6 +111,12 @@ class ProjectedHandFrameLabel:
     right_hand_issue_reasons: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class ProjectedHandLabelReport:
+    labels_by_source_identity: dict[str, list[ProjectedHandFrameLabel]]
+    uses_legacy_episode_names: bool
+
+
 def _required_label_record_string(
     frame_record: Mapping[str, object], field_name: str, record_context: str
 ) -> str:
@@ -141,8 +148,8 @@ def _label_record_issue_reasons(
 
 def load_projected_hand_label_report(
     report_path: Path,
-) -> dict[str, list[ProjectedHandFrameLabel]]:
-    """Parse a saved label report, keyed by its stable source episode name."""
+) -> ProjectedHandLabelReport:
+    """Parse a saved label report, keyed by source URI or a legacy episode name."""
 
     try:
         report_payload = json.loads(report_path.read_text())
@@ -172,8 +179,10 @@ def load_projected_hand_label_report(
     if not isinstance(raw_frame_records, list):
         raise ValueError(f"projected-hand label report {report_path} must contain a 'frames' array")
 
-    labels_by_source_episode: dict[str, list[ProjectedHandFrameLabel]] = defaultdict(list)
+    labels_by_source_identity: dict[str, list[ProjectedHandFrameLabel]] = defaultdict(list)
     seen_frame_keys: set[tuple[str, int]] = set()
+    legacy_source_path_by_episode: dict[str, Path] = {}
+    uses_legacy_episode_names: bool | None = None
     for record_index, raw_frame_record in enumerate(raw_frame_records):
         record_context = f"{report_path} frame record {record_index}"
         if not isinstance(raw_frame_record, dict):
@@ -189,6 +198,28 @@ def load_projected_hand_label_report(
                 f"{record_context} source_episode {source_episode!r} does not match "
                 f"source_path stem {source_path.stem!r}"
             )
+        record_uses_legacy_episode_name = "source_uri" not in raw_frame_record
+        if uses_legacy_episode_names is None:
+            uses_legacy_episode_names = record_uses_legacy_episode_name
+        elif uses_legacy_episode_names is not record_uses_legacy_episode_name:
+            raise ValueError(
+                f"{record_context} mixes legacy records without source_uri with current records"
+            )
+        source_identity = (
+            source_episode
+            if record_uses_legacy_episode_name
+            else _required_label_record_string(raw_frame_record, "source_uri", record_context)
+        )
+        if record_uses_legacy_episode_name:
+            previous_source_path = legacy_source_path_by_episode.setdefault(
+                source_episode, source_path
+            )
+            if previous_source_path != source_path:
+                raise ValueError(
+                    f"{record_context} uses legacy source episode {source_episode!r} for both "
+                    f"{previous_source_path} and {source_path}; regenerate the report to record "
+                    "source_uri provenance"
+                )
         try:
             camera_view = CameraView(
                 _required_label_record_string(raw_frame_record, "camera_view", record_context)
@@ -215,13 +246,14 @@ def load_projected_hand_label_report(
             raise ValueError(f"{record_context} right joint count must be between 0 and 21")
         if expected_hand_count not in {0, 1, 2}:
             raise ValueError(f"{record_context} expected_hand_count must be 0, 1, or 2")
-        frame_key = (source_episode, frame_index)
+        frame_key = (source_identity, frame_index)
         if frame_key in seen_frame_keys:
             raise ValueError(
-                f"{record_context} duplicates source episode {source_episode!r} frame {frame_index}"
+                f"{record_context} duplicates source identity {source_identity!r} "
+                f"frame {frame_index}"
             )
         seen_frame_keys.add(frame_key)
-        labels_by_source_episode[source_episode].append(
+        labels_by_source_identity[source_identity].append(
             ProjectedHandFrameLabel(
                 source_path=source_path,
                 source_episode=source_episode,
@@ -239,9 +271,12 @@ def load_projected_hand_label_report(
             )
         )
 
-    for source_labels in labels_by_source_episode.values():
+    for source_labels in labels_by_source_identity.values():
         source_labels.sort(key=lambda label: label.frame_index)
-    return dict(labels_by_source_episode)
+    return ProjectedHandLabelReport(
+        labels_by_source_identity=dict(labels_by_source_identity),
+        uses_legacy_episode_names=bool(uses_legacy_episode_names),
+    )
 
 
 @dataclass(frozen=True)
@@ -320,9 +355,19 @@ def _source_episode_name(source_path: Path) -> str:
     return source_path.stem
 
 
+def _source_uri_by_path(source_paths: Sequence[Path]) -> dict[Path, str]:
+    identity_app = hflow.App(
+        "egosuite-projected-hand-label-source-identity",
+        data_root=os.environ.get("HFLOW_DATA_ROOT", str(DEFAULT_HFLOW_DATA_ROOT)),
+        default_checks=(),
+    )
+    return {source_path: identity_app.source_identity(source_path) for source_path in source_paths}
+
+
 def select_episode_paths(
     source_paths: Sequence[Path],
     *,
+    source_uri_by_path: Mapping[Path, str],
     episode_count: int | None,
     sample_seed: int,
 ) -> tuple[Path, ...]:
@@ -336,7 +381,7 @@ def select_episode_paths(
         raise ValueError("sample seed must be nonnegative")
     ranked_source_paths = sorted(
         source_paths,
-        key=lambda source_path: _sha256_text(f"{sample_seed}\0{_source_episode_name(source_path)}"),
+        key=lambda source_path: _sha256_text(f"{sample_seed}\0{source_uri_by_path[source_path]}"),
     )
     selected_source_paths = set(ranked_source_paths[:episode_count])
     return tuple(
@@ -348,6 +393,7 @@ def _selected_frame_indices(
     source_path: Path,
     source_frame_count: int,
     *,
+    source_uri: str,
     frame_stride: int,
     limit_per_episode: int | None,
     samples_per_episode: int | None,
@@ -366,9 +412,7 @@ def _selected_frame_indices(
         raise ValueError("sample seed must be nonnegative")
     ranked_frame_indices = sorted(
         eligible_frame_indices,
-        key=lambda frame_index: _sha256_text(
-            f"{sample_seed}\0{_source_episode_name(source_path)}\0{frame_index}"
-        ),
+        key=lambda frame_index: _sha256_text(f"{sample_seed}\0{source_uri}\0{frame_index}"),
     )
     return sorted(ranked_frame_indices[:samples_per_episode])
 
@@ -541,6 +585,7 @@ def _complete_projected_label(
 def load_projected_hand_labels(
     source_path: Path,
     *,
+    source_uri: str,
     camera_view: CameraView,
     frame_stride: int,
     limit_per_episode: int | None,
@@ -571,6 +616,7 @@ def load_projected_hand_labels(
         selected_frame_indices = _selected_frame_indices(
             source_path,
             source_frame_count,
+            source_uri=source_uri,
             frame_stride=frame_stride,
             limit_per_episode=limit_per_episode,
             samples_per_episode=samples_per_episode,
@@ -633,6 +679,7 @@ def load_projected_hand_labels(
 def select_stratified_labels(
     labels_by_source: Mapping[Path, Sequence[ProjectedHandFrameLabel]],
     *,
+    source_uri_by_path: Mapping[Path, str],
     samples_per_hand_count: int | None,
     sample_seed: int,
 ) -> dict[Path, list[ProjectedHandFrameLabel]]:
@@ -656,7 +703,7 @@ def select_stratified_labels(
         ]
         matching_labels.sort(
             key=lambda label: _sha256_text(
-                f"{sample_seed}\0{label.source_path}\0{label.frame_index}"
+                f"{sample_seed}\0{source_uri_by_path[label.source_path]}\0{label.frame_index}"
             )
         )
         selected_frame_keys.update(
@@ -819,10 +866,11 @@ def _inspect_generate_config(configuration: EvaluationConfiguration) -> Generate
     )
 
 
-def _label_record(label: ProjectedHandFrameLabel) -> dict[str, object]:
+def _label_record(label: ProjectedHandFrameLabel, *, source_uri: str) -> dict[str, object]:
     return {
         **asdict(label),
         "source_path": str(label.source_path),
+        "source_uri": source_uri,
         "camera_view": label.camera_view.value,
         "left_hand_issue_reasons": list(label.left_hand_issue_reasons),
         "right_hand_issue_reasons": list(label.right_hand_issue_reasons),
@@ -904,6 +952,7 @@ def write_label_report(
     output_path: Path,
 ) -> None:
     all_labels = [label for labels in labels_by_source.values() for label in labels]
+    source_uri_by_path = _source_uri_by_path(tuple(labels_by_source))
     report = {
         "schema_version": SCHEMA_VERSION,
         "label_type": PROJECTED_HAND_LABEL_TYPE,
@@ -917,7 +966,10 @@ def write_label_report(
         "projection_rule": "hand is in frame when at least one labeled joint has positive depth and projects inside the image bounds",
         "summary": summarize_reference_labels(all_labels),
         "sources": [str(path) for path in labels_by_source],
-        "frames": [_label_record(label) for label in all_labels],
+        "frames": [
+            _label_record(label, source_uri=source_uri_by_path[label.source_path])
+            for label in all_labels
+        ],
     }
     _write_json_atomically(output_path, report)
 
@@ -1345,9 +1397,11 @@ def run_evaluation(configuration: EvaluationConfiguration) -> dict[str, object]:
             "only for an endpoint that does not authenticate"
         )
     run_metadata = _prepare_output_directory(configuration)
+    source_uri_by_path = _source_uri_by_path(configuration.source_paths)
     candidate_labels_by_source = {
         source_path: load_projected_hand_labels(
             source_path,
+            source_uri=source_uri_by_path[source_path],
             camera_view=configuration.camera_view,
             frame_stride=configuration.frame_stride,
             limit_per_episode=configuration.limit_per_episode,
@@ -1358,6 +1412,7 @@ def run_evaluation(configuration: EvaluationConfiguration) -> dict[str, object]:
     }
     labels_by_source = select_stratified_labels(
         candidate_labels_by_source,
+        source_uri_by_path=source_uri_by_path,
         samples_per_hand_count=configuration.samples_per_hand_count,
         sample_seed=configuration.sample_seed,
     )
@@ -1481,8 +1536,11 @@ def _default_output_directory(model: str, camera_view: CameraView) -> Path:
 def _labels_by_source_from_arguments(
     arguments: argparse.Namespace,
 ) -> dict[Path, list[ProjectedHandFrameLabel]]:
+    resolved_source_paths = _resolved_mcap_paths(arguments.inputs)
+    source_uri_by_path = _source_uri_by_path(resolved_source_paths)
     source_paths = select_episode_paths(
-        _resolved_mcap_paths(arguments.inputs),
+        resolved_source_paths,
+        source_uri_by_path=source_uri_by_path,
         episode_count=arguments.episode_count,
         sample_seed=arguments.sample_seed,
     )
@@ -1490,6 +1548,7 @@ def _labels_by_source_from_arguments(
     candidate_labels_by_source = {
         source_path: load_projected_hand_labels(
             source_path,
+            source_uri=source_uri_by_path[source_path],
             camera_view=camera_view,
             frame_stride=arguments.frame_stride,
             limit_per_episode=arguments.limit_per_episode,
@@ -1500,6 +1559,7 @@ def _labels_by_source_from_arguments(
     }
     return select_stratified_labels(
         candidate_labels_by_source,
+        source_uri_by_path=source_uri_by_path,
         samples_per_hand_count=arguments.samples_per_hand_count,
         sample_seed=arguments.sample_seed,
     )
@@ -1512,8 +1572,10 @@ def _run_configuration_from_arguments(arguments: argparse.Namespace) -> Evaluati
         raise ValueError("--base-url or OPENAI_BASE_URL is required")
     camera_view = CameraView(arguments.camera)
     output_directory = arguments.output or _default_output_directory(arguments.model, camera_view)
+    resolved_source_paths = _resolved_mcap_paths(arguments.inputs)
     source_paths = select_episode_paths(
-        _resolved_mcap_paths(arguments.inputs),
+        resolved_source_paths,
+        source_uri_by_path=_source_uri_by_path(resolved_source_paths),
         episode_count=arguments.episode_count,
         sample_seed=arguments.sample_seed,
     )

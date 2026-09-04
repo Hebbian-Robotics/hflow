@@ -25,13 +25,14 @@ import tempfile
 import urllib.request
 from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import NotRequired, TypedDict
 from urllib.parse import urlsplit
 
 from mcap.writer import Writer as McapWriter
 
 from hflow.ffmpeg import ffmpeg_path, ffmpeg_version, ffprobe_path
+from hflow.storage import LocalStorageRoot, StorageRoot, parse_storage_root
 from hflow.transform import TransformConfig, write_canonical_episode
 
 logger = logging.getLogger(__name__)
@@ -41,8 +42,14 @@ DEFAULT_REVISION = "main"
 DEFAULT_OUTPUT_DIR = Path("./data/lerobot_pusht")
 DEFAULT_CAMERA_KEY = "observation.image"
 
-CONVERTER_VERSION = "lerobot-converter-v4"
+# "v5": episode metadata is read from every meta/episodes shard, not only the
+# first, and shards are cached under their own chunk directory (#293).
+# Multi-shard corpora previously published episodes with the wrong video
+# window or the wrong source episode, so their outputs must not share an
+# identity with the corrected ones.
+CONVERTER_VERSION = "lerobot-converter-v5"
 PRESENTATION_TIMESTAMP_EPSILON_S = 0.050
+EPISODE_METADATA_TREE_PREFIX = PurePosixPath("meta/episodes")
 
 # Timestamp handling
 NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -370,6 +377,32 @@ def _download_file(url: str, destination_path: Path, chunk_size: int = 1 << 20) 
             raise
 
 
+def _episode_metadata_cache_path(
+    episodes_metadata_directory: Path, tree_entry_path: str, *, repo_id: str
+) -> Path:
+    """Where one ``meta/episodes`` tree entry lands in the local cache.
+
+    The path below ``meta/episodes`` is kept rather than flattened to its
+    basename. Dataset v3 shards episode metadata as
+    ``chunk-XXX/file-YYY.parquet`` and reuses file names across chunk
+    directories, so two shards flattened to one cache file would make the
+    second look already downloaded and its episodes vanish (#293). The tree
+    listing is remote input, so an entry that would land outside the
+    metadata directory is refused rather than joined.
+    """
+    tree_path = PurePosixPath(tree_entry_path)
+    try:
+        relative_path = tree_path.relative_to(EPISODE_METADATA_TREE_PREFIX)
+    except ValueError:
+        relative_path = None
+    if relative_path is None or not relative_path.parts or ".." in relative_path.parts:
+        raise ValueError(
+            f"Hugging Face tree response for {repo_id} lists {tree_entry_path!r}, which is "
+            f"not a file below {EPISODE_METADATA_TREE_PREFIX}/"
+        )
+    return episodes_metadata_directory / relative_path
+
+
 def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _SourceArchive:
     """Download the corpus parquets and video chunks needed for the given episodes."""
     import duckdb
@@ -409,7 +442,9 @@ def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _S
     entries = _hf_tree(dataset_source.repo_id, dataset_source.revision, "meta/episodes")
     for entry in entries:
         if entry.get("type") == "file" and entry["path"].endswith(".parquet"):
-            destination_path = episodes_metadata_directory / Path(entry["path"]).name
+            destination_path = _episode_metadata_cache_path(
+                episodes_metadata_directory, entry["path"], repo_id=dataset_source.repo_id
+            )
             if not destination_path.exists():
                 _download_file(f"{dataset_base_url}/{entry['path']}", destination_path)
             episode_metadata_files.append(destination_path)
@@ -417,46 +452,49 @@ def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _S
     if not episode_metadata_files:
         raise RuntimeError("no meta/episodes parquet files found")
 
-    # Index of per-episode data windows across chunks
+    # Index of per-episode data windows across chunks. Every shard is one
+    # relation: v3 splits episode metadata by size, so an episode and its
+    # video window can sit in any file, not only the first (#293).
+    episode_metadata_relation = (
+        "read_parquet(["
+        + ", ".join(
+            "'" + str(episode_metadata_file).replace("'", "''") + "'"
+            for episode_metadata_file in episode_metadata_files
+        )
+        + "], union_by_name=true)"
+    )
     connection = duckdb.connect()
     try:
         episode_rows: list[_EpisodeRow] = []
-        for episode_metadata_file in episode_metadata_files:
-            parquet_episode_rows = connection.execute(
-                f"""
-                SELECT "episode_index", "tasks", "length",
-                       "data/chunk_index", "data/file_index",
-                       "dataset_from_index", "dataset_to_index"
-                FROM read_parquet('{str(episode_metadata_file).replace("'", "''")}')
-                ORDER BY "episode_index"
-                """
-            ).fetchall()
-            for parquet_episode_row in parquet_episode_rows:
-                tasks = parquet_episode_row[1]
-                if isinstance(tasks, list):
-                    task = str(tasks[0]) if tasks else ""
-                else:
-                    task = str(tasks or "")
-                episode_rows.append(
-                    {
-                        "episode_index": int(parquet_episode_row[0]),
-                        "task": task,
-                        "length": int(parquet_episode_row[2]),
-                        "data_chunk": str(parquet_episode_row[3]).split("/")[-1],
-                        "data_file": str(parquet_episode_row[4]).split("/")[-1],
-                        "data_from": int(parquet_episode_row[5]),
-                        "data_to": int(parquet_episode_row[6]),
-                    }
-                )
-        episode_rows.sort(key=lambda episode: episode["episode_index"])
+        parquet_episode_rows = connection.execute(
+            f"""
+            SELECT "episode_index", "tasks", "length",
+                   "data/chunk_index", "data/file_index",
+                   "dataset_from_index", "dataset_to_index"
+            FROM {episode_metadata_relation}
+            ORDER BY "episode_index"
+            """
+        ).fetchall()
+        for parquet_episode_row in parquet_episode_rows:
+            tasks = parquet_episode_row[1]
+            task = (str(tasks[0]) if tasks else "") if isinstance(tasks, list) else str(tasks or "")
+            episode_rows.append(
+                {
+                    "episode_index": int(parquet_episode_row[0]),
+                    "task": task,
+                    "length": int(parquet_episode_row[2]),
+                    "data_chunk": str(parquet_episode_row[3]).split("/")[-1],
+                    "data_file": str(parquet_episode_row[4]).split("/")[-1],
+                    "data_from": int(parquet_episode_row[5]),
+                    "data_to": int(parquet_episode_row[6]),
+                }
+            )
 
         # Video window columns: videos/<camera>/{chunk_index,file_index,from_timestamp,to_timestamp}
         flattened_column_names = [
             column_description[0]
             for column_description in connection.execute(
-                "SELECT * FROM read_parquet('"
-                + str(episode_metadata_files[0]).replace("'", "''")
-                + "') LIMIT 1"
+                f"SELECT * FROM {episode_metadata_relation} LIMIT 1"
             ).description
         ]
         video_keys = sorted(
@@ -478,9 +516,8 @@ def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _S
                 f'"videos/{camera_key}/to_timestamp" as "vto_{camera_key}",',
             ]
         video_window_select_sql = "episode_index, " + " ".join(video_window_selectors).rstrip(",")
-        first_episode_metadata_file = str(episode_metadata_files[0]).replace("'", "''")
         video_window_rows = connection.execute(
-            f"SELECT {video_window_select_sql} FROM read_parquet('{first_episode_metadata_file}')"
+            f"SELECT {video_window_select_sql} FROM {episode_metadata_relation}"
         ).fetchall()
         video_window_column_names = [
             column_description[0] for column_description in connection.description
@@ -575,10 +612,10 @@ def _derive_numeric_schema(feature_name: str, feature_specification: dict) -> _N
 def import_lerobot_dataset(
     dataset_repo: str = DEFAULT_REPO,
     revision: str = DEFAULT_REVISION,
-    output_dir: Path = DEFAULT_OUTPUT_DIR,
+    output_dir: Path | str | StorageRoot = DEFAULT_OUTPUT_DIR,
     episode_index: int | None = None,
     camera_keys: str | Sequence[str] = (DEFAULT_CAMERA_KEY,),
-) -> list[Path]:
+) -> list[str]:
     """Import selected LeRobot Dataset v3 episodes as canonical MCAP.
 
     ``dataset_repo`` is a Hugging Face dataset repository. ``revision`` may
@@ -588,11 +625,28 @@ def import_lerobot_dataset(
     camera features; a comma-separated string is accepted for compatibility.
     When ``episode_index`` is omitted, every episode is imported.
 
+    ``output_dir`` is any HFlow data root: a local directory or an object-store
+    prefix (``s3://``, ``gs://``, ``az://``). Hugging Face downloads and MCAP
+    construction use local staging under the root's workspace. Durable outputs
+    are published as ``landing/*.mcap`` plus ``prepared-manifest.json`` after
+    every selected episode succeeds. The source cache (``_lerobot_cache``) stays
+    in the workspace -- the local directory itself, or the bucket mirror under
+    ``HFLOW_MIRROR_DIR`` -- and is never uploaded into a bucket root.
+
     Dataset v3 video features and one-dimensional, fixed-width float32 state
     and action vectors are supported. Unsupported feature layouts fail before
-    any episode is published. The returned paths identify the canonical MCAP
-    episodes written under ``output_dir / "landing"``.
+    any episode is published. The returned values are the published episode
+    URIs (absolute path strings for local roots; ``s3://`` / ``gs://`` /
+    ``az://`` object URIs for buckets).
     """
+    storage = parse_storage_root(output_dir)
+    if (
+        isinstance(storage, LocalStorageRoot)
+        and storage.path.exists()
+        and not storage.path.is_dir()
+    ):
+        raise NotADirectoryError(f"output_dir is not a directory: {storage.path}")
+
     normalized_dataset_repo = dataset_repo.strip()
     normalized_revision = revision.strip()
     if not normalized_dataset_repo:
@@ -603,8 +657,6 @@ def import_lerobot_dataset(
         isinstance(episode_index, bool) or not isinstance(episode_index, int) or episode_index < 0
     ):
         raise ValueError("episode_index must be zero or greater")
-    if output_dir.exists() and not output_dir.is_dir():
-        raise NotADirectoryError(f"output_dir is not a directory: {output_dir}")
 
     camera_key_arguments = (camera_keys,) if isinstance(camera_keys, str) else camera_keys
     resolved_camera_keys = tuple(
@@ -619,7 +671,7 @@ def import_lerobot_dataset(
         raise ValueError("camera_keys must not contain duplicates")
 
     repository_information = _hf_repo_info(normalized_dataset_repo, normalized_revision)
-    cache_directory = output_dir / "_lerobot_cache" / repository_information["sha"]
+    cache_directory = storage.workspace / "_lerobot_cache" / repository_information["sha"]
     source_archive = _ensure_source_archive(
         DatasetSource(
             repo_id=normalized_dataset_repo,
@@ -658,23 +710,22 @@ def import_lerobot_dataset(
     selected_episode_indexes = (
         [episode_index] if episode_index is not None else list(range(len(episode_rows)))
     )
-    canonical_episode_paths: list[Path] = []
+    published_episode_uris: list[str] = []
 
     dataset_source = source_archive["dataset"]
     for selected_episode_index in selected_episode_indexes:
-        canonical_episode_path = _convert_single_episode(
-            source_archive=source_archive,
-            dataset_source=dataset_source,
-            output_dir=output_dir,
-            episode_index=selected_episode_index,
-            camera_keys=resolved_camera_keys,
-            numeric_schemas=numeric_schemas,
-            frames_per_second=int(source_archive["fps"]),
+        published_episode_uris.append(
+            _convert_single_episode(
+                source_archive=source_archive,
+                dataset_source=dataset_source,
+                storage=storage,
+                episode_index=selected_episode_index,
+                camera_keys=resolved_camera_keys,
+                numeric_schemas=numeric_schemas,
+                frames_per_second=int(source_archive["fps"]),
+            )
         )
-        canonical_episode_paths.append(canonical_episode_path)
 
-    manifest_path = output_dir / "prepared-manifest.json"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_contents = json.dumps(
         {
             "schema_version": 2,
@@ -684,42 +735,33 @@ def import_lerobot_dataset(
                 "license": dataset_source.license,
             },
             "camera_keys": list(resolved_camera_keys),
-            "episodes_converted": len(canonical_episode_paths),
+            "episodes_converted": len(published_episode_uris),
             "converter_version": CONVERTER_VERSION,
         },
         indent=2,
     )
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        prefix=f".{manifest_path.name}.",
-        suffix=".partial",
-        dir=manifest_path.parent,
-        delete=False,
-    ) as temporary_manifest:
-        temporary_manifest_path = Path(temporary_manifest.name)
-        try:
-            temporary_manifest.write(manifest_contents)
-            temporary_manifest.flush()
-            os.fsync(temporary_manifest.fileno())
-            temporary_manifest_path.replace(manifest_path)
-        except BaseException:
-            temporary_manifest_path.unlink(missing_ok=True)
-            raise
-    logger.info("wrote LeRobot import manifest %s", manifest_path)
-    return canonical_episode_paths
+    # Manifest-last: only publish after every selected episode object succeeded.
+    with tempfile.TemporaryDirectory(prefix="lerobot-import-manifest-") as temporary_directory:
+        temporary_manifest_path = Path(temporary_directory) / "prepared-manifest.json"
+        temporary_manifest_path.write_text(manifest_contents + "\n", encoding="utf-8")
+        published_manifest_uri = storage.publish(temporary_manifest_path, "prepared-manifest.json")
+    logger.info("wrote LeRobot import manifest %s", published_manifest_uri)
+    return published_episode_uris
 
 
 def _convert_single_episode(
     source_archive: _SourceArchive,
     dataset_source: DatasetSource,
-    output_dir: Path,
+    storage: StorageRoot,
     episode_index: int,
     camera_keys: tuple[str, ...],
     numeric_schemas: dict[str, _NumericSchema],
     frames_per_second: int,
-) -> Path:
-    """Convert a single episode to canonical MCAP. Returns output path."""
+) -> str:
+    """Convert a single episode to canonical MCAP and publish it.
+
+    Returns the published episode URI under ``landing/``.
+    """
     import duckdb
 
     episode_row = source_archive["episodes"][episode_index]
@@ -886,10 +928,9 @@ def _convert_single_episode(
 
         video_data_by_camera[camera_key] = (access_units, presentation_timestamps)
 
-    # Write MCAP
+    # Write MCAP into local staging, then publish the complete file.
     output_file_name = f"lerobot_episode_{episode_index + 1:04d}.mcap"
-    output_path = output_dir / "landing" / output_file_name
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    landing_relative_key = f"landing/{output_file_name}"
 
     from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
     from mcap_protobuf.schema import build_file_descriptor_set
@@ -904,7 +945,8 @@ def _convert_single_episode(
 
     source_uri = f"hf://datasets/{dataset_source.repo_id}@{dataset_source.revision}"
     with tempfile.TemporaryDirectory(prefix="lerobot-source-episode-") as temporary_directory:
-        source_episode_path = Path(temporary_directory) / output_path.name
+        temporary_root = Path(temporary_directory)
+        source_episode_path = temporary_root / output_file_name
         with source_episode_path.open("wb") as source_stream:
             mcap_writer = McapWriter(source_stream)
             mcap_writer.start(profile="", library="hflow LeRobot source adapter")
@@ -990,19 +1032,22 @@ def _convert_single_episode(
             )
             mcap_writer.finish()
 
+        canonical_episode_path = temporary_root / f"canonical-{output_file_name}"
         write_canonical_episode(
             source_episode_path,
-            output_path,
+            canonical_episode_path,
             TransformConfig(gop_seconds=1.0),
             source_uri=source_uri,
         )
+        published_uri = storage.publish(canonical_episode_path, landing_relative_key)
+        episode_size_bytes = canonical_episode_path.stat().st_size
 
     logger.info(
         "wrote canonical LeRobot episode %s (%.2f MB)",
-        output_path,
-        output_path.stat().st_size / 1_000_000,
+        published_uri,
+        episode_size_bytes / 1_000_000,
     )
-    return output_path
+    return published_uri
 
 
 __all__ = ["import_lerobot_dataset"]

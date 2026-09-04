@@ -1,18 +1,24 @@
-# HFlow MCAP storage and read benchmarks
+# HFlow storage, read, and camera-check benchmarks
 
-These reproducible benchmarks measure the two performance decisions in HFlow's
-canonical MCAP writer: in-band video compression and topic-group chunking.
-They report what the current implementation achieves at honest small scale
-alongside the million-hour results Dyna published in
+These reproducible benchmarks measure HFlow's in-band video compression,
+topic-group chunking, and cold camera-evidence throughput. Every HFlow number
+below comes from a real run of the scripts in [`benchmarks/`](../benchmarks);
+nothing is extrapolated.
+
+For external scale context, Dyna Robotics reported about **68% lower storage**
+from moving per-frame JPEG data to H.264, about **3.4x fewer chunk fetches**
+from grouping topics by read pattern, and about **2.9x faster reads** across a
+43-million-episode corpus in
 [Training Dyna-2 at million-hour scale, repeatably](https://www.dyna.co/research/dyna-2-infrastructure)
-(Figure 3). Every number below comes from a real run of the scripts in
-[`benchmarks/`](../benchmarks); nothing is extrapolated.
+(Figure 3). Those figures describe a different system and workload; they are
+reference points, not targets or claims about HFlow.
 
 ## Results at a glance
 
 | Workload | Measured result | Why it matters |
 | --- | --- | --- |
 | Six-camera real footage | **48-50.5% less video payload** than the source JPEG payloads | Quantifies the storage effect without relying on synthetic test patterns |
+| One-camera 1080p30 evidence pass | **4.90 s median** to inspect every frame of a 30 s episode | Establishes the cold `camera_frame_stats` cost without mixing in transform or cache time |
 | Four-camera synthetic training windows | **2.42x fewer chunk fetches** than per-topic chunking | Shows how grouping topics by read pattern reduces sample assembly work |
 | Six-camera real footage with 8 MB chunks | **2.81x fewer fetches and 3.21x fewer bytes fetched** than per-topic chunking | Demonstrates that chunk size and grouping policy must be tuned together |
 | Selective state scans | Naive schema grouping fetched **230 MB** for a 0.2 MB `/imu` stream | Shows why HFlow exposes per-topic group overrides instead of treating grouping as a fixed schema rule |
@@ -29,6 +35,8 @@ sections for the reference datasets):
 ```bash
 uv run python benchmarks/storage_benchmark.py
 uv run python benchmarks/read_benchmark.py
+uv run python benchmarks/camera_frame_stats_benchmark.py
+uv run python benchmarks/camera_frame_stats_benchmark.py --profile-filters
 uv run python benchmarks/storage_benchmark.py --input nuscenes-mini-sample.mcap
 uv run python benchmarks/read_benchmark.py --input nuscenes-mini-sample.mcap \
     --grouping read-pattern --chunk-size-bytes 8000000
@@ -48,19 +56,80 @@ uv run python benchmarks/read_benchmark.py --input robotis-button-push-107.mcap 
   not an object-storage round trip. Wall-clock ratios here therefore
   *understate* the benefit that matters on S3/GCS; the fetch and
   bytes-fetched counts are layout facts and transfer directly.
-- Scale: 11.6-60 s episodes, not the forty-three million of Dyna's corpus. The
-  point is that the mechanisms behave as Dyna's article describes, not that
-  the ratios match.
-- Storage reductions compare **video payload bytes** (the codec effect, the
-  number comparable to Dyna's ~68%). File sizes are shown alongside but carry
+- Scale: the measured inputs are 11.6-60 s episodes. These results establish
+  behavior on the named workloads and do not predict million-hour performance.
+- Camera-check wall time is machine- and content-dependent. Its benchmark uses
+  a fresh `Episode` workdir for every repetition, so neither the remuxed MP4 nor
+  the persistent FFmpeg instrument cache can turn a cold run into a cache hit.
+- Storage reductions compare **video payload bytes** to isolate the codec
+  effect. File sizes are shown alongside but carry
   every non-camera channel passed through byte-for-byte; on a lidar-heavy
   recording those dwarf the cameras and would swamp a file-level comparison.
+
+## Camera evidence: cold per-frame throughput (issue #365)
+
+`camera_frame_stats` measures blackout, freeze, luma, frame-difference,
+temporal-outlier, and broadcast-range evidence for every decoded frame. The
+implementation already shares one FFmpeg filter graph between those
+measurements and caches its instrument output, so this benchmark measures the
+remaining first-run cost rather than reintroducing the repeated decode removed
+by #175.
+
+The script first transforms one deterministic synthetic episode, reports that
+time separately, then runs the check three times with a new workdir each time:
+
+```bash
+uv run python benchmarks/camera_frame_stats_benchmark.py
+# --quick uses a 3 s, 320x180 development fixture
+```
+
+Measured on a Ryzen 9 8945H (8 cores/16 threads), 32 GB RAM, Linux x86_64, and
+FFmpeg `n8.1.2-50-g1a748fe2cd-20260901` at commit `050d145`:
+
+| phase | wall-clock | decoded frames | instrument cache |
+|---|---:|---:|---:|
+| transform to canonical | 3.510 s | - | - |
+| cold `camera_frame_stats` #1 | 4.897 s | 900 | 840.3 KB |
+| cold `camera_frame_stats` #2 | 4.940 s | 900 | 840.3 KB |
+| cold `camera_frame_stats` #3 | 4.797 s | 900 | 840.3 KB |
+
+The cold median is **4.897 s per camera** for 30 seconds of 1920x1080 video at
+30 FPS. All three runs decoded all 900 frames. This synthetic result matches
+the shape of the separately reported real Egocentric-10K control in #365:
+seconds per camera, stable across cold repetitions, and independent of whether
+the canonical H.264 arrived directly or through a JPEG transform.
+
+### Where the time goes
+
+`--profile-filters` runs one-variable FFmpeg controls against the same
+canonical MP4 to isolate the cost:
+
+| filter path | wall-clock |
+|---|---:|
+| decode only | 0.422 s |
+| decode + `format=yuv420p` | 0.518 s |
+| decode + `blackframe` | 0.537 s |
+| decode + `freezedetect` | 0.508 s |
+| decode + `signalstats=stat=tout+brng` | 4.536 s |
+| complete shipped graph | 4.711 s |
+
+`signalstats` is the bottleneck, not H.264 decoding. The additional controls
+recorded in #365 found no repeatable gain from overriding FFmpeg's automatic
+filter threading, splitting the graph into parallel branches, or using NVDEC
+before the software-only evidence filters. A luma-only input is not equivalent
+either: FFmpeg's `BRNG` statistic deliberately evaluates the Y, U, and V
+planes, so removing chroma would silently weaken the recorded evidence.
+
+**Conclusion: keep the measurement path unchanged.** The tested changes do not
+produce a repeatable win without changing evidence or adding complexity that
+outweighs noise-level movement. The benchmark is the durable outcome: future
+FFmpeg releases or alternative instruments now have a reproducible baseline
+and must beat it while preserving every per-frame result.
 
 ## Storage: per-frame JPEG vs canonical MCAP by GOP preset (issue #26)
 
 HFlow's transform re-encodes per-frame JPEG into in-band H.264 with GOP
-length matched to the read pattern. Dyna's article reports that the same
-move (from H5 holding per-frame JPEG) cut their storage ~68%.
+length matched to the read pattern.
 
 **Measured** (30 s synthetic episode, 2 cameras @ 15 Hz, 320x240,
 zstd chunks; baseline = the sum of the JPEG payload bytes, i.e. the storage
@@ -76,9 +145,8 @@ that baseline):
 
 Observations:
 
-- The reduction direction and magnitude match the claim; the ~13-15 points
-  over Dyna's 68% are synthetic-content flattery, quantified against real
-  footage below (48-51% on a real recording).
+- Synthetic test patterns exaggerate compression. Real footage below measures
+  a 48-51% reduction on the named recording.
 - Longer GOPs buy a few points more on top of short GOPs (fewer keyframes):
   the storage side of the storage-vs-seek trade the presets encode.
 - The source MCAP row is itself smaller than its own JPEG payloads (4.28 vs
@@ -92,13 +160,11 @@ Observations:
 Default MCAP writing gives each topic its own chunks, so one training sample
 costs a read per topic. HFlow's writer instead lays out topic *groups*
 time-major (cameras in one chunk stream, proprioception+actions in another),
-so a sample costs one read per group; Dyna's article reports ~3.4x fewer
-chunk fetches and ~2.9x faster reads from the same layout change at their
-scale.
+so a sample costs one read per group.
 
 **Measured**: three layouts holding identical messages (60 s episode,
 4 cameras @ 15 Hz + `/joint_states` @ 100 Hz, 800 KB chunks, same stock
-reader): **per-topic** (Dyna's baseline), **interleaved** (the stock
+reader): **per-topic**, **interleaved** (the stock
 Python writer's single chunk builder, what most tooling writes today), and
 **topic-group** (ours).
 
@@ -107,7 +173,7 @@ state):
 
 | layout | fetches/sample | compressed MB fetched/sample | wall-clock (local) |
 |---|---|---|---|
-| per-topic (Dyna's baseline) | 5.04 | 0.963 | 2251 ms |
+| per-topic | 5.04 | 0.963 | 2251 ms |
 | interleaved (stock python writer) | 1.11 | 0.537 | 821 ms |
 | topic-group (ours) | **2.08** | 0.830 | 1508 ms |
 
@@ -116,18 +182,16 @@ pattern, x10):
 
 | layout | fetches/scan | compressed MB fetched/scan | wall-clock (local) |
 |---|---|---|---|
-| per-topic (Dyna's baseline) | 3.00 | 0.437 | 310 ms |
+| per-topic | 3.00 | 0.437 | 310 ms |
 | interleaved (stock python writer) | 6.00 | 2.889 | 363 ms |
 | topic-group (ours) | **3.00** | **0.437** | 302 ms |
 
 Observations:
 
-- Against Dyna's per-topic baseline, topic-group chunking gives **2.42x
-  fewer fetches** and 1.49x faster local reads on training samples. The
+- Against the per-topic baseline, topic-group chunking gives **2.42x fewer
+  fetches** and 1.49x faster local reads on training samples. The
   arithmetic ceiling at 4 cameras + 1 state topic is (4+1)/2 = 2.5x, and the
-  measurement sits on it; Dyna's 3.4x implies more topics per sample at
-  their scale, exactly their article's "adding a camera no longer adds a
-  round trip".
+  measurement sits near it.
 - The interleaved layout is *best* on full multi-view samples (every byte in
   its chunks is needed) but pays 6.6x the bytes and 2x the fetches the
   moment a read is selective: the state-only scan drags the entire video
@@ -135,9 +199,9 @@ Observations:
   under **both** access patterns, which is the actual claim under test:
   read layouts are tuned per consumer, and a corpus serves more than one
   consumer.
-- Local wall-clock tracks bytes-decompressed, not round trips; on object
-  storage the fetch counts dominate and the gap widens toward Dyna's
-  numbers.
+- Local wall-clock tracks bytes decompressed, not round trips. On object
+  storage, fetch count becomes more important because each fetch adds network
+  latency.
 
 ## Real footage: nuScenes mini scene
 
@@ -167,8 +231,7 @@ dataset. Copyright 2020 nuScenes.*
 | canonical MCAP, `gop_preset=vla` (1 s GOP) | 349.84 MB | 103.90 MB | **48.0%** | 18.9 s |
 | canonical MCAP, `gop_preset=world_model` (6 s GOP) | 344.89 MB | 98.96 MB | **50.5%** | 22.6 s |
 
-Real footage lands at **48-51% video reduction** against Dyna's ~68%. The gap
-has honest explanations rather than excuses: these cameras run at ~11.5 Hz
+Real footage lands at **48-51% video reduction**. These cameras run at ~11.5 Hz
 (far less temporal redundancy than a 30 Hz wrist camera), the source JPEGs
 are already well compressed (~150 KB per 1600x900 frame), and the encode uses
 the default `crf=23` with no per-deployment tuning. Manipulation-robot
@@ -184,8 +247,8 @@ everything-else) blindly, and it made reads *worse* than per-topic: this
 recording's "everything else" is ~300 MB of point clouds and diagnostics, so
 `/imu` shared chunks with lidar and a full `/imu` scan dragged **230 MB**
 through the reader (vs 0.2 MB per-topic), while training samples fetched
-37.5 chunks/sample vs per-topic's 12.9. The lesson is the instruction in
-Dyna's article read carefully: group topics that **share a read pattern**.
+37.5 chunks/sample vs per-topic's 12.9. The result demonstrates why topics
+must be grouped by **shared read pattern**.
 Grouping is not a schema decision, and `TransformConfig.topic_groups` exists
 precisely to say so. The benchmark's `--grouping read-pattern` mode assigns
 bulk modalities (mean message size > 16 KB) to their own group; the default
@@ -196,9 +259,9 @@ cameras + `/imu`):
 
 | chunk size | layout | fetches/sample | compressed MB fetched/sample |
 |---|---|---|---|
-| 800 KB flat | per-topic (Dyna's baseline) | 12.93 | 10.14 |
+| 800 KB flat | per-topic | 12.93 | 10.14 |
 | 800 KB flat | topic-group (read-pattern) | **9.18** | **6.65** |
-| 8 MB flat | per-topic (Dyna's baseline) | 7.56 | 49.26 |
+| 8 MB flat | per-topic | 7.56 | 49.26 |
 | 8 MB flat | topic-group (read-pattern) | **2.69** | **15.34** |
 | 5.41 MB flat | topic-group (read-pattern) | **3.08** | **12.32** |
 | **derived per group** (the default) | topic-group (read-pattern) | **3.79** | **11.21** |
@@ -258,11 +321,9 @@ Observations:
   spans ~7 camera chunks by sheer byte volume: fetch counts are byte-bound,
   not layout-bound, and grouping buys only 1.41x. Chunk size is a tuned
   parameter (docs/ARCHITECTURE.md); at 8 MB the layout effect dominates:
-  **2.81x fewer fetches and 3.21x fewer bytes** than the per-topic baseline,
-  against Dyna's ~3.4x with more topics per sample. The shipped derived
-  default lands at **3.41x fewer fetches** than per-topic -- the best fetch
-  ratio in this report, and the closest to Dyna's -- while fetching 0.90x its
-  bytes.
+  **2.81x fewer fetches and 3.21x fewer bytes** than the per-topic baseline.
+  The shipped derived default lands at **3.41x fewer fetches** than per-topic,
+  the best fetch ratio in this report, while fetching 0.90x its bytes.
 - The `/imu` scan under read-pattern grouping fetches 4 MB (vs 230 MB
   naive-grouped, 322-344 MB interleaved); per-topic remains the optimum for
   single-topic scans, as always.

@@ -1,4 +1,4 @@
-"""DuckDB's browser UI over a local HFlow catalog."""
+"""DuckDB's browser UI over a local or bucket-backed HFlow catalog."""
 
 from __future__ import annotations
 
@@ -13,7 +13,18 @@ from threading import Event
 import duckdb
 
 from hflow.catalog import Catalog
-from hflow.curation import _refresh_local_catalog_connection, open_catalog_connection
+from hflow.curation import (
+    _completed_append_exists,
+    _refresh_local_catalog_connection,
+    _sync_catalog_mirror,
+    open_catalog_connection,
+)
+from hflow.storage import (
+    BucketStorageRoot,
+    LocalStorageRoot,
+    StorageRoot,
+    parse_storage_root,
+)
 
 DEFAULT_CATALOG_UI_PORT = 4213
 DEFAULT_CATALOG_POLL_INTERVAL_SECONDS = 0.5
@@ -25,9 +36,9 @@ class CatalogUiStartupError(RuntimeError):
 
 @dataclass(frozen=True)
 class CatalogUiSettings:
-    """Configuration for one local DuckDB catalog browser."""
+    """Configuration for one DuckDB catalog browser."""
 
-    catalog_root: Path
+    catalog_root: Path | str | StorageRoot
     port: int = DEFAULT_CATALOG_UI_PORT
     open_browser: bool = True
     catalog_poll_interval_seconds: float = DEFAULT_CATALOG_POLL_INTERVAL_SECONDS
@@ -53,6 +64,11 @@ class CatalogUiSettings:
                 "catalog_poll_interval_seconds must be positive and finite, got "
                 f"{self.catalog_poll_interval_seconds}"
             )
+
+
+def _catalog_display_label(catalog_root: Path | str | StorageRoot) -> str:
+    """The catalog location to show the operator, never the mirror directory."""
+    return str(parse_storage_root(catalog_root))
 
 
 def _raise_if_loopback_port_is_unavailable(port: int) -> None:
@@ -118,26 +134,34 @@ def _catalog_connection_contains_episodes(
     return episode_count_row is not None and int(episode_count_row[0]) > 0
 
 
-def _first_completed_append_exists(catalog_root: Path) -> bool:
-    # Catalog.append_episode writes the episodes file last. Its presence is
-    # therefore the commit marker for all table files in that append.
-    return any((catalog_root / "episodes").glob("*.parquet"))
+def _first_completed_append_exists(catalog_root: Path | str | StorageRoot) -> bool:
+    return _completed_append_exists(catalog_root)
+
+
+def _prepare_catalog_for_ui(location: StorageRoot) -> None:
+    """Ensure a local catalog exists; bucket catalogs must already be present."""
+    if isinstance(location, LocalStorageRoot):
+        Catalog(location.path)
 
 
 def serve_catalog_ui(settings: CatalogUiSettings, *, shutdown_event: Event | None = None) -> None:
-    """Serve DuckDB UI now, including when the local catalog is still empty.
+    """Serve DuckDB UI now, including when the catalog is still empty.
 
     Empty catalog relations begin as in-memory tables because DuckDB refuses a
     Parquet glob with no matches. The first completed append replaces those
     tables with the normal Parquet-backed HFlow views on the same connection,
     so the already-open UI becomes queryable without restarting this command.
+
+    Bucket catalogs are read-only: the remote ``format_version`` marker must
+    already exist and this command never creates or changes object-store keys.
     """
     effective_shutdown_event = shutdown_event or Event()
+    catalog_root = settings.catalog_root
+    location = parse_storage_root(catalog_root)
+    bucket_catalog = isinstance(location, BucketStorageRoot)
 
-    # Creating a local Catalog is safe before the runtime starts. It writes the
-    # format marker and empty table directories that the ingest will use later.
-    Catalog(settings.catalog_root)
-    catalog_connection = open_catalog_connection(settings.catalog_root)
+    _prepare_catalog_for_ui(location)
+    catalog_connection = open_catalog_connection(catalog_root)
     server_started = False
     try:
         _start_duckdb_ui_server(catalog_connection, settings.port)
@@ -145,7 +169,7 @@ def serve_catalog_ui(settings: CatalogUiSettings, *, shutdown_event: Event | Non
 
         browser_url = f"http://127.0.0.1:{settings.port}"
         print(f"DuckDB UI: {browser_url}", flush=True)
-        print(f"Catalog: {settings.catalog_root.resolve()}", flush=True)
+        print(f"Catalog: {_catalog_display_label(catalog_root)}", flush=True)
         print("Press Ctrl+C to stop DuckDB UI.", flush=True)
         if settings.open_browser:
             try:
@@ -163,8 +187,8 @@ def serve_catalog_ui(settings: CatalogUiSettings, *, shutdown_event: Event | Non
                 flush=True,
             )
             while not effective_shutdown_event.wait(settings.catalog_poll_interval_seconds):
-                if _first_completed_append_exists(settings.catalog_root):
-                    _refresh_local_catalog_connection(catalog_connection, settings.catalog_root)
+                if _first_completed_append_exists(catalog_root):
+                    _refresh_local_catalog_connection(catalog_connection, catalog_root)
                     print(
                         "First completed append detected. Catalog views are now "
                         "available in the open UI.",
@@ -173,7 +197,8 @@ def serve_catalog_ui(settings: CatalogUiSettings, *, shutdown_event: Event | Non
                     break
 
         while not effective_shutdown_event.wait(settings.catalog_poll_interval_seconds):
-            pass
+            if bucket_catalog:
+                _sync_catalog_mirror(catalog_root)
     except KeyboardInterrupt:
         pass
     finally:

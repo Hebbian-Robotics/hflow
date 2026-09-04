@@ -150,6 +150,7 @@ def encode_images_to_h264(
       input order (no B-frames means decode order == presentation order).
     - ``result[i].is_keyframe`` is True exactly when ``i % gop_frames == 0``.
     - Every keyframe access unit has ``has_parameter_sets == True``.
+    - No access unit contains a B picture (checked from the slice headers).
     """
     concatenated_image_bytes = b"".join(images)
     x264_params = (
@@ -685,6 +686,17 @@ def _enforce_encode_guarantees(
             raise VideoEncodeError(
                 f"keyframe access unit {unit_index} is missing SPS/PPS despite repeat-headers=1"
             )
+    coding_scan = scan_picture_coding_types(b"".join(unit.data for unit in access_units))
+    if coding_scan.b_picture_count > 0:
+        # The joined scan proves the stream carries a B picture; the per-unit
+        # rescan on this error path names the first offending access unit.
+        for unit_index, access_unit in enumerate(access_units):
+            unit_scan = scan_picture_coding_types(access_unit.data)
+            if unit_scan.b_picture_count > 0:
+                raise VideoEncodeError(
+                    f"access unit {unit_index}: {unit_scan.b_picture_count} B picture(s), "
+                    "canonical video requires no B-frames"
+                )
 
 
 def _stderr_tail(stderr: bytes) -> str:

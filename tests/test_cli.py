@@ -36,6 +36,7 @@ def test_runtime_command_help_has_a_description(
         ("catalog", "Group commands for inspecting and exploring the append-only"),
         ("dataset", "Group commands that turn the pipeline's policy into version-pinned"),
         ("export", "Group commands for exporting catalog selections in portable downstream"),
+        ("package", "Compile Python implementation modules into a runtime-only"),
         ("serve", "Serve this workspace over HTTP with REST endpoints over the catalog"),
     ],
 )
@@ -173,3 +174,184 @@ def test_the_module_form_reports_a_conforming_file(tmp_path: Path) -> None:
     assert module.returncode == 0
     assert module.returncode == script.returncode
     assert module.stdout == script.stdout
+
+
+@pytest.mark.parametrize("scheme", ["s3", "gs", "az"])
+def test_catalog_ui_cli_accepts_bucket_catalog_urls(
+    scheme: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hflow.catalog_ui import CatalogUiSettings
+    from hflow.cli import _command_catalog_ui
+
+    served_catalog_roots: list[str] = []
+
+    def record_serve(settings: CatalogUiSettings) -> None:
+        served_catalog_roots.append(str(settings.catalog_root))
+
+    monkeypatch.setattr("hflow.catalog_ui.serve_catalog_ui", record_serve)
+    parser = _build_parser()
+    catalog_url = f"{scheme}://robot-data/production/catalog"
+    arguments = parser.parse_args(["catalog", "ui", "--no-browser", "--catalog", catalog_url])
+
+    assert _command_catalog_ui(arguments) == 0
+    assert served_catalog_roots == [catalog_url]
+
+
+def test_catalog_ui_cli_reports_a_missing_remote_catalog_marker(
+    monkeypatch: pytest.MonkeyPatch, capsys: CaptureFixture
+) -> None:
+    def raise_missing_marker(_settings: object) -> None:
+        raise FileNotFoundError(
+            "gs://robot-data/production/catalog is not a catalog root "
+            "(no format_version marker); expected the location a Catalog was "
+            "created with, e.g. <data_root>/catalog"
+        )
+
+    monkeypatch.setattr("hflow.catalog_ui.serve_catalog_ui", raise_missing_marker)
+
+    exit_code = main(
+        [
+            "catalog",
+            "ui",
+            "--no-browser",
+            "--catalog",
+            "gs://robot-data/production/catalog",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.err.startswith("catalog ui:")
+    assert "format_version" in captured.err
+
+
+def test_catalog_ui_cli_reports_a_missing_bucket_extra(
+    monkeypatch: pytest.MonkeyPatch, capsys: CaptureFixture
+) -> None:
+    def raise_missing_obstore() -> object:
+        raise ModuleNotFoundError(
+            "bucket storage roots need the optional obstore backend -- install the "
+            'extra: pip install "hflow[bucket]" (uv: uv add "hflow[bucket]")'
+        )
+
+    monkeypatch.setattr("hflow.storage._load_obstore", raise_missing_obstore)
+
+    exit_code = main(
+        ["catalog", "ui", "--no-browser", "--catalog", "s3://robot-data/production/catalog"]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.err.startswith("catalog ui:")
+    assert "hflow[bucket]" in captured.err
+
+
+def test_catalog_ui_cli_reports_a_bucket_credentials_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: CaptureFixture
+) -> None:
+    from obstore.exceptions import UnauthenticatedError
+
+    def raise_credentials_error(_settings: object) -> None:
+        raise UnauthenticatedError("provider credentials are unavailable")
+
+    monkeypatch.setattr("hflow.catalog_ui.serve_catalog_ui", raise_credentials_error)
+
+    exit_code = main(
+        ["catalog", "ui", "--no-browser", "--catalog", "s3://robot-data/production/catalog"]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.err == "catalog ui: provider credentials are unavailable\n"
+
+
+def test_catalog_ui_cli_does_not_hide_programming_errors_for_bucket_catalogs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_programming_error(_settings: object) -> None:
+        raise RuntimeError("unexpected implementation bug")
+
+    monkeypatch.setattr("hflow.catalog_ui.serve_catalog_ui", raise_programming_error)
+
+    with pytest.raises(RuntimeError, match="unexpected implementation bug"):
+        main(["catalog", "ui", "--no-browser", "--catalog", "gs://robot-data/catalog"])
+
+
+def test_import_lerobot_cli_reports_a_missing_bucket_extra(
+    monkeypatch: pytest.MonkeyPatch, capsys: CaptureFixture
+) -> None:
+    def raise_missing_obstore(**_kwargs: object) -> list[str]:
+        raise ModuleNotFoundError(
+            "bucket storage roots need the optional obstore backend -- install the "
+            'extra: pip install "hflow[bucket]" (uv: uv add "hflow[bucket]")'
+        )
+
+    monkeypatch.setattr("hflow.importers.lerobot.import_lerobot_dataset", raise_missing_obstore)
+
+    exit_code = main(
+        [
+            "import",
+            "lerobot",
+            "--repo",
+            "lerobot/pusht",
+            "--output-dir",
+            "s3://robot-data/production",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.err.startswith("import lerobot:")
+    assert "hflow[bucket]" in captured.err
+
+
+def test_import_lerobot_cli_reports_a_bucket_credentials_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: CaptureFixture
+) -> None:
+    from obstore.exceptions import UnauthenticatedError
+
+    def raise_credentials_error(**_kwargs: object) -> list[str]:
+        raise UnauthenticatedError("provider credentials are unavailable")
+
+    monkeypatch.setattr("hflow.importers.lerobot.import_lerobot_dataset", raise_credentials_error)
+
+    exit_code = main(
+        [
+            "import",
+            "lerobot",
+            "--repo",
+            "lerobot/pusht",
+            "--output-dir",
+            "s3://robot-data/production",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.err == "import lerobot: provider credentials are unavailable\n"
+
+
+def test_import_lerobot_cli_accepts_bucket_output_dir_strings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received: list[str] = []
+
+    def record_import(**kwargs: object) -> list[str]:
+        received.append(str(kwargs["output_dir"]))
+        return ["s3://robot-data/production/landing/lerobot_episode_0001.mcap"]
+
+    monkeypatch.setattr("hflow.importers.lerobot.import_lerobot_dataset", record_import)
+
+    exit_code = main(
+        [
+            "import",
+            "lerobot",
+            "--repo",
+            "lerobot/pusht",
+            "--output-dir",
+            "s3://robot-data/production",
+        ]
+    )
+
+    assert exit_code == 0
+    assert received == ["s3://robot-data/production"]

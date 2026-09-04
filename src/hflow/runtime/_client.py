@@ -153,6 +153,11 @@ def _parse_task_instance(value: object, *, endpoint: str) -> AirflowTaskInstance
     )
 
 
+# Airflow's Get Task Instances endpoint defaults to 50 per page. Asking for
+# more per request costs nothing and halves the round trips on a wide fan-out.
+_TASK_INSTANCE_PAGE_SIZE = 100
+
+
 def _dag_run_path(dag_id: str, dag_run_id: str) -> str:
     """The one owner of run-id-to-URL encoding: every per-run endpoint uses it.
 
@@ -402,14 +407,63 @@ class AirflowClient:
         entry -- state, timings, try number -- is Airflow's vocabulary, not
         HFlow's: this is a thin pass-through so a UI can colour the task graph
         :func:`hflow.runtime.ingest_dag_topology` describes.
+
+        Paged, unlike :meth:`dag_runs`. That one is caller-capped and says so;
+        this one's contract is complete run detail, so a fan-out wider than
+        one page must not silently become the first page. Airflow's endpoint
+        defaults to 50 per page and reports ``total_entries``.
+
+        Every page is requested until the run is exhausted. A failure on any
+        page, or a page carrying no task instance list, raises
+        :class:`AirflowClientError` rather than returning a short list as
+        though it were complete. Each ``(task_id, map_index)`` appears once
+        even if pages overlap.
         """
-        path = f"{_dag_run_path(dag_id, dag_run_id)}/taskInstances"
-        response = self._authenticated("GET", path)
-        task_instances = response.get("task_instances")
-        if not isinstance(task_instances, list):
-            return []
-        endpoint = f"{self.base_url}{path}"
-        return [_parse_task_instance(instance, endpoint=endpoint) for instance in task_instances]
+        run_path = _dag_run_path(dag_id, dag_run_id)
+        endpoint = f"{self.base_url}{run_path}/taskInstances"
+        collected: list[AirflowTaskInstance] = []
+        seen: set[tuple[str | None, int]] = set()
+        offset = 0
+        while True:
+            response = self._authenticated(
+                "GET",
+                f"{run_path}/taskInstances?limit={_TASK_INSTANCE_PAGE_SIZE}&offset={offset}",
+            )
+            page = response.get("task_instances")
+            if not isinstance(page, list):
+                raise AirflowClientError(f"{endpoint} returned no task instance list")
+            if not page:
+                break
+            added = 0
+            for entry in page:
+                parsed = _parse_task_instance(entry, endpoint=endpoint)
+                identity = (parsed.task_id, parsed.map_index)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                collected.append(parsed)
+                added += 1
+            offset += len(page)
+            total_entries = response.get("total_entries")
+            # A page that added nothing new is the guard against a server that
+            # disagrees with its own metadata: it stops the loop whatever the
+            # other two say.
+            if added == 0:
+                break
+            if isinstance(total_entries, int):
+                # Counted against what was kept, not what was asked for:
+                # overlapping pages advance the offset past entries we have not
+                # seen yet.
+                if len(collected) >= total_entries:
+                    break
+            elif len(page) < _TASK_INSTANCE_PAGE_SIZE:
+                # A short page only means exhaustion when there is no total to
+                # check against. Airflow clamps ``limit`` to
+                # ``api.maximum_page_limit`` without erroring, so a deployment
+                # configured below the page size we ask for serves short pages
+                # all the way through the run.
+                break
+        return collected
 
     def unpause_dag(self, dag_id: str) -> dict[str, Any]:
         return self._authenticated("PATCH", f"/api/v2/dags/{dag_id}", {"is_paused": False})

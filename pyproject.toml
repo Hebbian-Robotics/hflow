@@ -1,6 +1,6 @@
 [project]
 name = "hflow"
-version = "0.2.4"
+version = "0.2.5"
 description = "Open source SDK for building Physical AI data pipelines"
 readme = "README.md"
 license = "Apache-2.0"
@@ -23,6 +23,7 @@ requires-python = ">=3.11"
 dependencies = [
     "duckdb>=1.5.5",
     "foxglove-schemas-protobuf>=0.4.0",
+    "httpx2>=2.12.0",
     "mcap>=1.4.0",
     "mcap-protobuf-support>=0.5.4",
     "mcap-ros2-support>=0.5.7",
@@ -49,6 +50,7 @@ mediapipe = ["mediapipe>=1.0.1"]
 # dependency is real, and confined to the one check that needs it. Headless
 # because a data pipeline runs where there is no display.
 motion = ["opencv-python-headless>=5.0.0.93"]
+native-build = ["Cython>=3.3.0", "setuptools>=84.0.0"]
 openai = ["openai>=3.3.1"]
 
 [project.urls]
@@ -61,10 +63,8 @@ hflow = "hflow.cli:main"
 
 [dependency-groups]
 dev = [
+    "Cython>=3.3.0", # the native-build extra, present so its real build path is tested
     "hflow-server", # the workspace API package, present in dev so the suite tests it
-    # Starlette's TestClient transport for the hflow-server suite. httpx2, not
-    # httpx: starlette 1.6 deprecates the httpx transport in its favour.
-    "httpx2>=2.12.0",
     "obstore>=0.11.1", # the bucket extra, present in dev so the suite tests it
     # the motion extra, present in dev so the suite tests it rather than
     # skipping the one check that cannot be verified any other way
@@ -73,6 +73,7 @@ dev = [
     "pytest>=9.1.1",
     "pyyaml>=6.0.3",
     "ruff>=0.16.4",
+    "setuptools>=84.0.0", # the native-build extra's extension builder
     "ty>=0.0.74",
 ]
 

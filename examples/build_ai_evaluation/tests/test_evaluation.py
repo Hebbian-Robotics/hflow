@@ -35,7 +35,13 @@ from examples.build_ai_evaluation.evaluate import (
     main,
     summarize_results,
 )
-from examples.build_ai_evaluation.pipeline import app
+from examples.build_ai_evaluation.pipeline import (
+    _argument_parser as pipeline_argument_parser,
+)
+from examples.build_ai_evaluation.pipeline import (
+    _execution_from_environment,
+    app,
+)
 from hflow.build_ai_vlm_checks import (
     ACTIVE_MANIPULATION_RESPONSE_SCHEMA,
     HAND_COUNT_RESPONSE_SCHEMA,
@@ -244,6 +250,34 @@ def test_build_ai_pipeline_registers_both_judgments_as_hflow_checks() -> None:
         "build_ai_hand_visibility",
     }
     assert all(check.requires == frozenset({"vision-model"}) for check in checks_by_name.values())
+
+
+def test_build_ai_pipeline_defaults_to_hosted_and_can_select_openai_compatible_execution() -> None:
+    hosted_execution = _execution_from_environment("BUILD_AI_HAND_VISIBILITY", {})
+    openai_compatible_execution = _execution_from_environment(
+        "BUILD_AI_HAND_VISIBILITY",
+        {
+            "BUILD_AI_EXECUTION": "hflow-hosted",
+            "BUILD_AI_HAND_VISIBILITY_EXECUTION": "openai-compatible",
+            "BUILD_AI_HAND_VISIBILITY_BASE_URL": "http://localhost:8000/v1",
+            "BUILD_AI_HAND_VISIBILITY_MODEL": "local-vision-model",
+        },
+    )
+
+    assert hosted_execution == hflow.build_ai_vlm_checks.HFlowHostedExecution()
+    assert openai_compatible_execution == hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
+        endpoint="http://localhost:8000/v1",
+        model="local-vision-model",
+    )
+
+
+def test_build_ai_pipeline_requires_an_episode_with_meaningful_footage() -> None:
+    with pytest.raises(SystemExit):
+        pipeline_argument_parser().parse_args([])
+
+    arguments = pipeline_argument_parser().parse_args(["recording.mcap"])
+
+    assert arguments.episode == Path("recording.mcap")
 
 
 def test_summary_reports_prevalence_agreement_and_failures_without_counting_failures_negative() -> (

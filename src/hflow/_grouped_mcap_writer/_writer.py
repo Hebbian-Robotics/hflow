@@ -63,6 +63,8 @@ DEFAULT_LIBRARY_IDENTIFIER = "hflow._grouped_mcap_writer"
 
 SchemaId = NewType("SchemaId", int)
 ChannelId = NewType("ChannelId", int)
+SchemaId.__module__ = __name__
+ChannelId.__module__ = __name__
 NO_SCHEMA_ID = SchemaId(0)
 
 

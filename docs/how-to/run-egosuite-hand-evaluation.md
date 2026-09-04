@@ -148,10 +148,26 @@ export EGOSUITE_LABEL_MANIFEST='data/egosuite-evaluation/labels/natural-1000.jso
 ```
 
 The pipeline validates every manifest record, selects its declared source
-frame indices for each canonical episode, and includes the manifest digest in
-the HFlow check version. Missing or malformed model content is retained as a
+frame indices only when the report's `source_uri` matches the canonical
+episode's HFlow provenance, and includes the manifest digest in the HFlow
+check version. Missing or mismatched provenance fails before frame extraction
+or a model request. Missing or malformed model content is retained as a
 `valid=false` observation so provider output failures lower end-to-end
 accuracy instead of discarding the episode's evidence.
+
+Current label reports record the same source identity returned by
+`App.source_identity()`. Set `HFLOW_DATA_ROOT` consistently when creating the
+report and running the pipeline. When the dataset lives below that root, the
+identity is root-relative and remains stable across equivalent host and
+container mount paths. For the layout in this guide, use:
+
+```bash
+export HFLOW_DATA_ROOT='data/egosuite-evaluation'
+```
+
+Reports created before `source_uri` was added remain usable when each
+`source_episode` basename refers to exactly one source path. An older report
+that uses one basename for multiple paths is ambiguous and must be regenerated.
 
 Use this entrypoint when the judgment belongs in an HFlow episode pipeline.
 Use `evaluate.py` below when comparing models over a declared dataset slice;
@@ -172,8 +188,9 @@ uv run --project examples/egosuite_evaluation \
 
 The terminal table reports the number of frames labeled 0, 1, or 2. The JSON
 file records the projected joint count for each hand, the resulting hand count,
-the exact source frame index, and any pose-quality reasons. Run `labels` first
-on a new corpus to inspect class balance before interpreting model accuracy.
+the exact source frame index, HFlow's canonical `source_uri`, and any
+pose-quality reasons. Run `labels` first on a new corpus to inspect class
+balance before interpreting model accuracy.
 
 For a naturally distributed random sample, select episodes and then select
 temporally separated frames within each episode:

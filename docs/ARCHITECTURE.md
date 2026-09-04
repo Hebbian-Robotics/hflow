@@ -2,14 +2,10 @@
 
 HFlow applies a production data-pipeline architecture to multimodal physical-AI data from human egocentric collection, robot teleoperation, autonomous policy rollouts, and other sensor-rich sources.
 
-The architecture was inspired by Dyna Robotics' ["Training Dyna-2 at million-hour scale,
-repeatably"](https://www.dyna.co/research/dyna-2-infrastructure) (Aug 2026). HFlow is an
-independent project: not affiliated with Dyna, containing none of their code, and claiming no
-compatibility with their internal systems.
-
-Load-bearing decisions in this document cite their sources: Dyna's article where a mechanism or
-measurement is theirs (the article describes goals and mechanisms without publishing a complete
-file-format or service specification), and cited research everywhere else.
+Early design work was partly inspired by Dyna Robotics'
+["Training Dyna-2 at million-hour scale, repeatably"](https://www.dyna.co/research/dyna-2-infrastructure)
+(Aug 2026). HFlow is an independent project with its own public format,
+interfaces, implementation, and measured defaults.
 
 The governing trade: **democratize the architecture, defer the optimizations.**
 
@@ -22,19 +18,19 @@ means HFlow preserves the interface or intent with a single-tenant design;
 **deferred** means possible future work, not a release commitment; and **out of
 scope** means it is deliberately not part of this repository.
 
-| Area | At million-hour scale (per Dyna's article) | HFlow today | Status |
+| Area | Production need | HFlow today | Status |
 |---|---|---|---|
 | Lifecycle boundary | Collection through training-batch loading | Starts from landed MCAP files and ends at curated MCAP plus a Parquet manifest; data-collection systems and training/loading are not included | **Partial by design** |
-| Input formats and triggering | Data from multiple sources and vendors lands in a bucket | The pipeline consumes MCAP; a first-party LeRobot Dataset v3 importer converts its supported video/state/action subset to canonical MCAP. Runs are triggered explicitly through the SDK/CLI or Airflow API; there is no bucket/filesystem watcher | **Simplified; more importers deferred** |
-| Canonical episode format | MCAP, H.264 GOPs matched to read patterns, topic-group chunking, and version stamps | An independently specified, standard-MCAP convention covering the same ground (GOP presets, topic-group chunking, version stamps); interoperability with standard readers is tested, but compatibility with Dyna's undisclosed internal layout is not claimed | **Implemented independently** |
-| Ingestion graph and gates | Airflow transformation, quality-check, and enrichment stages with run profiles and critical/non-critical steps | The stage graph, profiles, quarantine gates, local Compose runtime, and bring-your-own Airflow bundle are implemented | **Implemented at small scale** |
-| Checkpoint and replay | Durable pipeline state, checkpointable multi-day runs, replay from any step, cross-DAG artifact sharing, and selective reprocessing | Durable outputs, a sync completion marker, versioned catalog facts, stage-profile reruns, and explicit selection of registered steps with catalog-aware outstanding-work planning; no general content-addressed checkpoint for every step artifact | **Partial; general artifact checkpoints deferred** |
-| Per-step compute | Resources and worker allocation tailored to each step | `requires=` records intent and puts cheaper steps first; it does not yet route tasks to heterogeneous worker pools or probe GPU/model-service health | **Deferred** |
-| Batch scheduling | Byte-balanced batches and staggered starts, plus joint optimization against network, I/O, database, and worker limits | First-fit-decreasing byte balancing and deterministic stagger are implemented; the joint optimizer is not | **Simplified; optimizer deferred** |
-| Catalog and curation | Transactional database, CDC, analytical warehouse, and a memory-mapped training manifest | Parquet catalog plus DuckDB SQL and Parquet manifests; no database/CDC/warehouse stack and no training dataloader | **Simplified; training loader out of scope** |
-| Corpus caching and fleet orchestration | Alluxio/NVMe cache warming and training-fleet orchestration at million-hour scale | No distributed corpus cache, cache warmer, Slurm/Ansible fleet layer, or topology-aware training orchestration | **Out of scope** |
-| Model-based enrichment | Production labels, captions, and segmentations | Hooks, frame/contact-sheet helpers, and examples; users supply models, clients, prompts, aggregation, and model-serving infrastructure | **Extension surface implemented; models out of scope** |
-| Product/tenancy | An internal production system operating at that scale | One open-source, single-tenant workspace with no accounts, RBAC, or hosted control plane | **Simplified; hosted control plane is only a future direction** |
+| Input formats and triggering | Multiple collection formats and durable event-driven triggering | The pipeline consumes MCAP; a first-party LeRobot Dataset v3 importer converts its supported video/state/action subset to canonical MCAP. Runs are triggered explicitly through the SDK/CLI or Airflow API; there is no bucket/filesystem watcher | **Simplified; more importers deferred** |
+| Canonical episode format | Random access, efficient video, workload-aware reads, and provenance | A standard-MCAP convention with GOP presets, topic-group chunking, and version stamps; interoperability with standard readers is tested | **Implemented** |
+| Ingestion graph and gates | Transformation, quality-check, and enrichment stages with selectable run profiles and failure policy | The stage graph, profiles, quarantine gates, local Compose runtime, and bring-your-own Airflow bundle are implemented | **Implemented at small scale** |
+| Checkpoint and replay | Durable pipeline state, checkpointable runs, replay, artifact sharing, and selective reprocessing | Durable outputs, a sync completion marker, versioned catalog facts, stage-profile reruns, and explicit selection of registered steps with catalog-aware outstanding-work planning; no general content-addressed checkpoint for every step artifact | **Partial; general artifact checkpoints deferred** |
+| Per-step compute | Resource and worker allocation tailored to each step | `requires=` records intent and puts cheaper steps first; it does not yet route tasks to heterogeneous worker pools or probe GPU/model-service health | **Deferred** |
+| Batch scheduling | Byte-balanced batches and staggered starts within infrastructure limits | First-fit-decreasing byte balancing and deterministic stagger are implemented; joint resource optimization is not | **Simplified; optimizer deferred** |
+| Catalog and curation | Low-latency writes, analytical queries, and efficient training manifests | Parquet catalog plus DuckDB SQL and Parquet manifests; no database/CDC/warehouse stack and no training dataloader | **Simplified; training loader out of scope** |
+| Corpus caching and fleet orchestration | Distributed cache warming and topology-aware training orchestration | No distributed corpus cache, cache warmer, Slurm/Ansible fleet layer, or topology-aware training orchestration | **Out of scope** |
+| Model-based enrichment | Production labels, captions, and segmentations | Hooks, frame/contact-sheet helpers, hosted checks for selected fixed methodologies, and examples for caller-supplied models and prompts | **Extension surface implemented; general model serving out of scope** |
+| Product/tenancy | Isolation, identity, and access control for multiple teams | One open-source, single-tenant workspace with no accounts, RBAC, or hosted control plane | **Simplified; hosted control plane is only a future direction** |
 
 The detailed sections below explain why each simplification was made. The
 remaining scale mechanisms are collected in [The scale path](#the-scale-path);
@@ -51,11 +47,12 @@ that is actually scheduled.
 
 ## The data lifecycle
 
-The pipeline follows a four-stage lifecycle -- in the words of Dyna's article, "collection into a
-landing bucket, ingestion into training-ready episodes, curation into the dataset for a given
-experiment, and loading into training batches." HFlow applies that lifecycle to physical-AI
-episode data regardless of who or what generated it: human-worn sensors, a teleoperated robot,
-an autonomous policy, or another multimodal collection system.
+The pipeline follows a four-stage lifecycle: collection into durable storage,
+ingestion into training-ready episodes, curation for a particular use, and
+loading by the downstream consumer. HFlow applies this lifecycle to physical-AI
+episode data regardless of who or what generated it: human-worn sensors, a
+teleoperated robot, an autonomous policy, or another multimodal collection
+system.
 
 ```
 multimodal              landing              ingestion DAG                    catalog + curation
@@ -87,43 +84,37 @@ with its own quality quirks; starting MCAP-in is our simplification, and other r
 ## The episode container: canonical MCAP
 
 Canonical episodes are standard [MCAP](https://mcap.dev/): video-optimizable, randomly
-accessible, flexibly chunked, and natively visualizable. Dyna's article describes moving from
-H5-holding-per-frame-JPEG to MCAP for the same reasons and names the two tunings that mattered
-most at scale; HFlow implements both, plus the version stamps the article calls for:
+accessible, flexibly chunked, and natively visualizable. HFlow adds three
+conventions for efficient reads and reproducible processing:
 
-1. **H.264 with GOP length matched to the read pattern.** Inter-frame compression cut Dyna's
-   storage ~68% versus per-frame JPEG (their measurement). GOP length is a storage-vs-seek trade
+1. **H.264 with GOP length matched to the read pattern.** GOP length is a storage-vs-seek trade
    that depends on the consumer: VLA-style training samples short sparse windows (pays a keyframe
    seek per sample → short GOPs), world-model training reads long contiguous sequences (amortizes
-   keyframes → long GOPs). HFlow exposes GOP as a writer preset keyed to model class, because --
-   as Dyna's article is explicit -- this is effectively a training hyperparameter.
+   keyframes → long GOPs). HFlow exposes GOP as a writer preset keyed to model class because the
+   best value depends on the training workload.
 2. **Topic-group chunking.** Per-topic layouts make one training sample cost a read per topic,
    while the stock Python writer's one interleaved chunk stream makes selective state reads fetch
    unrelated camera bytes. HFlow instead groups topics that share a read pattern and writes each
    group time-major: cameras interleaved in one chunk stream, proprioception + actions in another,
    never sharing a chunk. A sample then costs one read per *group*: an added camera costs no extra
-   fetch. The mechanism comes from Dyna's article, which reports ~3.4× fewer chunk fetches and
-   ~2.9× faster reads. The generic mechanism is isolated in the private
+   fetch. The generic mechanism is isolated in the private
    `hflow._grouped_mcap_writer` subpackage. Chunking changes write order, not the format, so
    **any conforming MCAP reader
    (Foxglove, Rerun, the stock `mcap` package) reads our files unmodified.**
 3. **Version stamps.** HFlow stamps every canonical episode with `schema_version`,
    `pipeline_version` (a content hash of the step configuration that produced it), and
-   `robot_software_version` (from the source recording's metadata, when present). Dyna's article
-   states the requirement plainly: "Every processed episode also carries a stamp of what produced
-   it: the schema version, the ingestion pipeline version, and the software version running on
-   the robot when it was recorded." The corpus is assumed permanently mixed-version (reprocessing
-   takes too long to ever be atomic), so curation filters by version range and stale episodes are
-   found and reprocessed selectively.
+   `robot_software_version` (from the source recording's metadata, when present). The corpus is
+   assumed permanently mixed-version because large reprocessing jobs cannot be atomic, so
+   curation filters by version and stale episodes are found and reprocessed selectively.
 
-The article leaves several specifics open; these are HFlow's design decisions:
+The remaining details are HFlow design decisions:
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| How H.264 sits in MCAP | [`foxglove.CompressedVideo`](https://docs.foxglove.dev/docs/sdk/schemas/compressed-video) messages (Annex B, SPS/PPS on every keyframe, no B-frames) | The ecosystem-standard encoding; it is what makes Foxglove/Rerun viewability real, and lack of native visualization was one of the two reasons Dyna's article gives for abandoning H5 |
-| Where stamps and episode semantics live | MCAP Metadata records (task, operator, success label, embodiment, version stamps); Attachments for calibration/URDF | Keeps the episode self-contained and viewer-inspectable; Dyna's article says only that metadata is indexed for manifest queries (a database concern), not where it lives in-file |
-| Compression codec | zstd chunks | Dyna's article mentions tuned compression without naming a codec; zstd is the MCAP ecosystem default |
-| Numeric parameters (GOP seconds, chunk sizes) | Configurable, with measured defaults | Not disclosed in Dyna's article; [the benchmark report](./BENCHMARKS.md) publishes what we measure |
+| How H.264 sits in MCAP | [`foxglove.CompressedVideo`](https://docs.foxglove.dev/docs/sdk/schemas/compressed-video) messages (Annex B, SPS/PPS on every keyframe, no B-frames) | Uses the ecosystem-standard encoding that Foxglove and Rerun visualize directly |
+| Where stamps and episode semantics live | MCAP Metadata records (task, operator, success label, embodiment, version stamps); Attachments for calibration/URDF | Keeps the episode self-contained and viewer-inspectable |
+| Compression codec | zstd chunks | Uses the MCAP ecosystem default |
+| Numeric parameters (GOP seconds, chunk sizes) | Configurable, with measured defaults | [The benchmark report](./BENCHMARKS.md) publishes the measurements and tradeoffs |
 
 On-disk identifiers (metadata record names, channel naming) are neutral and format-versioned: they never embed the project name, so stored data is independent of branding.
 
@@ -141,13 +132,10 @@ The full normative convention lives in [FORMAT.md](./FORMAT.md).
 Ingestion is an Airflow DAG with three stage families: **data transformation** (resample all
 streams onto a common timestamp grid, compute derived signals, encode canonical MCAP, index
 metadata), **quality check** (a runtime-toggleable pre/post gate around transformation), and
-**feature enrichment** (performance labels, captions, segmentations). The structure follows
-Dyna's article, which describes rewriting an original single-Kubernetes-job pipeline into this
-DAG shape to gain per-step resource allocation, critical/non-critical step tagging (a
-non-critical failure doesn't cancel the run), and per-run step toggles ("run profiles": full
-processing, metadata-only backfill, re-label pass), with pipeline state backed by durable
-storage rather than kept in a live process -- enabling checkpointable runs, replay from any
-step, cross-DAG artifact sharing, and selective reprocessing.
+**feature enrichment** (performance labels, captions, segmentations). Separate stages enable
+per-step resource allocation, critical/non-critical failure policy, and per-run step toggles
+("run profiles": full processing, metadata-only backfill, re-label pass). Pipeline state lives
+in durable storage so work can be resumed, replayed, and selectively reprocessed.
 
 HFlow adopts the stage model, run profiles, and the critical/non-critical gate
 semantics: the three-stage skeleton is fixed, and user steps hang off it. Its
@@ -160,9 +148,8 @@ The built-in transform resamples streams onto a common grid, computes derived si
 
 ### Steps and resources
 
-Each DAG step should get resources matched to its own requirements (Dyna's
-article counts per-step tailoring among the DAG rewrite's wins). In HFlow, a
-step can declare `requires={"gpu"}`; the current implementation uses that
+Each DAG step should get resources matched to its own requirements. In HFlow,
+a step can declare `requires={"gpu"}`; the current implementation uses that
 declaration to order plain steps before resource-declaring steps. It does
 **not** yet probe model-service health or GPU visibility, or route individual
 steps to heterogeneous Airflow worker pools. A bring-your-own Airflow
@@ -174,11 +161,9 @@ HFlow ships simple versions of two scheduler-protecting mechanisms in v1: a plan
 first-fit-decreasing over file sizes into near-equal-byte groups for mapped tasks (file sizes
 vary widely and unbalance workers), and batch starts are spaced by a configurable stagger
 interval (deterministic even spacing, which desynchronizes identical steps at least as well as
-random jitter and reproduces exactly). Both mechanisms come from Dyna's article: at their scale
-the scheduler database became the choke point, and the fixes were staggered batch start times
-and bin-packing input batches into near-equal *bytes*. What stays on
-[the scale path](#the-scale-path) is the joint optimizer the article describes, tuning worker
-counts against network/IO/DB constraints.
+random jitter and reproduces exactly). These controls prevent uneven files and synchronized task
+starts from overwhelming workers or the scheduler. Joint optimization of worker counts against
+network, I/O, and database constraints stays on [the scale path](#the-scale-path).
 
 ### Deployment modes
 
@@ -191,10 +176,10 @@ Airflow cannot be a normal pip dependency: its own maintainers state unconstrain
 
 **Dev loop:** `app.test(episode)` runs the entire pipeline in-process on one episode: no Docker, no scheduler, no Airflow import at all (a plain Python runner with the same gate semantics, wrapping the `app.process()` operation the DAG maps over). Iterate on a check in seconds; `app.run()` when it works.
 
-**Observability is Airflow's own UI**, exposed on localhost in Compose mode. Clear per-step
-status in the DAG view is part of what's being democratized (Dyna's article counts it among the
-rewrite's benefits). The SDK adds plain-language diagnostics for embedder-specific traps
-(`hflow status`), it does not replace the UI.
+**Observability is Airflow's own UI**, exposed on localhost in Compose mode.
+It shows per-step status, logs, retries, and reruns. The SDK adds plain-language
+diagnostics for embedder-specific traps (`hflow status`); it does not replace
+the UI.
 
 ### Data passing
 
@@ -204,10 +189,9 @@ Steps pass references (URIs, episode ids) and small measurements, never media by
 
 Quality checks run as their own runtime-toggleable pre/post gate around transformation, and
 their outcomes stay queryable at curation time (filter by whether the run succeeded, by whether
-a camera dropped out). Dyna's article pins down that placement and the issue classes production
-QC catches -- camera blackout, choppy joint states, missing/occluded hand positions, bad
-frames -- but not what a check outputs, any thresholds, or whether a filtered-out episode is
-deleted or tagged.
+a camera dropped out). The check library covers recording defects such as camera blackout,
+choppy joint states, missing or occluded hands, and bad frames while leaving thresholds and
+retention policy to the corpus owner.
 
 HFlow's answer is a three-layer model, grounded in published curation research:
 
@@ -215,7 +199,7 @@ HFlow's answer is a three-layer model, grounded in published curation research:
 
 **Layer 2: gates are optional policy on critical checks.** A check may declare a user-owned `verdict` predicate, or a pipeline may attach a declarative `Gate` at registration (`@app.check(version="1", gate=...)`) that the runner evaluates over the measurements the check returned. HFlow ships *recommended* gates as values (`hflow.checks.RECOMMENDED_CAMERA_INTEGRITY`) so a starting threshold is documented and tunable, but nothing gates until a pipeline passes one in: a corpus is never quarantined by a number its owner did not choose. Gates are evaluated outside the check on purpose -- a threshold applied inside raises on a key that episode never produced, and the runner records that as an infrastructure error, discarding every measurement already computed. A gate composes with a check's own verdict by conjunction, so it can only ever tighten policy; and because rejecting a conjunction needs only one false conjunct while accepting needs every threshold read, a gate that cannot read a threshold *abstains* (recording a `gate-unevaluated:<pattern>` tag) rather than approving what it never inspected. A failed **critical** verdict tags the episode `quarantined:<check>` and skips its downstream steps (no enrichment spend on an episode with a dead camera); a failed non-critical verdict records a tag and the run proceeds (the critical/non-critical gate semantics described above). Quarantine is a tag, never a deletion: the field's strongest teams keep failures ([DROID](https://droid-dataset.github.io/) releases them, [1X trains on them](https://www.1x.tech/discover/redwood-ai), RoboMIND annotates their causes). A check *crashing* is infrastructure, not data: it retries and can fail the run, but is never recorded as a bad episode.
 
-**Layer 3: curation is SQL over everything layer 1 recorded.** Measurements are catalog columns; a curation query emits `manifest.parquet`. Every measurement row carries the check's explicit, pipeline-owned version, so an author can bump a changed check, append new-version rows, and let curation pin exactly which versions are comparable. Versions are opaque identifiers, so pins use equality or set membership, never ordered ranges. The other half of that reality is selective reprocessing: `hflow stale` (`hflow.stale_episodes`) lists exactly which sources' latest runs predate the current pipeline/format versions, ready to pipe back into `hflow ingest` -- the selective reprocessing Dyna's article calls for: find exactly the stale episodes and reprocess only those.
+**Layer 3: curation is SQL over everything layer 1 recorded.** Measurements are catalog columns; a curation query emits `manifest.parquet`. Every measurement row carries the check's explicit, pipeline-owned version, so an author can bump a changed check, append new-version rows, and let curation pin exactly which versions are comparable. Versions are opaque identifiers, so pins use equality or set membership, never ordered ranges. `hflow stale` (`hflow.stale_episodes`) lists exactly which sources' latest runs predate the current pipeline or format versions, ready to pipe back into `hflow ingest` for selective reprocessing.
 
 Dataset-level reporting includes **coverage denominators** (which checks ran on what fraction of episodes) because a statistic over half a delivery must not look like a statistic over all of it.
 
@@ -236,12 +220,12 @@ def joint_smoothness(ep: hflow.Episode) -> hflow.CheckResult:
 
 The accessor surface is chosen by asking what existing robotics QC scripts take as input: `ep.video(camera)` (lossless remux of in-band H.264 to MP4, no re-encode), `ep.frames(camera, fps=...)` (rate-sampled JPEG frames), `ep.frames_at_indices(camera, frame_indices=...)` (exact labeled source frames), `ep.channel(topic).to_numpy() / .to_arrow()`, `ep.iter_decoded_batches(topics=...)` (bounded-memory multi-topic decoding), and `ep.metadata`. Users who want none of it can open `ep.path` with the raw `mcap` package; the file is standard MCAP.
 
-Built-in checks ship in the same shape users write, doubling as documentation. The starting set covers the issue classes named in Dyna's article plus the field's established integrity checks: timestamp regularity (1/fps ± tolerance, [LeRobot's check](https://github.com/huggingface/lerobot)) with cross-stream sync, required-topic inventory, camera blackout/freeze/exposure and frame count vs expected rate (`camera_frame_stats`), joint discontinuity vs velocity limits, and idle fraction. The camera checks run as a **single-decode ffmpeg instrument**: blackframe + freezedetect + signalstats in one filter graph, so all three share one frame denominator and one decode. Signal quality, action integrity, trajectory motion facts, keyframe seekability, and rate conformance round out the set ([the full list and what each one measures](./how-to/enable-built-in-checks.md#what-each-one-measures)). One built-in, `camera_stability`, needs a dependency outside the core install (OpenCV, via the optional `motion` extra), because separating camera shake from deliberate camera movement takes a transform fitted to tracked features and frame differencing cannot substitute for it. The format-independent frame and camera-motion algorithms now incubate in the private `hflow._video_measurements` package; HFlow checks only adapt episodes and catalog keys around them. Three of the classic cuts are corpus-relative judgments, so their checks record evidence and the decision is a curation query: `episode_duration` for length outliers, `action_rate` for command-traffic rate outliers (see [Cohort statistics](./CATALOG.md#cohort-statistics) for the windowed `_z` comparison), and `content_digest`/`media_digest` for duplicate detection (a `GROUP BY ... HAVING count(*) > 1`). Motion-smoothness metrics ship as flags only, never default reject rules (the Voxel51 inversion result), and no shipped gate thresholds one -- `tests/test_gates.py` walks the keys those checks emit and fails if any does. Built-in checks themselves always return evidence only. HFlow does ship *recommended* thresholds as gate values a pipeline can pass to `@app.check(version="1", gate=...)` and tune, so a starting bar is documented rather than folklore; choosing to gate on one is always the user's explicit act. No two built-ins claim the same measurement key ([why a shared key is unrecoverable](./CATALOG.md#naming-measurement-keys)).
+Built-in checks ship in the same shape users write, doubling as documentation. The starting set covers timestamp regularity (1/fps ± tolerance, [LeRobot's check](https://github.com/huggingface/lerobot)) with cross-stream sync, required-topic inventory, camera blackout/freeze/exposure and frame count vs expected rate (`camera_frame_stats`), joint discontinuity vs velocity limits, and idle fraction. The camera checks run as a **single-decode ffmpeg instrument**: blackframe + freezedetect + signalstats in one filter graph, so all three share one frame denominator and one decode. Signal quality, action integrity, trajectory motion facts, keyframe seekability, and rate conformance round out the set ([the full list and what each one measures](./how-to/enable-built-in-checks.md#what-each-one-measures)). One built-in, `camera_stability`, needs a dependency outside the core install (OpenCV, via the optional `motion` extra), because separating camera shake from deliberate camera movement takes a transform fitted to tracked features and frame differencing cannot substitute for it. The format-independent frame and camera-motion algorithms now incubate in the private `hflow._video_measurements` package; HFlow checks only adapt episodes and catalog keys around them. Three of the classic cuts are corpus-relative judgments, so their checks record evidence and the decision is a curation query: `episode_duration` for length outliers, `action_rate` for command-traffic rate outliers (see [Cohort statistics](./CATALOG.md#cohort-statistics) for the windowed `_z` comparison), and `content_digest`/`media_digest` for duplicate detection (a `GROUP BY ... HAVING count(*) > 1`). Motion-smoothness metrics ship as flags only, never default reject rules (the Voxel51 inversion result), and no shipped gate thresholds one -- `tests/test_gates.py` walks the keys those checks emit and fails if any does. Built-in checks themselves always return evidence only. HFlow does ship *recommended* thresholds as gate values a pipeline can pass to `@app.check(version="1", gate=...)` and tune, so a starting bar is documented rather than folklore; choosing to gate on one is always the user's explicit act. No two built-ins claim the same measurement key ([why a shared key is unrecoverable](./CATALOG.md#naming-measurement-keys)).
 
 ### Model-based checks
 
-Enrichment generates model-derived features -- performance labels, video captions, segmentations
-(the classes Dyna's article names; the mechanisms are unspecified there).
+Enrichment generates model-derived features such as performance labels, video
+captions, and segmentations.
 
 HFlow supports frames-only VLM usage in v1: most models and the OpenAI-compatible protocol don't
 natively support video, so the honest unit is the frame. A generic model step extracts frames
@@ -249,12 +233,12 @@ explicitly (`ep.frames(fps=...)`), calls its own client (hosted or self-run vLLM
 its endpoint, credentials, model, prompt, and aggregation policy. The opt-in
 `hflow.build_ai_vlm_checks.register_hand_visibility` and
 `register_active_manipulation` integrations bundle one published methodology
-on top of the optional OpenAI-compatible client; they still require the caller
-to supply endpoint and model configuration per check. Two helpers survive
+with a per-check execution choice: either a caller-configured OpenAI-compatible
+model or HFlow's fixed hosted check API. Two helpers survive
 because they encode non-obvious value: the **contact sheet** (N timestamped frames composited
 into one image; works even on single-image models, cheap on vision tokens) and frame extraction
-itself. Missing/occluded hand positions -- one of the issue classes Dyna's article names -- is
-the canonical example of this surface: hand visibility is a model judgment, not a signal
+itself. Missing or occluded hand positions are a canonical example of this
+surface: hand visibility is a model judgment, not a signal
 statistic, and the [OpenAI vision example](../examples/openai_vision/pipeline.py) shows it as a
 contact-sheet VLM check. Native-video protocols are a contributor-shaped provider extension
 point.
@@ -278,24 +262,21 @@ The ingest DAG appends one row per episode to Parquet under the data root, and
 [DuckDB](https://duckdb.org/) queries it directly: researcher-facing SQL (filter by task, robot,
 success, sensor dropout, pinned versions) with zero additional services, and a curation query
 writes a columnar manifest. This is the single-tenant collapse of the interface production
-systems need at scale. Dyna's article reports that manifest-building by walking files took ~48
-hours at 43M episodes; their fix was a transactional production DB CDC-replicated into an
-analytical warehouse, making curation a SQL query whose columnar manifest is memory-mapped by
-training ranks. The warehouse/CDC split solves contention between transactional load and
-columnar scans at tens of millions of rows; a single-tenant deployment with thousands of
-episodes doesn't have that problem. The manifest is Parquet; the
-download-once/mmap/zero-copy-shard loading trick Dyna's article describes lives in a training
-dataloader we don't ship, and is documented as [a recipe](./how-to/load-manifest-mmap.md) for
-users who need it.
+systems need at scale. A transactional database, change-data-capture pipeline,
+and analytical warehouse can separate write load from large columnar scans at
+tens of millions of rows; a single-tenant deployment with thousands of
+episodes usually does not need that stack. The manifest is Parquet. A
+download-once, memory-mapped, shard-per-rank loading pattern belongs in the
+training dataloader and is documented as [a recipe](./how-to/load-manifest-mmap.md)
+for users who need it.
 
 ## Storage and durability
 
 HFlow's small-scale durability model is drawn from production experience with
-Pareto and targets the same requirements Dyna's article states: durable
-externally-stored pipeline state, checkpointable multi-day runs, replay from
-any step, and selective reprocessing (the article leaves the mechanisms
-unspecified). Today, canonical outputs and catalog facts are durable, the sync
-stage has a persisted completion marker, and run profiles can replay a stage.
+Pareto and targets durable externally stored pipeline state, checkpointable
+multi-day runs, replay, and selective reprocessing. Today, canonical outputs
+and catalog facts are durable, the sync stage has a persisted completion
+marker, and run profiles can replay a stage.
 Direct and hosted executors can also select registered steps by name;
 catalog-aware planning then runs only selected steps whose current versions
 have no settled outcome. A later run consumes the canonical episode a previous
@@ -337,10 +318,10 @@ The open-source deployment is **single-tenant everything**: one workspace, no us
 
 ## The scale path
 
-What production scale needs that HFlow defers, and what replaces it here; Dyna's article is the
-cited description of each mechanism proven at million-hour scale:
+HFlow keeps its boundaries compatible with larger-scale components without
+shipping those systems in the open-source core:
 
-| Production-scale mechanism (per Dyna's article) | Why scale needs it | HFlow v1 |
+| Production-scale mechanism | Why scale needs it | HFlow v1 |
 |---|---|---|
 | Joint optimizer tuning worker counts vs network/IO/DB limits | millions of concurrent runs | simple FFD bin-packing + deterministic start stagger (included); tuning deferred |
 | Production DB + CDC + analytical warehouse | 50M+ row columnar scans vs transactional load | Parquet catalog + DuckDB, same SQL interface |
@@ -348,13 +329,9 @@ cited description of each mechanism proven at million-hour scale:
 | mmap/zero-copy manifest loading across ranks | 2 TB node RAM ceilings | [docs recipe](./how-to/load-manifest-mmap.md) (Arrow memory-map); trivial at small scale |
 | Topology-aware optimizer sharding, Slurm preflight gating, Ansible fleet provisioning | training-side, week-long runs on rented fleets | out of scope; this is a data pipeline, not a trainer |
 
-[The benchmark report](./BENCHMARKS.md) publishes what the simple version achieves and where each limit is: storage vs per-frame JPEG (Dyna: ~68% reduction), topic-group vs default chunking read performance (Dyna: ~2.9× faster), and single-machine ingestion throughput.
+[The benchmark report](./BENCHMARKS.md) publishes what the current implementation achieves and where each limit is: storage versus per-frame JPEG, topic-group versus default chunking read performance, and single-machine ingestion throughput.
 
 ## References
-
-Cited throughout for mechanisms and measurements proven at million-hour scale:
-
-- Dyna Robotics, [Training Dyna-2 at million-hour scale, repeatably](https://www.dyna.co/research/dyna-2-infrastructure) (Aug 2026)
 
 Formats and infrastructure:
 

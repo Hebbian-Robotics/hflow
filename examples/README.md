@@ -35,6 +35,38 @@ argument to process your own recording.
 
 Code: [`quickstart.py`](./quickstart.py)
 
+## Recommended real-episode evaluation
+
+**Use it for:** seeing HFlow's default deterministic checks and hosted semantic
+checks work together on real egocentric footage.
+
+**Prerequisites:** the normal development environment, the `hf` CLI, and
+network access. The hosted checks require no account, API key, or model server.
+
+```bash
+mkdir -p data/episode-evaluation
+downloaded_sample_mcap_path="$(
+    hf download LightwheelAI/EgoDemo \
+        'EgoStand/mcap/Thimble Removal/a8d29fea-3cf9-47f7-ad4b-4b1d0ecb7a71.mcap' \
+        --repo-type dataset \
+        --quiet
+)"
+cp "$downloaded_sample_mcap_path" data/episode-evaluation/sample.mcap
+
+uv run python examples/evaluate_episode.py \
+    data/episode-evaluation/sample.mcap \
+    --camera /sensor/camera/head_left/video
+```
+
+The report includes the six automatic recording-integrity checks plus hosted
+hand visibility and active manipulation. The sample's first left-camera frame
+is a clear positive case, so the model evidence should report two visible hands
+and active manipulation. Outputs land under `data/episode-evaluation/`.
+
+Guide: [Evaluate your first egocentric episode](../docs/tutorials/evaluate-an-egocentric-episode.md)
+
+Code: [`evaluate_episode.py`](./evaluate_episode.py)
+
 ## OpenAI vision check
 
 **Use it for:** sampling an episode, making a contact sheet, and calling an
@@ -51,8 +83,7 @@ uv run --extra openai python examples/openai_vision/pipeline.py
 
 The example synthesizes a small episode when no MCAP path is provided and runs
 two contact-sheet checks through the Responses API: an activity description,
-and a hand-visibility fraction (missing or occluded hand positions, a quality
-issue Dyna's article describes, answered as model evidence). Each check is one
+and a hand-visibility fraction answered as model evidence. Each check is one
 API call;
 `OPENAI_BASE_URL` can point the same client at another endpoint that
 implements the Responses API.
@@ -66,23 +97,44 @@ Code: [`openai_vision/pipeline.py`](./openai_vision/pipeline.py)
 active-manipulation methodology as HFlow checks, then replaying their
 Egocentric-10K or Egocentric-100K inputs to compare models and prompts.
 
-**Prerequisites:** an OpenAI-compatible vision endpoint. The pinned evaluation
-replay additionally needs the `hf` CLI and sufficient disk for the selected
-Parquet files. Each frame makes two API calls and can incur charges.
+**Prerequisites:** network access and the `hf` CLI for the sample recording.
+The default pipeline route uses HFlow's hosted checks without an account or API
+key. The pinned evaluation replay additionally needs sufficient disk for the
+selected Parquet files. Each frame makes two external check calls; a configured
+model provider may charge for them.
 
 ```bash
-export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
-export OPENAI_MODEL="qwen/qwen3-vl-32b-instruct"
-export BUILD_AI_API_KEY_ENV="OPENROUTER_API_KEY"
+mkdir -p data/build-ai-evaluation
+downloaded_sample_mcap_path="$(
+    hf download LightwheelAI/EgoDemo \
+        'EgoStand/mcap/Thimble Removal/a8d29fea-3cf9-47f7-ad4b-4b1d0ecb7a71.mcap' \
+        --repo-type dataset \
+        --quiet
+)"
+cp "$downloaded_sample_mcap_path" data/build-ai-evaluation/sample.mcap
+
 uv run --project examples/build_ai_evaluation \
-    python -m examples.build_ai_evaluation.pipeline
+    python -m examples.build_ai_evaluation.pipeline \
+    data/build-ai-evaluation/sample.mcap
 ```
 
-The HFlow pipeline synthesizes a sample episode when no MCAP path is supplied,
-evaluates its first frame through two `@app.check` steps, and records the raw
-answers, parsed predictions, routed model, and token usage as
-`hflow.CheckResult` measurements. Pass an MCAP path to run the checks on an
-existing episode.
+The HFlow pipeline evaluates the existing episode's first frame through two
+`@app.check` steps and records the raw answers, parsed predictions, execution
+identity, and any available model usage as `hflow.CheckResult`
+measurements. An episode path is required because generated test-pattern
+footage cannot meaningfully demonstrate either judgment.
+
+To use a local OpenAI-compatible model server instead of HFlow's hosted checks:
+
+```bash
+export BUILD_AI_EXECUTION="openai-compatible"
+export OPENAI_BASE_URL="http://localhost:8000/v1"
+export OPENAI_MODEL="Qwen/Qwen3-VL-8B-Instruct"
+
+uv run --project examples/build_ai_evaluation \
+    python -m examples.build_ai_evaluation.pipeline \
+    data/build-ai-evaluation/sample.mcap
+```
 
 The companion adapter streams the published Parquet images into Inspect AI
 without transcoding them, using the same prompts, schemas, and parsers:

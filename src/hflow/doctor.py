@@ -109,7 +109,21 @@ def _check_video_payload(
         )
         return
     try:
-        picture_count = video_module.count_h264_pictures(payload)
+        try:
+            coding_scan = video_module.scan_picture_coding_types(payload)
+        except ValueError:
+            # The scan fails closed on any unparseable slice header, but
+            # count_h264_pictures only needs first_mb_in_slice and can still
+            # succeed. Delegating to it keeps the doctor hot path to one walk
+            # while its own ValueError, caught below, keeps the finding text
+            # byte-identical for both count failure kinds. Its count also
+            # reproduces the pre-classification behavior exactly when the
+            # first_mb_in_slice field parses and slice_type does not.
+            picture_count = video_module.count_h264_pictures(payload)
+            b_picture_count = None
+        else:
+            picture_count = coding_scan.picture_count
+            b_picture_count = coding_scan.b_picture_count
     except ValueError as error:
         collector.add(
             DiagnosticLevel.ERROR,
@@ -117,6 +131,16 @@ def _check_video_payload(
             f"{topic} message {message_index}: {error}",
         )
         return
+    if b_picture_count is None:
+        # The scan could not classify; no B-frame claim is possible.
+        pass
+    elif b_picture_count > 0:
+        collector.add(
+            DiagnosticLevel.ERROR,
+            "video-b-picture",
+            f"{topic} message {message_index}: {b_picture_count} B picture(s), "
+            "canonical video requires no B-frames; a remux would drop the reorder tail",
+        )
     if picture_count > 1:
         collector.add(
             DiagnosticLevel.ERROR,

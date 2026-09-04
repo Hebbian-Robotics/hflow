@@ -295,9 +295,14 @@ def test_saved_label_report_selects_exact_frames_for_a_canonical_episode(tmp_pat
         output_path=report_path,
     )
 
-    labels_by_source_episode = load_projected_hand_label_report(report_path)
+    report_payload = json.loads(report_path.read_text())
+    recorded_source_uri = report_payload["frames"][0]["source_uri"]
+    assert isinstance(recorded_source_uri, str)
+    label_report = load_projected_hand_label_report(report_path)
     selected_labels = labels_for_pipeline_episode(
-        tmp_path / "episode-123.canonical.mcap", labels_by_source_episode
+        tmp_path / "episode-123.canonical.mcap",
+        {"source_uri": recorded_source_uri},
+        label_report,
     )
 
     assert [label.frame_index for label in selected_labels] == [3, 8]
@@ -377,6 +382,161 @@ def test_saved_label_report_rejects_unsupported_envelope_before_frames(
     assert repr(field_name) in message
     assert f"value {found_value}" in message
     assert f"supported value is {supported_value}" in message
+
+
+def test_legacy_label_report_rejects_one_basename_for_multiple_sources(tmp_path: Path) -> None:
+    report_path = tmp_path / "labels.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "label_type": "projected-hand-joints",
+                "frames": [
+                    {
+                        "source_path": str(tmp_path / run_name / "episode.mcap"),
+                        "source_episode": "episode",
+                        "camera_view": "head-left",
+                        "frame_index": frame_index,
+                        "left_in_frame_joint_count": 21,
+                        "right_in_frame_joint_count": 0,
+                        "expected_hand_count": 1,
+                        "left_hand_issue_reasons": [],
+                        "right_hand_issue_reasons": [],
+                    }
+                    for run_name, frame_index in (("run-a", 3), ("run-b", 8))
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match=r"regenerate.*source_uri"):
+        load_projected_hand_label_report(report_path)
+
+
+def test_saved_label_report_matches_same_named_sources_by_canonical_provenance(
+    tmp_path: Path,
+) -> None:
+    first_source_path = tmp_path / "run-a" / "episode.mcap"
+    second_source_path = tmp_path / "run-b" / "episode.mcap"
+    report_path = tmp_path / "labels.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "label_type": "projected-hand-joints",
+                "frames": [
+                    {
+                        "source_path": str(source_path),
+                        "source_uri": source_uri,
+                        "source_episode": "episode",
+                        "camera_view": "head-left",
+                        "frame_index": 3,
+                        "left_in_frame_joint_count": 21,
+                        "right_in_frame_joint_count": 21 if expected_hand_count == 2 else 0,
+                        "expected_hand_count": expected_hand_count,
+                        "left_hand_issue_reasons": [],
+                        "right_hand_issue_reasons": [],
+                    }
+                    for source_path, source_uri, expected_hand_count in (
+                        (first_source_path, "run-a/episode.mcap", 1),
+                        (second_source_path, "run-b/episode.mcap", 2),
+                    )
+                ],
+            }
+        )
+    )
+
+    label_report = load_projected_hand_label_report(report_path)
+    selected_labels = labels_for_pipeline_episode(
+        tmp_path / "episode.canonical.mcap",
+        {"source_uri": "run-b/episode.mcap"},
+        label_report,
+    )
+
+    assert [label.expected_hand_count for label in selected_labels] == [2]
+
+
+@pytest.mark.parametrize(
+    ("episode_metadata", "error_match"),
+    [
+        ({}, "has no source_uri provenance"),
+        ({"source_uri": "run-c/episode.mcap"}, "run-c/episode.mcap"),
+    ],
+)
+def test_saved_label_report_rejects_missing_or_unrelated_canonical_provenance(
+    tmp_path: Path,
+    episode_metadata: dict[str, object],
+    error_match: str,
+) -> None:
+    source_path = tmp_path / "run-a" / "episode.mcap"
+    report_path = tmp_path / "labels.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "label_type": "projected-hand-joints",
+                "frames": [
+                    {
+                        "source_path": str(source_path),
+                        "source_uri": "run-a/episode.mcap",
+                        "source_episode": "episode",
+                        "camera_view": "head-left",
+                        "frame_index": 3,
+                        "left_in_frame_joint_count": 21,
+                        "right_in_frame_joint_count": 0,
+                        "expected_hand_count": 1,
+                        "left_hand_issue_reasons": [],
+                        "right_hand_issue_reasons": [],
+                    }
+                ],
+            }
+        )
+    )
+    label_report = load_projected_hand_label_report(report_path)
+
+    with pytest.raises(ValueError, match=error_match):
+        labels_for_pipeline_episode(
+            tmp_path / "episode.canonical.mcap",
+            episode_metadata,
+            label_report,
+        )
+
+
+def test_label_report_records_hflow_source_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root = tmp_path / "hflow-data"
+    source_path = data_root / "run-a" / "episode.mcap"
+    source_path.parent.mkdir(parents=True)
+    source_path.touch()
+    monkeypatch.setenv("HFLOW_DATA_ROOT", str(data_root))
+    label = ProjectedHandFrameLabel(
+        source_path=source_path,
+        source_episode="episode",
+        camera_view=CameraView.HEAD_LEFT,
+        frame_index=3,
+        left_in_frame_joint_count=21,
+        right_in_frame_joint_count=0,
+        expected_hand_count=1,
+        left_hand_issue_reasons=(),
+        right_hand_issue_reasons=(),
+    )
+    report_path = tmp_path / "labels.json"
+
+    write_label_report(
+        {source_path: [label]},
+        camera_view=CameraView.HEAD_LEFT,
+        frame_stride=30,
+        limit_per_episode=None,
+        episode_count=None,
+        samples_per_episode=None,
+        samples_per_hand_count=None,
+        sample_seed=42,
+        output_path=report_path,
+    )
+
+    report = json.loads(report_path.read_text())
+    assert report["frames"][0]["source_uri"] == "run-a/episode.mcap"
 
 
 def test_pipeline_records_agreement_output_validity_and_frame_intervals() -> None:
@@ -1018,10 +1178,16 @@ def test_stratified_selection_caps_each_class_and_is_reproducible() -> None:
     ]
 
     first_selection = select_stratified_labels(
-        {source_path: labels}, samples_per_hand_count=2, sample_seed=7
+        {source_path: labels},
+        source_uri_by_path={source_path: "episode.mcap"},
+        samples_per_hand_count=2,
+        sample_seed=7,
     )
     repeated_selection = select_stratified_labels(
-        {source_path: labels}, samples_per_hand_count=2, sample_seed=7
+        {source_path: labels},
+        source_uri_by_path={source_path: "episode.mcap"},
+        samples_per_hand_count=2,
+        sample_seed=7,
     )
 
     selected_labels = first_selection[source_path]
@@ -1034,22 +1200,58 @@ def test_stratified_selection_caps_each_class_and_is_reproducible() -> None:
     assert first_selection == repeated_selection
 
 
+def test_stratified_sampling_ranks_same_named_sources_by_source_uri() -> None:
+    first_source_path = Path("/workspace/run-a/episode.mcap")
+    second_source_path = Path("/workspace/run-b/episode.mcap")
+    labels_by_source = {
+        source_path: [
+            ProjectedHandFrameLabel(
+                source_path=source_path,
+                source_episode="episode",
+                camera_view=CameraView.HEAD_LEFT,
+                frame_index=0,
+                left_in_frame_joint_count=0,
+                right_in_frame_joint_count=0,
+                expected_hand_count=0,
+                left_hand_issue_reasons=(),
+                right_hand_issue_reasons=(),
+            )
+        ]
+        for source_path in (first_source_path, second_source_path)
+    }
+
+    selection = select_stratified_labels(
+        labels_by_source,
+        source_uri_by_path={
+            first_source_path: "run-a/episode.mcap",
+            second_source_path: "run-b/episode.mcap",
+        },
+        samples_per_hand_count=1,
+        sample_seed=7,
+    )
+
+    assert set(selection) == {second_source_path}
+
+
 def test_natural_sampling_selects_reproducible_episodes_and_frames() -> None:
     source_paths = tuple(Path(f"episode-{episode_index}.mcap") for episode_index in range(5))
 
     first_episode_selection = select_episode_paths(
         source_paths,
+        source_uri_by_path={path: str(path) for path in source_paths},
         episode_count=3,
         sample_seed=7,
     )
     repeated_episode_selection = select_episode_paths(
         source_paths,
+        source_uri_by_path={path: str(path) for path in source_paths},
         episode_count=3,
         sample_seed=7,
     )
     selected_frame_indices = _selected_frame_indices(
         first_episode_selection[0],
         300,
+        source_uri=str(first_episode_selection[0]),
         frame_stride=30,
         limit_per_episode=None,
         samples_per_episode=4,
@@ -1062,6 +1264,47 @@ def test_natural_sampling_selects_reproducible_episodes_and_frames() -> None:
     assert selected_frame_indices == sorted(selected_frame_indices)
     assert len(selected_frame_indices) == 4
     assert all(frame_index % 30 == 0 for frame_index in selected_frame_indices)
+
+
+def test_episode_sampling_ranks_same_named_sources_by_source_uri() -> None:
+    first_source_path = Path("run-a/episode.mcap")
+    second_source_path = Path("run-b/episode.mcap")
+
+    selection = select_episode_paths(
+        (second_source_path, first_source_path),
+        source_uri_by_path={
+            first_source_path: "run-a/episode.mcap",
+            second_source_path: "run-b/episode.mcap",
+        },
+        episode_count=1,
+        sample_seed=7,
+    )
+
+    assert selection == (first_source_path,)
+
+
+def test_frame_sampling_ranks_same_named_sources_by_source_uri() -> None:
+    first_selection = _selected_frame_indices(
+        Path("run-a/episode.mcap"),
+        300,
+        source_uri="run-a/episode.mcap",
+        frame_stride=30,
+        limit_per_episode=None,
+        samples_per_episode=4,
+        sample_seed=7,
+    )
+    second_selection = _selected_frame_indices(
+        Path("run-b/episode.mcap"),
+        300,
+        source_uri="run-b/episode.mcap",
+        frame_stride=30,
+        limit_per_episode=None,
+        samples_per_episode=4,
+        sample_seed=7,
+    )
+
+    assert first_selection == [0, 30, 90, 150]
+    assert second_selection == [0, 150, 180, 240]
 
 
 def test_compare_refuses_a_missing_summary_without_a_traceback(

@@ -283,6 +283,24 @@ def test_runs_tolerates_an_unregistered_stage_dag(
     assert all(stage["recent"] == [] for stage in payload["stages"])
 
 
+def test_runs_maps_stage_rate_limit_to_502(
+    bundle_api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_dag_runs(
+        self: AirflowClient, dag_id: str, *, limit: int = 100, order_by: str | None = None
+    ) -> list[AirflowDagRun]:
+        if dag_id == "demo_pipeline_ingest":
+            return []
+        raise AirflowClientError(
+            f"GET /dags/{dag_id}/dagRuns failed with HTTP 429: rate limited", status=429
+        )
+
+    monkeypatch.setattr(AirflowClient, "dag_runs", fake_dag_runs)
+    response = bundle_api.get("/api/v1/runtime/runs")
+    assert response.status_code == 502
+    assert "rate limited" in response.json()["detail"]
+
+
 def test_runs_without_a_runtime_is_a_clear_409(
     runtime_free_cwd: Path, tmp_path: Path, unbuilt_assets_dir: Path
 ) -> None:
@@ -344,7 +362,15 @@ def test_ingest_rejects_absolute_and_escaping_uris_before_any_runtime(
     data_root = tmp_path / "bare-root"
     data_root.mkdir()
     client = _client_over(data_root, unbuilt_assets_dir)
-    for hostile_uri in ("/etc/passwd", "../../etc/shadow", "sub/../../escape.mcap"):
+    for hostile_uri in (
+        ".",
+        "./",
+        "a/..",
+        "a/b/../..",
+        "/etc/passwd",
+        "../../etc/shadow",
+        "sub/../../escape.mcap",
+    ):
         response = client.post(
             "/api/v1/runtime/ingest",
             json={"uris": [hostile_uri], "profile": "full", "mode": "batch"},

@@ -18,10 +18,60 @@ The example has two execution paths built around the same judgment contract:
   and the local results viewer; the adapter adds the pinned datasets and
   Build AI-specific summary and comparison table.
 
+For a first HFlow run that combines these hosted model checks with the default
+deterministic quality checks, start with
+[Evaluate your first egocentric episode](../tutorials/evaluate-an-egocentric-episode.md).
+
 ## Run the methodology on an HFlow episode
 
-Configure any OpenAI-compatible vision endpoint and the environment variable
-that contains its credential:
+The example uses HFlow's fixed hosted implementation for both checks by
+default. It needs no model configuration, account, or API key.
+
+To try the checks without supplying your own recording, download a small
+egocentric MCAP from Lightwheel's
+[`EgoDemo`](https://huggingface.co/datasets/LightwheelAI/EgoDemo) dataset. The
+Hugging Face CLI preserves the dataset's deeply nested source path, so copy the
+download to a short path used by the rest of this guide:
+
+```bash
+mkdir -p data/build-ai-evaluation
+downloaded_sample_mcap_path="$(
+    hf download LightwheelAI/EgoDemo \
+        'EgoStand/mcap/Thimble Removal/a8d29fea-3cf9-47f7-ad4b-4b1d0ecb7a71.mcap' \
+        --repo-type dataset \
+        --quiet
+)"
+cp "$downloaded_sample_mcap_path" data/build-ai-evaluation/sample.mcap
+```
+
+If Hugging Face requests access, accept the dataset's terms and run
+`hf auth login` before downloading. You can then run the pipeline against the
+sample:
+
+```bash
+uv run --project examples/build_ai_evaluation \
+    python -m examples.build_ai_evaluation.pipeline \
+    data/build-ai-evaluation/sample.mcap
+```
+
+Replace that path with any MCAP containing meaningful egocentric footage to
+evaluate your own recording.
+
+To use an unauthenticated local OpenAI-compatible vision server instead, select
+that execution route and identify its model:
+
+```bash
+export BUILD_AI_EXECUTION="openai-compatible"
+export OPENAI_BASE_URL="http://localhost:8000/v1"
+export OPENAI_MODEL="Qwen/Qwen3-VL-8B-Instruct"
+
+uv run --project examples/build_ai_evaluation \
+    python -m examples.build_ai_evaluation.pipeline \
+    data/build-ai-evaluation/sample.mcap
+```
+
+For an authenticated provider such as OpenRouter, change `OPENAI_BASE_URL` and
+`OPENAI_MODEL`, then name the environment variable holding its credential:
 
 ```bash
 export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
@@ -29,67 +79,74 @@ export OPENAI_MODEL="qwen/qwen3-vl-32b-instruct"
 export BUILD_AI_API_KEY_ENV="OPENROUTER_API_KEY"
 ```
 
-Run against a small synthesized episode:
-
-```bash
-uv run --project examples/build_ai_evaluation \
-    python -m examples.build_ai_evaluation.pipeline
-```
-
-Or pass an existing MCAP recording:
-
-```bash
-uv run --project examples/build_ai_evaluation \
-    python -m examples.build_ai_evaluation.pipeline path/to/episode.mcap
-```
-
 The pipeline samples one frame at zero seconds from the episode's only camera
 and runs both judgments as `@app.check` steps. For a multi-camera episode, set
 `BUILD_AI_CAMERA` to the camera topic. Change the sample time with
 `BUILD_AI_FRAME_TIME_SECONDS`. The resulting HFlow measurements use the
 `build_ai/hand_count/` and `build_ai/active_manipulation/` namespaces and
-include the parsed prediction, raw response, requested and routed models, and
-numeric token usage.
+always include the parsed prediction and raw response. OpenAI-compatible
+execution also records the requested model plus any routed model and numeric
+token usage the provider returns; hosted execution records its immutable hosted
+check reference as the requested model.
 
 Each check also writes one `hflow.Observation` at the exact sampled-frame
 timestamp. Its typed fields retain the task, prediction, raw response,
-validity, requested/routed models, and usage in the catalog's `observations`
-table. The measurements remain as convenient episode summaries; the
+validity, execution identity, and any available model usage in the catalog's
+`observations` table. The measurements remain as convenient episode summaries; the
 observation is the per-frame record that scales to evaluations sampling more
 than one frame.
 
-Swap prompt files with `BUILD_AI_HAND_VISIBILITY_PROMPT` and
-`BUILD_AI_ACTIVE_MANIPULATION_PROMPT`. Other request controls are
-`BUILD_AI_RESPONSE_FORMAT`, `BUILD_AI_TEMPERATURE`, `BUILD_AI_MAX_TOKENS`, and
-`BUILD_AI_MAX_RETRIES`. The registered HFlow check version hashes every
+When using OpenAI-compatible execution, swap prompt files with
+`BUILD_AI_HAND_VISIBILITY_PROMPT` and
+`BUILD_AI_ACTIVE_MANIPULATION_PROMPT`. Other request controls for that route
+are `BUILD_AI_RESPONSE_FORMAT`, `BUILD_AI_TEMPERATURE`, `BUILD_AI_MAX_TOKENS`,
+and `BUILD_AI_MAX_RETRIES`. The registered HFlow check version hashes every
 result-affecting model, prompt, schema, request, camera, and sampling setting so
 different configurations do not claim comparable step versions.
 
-For an unauthenticated self-hosted endpoint, omit `BUILD_AI_API_KEY_ENV`. Each
-check can use a different service through the
+Each check can select its execution independently with
+`BUILD_AI_HAND_VISIBILITY_EXECUTION` and
+`BUILD_AI_ACTIVE_MANIPULATION_EXECUTION`; each defaults to `BUILD_AI_EXECUTION`
+and then to `hflow-hosted`. For example, one check can remain hosted while the
+other uses your model:
+
+```bash
+export BUILD_AI_HAND_VISIBILITY_EXECUTION="hflow-hosted"
+export BUILD_AI_ACTIVE_MANIPULATION_EXECUTION="openai-compatible"
+```
+
+OpenAI-compatible checks can use different services through the
 `BUILD_AI_HAND_VISIBILITY_BASE_URL` / `BUILD_AI_HAND_VISIBILITY_MODEL` /
 `BUILD_AI_HAND_VISIBILITY_API_KEY_ENV` and corresponding
 `BUILD_AI_ACTIVE_MANIPULATION_*` overrides.
 
-The same checks are available directly in any pipeline:
+`HFlowHostedExecution` owns only the hosted base URL, check version, and request
+timeout; its server owns every model setting.
+
+The same checks are available directly in any pipeline. Execution is selected
+per check, so the two checks may use different models:
 
 ```python
 hflow.build_ai_vlm_checks.register_hand_visibility(
     app,
-    endpoint="http://localhost:8000/v1",
-    model="Qwen/Qwen3-VL-8B-Instruct",
+    execution=hflow.build_ai_vlm_checks.HFlowHostedExecution(),
 )
 hflow.build_ai_vlm_checks.register_active_manipulation(
     app,
-    endpoint="https://hosted.example/v1",
-    model="hosted-model",
-    api_key_environment_variable="HOSTED_MODEL_API_KEY",
+    execution=hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
+        endpoint="https://hosted.example/v1",
+        model="hosted-model",
+        api_key_environment_variable="HOSTED_MODEL_API_KEY",
+    ),
 )
 ```
 
-The API key is optional for local unauthenticated servers. Registration is
+The API key is optional for local unauthenticated servers. The hosted service
+accepts no model, prompt, or generation settings and needs no API key. A custom
+prompt is supported only with `OpenAICompatibleExecution`. Registration is
 opt-in rather than part of `DEFAULT_CHECKS`, because both checks perform model
-calls and users may intentionally choose different models for them.
+calls and users may intentionally choose different execution strategies for
+them.
 
 ## What this reproduces
 

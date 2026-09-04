@@ -17,6 +17,7 @@ import pytest
 
 import hflow.importers.lerobot as prep
 from hflow.cli import main as cli_main
+from hflow.storage import LocalStorageRoot, StorageRoot
 
 _DERIVE = prep._derive_numeric_schema
 _ENCODE = prep._encode_cdr_float32_array
@@ -258,6 +259,105 @@ def test_index_discovery_multi_camera_metadata(
     ] == pytest.approx(2.0)
 
 
+@pytest.mark.parametrize(
+    "second_shard_path",
+    [
+        # Distinct basenames in one chunk directory: how lerobot/droid_1.0.1
+        # ships its seven metadata shards.
+        "meta/episodes/chunk-000/file-001.parquet",
+        # The same basename in the next chunk directory, which a cache keyed
+        # by basename alone would collapse onto the first shard.
+        "meta/episodes/chunk-001/file-000.parquet",
+    ],
+)
+def test_index_discovery_reads_every_metadata_shard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, second_shard_path: str
+) -> None:
+    """Episodes and video windows come from every ``meta/episodes`` shard (#293).
+
+    The corpus is split the way Dataset v3 shards it: a different pair of
+    episodes in each file and a distinct video window per episode.
+    """
+    corpus = _build_fake_corpus(tmp_path)
+    single_shard = tmp_path / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    shard_paths = ("meta/episodes/chunk-000/file-000.parquet", second_shard_path)
+    import duckdb
+
+    conn = duckdb.connect()
+    conn.execute(
+        "CREATE TABLE all_episodes AS SELECT * FROM read_parquet('"
+        + str(single_shard).replace("'", "''")
+        + "')"
+    )
+    for shard_path, episode_indexes in zip(shard_paths, ((0, 1), (2, 3)), strict=True):
+        shard_file = tmp_path / shard_path
+        shard_file.parent.mkdir(parents=True, exist_ok=True)
+        conn.execute(
+            f"COPY (SELECT * FROM all_episodes WHERE episode_index IN {episode_indexes}) "
+            f"TO '{str(shard_file).replace(chr(39), chr(39) * 2)}' (FORMAT parquet)"
+        )
+    conn.close()
+
+    monkeypatch.setattr(
+        prep, "_hf_repo_info", lambda repo, rev: {"sha": rev, "license": "apache-2.0"}
+    )
+    monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: corpus["info"])
+    monkeypatch.setattr(
+        prep,
+        "_hf_tree",
+        lambda repo, rev, path: (
+            [{"path": shard_path, "type": "file"} for shard_path in shard_paths]
+            if "episodes" in path
+            else [{"path": "meta/info.json", "type": "file"}]
+        ),
+    )
+    downloaded_destinations: dict[str, Path] = {}
+
+    def fake_download(url: str, dest: Path, **kw: object) -> None:
+        relative_path = url.split("/resolve/abc/", 1)[1]
+        assert relative_path not in downloaded_destinations, f"downloaded twice: {url}"
+        downloaded_destinations[relative_path] = dest
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(tmp_path / relative_path, dest)
+
+    monkeypatch.setattr(prep, "_download_file", fake_download)
+
+    ds = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
+    cache_dir = tmp_path / "cache"
+    found = prep._ensure_source_archive(ds, cache_dir)
+    # A second discovery reuses each shard's own cache entry instead of
+    # re-downloading or colliding with the other shard.
+    prep._ensure_source_archive(ds, cache_dir)
+
+    assert set(downloaded_destinations) == set(shard_paths)
+    assert len(set(downloaded_destinations.values())) == len(shard_paths)
+    assert [episode["episode_index"] for episode in found["episodes"]] == [0, 1, 2, 3]
+    assert set(found["video_keys"]) == {"observation.images.up", "observation.images.side"}
+    for episode in found["episodes"]:
+        episode_index = episode["episode_index"]
+        assert episode["length"] == 60 + episode_index * 5
+        for camera_key in found["video_keys"]:
+            window = episode["video_windows"][camera_key]
+            assert window["chunk_index"] == "chunk-000"
+            assert window["to_timestamp"] == pytest.approx(2.0 + episode_index * 0.2)
+
+
+@pytest.mark.parametrize(
+    "tree_entry_path",
+    [
+        "meta/episodes/../../data/chunk-000/file-000.parquet",
+        "/tmp/probe-293-absolute.parquet",
+        "meta/episodes",
+        "meta/other/file-000.parquet",
+    ],
+)
+def test_episode_metadata_cache_path_refuses_entries_outside_the_metadata_tree(
+    tmp_path: Path, tree_entry_path: str
+) -> None:
+    with pytest.raises(ValueError, match="not a file below meta/episodes/"):
+        prep._episode_metadata_cache_path(tmp_path, tree_entry_path, repo_id="fake/repo")
+
+
 def test_video_cache_distinguishes_file_indices_and_reuses_same_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -325,16 +425,21 @@ def test_video_cache_distinguishes_file_indices_and_reuses_same_source(
         lambda source_path, output_path, *_args, **_kwargs: shutil.copy(source_path, output_path),
     )
 
+    published_uris: list[str] = []
     for episode_index in (0, 1, 0):
-        prep._convert_single_episode(
+        uri = prep._convert_single_episode(
             source_archive=source_archive,
             dataset_source=dataset_source,
-            output_dir=tmp_path / "output",
+            storage=LocalStorageRoot(tmp_path / "output"),
             episode_index=episode_index,
             camera_keys=(camera_key,),
             numeric_schemas=numeric_schemas,
             frames_per_second=30,
         )
+        published_uris.append(uri)
+
+    assert published_uris[0].endswith("landing/lerobot_episode_0001.mcap")
+    assert published_uris[1].endswith("landing/lerobot_episode_0002.mcap")
 
     video_urls = [
         "https://huggingface.co/datasets/fake/repo/resolve/abc/videos/"
@@ -393,7 +498,18 @@ def test_camera_selection_validates_keys(tmp_path: Path, monkeypatch: pytest.Mon
 def test_import_namespaces_source_cache_by_resolved_revision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    resolved_shas = {"branch-a": "sha-a", "branch-b": "sha-b", "tag-a": "sha-a"}
+    # Realistic valid shas the production validator at
+    # src/hflow/importers/lerobot.py would accept: 40-character hexadecimal,
+    # visibly distinct at the start so a reader can tell them apart at a
+    # glance. ``branch-a`` and ``tag-a`` resolve to the same sha on purpose:
+    # they are the two-revisions-one-cache leg of the contract.
+    sha_a = "a1b2c3d4e5f60718293a4b5c6d7e8f9001020304"
+    sha_b = "f0e1d2c3b4a5968778695a4b3c2d1e0f00112233"
+    resolved_shas = {
+        "branch-a": sha_a,
+        "branch-b": sha_b,
+        "tag-a": sha_a,
+    }
     cache_observations: list[tuple[str, Path, str]] = []
 
     monkeypatch.setattr(
@@ -431,13 +547,13 @@ def test_import_namespaces_source_cache_by_resolved_revision(
         )
 
     assert cache_observations == [
-        ("sha-a", tmp_path / "_lerobot_cache" / "sha-a", "sha-a"),
-        ("sha-b", tmp_path / "_lerobot_cache" / "sha-b", "sha-b"),
-        ("sha-a", tmp_path / "_lerobot_cache" / "sha-a", "sha-a"),
+        (sha_a, tmp_path / "_lerobot_cache" / sha_a, sha_a),
+        (sha_b, tmp_path / "_lerobot_cache" / sha_b, sha_b),
+        (sha_a, tmp_path / "_lerobot_cache" / sha_a, sha_a),
     ]
     assert sorted(path.name for path in (tmp_path / "_lerobot_cache").iterdir()) == [
-        "sha-a",
-        "sha-b",
+        sha_a,
+        sha_b,
     ]
 
 
@@ -911,3 +1027,180 @@ def test_info_json_accepts_normal_positive_fps(
     dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
     source_archive = prep._ensure_source_archive(dataset_source, tmp_path / "cache")
     assert source_archive["fps"] == 30
+
+
+def _stub_single_episode_source_archive(
+    dataset_source: prep.DatasetSource, cache_dir: Path
+) -> dict:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        "info": {"robot_type": "pusht"},
+        "fps": 30,
+        "data_path": "data/{chunk_index}/{file_index}.parquet",
+        "video_path": "videos/{camera_key}/{chunk_index}/{file_index}.mp4",
+        "episodes": [
+            {
+                "episode_index": 0,
+                "task": "push",
+                "length": 1,
+                "data_chunk": "000",
+                "data_file": "000",
+                "data_from": 0,
+                "data_to": 1,
+            }
+        ],
+        "video_keys": [prep.DEFAULT_CAMERA_KEY],
+        "numeric_features": {
+            "action": {"dtype": "float32", "shape": [1]},
+            "observation.state": {"dtype": "float32", "shape": [1]},
+        },
+        "cache_dir": cache_dir,
+        "dataset": dataset_source,
+    }
+
+
+def _install_publish_through_convert(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[str]:
+    """Exercise StorageRoot.publish without running the video converter."""
+
+    published_keys: list[str] = []
+
+    def fake_convert(
+        *,
+        source_archive: object,
+        dataset_source: object,
+        storage: StorageRoot,
+        episode_index: int,
+        camera_keys: object,
+        numeric_schemas: object,
+        frames_per_second: object,
+    ) -> str:
+        del source_archive, dataset_source, camera_keys, numeric_schemas, frames_per_second
+        relative_key = f"landing/lerobot_episode_{episode_index + 1:04d}.mcap"
+        staged = tmp_path / f"staged-{episode_index}.mcap"
+        staged.write_bytes(f"episode-{episode_index}".encode())
+        published_keys.append(relative_key)
+        return storage.publish(staged, relative_key)
+
+    monkeypatch.setattr(prep, "_convert_single_episode", fake_convert)
+    return published_keys
+
+
+def test_import_returns_local_uris_and_keeps_cache_beside_landing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_dir = tmp_path / "out"
+    monkeypatch.setattr(
+        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
+    )
+    monkeypatch.setattr(prep, "_ensure_source_archive", _stub_single_episode_source_archive)
+    _install_publish_through_convert(monkeypatch, tmp_path)
+
+    episode_uris = prep.import_lerobot_dataset(
+        dataset_repo="fake/repo",
+        revision="main",
+        output_dir=output_dir,
+        episode_index=0,
+    )
+
+    assert episode_uris == [str((output_dir / "landing" / "lerobot_episode_0001.mcap").resolve())]
+    assert Path(episode_uris[0]).is_file()
+    assert (output_dir / "prepared-manifest.json").is_file()
+    assert (output_dir / "_lerobot_cache" / "abc").is_dir()
+
+
+def test_import_publishes_into_a_bucket_data_root_without_uploading_cache(
+    tmp_path: Path,
+    bucket_over_tmp: tuple[object, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hflow.storage import BucketStorageRoot
+
+    data_root, remote_dir = bucket_over_tmp
+    assert isinstance(data_root, BucketStorageRoot)
+    monkeypatch.setattr(
+        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
+    )
+    monkeypatch.setattr(prep, "_ensure_source_archive", _stub_single_episode_source_archive)
+    _install_publish_through_convert(monkeypatch, tmp_path)
+
+    episode_uris = prep.import_lerobot_dataset(
+        dataset_repo="fake/repo",
+        revision="main",
+        output_dir=data_root,
+        episode_index=0,
+    )
+
+    assert episode_uris == [f"{data_root.url}/landing/lerobot_episode_0001.mcap"]
+    assert all(isinstance(uri, str) for uri in episode_uris)
+    assert not isinstance(episode_uris[0], Path)
+    assert (remote_dir / "landing" / "lerobot_episode_0001.mcap").is_file()
+    assert (remote_dir / "prepared-manifest.json").is_file()
+    assert data_root.list_names() == [
+        "landing/lerobot_episode_0001.mcap",
+        "prepared-manifest.json",
+    ]
+    assert not any(name.startswith("_lerobot_cache") for name in data_root.list_names())
+    assert (data_root.mirror / "_lerobot_cache" / "abc").is_dir()
+
+
+def test_import_skips_bucket_manifest_when_an_episode_publish_fails(
+    tmp_path: Path,
+    bucket_over_tmp: tuple[object, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hflow.storage import BucketStorageRoot
+
+    data_root, remote_dir = bucket_over_tmp
+    assert isinstance(data_root, BucketStorageRoot)
+
+    def ensure_two_episodes(dataset_source: prep.DatasetSource, cache_dir: Path) -> dict:
+        archive = _stub_single_episode_source_archive(dataset_source, cache_dir)
+        archive["episodes"] = [
+            archive["episodes"][0],
+            {
+                **archive["episodes"][0],
+                "episode_index": 1,
+                "task": "second",
+            },
+        ]
+        return archive
+
+    convert_calls = 0
+
+    def fail_on_second_episode(
+        *,
+        source_archive: object,
+        dataset_source: object,
+        storage: StorageRoot,
+        episode_index: int,
+        camera_keys: object,
+        numeric_schemas: object,
+        frames_per_second: object,
+    ) -> str:
+        nonlocal convert_calls
+        del source_archive, dataset_source, camera_keys, numeric_schemas, frames_per_second
+        convert_calls += 1
+        if episode_index == 1:
+            raise RuntimeError("forced publish failure")
+        relative_key = f"landing/lerobot_episode_{episode_index + 1:04d}.mcap"
+        staged = tmp_path / f"staged-{episode_index}.mcap"
+        staged.write_bytes(b"first")
+        return storage.publish(staged, relative_key)
+
+    monkeypatch.setattr(
+        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
+    )
+    monkeypatch.setattr(prep, "_ensure_source_archive", ensure_two_episodes)
+    monkeypatch.setattr(prep, "_convert_single_episode", fail_on_second_episode)
+
+    with pytest.raises(RuntimeError, match="forced publish failure"):
+        prep.import_lerobot_dataset(
+            dataset_repo="fake/repo",
+            revision="main",
+            output_dir=data_root,
+        )
+
+    assert convert_calls == 2
+    assert (remote_dir / "landing" / "lerobot_episode_0001.mcap").is_file()
+    assert not (remote_dir / "prepared-manifest.json").exists()
+    assert "prepared-manifest.json" not in data_root.list_names()

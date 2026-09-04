@@ -97,8 +97,9 @@ sampling policy, and interpretation of the response.
 The [OpenAI vision guide](./how-to/call-openai-vision.md) demonstrates the
 generic pattern with an ordinary client. The opt-in
 [Build AI checks](./how-to/run-build-ai-evaluation.md) provide a named,
-published hand-visibility and active-manipulation methodology while leaving
-endpoint and model selection with each registration. The
+published hand-visibility and active-manipulation methodology with an explicit
+per-check choice between a caller-owned OpenAI-compatible model and HFlow's
+fixed hosted execution. The
 [native-video provider protocol](./PROVIDERS.md) is an extension point for
 servers whose request format contains reusable protocol knowledge.
 

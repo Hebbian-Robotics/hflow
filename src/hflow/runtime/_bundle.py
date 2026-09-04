@@ -556,8 +556,7 @@ def warn_if_pipeline_data_root_differs(
             )
 
 
-# The stage sub-DAG display names shown in the Airflow UI (the same stage
-# vocabulary Dyna's article uses for this graph).
+# The stage sub-DAG display names shown in the Airflow UI.
 STAGE_TITLES: dict[Stage, str] = {
     Stage.SYNC: "Transform & sync",
     Stage.META: "Metadata",

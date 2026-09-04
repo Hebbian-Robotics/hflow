@@ -470,6 +470,7 @@ def _resolve_stages(stages: Iterable[Stage] | str | None) -> frozenset[Stage]:
 
 
 _ConcurrentTestLimit = NewType("_ConcurrentTestLimit", int)
+_ConcurrentTestLimit.__module__ = __name__
 _ConcurrentInputT = TypeVar("_ConcurrentInputT")
 _ConcurrentResultT = TypeVar("_ConcurrentResultT")
 

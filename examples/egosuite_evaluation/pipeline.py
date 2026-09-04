@@ -15,14 +15,16 @@ import importlib
 import os
 import threading
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple, assert_never
 
 import hflow
 from examples.egosuite_evaluation.evaluate import (
+    DEFAULT_HFLOW_DATA_ROOT,
     CameraView,
     ProjectedHandFrameLabel,
+    ProjectedHandLabelReport,
     camera_topics,
     load_projected_hand_label_report,
     load_projected_hand_labels,
@@ -37,7 +39,6 @@ from examples.egosuite_evaluation.judgment import (
     image_file_data_url,
 )
 
-DEFAULT_HFLOW_DATA_ROOT = Path("data/egosuite-evaluation/hflow")
 DEFAULT_OPENAI_COMPATIBLE_BASE_URL = "http://localhost:8000/v1"
 DEFAULT_MODEL_NAME = "model-not-configured"
 MEASUREMENT_PREFIX = "egosuite/hand_count"
@@ -109,7 +110,7 @@ def _pipeline_configuration() -> PipelineConfiguration:
 
 
 pipeline_configuration = _pipeline_configuration()
-manifest_labels_by_source_episode = (
+manifest_label_report = (
     load_projected_hand_label_report(pipeline_configuration.label_manifest_path)
     if pipeline_configuration.label_manifest_path is not None
     else None
@@ -140,28 +141,33 @@ def _check_version() -> hflow.StepVersion:
         ),
     }
     return hflow.step_version_from_contract(
-        "egosuite-projected-hand-visibility-v1",
+        "egosuite-projected-hand-visibility-v2",
         version_contract,
     )
 
 
 def labels_for_pipeline_episode(
     episode_path: Path,
-    labels_by_source_episode: dict[str, list[ProjectedHandFrameLabel]],
+    episode_metadata: Mapping[str, object],
+    label_report: ProjectedHandLabelReport,
 ) -> list[ProjectedHandFrameLabel]:
     """Select one canonical episode's declared frames from a label manifest."""
 
+    source_uri = episode_metadata.get("source_uri")
+    if not isinstance(source_uri, str) or not source_uri:
+        raise ValueError(f"canonical episode {episode_path} has no source_uri provenance")
     canonical_suffix = ".canonical.mcap"
     source_episode = (
         episode_path.name[: -len(canonical_suffix)]
         if episode_path.name.endswith(canonical_suffix)
         else episode_path.stem
     )
+    source_identity = source_episode if label_report.uses_legacy_episode_names else source_uri
     try:
-        return labels_by_source_episode[source_episode]
+        return label_report.labels_by_source_identity[source_identity]
     except KeyError:
         raise ValueError(
-            f"label manifest has no frames for source episode {source_episode!r}"
+            f"label manifest has no frames for source identity {source_identity!r}"
         ) from None
 
 
@@ -337,8 +343,11 @@ def hand_visibility_check_result(
 def egosuite_projected_hand_visibility(episode: hflow.Episode) -> hflow.CheckResult:
     """Compare image-only VLM hand counts with projected EgoSuite joints."""
 
-    if manifest_labels_by_source_episode is not None:
-        labels = labels_for_pipeline_episode(episode.path, manifest_labels_by_source_episode)
+    source_uri = episode.metadata.get("source_uri")
+    if not isinstance(source_uri, str) or not source_uri:
+        raise ValueError(f"canonical episode {episode.path} has no source_uri provenance")
+    if manifest_label_report is not None:
+        labels = labels_for_pipeline_episode(episode.path, episode.metadata, manifest_label_report)
         mismatched_camera_views = sorted(
             {
                 label.camera_view.value
@@ -354,6 +363,7 @@ def egosuite_projected_hand_visibility(episode: hflow.Episode) -> hflow.CheckRes
     else:
         labels = load_projected_hand_labels(
             episode.path,
+            source_uri=source_uri,
             camera_view=pipeline_configuration.camera_view,
             frame_stride=pipeline_configuration.frame_stride,
             limit_per_episode=pipeline_configuration.limit_per_episode,

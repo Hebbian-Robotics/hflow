@@ -1,16 +1,14 @@
 """Benchmark (issue #27): chunk layout vs read cost, three layouts, two patterns.
 
-Measures the chunk-layout effect at honest small scale, alongside the
-results Dyna's article reports (its Figure 3, panels 2-3). Default MCAP
-writing gives each topic its own chunks, so one training sample costs a
+Measures the chunk-layout effect at honest small scale. Default MCAP writing
+gives each topic its own chunks, so one training sample costs a
 read per topic; grouping topics by read pattern (cameras time-major in one
 chunk stream, proprioception+actions in another) makes samples cost one
-read per *group* -- Dyna's article reports ~3.4x fewer fetches and ~2.9x
-faster reads at their scale on object storage.
+read per *group*.
 
 Layouts compared (identical message content):
 
-- **per-topic**: every topic its own chunk stream (Dyna's baseline).
+- **per-topic**: every topic has its own chunk stream.
 - **interleaved**: the stock Python writer's single chunk builder (all
   topics share every chunk) -- included because it is what most tooling
   writes today.
@@ -338,7 +336,7 @@ def _measure_source(
     ] * 10
 
     layouts = [
-        ("per-topic (Dyna's baseline)", per_topic_path),
+        ("per-topic", per_topic_path),
         ("interleaved (stock python writer)", interleaved_path),
         ("topic-group (ours)", grouped_path),
     ]

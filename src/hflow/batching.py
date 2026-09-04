@@ -3,9 +3,8 @@
 Two scheduler-protecting measures, applied at plan time: inputs are
 bin-packed into batches of near-equal *bytes* (file sizes vary widely, so
 count-based batches unbalance workers), and batch starts are staggered to
-smooth scheduler write bursts. Dyna's article reports both as the fixes
-when the scheduler database became the choke point at scale. These are the
-simple v1 versions of both; the joint optimizer tuning worker counts
+smooth scheduler write bursts. These are the simple v1 versions of both;
+the joint optimizer tuning worker counts
 against network/IO/DB constraints stays on the scale path.
 
 Two planning modes, chosen by which parameter you pass:

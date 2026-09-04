@@ -2,7 +2,7 @@
 
 import os
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -76,14 +76,23 @@ def test_preview_stats_render_timestamps_in_utc_on_a_non_utc_host(
     # Rows are UTC ISO text...
     for row in payload["rows"]:
         assert row["recorded_at"].endswith("+00:00")
-    # ...and the column stats agree (same UTC rendering, not the host's -04),
-    # so the stats panel never shows a different offset or calendar day.
+    # ...and the column stats agree, so the stats panel never shows a different
+    # offset or calendar day than the rows above it.
     stats_by_column = {entry["column_name"]: entry for entry in payload["column_stats"]}
     recorded_at_stats = stats_by_column["recorded_at"]
+    row_timestamps = sorted(datetime.fromisoformat(row["recorded_at"]) for row in payload["rows"])
+    expected_bounds = {"min": row_timestamps[0], "max": row_timestamps[-1]}
     for bound_key in ("min", "max"):
         bound_value = recorded_at_stats[bound_key]
         assert bound_value.endswith("+00:00"), bound_value
-        assert "-04" not in bound_value
+        parsed_bound = datetime.fromisoformat(bound_value)
+        assert parsed_bound.utcoffset() == timedelta(0), bound_value
+        assert parsed_bound == expected_bounds[bound_key], bound_value
+    # The fixture stamps recorded_at as it appends, so a correct render lands
+    # near now. Rows and stats pass through the same projection and would shift
+    # together, so agreement alone cannot catch a clock moved into the host zone
+    # and then stamped +00:00; the host offset here is whole hours away from UTC.
+    assert abs(datetime.now(UTC) - expected_bounds["max"]) < timedelta(hours=1)
 
 
 def test_preview_stats_returns_summarize_rows(api: TestClient) -> None:

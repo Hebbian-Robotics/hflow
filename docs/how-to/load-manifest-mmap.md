@@ -1,8 +1,8 @@
 # Load a large manifest with memory mapping
 
 **Goal:** start training against a big `manifest.parquet` without every rank
-reading the whole file into RAM -- the download-once / memory-map /
-shard-on-load pattern Dyna's article describes for million-hour manifests.
+reading the whole file into RAM. Download it once, memory-map it, and assign
+each rank its own shard.
 
 At small scale you do not need this: a manifest of thousands of episodes loads
 instantly with `pandas.read_parquet`. The pattern matters when the manifest has

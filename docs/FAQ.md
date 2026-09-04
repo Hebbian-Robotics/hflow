@@ -112,26 +112,6 @@ with `hflow import lerobot`. It does not export a curated HFlow selection back
 to LeRobot or run LeRobot training; HFlow's processing and curation boundaries
 remain MCAP and Parquet.
 
-## How does HFlow relate to Dyna Robotics' article?
-
-The architecture was inspired by Dyna Robotics'
-[Training Dyna-2 at million-hour scale, repeatably](https://www.dyna.co/research/dyna-2-infrastructure)
-(Aug 2026), and the docs cite the article wherever a mechanism or measurement
-comes from it. HFlow is an independent project: not affiliated with Dyna,
-containing none of their code, and claiming no compatibility with their
-internal systems.
-
-The [implementation status](./ARCHITECTURE.md#implementation-status) matrix
-marks what is implemented, simplified, deferred, and out of scope.
-
-## Is HFlow ready for million-hour deployments?
-
-No such claim is made. HFlow is pre-v1 and designed to make the useful workflow
-available at single-tenant, small-to-moderate scale while keeping standard
-boundaries that leave room to scale. The
-[benchmark report](./BENCHMARKS.md) publishes measured results without
-extrapolating them to million-hour production scale.
-
 ## Where can HFlow store data?
 
 The durable data root can be a local directory or, with the optional bucket
