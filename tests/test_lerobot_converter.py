@@ -1872,7 +1872,10 @@ def test_import_full_reuse_reports_zero_episodes_converted(
 
 
 def _build_success_label_corpus(root: Path, outcome_mode: str) -> dict:
-    """One two-frame episode. outcome_mode: 'transition', 'all-false', 'none'."""
+    """One two-frame episode.
+
+    outcome_mode: 'transition', 'all-false', 'empty-aggregate', or 'none'.
+    """
     has_outcome = outcome_mode != "none"
     info = {
         "fps": 30,
@@ -1909,9 +1912,14 @@ def _build_success_label_corpus(root: Path, outcome_mode: str) -> dict:
     ]
     row: list[object] = [0, 2, "000", "000", 0, 2, "000", "000", 0.0, 0.0, ["push the block"]]
     if has_outcome:
-        stats_min, stats_max = (
-            ([False], [True]) if outcome_mode == "transition" else ([False], [False])
-        )
+        if outcome_mode == "transition":
+            stats_min, stats_max = [False], [True]
+        elif outcome_mode == "empty-aggregate":
+            # The column exists but carries no value for this episode, which
+            # is a declared feature with nothing recorded rather than a label.
+            stats_min, stats_max = [], []
+        else:
+            stats_min, stats_max = [False], [False]
         ep_cols += ["stats/next.success/min", "stats/next.success/max"]
         row += [stats_min, stats_max]
     ep_path = root / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
@@ -2041,6 +2049,26 @@ def test_success_label_reports_false_when_source_is_all_false(
         record = episode.metadata_records["episode/v1"]
     assert record["success"] == "false"
     assert record["success_derivation"] == "max(stats/next.success)"
+
+
+def test_success_label_omitted_when_the_outcome_aggregate_is_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A declared outcome feature with nothing recorded is not a label.
+
+    Dropping the length check stamps ``success: "false"`` here, because
+    ``any([])`` is False. That is the same invention the hardcoded ``"true"``
+    was, one value over, so the empty aggregate needs its own case rather than
+    riding on the no-feature one.
+    """
+    from hflow.episode import Episode
+
+    output_dir = _import_success_label_corpus(tmp_path, monkeypatch, "empty-aggregate")
+    landing = sorted((output_dir / "landing").glob("*.mcap"))
+    with Episode(landing[0]) as episode:
+        record = episode.metadata_records["episode/v1"]
+    assert "success" not in record
+    assert "success_derivation" not in record
 
 
 def test_success_label_omitted_when_source_has_no_outcome_feature(

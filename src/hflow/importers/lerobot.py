@@ -57,6 +57,10 @@ DEFAULT_CAMERA_KEY = "observation.image"
 CONVERTER_VERSION = "lerobot-converter-v7"
 # Canonical transform knobs that affect published bytes for this importer.
 IMPORT_GOP_SECONDS = 1.0
+# The v3 per-episode aggregate of the collector's frame-level next.success
+# label. Optional: a corpus that declares no outcome feature has no such column.
+_OUTCOME_AGGREGATE_COLUMN = "stats/next.success/max"
+_SUCCESS_DERIVATION = f"max({_OUTCOME_AGGREGATE_COLUMN.removesuffix('/max')})"
 PRESENTATION_TIMESTAMP_EPSILON_S = 0.050
 EPISODE_METADATA_TREE_PREFIX = PurePosixPath("meta/episodes")
 
@@ -597,7 +601,13 @@ def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _S
                 f"SELECT * FROM {episode_metadata_relation} LIMIT 1"
             ).description
         ]
-        has_outcome_aggregate = "stats/next.success/max" in episodes_columns
+        # Built outside the f-string below: a quoted identifier cannot be
+        # nested in a same-quoted f-string on Python 3.11, which this repo
+        # still supports.
+        has_outcome_aggregate = _OUTCOME_AGGREGATE_COLUMN in episodes_columns
+        outcome_aggregate_selector = (
+            f', "{_OUTCOME_AGGREGATE_COLUMN}"' if has_outcome_aggregate else ""
+        )
 
         episode_rows: list[_EpisodeRow] = []
         parquet_episode_rows = connection.execute(
@@ -605,7 +615,7 @@ def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _S
             SELECT "episode_index", "tasks", "length",
                    "data/chunk_index", "data/file_index",
                    "dataset_from_index", "dataset_to_index"
-                   {"," + chr(34) + "stats/next.success/max" + chr(34) if has_outcome_aggregate else ""}
+                   {outcome_aggregate_selector}
             FROM {episode_metadata_relation}
             ORDER BY "episode_index"
             """
@@ -1237,7 +1247,7 @@ def _convert_single_episode(
             success_outcome = episode_row.get("success_outcome")
             if success_outcome is not None:
                 episode_record["success"] = "true" if success_outcome else "false"
-                episode_record["success_derivation"] = "max(stats/next.success)"
+                episode_record["success_derivation"] = _SUCCESS_DERIVATION
             mcap_writer.add_metadata(
                 name="episode/v1",
                 data=episode_record,

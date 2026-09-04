@@ -22,6 +22,7 @@ packages/hflow-server/src/hflow_server/static/
 # Local maintainer tooling (agent skills, settings); not part of the public repo.
 .claude/
 .agents/
+.zcode/
 
 # Transient: `pnpm gen:api` dumps the schema here on its way to src/apiSchema.ts.
 .openapi.json
