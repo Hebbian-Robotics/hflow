@@ -334,6 +334,15 @@ def test_saved_label_report_selects_exact_frames_for_a_canonical_episode(tmp_pat
             "1",
             id="older-schema-version",
         ),
+        # bool subclasses int, so True passes an isinstance(_, int) check and
+        # compares equal to 1. Only the explicit bool guard rejects it.
+        pytest.param(
+            {"schema_version": True, "label_type": "projected-hand-joints"},
+            "schema_version",
+            "True",
+            "1",
+            id="bool-schema-version",
+        ),
         pytest.param(
             {"schema_version": 2, "label_type": "projected-hand-joints"},
             "schema_version",
