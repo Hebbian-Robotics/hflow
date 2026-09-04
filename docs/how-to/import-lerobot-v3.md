@@ -26,7 +26,7 @@ data/lerobot_pusht/
 ├── _lerobot_cache/                 # downloaded metadata, Parquet, and video
 ├── landing/
 │   └── lerobot_episode_0001.mcap   # canonical episode
-└── prepared-manifest.json          # source commit and import summary
+└── prepared-manifest.json          # source commit, import summary, per-episode receipts
 ```
 
 Re-running against the same output directory reuses downloaded source files.
@@ -46,7 +46,12 @@ uv run hflow import lerobot \
 ```
 
 Durable outputs land as `landing/*.mcap` and `prepared-manifest.json` under
-that prefix. Hugging Face downloads stay in the local mirror under
+that prefix. The manifest (schema version 3) carries a `episodes` receipt
+list: every delivered episode's published URI, its `content_id` (the sha256
+content address of the canonical bytes, the same value the catalog uses for
+dedupe), and its `size_bytes`, so a delivery can be checked against the
+manifest without re-running the import. Hugging Face downloads stay in the
+local mirror under
 `_lerobot_cache/` (`HFLOW_MIRROR_DIR`, or `$XDG_CACHE_HOME/hflow/mirrors`) and
 are never uploaded into the bucket. The success manifest is published only
 after every selected episode object has been written.
