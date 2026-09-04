@@ -62,6 +62,24 @@ each table, records the media mode, and states whether media paths are relative
 to the export directory. The JSON marker is written last and the completed
 directory is activated atomically.
 
+Under the same format version `1`, the marker also records delivery integrity
+so a later verifier (not shipped here) can tell whether the published bytes
+are still intact:
+
+| Field | Meaning |
+| --- | --- |
+| `tables.<name>.path` | Required Parquet file relative to the export root |
+| `tables.<name>.size_bytes` | Size of that file at export time |
+| `tables.<name>.sha256` | Full SHA-256 of that file's bytes |
+| `assets[]` | Same `path` / `size_bytes` / `sha256` for every regular file under `assets/` in copy mode; empty in references mode (remote media are not fetched) |
+| `content_id` | 16-hex digest of the normalized inventory (all table and asset receipts, sorted by path), so a deleted member is visible even when every remaining file still matches |
+
+This is a receipt, not a verify command: export does not re-read the
+destination after transfer, and there is no public `verify_dataset_snapshot`
+API or CLI yet. Older HFlow overwrite checks only `format` and
+`format_version`, so these added keys stay backward compatible without a
+format-version bump.
+
 The Parquet tables form one snapshot:
 
 | File | Grain and purpose |

@@ -175,6 +175,23 @@ def test_dataset_snapshot_is_tool_neutral_and_selected_by_manifest(tmp_path: Pat
     assert format_marker["format"] == "hflow-dataset-snapshot"
     assert format_marker["format_version"] == "1"
     assert format_marker["media_mode"] == "references"
+    assert format_marker["assets"] == []
+    assert set(format_marker["tables"]) == {
+        "samples",
+        "measurements",
+        "observations",
+        "media",
+        "check_runs",
+        "tags",
+        "intervals",
+    }
+    for table_name, receipt in format_marker["tables"].items():
+        assert receipt["path"] == f"{table_name}.parquet"
+        assert receipt["size_bytes"] == (output_directory / receipt["path"]).stat().st_size
+        assert receipt["sha256"] == snapshot_module._sha256_hex(output_directory / receipt["path"])
+    inventory = [*format_marker["tables"].values(), *format_marker["assets"]]
+    assert format_marker["content_id"] == snapshot_module._inventory_content_id(inventory)
+    assert len(format_marker["content_id"]) == 16
 
     sample_row = duckdb.execute(
         """
@@ -647,3 +664,130 @@ def test_snapshot_samples_report_unverified_for_a_crashed_critical_check(
         [str(output_directory / "samples.parquet")],
     ).fetchone()
     assert sample_row == (append_result.episode_id, "unverified")
+
+
+def test_dataset_snapshot_copy_mode_records_asset_integrity(tmp_path: Path) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    _append_snapshot_episode(
+        catalog,
+        tmp_path,
+        name="copy-integrity",
+        score=0.5,
+        with_media=True,
+    )
+    output_directory = tmp_path / "dataset-snapshot"
+
+    report = hflow.export_dataset_snapshot(
+        catalog.location,
+        output_directory,
+        media_mode=hflow.SnapshotMediaMode.COPY,
+    )
+
+    assert report.copied_media_count == 1
+    format_marker = json.loads((output_directory / "format.json").read_text())
+    assert format_marker["format_version"] == "1"
+    assert format_marker["media_mode"] == "copy"
+    assert len(format_marker["assets"]) == 1
+    asset_receipt = format_marker["assets"][0]
+    asset_path = output_directory / asset_receipt["path"]
+    assert asset_path.is_file()
+    assert asset_receipt["path"].startswith("assets/")
+    assert asset_receipt["size_bytes"] == asset_path.stat().st_size
+    assert asset_receipt["sha256"] == snapshot_module._sha256_hex(asset_path)
+    inventory = [*format_marker["tables"].values(), *format_marker["assets"]]
+    assert format_marker["content_id"] == snapshot_module._inventory_content_id(inventory)
+
+
+def test_dataset_snapshot_marker_integrity_detects_post_export_mutations(
+    tmp_path: Path,
+) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    _append_snapshot_episode(
+        catalog,
+        tmp_path,
+        name="mutation-source",
+        score=0.9,
+        with_media=True,
+    )
+    output_directory = tmp_path / "dataset-snapshot"
+    hflow.export_dataset_snapshot(
+        catalog.location,
+        output_directory,
+        media_mode=hflow.SnapshotMediaMode.COPY,
+    )
+    original_marker = json.loads((output_directory / "format.json").read_text())
+    assert original_marker["format_version"] == "1"
+
+    media_copy = tmp_path / "media-mutated"
+    tags_copy = tmp_path / "tags-deleted"
+    samples_copy = tmp_path / "samples-truncated"
+    for destination in (media_copy, tags_copy, samples_copy):
+        snapshot_module.shutil.copytree(output_directory, destination)
+
+    # Replacing copied media bytes leaves tables readable but mismatches the receipt.
+    media_receipt = original_marker["assets"][0]
+    media_path = media_copy / media_receipt["path"]
+    media_path.write_bytes(b"replaced media bytes")
+    assert snapshot_module._sha256_hex(media_path) != media_receipt["sha256"]
+    assert media_path.stat().st_size != media_receipt["size_bytes"]
+    media_inventory = [
+        *[
+            snapshot_module._file_integrity_record(receipt["path"], media_copy / receipt["path"])
+            for receipt in original_marker["tables"].values()
+        ],
+        snapshot_module._file_integrity_record(media_receipt["path"], media_path),
+    ]
+    assert snapshot_module._inventory_content_id(media_inventory) != original_marker["content_id"]
+
+    # Deleting a required table is invisible to format/format_version checks,
+    # but the inventory digest no longer matches the marker.
+    (tags_copy / "tags.parquet").unlink()
+    assert not (tags_copy / "tags.parquet").exists()
+    remaining_entries = [
+        snapshot_module._file_integrity_record(receipt["path"], tags_copy / receipt["path"])
+        for receipt in original_marker["tables"].values()
+        if (tags_copy / receipt["path"]).is_file()
+    ] + [
+        snapshot_module._file_integrity_record(receipt["path"], tags_copy / receipt["path"])
+        for receipt in original_marker["assets"]
+    ]
+    assert snapshot_module._inventory_content_id(remaining_entries) != original_marker["content_id"]
+    overwrite_marker = json.loads((tags_copy / "format.json").read_text())
+    assert overwrite_marker["format"] == "hflow-dataset-snapshot"
+    assert overwrite_marker["format_version"] == "1"
+
+    # Truncation changes size and hash while the destination still looks like a snapshot.
+    samples_path = samples_copy / "samples.parquet"
+    samples_path.write_bytes(samples_path.read_bytes()[:64])
+    samples_receipt = original_marker["tables"]["samples"]
+    assert samples_path.stat().st_size != samples_receipt["size_bytes"]
+    assert snapshot_module._sha256_hex(samples_path) != samples_receipt["sha256"]
+
+
+def test_dataset_snapshot_overwrite_still_accepts_integrity_enriched_v1_marker(
+    tmp_path: Path,
+) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    _append_snapshot_episode(
+        catalog,
+        tmp_path,
+        name="overwrite-v1",
+        score=0.2,
+        with_media=False,
+    )
+    output_directory = tmp_path / "dataset-snapshot"
+    hflow.export_dataset_snapshot(catalog.location, output_directory)
+    first_marker = json.loads((output_directory / "format.json").read_text())
+    assert "content_id" in first_marker
+    assert first_marker["format_version"] == "1"
+
+    report = hflow.export_dataset_snapshot(
+        catalog.location,
+        output_directory,
+        overwrite=True,
+    )
+    assert report.retained_backup is None
+    second_marker = json.loads((output_directory / "format.json").read_text())
+    assert second_marker["format_version"] == "1"
+    assert "content_id" in second_marker
+    assert set(second_marker["tables"]) == set(first_marker["tables"])

@@ -35,6 +35,18 @@ _CHECK_RUNS_TABLE_FILE_NAME = "check_runs.parquet"
 _TAGS_TABLE_FILE_NAME = "tags.parquet"
 _INTERVALS_TABLE_FILE_NAME = "intervals.parquet"
 _FORMAT_MARKER_FILE_NAME = "format.json"
+_REQUIRED_TABLE_FILES: dict[str, str] = {
+    "samples": _SAMPLES_TABLE_FILE_NAME,
+    "measurements": _MEASUREMENTS_TABLE_FILE_NAME,
+    "observations": _OBSERVATIONS_TABLE_FILE_NAME,
+    "media": _MEDIA_TABLE_FILE_NAME,
+    "check_runs": _CHECK_RUNS_TABLE_FILE_NAME,
+    "tags": _TAGS_TABLE_FILE_NAME,
+    "intervals": _INTERVALS_TABLE_FILE_NAME,
+}
+_COPIED_ASSETS_DIRECTORY_NAME = "assets"
+# Whole-inventory digest width matches prepared-manifest episode content_id (#389).
+_INVENTORY_CONTENT_ID_HEX_CHARS = 16
 
 
 class SnapshotMediaMode(StrEnum):
@@ -101,6 +113,74 @@ class DatasetSnapshotReport:
 
 def _quote_sql_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def _sha256_hex(path: Path) -> str:
+    """Full SHA-256 hex digest of a file's bytes."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _file_integrity_record(relative_path: str, absolute_path: Path) -> dict[str, str | int]:
+    """Receipt for one delivered snapshot file (table or copied asset)."""
+    return {
+        "path": relative_path,
+        "size_bytes": absolute_path.stat().st_size,
+        "sha256": _sha256_hex(absolute_path),
+    }
+
+
+def _inventory_content_id(entries: list[dict[str, str | int]]) -> str:
+    """Digest of the normalized integrity inventory (catches missing members).
+
+    Entries are sorted by ``path`` and serialized with stable separators so the
+    digest depends only on the delivered set, not write order. Width matches
+    LeRobot prepared-manifest ``content_id`` (#389).
+    """
+    normalized = sorted(entries, key=lambda entry: str(entry["path"]))
+    payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()[:_INVENTORY_CONTENT_ID_HEX_CHARS]
+
+
+def _build_snapshot_integrity_marker_fields(
+    staging_directory: Path,
+) -> dict[str, object]:
+    """Integrity fields recorded in ``format.json`` under format version 1.
+
+    Required Parquet tables and every regular file under ``assets/`` (copy mode)
+    get ``path`` / ``size_bytes`` / ``sha256``. ``content_id`` digests that
+    normalized inventory so a deleted member is detectable without a verifier
+    product yet. References mode leaves ``assets`` empty: remote media are not
+    fetched for hashing.
+    """
+    tables: dict[str, dict[str, str | int]] = {}
+    for table_name, file_name in _REQUIRED_TABLE_FILES.items():
+        absolute_path = staging_directory / file_name
+        if not absolute_path.is_file():
+            raise FileNotFoundError(
+                f"snapshot staging is missing required table {file_name!r} "
+                f"under {staging_directory}"
+            )
+        tables[table_name] = _file_integrity_record(file_name, absolute_path)
+
+    assets: list[dict[str, str | int]] = []
+    assets_directory = staging_directory / _COPIED_ASSETS_DIRECTORY_NAME
+    if assets_directory.is_dir():
+        for absolute_path in sorted(assets_directory.rglob("*")):
+            if not absolute_path.is_file():
+                continue
+            relative_path = absolute_path.relative_to(staging_directory).as_posix()
+            assets.append(_file_integrity_record(relative_path, absolute_path))
+
+    inventory = [*tables.values(), *assets]
+    return {
+        "tables": tables,
+        "assets": assets,
+        "content_id": _inventory_content_id(inventory),
+    }
 
 
 def _copy_query_to_parquet(
@@ -335,7 +415,11 @@ def _copied_media_relative_path(*, episode_id: str, artifact_name: str, artifact
     safe_source_file_name = _safe_file_name(source_file_name)
     identity_digest = hashlib.sha256(f"{artifact_name}\0{artifact_uri}".encode()).hexdigest()[:12]
     safe_episode_id = _safe_file_name(episode_id)
-    return Path("assets") / safe_episode_id / f"{identity_digest}-{safe_source_file_name}"
+    return (
+        Path(_COPIED_ASSETS_DIRECTORY_NAME)
+        / safe_episode_id
+        / f"{identity_digest}-{safe_source_file_name}"
+    )
 
 
 def _write_media_table(
@@ -579,6 +663,12 @@ def export_dataset_snapshot(
     mode every recorded artifact is materialized below ``assets/`` and the
     media table stores a path relative to the export directory.
 
+    ``format.json`` stays format version ``1`` and records per-file integrity
+    (``path``, ``size_bytes``, ``sha256``) for every required table and every
+    copied asset, plus a ``content_id`` over that normalized inventory. That
+    is a delivery receipt only: this export does not verify the destination
+    after transfer.
+
     The completed directory appears atomically. Existing destinations are
     refused unless ``overwrite=True`` and ``format.json`` identifies a
     supported HFlow dataset snapshot; even then, the prior export remains in
@@ -670,15 +760,7 @@ def export_dataset_snapshot(
             "media_uri_base": (
                 "export_directory" if resolved_media_mode is SnapshotMediaMode.COPY else None
             ),
-            "tables": {
-                "samples": _SAMPLES_TABLE_FILE_NAME,
-                "measurements": _MEASUREMENTS_TABLE_FILE_NAME,
-                "observations": _OBSERVATIONS_TABLE_FILE_NAME,
-                "media": _MEDIA_TABLE_FILE_NAME,
-                "check_runs": _CHECK_RUNS_TABLE_FILE_NAME,
-                "tags": _TAGS_TABLE_FILE_NAME,
-                "intervals": _INTERVALS_TABLE_FILE_NAME,
-            },
+            **_build_snapshot_integrity_marker_fields(staging_directory),
         }
         (staging_directory / _FORMAT_MARKER_FILE_NAME).write_text(
             json.dumps(format_marker, indent=2, sort_keys=True) + "\n"
