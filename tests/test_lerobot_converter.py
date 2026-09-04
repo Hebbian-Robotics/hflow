@@ -1124,6 +1124,17 @@ def test_import_returns_local_uris_and_keeps_cache_beside_landing(
 def test_converter_version_reaches_the_canonical_episode_provenance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """What the importer writes into the episode it publishes, not what survives
+    canonicalization.
+
+    ``write_canonical_episode`` is stubbed to a copy, the idiom of the sibling
+    converter tests, because synthetic access units are not parseable video. So
+    the two records are asserted as written rather than as carried through: the
+    real transform reaches them by different routes, copying an unrecognized
+    record verbatim (``transform.py:886``) but skipping ``episode/v1`` there and
+    rewriting it from the source dict (``transform.py:889-890``). Neither route
+    is exercised here.
+    """
     corpus = _build_fake_corpus(tmp_path)
     camera_key = "observation.images.up"
     dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
