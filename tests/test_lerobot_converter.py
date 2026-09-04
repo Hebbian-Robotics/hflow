@@ -1374,7 +1374,7 @@ def test_import_skips_bucket_manifest_when_an_episode_publish_fails(
         camera_keys: object,
         numeric_schemas: object,
         frames_per_second: object,
-    ) -> str:
+    ) -> prep._PublishedEpisode:
         nonlocal convert_calls
         del source_archive, dataset_source, camera_keys, numeric_schemas, frames_per_second
         convert_calls += 1
@@ -1383,7 +1383,12 @@ def test_import_skips_bucket_manifest_when_an_episode_publish_fails(
         relative_key = f"landing/lerobot_episode_{episode_index + 1:04d}.mcap"
         staged = tmp_path / f"staged-{episode_index}.mcap"
         staged.write_bytes(b"first")
-        return storage.publish(staged, relative_key)
+        published_uri = storage.publish(staged, relative_key)
+        return {
+            "uri": published_uri,
+            "content_id": prep.content_episode_id(staged),
+            "size_bytes": staged.stat().st_size,
+        }
 
     monkeypatch.setattr(
         prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
@@ -1402,3 +1407,256 @@ def test_import_skips_bucket_manifest_when_an_episode_publish_fails(
     assert (remote_dir / "landing" / "lerobot_episode_0001.mcap").is_file()
     assert not (remote_dir / "prepared-manifest.json").exists()
     assert "prepared-manifest.json" not in data_root.list_names()
+
+
+def _write_identity_matching_landing_mcap(
+    destination: Path,
+    *,
+    dataset_source: prep.DatasetSource,
+    episode_index: int,
+    camera_keys: tuple[str, ...],
+    marker: str,
+) -> None:
+    """Write a landing MCAP whose metadata satisfies import resume identity."""
+    from mcap.writer import Writer
+
+    from hflow.format import METADATA_RECORD_EPISODE, METADATA_RECORD_PROVENANCE
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("wb") as stream:
+        writer = Writer(stream)
+        writer.start(profile="", library="test-lerobot-resume")
+        writer.add_metadata(
+            METADATA_RECORD_EPISODE,
+            {
+                "task": f"task-{episode_index}",
+                "operator": "lerobot_converter",
+                "success": "true",
+                "embodiment": "unknown",
+                "source_dataset": dataset_source.repo_id,
+                "source_revision": dataset_source.revision,
+                "source_episode_index": str(episode_index),
+                "converter_version": prep.CONVERTER_VERSION,
+                "camera_keys": prep._encode_camera_keys(camera_keys),
+                "gop_seconds": f"{prep.IMPORT_GOP_SECONDS:g}",
+            },
+        )
+        writer.add_metadata(
+            "source-provenance/v1",
+            {
+                "converter_version": prep.CONVERTER_VERSION,
+                "ffmpeg_version": "test-ffmpeg",
+                "source_uri": (f"hf://datasets/{dataset_source.repo_id}@{dataset_source.revision}"),
+            },
+        )
+        writer.add_metadata(
+            METADATA_RECORD_PROVENANCE,
+            {
+                "schema_version": "1",
+                "pipeline_version": "test",
+                "ffmpeg_version": "test-ffmpeg",
+                "gop_preset": "custom",
+                "gop_seconds": f"{prep.IMPORT_GOP_SECONDS:g}",
+                "marker": marker,
+            },
+        )
+        writer.finish()
+
+
+def _ensure_two_episode_archive(dataset_source: prep.DatasetSource, cache_dir: Path) -> dict:
+    archive = _stub_single_episode_source_archive(dataset_source, cache_dir)
+    archive["episodes"] = [
+        archive["episodes"][0],
+        {
+            **archive["episodes"][0],
+            "episode_index": 1,
+            "task": "second",
+        },
+    ]
+    return archive
+
+
+def test_import_resumes_after_mid_batch_failure_without_rewriting_completed_episode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_dir = tmp_path / "out"
+    camera_keys = (prep.DEFAULT_CAMERA_KEY,)
+    convert_calls: list[int] = []
+
+    def convert_or_fail(
+        *,
+        source_archive: object,
+        dataset_source: prep.DatasetSource,
+        storage: StorageRoot,
+        episode_index: int,
+        camera_keys: tuple[str, ...],
+        numeric_schemas: object,
+        frames_per_second: object,
+    ) -> prep._PublishedEpisode:
+        del source_archive, numeric_schemas, frames_per_second
+        convert_calls.append(episode_index)
+        if episode_index == 1 and convert_calls.count(1) == 1:
+            raise RuntimeError("forced mid-batch failure")
+        relative_key = prep._landing_relative_key(episode_index)
+        staged = tmp_path / f"staged-{episode_index}-{len(convert_calls)}.mcap"
+        _write_identity_matching_landing_mcap(
+            staged,
+            dataset_source=dataset_source,
+            episode_index=episode_index,
+            camera_keys=camera_keys,
+            marker=f"episode-{episode_index}-bytes",
+        )
+        published_uri = storage.publish(staged, relative_key)
+        return {
+            "uri": published_uri,
+            "content_id": prep.content_episode_id(staged),
+            "size_bytes": staged.stat().st_size,
+        }
+
+    monkeypatch.setattr(
+        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
+    )
+    monkeypatch.setattr(prep, "_ensure_source_archive", _ensure_two_episode_archive)
+    monkeypatch.setattr(prep, "_convert_single_episode", convert_or_fail)
+
+    with pytest.raises(RuntimeError, match="forced mid-batch failure"):
+        prep.import_lerobot_dataset(
+            dataset_repo="fake/repo",
+            revision="main",
+            output_dir=output_dir,
+            camera_keys=camera_keys,
+        )
+
+    first_episode_path = output_dir / "landing" / "lerobot_episode_0001.mcap"
+    assert first_episode_path.is_file()
+    assert not (output_dir / "prepared-manifest.json").exists()
+    first_episode_bytes = first_episode_path.read_bytes()
+    assert convert_calls == [0, 1]
+
+    episode_uris = prep.import_lerobot_dataset(
+        dataset_repo="fake/repo",
+        revision="main",
+        output_dir=output_dir,
+        camera_keys=camera_keys,
+    )
+
+    assert convert_calls == [0, 1, 1]
+    assert first_episode_path.read_bytes() == first_episode_bytes
+    assert episode_uris == [
+        str(first_episode_path.resolve()),
+        str((output_dir / "landing" / "lerobot_episode_0002.mcap").resolve()),
+    ]
+    manifest = json.loads((output_dir / "prepared-manifest.json").read_text())
+    assert manifest["schema_version"] == 3
+    assert manifest["episodes_converted"] == 1
+    assert len(manifest["episodes"]) == 2
+    assert [entry["uri"] for entry in manifest["episodes"]] == episode_uris
+    assert all(len(entry["content_id"]) == 16 for entry in manifest["episodes"])
+    assert all(entry["size_bytes"] > 0 for entry in manifest["episodes"])
+
+
+def test_import_does_not_reuse_identity_mismatched_landing_episode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_dir = tmp_path / "out"
+    landing = output_dir / "landing" / "lerobot_episode_0001.mcap"
+    mismatched_source = prep.DatasetSource("other/repo", "deadbeef", "apache-2.0")
+    _write_identity_matching_landing_mcap(
+        landing,
+        dataset_source=mismatched_source,
+        episode_index=0,
+        camera_keys=(prep.DEFAULT_CAMERA_KEY,),
+        marker="wrong-identity",
+    )
+    original_bytes = landing.read_bytes()
+    convert_calls = 0
+
+    def convert_replacement(
+        *,
+        source_archive: object,
+        dataset_source: prep.DatasetSource,
+        storage: StorageRoot,
+        episode_index: int,
+        camera_keys: tuple[str, ...],
+        numeric_schemas: object,
+        frames_per_second: object,
+    ) -> prep._PublishedEpisode:
+        nonlocal convert_calls
+        del source_archive, numeric_schemas, frames_per_second
+        convert_calls += 1
+        relative_key = prep._landing_relative_key(episode_index)
+        staged = tmp_path / f"replacement-{episode_index}.mcap"
+        _write_identity_matching_landing_mcap(
+            staged,
+            dataset_source=dataset_source,
+            episode_index=episode_index,
+            camera_keys=camera_keys,
+            marker="replacement",
+        )
+        published_uri = storage.publish(staged, relative_key)
+        return {
+            "uri": published_uri,
+            "content_id": prep.content_episode_id(staged),
+            "size_bytes": staged.stat().st_size,
+        }
+
+    monkeypatch.setattr(
+        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
+    )
+    monkeypatch.setattr(prep, "_ensure_source_archive", _stub_single_episode_source_archive)
+    monkeypatch.setattr(prep, "_convert_single_episode", convert_replacement)
+
+    episode_uris = prep.import_lerobot_dataset(
+        dataset_repo="fake/repo",
+        revision="main",
+        output_dir=output_dir,
+        episode_index=0,
+    )
+
+    assert convert_calls == 1
+    assert landing.read_bytes() != original_bytes
+    assert episode_uris == [str(landing.resolve())]
+    manifest = json.loads((output_dir / "prepared-manifest.json").read_text())
+    assert manifest["episodes_converted"] == 1
+
+
+def test_import_full_reuse_reports_zero_episodes_converted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_dir = tmp_path / "out"
+    camera_keys = (prep.DEFAULT_CAMERA_KEY,)
+    dataset_source = prep.DatasetSource("fake/repo", "abc", "apache-2.0")
+    for episode_index in (0, 1):
+        _write_identity_matching_landing_mcap(
+            output_dir / "landing" / f"lerobot_episode_{episode_index + 1:04d}.mcap",
+            dataset_source=dataset_source,
+            episode_index=episode_index,
+            camera_keys=camera_keys,
+            marker=f"already-{episode_index}",
+        )
+
+    convert_calls = 0
+
+    def should_not_convert(**_kwargs: object) -> prep._PublishedEpisode:
+        nonlocal convert_calls
+        convert_calls += 1
+        raise AssertionError("matching landing episodes must be reused")
+
+    monkeypatch.setattr(
+        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
+    )
+    monkeypatch.setattr(prep, "_ensure_source_archive", _ensure_two_episode_archive)
+    monkeypatch.setattr(prep, "_convert_single_episode", should_not_convert)
+
+    episode_uris = prep.import_lerobot_dataset(
+        dataset_repo="fake/repo",
+        revision="main",
+        output_dir=output_dir,
+        camera_keys=camera_keys,
+    )
+
+    assert convert_calls == 0
+    assert len(episode_uris) == 2
+    manifest = json.loads((output_dir / "prepared-manifest.json").read_text())
+    assert manifest["episodes_converted"] == 0
+    assert len(manifest["episodes"]) == 2
