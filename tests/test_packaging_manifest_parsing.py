@@ -1,7 +1,5 @@
 """Regression coverage for native overlay manifest parse-stage refusals."""
 
-import csv
-import io
 import json
 from pathlib import Path
 from typing import cast
@@ -17,43 +15,11 @@ from hflow.packaging import (
     apply_cython_overlay,
     build_cython_overlay,
 )
-
-
-def _write_example_distribution(temporary_directory: Path) -> Path:
-    site_packages_directory = temporary_directory / "site-packages"
-    package_root = site_packages_directory / "sample_native_package"
-    distribution_metadata_root = site_packages_directory / "sample_native_package-7.2.dist-info"
-    package_root.mkdir(parents=True)
-    distribution_metadata_root.mkdir()
-
-    (package_root / "__init__.py").write_text(
-        "from .worker import compute\n\n__all__ = ['compute']\n",
-        encoding="utf-8",
-    )
-    (package_root / "worker.py").write_text(
-        "def compute(value: int) -> int:\n    return value * 3\n",
-        encoding="utf-8",
-    )
-
-    record_path = distribution_metadata_root / "RECORD"
-    serialized_record = io.StringIO(newline="")
-    writer = csv.writer(serialized_record, lineterminator="\n")
-    for path in (
-        "sample_native_package/__init__.py",
-        "sample_native_package/worker.py",
-        "sample_native_package-7.2.dist-info/RECORD",
-    ):
-        writer.writerow((path, "", ""))
-    record_path.write_text(serialized_record.getvalue(), encoding="utf-8")
-    return package_root
-
-
-def _example_record_path(package_root: Path) -> Path:
-    return package_root.parent / "sample_native_package-7.2.dist-info" / "RECORD"
+from tests.packaging_test_helpers import _example_record_path, _write_example_distribution
 
 
 def _build_overlay(tmp_path: Path) -> tuple[Path, Path, CythonOverlayManifest, bytes, bytes]:
-    package_root = _write_example_distribution(tmp_path)
+    package_root, _ = _write_example_distribution(tmp_path)
     source_path = package_root / "worker.py"
     source_bytes = source_path.read_bytes()
     original_record = _example_record_path(package_root).read_bytes()
