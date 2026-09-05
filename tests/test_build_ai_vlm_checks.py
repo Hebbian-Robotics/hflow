@@ -238,6 +238,28 @@ def test_build_ai_check_version_changes_with_hosted_check_version(tmp_path: Path
         ),
     ],
 )
+def test_openai_compatible_execution_refuses_invalid_configuration(
+    endpoint: str,
+    model: str,
+    response_format: object,
+    api_key_environment_variable: str | None,
+    temperature: float | None,
+    max_tokens: object,
+    max_retries: object,
+    expected_message: str,
+) -> None:
+    with pytest.raises(ValueError, match=expected_message):
+        hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
+            endpoint=endpoint,
+            model=model,
+            response_format=response_format,  # ty: ignore
+            api_key_environment_variable=api_key_environment_variable,
+            temperature=temperature,
+            max_tokens=max_tokens,  # ty: ignore
+            max_retries=max_retries,  # ty: ignore
+        )
+
+
 def test_openai_compatible_execution_accepts_valid_configuration() -> None:
     execution = hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
         endpoint="http://localhost:8000/v1",
@@ -256,18 +278,6 @@ def test_openai_compatible_execution_accepts_valid_configuration() -> None:
     assert execution.temperature == 0.2
     assert execution.max_tokens == 32
     assert execution.max_retries == 5
-
-
-def test_openai_compatible_execution_refuses_invalid_configuration(
-    endpoint: str,
-    model: str,
-    expected_message: str,
-) -> None:
-    with pytest.raises(ValueError, match=expected_message):
-        hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
-            endpoint=endpoint,
-            model=model,
-        )
 
 
 @pytest.mark.parametrize("rejected_max_retries", [True, 2.5])
