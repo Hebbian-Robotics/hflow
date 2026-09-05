@@ -291,6 +291,96 @@ def test_an_unorchestrated_append_records_no_run(tmp_path: Path) -> None:
         connection.close()
 
 
+def test_episode_time_bounds_are_recorded_as_the_episode_axis(tmp_path: Path) -> None:
+    """A synthesized episode's first and last message stamps land as
+    ``start_ns``/``end_ns``; the bounds describe the canonical bytes the
+    episode id already hashes, so they never enter the run fingerprint."""
+    raw = synthesize_episode(tmp_path / "raw.mcap", SyntheticEpisodeSpec(duration_s=2.0))
+    canonical = tmp_path / "episode.canonical.mcap"
+    hflow.write_canonical_episode(raw, canonical)
+    with hflow.Episode(canonical) as episode:
+        time_bounds = episode.time_bounds
+        assert time_bounds is not None
+        stamps = np.concatenate([episode.channel(topic).timestamps for topic in episode.topics])
+    assert time_bounds.start_ns == int(stamps.min())
+    assert time_bounds.end_ns == int(stamps.max())
+    assert time_bounds.duration_s == pytest.approx(2.0, abs=0.2)
+
+    catalog = Catalog(tmp_path / "catalog")
+    with_bounds = catalog.append_episode(
+        canonical_path=canonical,
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[_check_row()],
+        time_bounds=time_bounds,
+    )
+    replayed_without_bounds = catalog.append_episode(
+        canonical_path=canonical,
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[_check_row()],
+    )
+    assert with_bounds.written and not replayed_without_bounds.written
+    assert with_bounds.run_fingerprint == replayed_without_bounds.run_fingerprint
+
+    connection = open_catalog_connection(tmp_path / "catalog")
+    try:
+        assert connection.execute("SELECT start_ns, end_ns FROM episodes_latest").fetchall() == [
+            (time_bounds.start_ns, time_bounds.end_ns)
+        ]
+    finally:
+        connection.close()
+
+
+def test_a_catalog_written_before_time_bounds_still_reads_beside_new_rows(
+    tmp_path: Path,
+) -> None:
+    """The episodes files are unioned by column name, so a row an older hflow
+    wrote (no ``start_ns``/``end_ns`` columns at all) reads as NULL bounds
+    next to a row that carries them."""
+    catalog_root = tmp_path / "catalog"
+    catalog = Catalog(catalog_root)
+    older = catalog.append_episode(
+        canonical_path=_fake_canonical(tmp_path, b"older canonical"),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[_check_row()],
+        time_bounds=hflow.EpisodeTimeBounds(start_ns=5, end_ns=50),
+    )
+    # Rewrite the older row's file the way a pre-bounds hflow laid it out.
+    (older_file,) = (catalog_root / "episodes").glob(f"{older.episode_id}-*.parquet")
+    older_layout = tmp_path / "older-layout.parquet"
+    rewrite = duckdb.connect()
+    try:
+        rewrite.execute(
+            f"COPY (SELECT * EXCLUDE (start_ns, end_ns) FROM read_parquet('{older_file}')) "
+            f"TO '{older_layout}' (FORMAT PARQUET)"
+        )
+    finally:
+        rewrite.close()
+    older_layout.replace(older_file)
+
+    newer = catalog.append_episode(
+        canonical_path=_fake_canonical(tmp_path, b"newer canonical"),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[_check_row()],
+        time_bounds=hflow.EpisodeTimeBounds(start_ns=100, end_ns=900),
+    )
+
+    connection = open_catalog_connection(catalog_root)
+    try:
+        bounds_by_episode = dict(
+            connection.execute(
+                "SELECT episode_id, (start_ns, end_ns) FROM episodes_latest"
+            ).fetchall()
+        )
+    finally:
+        connection.close()
+    assert bounds_by_episode[older.episode_id] == (None, None)
+    assert bounds_by_episode[newer.episode_id] == (100, 900)
+
+
 @pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
 def test_a_blank_run_id_records_as_absent_rather_than_as_a_value(
     tmp_path: Path, blank: str
@@ -360,8 +450,13 @@ def test_a_corpus_written_before_the_run_id_column_still_reads(tmp_path: Path) -
         orchestrator_run_id="manual__2026-08-23T00:00:00+00:00",
     )
 
-    # An episodes file in the pre-column shape, beside the new one.
-    legacy_columns = TABLE_COLUMN_DDL["episodes"].replace("orchestrator_run_id VARCHAR, ", "")
+    # An episodes file in the pre-column shape, beside the new one. A corpus
+    # that predates the run id column predates the time-bounds columns too.
+    legacy_columns = (
+        TABLE_COLUMN_DDL["episodes"]
+        .replace("orchestrator_run_id VARCHAR, ", "")
+        .replace(", start_ns BIGINT, end_ns BIGINT", "")
+    )
     legacy_file = str(catalog_root / "episodes" / "legacy-episode-000000000000.parquet")
     writer = duckdb.connect()
     try:

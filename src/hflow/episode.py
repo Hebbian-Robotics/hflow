@@ -38,6 +38,7 @@ from hflow.reader import (
     DEFAULT_BATCH_MAX_BYTES,
     DEFAULT_BATCH_MAX_MESSAGES,
     EpisodeReader,
+    EpisodeTimeBounds,
     TopicInfo,
     open_reader,
 )
@@ -379,6 +380,17 @@ class Episode:
         merged.update(self.metadata_records.get(METADATA_RECORD_EPISODE, {}))
         merged.update(self.metadata_records.get(METADATA_RECORD_PROVENANCE, {}))
         return merged
+
+    @cached_property
+    def time_bounds(self) -> EpisodeTimeBounds | None:
+        """The log-time span every message in the file falls within, or
+        ``None`` when the file records no statistics or holds no messages.
+
+        This is the episode's time axis: interval bounds and message
+        timestamps are absolute log-time nanoseconds, so a timeline or a
+        video scrubber places them relative to ``start_ns``. Read from the
+        MCAP summary, so asking costs no message decode."""
+        return self._reader.time_bounds()
 
     @property
     def cameras(self) -> list[str]:

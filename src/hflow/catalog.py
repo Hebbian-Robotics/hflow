@@ -45,6 +45,7 @@ import duckdb
 import numpy as np
 
 from hflow.format import CATALOG_FORMAT_VERSION
+from hflow.reader import EpisodeTimeBounds
 from hflow.steps import CheckResult, CheckStatus, Interval, MeasurementValue, Observation
 from hflow.storage import (
     BucketStorageRoot,
@@ -67,7 +68,12 @@ TABLE_COLUMN_DDL: dict[str, str] = {
         "robot_software_version VARCHAR, ffmpeg_version VARCHAR, "
         "task VARCHAR, operator VARCHAR, success VARCHAR, embodiment VARCHAR, "
         "metadata_json VARCHAR, quarantined BOOLEAN, "
-        "quarantine_tags_json VARCHAR, recorded_at TIMESTAMPTZ"
+        "quarantine_tags_json VARCHAR, recorded_at TIMESTAMPTZ, "
+        # The episode's own time axis (log-time nanoseconds of its first and
+        # last message). NULL on rows an older hflow wrote, and on an episode
+        # whose file records no statistics; the curation views union files by
+        # name, so a catalog mixing both generations still reads.
+        "start_ns BIGINT, end_ns BIGINT"
     ),
     "check_runs": (
         "episode_id VARCHAR, run_fingerprint VARCHAR, check_name VARCHAR, "
@@ -812,8 +818,14 @@ class Catalog:
         source_uri: str | None = None,
         uri: str | None = None,
         orchestrator_run_id: str | None = None,
+        time_bounds: EpisodeTimeBounds | None = None,
     ) -> AppendResult:
         """Record one outcome; replaying that exact outcome is idempotent.
+
+        ``time_bounds`` is the episode's own time axis (``Episode.time_bounds``),
+        recorded as the ``start_ns``/``end_ns`` columns. It is a fact about the
+        canonical bytes ``episode_id`` already hashes, so it deliberately stays
+        out of the run fingerprint. ``None`` records NULLs.
 
         ``uri`` is the address the ``episodes.uri`` column records for the
         canonical file -- pass the published object URL for bucket data
@@ -895,7 +907,8 @@ class Catalog:
             for table_name, column_ddl in TABLE_COLUMN_DDL.items():
                 connection.execute(f"CREATE TABLE {table_name} ({column_ddl})")
             connection.execute(
-                "INSERT INTO episodes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO episodes VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     episode_id,
                     run_fingerprint,
@@ -914,6 +927,8 @@ class Catalog:
                     bool(quarantine_tags),
                     json.dumps(list(quarantine_tags)),
                     recorded_at,
+                    time_bounds.start_ns if time_bounds is not None else None,
+                    time_bounds.end_ns if time_bounds is not None else None,
                 ],
             )
             _insert_dependent_rows(

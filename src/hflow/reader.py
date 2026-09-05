@@ -55,6 +55,23 @@ class TopicInfo:
     has_schema: bool = True
 
 
+@dataclass(frozen=True)
+class EpisodeTimeBounds:
+    """The log-time span one episode's messages cover, in nanoseconds.
+
+    Read from the MCAP summary statistics, so it costs no message decode and
+    covers every channel, not only the ones a caller happened to load.
+    ``start_ns == end_ns`` is a real single-instant episode.
+    """
+
+    start_ns: int
+    end_ns: int
+
+    @property
+    def duration_s(self) -> float:
+        return (self.end_ns - self.start_ns) / 1_000_000_000
+
+
 @dataclass
 class MessageBatch:
     """A contiguous run of raw messages from one channel, ascending in log time.
@@ -90,6 +107,11 @@ class EpisodeReader(Protocol):
 
     def metadata(self) -> dict[str, dict[str, str]]:
         """All MCAP Metadata records, keyed by record name (last record wins)."""
+        ...
+
+    def time_bounds(self) -> EpisodeTimeBounds | None:
+        """The log-time span of every message in the file, or ``None`` when
+        the file records no statistics or holds no messages."""
         ...
 
     def attachments(self) -> Iterator[Attachment]:
@@ -176,6 +198,17 @@ class PythonMcapEpisodeReader:
                 "the topic-keyed view cannot represent them -- use channels() instead"
             )
         return {info.topic: info for info in self.channels().values()}
+
+    def time_bounds(self) -> EpisodeTimeBounds | None:
+        summary = self._reader.get_summary()
+        if summary is None or summary.statistics is None:
+            return None
+        if summary.statistics.message_count == 0:
+            return None
+        return EpisodeTimeBounds(
+            start_ns=int(summary.statistics.message_start_time),
+            end_ns=int(summary.statistics.message_end_time),
+        )
 
     def metadata(self) -> dict[str, dict[str, str]]:
         records: dict[str, dict[str, str]] = {}

@@ -2518,6 +2518,7 @@ class App:
                 )
 
             episode_metadata = dict(canonical_episode.metadata)
+            episode_time_bounds = canonical_episode.time_bounds
 
         for enrichment_run in report.enrichments:
             enrichment_result = enrichment_run.result
@@ -2578,6 +2579,7 @@ class App:
                 quarantine_tags=report.quarantine_tags,
                 source_uri=source_identifier,
                 orchestrator_run_id=orchestrator_run_id,
+                time_bounds=episode_time_bounds,
             )
 
         if verbose:

@@ -54,7 +54,7 @@ append at all:
 
 | Table | One row per | Carries |
 |---|---|---|
-| `episodes` | episode append | `uri`, `source_uri`, version stamps (`schema_version`, `pipeline_version`, `robot_software_version`, `ffmpeg_version`), promoted semantics (`task`, `operator`, `success`, `embodiment`), the rest of `episode/v1` as `metadata_json`, `quarantined` + `quarantine_tags_json`, `orchestrator_run_id`, `recorded_at` |
+| `episodes` | episode append | `uri`, `source_uri`, version stamps (`schema_version`, `pipeline_version`, `robot_software_version`, `ffmpeg_version`), promoted semantics (`task`, `operator`, `success`, `embodiment`), the rest of `episode/v1` as `metadata_json`, `quarantined` + `quarantine_tags_json`, `orchestrator_run_id`, `recorded_at`, and the episode's time axis `start_ns`/`end_ns` (log time of its first and last message, from the MCAP summary; NULL on rows written before it was recorded) |
 | `check_runs` | (episode, step) invocation | `check_name`, `check_version`, `critical`, `status`, `duration_s`, `error`; present even when a step produced nothing, which is what makes coverage countable |
 | `measurements` | measurement key | `key`, typed value columns (`value_double`, `value_text`, `value_bool`), the producing `check_name`/`check_version` |
 | `observations` | observation field | `observation_id`, `timestamp_ns`, `key`, typed value columns, and the producing `check_name`/`check_version` |
