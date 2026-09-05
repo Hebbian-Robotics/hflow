@@ -105,7 +105,7 @@ def test_build_ai_check_version_changes_with_hosted_check_version(tmp_path: Path
 
 
 @pytest.mark.parametrize(
-    ("kwargs", "expected_message"),
+    ("endpoint", "model", "expected_message"),
     [
         (
             {
