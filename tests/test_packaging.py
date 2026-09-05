@@ -14,6 +14,13 @@ from typing import cast
 
 import pytest
 
+from packaging_test_helpers import (
+    _example_record_path,
+    _record_values_for_file,
+    _write_example_distribution,
+    _write_record,
+)
+
 import hflow.packaging as packaging
 from hflow.cli import main
 from hflow.packaging import (
@@ -30,14 +37,6 @@ from hflow.packaging import (
     load_cython_overlay_manifest,
     verify_cython_overlay,
 )
-from packaging_test_helpers import (
-    _example_record_path,
-    _record_values_for_file,
-    _write_example_distribution,
-    _write_record,
-)
-
-
 def _read_record(record_path: Path) -> dict[str, tuple[str, str]]:
     with record_path.open(encoding="utf-8", newline="") as record_file:
         return {
