@@ -310,6 +310,51 @@ def test_check_version_stable_when_every_covered_field_is_identical(tmp_path: Pa
     assert first_application.checks[0].version == second_application.checks[0].version
 
 
+# Golden versions for two fixed configurations, one per execution branch.
+#
+# The equality test above only proves _check_version is a function: it cannot
+# fail unless the same input starts producing two answers. The property DoD 3
+# actually claims is that unchanged methodology keeps its identity across
+# changes to this module, and only a recorded value can hold that. Adding a
+# field to the contract, renaming a key, or reordering nothing at all silently
+# re-mints every stored check version; here it fails instead.
+#
+# Editing these strings is the signal, not the chore. Change them only
+# together with a deliberate contract change, and say in the PR why every
+# existing Build AI result is being invalidated.
+_GOLDEN_OPENAI_CHECK_VERSION = "build-ai-single-frame-v1-2aed30388241d554"
+_GOLDEN_HOSTED_CHECK_VERSION = "build-ai-single-frame-v1-400d7f82abd83534"
+
+
+def test_check_version_is_pinned_for_a_fixed_openai_configuration(tmp_path: Path) -> None:
+    application = hflow.App("golden-openai", data_root=tmp_path, default_checks=())
+    hflow.build_ai_vlm_checks.register_hand_visibility(
+        application,
+        execution=hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
+            endpoint="http://localhost:8000/v1",
+            model="model-a",
+            temperature=0.5,
+            max_tokens=512,
+            max_retries=3,
+        ),
+    )
+
+    assert str(application.checks[0].version) == _GOLDEN_OPENAI_CHECK_VERSION
+
+
+def test_check_version_is_pinned_for_a_fixed_hosted_configuration(tmp_path: Path) -> None:
+    application = hflow.App("golden-hosted", data_root=tmp_path, default_checks=())
+    hflow.build_ai_vlm_checks.register_hand_visibility(
+        application,
+        execution=hflow.build_ai_vlm_checks.HFlowHostedExecution(
+            check_version=1,
+            request_timeout_seconds=30.0,
+        ),
+    )
+
+    assert str(application.checks[0].version) == _GOLDEN_HOSTED_CHECK_VERSION
+
+
 def test_check_version_changes_with_max_retries(tmp_path: Path) -> None:
     """max_retries decides whether a transient error becomes a prediction or
     a failed run: retries change which items produce answers at all, so two
