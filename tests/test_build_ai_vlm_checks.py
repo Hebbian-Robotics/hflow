@@ -238,7 +238,6 @@ def test_build_ai_check_version_changes_with_hosted_check_version(tmp_path: Path
         ),
     ],
 )
-
 def test_openai_compatible_execution_accepts_valid_configuration() -> None:
     execution = hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
         endpoint="http://localhost:8000/v1",
