@@ -15,7 +15,7 @@ from hflow.packaging import (
     apply_cython_overlay,
     build_cython_overlay,
 )
-from tests.packaging_test_helpers import _example_record_path, _write_example_distribution
+from packaging_test_helpers import _example_record_path, _write_example_distribution
 
 
 def _build_overlay(tmp_path: Path) -> tuple[Path, Path, CythonOverlayManifest, bytes, bytes]:

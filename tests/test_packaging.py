@@ -30,7 +30,7 @@ from hflow.packaging import (
     load_cython_overlay_manifest,
     verify_cython_overlay,
 )
-from tests.packaging_test_helpers import (
+from packaging_test_helpers import (
     _example_record_path,
     _record_values_for_file,
     _write_example_distribution,
