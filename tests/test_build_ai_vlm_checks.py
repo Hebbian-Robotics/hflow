@@ -105,22 +105,179 @@ def test_build_ai_check_version_changes_with_hosted_check_version(tmp_path: Path
 
 
 @pytest.mark.parametrize(
-    ("endpoint", "model", "expected_message"),
+    (
+        "endpoint",
+        "model",
+        "response_format",
+        "api_key_environment_variable",
+        "temperature",
+        "max_tokens",
+        "max_retries",
+        "expected_message",
+    ),
     [
-        ("localhost:8000/v1", "model", "absolute http"),
-        ("http://localhost:8000/v1", " ", "model must not be empty"),
+        (
+            "localhost:8000/v1",
+            "model",
+            hflow.build_ai_vlm_checks.ResponseFormat.JSON_SCHEMA,
+            None,
+            None,
+            32,
+            5,
+            "absolute http",
+        ),
+        (
+            "http://localhost:8000/v1",
+            " ",
+            hflow.build_ai_vlm_checks.ResponseFormat.JSON_SCHEMA,
+            None,
+            None,
+            32,
+            5,
+            "model must not be empty",
+        ),
+        (
+            "http://localhost:8000/v1",
+            " model ",
+            hflow.build_ai_vlm_checks.ResponseFormat.JSON_SCHEMA,
+            None,
+            None,
+            32,
+            5,
+            "model must not have leading or trailing whitespace",
+        ),
+        (
+            "http://localhost:8000/v1",
+            "model",
+            "json",
+            None,
+            None,
+            32,
+            5,
+            "response_format must be",
+        ),
+        (
+            "http://localhost:8000/v1",
+            "model",
+            hflow.build_ai_vlm_checks.ResponseFormat.JSON_SCHEMA,
+            "INVALID-NAME",
+            None,
+            32,
+            5,
+            "valid environment variable name",
+        ),
+        (
+            "http://localhost:8000/v1",
+            "model",
+            hflow.build_ai_vlm_checks.ResponseFormat.JSON_SCHEMA,
+            None,
+            None,
+            "32",
+            5,
+            "max_tokens must be an integer",
+        ),
+        (
+            "http://localhost:8000/v1",
+            "model",
+            hflow.build_ai_vlm_checks.ResponseFormat.JSON_SCHEMA,
+            None,
+            None,
+            True,
+            5,
+            "max_tokens must be an integer",
+        ),
+        (
+            "http://localhost:8000/v1",
+            "model",
+            hflow.build_ai_vlm_checks.ResponseFormat.JSON_SCHEMA,
+            None,
+            None,
+            0,
+            5,
+            "max_tokens must be greater than zero",
+        ),
+        (
+            "http://localhost:8000/v1",
+            "model",
+            hflow.build_ai_vlm_checks.ResponseFormat.JSON_SCHEMA,
+            None,
+            None,
+            32,
+            "5",
+            "max_retries must be an integer",
+        ),
+        (
+            "http://localhost:8000/v1",
+            "model",
+            hflow.build_ai_vlm_checks.ResponseFormat.JSON_SCHEMA,
+            None,
+            None,
+            32,
+            True,
+            "max_retries must be an integer",
+        ),
+        (
+            "http://localhost:8000/v1",
+            "model",
+            hflow.build_ai_vlm_checks.ResponseFormat.JSON_SCHEMA,
+            None,
+            None,
+            32,
+            -1,
+            "max_retries must not be negative",
+        ),
+        (
+            "http://localhost:8000/v1",
+            "model",
+            hflow.build_ai_vlm_checks.ResponseFormat.JSON_SCHEMA,
+            None,
+            float("nan"),
+            32,
+            5,
+            "temperature must be finite",
+        ),
     ],
 )
 def test_openai_compatible_execution_refuses_invalid_configuration(
     endpoint: str,
     model: str,
+    response_format: object,
+    api_key_environment_variable: str | None,
+    temperature: float | None,
+    max_tokens: object,
+    max_retries: object,
     expected_message: str,
 ) -> None:
     with pytest.raises(ValueError, match=expected_message):
         hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
             endpoint=endpoint,
             model=model,
+            response_format=response_format,  # ty: ignore
+            api_key_environment_variable=api_key_environment_variable,
+            temperature=temperature,
+            max_tokens=max_tokens,  # ty: ignore
+            max_retries=max_retries,  # ty: ignore
         )
+
+
+def test_openai_compatible_execution_accepts_valid_configuration() -> None:
+    execution = hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
+        endpoint="http://localhost:8000/v1",
+        model="model",
+        api_key_environment_variable="TEST_MODEL_API_KEY",
+        response_format=hflow.build_ai_vlm_checks.ResponseFormat.JSON_SCHEMA,
+        temperature=0.2,
+        max_tokens=32,
+        max_retries=5,
+    )
+
+    assert execution.endpoint == "http://localhost:8000/v1"
+    assert execution.model == "model"
+    assert execution.api_key_environment_variable == "TEST_MODEL_API_KEY"
+    assert execution.response_format is hflow.build_ai_vlm_checks.ResponseFormat.JSON_SCHEMA
+    assert execution.temperature == 0.2
+    assert execution.max_tokens == 32
+    assert execution.max_retries == 5
 
 
 @pytest.mark.parametrize("rejected_max_retries", [True, 2.5])
