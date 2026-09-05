@@ -250,3 +250,110 @@ def test_hosted_response_refuses_a_prediction_outside_the_check_contract() -> No
                 "raw_response": "3",
             },
         )
+
+
+# --- version contract covers every knob that changes result completeness (#404)
+
+
+def _versions_for(executions: list) -> list:
+    versions = []
+    for index, execution in enumerate(executions):
+        application = hflow.App(
+            f"app-{index}-{abs(hash(execution))}",
+            data_root=Path(f"/tmp/unused-{index}-{abs(hash(execution))}"),
+            default_checks=(),
+        )
+        hflow.build_ai_vlm_checks.register_hand_visibility(application, execution=execution)
+        versions.append(application.checks[0].version)
+    return versions
+
+
+def test_check_version_stable_when_every_covered_field_is_identical(tmp_path: Path) -> None:
+    """DoD 3: a configuration identical in every covered field keeps its
+    current version, so unchanged methodology never silently invalidates."""
+    first_application = hflow.App("first", data_root=tmp_path / "first", default_checks=())
+    second_application = hflow.App("second", data_root=tmp_path / "second", default_checks=())
+    execution = hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
+        endpoint="http://localhost:8000/v1",
+        model="model-a",
+        temperature=0.5,
+        max_tokens=512,
+        max_retries=3,
+    )
+    hflow.build_ai_vlm_checks.register_hand_visibility(first_application, execution=execution)
+    hflow.build_ai_vlm_checks.register_hand_visibility(second_application, execution=execution)
+
+    assert first_application.checks[0].version == second_application.checks[0].version
+
+
+def test_check_version_changes_with_max_retries(tmp_path: Path) -> None:
+    """max_retries decides whether a transient error becomes a prediction or
+    a failed run: retries change which items produce answers at all, so two
+    executions differing only in retries must not share a version."""
+    first_application = hflow.App("first", data_root=tmp_path / "first", default_checks=())
+    second_application = hflow.App("second", data_root=tmp_path / "second", default_checks=())
+    hflow.build_ai_vlm_checks.register_hand_visibility(
+        first_application,
+        execution=hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
+            endpoint="http://localhost:8000/v1", model="model-a", max_retries=0
+        ),
+    )
+    hflow.build_ai_vlm_checks.register_hand_visibility(
+        second_application,
+        execution=hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
+            endpoint="http://localhost:8000/v1", model="model-a", max_retries=5
+        ),
+    )
+
+    assert first_application.checks[0].version != second_application.checks[0].version
+
+
+def test_check_version_changes_with_request_timeout_seconds(tmp_path: Path) -> None:
+    """The hosted branch applies the same rule: a timeout decides whether a
+    slow-but-valid response is included, so the field belongs in identity."""
+    first_application = hflow.App("first", data_root=tmp_path / "first", default_checks=())
+    second_application = hflow.App("second", data_root=tmp_path / "second", default_checks=())
+    hflow.build_ai_vlm_checks.register_hand_visibility(
+        first_application,
+        execution=hflow.build_ai_vlm_checks.HFlowHostedExecution(
+            check_version=1, request_timeout_seconds=1.0
+        ),
+    )
+    hflow.build_ai_vlm_checks.register_hand_visibility(
+        second_application,
+        execution=hflow.build_ai_vlm_checks.HFlowHostedExecution(
+            check_version=1, request_timeout_seconds=60.0
+        ),
+    )
+
+    assert first_application.checks[0].version != second_application.checks[0].version
+
+
+def test_check_version_applies_the_rule_symmetrically_across_branches(
+    tmp_path: Path,
+) -> None:
+    """DoD 4: both branches treat the rule the same way. Each branch must
+    change its version when its own completeness knob changes, by the same
+    mechanism (the contract), not by an asymmetric special case."""
+    openai_versions = _versions_for(
+        [
+            hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
+                endpoint="http://localhost:8000/v1", model="model-a", max_retries=0
+            ),
+            hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
+                endpoint="http://localhost:8000/v1", model="model-a", max_retries=5
+            ),
+        ]
+    )
+    hosted_versions = _versions_for(
+        [
+            hflow.build_ai_vlm_checks.HFlowHostedExecution(
+                check_version=1, request_timeout_seconds=1.0
+            ),
+            hflow.build_ai_vlm_checks.HFlowHostedExecution(
+                check_version=1, request_timeout_seconds=60.0
+            ),
+        ]
+    )
+    assert openai_versions[0] != openai_versions[1]
+    assert hosted_versions[0] != hosted_versions[1]
