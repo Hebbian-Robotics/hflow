@@ -58,6 +58,7 @@ from hflow.manifest import (
 )
 from hflow.reader import (
     EpisodeReader,
+    EpisodeTimeBounds,
     MessageBatch,
     PythonMcapEpisodeReader,
     TopicInfo,
@@ -140,6 +141,7 @@ __all__ = [
     "Episode",
     "EpisodeReader",
     "EpisodeStamps",
+    "EpisodeTimeBounds",
     "Errored",
     "ExtractedFrame",
     "Finding",

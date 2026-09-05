@@ -24,6 +24,62 @@ def test_media_bytes_are_served_with_content_type(
     assert "default-src 'none'" in response.headers["content-security-policy"]
 
 
+def test_any_steps_artifact_is_served_not_only_the_contact_sheet(tmp_path: Path) -> None:
+    """The ``artifact/`` key prefix is the qualifier: a user enrichment's MP4
+    (here named the way ``hflow.camera_video`` names one) is served inline
+    with its media type, and the dossier lists it beside the contact sheet."""
+    data_root = tmp_path / "data"
+    episodes_dir = data_root / "episodes"
+    episodes_dir.mkdir(parents=True)
+    media_dir = data_root / "media"
+    media_dir.mkdir()
+    mp4_bytes = b"\x00\x00\x00\x18ftypmp42 fake mp4 payload"
+    (media_dir / "wrist_cam.mp4").write_bytes(mp4_bytes)
+    (media_dir / "wrist_cam.jpg").write_bytes(b"\xff\xd8\xff\xe0 jpeg \xff\xd9")
+    catalog = Catalog(data_root / "catalog")
+    canonical = episodes_dir / "a.canonical.mcap"
+    canonical.write_bytes(b"canonical a")
+    result = catalog.append_episode(
+        canonical_path=canonical,
+        stamps=STAMPS,
+        episode_metadata={"task": "fold"},
+        check_rows=[
+            CheckRunRow(
+                check_name="media/contact_sheet",
+                check_version="v1",
+                critical=False,
+                status=hflow.CheckStatus.MEASURED,
+                duration_s=0.01,
+                measurements={"artifact//wrist_cam/compressed": str(media_dir / "wrist_cam.jpg")},
+            ),
+            CheckRunRow(
+                check_name="camera_video",
+                check_version="1",
+                critical=False,
+                status=hflow.CheckStatus.MEASURED,
+                duration_s=0.5,
+                measurements={
+                    "artifact/video:/wrist_cam/compressed": str(media_dir / "wrist_cam.mp4"),
+                    "/wrist_cam/compressed/video_start_s": 0.0,
+                },
+            ),
+        ],
+    )
+    client = TestClient(create_app(ServerSettings(data_root=str(data_root))))
+
+    response = client.get(f"/api/v1/episodes/{result.episode_id}/media/video:/wrist_cam/compressed")
+    assert response.status_code == 200
+    assert response.content == mp4_bytes
+    assert response.headers["content-type"] == "video/mp4"
+    assert "attachment" not in response.headers.get("content-disposition", "")
+
+    dossier = client.get(f"/api/v1/episodes/{result.episode_id}").json()
+    assert [entry["name"] for entry in dossier["media"]] == [
+        "/wrist_cam/compressed",
+        "video:/wrist_cam/compressed",
+    ]
+
+
 @pytest.fixture()
 def mixed_media_workspace(tmp_path: Path) -> tuple[TestClient, str]:
     """A workspace with .jpg, .html, and .svg contact-sheet artifacts, all

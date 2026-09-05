@@ -659,8 +659,13 @@ def _check_version(configuration: _RegisteredBuildAICheckConfiguration) -> StepV
     }
     match configuration.execution:
         case OpenAICompatibleExecution() as execution:
-            # Keep the existing contract shape so migrating to the explicit
-            # execution value does not invalidate otherwise identical results.
+            # The contract shape was kept stable during the migration to the
+            # explicit execution value so that migration alone did not
+            # invalidate otherwise identical results. That constraint applied
+            # to that migration only: the contract must include every knob
+            # that changes which items produce results, so max_retries is
+            # version-worthy even though it only affects request liveness
+            # (#404). Adding a field re-mints the version by design.
             version_contract.update(
                 {
                     "endpoint": execution.endpoint,
@@ -668,15 +673,19 @@ def _check_version(configuration: _RegisteredBuildAICheckConfiguration) -> StepV
                     "response_format": execution.response_format.value,
                     "temperature": execution.temperature,
                     "max_tokens": execution.max_tokens,
+                    "max_retries": execution.max_retries,
                 }
             )
         case HFlowHostedExecution() as execution:
+            # Same rule, applied symmetrically: the timeout decides whether a
+            # slow-but-valid response is included in the corpus at all.
             version_contract.update(
                 {
                     "execution": "hflow-hosted",
                     "hosted_check_endpoint": _hosted_check_endpoint(
                         execution, configuration.task_definition.task
                     ),
+                    "request_timeout_seconds": execution.request_timeout_seconds,
                 }
             )
         case unexpected_execution:

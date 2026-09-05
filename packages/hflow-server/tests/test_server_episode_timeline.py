@@ -1,9 +1,10 @@
 """GET /api/v1/episodes/{id}/timeline: the episode's time axis, server-side.
 
-The span derivation is the point: intervals give the axis when they exist, a
-duration-naming measurement gives (or extends) it otherwise, and an episode
-that offers neither returns nulls so the UI can say "unknown" instead of
-drawing a fabricated axis.
+The span derivation is the point: the episode's recorded time bounds are the
+axis when the catalog holds them; on rows written without them, intervals
+give the axis when they exist, a duration-naming measurement gives (or
+extends) it otherwise, and an episode that offers neither returns nulls so
+the UI can say "unknown" instead of drawing a fabricated axis.
 """
 
 import pytest
@@ -25,7 +26,11 @@ def timeline_workspace(tmp_path_factory: pytest.TempPathFactory) -> dict[str, st
     episodes_directory.mkdir()
     catalog = Catalog(data_root / "catalog")
 
-    def appended(name: str, check_rows: list[CheckRunRow]) -> str:
+    def appended(
+        name: str,
+        check_rows: list[CheckRunRow],
+        time_bounds: hflow.EpisodeTimeBounds | None = None,
+    ) -> str:
         canonical_file = episodes_directory / f"{name}.canonical.mcap"
         canonical_file.write_bytes(f"canonical {name}".encode())
         return catalog.append_episode(
@@ -33,6 +38,7 @@ def timeline_workspace(tmp_path_factory: pytest.TempPathFactory) -> dict[str, st
             stamps=STAMPS,
             episode_metadata={"task": name},
             check_rows=check_rows,
+            time_bounds=time_bounds,
         ).episode_id
 
     intervals_and_duration = appended(
@@ -111,8 +117,34 @@ def timeline_workspace(tmp_path_factory: pytest.TempPathFactory) -> dict[str, st
             )
         ],
     )
+    recorded_axis = appended(
+        "recorded_axis",
+        [
+            CheckRunRow(
+                check_name="gap_check",
+                check_version="v1",
+                critical=False,
+                status=hflow.CheckStatus.MEASURED,
+                duration_s=0.01,
+                # Claims a longer episode than the file itself records: the
+                # file's own clock wins over a measurement's opinion.
+                measurements={"episode_duration_s": 40.0},
+                intervals=[
+                    hflow.Interval(
+                        start_ns=12 * NANOSECONDS_PER_SECOND,
+                        end_ns=13 * NANOSECONDS_PER_SECOND,
+                        label="gap:/imu",
+                    )
+                ],
+            )
+        ],
+        time_bounds=hflow.EpisodeTimeBounds(
+            start_ns=10 * NANOSECONDS_PER_SECOND, end_ns=25 * NANOSECONDS_PER_SECOND
+        ),
+    )
     return {
         "data_root": str(data_root),
+        "recorded_axis": recorded_axis,
         "intervals_and_duration": intervals_and_duration,
         "duration_only": duration_only,
         "duration_named_percentage": duration_named_percentage,
@@ -131,14 +163,34 @@ def timeline_api(
     return TestClient(create_app(settings))
 
 
+def test_recorded_time_bounds_are_the_axis_and_intervals_sit_on_it(
+    timeline_api: TestClient, timeline_workspace: dict[str, str]
+) -> None:
+    """The file's first and last message time is the axis: the interval two
+    seconds in reads as two seconds in, not as the axis origin, and a
+    duration measurement claiming a longer episode does not stretch it."""
+    payload = timeline_api.get(
+        f"/api/v1/episodes/{timeline_workspace['recorded_axis']}/timeline"
+    ).json()
+    assert payload["axis_source"] == "recorded"
+    assert payload["start_ns"] == 10 * NANOSECONDS_PER_SECOND
+    assert payload["end_ns"] == 25 * NANOSECONDS_PER_SECOND
+    assert payload["duration_s"] == pytest.approx(15.0)
+    (interval,) = payload["intervals"]
+    assert interval["start_s"] == pytest.approx(2.0)
+    assert interval["end_s"] == pytest.approx(3.0)
+
+
 def test_timeline_spans_the_intervals_and_the_duration_measurement(
     timeline_api: TestClient, timeline_workspace: dict[str, str]
 ) -> None:
     payload = timeline_api.get(
         f"/api/v1/episodes/{timeline_workspace['intervals_and_duration']}/timeline"
     ).json()
-    # The axis starts at the first interval; the 12.5s duration measurement
-    # claims a longer episode than the intervals do, so the span extends.
+    # No recorded bounds: the axis starts at the first interval; the 12.5s
+    # duration measurement claims a longer episode than the intervals do, so
+    # the span extends.
+    assert payload["axis_source"] == "intervals"
     assert payload["start_ns"] == 1 * NANOSECONDS_PER_SECOND
     assert payload["end_ns"] == 1 * NANOSECONDS_PER_SECOND + int(12.5 * NANOSECONDS_PER_SECOND)
     assert payload["duration_s"] == pytest.approx(12.5)
@@ -187,6 +239,7 @@ def test_timeline_from_a_duration_measurement_alone_is_zero_based(
     assert payload["intervals"] == []
     # No intervals to anchor the axis: an unsuffixed duration key reads as
     # seconds and the axis starts at zero.
+    assert payload["axis_source"] == "duration_measurement"
     assert payload["start_ns"] == 0
     assert payload["end_ns"] == 30 * NANOSECONDS_PER_SECOND
     assert payload["duration_s"] == pytest.approx(30.0)
@@ -216,6 +269,7 @@ def test_timeline_without_any_span_returns_nulls_not_a_guess(
     timeline_api: TestClient, timeline_workspace: dict[str, str]
 ) -> None:
     payload = timeline_api.get(f"/api/v1/episodes/{timeline_workspace['no_span']}/timeline").json()
+    assert payload["axis_source"] is None
     assert payload["start_ns"] is None
     assert payload["end_ns"] is None
     assert payload["duration_s"] is None
@@ -246,6 +300,7 @@ def test_timeline_of_an_episode_without_evidence_is_all_nulls(
         "start_ns": None,
         "end_ns": None,
         "duration_s": None,
+        "axis_source": None,
         "intervals": [],
         "measurements": [],
     }
