@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-
 from packaging_test_helpers import _example_record_path, _write_example_distribution
 
 from hflow.packaging import (
@@ -17,6 +16,8 @@ from hflow.packaging import (
     apply_cython_overlay,
     build_cython_overlay,
 )
+
+
 def _build_overlay(tmp_path: Path) -> tuple[Path, Path, CythonOverlayManifest, bytes, bytes]:
     package_root, _ = _write_example_distribution(tmp_path)
     source_path = package_root / "worker.py"
