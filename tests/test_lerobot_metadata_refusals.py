@@ -2,14 +2,25 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from urllib.request import Request
 
-import hflow.importers.lerobot as prep
 import pytest
+
+import hflow.importers.lerobot as prep
 
 _REPO = "fake/repo"
 _SHA = "abcdef1234567890"
+
+
+def _exactly(message: str) -> str:
+    """A ``match=`` pattern pinning the whole message, metacharacters and all.
+
+    #405 asks for these to be byte-identical, and several contain a ``.``
+    (``meta/info.json``), which unescaped would also match ``meta/infoXjson``.
+    """
+    return rf"^{re.escape(message)}$"
 
 
 class _Response:
@@ -51,7 +62,9 @@ def test_import_refuses_repository_without_lerobot_v3_info(
     monkeypatch.setattr(prep, "_hf_tree", lambda _repo, _revision, _path: [])
     output_dir = tmp_path / "out"
 
-    with pytest.raises(RuntimeError, match=r"^meta/info.json not found; not a LeRobot v3 repository$"):
+    with pytest.raises(
+        RuntimeError, match=_exactly("meta/info.json not found; not a LeRobot v3 repository")
+    ):
         _import(output_dir)
 
     _assert_no_dataset_output(output_dir)
@@ -69,7 +82,7 @@ def test_import_refuses_info_json_that_is_not_an_object(
     monkeypatch.setattr(prep.urllib.request, "urlopen", lambda *_args, **_kwargs: _Response(b"[]"))
     output_dir = tmp_path / "out"
 
-    with pytest.raises(ValueError, match=r"^LeRobot meta/info.json is not a JSON object$"):
+    with pytest.raises(ValueError, match=_exactly("LeRobot meta/info.json is not a JSON object")):
         _import(output_dir)
 
     _assert_no_dataset_output(output_dir)
@@ -100,7 +113,7 @@ def test_import_refuses_empty_path_templates(
     monkeypatch.setattr(prep, "_fetch_info_json", lambda _repo, _revision, _cache: info)
     output_dir = tmp_path / "out"
 
-    with pytest.raises(ValueError, match=f"^{message}$"):
+    with pytest.raises(ValueError, match=_exactly(message)):
         _import(output_dir)
 
     _assert_no_dataset_output(output_dir)
@@ -123,7 +136,7 @@ def test_import_refuses_repository_without_episode_parquets(
     monkeypatch.setattr(prep, "_hf_tree", lambda _repo, _revision, _path: [])
     output_dir = tmp_path / "out"
 
-    with pytest.raises(RuntimeError, match=r"^no meta/episodes parquet files found$"):
+    with pytest.raises(RuntimeError, match=_exactly("no meta/episodes parquet files found")):
         _import(output_dir)
 
     _assert_no_dataset_output(output_dir)
@@ -138,7 +151,7 @@ def test_import_refuses_tree_response_that_is_not_a_list_of_objects(
 
     with pytest.raises(
         ValueError,
-        match=r"^Hugging Face tree response for 'meta' is not a list of objects$",
+        match=_exactly("Hugging Face tree response for 'meta' is not a list of objects"),
     ):
         _import(output_dir)
 
@@ -151,8 +164,18 @@ def test_import_refuses_repeated_pagination_url(
     _stub_repo_info(monkeypatch)
     initial_url = f"https://huggingface.co/api/datasets/{_REPO}/tree/{_SHA}/meta?recursive=true"
 
+    fetched_urls: list[str] = []
+
     def fake_urlopen(request: Request, **_kwargs: object) -> _Response:
         assert request.full_url == initial_url
+        fetched_urls.append(request.full_url)
+        # Bounded on purpose. Without the visited-URL guard this server would
+        # feed the loop its own URL forever, and the test would hang rather
+        # than fail: CI would report nothing and a human would wait. Dropping
+        # the `next` link after a few passes lets a guard-less loop terminate
+        # and fail on the missing refusal instead.
+        if len(fetched_urls) > 4:
+            return _Response(b"[]")
         return _Response(b"[]", link=f'<{initial_url}>; rel="next"')
 
     monkeypatch.setattr(prep.urllib.request, "urlopen", fake_urlopen)
@@ -161,6 +184,10 @@ def test_import_refuses_repeated_pagination_url(
     with pytest.raises(ValueError, match="repeated an already fetched pagination URL"):
         _import(output_dir)
 
+    # The guard fires on the second pass, before a second fetch: one request
+    # went out, not five. Without this the bound above could be doing the
+    # stopping and the test would still pass.
+    assert fetched_urls == [initial_url]
     _assert_no_dataset_output(output_dir)
 
 
