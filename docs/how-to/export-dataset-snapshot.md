@@ -58,27 +58,32 @@ dataset-snapshot/
 ## Format contract
 
 `format.json` identifies `hflow-dataset-snapshot` format version `1`, names
-each table, records the media mode, and states whether media paths are relative
-to the export directory. The JSON marker is written last and the completed
-directory is activated atomically.
+each table (a name-to-filename map), records the media mode, and states whether
+media paths are relative to the export directory. The JSON marker is written
+last and the completed directory is activated atomically.
 
-Under the same format version `1`, the marker also records delivery integrity
-so a later verifier (not shipped here) can tell whether the published bytes
-are still intact:
+Under the same format version `1`, an additive `integrity` block records
+delivery integrity so a later verifier (not shipped here) can tell whether the
+published bytes are still intact. The original `tables` map is unchanged for
+external readers; receipts live only under `integrity`:
 
 | Field | Meaning |
 | --- | --- |
-| `tables.<name>.path` | Required Parquet file relative to the export root |
-| `tables.<name>.size_bytes` | Size of that file at export time |
-| `tables.<name>.sha256` | Full SHA-256 of that file's bytes |
-| `assets[]` | Same `path` / `size_bytes` / `sha256` for every regular file under `assets/` in copy mode; empty in references mode (remote media are not fetched) |
-| `content_id` | 16-hex digest of the normalized inventory (all table and asset receipts, sorted by path), so a deleted member is visible even when every remaining file still matches |
+| `tables.<name>` | Required Parquet filename (unchanged string map) |
+| `integrity.tables.<name>.path` | Same file relative to the export root |
+| `integrity.tables.<name>.size_bytes` | Size of that file at export time |
+| `integrity.tables.<name>.sha256` | Full SHA-256 of that file's bytes |
+| `integrity.assets[]` | Same `path` / `size_bytes` / `sha256` for every regular file under `assets/` in copy mode; empty in references mode (remote media are not fetched) |
+| `integrity.content_id` | Full SHA-256 of the normalized inventory (all table and asset receipts, sorted by path), so a deleted member is visible even when every remaining file still matches |
+
+Copy mode re-reads each copied asset once after the copy to compute its hash
+(a second full read of media bytes on export).
 
 This is a receipt, not a verify command: export does not re-read the
 destination after transfer, and there is no public `verify_dataset_snapshot`
 API or CLI yet. Older HFlow overwrite checks only `format` and
-`format_version`, so these added keys stay backward compatible without a
-format-version bump.
+`format_version`, and readers that only consume the string `tables` map keep
+working; the `integrity` key is purely additive under format version `1`.
 
 The Parquet tables form one snapshot:
 

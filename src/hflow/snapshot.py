@@ -45,8 +45,6 @@ _REQUIRED_TABLE_FILES: dict[str, str] = {
     "intervals": _INTERVALS_TABLE_FILE_NAME,
 }
 _COPIED_ASSETS_DIRECTORY_NAME = "assets"
-# Whole-inventory digest width matches prepared-manifest episode content_id (#389).
-_INVENTORY_CONTENT_ID_HEX_CHARS = 16
 
 
 class SnapshotMediaMode(StrEnum):
@@ -134,27 +132,31 @@ def _file_integrity_record(relative_path: str, absolute_path: Path) -> dict[str,
 
 
 def _inventory_content_id(entries: list[dict[str, str | int]]) -> str:
-    """Digest of the normalized integrity inventory (catches missing members).
+    """Full SHA-256 of the normalized integrity inventory.
 
     Entries are sorted by ``path`` and serialized with stable separators so the
-    digest depends only on the delivered set, not write order. Width matches
-    LeRobot prepared-manifest ``content_id`` (#389).
+    digest depends only on the delivered set, not write order. This is the
+    delivery's integrity digest (corruption and deliberate set tampering), not
+    an episode identity; the field name ``content_id`` matches prepared-manifest
+    receipts (#389) but the value is full-length like the per-file hashes and
+    Croissant's SHA-256 recommendation.
     """
     normalized = sorted(entries, key=lambda entry: str(entry["path"]))
     payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode()).hexdigest()[:_INVENTORY_CONTENT_ID_HEX_CHARS]
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def _build_snapshot_integrity_marker_fields(
     staging_directory: Path,
 ) -> dict[str, object]:
-    """Integrity fields recorded in ``format.json`` under format version 1.
+    """Additive ``integrity`` block for ``format.json`` under format version 1.
 
     Required Parquet tables and every regular file under ``assets/`` (copy mode)
     get ``path`` / ``size_bytes`` / ``sha256``. ``content_id`` digests that
     normalized inventory so a deleted member is detectable without a verifier
     product yet. References mode leaves ``assets`` empty: remote media are not
-    fetched for hashing.
+    fetched for hashing. Copy mode re-reads each copied asset once after the
+    copy to compute its hash.
     """
     tables: dict[str, dict[str, str | int]] = {}
     for table_name, file_name in _REQUIRED_TABLE_FILES.items():
@@ -177,9 +179,11 @@ def _build_snapshot_integrity_marker_fields(
 
     inventory = [*tables.values(), *assets]
     return {
-        "tables": tables,
-        "assets": assets,
-        "content_id": _inventory_content_id(inventory),
+        "integrity": {
+            "tables": tables,
+            "assets": assets,
+            "content_id": _inventory_content_id(inventory),
+        }
     }
 
 
@@ -663,11 +667,13 @@ def export_dataset_snapshot(
     mode every recorded artifact is materialized below ``assets/`` and the
     media table stores a path relative to the export directory.
 
-    ``format.json`` stays format version ``1`` and records per-file integrity
-    (``path``, ``size_bytes``, ``sha256``) for every required table and every
-    copied asset, plus a ``content_id`` over that normalized inventory. That
-    is a delivery receipt only: this export does not verify the destination
-    after transfer.
+    ``format.json`` stays format version ``1``. The published ``tables`` map
+    remains a name-to-filename contract. An additive ``integrity`` block
+    records per-file ``path`` / ``size_bytes`` / ``sha256`` for every required
+    table and every copied asset, plus a full-length ``content_id`` over that
+    normalized inventory. Copy mode re-reads each copied asset once after the
+    copy to hash it. This is a delivery receipt only: this export does not
+    verify the destination after transfer.
 
     The completed directory appears atomically. Existing destinations are
     refused unless ``overwrite=True`` and ``format.json`` identifies a
@@ -760,6 +766,7 @@ def export_dataset_snapshot(
             "media_uri_base": (
                 "export_directory" if resolved_media_mode is SnapshotMediaMode.COPY else None
             ),
+            "tables": dict(_REQUIRED_TABLE_FILES),
             **_build_snapshot_integrity_marker_fields(staging_directory),
         }
         (staging_directory / _FORMAT_MARKER_FILE_NAME).write_text(
