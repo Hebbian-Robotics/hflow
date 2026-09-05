@@ -69,6 +69,12 @@ ListingOrder = Literal["asc", "desc"]
 
 RuntimeSource = Literal["bundle", "remote"]
 
+# Where an episode timeline's axis came from. Only "recorded" (the catalog's
+# start_ns/end_ns, the file's first and last message log time) puts intervals
+# and camera video on one clock; the other two are reconstructions from the
+# evidence alone, for rows an older hflow wrote without time bounds.
+TimelineAxisSource = Literal["recorded", "intervals", "duration_measurement"]
+
 # How a stage sub-DAG run was attributed to a master run. "heuristic" is the
 # only honest answer available: Airflow stores no parent-run link, so the
 # attribution is by time window alone (see _graph._matched_stage_run).
@@ -337,6 +343,12 @@ class EpisodeTimelineResponse(BaseModel):
     start_ns: int | None
     end_ns: int | None
     duration_s: float | None
+    axis_source: TimelineAxisSource | None = Field(
+        description="What produced the axis: 'recorded' (the episode's cataloged first "
+        "and last message time, the only axis shared with camera video), 'intervals' "
+        "(reconstructed from the latest run's spans), 'duration_measurement' "
+        "(zero-based from a duration-naming measurement), or null when unknown."
+    )
     intervals: list[TimelineInterval]
     measurements: list[TimelineMeasurement]
 

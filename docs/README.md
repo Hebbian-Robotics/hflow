@@ -68,6 +68,7 @@ Use these when you already know the outcome you need.
 - [Find and reprocess stale episodes](./CATALOG.md#finding-stale-episodes-to-reprocess)
 - [Load a large manifest with memory mapping](./how-to/load-manifest-mmap.md)
 - [Inspect episodes in Foxglove](./how-to/inspect-episodes-in-foxglove.md)
+- [Publish browser-playable camera video](./how-to/publish-camera-video.md)
 - [Add a native-video provider](./PROVIDERS.md)
 - [Develop from Windows with WSL2](./how-to/wsl2.md)
 

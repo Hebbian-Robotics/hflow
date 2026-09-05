@@ -28,7 +28,7 @@ from urllib.parse import quote
 import duckdb
 from pydantic import BaseModel
 
-from hflow.app import ARTIFACT_MEASUREMENT_KEY_PREFIX, MEDIA_CONTACT_SHEET_STEP_NAME
+from hflow.app import ARTIFACT_MEASUREMENT_KEY_PREFIX
 from hflow.curation import open_catalog_connection
 from hflow.workspace import Workspace
 from hflow_server._contract import (
@@ -50,6 +50,7 @@ from hflow_server._contract import (
     NumericColumnStats,
     NumericHistogramBucket,
     SuccessFilterValue,
+    TimelineAxisSource,
     TimelineInterval,
     TimelineMeasurement,
     ValueCount,
@@ -579,15 +580,18 @@ def query_episode_stats(
 def find_media_uri(
     connection: duckdb.DuckDBPyConnection, episode_id: str, artifact_name: str
 ) -> str | None:
-    """The cataloged URI behind one (episode, artifact name), if recorded."""
+    """The cataloged URI behind one (episode, artifact name), if recorded.
+
+    Any step's artifact qualifies: the ``artifact/`` key prefix is reserved
+    for URIs the framework itself published (``hflow.app``), so a user
+    enrichment's mask or the ``camera_video`` MP4 is as servable as the
+    built-in contact sheet. ``measurements_latest`` holds one row per
+    (episode, key), so two steps cannot both own one name.
+    """
     row = connection.execute(
         "SELECT value_text FROM measurements_latest "
-        "WHERE episode_id = ? AND check_name = ? AND key = ? AND value_text IS NOT NULL",
-        [
-            episode_id,
-            MEDIA_CONTACT_SHEET_STEP_NAME,
-            ARTIFACT_MEASUREMENT_KEY_PREFIX + artifact_name,
-        ],
+        "WHERE episode_id = ? AND key = ? AND value_text IS NOT NULL",
+        [episode_id, ARTIFACT_MEASUREMENT_KEY_PREFIX + artifact_name],
     ).fetchone()
     return str(row[0]) if row is not None and row[0] is not None else None
 
@@ -699,11 +703,13 @@ def query_episode_dossier(
         )
     )
 
+    # Every step's published artifacts, not only the built-in contact sheet:
+    # see find_media_uri for why the key prefix alone is the qualifier.
     media_rows = connection.execute(
         "SELECT key, value_text FROM measurements_latest "
-        "WHERE episode_id = ? AND check_name = ? AND key LIKE ? AND value_text IS NOT NULL "
+        "WHERE episode_id = ? AND key LIKE ? AND value_text IS NOT NULL "
         "ORDER BY key",
-        [episode_id, MEDIA_CONTACT_SHEET_STEP_NAME, ARTIFACT_MEASUREMENT_KEY_PREFIX + "%"],
+        [episode_id, ARTIFACT_MEASUREMENT_KEY_PREFIX + "%"],
     ).fetchall()
     quoted_episode_id = quote(episode_id, safe="")
     media: list[EpisodeMediaArtifact] = []
@@ -855,16 +861,44 @@ def _relative_seconds(absolute_ns: int | None, span_start_ns: int | None) -> flo
     return (absolute_ns - span_start_ns) / NANOSECONDS_PER_SECOND
 
 
+def _recorded_time_bounds(
+    connection: duckdb.DuckDBPyConnection, episode_id: str
+) -> tuple[int, int] | None:
+    """The episode's cataloged ``start_ns``/``end_ns``, or ``None``.
+
+    A catalog written entirely by an older hflow has no such columns at all
+    (the views are ``SELECT *`` over its Parquet files), so their presence is
+    checked before they are named; a row that has the columns but NULL in
+    them (an episode file without statistics) reads the same as no columns.
+    """
+    column_names = {
+        str(row[0]) for row in connection.execute("DESCRIBE episodes_latest").fetchall()
+    }
+    if not {"start_ns", "end_ns"} <= column_names:
+        return None
+    row = connection.execute(
+        "SELECT start_ns, end_ns FROM episodes_latest WHERE episode_id = ?", [episode_id]
+    ).fetchone()
+    if row is None or row[0] is None or row[1] is None:
+        return None
+    return int(row[0]), int(row[1])
+
+
 def query_episode_timeline(
     connection: duckdb.DuckDBPyConnection, episode_id: str
 ) -> EpisodeTimelineResponse | None:
     """One episode's time axis, computed server-side (``None`` when unknown).
 
-    The span comes from the latest run's intervals, extended by any duration
-    measurement that claims a longer episode; an episode with no intervals but
-    a duration measurement gets a zero-based axis; an episode with neither
-    gets nulls, and a client says the span is unknown rather than drawing a
-    fabricated axis.
+    The axis is the episode's recorded time bounds when the catalog holds them
+    (``episodes.start_ns``/``end_ns``, the first and last message log time),
+    widened only if an interval falls outside them. A row an older hflow
+    wrote has no bounds, so the span then falls back to the latest run's
+    intervals, extended by any duration measurement that claims a longer
+    episode; an episode with no intervals but a duration measurement gets a
+    zero-based axis; an episode with neither gets nulls, and a client says
+    the span is unknown rather than drawing a fabricated axis.
+    ``axis_source`` names which of those produced the axis, because only the
+    recorded one places video frames and intervals on a shared clock.
     """
     if (
         connection.execute(
@@ -873,6 +907,7 @@ def query_episode_timeline(
         is None
     ):
         return None
+    recorded_bounds = _recorded_time_bounds(connection, episode_id)
 
     interval_rows = query_latest_run_intervals(connection, episode_id)
     measurement_rows = connection.execute(
@@ -900,13 +935,23 @@ def query_episode_timeline(
 
     start_ns: int | None = None
     end_ns: int | None = None
-    if interval_starts:
+    axis_source: TimelineAxisSource | None = None
+    if recorded_bounds is not None:
+        recorded_start_ns, recorded_end_ns = recorded_bounds
+        # The file's own clock wins; an interval outside it (a check stamping
+        # past the last message) still has to land on the axis, so widen.
+        start_ns = min([recorded_start_ns, *interval_starts])
+        end_ns = max([recorded_end_ns, *interval_ends])
+        axis_source = "recorded"
+    elif interval_starts:
         start_ns = min(interval_starts)
         end_ns = max([*interval_ends, start_ns])
         if longest_claimed_duration_ns is not None:
             end_ns = max(end_ns, start_ns + int(longest_claimed_duration_ns))
+        axis_source = "intervals"
     elif longest_claimed_duration_ns is not None:
         start_ns, end_ns = 0, int(longest_claimed_duration_ns)
+        axis_source = "duration_measurement"
 
     duration_s = (
         (end_ns - start_ns) / NANOSECONDS_PER_SECOND
@@ -917,6 +962,7 @@ def query_episode_timeline(
         start_ns=start_ns,
         end_ns=end_ns,
         duration_s=duration_s,
+        axis_source=axis_source,
         intervals=[
             TimelineInterval(
                 label=row.label,
