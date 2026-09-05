@@ -168,8 +168,7 @@ def test_apply_refuses_duplicate_manifest_fields_before_mutation(tmp_path: Path)
     serialized_manifest = manifest_path.read_text(encoding="utf-8").rstrip("\n")
     assert serialized_manifest.endswith("}")
     duplicated_manifest = (
-        serialized_manifest[:-1]
-        + f',\n  "format": {json.dumps(payload["format"])}\n}}\n'
+        serialized_manifest[:-1] + f',\n  "format": {json.dumps(payload["format"])}\n}}\n'
     ).encode("utf-8")
     assert json.loads(duplicated_manifest)["format"] == payload["format"]
     _write_manifest_bytes(manifest_path, duplicated_manifest)
