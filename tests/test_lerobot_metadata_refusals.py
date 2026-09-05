@@ -5,10 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from urllib.request import Request
 
-import pytest
-
 import hflow.importers.lerobot as prep
-
+import pytest
 
 _REPO = "fake/repo"
 _SHA = "abcdef1234567890"
@@ -53,7 +51,7 @@ def test_import_refuses_repository_without_lerobot_v3_info(
     monkeypatch.setattr(prep, "_hf_tree", lambda _repo, _revision, _path: [])
     output_dir = tmp_path / "out"
 
-    with pytest.raises(RuntimeError, match="^meta/info.json not found; not a LeRobot v3 repository$"):
+    with pytest.raises(RuntimeError, match=r"^meta/info.json not found; not a LeRobot v3 repository$"):
         _import(output_dir)
 
     _assert_no_dataset_output(output_dir)
@@ -71,7 +69,7 @@ def test_import_refuses_info_json_that_is_not_an_object(
     monkeypatch.setattr(prep.urllib.request, "urlopen", lambda *_args, **_kwargs: _Response(b"[]"))
     output_dir = tmp_path / "out"
 
-    with pytest.raises(ValueError, match="^LeRobot meta/info.json is not a JSON object$"):
+    with pytest.raises(ValueError, match=r"^LeRobot meta/info.json is not a JSON object$"):
         _import(output_dir)
 
     _assert_no_dataset_output(output_dir)
@@ -125,7 +123,7 @@ def test_import_refuses_repository_without_episode_parquets(
     monkeypatch.setattr(prep, "_hf_tree", lambda _repo, _revision, _path: [])
     output_dir = tmp_path / "out"
 
-    with pytest.raises(RuntimeError, match="^no meta/episodes parquet files found$"):
+    with pytest.raises(RuntimeError, match=r"^no meta/episodes parquet files found$"):
         _import(output_dir)
 
     _assert_no_dataset_output(output_dir)
@@ -140,7 +138,7 @@ def test_import_refuses_tree_response_that_is_not_a_list_of_objects(
 
     with pytest.raises(
         ValueError,
-        match="^Hugging Face tree response for 'meta' is not a list of objects$",
+        match=r"^Hugging Face tree response for 'meta' is not a list of objects$",
     ):
         _import(output_dir)
 
