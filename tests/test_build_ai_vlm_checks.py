@@ -105,12 +105,123 @@ def test_build_ai_check_version_changes_with_hosted_check_version(tmp_path: Path
 
 
 @pytest.mark.parametrize(
-    ("endpoint", "model", "expected_message"),
+    ("kwargs", "expected_message"),
     [
-        ("localhost:8000/v1", "model", "absolute http"),
-        ("http://localhost:8000/v1", " ", "model must not be empty"),
+        (
+            {
+                "endpoint": "localhost:8000/v1",
+                "model": "model",
+            },
+            "absolute http",
+        ),
+        (
+            {
+                "endpoint": "http://localhost:8000/v1",
+                "model": " ",
+            },
+            "model must not be empty",
+        ),
+        (
+            {
+                "endpoint": "http://localhost:8000/v1",
+                "model": " model ",
+            },
+            "model must not have leading or trailing whitespace",
+        ),
+        (
+            {
+                "endpoint": "http://localhost:8000/v1",
+                "model": "model",
+                "response_format": "json",
+            },
+            "response_format must be",
+        ),
+        (
+            {
+                "endpoint": "http://localhost:8000/v1",
+                "model": "model",
+                "api_key_environment_variable": "INVALID-NAME",
+            },
+            "valid environment variable name",
+        ),
+        (
+            {
+                "endpoint": "http://localhost:8000/v1",
+                "model": "model",
+                "max_tokens": "32",
+            },
+            "max_tokens must be an integer",
+        ),
+        (
+            {
+                "endpoint": "http://localhost:8000/v1",
+                "model": "model",
+                "max_tokens": 0,
+            },
+            "max_tokens must be greater than zero",
+        ),
+        (
+            {
+                "endpoint": "http://localhost:8000/v1",
+                "model": "model",
+                "max_retries": "5",
+            },
+            "max_retries must be an integer",
+        ),
+        (
+            {
+                "endpoint": "http://localhost:8000/v1",
+                "model": "model",
+                "max_retries": -1,
+            },
+            "max_retries must not be negative",
+        ),
+        (
+            {
+                "endpoint": "http://localhost:8000/v1",
+                "model": "model",
+                "temperature": float("nan"),
+            },
+            "temperature must be finite",
+        ),
+        (
+            {
+                "endpoint": "http://localhost:8000/v1",
+                "model": "model",
+                "max_tokens": True,
+            },
+            "max_tokens must be an integer",
+        ),
+        (
+            {
+                "endpoint": "http://localhost:8000/v1",
+                "model": "model",
+                "max_retries": True,
+            },
+            "max_retries must be an integer",
+        ),
     ],
 )
+def test_openai_compatible_execution_accepts_valid_configuration() -> None:
+    execution = hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
+        endpoint="http://localhost:8000/v1",
+        model="model",
+        api_key_environment_variable="TEST_MODEL_API_KEY",
+        response_format=hflow.build_ai_vlm_checks.ResponseFormat.JSON_SCHEMA,
+        temperature=0.2,
+        max_tokens=32,
+        max_retries=5,
+    )
+
+    assert execution.endpoint == "http://localhost:8000/v1"
+    assert execution.model == "model"
+    assert execution.api_key_environment_variable == "TEST_MODEL_API_KEY"
+    assert execution.response_format is hflow.build_ai_vlm_checks.ResponseFormat.JSON_SCHEMA
+    assert execution.temperature == 0.2
+    assert execution.max_tokens == 32
+    assert execution.max_retries == 5
+
+
 def test_openai_compatible_execution_refuses_invalid_configuration(
     endpoint: str,
     model: str,
