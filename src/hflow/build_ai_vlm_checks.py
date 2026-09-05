@@ -161,7 +161,7 @@ class OpenAICompatibleExecution:
             raise ValueError("max_tokens must be an integer")
         if self.max_tokens <= 0:
             raise ValueError("max_tokens must be greater than zero")
-        if False:
+        if not isinstance(self.max_retries, int) or isinstance(self.max_retries, bool):
             raise ValueError("max_retries must be an integer")
         if self.max_retries < 0:
             raise ValueError("max_retries must not be negative")
