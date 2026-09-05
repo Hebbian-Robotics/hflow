@@ -110,8 +110,32 @@ robot software that produced it. All values are strings.
 | `embodiment` | Robot/platform identifier |
 | `robot_software_version` | Software running on the robot at record time |
 | *(any user key)* | Additional semantics pass through untouched |
+| `source_dataset` | Repo id of the LeRobot dataset the episode was imported from |
+| `source_revision` | Revision of that dataset at import time (the ref the importer resolved) |
+| `source_episode_index` | Zero-based index of the episode within the source dataset, as a decimal string |
+| `converter_version` | Version stamp of the importer that produced the episode (currently `lerobot-converter-v7`) |
+| `camera_keys` | Camera keys converted to video, as a compact JSON array of strings (e.g. `["observation.image"]`) |
+| `gop_seconds` | Keyframe interval actually used, `%g`-formatted (e.g. `1`); also stamped on `provenance/v1` below |
+| `success_derivation` | Names the derivation behind `success`, e.g. `max(stats/next.success)` — any success frame makes the episode a success; written alongside `success`, and both are absent together when the source declares no outcome feature |
 
-All keys are optional; the record is copied/merged from the source recording. Recorders are encouraged to write it at collection time.
+All keys are optional; the record is copied/merged from the source recording.
+Recorders are encouraged to write it at collection time.
+
+The seven keys after *(any user key)* are written by the LeRobot importer, not
+by a recorder, and they are not free-form user keys. Six of them —
+`source_dataset`, `source_revision`, `source_episode_index`,
+`converter_version`, `camera_keys`, `gop_seconds` — are a contract between the
+importer and its resume path: when an earlier run already published a landing
+file for the same episode, the importer reuses it only while each of these
+still matches the source dataset and this conversion's settings. `gop_seconds`
+is deliberately written to both `episode/v1` and `provenance/v1` — same name,
+same value for an imported episode — so the resume check can compare the
+keyframe interval actually used without opening the transform's record.
+`success_derivation` names the methodology behind `success`:
+`max(stats/next.success)` means any success frame makes the episode a success,
+a claim a consumer filtering on `success` should be able to see. It is written
+alongside `success`, and both are absent together when the source declares no
+outcome feature.
 
 ### `provenance/v1`: what produced this file
 
