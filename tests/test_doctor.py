@@ -27,6 +27,15 @@ ROS2_COMPRESSED_VIDEO_SCHEMA = "\n".join(
         "uint32 nanosec",
     ]
 )
+ANNEX_B_START_CODE = b"\x00\x00\x00\x01"
+KEYFRAME_ACCESS_UNIT = b"".join(
+    ANNEX_B_START_CODE + bytes([nal_type]) + (b"\x80payload" if nal_type == 0x65 else b"payload")
+    for nal_type in (0x09, 0x67, 0x68, 0x65)
+)
+NON_KEYFRAME_ACCESS_UNIT = b"".join(
+    ANNEX_B_START_CODE + bytes([nal_type]) + (b"\x80payload" if nal_type == 0x41 else b"payload")
+    for nal_type in (0x09, 0x41)
+)
 
 
 @pytest.fixture(scope="module")
@@ -129,6 +138,79 @@ def _write_video_message_mcap(path: Path, payload: bytes) -> None:
             channel_id, log_time=10**9, data=message.SerializeToString(), publish_time=10**9
         )
         writer.finish()
+
+
+def _write_video_cadence_mcap(
+    path: Path, *, keyframe_positions: set[int], message_count: int
+) -> None:
+    with path.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        schema_id = writer.register_schema(
+            name="foxglove.CompressedVideo",
+            encoding="protobuf",
+            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
+        )
+        channel_id = writer.register_channel(
+            topic="/cam", message_encoding="protobuf", schema_id=schema_id
+        )
+        for message_index in range(message_count):
+            log_time = message_index * 33_333_333
+            message = CompressedVideo()
+            message.timestamp.FromNanoseconds(log_time)
+            message.frame_id = "cam"
+            message.data = (
+                KEYFRAME_ACCESS_UNIT
+                if message_index in keyframe_positions
+                else NON_KEYFRAME_ACCESS_UNIT
+            )
+            message.format = "h264"
+            writer.add_message(
+                channel_id,
+                log_time=log_time,
+                data=message.SerializeToString(),
+                publish_time=log_time,
+            )
+        writer.add_metadata(
+            "provenance/v1",
+            {"schema_version": "1", "pipeline_version": "test", "gop_seconds": "1"},
+        )
+        writer.finish()
+
+
+def test_doctor_reports_passthrough_keyframes_off_stamped_fixed_gop_grid(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "off_grid_keyframes.mcap"
+    _write_video_cadence_mcap(path, keyframe_positions={0, 7, 8, 90, 91}, message_count=100)
+
+    report = diagnose(path)
+
+    assert not report.conforming
+    cadence_findings = [
+        finding for finding in report.findings if finding.code == "video-keyframe-cadence"
+    ]
+    assert cadence_findings
+    assert all(finding.level is DiagnosticLevel.ERROR for finding in cadence_findings)
+    assert any(
+        "message 7: is_keyframe=True, expected False (gop_frames=30)" in finding.message
+        for finding in cadence_findings
+    )
+    assert any(
+        "message 30: is_keyframe=False, expected True (gop_frames=30)" in finding.message
+        for finding in cadence_findings
+    )
+
+
+def test_doctor_does_not_duplicate_first_message_mid_gop_as_cadence(tmp_path: Path) -> None:
+    path = tmp_path / "starts_mid_gop.mcap"
+    _write_video_cadence_mcap(path, keyframe_positions=set(), message_count=1)
+
+    report = diagnose(path)
+
+    codes = [finding.code for finding in report.findings]
+    assert "video-stream-starts-mid-gop" in codes
+    assert "video-keyframe-cadence" not in codes
 
 
 def test_doctor_reports_a_b_picture_from_slice_headers(tmp_path: Path) -> None:

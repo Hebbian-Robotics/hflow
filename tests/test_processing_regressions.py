@@ -24,7 +24,7 @@ from hflow.doctor import diagnose
 from hflow.format import METADATA_RECORD_EPISODE
 from hflow.reader import TopicInfo
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
-from hflow.transform import SourceNotConforming, write_canonical_episode
+from hflow.transform import SourceNotConforming, TransformConfig, write_canonical_episode
 from hflow.video import estimate_fps_from_log_times
 
 ANNEX_B_START_CODE = b"\x00\x00\x00\x01"
@@ -217,6 +217,103 @@ def test_transform_accepts_independent_interleaved_passthrough_video_channels(
         actual_payloads: dict[str, list[bytes]] = {}
         for _schema, channel, message in reader.iter_messages(log_time_order=True):
             actual_payloads.setdefault(channel.topic, []).append(message.data)
+    assert actual_payloads == expected_payloads
+    report = diagnose(output)
+    assert report.conforming, report.summary()
+
+
+def test_transform_tracks_passthrough_fixed_gop_by_channel_id_when_topics_match(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "same-topic-fixed-gop.mcap"
+    with source.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        schema_id = writer.register_schema(
+            name="foxglove.CompressedVideo",
+            encoding="protobuf",
+            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
+        )
+        channel_ids = [
+            writer.register_channel(topic="/cam", message_encoding="protobuf", schema_id=schema_id)
+            for _ in range(2)
+        ]
+        for channel_index, log_time, access_unit_data in (
+            (0, 0, KEYFRAME_ACCESS_UNIT),
+            (1, 100_000_000, KEYFRAME_ACCESS_UNIT),
+            (0, 500_000_000, NON_KEYFRAME_ACCESS_UNIT),
+            (1, 600_000_000, NON_KEYFRAME_ACCESS_UNIT),
+            (0, 1_000_000_000, KEYFRAME_ACCESS_UNIT),
+            (1, 1_100_000_000, KEYFRAME_ACCESS_UNIT),
+        ):
+            message = CompressedVideo()
+            message.timestamp.FromNanoseconds(log_time)
+            message.frame_id = f"cam-{channel_index}"
+            message.data = access_unit_data
+            message.format = "h264"
+            writer.add_message(
+                channel_ids[channel_index],
+                log_time=log_time,
+                data=message.SerializeToString(),
+                publish_time=log_time,
+            )
+        writer.finish()
+    output = tmp_path / "out.mcap"
+
+    write_canonical_episode(source, output, TransformConfig(gop_seconds=1.0))
+
+    report = diagnose(output)
+    assert report.conforming, report.summary()
+
+
+def test_transform_rejects_passthrough_video_off_fixed_gop_grid(tmp_path: Path) -> None:
+    source = tmp_path / "off-grid-keyframes.mcap"
+    keyframe_positions = {0, 7, 8, 90, 91}
+    _write_passthrough_video_source(
+        source,
+        [
+            (
+                "/cam",
+                message_index * 33_333_333,
+                KEYFRAME_ACCESS_UNIT
+                if message_index in keyframe_positions
+                else NON_KEYFRAME_ACCESS_UNIT,
+            )
+            for message_index in range(100)
+        ],
+    )
+
+    with pytest.raises(
+        SourceNotConforming,
+        match=r"/cam.*message 7: is_keyframe=True, expected False \(gop_frames=30\)",
+    ):
+        write_canonical_episode(source, tmp_path / "out.mcap", TransformConfig(gop_seconds=1.0))
+
+
+def test_transform_preserves_passthrough_video_on_fixed_gop_grid(tmp_path: Path) -> None:
+    source = tmp_path / "fixed-grid-keyframes.mcap"
+    keyframe_positions = {0, 30, 60, 90}
+    expected_payloads = _write_passthrough_video_source(
+        source,
+        [
+            (
+                "/cam",
+                message_index * 33_333_333,
+                KEYFRAME_ACCESS_UNIT
+                if message_index in keyframe_positions
+                else NON_KEYFRAME_ACCESS_UNIT,
+            )
+            for message_index in range(100)
+        ],
+    )["/cam"]
+    output = tmp_path / "out.mcap"
+
+    write_canonical_episode(source, output, TransformConfig(gop_seconds=1.0))
+
+    with output.open("rb") as stream:
+        actual_payloads = [
+            message.data for _schema, _channel, message in make_reader(stream).iter_messages()
+        ]
     assert actual_payloads == expected_payloads
     report = diagnose(output)
     assert report.conforming, report.summary()

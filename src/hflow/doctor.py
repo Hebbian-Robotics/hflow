@@ -5,7 +5,8 @@ canonical-episode convention, in the spirit of ``mcap doctor``: container
 integrity (CRC-validated read, summary section, chunk indexes, statistics),
 the metadata records and their required stamps, chunk-group layout, per-topic
 time ordering, and every in-band video constraint (h264, one AUD-delimited
-access unit per message, SPS/PPS on keyframes, streams start on a keyframe).
+access unit per message, SPS/PPS on keyframes, no B-frames, streams start on a
+keyframe, fixed GOP against the stamped interval).
 
 Findings, not exceptions: the doctor accumulates everything it can observe
 and reports levels. ``error`` breaks the convention; ``warning`` is legal but
@@ -14,6 +15,7 @@ assignments cannot be distinguished from accidental mixing by reading the
 file alone).
 """
 
+import math
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -100,14 +102,14 @@ def _check_video_payload(
     video_format: str,
     payload: bytes,
     is_first_message: bool,
-) -> None:
+) -> bool | None:
     if video_format != "h264":
         collector.add(
             DiagnosticLevel.ERROR,
             "video-format",
             f"{topic} message {message_index}: format {video_format!r}, convention requires 'h264'",
         )
-        return
+        return None
     try:
         try:
             coding_scan = video_module.scan_picture_coding_types(payload)
@@ -130,7 +132,7 @@ def _check_video_payload(
             "video-invalid-slice-header",
             f"{topic} message {message_index}: {error}",
         )
-        return
+        return None
     if b_picture_count is None:
         # The scan could not classify; no B-frame claim is possible.
         pass
@@ -148,7 +150,7 @@ def _check_video_payload(
             f"{topic} message {message_index}: {picture_count} pictures, "
             "convention requires exactly one decodable frame per message",
         )
-        return
+        return None
     try:
         access_units = video_module.split_annex_b_stream(payload)
     except ValueError as error:
@@ -157,7 +159,7 @@ def _check_video_payload(
             "video-not-aud-delimited",
             f"{topic} message {message_index}: {error}",
         )
-        return
+        return None
     if len(access_units) != 1:
         collector.add(
             DiagnosticLevel.ERROR,
@@ -165,7 +167,7 @@ def _check_video_payload(
             f"{topic} message {message_index}: {len(access_units)} access units, "
             "convention requires exactly one decodable frame per message",
         )
-        return
+        return None
     unit = access_units[0]
     if unit.is_keyframe and not unit.has_parameter_sets:
         collector.add(
@@ -179,6 +181,7 @@ def _check_video_payload(
             "video-stream-starts-mid-gop",
             f"{topic}: first message is not a keyframe; the stream is not decodable from the start",
         )
+    return unit.is_keyframe
 
 
 def _resolve_video_decoder(topic: str, channel: Channel, schema: Schema) -> Callable[[bytes], Any]:
@@ -237,6 +240,15 @@ def diagnose(path: Path | str) -> DoctorReport:
 
         metadata_records = {record.name: dict(record.metadata) for record in reader.iter_metadata()}
         provenance = metadata_records.get(METADATA_RECORD_PROVENANCE)
+        stamped_gop_seconds: float | None = None
+        if provenance is not None and "gop_seconds" in provenance:
+            try:
+                parsed_gop_seconds = float(provenance["gop_seconds"])
+            except ValueError:
+                pass
+            else:
+                if math.isfinite(parsed_gop_seconds) and parsed_gop_seconds > 0:
+                    stamped_gop_seconds = parsed_gop_seconds
 
         group_by_topic = {}
         if provenance:
@@ -351,6 +363,8 @@ def diagnose(path: Path | str) -> DoctorReport:
 
         last_log_time_by_channel: dict[int, int] = {}
         video_message_counts: dict[int, int] = {}
+        video_log_times: dict[int, list[int]] = {}
+        video_keyframes: dict[int, list[bool | None]] = {}
         try:
             video_decoders: dict[int, Callable[[bytes], Any]] = {}
 
@@ -378,7 +392,7 @@ def diagnose(path: Path | str) -> DoctorReport:
                         decoder = _resolve_video_decoder(channel.topic, channel, schema)
                         video_decoders[channel_id] = decoder
                     decoded = decoder(payload)
-                    _check_video_payload(
+                    is_keyframe = _check_video_payload(
                         collector,
                         topics_by_channel_id[channel_id],
                         message_index,
@@ -386,12 +400,48 @@ def diagnose(path: Path | str) -> DoctorReport:
                         bytes(decoded.data),
                         is_first_message=message_index == 0,
                     )
+                    video_log_times.setdefault(channel_id, []).append(log_time)
+                    video_keyframes.setdefault(channel_id, []).append(is_keyframe)
         except Exception as error:
             collector.add(
                 DiagnosticLevel.ERROR,
                 "read-failed",
                 f"reading messages failed (corrupt chunk or bad CRC?): {error}",
             )
+        else:
+            if stamped_gop_seconds is not None:
+                for channel_id in sorted(video_channel_ids):
+                    keyframes = video_keyframes.get(channel_id, [])
+                    if not keyframes or any(is_keyframe is None for is_keyframe in keyframes):
+                        continue
+                    topic = topics_by_channel_id[channel_id]
+                    log_times = video_log_times[channel_id]
+                    if len(log_times) >= 2:
+                        try:
+                            fps = video_module.estimate_fps_from_log_times(log_times, topic=topic)
+                        except ValueError as error:
+                            collector.add(
+                                DiagnosticLevel.ERROR,
+                                "video-keyframe-cadence",
+                                f"{topic} channel {channel_id}: cannot validate fixed GOP cadence: "
+                                f"{error}",
+                            )
+                            continue
+                    else:
+                        fps = 1.0
+                    gop_frames = max(1, round(stamped_gop_seconds * fps))
+                    for message_index, is_keyframe in enumerate(keyframes):
+                        if message_index == 0:
+                            continue
+                        keyframe_expected = message_index % gop_frames == 0
+                        if is_keyframe != keyframe_expected:
+                            collector.add(
+                                DiagnosticLevel.ERROR,
+                                "video-keyframe-cadence",
+                                f"{topic} channel {channel_id} message {message_index}: "
+                                f"is_keyframe={is_keyframe}, expected {keyframe_expected} "
+                                f"(gop_frames={gop_frames})",
+                            )
 
     report.findings = collector.findings
     report.suppressed_counts = collector.suppressed_counts
