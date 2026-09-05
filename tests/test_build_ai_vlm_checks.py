@@ -123,6 +123,18 @@ def test_openai_compatible_execution_refuses_invalid_configuration(
         )
 
 
+def test_openai_compatible_execution_refuses_non_integer_max_retries() -> None:
+    kwargs = {"endpoint": "https://example.com/v1", "model": "model"}
+    # bool is an int subclass, so the isinstance(int) check alone would let
+    # True through; both shapes must raise the same error.
+    for bad in (True, 2.5):
+        with pytest.raises(ValueError, match="max_retries must be an integer"):
+            hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
+                max_retries=bad, **kwargs  # type: ignore[arg-type]
+            )
+    assert hflow.build_ai_vlm_checks.OpenAICompatibleExecution(max_retries=3, **kwargs)
+
+
 def test_hosted_execution_refuses_custom_prompt(tmp_path: Path) -> None:
     application = hflow.App("invalid-hosted-prompt", data_root=tmp_path, default_checks=())
 
