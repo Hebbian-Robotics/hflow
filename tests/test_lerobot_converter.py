@@ -11,8 +11,9 @@ import logging
 import shutil
 import subprocess
 import urllib.request
+from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
-from typing import cast
 
 import pytest
 
@@ -23,6 +24,33 @@ from hflow.storage import LocalStorageRoot, StorageRoot
 
 _DERIVE = prep._derive_numeric_schema
 _ENCODE = prep._encode_cdr_float32_array
+
+
+def _numeric_feature(name: str, dtype: str, shape: list) -> prep._NumericFeature:
+    return prep._NumericFeature(name=name, dtype=dtype, shape=tuple(shape))
+
+
+def _source_archive(
+    dataset_source: prep.DatasetSource,
+    cache_dir: Path,
+    *,
+    info: dict,
+    episodes: Sequence[prep._EpisodeRow] = (),
+    video_keys: Sequence[str] = (),
+) -> prep._SourceArchive:
+    """A source archive whose metadata went through the real info.json parser.
+
+    Building the fakes this way keeps them honest: a test corpus that the
+    parser would refuse cannot reach the conversion code under test.
+    """
+    return prep._SourceArchive(
+        dataset_information=prep._parse_dataset_information(info),
+        episodes=tuple(episodes),
+        video_keys=tuple(video_keys),
+        cache_dir=cache_dir,
+        dataset=dataset_source,
+    )
+
 
 _FFMPEG = shutil.which("ffmpeg")
 _FFPROBE = shutil.which("ffprobe")
@@ -149,24 +177,24 @@ def _build_fake_corpus(tmp_path: Path) -> dict:
 
 
 def test_derive_numeric_schema_float32_vector() -> None:
-    schema = _DERIVE("observation.state", {"dtype": "float32", "shape": [6]})
+    schema = _DERIVE(_numeric_feature("observation.state", "float32", [6]))
     assert schema.name == "observation.state"
     assert schema.dim == 6
 
 
 def test_derive_numeric_schema_rejects_unsupported() -> None:
     with pytest.raises(ValueError, match="unsupported feature"):
-        _DERIVE("action", {"dtype": "float64", "shape": [6]})
+        _DERIVE(_numeric_feature("action", "float64", [6]))
     with pytest.raises(ValueError, match="unsupported feature"):
-        _DERIVE("observation.state", {"dtype": "float32", "shape": [2, 3]})
+        _DERIVE(_numeric_feature("observation.state", "float32", [2, 3]))
     with pytest.raises(ValueError, match="unsupported feature"):
-        _DERIVE("observation.state", {"dtype": "float32", "shape": []})
+        _DERIVE(_numeric_feature("observation.state", "float32", []))
     for shape in ([True], [False]):
         with pytest.raises(
             ValueError,
             match=rf"unsupported feature action: dtype=float32, shape=\[{shape[0]}\]",
         ):
-            _DERIVE("action", {"dtype": "float32", "shape": shape})
+            _DERIVE(_numeric_feature("action", "float32", shape))
 
 
 def test_import_rejects_required_boolean_dimension_without_dataset_output(
@@ -182,24 +210,25 @@ def test_import_rejects_required_boolean_dimension_without_dataset_output(
     monkeypatch.setattr(
         prep,
         "_ensure_source_archive",
-        lambda source, cache_dir: {
-            "info": {
+        lambda source, cache_dir: _source_archive(
+            dataset_source,
+            cache_dir,
+            info={
+                "fps": 30,
+                "data_path": "data/{chunk_index}/{file_index}.parquet",
+                "video_path": "videos/{camera_key}/{chunk_index}/{file_index}.mp4",
                 "features": {
                     prep.DEFAULT_CAMERA_KEY: {
                         "dtype": "video",
                         "shape": [480, 640, 3],
                         "info": {"is_depth_map": False},
-                    }
-                }
+                    },
+                    "action": {"dtype": "float32", "shape": [True]},
+                    "observation.state": {"dtype": "float32", "shape": [6]},
+                },
             },
-            "numeric_features": {
-                "action": {"dtype": "float32", "shape": [True]},
-                "observation.state": {"dtype": "float32", "shape": [6]},
-            },
-            "video_keys": [prep.DEFAULT_CAMERA_KEY],
-            "episodes": [],
-            "dataset": dataset_source,
-        },
+            video_keys=[prep.DEFAULT_CAMERA_KEY],
+        ),
     )
 
     with pytest.raises(
@@ -259,15 +288,15 @@ def test_index_discovery_multi_camera_metadata(
 
     ds = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
     found = prep._ensure_source_archive(ds, tmp_path)
-    assert len(found["episodes"]) == 4
-    assert found["episodes"][0]["length"] == 60
-    assert found["episodes"][1]["length"] == 65
-    assert found["episodes"][0]["data_from"] == 0
-    assert found["episodes"][0]["data_to"] == 60
-    assert set(found["video_keys"]) == {"observation.images.up", "observation.images.side"}
-    assert found["episodes"][0]["video_windows"]["observation.images.up"][
-        "to_timestamp"
-    ] == pytest.approx(2.0)
+    assert len(found.episodes) == 4
+    assert found.episodes[0].length == 60
+    assert found.episodes[1].length == 65
+    assert found.episodes[0].data_from == 0
+    assert found.episodes[0].data_to == 60
+    assert set(found.video_keys) == {"observation.images.up", "observation.images.side"}
+    assert found.episodes[0].video_windows["observation.images.up"].to_timestamp == pytest.approx(
+        2.0
+    )
 
 
 @pytest.mark.parametrize(
@@ -342,15 +371,15 @@ def test_index_discovery_reads_every_metadata_shard(
 
     assert set(downloaded_destinations) == set(shard_paths)
     assert len(set(downloaded_destinations.values())) == len(shard_paths)
-    assert [episode["episode_index"] for episode in found["episodes"]] == [0, 1, 2, 3]
-    assert set(found["video_keys"]) == {"observation.images.up", "observation.images.side"}
-    for episode in found["episodes"]:
-        episode_index = episode["episode_index"]
-        assert episode["length"] == 60 + episode_index * 5
-        for camera_key in found["video_keys"]:
-            window = episode["video_windows"][camera_key]
-            assert window["chunk_index"] == "chunk-000"
-            assert window["to_timestamp"] == pytest.approx(2.0 + episode_index * 0.2)
+    assert [episode.episode_index for episode in found.episodes] == [0, 1, 2, 3]
+    assert set(found.video_keys) == {"observation.images.up", "observation.images.side"}
+    for episode in found.episodes:
+        episode_index = episode.episode_index
+        assert episode.length == 60 + episode_index * 5
+        for camera_key in found.video_keys:
+            window = episode.video_windows[camera_key]
+            assert window.chunk_index == "chunk-000"
+            assert window.to_timestamp == pytest.approx(2.0 + episode_index * 0.2)
 
 
 @pytest.mark.parametrize(
@@ -376,32 +405,31 @@ def test_video_cache_distinguishes_file_indices_and_reuses_same_source(
     camera_key = "observation.images.up"
     dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
 
-    def episode_row(episode_index: int, video_file_index: int) -> dict:
-        return {
-            "episode_index": episode_index,
-            "task": f"task-{episode_index}",
-            "length": 1,
-            "data_chunk": "000",
-            "data_file": "000",
-            "data_from": 0,
-            "data_to": 1,
-            "video_windows": {
-                camera_key: {
-                    "chunk_index": "000",
-                    "file_index": f"{video_file_index:03d}",
-                    "from_timestamp": 0.0,
-                    "to_timestamp": 0.0,
-                }
+    def episode_row(episode_index: int, video_file_index: int) -> prep._EpisodeRow:
+        return prep._EpisodeRow(
+            episode_index=episode_index,
+            task=f"task-{episode_index}",
+            length=1,
+            data_chunk="000",
+            data_file="000",
+            data_from=0,
+            data_to=1,
+            video_windows={
+                camera_key: prep._VideoWindow(
+                    chunk_index="000",
+                    file_index=f"{video_file_index:03d}",
+                    from_timestamp=0.0,
+                    to_timestamp=0.0,
+                )
             },
-        }
+        )
 
-    source_archive = cast(
-        prep._SourceArchive,
-        {
-            **corpus,
-            "episodes": [episode_row(0, 0), episode_row(1, 1)],
-            "video_keys": [camera_key],
-        },
+    source_archive = _source_archive(
+        dataset_source,
+        corpus["cache_dir"],
+        info=corpus["info"],
+        episodes=[episode_row(0, 0), episode_row(1, 1)],
+        video_keys=[camera_key],
     )
     numeric_schemas = {
         "observation.state": prep._NumericSchema(name="observation.state", dim=6),
@@ -539,26 +567,28 @@ def test_import_namespaces_source_cache_by_resolved_revision(
         lambda repo, revision: {"sha": resolved_shas[revision], "license": "apache-2.0"},
     )
 
-    def fake_ensure_source_archive(dataset_source: prep.DatasetSource, cache_dir: Path) -> dict:
+    def fake_ensure_source_archive(
+        dataset_source: prep.DatasetSource, cache_dir: Path
+    ) -> prep._SourceArchive:
         cache_dir.mkdir(parents=True, exist_ok=True)
         source_marker = cache_dir / "source-marker.txt"
         if not source_marker.exists():
             source_marker.write_text(dataset_source.revision)
         cache_observations.append((dataset_source.revision, cache_dir, source_marker.read_text()))
-        return {
-            "info": {},
-            "fps": 30,
-            "data_path": "data/{chunk_index}/{file_index}.parquet",
-            "video_path": "videos/{camera_key}/{chunk_index}/{file_index}.mp4",
-            "episodes": [],
-            "video_keys": [prep.DEFAULT_CAMERA_KEY],
-            "numeric_features": {
-                "action": {"dtype": "float32", "shape": [1]},
-                "observation.state": {"dtype": "float32", "shape": [1]},
+        return _source_archive(
+            dataset_source,
+            cache_dir,
+            info={
+                "fps": 30,
+                "data_path": "data/{chunk_index}/{file_index}.parquet",
+                "video_path": "videos/{camera_key}/{chunk_index}/{file_index}.mp4",
+                "features": {
+                    "action": {"dtype": "float32", "shape": [1]},
+                    "observation.state": {"dtype": "float32", "shape": [1]},
+                },
             },
-            "cache_dir": cache_dir,
-            "dataset": dataset_source,
-        }
+            video_keys=[prep.DEFAULT_CAMERA_KEY],
+        )
 
     monkeypatch.setattr(prep, "_ensure_source_archive", fake_ensure_source_archive)
 
@@ -1047,46 +1077,54 @@ def test_info_json_accepts_normal_positive_fps(
 
     dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
     source_archive = prep._ensure_source_archive(dataset_source, tmp_path / "cache")
-    assert source_archive["fps"] == 30
+    assert source_archive.fps == 30
+
+
+def _stub_single_episode_info(camera_metadata: dict | None = None) -> dict:
+    """One RGB camera and the two required numeric features.
+
+    ``camera_metadata`` replaces the camera feature outright, which is how the
+    depth-refusal tests mark the same camera as depth.
+    """
+    return {
+        "robot_type": "pusht",
+        "fps": 30,
+        "data_path": "data/{chunk_index}/{file_index}.parquet",
+        "video_path": "videos/{camera_key}/{chunk_index}/{file_index}.mp4",
+        "features": {
+            prep.DEFAULT_CAMERA_KEY: camera_metadata
+            or {
+                "dtype": "video",
+                "shape": [480, 640, 3],
+                "info": {"is_depth_map": False},
+            },
+            "action": {"dtype": "float32", "shape": [1]},
+            "observation.state": {"dtype": "float32", "shape": [1]},
+        },
+    }
 
 
 def _stub_single_episode_source_archive(
     dataset_source: prep.DatasetSource, cache_dir: Path
-) -> dict:
+) -> prep._SourceArchive:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return {
-        "info": {
-            "robot_type": "pusht",
-            "features": {
-                prep.DEFAULT_CAMERA_KEY: {
-                    "dtype": "video",
-                    "shape": [480, 640, 3],
-                    "info": {"is_depth_map": False},
-                }
-            },
-        },
-        "fps": 30,
-        "data_path": "data/{chunk_index}/{file_index}.parquet",
-        "video_path": "videos/{camera_key}/{chunk_index}/{file_index}.mp4",
-        "episodes": [
-            {
-                "episode_index": 0,
-                "task": "push",
-                "length": 1,
-                "data_chunk": "000",
-                "data_file": "000",
-                "data_from": 0,
-                "data_to": 1,
-            }
+    return _source_archive(
+        dataset_source,
+        cache_dir,
+        info=_stub_single_episode_info(),
+        episodes=[
+            prep._EpisodeRow(
+                episode_index=0,
+                task="push",
+                length=1,
+                data_chunk="000",
+                data_file="000",
+                data_from=0,
+                data_to=1,
+            )
         ],
-        "video_keys": [prep.DEFAULT_CAMERA_KEY],
-        "numeric_features": {
-            "action": {"dtype": "float32", "shape": [1]},
-            "observation.state": {"dtype": "float32", "shape": [1]},
-        },
-        "cache_dir": cache_dir,
-        "dataset": dataset_source,
-    }
+        video_keys=[prep.DEFAULT_CAMERA_KEY],
+    )
 
 
 def _install_publish_through_convert(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[str]:
@@ -1143,16 +1181,18 @@ def test_import_refuses_a_depth_video_before_publishing_dataset_output(
 ) -> None:
     output_dir = tmp_path / "out"
 
-    def ensure_depth_archive(dataset_source: prep.DatasetSource, cache_dir: Path) -> dict:
+    def ensure_depth_archive(
+        dataset_source: prep.DatasetSource, cache_dir: Path
+    ) -> prep._SourceArchive:
         archive = _stub_single_episode_source_archive(dataset_source, cache_dir)
-        archive["info"]["features"] = {
-            prep.DEFAULT_CAMERA_KEY: {
-                "dtype": "video",
-                "shape": [24, 32, 1],
-                **depth_metadata,
-            }
-        }
-        return archive
+        return replace(
+            archive,
+            dataset_information=prep._parse_dataset_information(
+                _stub_single_episode_info(
+                    {"dtype": "video", "shape": [24, 32, 1], **depth_metadata}
+                )
+            ),
+        )
 
     monkeypatch.setattr(
         prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
@@ -1235,31 +1275,30 @@ def test_converter_version_reaches_the_canonical_episode_provenance(
     corpus = _build_fake_corpus(tmp_path)
     camera_key = "observation.images.up"
     dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
-    source_archive = cast(
-        prep._SourceArchive,
-        {
-            **corpus,
-            "episodes": [
-                {
-                    "episode_index": 0,
-                    "task": "pick-and-place",
-                    "length": 1,
-                    "data_chunk": "000",
-                    "data_file": "000",
-                    "data_from": 0,
-                    "data_to": 1,
-                    "video_windows": {
-                        camera_key: {
-                            "chunk_index": "000",
-                            "file_index": "000",
-                            "from_timestamp": 0.0,
-                            "to_timestamp": 0.0,
-                        }
-                    },
-                }
-            ],
-            "video_keys": [camera_key],
-        },
+    source_archive = _source_archive(
+        dataset_source,
+        corpus["cache_dir"],
+        info=corpus["info"],
+        episodes=[
+            prep._EpisodeRow(
+                episode_index=0,
+                task="pick-and-place",
+                length=1,
+                data_chunk="000",
+                data_file="000",
+                data_from=0,
+                data_to=1,
+                video_windows={
+                    camera_key: prep._VideoWindow(
+                        chunk_index="000",
+                        file_index="000",
+                        from_timestamp=0.0,
+                        to_timestamp=0.0,
+                    )
+                },
+            )
+        ],
+        video_keys=[camera_key],
     )
     numeric_schemas = {
         "observation.state": prep._NumericSchema(name="observation.state", dim=6),
@@ -1425,17 +1464,17 @@ def test_import_skips_bucket_manifest_when_an_episode_publish_fails(
     data_root, remote_dir = bucket_over_tmp
     assert isinstance(data_root, BucketStorageRoot)
 
-    def ensure_two_episodes(dataset_source: prep.DatasetSource, cache_dir: Path) -> dict:
+    def ensure_two_episodes(
+        dataset_source: prep.DatasetSource, cache_dir: Path
+    ) -> prep._SourceArchive:
         archive = _stub_single_episode_source_archive(dataset_source, cache_dir)
-        archive["episodes"] = [
-            archive["episodes"][0],
-            {
-                **archive["episodes"][0],
-                "episode_index": 1,
-                "task": "second",
-            },
-        ]
-        return archive
+        return replace(
+            archive,
+            episodes=(
+                archive.episodes[0],
+                replace(archive.episodes[0], episode_index=1, task="second"),
+            ),
+        )
 
     convert_calls = 0
 
@@ -1680,17 +1719,17 @@ def test_reuse_refuses_an_empty_landing_episode(tmp_path: Path) -> None:
     )
 
 
-def _ensure_two_episode_archive(dataset_source: prep.DatasetSource, cache_dir: Path) -> dict:
+def _ensure_two_episode_archive(
+    dataset_source: prep.DatasetSource, cache_dir: Path
+) -> prep._SourceArchive:
     archive = _stub_single_episode_source_archive(dataset_source, cache_dir)
-    archive["episodes"] = [
-        archive["episodes"][0],
-        {
-            **archive["episodes"][0],
-            "episode_index": 1,
-            "task": "second",
-        },
-    ]
-    return archive
+    return replace(
+        archive,
+        episodes=(
+            archive.episodes[0],
+            replace(archive.episodes[0], episode_index=1, task="second"),
+        ),
+    )
 
 
 def test_import_resumes_after_mid_batch_failure_without_rewriting_completed_episode(
