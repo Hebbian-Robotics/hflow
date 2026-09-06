@@ -135,11 +135,16 @@ def _inventory_content_id(entries: list[dict[str, str | int]]) -> str:
     """Full SHA-256 of the normalized integrity inventory.
 
     Entries are sorted by ``path`` and serialized with stable separators so the
-    digest depends only on the delivered set, not write order. This is the
-    delivery's integrity digest (corruption and deliberate set tampering), not
-    an episode identity; the field name ``content_id`` matches prepared-manifest
-    receipts (#389) but the value is full-length like the per-file hashes and
-    Croissant's SHA-256 recommendation.
+    digest depends only on the delivered set, not write order. It catches
+    corruption and accidental loss: a truncated table, a partial transfer, a
+    member that never arrived. It is not a tamper defence, because it travels
+    unsigned inside the same ``format.json`` it describes, so anyone who edits
+    a table can recompute it.
+
+    This is a delivery receipt, not an episode identity. The field name
+    ``content_id`` matches prepared-manifest receipts (#389) but the value is
+    full-length like the per-file hashes and Croissant's SHA-256
+    recommendation.
     """
     normalized = sorted(entries, key=lambda entry: str(entry["path"]))
     payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"))

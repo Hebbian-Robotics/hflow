@@ -85,6 +85,11 @@ API or CLI yet. Older HFlow overwrite checks only `format` and
 `format_version`, and readers that only consume the string `tables` map keep
 working; the `integrity` key is purely additive under format version `1`.
 
+The receipt travels unsigned inside the `format.json` it describes, so it
+catches corruption and accidental loss, not tampering: anyone who can edit a
+table can recompute the hashes to match. Use a signature or an out-of-band
+checksum if you need to detect a deliberate change.
+
 The Parquet tables form one snapshot:
 
 | File | Grain and purpose |

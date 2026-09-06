@@ -1,4 +1,5 @@
 import json
+import shutil
 from pathlib import Path
 
 import duckdb
@@ -729,7 +730,7 @@ def test_dataset_snapshot_marker_integrity_detects_post_export_mutations(
     tags_copy = tmp_path / "tags-deleted"
     samples_copy = tmp_path / "samples-truncated"
     for destination in (media_copy, tags_copy, samples_copy):
-        snapshot_module.shutil.copytree(output_directory, destination)
+        shutil.copytree(output_directory, destination)
 
     # Replacing copied media bytes leaves tables readable but mismatches the receipt.
     media_receipt = original_integrity["assets"][0]
