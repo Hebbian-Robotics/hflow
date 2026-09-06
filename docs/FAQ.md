@@ -13,8 +13,8 @@ verifying the quality of robotics data before it trains a model. It runs
 quality checks, transformations, and enrichments as pipelines over multimodal
 recordings, records provenance and evidence for every episode, and makes
 corpus metadata queryable without loading the underlying recordings. The
-checks include Hebbian Robotics' hosted models for questions about egocentric
-footage, which the SDK calls through one API.
+checks include Hebbian Robotics' hosted checks for questions about the footage
+itself, which the SDK calls through one API.
 
 Teams can start with the built-in quality checks, write new processing steps, or
 adapt code they already use. Quality control is a common starting point, while the
@@ -71,8 +71,8 @@ built-in check run where you run them. The hosted checks are the exception and
 are opt-in. When you register one with `HFlowHostedExecution`, the SDK sends
 the sampled JPEG frames that check needs to `https://api.hflow.dev` and records
 the answers in your catalog alongside every other check. No API key is needed.
-The service pins its prompt, model, and settings per hosted check version and
-admits one request at a time per client.
+Each hosted check version is frozen, so results stay comparable over time, and
+the service admits one request at a time per client.
 
 ## What does a run produce?
 

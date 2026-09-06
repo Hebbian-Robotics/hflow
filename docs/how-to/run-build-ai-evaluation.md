@@ -127,8 +127,8 @@ The two checks are contracts, not a particular model: one egocentric frame in,
 a hand count of 0, 1, or 2 or a yes/no on active manipulation out, recorded as
 the same catalog evidence either way. `OpenAICompatibleExecution` answers with
 Build AI's published prompts through a model you name. `HFlowHostedExecution`
-answers with HFlow's hosted implementation, which pins its own prompt, model,
-and settings per version and is not required to match Build AI's. Every result
+answers with HFlow's hosted implementation, whose implementation is pinned per
+version and is not required to match Build AI's. Every result
 names what answered it in `requested_model`.
 
 The same checks are available directly in any pipeline. Execution is selected

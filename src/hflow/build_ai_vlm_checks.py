@@ -12,10 +12,10 @@ implement the contract and are chosen per registered check:
   name and the ``build_ai_`` check names record that this is where the
   contract and the reference prompts come from.
 - :class:`HFlowHostedExecution` runs HFlow's hosted checks: fixed, versioned
-  services that answer the same contract. Their prompt, model, and generation
-  settings belong to the service and are pinned per hosted check version;
-  they are not required to match Build AI's, and a version may diverge from
-  the published methodology while keeping the input and output shapes.
+  services that answer the same contract. Their implementation belongs to the
+  service and is pinned per hosted check version; it is not required to match
+  Build AI's, and a version may diverge from the published methodology while
+  keeping the input and output shapes.
 
 Every result records which execution answered it in the ``requested_model``
 measurement (the model name, or ``hflow-hosted/<check>@<version>``), and the
@@ -231,9 +231,9 @@ class OpenAICompatibleExecution:
 class HFlowHostedExecution:
     """Answer a check with HFlow's hosted service, a fixed and versioned implementation.
 
-    The service owns the prompt, the model, and the generation settings for
-    each hosted check version, so a caller configures only where it is, which
-    version to ask, and how long to wait. It answers the same contract as the
+    The service owns the implementation of each hosted check version, so a
+    caller configures only where it is, which version to ask, and how long to
+    wait. It answers the same contract as the
     Build AI methodology (one frame in, the same answer shape out) but is a
     separate implementation: a hosted version is not required to reproduce
     Build AI's prompts or results.
