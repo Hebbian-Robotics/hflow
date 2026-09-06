@@ -4,16 +4,17 @@ Direct answers about HFlow's purpose, supported formats, infrastructure,
 outputs, scale, and current release status.
 
 **Project status:** pre-v1. These answers reflect the repository on
-August 19, 2026.
+September 6, 2026.
 
 ## What is HFlow?
 
-HFlow by Hebbian Robotics (YC S26) is an open source Python SDK for scalable
-multimodal data pipelines in robotics and physical AI. It makes production-grade
-data tooling and practices, typically developed inside large robotics data teams,
-accessible to anyone. HFlow runs user-owned Python processing code around a
-standard episode format, records provenance and quality evidence, and makes
-corpus metadata queryable without loading the underlying recordings.
+HFlow is the open source Python SDK from Hebbian Robotics (YC S26) for
+verifying the quality of robotics data before it trains a model. It runs
+quality checks, transformations, and enrichments as pipelines over multimodal
+recordings, records provenance and evidence for every episode, and makes
+corpus metadata queryable without loading the underlying recordings. The
+checks include Hebbian Robotics' hosted models for questions about egocentric
+footage, which the SDK calls through one API.
 
 Teams can start with the built-in quality checks, write new processing steps, or
 adapt code they already use. Quality control is a common starting point, while the
@@ -36,13 +37,52 @@ streams become in-band video, non-camera channels retain their original topic,
 schema, encoding, payload bytes, and timestamps, and provenance travels with
 the file.
 
+Recordings that are not MCAP get there in two ways: `hflow import lerobot`
+[imports a LeRobot Dataset v3 repository](./how-to/import-lerobot-v3.md), and
+any other format takes a [small converter](./how-to/write-a-converter.md) you
+write once. Human egocentric capture, UMI-style handheld grippers, robot
+teleoperation, and autonomous policy rollouts all fit the same episode shape.
+
+## What data quality problems does HFlow detect?
+
+The [built-in checks](./how-to/enable-built-in-checks.md) cover the camera and
+timing faults every corpus has: black frames, frozen cameras, camera shake,
+exposure, irregular or missing timestamps, keyframe intervals that make video
+slow to seek, and duplicate recordings by content or media digest. Trajectory
+checks cover joint discontinuities, idle stretches, and motion facts when state
+streams are present.
+
+Two opt-in checks ask questions about the footage itself: whether the wearer's
+hands are in view and whether active manipulation is happening. Each is a
+contract, one frame in and a fixed answer out, answered either by Build AI's
+published prompts through a vision model you name or by Hebbian Robotics'
+hosted implementation. Sampled over an episode, their negative answers become
+`hands_absent` and `no_manipulation` intervals. See
+[the Build AI checks guide](./how-to/run-build-ai-evaluation.md).
+
+Every finding is stored as a measurement, a timestamped observation, or a
+labeled interval on the episode's own time axis, so a viewer can show exactly
+where in the recording each problem occurred.
+
+## What are the hosted checks, and does my data leave my machine?
+
+By default nothing leaves your infrastructure: the SDK, the catalog, and every
+built-in check run where you run them. The hosted checks are the exception and
+are opt-in. When you register one with `HFlowHostedExecution`, the SDK sends
+the sampled JPEG frames that check needs to `https://api.hflow.dev` and records
+the answers in your catalog alongside every other check. No API key is needed.
+The service pins its prompt, model, and settings per hosted check version and
+admits one request at a time per client.
+
 ## What does a run produce?
 
 A complete run can produce:
 
 - a canonical MCAP episode with provenance metadata;
 - quality measurements, timestamped observations, intervals, tags, and quarantine status;
-- enrichment artifacts such as contact sheets;
+- enrichment artifacts such as contact sheets and, with the opt-in
+  [`camera_video` enrichment](./how-to/publish-camera-video.md),
+  browser-playable MP4s aligned to the episode's time axis;
 - append-only Parquet catalog rows; and
 - a version-pinned Parquet manifest selected with DuckDB SQL.
 
