@@ -529,6 +529,8 @@ def _run_metadata_document(configuration: EvaluationConfiguration) -> dict[str, 
         "fingerprint": hflow.fingerprint_contract(result_contract),
         **result_contract,
         "api_key_environment_variable": configuration.api_key_environment_variable,
+        # Waiving API-key presence affects replay setup, not evaluation results.
+        "allow_missing_api_key": configuration.allow_missing_api_key,
         # Execution parallelism changes throughput, not evaluation results.
         "worker_count": configuration.worker_count,
     }
