@@ -16,6 +16,7 @@ rather than a shared ``message_count``.
 """
 
 import hashlib
+import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -986,6 +987,20 @@ def camera_stability(
     separate a shaking camera from a moving subject, which is the entire reason
     this check exists.
     """
+
+    if (
+        isinstance(shake_threshold_dps, bool)
+        or not math.isfinite(shake_threshold_dps)
+        or shake_threshold_dps < 0
+    ):
+        raise ValueError("shake_threshold_dps must be finite and non-negative")
+
+    if (
+        isinstance(unstable_min_duration_s, bool)
+        or not math.isfinite(unstable_min_duration_s)
+        or unstable_min_duration_s < 0
+    ):
+        raise ValueError("unstable_min_duration_s must be finite and non-negative")
 
     selected_cameras = list(cameras) if cameras is not None else episode.cameras
     measurements: dict[str, MeasurementValue] = {}

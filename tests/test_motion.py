@@ -338,6 +338,31 @@ def test_the_check_knobs_raise_the_bar_without_changing_the_rate_measurements(
         )
 
 
+@pytest.mark.parametrize(
+    ("arg_name", "bad_value"),
+    [
+        ("shake_threshold_dps", float("nan")),
+        ("shake_threshold_dps", float("inf")),
+        ("shake_threshold_dps", -1.0),
+        ("shake_threshold_dps", True),
+        ("shake_threshold_dps", False),
+        ("unstable_min_duration_s", float("nan")),
+        ("unstable_min_duration_s", float("inf")),
+        ("unstable_min_duration_s", -0.5),
+        ("unstable_min_duration_s", True),
+        ("unstable_min_duration_s", False),
+    ],
+)
+def test_camera_stability_refuses_invalid_tuning_knobs_early(
+    arg_name: str, bad_value: object
+) -> None:
+    """Invalid knobs must be rejected immediately before any video is decoded."""
+    dummy_episode = object()  # Not even an Episode instance; fails before touching it
+    pattern = rf"^{arg_name} must be finite and non-negative$"
+    with pytest.raises(ValueError, match=pattern):
+        camera_stability(dummy_episode, **{arg_name: bad_value})  # type: ignore[arg-type]
+
+
 # ``luma_frames`` itself is tested in tests/test_ffmpeg.py, beside the other
 # ffmpeg helpers: it needs only numpy, so keeping it here would have skipped it
 # whenever the motion extra is absent.
