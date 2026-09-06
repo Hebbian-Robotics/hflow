@@ -519,6 +519,7 @@ def _run_metadata_document(configuration: EvaluationConfiguration) -> dict[str, 
         "response_format": configuration.response_format.value,
         "temperature": configuration.temperature,
         "max_tokens": configuration.max_tokens,
+        "max_retries": configuration.max_retries,
         "row_limit_per_source": configuration.row_limit_per_source,
         "prompts": prompt_metadata,
     }
@@ -528,8 +529,8 @@ def _run_metadata_document(configuration: EvaluationConfiguration) -> dict[str, 
         "fingerprint": hflow.fingerprint_contract(result_contract),
         **result_contract,
         "api_key_environment_variable": configuration.api_key_environment_variable,
+        # Execution parallelism changes throughput, not evaluation results.
         "worker_count": configuration.worker_count,
-        "max_retries": configuration.max_retries,
     }
 
 

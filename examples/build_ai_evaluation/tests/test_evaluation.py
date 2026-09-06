@@ -29,6 +29,7 @@ from examples.build_ai_evaluation.evaluate import (
     _argument_parser,
     _prepare_output_directory,
     _run_configuration_from_arguments,
+    _run_metadata_document,
     _sample_result,
     _sanitize_base_url,
     iter_evaluation_frames,
@@ -474,6 +475,30 @@ def test_prepare_output_directory_writes_and_resumes_the_same_fingerprint(
     assert second.label == "run-label"
     assert second.model == "vision-model"
     assert second.prompt_sha256s == first.prompt_sha256s
+
+
+def test_run_fingerprint_changes_with_max_retries_but_not_worker_count(tmp_path: Path) -> None:
+    configuration = _evaluation_configuration(tmp_path / "run")
+    original = _run_metadata_document(configuration)
+    retried = _run_metadata_document(
+        replace(configuration, max_retries=configuration.max_retries + 1)
+    )
+    parallel = _run_metadata_document(
+        replace(configuration, worker_count=configuration.worker_count + 1)
+    )
+
+    assert retried["fingerprint"] != original["fingerprint"]
+    assert parallel["fingerprint"] == original["fingerprint"]
+
+
+def test_run_fingerprint_for_unchanged_methodology_is_stable(tmp_path: Path) -> None:
+    configuration = _evaluation_configuration(tmp_path / "run")
+    document = _run_metadata_document(configuration)
+
+    assert (
+        document["fingerprint"]
+        == "6e58a791b9fb05d793fbb10cfbb3f894d6f896691d8285e90fa5fc6e4685aa15"
+    )
 
 
 def test_prepare_output_directory_refuses_a_different_experiment(tmp_path: Path) -> None:
