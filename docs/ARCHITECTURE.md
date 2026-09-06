@@ -232,9 +232,11 @@ natively support video, so the honest unit is the frame. A generic model step ex
 explicitly (`ep.frames(fps=...)`), calls its own client (hosted or self-run vLLM/Ollama), and owns
 its endpoint, credentials, model, prompt, and aggregation policy. The opt-in
 `hflow.build_ai_vlm_checks.register_hand_visibility` and
-`register_active_manipulation` integrations bundle one published methodology
-with a per-check execution choice: either a caller-configured OpenAI-compatible
-model or HFlow's fixed hosted check API. Two helpers survive
+`register_active_manipulation` integrations define each check as a contract (one
+frame in, a fixed answer shape out) with a per-check choice of who answers it:
+Build AI's published prompts through a caller-configured OpenAI-compatible
+model, or HFlow's hosted checks, a separate versioned implementation of the same
+contract that is not required to match Build AI's prompts or results. Two helpers survive
 because they encode non-obvious value: the **contact sheet** (N timestamped frames composited
 into one image; works even on single-image models, cheap on vision tokens) and frame extraction
 itself. Missing or occluded hand positions are a canonical example of this

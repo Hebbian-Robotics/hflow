@@ -1,11 +1,30 @@
-"""Build AI's published single-frame egocentric vision checks.
+"""Two egocentric vision checks, hand visibility and active manipulation.
 
-The prompts, schemas, response parsing, and HFlow evidence adapter live here
-so an episode pipeline and a corpus evaluation can share one methodology.
-Execution is selected per registered check: callers can provide an
-OpenAI-compatible model configuration or use HFlow's fixed hosted check API.
+Each check is a contract, not a particular model: one egocentric frame in,
+one fixed answer out (a hand count of 0, 1, or 2; a yes or no on active
+manipulation), recorded as the same measurements, observations, and, when
+sampled, intervals whichever way the answer was produced. Two executions
+implement the contract and are chosen per registered check:
 
-Original methodology and released evaluation inputs:
+- :class:`OpenAICompatibleExecution` runs Build AI's published methodology:
+  their exact prompts and response schemas (copied below from the evaluation
+  release) through an OpenAI-compatible vision model you name. The module's
+  name and the ``build_ai_`` check names record that this is where the
+  contract and the reference prompts come from.
+- :class:`HFlowHostedExecution` runs HFlow's hosted checks: fixed, versioned
+  services that answer the same contract. Their prompt, model, and generation
+  settings belong to the service and are pinned per hosted check version;
+  they are not required to match Build AI's, and a version may diverge from
+  the published methodology while keeping the input and output shapes.
+
+Results from the two are comparable in shape, not guaranteed to agree in
+value. Every result records which execution answered it: the
+``requested_model`` measurement holds the model name for an OpenAI-compatible
+run and ``hflow-hosted/<check>@<version>`` for a hosted run, and the
+execution's settings enter the check version, so a catalog never mixes the
+two under one version.
+
+Build AI's methodology and released evaluation inputs:
 https://huggingface.co/datasets/builddotai/Egocentric-10K-Evaluation
 https://huggingface.co/datasets/builddotai/Egocentric-100K-Evaluation
 """
@@ -168,7 +187,13 @@ ACTIVE_MANIPULATION_RESPONSE_SCHEMA: dict[str, object] = {
 
 @dataclass(frozen=True)
 class OpenAICompatibleExecution:
-    """Run a Build AI check through one caller-selected model endpoint."""
+    """Answer a check with Build AI's published prompts through a model you name.
+
+    This is the reference methodology: the prompt and response schema are the
+    ones Build AI released, and the model is whatever the OpenAI-compatible
+    endpoint serves. Changing the model changes the answers but not the
+    contract.
+    """
 
     endpoint: str
     model: str
@@ -207,7 +232,16 @@ class OpenAICompatibleExecution:
 
 @dataclass(frozen=True)
 class HFlowHostedExecution:
-    """Run a fixed, versioned Build AI check through HFlow's hosted API."""
+    """Answer a check with HFlow's hosted service, a fixed and versioned implementation.
+
+    The service owns the prompt, the model, and the generation settings for
+    each hosted check version, so a caller configures only where it is, which
+    version to ask, and how long to wait. It answers the same contract as the
+    Build AI methodology (one frame in, the same answer shape out) but is a
+    separate implementation: a hosted version is not required to reproduce
+    Build AI's prompts or results, and the two should be compared, not
+    assumed equal.
+    """
 
     base_url: str = DEFAULT_HFLOW_HOSTED_BASE_URL
     check_version: int = _DEFAULT_HFLOW_HOSTED_CHECK_VERSION
@@ -1082,7 +1116,13 @@ def register_hand_visibility(
     prompt: str = BUILD_AI_HAND_VISIBILITY_PROMPT,
     sampling: FrameSampling | None = None,
 ) -> CheckFunction:
-    """Register Build AI's hand-visibility methodology with one execution strategy.
+    """Register the hand-visibility check with one of its two executions.
+
+    The contract is a count of the wearer's visible hands, 0, 1, or 2, per
+    frame. ``execution`` decides who answers: Build AI's published prompt
+    through a model you name (:class:`OpenAICompatibleExecution`) or HFlow's
+    hosted implementation (:class:`HFlowHostedExecution`); see the module
+    docstring for how the two relate.
 
     ``sampling`` evaluates every frame at its rate over its window and records
     ``hands_absent:<camera>`` intervals (see :class:`FrameSampling`); without
@@ -1114,7 +1154,14 @@ def register_active_manipulation(
     prompt: str = BUILD_AI_ACTIVE_MANIPULATION_PROMPT,
     sampling: FrameSampling | None = None,
 ) -> CheckFunction:
-    """Register Build AI's active-manipulation methodology with one execution strategy.
+    """Register the active-manipulation check with one of its two executions.
+
+    The contract is a yes or no on whether the wearer is actively manipulating
+    something in the frame. ``execution`` decides who answers: Build AI's
+    published prompt through a model you name
+    (:class:`OpenAICompatibleExecution`) or HFlow's hosted implementation
+    (:class:`HFlowHostedExecution`); see the module docstring for how the two
+    relate.
 
     ``sampling`` evaluates every frame at its rate over its window and records
     ``no_manipulation:<camera>`` intervals (see :class:`FrameSampling`);
