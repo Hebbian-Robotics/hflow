@@ -30,6 +30,8 @@ from urllib.parse import urlsplit
 import httpx2
 
 from hflow._version import __version__
+from hflow._video_measurement_toolchain import measure_video_frame_statistics_for_hflow
+from hflow._video_measurements import FrameStatisticsSettings
 from hflow.episode import Episode
 from hflow.fingerprints import step_version_from_contract
 from hflow.steps import (
@@ -144,6 +146,14 @@ class UnparsedVisionModelOutcome:
 
 VisionModelOutcome = ParsedVisionModelOutcome | UnparsedVisionModelOutcome
 
+
+@dataclass(frozen=True)
+class SkippedBlackFrame:
+    """A sampled frame the camera instrument read as black, so no model was asked."""
+
+
+SampledFrameOutcome = VisionModelOutcome | SkippedBlackFrame
+
 HAND_COUNT_RESPONSE_SCHEMA: dict[str, object] = {
     "type": "object",
     "properties": {"hand_count": {"type": "integer"}},
@@ -242,13 +252,23 @@ class FrameSampling:
     the answer was "no hands" or "not manipulating". ``start_s``/``end_s``
     are seconds from the start of the camera stream, and ``end_s=None`` runs
     to its end. Model calls scale with ``fps`` times the window length.
+
+    ``skip_black_frames`` leaves out frames the camera instrument reads as
+    black (the same definition ``camera_frame_stats`` records as
+    ``black:<camera>`` intervals): a black frame says nothing about hands or
+    work, so asking the model would record an absence that is really a
+    blackout. Skipped frames are observations with ``skipped="black_frame"``
+    and never open or extend an absence interval.
     """
 
     fps: float = 1.0
     start_s: float = 0.0
     end_s: float | None = None
+    skip_black_frames: bool = True
 
     def __post_init__(self) -> None:
+        if not isinstance(self.skip_black_frames, bool):
+            raise ValueError("skip_black_frames must be a bool")
         if isinstance(self.fps, bool) or not math.isfinite(self.fps) or self.fps <= 0:
             raise ValueError("fps must be finite and greater than zero")
         if isinstance(self.start_s, bool) or not math.isfinite(self.start_s) or self.start_s < 0:
@@ -558,7 +578,7 @@ def sampled_model_output_check_result(
     task: EvaluationTask,
     camera_topic: str,
     sample_period_ns: int,
-    frame_outcomes: Sequence[tuple[int, VisionModelOutcome, str]],
+    frame_outcomes: Sequence[tuple[int, SampledFrameOutcome, str | None]],
 ) -> CheckResult:
     """Adapt one model outcome per sampled frame to HFlow's evidence boundary.
 
@@ -569,7 +589,8 @@ def sampled_model_output_check_result(
     log time and closes at the first frame after it that answered otherwise,
     or one sample period after the last frame when the run reaches the end.
     A frame whose answer did not parse ends any open run without opening
-    one, so an unreadable answer is never counted as absence.
+    one, so an unreadable answer is never counted as absence; a frame skipped
+    as black does the same, because a blackout is not evidence about hands.
     """
     measurement_prefix = _task_measurement_prefix(task)
     interval_kind = _absence_interval_kind(task)
@@ -593,9 +614,23 @@ def sampled_model_output_check_result(
             )
             open_run_start_ns = None
 
+    skipped_black_frame_count = 0
     for timestamp_ns, outcome, requested_model in frame_outcomes:
-        requested_models.add(requested_model)
         last_timestamp_ns = timestamp_ns
+        if isinstance(outcome, SkippedBlackFrame):
+            skipped_black_frame_count += 1
+            observations.append(
+                Observation(
+                    observation_id=f"frame:{timestamp_ns}",
+                    timestamp_ns=timestamp_ns,
+                    values={"task": task.value, "valid": False, "skipped": "black_frame"},
+                )
+            )
+            close_run(timestamp_ns)
+            continue
+        if requested_model is None:
+            raise AssertionError("an evaluated frame always names the model that answered it")
+        requested_models.add(requested_model)
         single = model_output_check_result(
             task=task,
             requested_model=requested_model,
@@ -621,13 +656,15 @@ def sampled_model_output_check_result(
         close_run(last_timestamp_ns + sample_period_ns)
 
     sampled_frame_count = len(frame_outcomes)
+    evaluated_frame_count = sampled_frame_count - skipped_black_frame_count
     measurements: dict[str, MeasurementValue] = {
         f"{measurement_prefix}/requested_model": ", ".join(sorted(requested_models)),
         f"{measurement_prefix}/sampled_frame_count": sampled_frame_count,
         f"{measurement_prefix}/unparsed_frame_count": unparsed_frame_count,
+        f"{measurement_prefix}/skipped_black_frame_count": skipped_black_frame_count,
         f"{measurement_prefix}/{interval_kind}_frame_count": absent_frame_count,
         f"{measurement_prefix}/{interval_kind}_frame_pct": (
-            100.0 * absent_frame_count / sampled_frame_count if sampled_frame_count else 0.0
+            100.0 * absent_frame_count / evaluated_frame_count if evaluated_frame_count else 0.0
         ),
         f"{measurement_prefix}/{interval_kind}_total_s": sum(
             (interval.end_ns - interval.start_ns) / NANOSECONDS_PER_SECOND for interval in intervals
@@ -858,6 +895,7 @@ def _check_version(configuration: _RegisteredBuildAICheckConfiguration) -> StepV
             "fps": configuration.sampling.fps,
             "start_s": configuration.sampling.start_s,
             "end_s": configuration.sampling.end_s,
+            "skip_black_frames": configuration.sampling.skip_black_frames,
         }
     match configuration.execution:
         case OpenAICompatibleExecution() as execution:
@@ -894,6 +932,28 @@ def _check_version(configuration: _RegisteredBuildAICheckConfiguration) -> StepV
         case unexpected_execution:
             assert_never(unexpected_execution)
     return step_version_from_contract(contract_name, version_contract)
+
+
+def _black_frame_spans_ns(episode: Episode, camera_topic: str) -> tuple[tuple[int, int], ...]:
+    """Log-time spans the camera instrument reads as black, at its default settings.
+
+    The same instrument and defaults as ``camera_frame_stats``, so a frame this
+    skips is one that check records inside a ``black:<camera>`` interval.
+    """
+    stamps_ns = episode.channel(camera_topic).timestamps
+    if stamps_ns.size == 0:
+        return ()
+    stream_start_ns = int(stamps_ns[0])
+    statistics = measure_video_frame_statistics_for_hflow(
+        episode.video(camera_topic), settings=FrameStatisticsSettings()
+    )
+    return tuple(
+        (
+            stream_start_ns + int(interval.start_seconds * NANOSECONDS_PER_SECOND),
+            stream_start_ns + int(interval.end_seconds * NANOSECONDS_PER_SECOND),
+        )
+        for interval in statistics.black_intervals
+    )
 
 
 def _register_build_ai_check(
@@ -965,20 +1025,24 @@ def _register_build_ai_check(
                 raise ValueError(
                     f"episode has no frames in the sampling window for camera {camera_topic!r}"
                 )
+            black_spans_ns = (
+                _black_frame_spans_ns(episode, camera_topic) if sampling.skip_black_frames else ()
+            )
             # One request at a time: the hosted quota admits a single request
             # per client, and a sequential loop keeps the observation order
             # equal to the frame order.
-            frame_outcomes = [
-                (frame, *evaluate_frame(frame.path.read_bytes())) for frame in sampled_frames
-            ]
+            frame_outcomes: list[tuple[int, SampledFrameOutcome, str | None]] = []
+            for frame in sampled_frames:
+                if any(start <= frame.log_time_ns < end for start, end in black_spans_ns):
+                    frame_outcomes.append((frame.log_time_ns, SkippedBlackFrame(), None))
+                    continue
+                outcome, requested_model = evaluate_frame(frame.path.read_bytes())
+                frame_outcomes.append((frame.log_time_ns, outcome, requested_model))
             return sampled_model_output_check_result(
                 task=configuration.task_definition.task,
                 camera_topic=camera_topic,
                 sample_period_ns=int(NANOSECONDS_PER_SECOND / sampling.fps),
-                frame_outcomes=[
-                    (frame.log_time_ns, outcome, requested_model)
-                    for frame, outcome, requested_model in frame_outcomes
-                ],
+                frame_outcomes=frame_outcomes,
             )
 
         extracted_frames = episode.frames(

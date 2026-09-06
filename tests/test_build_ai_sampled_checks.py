@@ -254,6 +254,57 @@ def test_hosted_retries_are_bounded_and_the_last_status_is_reported(
     assert sleeps == [1.0, 2.0]
 
 
+def test_black_frames_are_skipped_and_never_read_as_absence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A blackout says nothing about hands: the model is not asked about a
+    black frame, the frame is recorded as skipped, and it ends a run of
+    absence instead of extending one."""
+    served = _scripted_hosted_answers(monkeypatch, [0, 0, 2])
+    application = hflow.App("sampled-black", data_root=tmp_path / "data", default_checks=())
+    register_hand_visibility(
+        application, execution=HFlowHostedExecution(), sampling=FrameSampling(fps=1.0)
+    )
+    source = synthesize_episode(
+        tmp_path / "episode.mcap",
+        SyntheticEpisodeSpec(
+            duration_s=4.0,
+            cameras=("head_camera",),
+            image_hz=10.0,
+            # Frames sampled at 0, 1, 2, 3 s: the one at 2 s is black.
+            black_segment=(1.8, 2.6),
+            joint_jump_at_s=None,
+            timestamp_offset_segment=None,
+        ),
+    )
+
+    report = application.test(source, verbose=False)
+
+    run = report.check("build_ai_hand_visibility")
+    assert run.status is hflow.CheckStatus.MEASURED, run.error
+    assert run.result is not None
+    # Three model calls for four frames: the black one was never sent.
+    assert len(served) == 3
+    observations = run.result.observations
+    assert len(observations) == 4
+    assert observations[2].values == {
+        "task": "hand-count",
+        "valid": False,
+        "skipped": "black_frame",
+    }
+    stamps = [observation.timestamp_ns for observation in observations]
+    # 0 hands at 0 s and 1 s, then the black frame closes the run at 2 s.
+    assert run.result.intervals == [
+        hflow.Interval(start_ns=stamps[0], end_ns=stamps[2], label=f"hands_absent:{CAMERA_TOPIC}")
+    ]
+    measurements = run.result.measurements
+    assert measurements["build_ai/hand_count/sampled_frame_count"] == 4
+    assert measurements["build_ai/hand_count/skipped_black_frame_count"] == 1
+    assert measurements["build_ai/hand_count/hands_absent_frame_count"] == 2
+    # Percentages are over the frames the model actually saw.
+    assert measurements["build_ai/hand_count/hands_absent_frame_pct"] == pytest.approx(200 / 3)
+
+
 def test_sampling_is_part_of_the_check_version(tmp_path: Path) -> None:
     versions: list[str] = []
     for sampling in (None, FrameSampling(fps=1.0), FrameSampling(fps=2.0)):

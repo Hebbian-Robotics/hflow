@@ -165,7 +165,11 @@ negative answers into intervals on the log clock: `hands_absent:<camera>` for
 runs of `0` hands, `no_manipulation:<camera>` for runs of `"no"`. Its
 measurements are the sampled frame count, the count and percentage of negative
 frames, the total seconds the intervals cover, and how many answers did not
-parse (an unparsed answer ends a run without opening one). Model calls scale
+parse (an unparsed answer ends a run without opening one). Frames the camera
+instrument reads as black are skipped by default (`skip_black_frames=True`):
+a blackout is not evidence about hands, so the model is not asked, the frame
+is recorded as an observation with `skipped="black_frame"`, and it ends a run
+the same way an unparsed answer does. Model calls scale
 with the frame rate times the window length, and the hosted service admits one
 request at a time per client, so sample at the coarsest rate the question
 allows.
