@@ -480,7 +480,9 @@ def test_check_version_stable_when_every_covered_field_is_identical(tmp_path: Pa
 # together with a deliberate contract change, and say in the PR why every
 # existing Build AI result is being invalidated.
 _GOLDEN_OPENAI_CHECK_VERSION = "build-ai-single-frame-v1-2aed30388241d554"
-_GOLDEN_HOSTED_CHECK_VERSION = "build-ai-single-frame-v1-400d7f82abd83534"
+# Re-minted when HFlowHostedExecution gained max_retries: like the OpenAI
+# branch's max_retries (#404), it decides which frames produce a result at all.
+_GOLDEN_HOSTED_CHECK_VERSION = "build-ai-single-frame-v1-fa8da9fd481bfc4d"
 
 
 def test_check_version_is_pinned_for_a_fixed_openai_configuration(tmp_path: Path) -> None:

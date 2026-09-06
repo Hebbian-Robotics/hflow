@@ -165,6 +165,95 @@ def test_an_unparsed_answer_ends_a_run_without_counting_as_absence(
     assert run.result.observations[1].values["valid"] is False
 
 
+def test_a_transient_hosted_failure_is_retried_within_the_sampled_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One gateway timeout mid-run costs a delay, not the whole check."""
+    import httpx2 as httpx_module
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("hflow.build_ai_vlm_checks.time.sleep", sleeps.append)
+    answers: list[object] = [2, "http-504", 0, 2]
+
+    class _FailingResponse(_StubHostedResponse):
+        def __init__(self, status_code: int) -> None:
+            super().__init__({})
+            self._status_code = status_code
+
+        def raise_for_status(self) -> None:
+            request = httpx_module.Request("POST", "https://api.hflow.dev/v1/checks")
+            response = httpx_module.Response(
+                self._status_code, request=request, headers={"Retry-After": "3"}
+            )
+            raise httpx_module.HTTPStatusError("gateway", request=request, response=response)
+
+    def hosted_response(method: str, url: str, **_request: object) -> _StubHostedResponse:
+        answer = answers.pop(0)
+        if answer == "http-504":
+            return _FailingResponse(504)
+        return _StubHostedResponse(
+            {"outcome": "parsed", "prediction": answer, "raw_response": str(answer)}
+        )
+
+    monkeypatch.setattr(httpx2, "stream", hosted_response)
+    application = hflow.App("sampled-retry", data_root=tmp_path / "data", default_checks=())
+    register_hand_visibility(
+        application, execution=HFlowHostedExecution(), sampling=FrameSampling(fps=1.0)
+    )
+
+    report = application.test(_episode(tmp_path, duration_s=3.0), verbose=False)
+
+    run = report.check("build_ai_hand_visibility")
+    assert run.status is hflow.CheckStatus.MEASURED, run.error
+    assert run.result is not None
+    assert [observation.values["prediction"] for observation in run.result.observations] == [
+        2,
+        0,
+        2,
+    ]
+    # The server's Retry-After was honoured and the failed request was repeated.
+    assert sleeps == [3.0]
+    assert answers == []
+
+
+def test_hosted_retries_are_bounded_and_the_last_status_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx2 as httpx_module
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("hflow.build_ai_vlm_checks.time.sleep", sleeps.append)
+    attempts = 0
+
+    class _AlwaysBusy(_StubHostedResponse):
+        def raise_for_status(self) -> None:
+            request = httpx_module.Request("POST", "https://api.hflow.dev/v1/checks")
+            response = httpx_module.Response(429, request=request)
+            raise httpx_module.HTTPStatusError("busy", request=request, response=response)
+
+    def hosted_response(method: str, url: str, **_request: object) -> _StubHostedResponse:
+        nonlocal attempts
+        attempts += 1
+        return _AlwaysBusy({})
+
+    monkeypatch.setattr(httpx2, "stream", hosted_response)
+    application = hflow.App("sampled-busy", data_root=tmp_path / "data", default_checks=())
+    register_hand_visibility(
+        application,
+        execution=HFlowHostedExecution(max_retries=2),
+        sampling=FrameSampling(fps=1.0),
+    )
+
+    report = application.test(_episode(tmp_path, duration_s=1.0), verbose=False)
+
+    run = report.check("build_ai_hand_visibility")
+    assert run.status is hflow.CheckStatus.ERROR
+    assert run.error is not None and "HTTP 429" in run.error
+    assert attempts == 3
+    # No Retry-After: exponential from one second.
+    assert sleeps == [1.0, 2.0]
+
+
 def test_sampling_is_part_of_the_check_version(tmp_path: Path) -> None:
     versions: list[str] = []
     for sampling in (None, FrameSampling(fps=1.0), FrameSampling(fps=2.0)):

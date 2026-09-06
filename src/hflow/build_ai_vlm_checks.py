@@ -19,6 +19,7 @@ import math
 import os
 import re
 import threading
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -83,6 +84,23 @@ _DEFAULT_HFLOW_HOSTED_CHECK_VERSION = 1
 _MAX_HFLOW_HOSTED_IMAGE_BYTES = 10 * 1024 * 1024
 _MAX_HFLOW_HOSTED_RESPONSE_BYTES = 64 * 1024
 _HFLOW_HOSTED_USER_AGENT = f"hflow/{__version__} (+https://hflow.dev)"
+# Statuses the hosted service answers for a request that may succeed if simply
+# repeated: its own admission control (429) and its upstream's transient
+# failures (502/503/504). Anything else describes the request itself.
+_RETRYABLE_HOSTED_STATUS_CODES = frozenset({429, 502, 503, 504})
+_MAX_HOSTED_RETRY_DELAY_SECONDS = 120.0
+
+
+def _hosted_retry_delay_seconds(retry_after_header: str | None, attempt: int) -> float:
+    """The server's Retry-After when it gave one, else exponential from one second."""
+    if retry_after_header is not None:
+        try:
+            requested_delay = float(retry_after_header)
+        except ValueError:
+            requested_delay = None
+        if requested_delay is not None and math.isfinite(requested_delay) and requested_delay >= 0:
+            return min(requested_delay, _MAX_HOSTED_RETRY_DELAY_SECONDS)
+    return min(float(2**attempt), _MAX_HOSTED_RETRY_DELAY_SECONDS)
 
 
 class EvaluationTask(StrEnum):
@@ -184,9 +202,18 @@ class HFlowHostedExecution:
     base_url: str = DEFAULT_HFLOW_HOSTED_BASE_URL
     check_version: int = _DEFAULT_HFLOW_HOSTED_CHECK_VERSION
     request_timeout_seconds: float = 60.0
+    # Retries for transient failures only (429, 502, 503, 504, transport
+    # errors), each after the server's Retry-After or an exponential delay. A
+    # sampled check makes one request per frame, so one gateway timeout must
+    # not discard the whole run.
+    max_retries: int = 5
 
     def __post_init__(self) -> None:
         _require_absolute_http_url(self.base_url, name="base_url")
+        if not isinstance(self.max_retries, int) or isinstance(self.max_retries, bool):
+            raise ValueError("max_retries must be an integer")
+        if self.max_retries < 0:
+            raise ValueError("max_retries must not be negative")
         parsed_base_url = urlsplit(self.base_url)
         if parsed_base_url.query or parsed_base_url.fragment:
             raise ValueError("base_url must not contain a query string or fragment")
@@ -767,30 +794,42 @@ def _evaluate_image_with_hflow_hosted_service(
     if len(image_bytes) > _MAX_HFLOW_HOSTED_IMAGE_BYTES:
         raise ValueError("HFlow hosted check observation exceeds the 10 MiB image limit")
     endpoint = _hosted_check_endpoint(execution, task)
-    try:
-        with httpx2.stream(
-            "POST",
-            endpoint,
-            headers={
-                "Accept": "application/json",
-                "User-Agent": _HFLOW_HOSTED_USER_AGENT,
-            },
-            files={"observation": _hosted_observation_upload(image_bytes)},
-            timeout=execution.request_timeout_seconds,
-            # An image-bearing API request must never follow a redirect to another origin.
-            follow_redirects=False,
-        ) as response:
-            response.raise_for_status()
-            response_bytes = _read_bounded_hosted_response(response)
-    except httpx2.HTTPStatusError as error:
-        retry_after = error.response.headers.get("Retry-After")
-        retry_after_suffix = f"; retry after {retry_after}" if retry_after else ""
-        raise RuntimeError(
-            f"HFlow hosted check request failed with HTTP "
-            f"{error.response.status_code}{retry_after_suffix}"
-        ) from error
-    except httpx2.RequestError as error:
-        raise RuntimeError(f"HFlow hosted check endpoint is unreachable: {error}") from error
+    response_bytes: bytes | None = None
+    for attempt in range(execution.max_retries + 1):
+        is_last_attempt = attempt == execution.max_retries
+        try:
+            with httpx2.stream(
+                "POST",
+                endpoint,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": _HFLOW_HOSTED_USER_AGENT,
+                },
+                files={"observation": _hosted_observation_upload(image_bytes)},
+                timeout=execution.request_timeout_seconds,
+                # An image-bearing API request must never follow a redirect to another origin.
+                follow_redirects=False,
+            ) as response:
+                response.raise_for_status()
+                response_bytes = _read_bounded_hosted_response(response)
+            break
+        except httpx2.HTTPStatusError as error:
+            retry_after = error.response.headers.get("Retry-After")
+            status_code = error.response.status_code
+            if status_code in _RETRYABLE_HOSTED_STATUS_CODES and not is_last_attempt:
+                time.sleep(_hosted_retry_delay_seconds(retry_after, attempt))
+                continue
+            retry_after_suffix = f"; retry after {retry_after}" if retry_after else ""
+            raise RuntimeError(
+                f"HFlow hosted check request failed with HTTP {status_code}{retry_after_suffix}"
+            ) from error
+        except httpx2.RequestError as error:
+            if not is_last_attempt:
+                time.sleep(_hosted_retry_delay_seconds(None, attempt))
+                continue
+            raise RuntimeError(f"HFlow hosted check endpoint is unreachable: {error}") from error
+    if response_bytes is None:
+        raise AssertionError("the hosted request loop exits by returning or raising")
     try:
         response_text = response_bytes.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -849,6 +888,7 @@ def _check_version(configuration: _RegisteredBuildAICheckConfiguration) -> StepV
                         execution, configuration.task_definition.task
                     ),
                     "request_timeout_seconds": execution.request_timeout_seconds,
+                    "max_retries": execution.max_retries,
                 }
             )
         case unexpected_execution:
