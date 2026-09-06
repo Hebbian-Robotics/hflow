@@ -486,9 +486,13 @@ def test_run_fingerprint_changes_with_max_retries_but_not_worker_count(tmp_path:
     parallel = _run_metadata_document(
         replace(configuration, worker_count=configuration.worker_count + 1)
     )
+    missing_key_policy_changed = _run_metadata_document(
+        replace(configuration, allow_missing_api_key=not configuration.allow_missing_api_key)
+    )
 
     assert retried["fingerprint"] != original["fingerprint"]
     assert parallel["fingerprint"] == original["fingerprint"]
+    assert missing_key_policy_changed["fingerprint"] == original["fingerprint"]
 
 
 def test_run_fingerprint_for_unchanged_methodology_is_stable(tmp_path: Path) -> None:
@@ -603,6 +607,7 @@ def test_run_metadata_document_persists_the_existing_schema(tmp_path: Path) -> N
     assert document == metadata.to_json_dict()
     assert set(document) == {
         "adapter_schema_version",
+        "allow_missing_api_key",
         "api_key_environment_variable",
         "base_url",
         "dataset_repository",
@@ -623,6 +628,7 @@ def test_run_metadata_document_persists_the_existing_schema(tmp_path: Path) -> N
         "temperature",
         "worker_count",
     }
+    assert document["allow_missing_api_key"] is True
     assert document["label"] == "run-label"
     assert document["row_limit_per_source"] is None
     assert document["schema_version"] == 1
