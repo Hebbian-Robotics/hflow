@@ -7,6 +7,7 @@ implementation details or touching the network.
 
 import io
 import json
+import logging
 import shutil
 import subprocess
 import urllib.request
@@ -2124,6 +2125,7 @@ def test_converter_version_bumped_with_the_label_support() -> None:
 
 def test_reuse_refuses_a_landing_episode_with_damaged_payload(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Payload damage that leaves the MCAP structure and metadata intact is
     still damaged work: the reuse path CRC-validates before stamping the
@@ -2150,15 +2152,22 @@ def test_reuse_refuses_a_landing_episode_with_damaged_payload(
 
     flip_chunk_payload_bytes(landing)
 
-    assert (
-        prep._try_reuse_completed_episode(
-            data_root,
-            dataset_source=_MATCHING_SOURCE,
-            episode_index=0,
-            camera_keys=_MATCHING_CAMERA_KEYS,
+    with caplog.at_level(logging.WARNING, logger="hflow.importers.lerobot"):
+        assert (
+            prep._try_reuse_completed_episode(
+                data_root,
+                dataset_source=_MATCHING_SOURCE,
+                episode_index=0,
+                camera_keys=_MATCHING_CAMERA_KEYS,
+            )
+            is None
         )
-        is None
-    )
+    # Silent re-conversion would repair the damage and hide it. The operator
+    # gets told which file failed, so bit rot in a landing tree is visible
+    # rather than absorbed by the next successful import.
+    warning_messages = [record.getMessage() for record in caplog.records]
+    assert any("failed CRC validation" in message for message in warning_messages), warning_messages
+    assert any(str(landing) in message for message in warning_messages), warning_messages
     # The damaged bytes must not be laundered: the damaged file's hash
     # differs from the receipt the intact file earned.
     from reuse_test_helpers import content_id_differs_from_delivery_receipt

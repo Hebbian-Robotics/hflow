@@ -206,7 +206,17 @@ def _episode_identity_matches(
             validated_reader = make_reader(stream, validate_crcs=True)
             for _ in validated_reader.iter_messages(log_time_order=False):
                 pass
-    except (OSError, McapError, ValueError):
+    except (OSError, McapError, ValueError) as error:
+        # Reached only when identity already matched, so this is our own prior
+        # output found damaged, not a stranger's file. Re-conversion repairs it
+        # silently otherwise, which would hide bit rot in a landing tree for as
+        # long as the imports keep succeeding.
+        logger.warning(
+            "re-converting landing episode %s: identity matches but the payload "
+            "failed CRC validation (%s)",
+            local_episode_path,
+            error,
+        )
         return False
     return True
 
