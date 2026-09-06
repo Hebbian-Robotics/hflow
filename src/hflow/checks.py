@@ -987,6 +987,20 @@ def camera_stability(
     this check exists.
     """
 
+    if (
+        isinstance(shake_threshold_dps, bool)
+        or not np.isfinite(shake_threshold_dps)
+        or shake_threshold_dps < 0
+    ):
+        raise ValueError("shake_threshold_dps must be finite and non-negative")
+
+    if (
+        isinstance(unstable_min_duration_s, bool)
+        or not np.isfinite(unstable_min_duration_s)
+        or unstable_min_duration_s < 0
+    ):
+        raise ValueError("unstable_min_duration_s must be finite and non-negative")
+
     selected_cameras = list(cameras) if cameras is not None else episode.cameras
     measurements: dict[str, MeasurementValue] = {}
     intervals: list[Interval] = []

@@ -8,6 +8,7 @@ it proves nothing.
 """
 
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -289,6 +290,74 @@ def test_the_check_reports_stability_with_its_coverage(still_texture: Path, tmp_
     )
     assert result.intervals, "shaky footage must localize somewhere"
     assert result.verdict is None
+
+
+@pytest.fixture(scope="module")
+def stability_episode(still_texture: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """One canonical episode shared by the argument-guard cases.
+
+    The guards refuse before any frame is read, which is the point of the
+    change they cover, so rendering a video per case buys nothing.
+    """
+    from hflow.testing import VideoEpisodeSpec, write_video_episode
+    from hflow.transform import TransformConfig, write_canonical_episode
+
+    tmp_path = tmp_path_factory.mktemp("stability-guards")
+    shaky = _render_camera_path(still_texture, tmp_path / "shaky.mp4", *_shake(24))
+    source = write_video_episode(
+        shaky,
+        tmp_path / "episode.mcap",
+        VideoEpisodeSpec(
+            duration_s=float(_DURATION_S),
+            image_hz=float(_FRAMES_PER_SECOND),
+            image_width=320,
+            image_height=240,
+            camera_name="head_camera",
+        ),
+    )
+    canonical = tmp_path / "episode.canonical.mcap"
+    write_canonical_episode(source, canonical, TransformConfig())
+    return canonical
+
+
+@pytest.mark.parametrize(
+    ("parameter", "call_with"),
+    [
+        (
+            "shake_threshold_dps",
+            lambda episode, value: camera_stability(episode, shake_threshold_dps=value),
+        ),
+        (
+            "unstable_min_duration_s",
+            lambda episode, value: camera_stability(episode, unstable_min_duration_s=value),
+        ),
+    ],
+    ids=["shake_threshold_dps", "unstable_min_duration_s"],
+)
+@pytest.mark.parametrize(
+    "value",
+    [-1.0, float("nan"), float("inf"), True],
+    ids=["negative", "nan", "infinite", "bool"],
+)
+def test_camera_stability_refuses_a_bad_tuning_value(
+    stability_episode: Path,
+    parameter: str,
+    call_with: Callable[[hflow.Episode, float], hflow.CheckResult],
+    value: float,
+) -> None:
+    """Both knobs refuse the same four values, each under its own name.
+
+    ``True`` is in the list because ``bool`` subclasses ``int``: without the
+    guard it would pass as one degree per second, or one second of run.
+
+    Each case passes its argument through a real keyword rather than unpacking
+    a dict, so the call stays type-checked.
+    """
+    with (
+        hflow.Episode(stability_episode) as episode,
+        pytest.raises(ValueError, match=rf"^{parameter} must be finite and non-negative$"),
+    ):
+        call_with(episode, value)
 
 
 def test_the_check_knobs_raise_the_bar_without_changing_the_rate_measurements(
