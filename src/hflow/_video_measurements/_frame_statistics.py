@@ -121,6 +121,7 @@ class VideoFrameStatistics:
     duration_seconds: float
     black_frame_count: int
     black_frame_percent: float
+    black_intervals: tuple[VideoTimeInterval, ...]
     overexposed_frame_count: int
     overexposed_frame_percent: float
     freeze_intervals: tuple[VideoTimeInterval, ...]
@@ -152,6 +153,7 @@ class _AggregatedFrameStatistics:
     duration_seconds: float
     black_frame_count: int
     black_frame_percent: float
+    black_intervals: tuple[VideoTimeInterval, ...]
     overexposed_frame_count: int
     overexposed_frame_percent: float
     freeze_intervals: tuple[VideoTimeInterval, ...]
@@ -242,6 +244,8 @@ class _FrameStatisticsAccumulator:
     last_presentation_time_seconds: float = 0.0
     frame_intervals_seconds: list[float] = field(default_factory=list)
     black_frame_count: int = 0
+    open_black_start_seconds: float | None = None
+    black_intervals: list[VideoTimeInterval] = field(default_factory=list)
     overexposed_frame_count: int = 0
     limited_range_clipped_highlight_count: int = 0
     extended_range_clipped_highlight_count: int = 0
@@ -288,9 +292,9 @@ class _FrameStatisticsAccumulator:
         self.temporal_outlier.add(temporal_outlier)
         self.out_of_legal_range.add(out_of_legal_range)
 
-        self.black_frame_count += int(
-            black_pixel_share >= self.settings.black_frame_minimum_pixel_share_percent
-        )
+        frame_is_black = black_pixel_share >= self.settings.black_frame_minimum_pixel_share_percent
+        self.black_frame_count += int(frame_is_black)
+        self._add_black_run_boundary(frame, frame_index, frame_is_black=frame_is_black)
         self.overexposed_frame_count += int(
             average_luma >= self.settings.overexposed_average_luma_threshold
         )
@@ -308,6 +312,29 @@ class _FrameStatisticsAccumulator:
         )
         self._add_freeze_metadata(frame, frame_index)
         self.decoded_frame_count += 1
+
+    def _add_black_run_boundary(
+        self, frame: _ParsedFrame, frame_index: int, *, frame_is_black: bool
+    ) -> None:
+        """Fold consecutive black frames into closed-open intervals.
+
+        A run opens at the first black frame's presentation time and closes at
+        the presentation time of the first non-black frame after it, which is
+        the same edge the freeze intervals use, so the two kinds of span line
+        up on one clock.
+        """
+        if frame_is_black and self.open_black_start_seconds is None:
+            self.open_black_start_seconds = frame.presentation_time_seconds
+        elif not frame_is_black and self.open_black_start_seconds is not None:
+            self.black_intervals.append(
+                _validated_interval(
+                    self.open_black_start_seconds,
+                    frame.presentation_time_seconds,
+                    kind="black",
+                    context=f"frame {frame_index}",
+                )
+            )
+            self.open_black_start_seconds = None
 
     def _add_freeze_metadata(self, frame: _ParsedFrame, frame_index: int) -> None:
         freeze_start_text = frame.metadata.get(_FREEZE_START_KEY)
@@ -352,6 +379,15 @@ class _FrameStatisticsAccumulator:
                     context="unterminated freeze at end of video",
                 )
             )
+        if self.open_black_start_seconds is not None:
+            self.black_intervals.append(
+                _validated_interval(
+                    self.open_black_start_seconds,
+                    duration_seconds,
+                    kind="black",
+                    context="unterminated black run at end of video",
+                )
+            )
 
         extends_beyond_limited_range = (
             self.minimum_luma.minimum() < LIMITED_RANGE_LUMA_FLOOR
@@ -378,6 +414,7 @@ class _FrameStatisticsAccumulator:
             duration_seconds=duration_seconds,
             black_frame_count=self.black_frame_count,
             black_frame_percent=100.0 * self.black_frame_count / frame_count,
+            black_intervals=tuple(self.black_intervals),
             overexposed_frame_count=self.overexposed_frame_count,
             overexposed_frame_percent=100.0 * self.overexposed_frame_count / frame_count,
             freeze_intervals=tuple(self.freeze_intervals),
@@ -419,8 +456,8 @@ def _parse_finite_float(value_text: str, context: str) -> float:
     return value
 
 
-def _validated_freeze_interval(
-    start_seconds: float, end_seconds: float, *, context: str
+def _validated_interval(
+    start_seconds: float, end_seconds: float, *, kind: str, context: str
 ) -> VideoTimeInterval:
     try:
         return VideoTimeInterval(
@@ -429,8 +466,14 @@ def _validated_freeze_interval(
         )
     except ValueError as error:
         raise FrameStatisticsParseError(
-            f"invalid freeze interval in {context}: {start_seconds} to {end_seconds}"
+            f"invalid {kind} interval in {context}: {start_seconds} to {end_seconds}"
         ) from error
+
+
+def _validated_freeze_interval(
+    start_seconds: float, end_seconds: float, *, context: str
+) -> VideoTimeInterval:
+    return _validated_interval(start_seconds, end_seconds, kind="freeze", context=context)
 
 
 def _required_finite_value(frame: _ParsedFrame, frame_index: int, metadata_key: str) -> float:
@@ -604,6 +647,7 @@ def _attach_provenance(
         duration_seconds=aggregate.duration_seconds,
         black_frame_count=aggregate.black_frame_count,
         black_frame_percent=aggregate.black_frame_percent,
+        black_intervals=aggregate.black_intervals,
         overexposed_frame_count=aggregate.overexposed_frame_count,
         overexposed_frame_percent=aggregate.overexposed_frame_percent,
         freeze_intervals=aggregate.freeze_intervals,

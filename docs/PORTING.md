@@ -86,8 +86,9 @@ def sharpness(ep: hflow.Episode) -> hflow.CheckResult:
 
 For the common camera integrity questions -- blackout, freeze, exposure, frame
 count versus the rate the stream claims -- do not write this one. The packaged
-check already measures every camera in a single decode pass and records freeze
-spans as `freeze:<topic>` intervals, so registering it is the whole job:
+check already measures every camera in a single decode pass and records black
+runs and freeze spans as `black:<topic>` and `freeze:<topic>` intervals, so
+registering it is the whole job:
 
 ```python
 from hflow.checks import camera_frame_stats

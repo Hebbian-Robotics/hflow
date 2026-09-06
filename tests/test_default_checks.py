@@ -66,7 +66,7 @@ def test_a_pipeline_that_registers_nothing_still_records_evidence(
     assert {run.check.name: run.check.version for run in report.checks} == {
         "episode_duration": "1",
         "timestamp_regularity": "1",
-        "camera_frame_stats": "2",
+        "camera_frame_stats": "3",
         "keyframe_interval": "1",
         "content_digest": "1",
         "media_digest": "1",
@@ -669,6 +669,26 @@ def test_camera_frame_stats_emits_exactly_the_documented_measurements(
         # even the bare instrument keys, lives inside the per-topic selection.
         assert run.result.intervals == []
 
+    # The black run the spec injects into camera 0 comes back as one
+    # black:<topic> interval on the log clock; cameras without black frames
+    # contribute no such interval. Edges are frame-quantized, so one frame
+    # period of slack on each side.
+    expected_black_topics = {
+        topic_by_name[name] for name, fixture in camera_pins.items() if fixture["black_frame_pct"]
+    }
+    black_intervals = [
+        interval for interval in run.result.intervals if interval.label.startswith("black:")
+    ]
+    assert {interval.label for interval in black_intervals} == {
+        f"black:{topic}" for topic in expected_black_topics
+    }
+    for interval in black_intervals:
+        topic = interval.label.removeprefix("black:")
+        stream_start_ns = int(Episode(report.canonical_path).channel(topic).timestamps[0])
+        frame_period_s = 1.0 / spec.image_hz
+        assert (interval.start_ns - stream_start_ns) / 1e9 == pytest.approx(0.2, abs=frame_period_s)
+        assert (interval.end_ns - stream_start_ns) / 1e9 == pytest.approx(0.5, abs=frame_period_s)
+
     for name in camera_pins:
         topic = topic_by_name[name]
         minimum = float(run.result.measurements[f"{topic}/luma_avg_min"])
@@ -793,6 +813,7 @@ def test_dispatcher_message_count_and_decoded_frame_count_read_distinct_sources(
         duration_seconds=0.0,
         black_frame_count=0,
         black_frame_percent=0.0,
+        black_intervals=(),
         overexposed_frame_count=0,
         overexposed_frame_percent=0.0,
         freeze_intervals=(),

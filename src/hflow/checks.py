@@ -582,8 +582,9 @@ def camera_frame_stats(
     frame denominator) over each camera's lossless MP4 remux, and compares
     the stored frame count against the rate the stream claims (declared
     ``expected_hz`` when given, else the stream's median delta), and compares
-    messages present with frames decoded. Freeze spans become labeled
-    ``freeze:<topic>`` intervals in log time. Requires a canonical episode
+    messages present with frames decoded. Runs of black frames and freeze
+    spans become labeled ``black:<topic>`` and ``freeze:<topic>`` intervals
+    in log time. Requires a canonical episode
     (``Episode.video`` remuxes in-band H.264 only).
 
     Evidence only, as always: blackout/exposure thresholds (including
@@ -625,16 +626,20 @@ def camera_frame_stats(
         inter = intermediates_by_topic[topic]
         if inter.stamps_ns.size:
             # Instrument times are seconds from the MP4 start, which is the
-            # camera's first message; map freezes back onto the log clock.
+            # camera's first message; map spans back onto the log clock.
             stream_start_ns = int(inter.stamps_ns[0])
-            intervals.extend(
-                Interval(
-                    start_ns=stream_start_ns + int(freeze_interval.start_seconds * 1e9),
-                    end_ns=stream_start_ns + int(freeze_interval.end_seconds * 1e9),
-                    label=f"freeze:{topic}",
+            for label_kind, video_intervals in (
+                ("black", inter.stats.black_intervals),
+                ("freeze", inter.stats.freeze_intervals),
+            ):
+                intervals.extend(
+                    Interval(
+                        start_ns=stream_start_ns + int(video_interval.start_seconds * 1e9),
+                        end_ns=stream_start_ns + int(video_interval.end_seconds * 1e9),
+                        label=f"{label_kind}:{topic}",
+                    )
+                    for video_interval in video_intervals
                 )
-                for freeze_interval in inter.stats.freeze_intervals
-            )
     return CheckResult(measurements=measurements, intervals=intervals)
 
 
@@ -1926,7 +1931,8 @@ def keyframe_interval(episode: Episode, *, cameras: Sequence[str] | None = None)
 _DEFAULT_CHECK_VERSION_BY_FUNCTION: dict[CheckFunction, str] = {
     episode_duration: "1",
     timestamp_regularity: "1",
-    camera_frame_stats: "2",
+    # 3: black-frame runs join the freeze spans as black:<topic> intervals.
+    camera_frame_stats: "3",
     keyframe_interval: "1",
     content_digest: "1",
     media_digest: "1",

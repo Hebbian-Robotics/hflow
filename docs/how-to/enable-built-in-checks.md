@@ -146,7 +146,7 @@ query later rather than pass/fail decisions baked into your corpus.
 | Check | Answers |
 |---|---|
 | `timestamp_regularity` | Are message intervals regular, and are the camera and state streams aligned with each other? |
-| `camera_frame_stats` | Blackout, freeze, exposure, and stored frame count versus the rate the stream claims -- all from one decode pass. |
+| `camera_frame_stats` | Blackout, freeze, exposure, and stored frame count versus the rate the stream claims -- all from one decode pass. Black runs and freezes also land as `black:<topic>` and `freeze:<topic>` intervals. |
 | `joint_discontinuity` | Does any joint move faster than a limit you set? |
 | `idle_fraction` | How much of the episode had nothing moving? |
 | `camera_signal_quality` | Coding range, range-gated exposure, impulse noise, and stillness. Shares the same one ffmpeg decode pass per camera per episode as `camera_frame_stats` -- the instrument's raw output is cached in the workdir, so registering both checks against one episode pays a single decode, not two. |
