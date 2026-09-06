@@ -148,6 +148,28 @@ opt-in rather than part of `DEFAULT_CHECKS`, because both checks perform model
 calls and users may intentionally choose different execution strategies for
 them.
 
+Both checks read one frame (`frame_time_seconds`) by default, which is Build
+AI's single-frame methodology. Pass `sampling=FrameSampling(fps=1.0)` to apply
+the same prompt to every frame at that rate instead:
+
+```python
+hflow.build_ai_vlm_checks.register_hand_visibility(
+    app,
+    execution=hflow.build_ai_vlm_checks.HFlowHostedExecution(),
+    sampling=hflow.build_ai_vlm_checks.FrameSampling(fps=1.0, start_s=0.0, end_s=None),
+)
+```
+
+A sampled check records one observation per frame and folds consecutive
+negative answers into intervals on the log clock: `hands_absent:<camera>` for
+runs of `0` hands, `no_manipulation:<camera>` for runs of `"no"`. Its
+measurements are the sampled frame count, the count and percentage of negative
+frames, the total seconds the intervals cover, and how many answers did not
+parse (an unparsed answer ends a run without opening one). Model calls scale
+with the frame rate times the window length, and the hosted service admits one
+request at a time per client, so sample at the coarsest rate the question
+allows.
+
 ## What this reproduces
 
 The original specification is Build AI's

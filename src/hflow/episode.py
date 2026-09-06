@@ -518,6 +518,13 @@ class Episode:
             return substring_matches[0]
         raise ValueError(f"camera {camera!r} is ambiguous or unknown; camera topics: {cameras}")
 
+    def resolve_camera(self, camera: str | None = None) -> str:
+        """The camera topic ``camera`` names, the way :meth:`video` and
+        :meth:`frames` read it: ``None`` selects the only camera, a full
+        topic matches exactly, and a unique substring matches one topic.
+        Raises ``ValueError`` when the choice is ambiguous or unknown."""
+        return self._resolve_camera(camera)
+
     def video(self, camera: str | None = None) -> Path:
         """Losslessly remux a camera's in-band H.264 into an MP4 file.
 

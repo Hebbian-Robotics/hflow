@@ -19,6 +19,7 @@ import math
 import os
 import re
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -30,7 +31,14 @@ import httpx2
 from hflow._version import __version__
 from hflow.episode import Episode
 from hflow.fingerprints import step_version_from_contract
-from hflow.steps import CheckFunction, CheckResult, MeasurementValue, Observation, StepVersion
+from hflow.steps import (
+    CheckFunction,
+    CheckResult,
+    Interval,
+    MeasurementValue,
+    Observation,
+    StepVersion,
+)
 
 if TYPE_CHECKING:
     from hflow.app import App
@@ -199,14 +207,45 @@ BuildAIExecution = OpenAICompatibleExecution | HFlowHostedExecution
 
 
 @dataclass(frozen=True)
+class FrameSampling:
+    """Evaluate every frame at ``fps`` over a window instead of one frame.
+
+    Build AI's methodology is single-frame; sampling applies it repeatedly so
+    the per-frame answers become per-frame observations plus intervals where
+    the answer was "no hands" or "not manipulating". ``start_s``/``end_s``
+    are seconds from the start of the camera stream, and ``end_s=None`` runs
+    to its end. Model calls scale with ``fps`` times the window length.
+    """
+
+    fps: float = 1.0
+    start_s: float = 0.0
+    end_s: float | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.fps, bool) or not math.isfinite(self.fps) or self.fps <= 0:
+            raise ValueError("fps must be finite and greater than zero")
+        if isinstance(self.start_s, bool) or not math.isfinite(self.start_s) or self.start_s < 0:
+            raise ValueError("start_s must be finite and non-negative")
+        if self.end_s is not None and (
+            isinstance(self.end_s, bool)
+            or not math.isfinite(self.end_s)
+            or self.end_s <= self.start_s
+        ):
+            raise ValueError("end_s must be finite and greater than start_s")
+
+
+@dataclass(frozen=True)
 class _RegisteredBuildAICheckConfiguration:
     execution: BuildAIExecution
     task_definition: TaskDefinition
     published_prompt: str
     camera: str | None
     frame_time_seconds: float
+    sampling: FrameSampling | None = None
 
     def __post_init__(self) -> None:
+        if self.sampling is not None and not isinstance(self.sampling, FrameSampling):
+            raise ValueError("sampling must be a FrameSampling or None")
         if not isinstance(self.execution, OpenAICompatibleExecution | HFlowHostedExecution):
             raise ValueError(
                 "execution must be an OpenAICompatibleExecution or HFlowHostedExecution"
@@ -459,6 +498,120 @@ def model_output_check_result(
     )
 
 
+NANOSECONDS_PER_SECOND = 1_000_000_000
+
+
+def _absence_interval_kind(task: EvaluationTask) -> str:
+    """The interval kind a run of negative answers to ``task`` records."""
+    match task:
+        case EvaluationTask.HAND_COUNT:
+            return "hands_absent"
+        case EvaluationTask.ACTIVE_MANIPULATION:
+            return "no_manipulation"
+        case EvaluationTask.BOTH:
+            raise AssertionError("BOTH is a CLI selection, not an executable task")
+        case unexpected_task:
+            assert_never(unexpected_task)
+
+
+def _prediction_is_absence(task: EvaluationTask, predicted_value: int | str) -> bool:
+    match task:
+        case EvaluationTask.HAND_COUNT:
+            return predicted_value == 0
+        case EvaluationTask.ACTIVE_MANIPULATION:
+            return predicted_value == "no"
+        case EvaluationTask.BOTH:
+            raise AssertionError("BOTH is a CLI selection, not an executable task")
+        case unexpected_task:
+            assert_never(unexpected_task)
+
+
+def sampled_model_output_check_result(
+    *,
+    task: EvaluationTask,
+    camera_topic: str,
+    sample_period_ns: int,
+    frame_outcomes: Sequence[tuple[int, VisionModelOutcome, str]],
+) -> CheckResult:
+    """Adapt one model outcome per sampled frame to HFlow's evidence boundary.
+
+    Every frame becomes one observation shaped like the single-frame check's.
+    Consecutive frames whose parsed answer is the task's negative (``0``
+    hands, ``"no"`` manipulation) fold into ``hands_absent:<camera>`` or
+    ``no_manipulation:<camera>`` intervals: a run opens at its first frame's
+    log time and closes at the first frame after it that answered otherwise,
+    or one sample period after the last frame when the run reaches the end.
+    A frame whose answer did not parse ends any open run without opening
+    one, so an unreadable answer is never counted as absence.
+    """
+    measurement_prefix = _task_measurement_prefix(task)
+    interval_kind = _absence_interval_kind(task)
+    observations: list[Observation] = []
+    intervals: list[Interval] = []
+    requested_models: set[str] = set()
+    open_run_start_ns: int | None = None
+    absent_frame_count = 0
+    unparsed_frame_count = 0
+    last_timestamp_ns: int | None = None
+
+    def close_run(end_ns: int) -> None:
+        nonlocal open_run_start_ns
+        if open_run_start_ns is not None:
+            intervals.append(
+                Interval(
+                    start_ns=open_run_start_ns,
+                    end_ns=end_ns,
+                    label=f"{interval_kind}:{camera_topic}",
+                )
+            )
+            open_run_start_ns = None
+
+    for timestamp_ns, outcome, requested_model in frame_outcomes:
+        requested_models.add(requested_model)
+        last_timestamp_ns = timestamp_ns
+        single = model_output_check_result(
+            task=task,
+            requested_model=requested_model,
+            outcome=outcome,
+            observation_id=f"frame:{timestamp_ns}",
+            timestamp_ns=timestamp_ns,
+        )
+        observations.extend(single.observations)
+        match outcome:
+            case ParsedVisionModelOutcome(predicted_value=predicted_value):
+                if _prediction_is_absence(task, predicted_value):
+                    absent_frame_count += 1
+                    if open_run_start_ns is None:
+                        open_run_start_ns = timestamp_ns
+                else:
+                    close_run(timestamp_ns)
+            case UnparsedVisionModelOutcome():
+                unparsed_frame_count += 1
+                close_run(timestamp_ns)
+            case unexpected_outcome:
+                assert_never(unexpected_outcome)
+    if last_timestamp_ns is not None:
+        close_run(last_timestamp_ns + sample_period_ns)
+
+    sampled_frame_count = len(frame_outcomes)
+    measurements: dict[str, MeasurementValue] = {
+        f"{measurement_prefix}/requested_model": ", ".join(sorted(requested_models)),
+        f"{measurement_prefix}/sampled_frame_count": sampled_frame_count,
+        f"{measurement_prefix}/unparsed_frame_count": unparsed_frame_count,
+        f"{measurement_prefix}/{interval_kind}_frame_count": absent_frame_count,
+        f"{measurement_prefix}/{interval_kind}_frame_pct": (
+            100.0 * absent_frame_count / sampled_frame_count if sampled_frame_count else 0.0
+        ),
+        f"{measurement_prefix}/{interval_kind}_total_s": sum(
+            (interval.end_ns - interval.start_ns) / NANOSECONDS_PER_SECOND for interval in intervals
+        ),
+    }
+    tags = [f"{measurement_prefix}/unparsed"] if unparsed_frame_count else []
+    return CheckResult(
+        measurements=measurements, observations=observations, intervals=intervals, tags=tags
+    )
+
+
 def evaluate_image_with_model(
     *,
     client: Any,
@@ -657,6 +810,16 @@ def _check_version(configuration: _RegisteredBuildAICheckConfiguration) -> StepV
         "camera": configuration.camera,
         "frame_time_seconds": configuration.frame_time_seconds,
     }
+    # Sampling changes which frames produce results, so it is version-worthy;
+    # the single-frame contract keeps its shape so existing versions hold.
+    contract_name = "build-ai-single-frame-v1"
+    if configuration.sampling is not None:
+        contract_name = "build-ai-sampled-frames-v1"
+        version_contract["sampling"] = {
+            "fps": configuration.sampling.fps,
+            "start_s": configuration.sampling.start_s,
+            "end_s": configuration.sampling.end_s,
+        }
     match configuration.execution:
         case OpenAICompatibleExecution() as execution:
             # The contract shape was kept stable during the migration to the
@@ -690,7 +853,7 @@ def _check_version(configuration: _RegisteredBuildAICheckConfiguration) -> StepV
             )
         case unexpected_execution:
             assert_never(unexpected_execution)
-    return step_version_from_contract("build-ai-single-frame-v1", version_contract)
+    return step_version_from_contract(contract_name, version_contract)
 
 
 def _register_build_ai_check(
@@ -726,7 +889,58 @@ def _register_build_ai_check(
             client_for_thread.cache_key = cache_key
         return client_for_thread.client
 
+    def evaluate_frame(image_bytes: bytes) -> tuple[VisionModelOutcome, str]:
+        match configuration.execution:
+            case OpenAICompatibleExecution() as execution:
+                outcome = evaluate_image_with_model(
+                    client=model_client(execution),
+                    model=execution.model,
+                    task_definition=configuration.task_definition,
+                    image_data_url=image_bytes_data_url(image_bytes),
+                    response_format=execution.response_format,
+                    temperature=execution.temperature,
+                    max_tokens=execution.max_tokens,
+                )
+                return outcome, execution.model
+            case HFlowHostedExecution() as execution:
+                outcome = _evaluate_image_with_hflow_hosted_service(
+                    execution=execution,
+                    task=configuration.task_definition.task,
+                    image_bytes=image_bytes,
+                )
+                return outcome, _hosted_execution_label(
+                    execution, configuration.task_definition.task
+                )
+            case unexpected_execution:
+                assert_never(unexpected_execution)
+
     def evaluate_build_ai_check(episode: Episode) -> CheckResult:
+        sampling = configuration.sampling
+        if sampling is not None:
+            camera_topic = episode.resolve_camera(configuration.camera)
+            sampled_frames = episode.frames(
+                camera_topic, fps=sampling.fps, start_s=sampling.start_s, end_s=sampling.end_s
+            )
+            if not sampled_frames:
+                raise ValueError(
+                    f"episode has no frames in the sampling window for camera {camera_topic!r}"
+                )
+            # One request at a time: the hosted quota admits a single request
+            # per client, and a sequential loop keeps the observation order
+            # equal to the frame order.
+            frame_outcomes = [
+                (frame, *evaluate_frame(frame.path.read_bytes())) for frame in sampled_frames
+            ]
+            return sampled_model_output_check_result(
+                task=configuration.task_definition.task,
+                camera_topic=camera_topic,
+                sample_period_ns=int(NANOSECONDS_PER_SECOND / sampling.fps),
+                frame_outcomes=[
+                    (frame.log_time_ns, outcome, requested_model)
+                    for frame, outcome, requested_model in frame_outcomes
+                ],
+            )
+
         extracted_frames = episode.frames(
             configuration.camera,
             fps=1.0,
@@ -739,30 +953,7 @@ def _register_build_ai_check(
                 f"camera {configuration.camera!r}"
             )
         selected_frame = extracted_frames[0]
-        image_bytes = selected_frame.path.read_bytes()
-        match configuration.execution:
-            case OpenAICompatibleExecution() as execution:
-                outcome = evaluate_image_with_model(
-                    client=model_client(execution),
-                    model=execution.model,
-                    task_definition=configuration.task_definition,
-                    image_data_url=image_bytes_data_url(image_bytes),
-                    response_format=execution.response_format,
-                    temperature=execution.temperature,
-                    max_tokens=execution.max_tokens,
-                )
-                requested_model = execution.model
-            case HFlowHostedExecution() as execution:
-                outcome = _evaluate_image_with_hflow_hosted_service(
-                    execution=execution,
-                    task=configuration.task_definition.task,
-                    image_bytes=image_bytes,
-                )
-                requested_model = _hosted_execution_label(
-                    execution, configuration.task_definition.task
-                )
-            case unexpected_execution:
-                assert_never(unexpected_execution)
+        outcome, requested_model = evaluate_frame(selected_frame.path.read_bytes())
         return model_output_check_result(
             task=configuration.task_definition.task,
             requested_model=requested_model,
@@ -785,8 +976,14 @@ def register_hand_visibility(
     camera: str | None = None,
     frame_time_seconds: float = 0.0,
     prompt: str = BUILD_AI_HAND_VISIBILITY_PROMPT,
+    sampling: FrameSampling | None = None,
 ) -> CheckFunction:
-    """Register Build AI's hand-visibility methodology with one execution strategy."""
+    """Register Build AI's hand-visibility methodology with one execution strategy.
+
+    ``sampling`` evaluates every frame at its rate over its window and records
+    ``hands_absent:<camera>`` intervals (see :class:`FrameSampling`); without
+    it the check reads the single frame at ``frame_time_seconds``.
+    """
     return _register_build_ai_check(
         application,
         configuration=_RegisteredBuildAICheckConfiguration(
@@ -799,6 +996,7 @@ def register_hand_visibility(
             published_prompt=BUILD_AI_HAND_VISIBILITY_PROMPT,
             camera=camera,
             frame_time_seconds=frame_time_seconds,
+            sampling=sampling,
         ),
     )
 
@@ -810,8 +1008,14 @@ def register_active_manipulation(
     camera: str | None = None,
     frame_time_seconds: float = 0.0,
     prompt: str = BUILD_AI_ACTIVE_MANIPULATION_PROMPT,
+    sampling: FrameSampling | None = None,
 ) -> CheckFunction:
-    """Register Build AI's active-manipulation methodology with one execution strategy."""
+    """Register Build AI's active-manipulation methodology with one execution strategy.
+
+    ``sampling`` evaluates every frame at its rate over its window and records
+    ``no_manipulation:<camera>`` intervals (see :class:`FrameSampling`);
+    without it the check reads the single frame at ``frame_time_seconds``.
+    """
     return _register_build_ai_check(
         application,
         configuration=_RegisteredBuildAICheckConfiguration(
@@ -824,5 +1028,6 @@ def register_active_manipulation(
             published_prompt=BUILD_AI_ACTIVE_MANIPULATION_PROMPT,
             camera=camera,
             frame_time_seconds=frame_time_seconds,
+            sampling=sampling,
         ),
     )
