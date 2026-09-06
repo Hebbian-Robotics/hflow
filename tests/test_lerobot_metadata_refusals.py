@@ -119,6 +119,43 @@ def test_import_refuses_empty_path_templates(
     _assert_no_dataset_output(output_dir)
 
 
+def test_import_refuses_info_json_without_features_before_listing_episodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal fires at the parse boundary, not after a shard download.
+
+    #433 moved this ahead of episode discovery. Asserting only the message
+    would pass either way, so the point of the test is the second assertion:
+    a corpus with no ``features`` must not cost a listing of ``meta/episodes``.
+    """
+    _stub_repo_info(monkeypatch)
+    monkeypatch.setattr(
+        prep,
+        "_fetch_info_json",
+        lambda _repo, _revision, _cache: {
+            "fps": 30,
+            "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+            "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+        },
+    )
+    listed_paths: list[str] = []
+
+    def recording_hf_tree(_repo: str, _revision: str, path: str) -> list[dict[str, str]]:
+        listed_paths.append(path)
+        return []
+
+    monkeypatch.setattr(prep, "_hf_tree", recording_hf_tree)
+    output_dir = tmp_path / "out"
+
+    with pytest.raises(
+        ValueError, match=_exactly("LeRobot meta/info.json must define a features object")
+    ):
+        _import(output_dir)
+
+    assert listed_paths == []
+    _assert_no_dataset_output(output_dir)
+
+
 def test_import_refuses_repository_without_episode_parquets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

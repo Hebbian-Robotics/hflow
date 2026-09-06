@@ -23,10 +23,10 @@ import struct
 import subprocess
 import tempfile
 import urllib.request
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
-from typing import NotRequired, TypedDict
+from typing import TypedDict
 from urllib.parse import urlsplit
 
 from mcap.reader import make_reader
@@ -71,7 +71,20 @@ EPISODE_START_TIME_NS = 1_755_000_000_000_000_000
 HUGGING_FACE_TOKEN_ENVIRONMENT_VARIABLES = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
 
 
-class _EpisodeRow(TypedDict):
+@dataclass(frozen=True)
+class _VideoWindow:
+    """One camera's slice of a chunk video for one episode."""
+
+    chunk_index: str
+    file_index: str
+    from_timestamp: float
+    to_timestamp: float
+
+
+@dataclass(frozen=True)
+class _EpisodeRow:
+    """One episode as the ``meta/episodes`` shards describe it."""
+
     episode_index: int
     task: str
     length: int
@@ -79,17 +92,11 @@ class _EpisodeRow(TypedDict):
     data_file: str
     data_from: int
     data_to: int
-    video_windows: NotRequired[dict[str, "_VideoWindow"]]
-    # MAX of the episode's collector-labeled next.success frames, present only
-    # when the source declares that outcome feature at all.
-    success_outcome: NotRequired[bool]
-
-
-class _VideoWindow(TypedDict):
-    chunk_index: str
-    file_index: str
-    from_timestamp: float
-    to_timestamp: float
+    video_windows: Mapping[str, _VideoWindow] = field(default_factory=dict)
+    # MAX of the episode's collector-labeled next.success frames. None when
+    # the source declares no such outcome feature, which carries no label
+    # either way and must not be read as a failure.
+    success_outcome: bool | None = None
 
 
 class _PublishedEpisode(TypedDict):
@@ -119,16 +126,65 @@ class _DatasetRepositoryInformation(TypedDict):
     license: str
 
 
-class _SourceArchive(TypedDict):
-    info: dict
+@dataclass(frozen=True)
+class _NumericFeature:
+    """A declared float32 feature, still unchecked for a supported shape.
+
+    Shape validation stays deferred to :func:`_derive_numeric_schema` because
+    only selected features are required to be convertible: a corpus may ship
+    a float32 feature HFlow never reads, and refusing the whole import for it
+    would reject datasets that convert correctly today.
+    """
+
+    name: str
+    dtype: str
+    shape: tuple[object, ...]
+
+    @property
+    def declared_shape(self) -> list[object]:
+        """The shape as the source document spelled it, for error messages."""
+        return list(self.shape)
+
+
+@dataclass(frozen=True)
+class _DatasetInformation:
+    """The supported fields of ``meta/info.json``, validated once.
+
+    The raw document stays on disk in the cache; nothing downstream of the
+    parser reads it, so an unknown upstream field is ignored rather than
+    carried around untyped.
+    """
+
     fps: int | float
     data_path: str
     video_path: str
-    episodes: list[_EpisodeRow]
-    video_keys: list[str]
-    numeric_features: dict[str, dict]
+    robot_type: str
+    video_feature_names: tuple[str, ...]
+    numeric_features: Mapping[str, _NumericFeature]
+    depth_map_feature_names: frozenset[str]
+
+
+@dataclass(frozen=True)
+class _SourceArchive:
+    """The downloaded corpus metadata every conversion step reads."""
+
+    dataset_information: _DatasetInformation
+    episodes: tuple[_EpisodeRow, ...]
+    video_keys: tuple[str, ...]
     cache_dir: Path
     dataset: DatasetSource
+
+    @property
+    def fps(self) -> int | float:
+        return self.dataset_information.fps
+
+    @property
+    def data_path(self) -> str:
+        return self.dataset_information.data_path
+
+    @property
+    def video_path(self) -> str:
+        return self.dataset_information.video_path
 
 
 def _landing_relative_key(episode_index: int) -> str:
@@ -557,18 +613,14 @@ def _episode_metadata_cache_path(
     return episodes_metadata_directory / relative_path
 
 
-def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _SourceArchive:
-    """Download the corpus parquets and video chunks needed for the given episodes."""
-    import duckdb
+def _parse_dataset_information(dataset_information: dict) -> _DatasetInformation:
+    """Turn a raw ``meta/info.json`` document into immutable internal values.
 
-    dataset_base_url = (
-        "https://huggingface.co/datasets/"
-        f"{dataset_source.repo_id}/resolve/{dataset_source.revision}"
-    )
-    metadata_directory = cache_dir / "meta"
-    dataset_information = _fetch_info_json(
-        dataset_source.repo_id, dataset_source.revision, cache_dir
-    )
+    Every supported field is validated here, once, so that nothing after this
+    boundary inspects the external document again. Unknown upstream fields are
+    ignored: LeRobot adds them, and refusing one would fail imports that
+    convert correctly.
+    """
     frames_per_second = dataset_information.get("fps")
     if (
         isinstance(frames_per_second, bool)
@@ -588,6 +640,53 @@ def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _S
     )
     if not isinstance(video_path_template, str) or not video_path_template.strip():
         raise ValueError("LeRobot meta/info.json must define a non-empty video_path template")
+
+    dataset_features = dataset_information.get("features")
+    if not isinstance(dataset_features, dict):
+        raise ValueError("LeRobot meta/info.json must define a features object")
+
+    video_feature_names: list[str] = []
+    numeric_features: dict[str, _NumericFeature] = {}
+    depth_map_feature_names: set[str] = set()
+    for feature_name, feature_specification in dataset_features.items():
+        if not isinstance(feature_specification, dict):
+            continue
+        declared_dtype = feature_specification.get("dtype")
+        if declared_dtype == "video":
+            video_feature_names.append(str(feature_name))
+        if _is_depth_map_feature(feature_specification):
+            depth_map_feature_names.add(str(feature_name))
+        if declared_dtype == "float32":
+            declared_shape = feature_specification.get("shape") or []
+            numeric_features[str(feature_name)] = _NumericFeature(
+                name=str(feature_name),
+                dtype=declared_dtype,
+                shape=tuple(declared_shape) if isinstance(declared_shape, list | tuple) else (),
+            )
+
+    return _DatasetInformation(
+        fps=frames_per_second,
+        data_path=data_path_template,
+        video_path=video_path_template,
+        robot_type=str(dataset_information.get("robot_type") or "unknown"),
+        video_feature_names=tuple(sorted(video_feature_names)),
+        numeric_features=numeric_features,
+        depth_map_feature_names=frozenset(depth_map_feature_names),
+    )
+
+
+def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _SourceArchive:
+    """Download the corpus parquets and video chunks needed for the given episodes."""
+    import duckdb
+
+    dataset_base_url = (
+        "https://huggingface.co/datasets/"
+        f"{dataset_source.repo_id}/resolve/{dataset_source.revision}"
+    )
+    metadata_directory = cache_dir / "meta"
+    parsed_information = _parse_dataset_information(
+        _fetch_info_json(dataset_source.repo_id, dataset_source.revision, cache_dir)
+    )
 
     # Determine the episodes parquet location (v3 uses meta/episodes/*.parquet)
     episodes_metadata_directory = metadata_directory / "episodes"
@@ -651,25 +750,26 @@ def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _S
         for parquet_episode_row in parquet_episode_rows:
             tasks = parquet_episode_row[1]
             task = (str(tasks[0]) if tasks else "") if isinstance(tasks, list) else str(tasks or "")
-            episode_row_value: _EpisodeRow = {
-                "episode_index": int(parquet_episode_row[0]),
-                "task": task,
-                "length": int(parquet_episode_row[2]),
-                "data_chunk": str(parquet_episode_row[3]).split("/")[-1],
-                "data_file": str(parquet_episode_row[4]).split("/")[-1],
-                "data_from": int(parquet_episode_row[5]),
-                "data_to": int(parquet_episode_row[6]),
-            }
+            success_outcome: bool | None = None
             if has_outcome_aggregate:
                 # Episode outcome = MAX over the episode's collector-labeled
                 # next.success frames: any success frame makes the episode a
                 # success. An empty aggregate carries no label either way.
                 outcome_frames = parquet_episode_row[7]
                 if outcome_frames is not None and len(outcome_frames) > 0:
-                    episode_row_value["success_outcome"] = any(
-                        bool(value) for value in outcome_frames
-                    )
-            episode_rows.append(episode_row_value)
+                    success_outcome = any(bool(value) for value in outcome_frames)
+            episode_rows.append(
+                _EpisodeRow(
+                    episode_index=int(parquet_episode_row[0]),
+                    task=task,
+                    length=int(parquet_episode_row[2]),
+                    data_chunk=str(parquet_episode_row[3]).split("/")[-1],
+                    data_file=str(parquet_episode_row[4]).split("/")[-1],
+                    data_from=int(parquet_episode_row[5]),
+                    data_to=int(parquet_episode_row[6]),
+                    success_outcome=success_outcome,
+                )
+            )
 
         # Video window columns: videos/<camera>/{chunk_index,file_index,from_timestamp,to_timestamp}
         flattened_column_names = [
@@ -712,53 +812,39 @@ def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _S
             for camera_key in video_keys:
                 video_chunk_index = video_window_by_column.get(f"vc_{camera_key}")
                 video_file_index = video_window_by_column.get(f"vf_{camera_key}")
-                video_windows_by_episode[episode_index][camera_key] = {
-                    "chunk_index": (
+                video_windows_by_episode[episode_index][camera_key] = _VideoWindow(
+                    chunk_index=(
                         "" if video_chunk_index is None else str(video_chunk_index).split("/")[-1]
                     ),
-                    "file_index": (
+                    file_index=(
                         "" if video_file_index is None else str(video_file_index).split("/")[-1]
                     ),
-                    "from_timestamp": float(
-                        video_window_by_column.get(f"vfrom_{camera_key}") or 0.0
-                    ),
-                    "to_timestamp": float(video_window_by_column.get(f"vto_{camera_key}") or 0.0),
-                }
-        for episode_row in episode_rows:
-            episode_row["video_windows"] = dict(
-                video_windows_by_episode.get(episode_row["episode_index"], {})
+                    from_timestamp=float(video_window_by_column.get(f"vfrom_{camera_key}") or 0.0),
+                    to_timestamp=float(video_window_by_column.get(f"vto_{camera_key}") or 0.0),
+                )
+        episode_rows = [
+            replace(
+                episode_row,
+                video_windows=dict(video_windows_by_episode.get(episode_row.episode_index, {})),
             )
+            for episode_row in episode_rows
+        ]
     finally:
         connection.close()
 
-    dataset_features = dataset_information.get("features")
-    if not isinstance(dataset_features, dict):
-        raise ValueError("LeRobot meta/info.json must define a features object")
-    video_keys_from_schema = sorted(
-        feature_name
-        for feature_name, feature_specification in dataset_features.items()
-        if isinstance(feature_specification, dict) and feature_specification.get("dtype") == "video"
-    )
+    # The parquet columns are the authority on which cameras this corpus
+    # actually stores; the declared video features are the fallback for a
+    # corpus whose episode metadata carries no video window columns.
     if not video_keys:
-        video_keys = video_keys_from_schema
-    numeric_features = {
-        feature_name: feature_specification
-        for feature_name, feature_specification in dataset_features.items()
-        if isinstance(feature_specification, dict)
-        and feature_specification.get("dtype") == "float32"
-    }
+        video_keys = list(parsed_information.video_feature_names)
 
-    return {
-        "info": dataset_information,
-        "fps": frames_per_second,
-        "data_path": data_path_template,
-        "video_path": video_path_template,
-        "episodes": episode_rows,
-        "video_keys": video_keys,
-        "numeric_features": numeric_features,
-        "cache_dir": cache_dir,
-        "dataset": dataset_source,
-    }
+    return _SourceArchive(
+        dataset_information=parsed_information,
+        episodes=tuple(episode_rows),
+        video_keys=tuple(video_keys),
+        cache_dir=cache_dir,
+        dataset=dataset_source,
+    )
 
 
 @dataclass
@@ -800,9 +886,10 @@ def _is_depth_map_feature(feature_specification: object) -> bool:
     )
 
 
-def _derive_numeric_schema(feature_name: str, feature_specification: dict) -> _NumericSchema:
-    declared_dtype = feature_specification.get("dtype")
-    declared_shape = feature_specification.get("shape") or []
+def _derive_numeric_schema(numeric_feature: _NumericFeature) -> _NumericSchema:
+    feature_name = numeric_feature.name
+    declared_dtype = numeric_feature.dtype
+    declared_shape = numeric_feature.declared_shape
     if declared_dtype != "float32":
         raise ValueError(
             f"unsupported feature {feature_name}: "
@@ -902,26 +989,25 @@ def import_lerobot_dataset(
         cache_directory,
     )
 
+    dataset_information = source_archive.dataset_information
     for camera_key in resolved_camera_keys:
-        if camera_key not in source_archive["video_keys"]:
+        if camera_key not in source_archive.video_keys:
             raise ValueError(
                 f"camera key '{camera_key}' not found in dataset. "
-                f"Available: {source_archive['video_keys']}"
+                f"Available: {list(source_archive.video_keys)}"
             )
 
-    dataset_features = source_archive["info"].get("features")
-    if isinstance(dataset_features, dict):
-        for camera_key in resolved_camera_keys:
-            if _is_depth_map_feature(dataset_features.get(camera_key)):
-                raise ValueError(
-                    f"LeRobot feature '{camera_key}' is a depth-map video; HFlow's RGB H.264 "
-                    "conversion cannot preserve depth values"
-                )
+    for camera_key in resolved_camera_keys:
+        if camera_key in dataset_information.depth_map_feature_names:
+            raise ValueError(
+                f"LeRobot feature '{camera_key}' is a depth-map video; HFlow's RGB H.264 "
+                "conversion cannot preserve depth values"
+            )
 
     # Numeric schemas derived from metadata (fail before any conversion)
     numeric_schemas = {
-        feature_name: _derive_numeric_schema(feature_name, feature_specification)
-        for feature_name, feature_specification in source_archive["numeric_features"].items()
+        feature_name: _derive_numeric_schema(numeric_feature)
+        for feature_name, numeric_feature in dataset_information.numeric_features.items()
         if feature_name in ("observation.state", "action")
         or feature_name.startswith("observation.")
     }
@@ -932,7 +1018,7 @@ def import_lerobot_dataset(
             + ", ".join(sorted(missing_required_features))
         )
 
-    episode_rows = source_archive["episodes"]
+    episode_rows = source_archive.episodes
     if episode_index is not None and episode_index >= len(episode_rows):
         raise ValueError(
             f"episode_index {episode_index} is out of range for {len(episode_rows)} episode(s)"
@@ -943,7 +1029,7 @@ def import_lerobot_dataset(
     published_episodes: list[_PublishedEpisode] = []
     episodes_converted = 0
 
-    dataset_source = source_archive["dataset"]
+    dataset_source = source_archive.dataset
     for selected_episode_index in selected_episode_indexes:
         reused_episode = _try_reuse_completed_episode(
             storage,
@@ -967,7 +1053,7 @@ def import_lerobot_dataset(
                 episode_index=selected_episode_index,
                 camera_keys=resolved_camera_keys,
                 numeric_schemas=numeric_schemas,
-                frames_per_second=int(source_archive["fps"]),
+                frames_per_second=int(source_archive.fps),
             )
         )
         episodes_converted += 1
@@ -1012,20 +1098,20 @@ def _convert_single_episode(
     """
     import duckdb
 
-    episode_row = source_archive["episodes"][episode_index]
-    if episode_row["length"] is None or episode_row["length"] < 1:
+    episode_row = source_archive.episodes[episode_index]
+    if episode_row.length is None or episode_row.length < 1:
         raise ValueError(f"episode {episode_index} has no frames")
 
     dataset_base_url = (
         "https://huggingface.co/datasets/"
         f"{dataset_source.repo_id}/resolve/{dataset_source.revision}"
     )
-    cache_directory = source_archive["cache_dir"]
+    cache_directory = source_archive.cache_dir
 
     # Locate the data parquet for this episode
-    data_chunk_index = episode_row["data_chunk"]
-    data_file_index = episode_row["data_file"]
-    data_relative_path = source_archive["data_path"].format(
+    data_chunk_index = episode_row.data_chunk
+    data_file_index = episode_row.data_file
+    data_relative_path = source_archive.data_path.format(
         chunk_index=int(data_chunk_index), file_index=int(data_file_index)
     )
     local_data_path = (
@@ -1040,11 +1126,11 @@ def _convert_single_episode(
     video_time_window_by_camera: dict[str, tuple[float, float]] = {}
     video_metadata_by_camera: dict[str, _VideoWindow] = {}
     for camera_key in camera_keys:
-        video_window = episode_row.get("video_windows", {}).get(camera_key)
-        if video_window:
+        video_window = episode_row.video_windows.get(camera_key)
+        if video_window is not None:
             video_time_window_by_camera[camera_key] = (
-                video_window["from_timestamp"],
-                video_window["to_timestamp"],
+                video_window.from_timestamp,
+                video_window.to_timestamp,
             )
             video_metadata_by_camera[camera_key] = video_window
 
@@ -1064,8 +1150,8 @@ def _convert_single_episode(
             ]
             else "frame_index"
         )
-        data_start_index = int(episode_row["data_from"])
-        data_end_index = int(episode_row["data_to"])
+        data_start_index = int(episode_row.data_from)
+        data_end_index = int(episode_row.data_to)
         episode_data_rows = connection.execute(
             f"SELECT * FROM read_parquet('{escaped_data_path}') "
             f"WHERE {index_column_name} >= {data_start_index} "
@@ -1099,24 +1185,24 @@ def _convert_single_episode(
     # Per-camera video: download chunk video, slice to episode window, transcode
     video_data_by_camera: dict[str, tuple[list[bytes], list[float]]] = {}
     for camera_key in camera_keys:
-        camera_video_metadata = video_metadata_by_camera.get(camera_key, {})
+        camera_video_metadata = video_metadata_by_camera.get(camera_key)
         video_time_window = video_time_window_by_camera.get(camera_key)
         video_start_seconds = video_time_window[0] if video_time_window is not None else 0.0
         video_end_seconds = video_time_window[1] if video_time_window is not None else 0.0
 
         video_chunk_index = (
-            str(camera_video_metadata.get("chunk_index"))
-            if camera_video_metadata.get("chunk_index") is not None
+            camera_video_metadata.chunk_index
+            if camera_video_metadata is not None
             else (data_chunk_index or "0")
         )
         video_chunk_index = video_chunk_index.split("/")[-1]
         video_file_index = (
-            str(camera_video_metadata.get("file_index"))
-            if camera_video_metadata.get("file_index") is not None
+            camera_video_metadata.file_index
+            if camera_video_metadata is not None
             else (data_file_index or "0")
         )
         video_file_index = video_file_index.split("/")[-1]
-        video_relative_path = source_archive["video_path"].format(
+        video_relative_path = source_archive.video_path.format(
             chunk_index=int(video_chunk_index or 0),
             file_index=int(video_file_index or 0),
             video_key=camera_key,
@@ -1260,9 +1346,9 @@ def _convert_single_episode(
                 )
 
             episode_record: dict[str, str] = {
-                "task": str(episode_row["task"] or ""),
+                "task": str(episode_row.task or ""),
                 "operator": "lerobot_converter",
-                "embodiment": str(source_archive["info"].get("robot_type") or "unknown"),
+                "embodiment": source_archive.dataset_information.robot_type,
                 "source_dataset": dataset_source.repo_id,
                 "source_revision": dataset_source.revision,
                 "source_episode_index": str(episode_index),
@@ -1276,7 +1362,7 @@ def _convert_single_episode(
             # the data; when it does not, the key is omitted rather than
             # invented (FORMAT.md: every episode/v1 key is optional and the
             # record is copied/merged from the source recording).
-            success_outcome = episode_row.get("success_outcome")
+            success_outcome = episode_row.success_outcome
             if success_outcome is not None:
                 episode_record["success"] = "true" if success_outcome else "false"
                 episode_record["success_derivation"] = _SUCCESS_DERIVATION
