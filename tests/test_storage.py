@@ -412,9 +412,16 @@ class TestFetchUri:
             "gs://bucket",
             "s3://bucket",
         ]
-        for uri in refused:
-            pattern = rf"^bucket URI {re.escape(repr(uri))} names no object$"
-            with pytest.raises(ValueError, match=pattern):
+        # Cases where no key is specified at all (e.g. gs://bucket, s3://bucket)
+        no_key_cases = ["gs://bucket", "s3://bucket"]
+        for uri in no_key_cases:
+            with pytest.raises(ValueError, match=rf"^bucket URI {re.escape(repr(uri))} names no object"):
+                fetch_uri(uri)
+        
+        # Cases where a key is specified but empty (trailing slash)
+        empty_key_cases = ["gs://bucket/", "s3://bucket/prefix/", "gs://bucket//"]
+        for uri in empty_key_cases:
+            with pytest.raises(ValueError, match=rf"^bucket URI {re.escape(repr(uri))} names no object"):
                 fetch_uri(uri)
 
 
