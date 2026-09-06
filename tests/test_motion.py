@@ -10,6 +10,7 @@ it proves nothing.
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import hflow
@@ -289,6 +290,254 @@ def test_the_check_reports_stability_with_its_coverage(still_texture: Path, tmp_
     )
     assert result.intervals, "shaky footage must localize somewhere"
     assert result.verdict is None
+
+
+def test_camera_stability_rejects_negative_shake_threshold(
+    still_texture: Path, tmp_path: Path
+) -> None:
+    """A negative shake threshold is rejected before camera measurement."""
+    from hflow.testing import VideoEpisodeSpec, write_video_episode
+    from hflow.transform import TransformConfig, write_canonical_episode
+
+    shaky = _render_camera_path(still_texture, tmp_path / "shaky.mp4", *_shake(24))
+    source = write_video_episode(
+        shaky,
+        tmp_path / "episode.mcap",
+        VideoEpisodeSpec(
+            duration_s=float(_DURATION_S),
+            image_hz=float(_FRAMES_PER_SECOND),
+            image_width=320,
+            image_height=240,
+            camera_name="head_camera",
+        ),
+    )
+    canonical = tmp_path / "episode.canonical.mcap"
+    write_canonical_episode(source, canonical, TransformConfig())
+
+    with (
+        hflow.Episode(canonical) as episode,
+        pytest.raises(
+            ValueError,
+            match=r"^shake_threshold_dps must be finite and non-negative$",
+        ),
+    ):
+        camera_stability(episode, shake_threshold_dps=-1.0)
+
+
+def test_camera_stability_rejects_nan_shake_threshold(still_texture: Path, tmp_path: Path) -> None:
+    """A NaN shake threshold is rejected before camera measurement."""
+    from hflow.testing import VideoEpisodeSpec, write_video_episode
+    from hflow.transform import TransformConfig, write_canonical_episode
+
+    shaky = _render_camera_path(still_texture, tmp_path / "shaky.mp4", *_shake(24))
+    source = write_video_episode(
+        shaky,
+        tmp_path / "episode.mcap",
+        VideoEpisodeSpec(
+            duration_s=float(_DURATION_S),
+            image_hz=float(_FRAMES_PER_SECOND),
+            image_width=320,
+            image_height=240,
+            camera_name="head_camera",
+        ),
+    )
+    canonical = tmp_path / "episode.canonical.mcap"
+    write_canonical_episode(source, canonical, TransformConfig())
+
+    with (
+        hflow.Episode(canonical) as episode,
+        pytest.raises(
+            ValueError,
+            match=r"^shake_threshold_dps must be finite and non-negative$",
+        ),
+    ):
+        camera_stability(episode, shake_threshold_dps=np.nan)
+
+
+def test_camera_stability_rejects_infinite_shake_threshold(
+    still_texture: Path, tmp_path: Path
+) -> None:
+    """An infinite shake threshold is rejected before camera measurement."""
+    from hflow.testing import VideoEpisodeSpec, write_video_episode
+    from hflow.transform import TransformConfig, write_canonical_episode
+
+    shaky = _render_camera_path(still_texture, tmp_path / "shaky.mp4", *_shake(24))
+    source = write_video_episode(
+        shaky,
+        tmp_path / "episode.mcap",
+        VideoEpisodeSpec(
+            duration_s=float(_DURATION_S),
+            image_hz=float(_FRAMES_PER_SECOND),
+            image_width=320,
+            image_height=240,
+            camera_name="head_camera",
+        ),
+    )
+    canonical = tmp_path / "episode.canonical.mcap"
+    write_canonical_episode(source, canonical, TransformConfig())
+
+    with (
+        hflow.Episode(canonical) as episode,
+        pytest.raises(
+            ValueError,
+            match=r"^shake_threshold_dps must be finite and non-negative$",
+        ),
+    ):
+        camera_stability(episode, shake_threshold_dps=np.inf)
+
+
+def test_camera_stability_rejects_bool_shake_threshold(still_texture: Path, tmp_path: Path) -> None:
+    """A boolean shake threshold is rejected instead of being treated as 1."""
+    from hflow.testing import VideoEpisodeSpec, write_video_episode
+    from hflow.transform import TransformConfig, write_canonical_episode
+
+    shaky = _render_camera_path(still_texture, tmp_path / "shaky.mp4", *_shake(24))
+    source = write_video_episode(
+        shaky,
+        tmp_path / "episode.mcap",
+        VideoEpisodeSpec(
+            duration_s=float(_DURATION_S),
+            image_hz=float(_FRAMES_PER_SECOND),
+            image_width=320,
+            image_height=240,
+            camera_name="head_camera",
+        ),
+    )
+    canonical = tmp_path / "episode.canonical.mcap"
+    write_canonical_episode(source, canonical, TransformConfig())
+
+    with (
+        hflow.Episode(canonical) as episode,
+        pytest.raises(
+            ValueError,
+            match=r"^shake_threshold_dps must be finite and non-negative$",
+        ),
+    ):
+        camera_stability(episode, shake_threshold_dps=True)
+
+
+def test_camera_stability_rejects_negative_min_duration(
+    still_texture: Path, tmp_path: Path
+) -> None:
+    """A negative minimum unstable duration is rejected before camera measurement."""
+    from hflow.testing import VideoEpisodeSpec, write_video_episode
+    from hflow.transform import TransformConfig, write_canonical_episode
+
+    shaky = _render_camera_path(still_texture, tmp_path / "shaky.mp4", *_shake(24))
+    source = write_video_episode(
+        shaky,
+        tmp_path / "episode.mcap",
+        VideoEpisodeSpec(
+            duration_s=float(_DURATION_S),
+            image_hz=float(_FRAMES_PER_SECOND),
+            image_width=320,
+            image_height=240,
+            camera_name="head_camera",
+        ),
+    )
+    canonical = tmp_path / "episode.canonical.mcap"
+    write_canonical_episode(source, canonical, TransformConfig())
+
+    with (
+        hflow.Episode(canonical) as episode,
+        pytest.raises(
+            ValueError,
+            match=r"^unstable_min_duration_s must be finite and non-negative$",
+        ),
+    ):
+        camera_stability(episode, unstable_min_duration_s=-1.0)
+
+
+def test_camera_stability_rejects_nan_min_duration(still_texture: Path, tmp_path: Path) -> None:
+    """A NaN minimum unstable duration is rejected before camera measurement."""
+    from hflow.testing import VideoEpisodeSpec, write_video_episode
+    from hflow.transform import TransformConfig, write_canonical_episode
+
+    shaky = _render_camera_path(still_texture, tmp_path / "shaky.mp4", *_shake(24))
+    source = write_video_episode(
+        shaky,
+        tmp_path / "episode.mcap",
+        VideoEpisodeSpec(
+            duration_s=float(_DURATION_S),
+            image_hz=float(_FRAMES_PER_SECOND),
+            image_width=320,
+            image_height=240,
+            camera_name="head_camera",
+        ),
+    )
+    canonical = tmp_path / "episode.canonical.mcap"
+    write_canonical_episode(source, canonical, TransformConfig())
+
+    with (
+        hflow.Episode(canonical) as episode,
+        pytest.raises(
+            ValueError,
+            match=r"^unstable_min_duration_s must be finite and non-negative$",
+        ),
+    ):
+        camera_stability(episode, unstable_min_duration_s=np.nan)
+
+
+def test_camera_stability_rejects_infinite_min_duration(
+    still_texture: Path, tmp_path: Path
+) -> None:
+    """An infinite minimum unstable duration is rejected before camera measurement."""
+    from hflow.testing import VideoEpisodeSpec, write_video_episode
+    from hflow.transform import TransformConfig, write_canonical_episode
+
+    shaky = _render_camera_path(still_texture, tmp_path / "shaky.mp4", *_shake(24))
+    source = write_video_episode(
+        shaky,
+        tmp_path / "episode.mcap",
+        VideoEpisodeSpec(
+            duration_s=float(_DURATION_S),
+            image_hz=float(_FRAMES_PER_SECOND),
+            image_width=320,
+            image_height=240,
+            camera_name="head_camera",
+        ),
+    )
+    canonical = tmp_path / "episode.canonical.mcap"
+    write_canonical_episode(source, canonical, TransformConfig())
+
+    with (
+        hflow.Episode(canonical) as episode,
+        pytest.raises(
+            ValueError,
+            match=r"^unstable_min_duration_s must be finite and non-negative$",
+        ),
+    ):
+        camera_stability(episode, unstable_min_duration_s=np.inf)
+
+
+def test_camera_stability_rejects_bool_min_duration(still_texture: Path, tmp_path: Path) -> None:
+    """A boolean minimum unstable duration is rejected instead of being treated as 1."""
+    from hflow.testing import VideoEpisodeSpec, write_video_episode
+    from hflow.transform import TransformConfig, write_canonical_episode
+
+    shaky = _render_camera_path(still_texture, tmp_path / "shaky.mp4", *_shake(24))
+    source = write_video_episode(
+        shaky,
+        tmp_path / "episode.mcap",
+        VideoEpisodeSpec(
+            duration_s=float(_DURATION_S),
+            image_hz=float(_FRAMES_PER_SECOND),
+            image_width=320,
+            image_height=240,
+            camera_name="head_camera",
+        ),
+    )
+    canonical = tmp_path / "episode.canonical.mcap"
+    write_canonical_episode(source, canonical, TransformConfig())
+
+    with (
+        hflow.Episode(canonical) as episode,
+        pytest.raises(
+            ValueError,
+            match=r"^unstable_min_duration_s must be finite and non-negative$",
+        ),
+    ):
+        camera_stability(episode, unstable_min_duration_s=True)
 
 
 def test_the_check_knobs_raise_the_bar_without_changing_the_rate_measurements(
