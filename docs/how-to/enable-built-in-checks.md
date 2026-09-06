@@ -175,6 +175,19 @@ optional `motion` extra (`pip install 'hflow[motion]'`). Everything else here
 runs on the core install. Enabling it without the extra raises at the first
 episode with the install command in the message, rather than failing obscurely.
 
+Hand-held footage clears the instrument's resolution floor almost continuously
+by fractions of a degree. That is real movement, but it is not what a viewer
+means by a shaky camera. Two optional knobs tune the sensitivity:
+`shake_threshold_dps=` (degrees per second) sets a minimum shake rate a frame
+pair must clear to be counted as unstable, and `unstable_min_duration_s=`
+(seconds) drops unstable spans shorter than that duration from the intervals.
+They do not behave symmetrically: `shake_threshold_dps` changes which frame
+pairs count, so it moves `{topic}/unstable_share` and `{topic}/unstable_s` as
+well as the intervals; `unstable_min_duration_s` filters the intervals only and
+leaves the summary measurements alone. If hand-held recordings read as
+continuously shaky, start with `shake_threshold_dps=3.0` and
+`unstable_min_duration_s=0.25`. Both default to `0.0`.
+
 The trajectory checks report in the stream's own units. If your dimensions share
 no unit -- a gripper width beside a shoulder angle -- pass `dimension_scales=`,
 one positive divisor per dimension, and `{topic}/scale_source` will record that
