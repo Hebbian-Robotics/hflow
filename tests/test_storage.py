@@ -409,6 +409,7 @@ class TestFetchUri:
             "gs://bucket/",
             "s3://bucket/prefix/",
             "gs://bucket//",
+            "gs://bucket///",
             "gs://bucket",
             "s3://bucket",
         ]
