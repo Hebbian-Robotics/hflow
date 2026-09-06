@@ -335,7 +335,7 @@ For an unauthenticated self-hosted endpoint, add
 default because Build AI did not publish one; set it explicitly when a model
 comparison requires a fixed non-default value. The run fingerprint captures
 the endpoint, model, prompt contents, schema mode, temperature, token limit,
-selected rows, sources, and tasks so incompatible experiments cannot silently
+retry policy, selected rows, sources, and tasks so incompatible experiments cannot silently
 reuse the same output directory.
 
 ## Inspect and compare results
