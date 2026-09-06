@@ -1,12 +1,11 @@
 """Regression coverage for native overlay manifest parse-stage refusals."""
 
-import csv
-import io
 import json
 from pathlib import Path
 from typing import cast
 
 import pytest
+from packaging_test_helpers import example_record_path, write_example_distribution
 
 from hflow.packaging import (
     CYTHON_OVERLAY_MANIFEST_FILE_NAME,
@@ -19,44 +18,11 @@ from hflow.packaging import (
 )
 
 
-def _write_example_distribution(temporary_directory: Path) -> Path:
-    site_packages_directory = temporary_directory / "site-packages"
-    package_root = site_packages_directory / "sample_native_package"
-    distribution_metadata_root = site_packages_directory / "sample_native_package-7.2.dist-info"
-    package_root.mkdir(parents=True)
-    distribution_metadata_root.mkdir()
-
-    (package_root / "__init__.py").write_text(
-        "from .worker import compute\n\n__all__ = ['compute']\n",
-        encoding="utf-8",
-    )
-    (package_root / "worker.py").write_text(
-        "def compute(value: int) -> int:\n    return value * 3\n",
-        encoding="utf-8",
-    )
-
-    record_path = distribution_metadata_root / "RECORD"
-    serialized_record = io.StringIO(newline="")
-    writer = csv.writer(serialized_record, lineterminator="\n")
-    for path in (
-        "sample_native_package/__init__.py",
-        "sample_native_package/worker.py",
-        "sample_native_package-7.2.dist-info/RECORD",
-    ):
-        writer.writerow((path, "", ""))
-    record_path.write_text(serialized_record.getvalue(), encoding="utf-8")
-    return package_root
-
-
-def _example_record_path(package_root: Path) -> Path:
-    return package_root.parent / "sample_native_package-7.2.dist-info" / "RECORD"
-
-
 def _build_overlay(tmp_path: Path) -> tuple[Path, Path, CythonOverlayManifest, bytes, bytes]:
-    package_root = _write_example_distribution(tmp_path)
+    package_root, _ = write_example_distribution(tmp_path)
     source_path = package_root / "worker.py"
     source_bytes = source_path.read_bytes()
-    original_record = _example_record_path(package_root).read_bytes()
+    original_record = example_record_path(package_root).read_bytes()
     overlay_directory = tmp_path / "native-overlay"
     manifest = build_cython_overlay(
         CythonOverlayBuildConfig(
@@ -94,7 +60,7 @@ def _assert_apply_refused_without_mutation(
         for artifact in manifest.artifacts
     )
     assert not (package_root / INSTALLED_CYTHON_OVERLAY_MANIFEST_FILE_NAME).exists()
-    assert _example_record_path(package_root).read_bytes() == original_record
+    assert example_record_path(package_root).read_bytes() == original_record
 
 
 def test_apply_refuses_invalid_manifest_json_before_mutation(tmp_path: Path) -> None:
