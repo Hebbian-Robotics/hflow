@@ -17,12 +17,9 @@ implement the contract and are chosen per registered check:
   they are not required to match Build AI's, and a version may diverge from
   the published methodology while keeping the input and output shapes.
 
-Results from the two are comparable in shape, not guaranteed to agree in
-value. Every result records which execution answered it: the
-``requested_model`` measurement holds the model name for an OpenAI-compatible
-run and ``hflow-hosted/<check>@<version>`` for a hosted run, and the
-execution's settings enter the check version, so a catalog never mixes the
-two under one version.
+Every result records which execution answered it in the ``requested_model``
+measurement (the model name, or ``hflow-hosted/<check>@<version>``), and the
+execution's settings enter the check version.
 
 Build AI's methodology and released evaluation inputs:
 https://huggingface.co/datasets/builddotai/Egocentric-10K-Evaluation
@@ -239,8 +236,7 @@ class HFlowHostedExecution:
     version to ask, and how long to wait. It answers the same contract as the
     Build AI methodology (one frame in, the same answer shape out) but is a
     separate implementation: a hosted version is not required to reproduce
-    Build AI's prompts or results, and the two should be compared, not
-    assumed equal.
+    Build AI's prompts or results.
     """
 
     base_url: str = DEFAULT_HFLOW_HOSTED_BASE_URL

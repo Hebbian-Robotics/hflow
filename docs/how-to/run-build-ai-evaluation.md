@@ -125,16 +125,11 @@ timeout; its server owns every model setting.
 
 The two checks are contracts, not a particular model: one egocentric frame in,
 a hand count of 0, 1, or 2 or a yes/no on active manipulation out, recorded as
-the same catalog evidence either way. Two executions answer them.
-`OpenAICompatibleExecution` is Build AI's published methodology, their exact
-prompts and schemas through a model you name. `HFlowHostedExecution` is HFlow's
-hosted implementation: each hosted check version pins its own prompt, model, and
-generation settings, answers the same contract, and is not required to match
-Build AI's prompts or results. Treat the two as comparable in shape and compare
-their values rather than assuming agreement. Every result names what answered
-it in `requested_model` (the model name, or `hflow-hosted/<check>@<version>`),
-and the execution's settings enter the check version, so a catalog never holds
-both under one version.
+the same catalog evidence either way. `OpenAICompatibleExecution` answers with
+Build AI's published prompts through a model you name. `HFlowHostedExecution`
+answers with HFlow's hosted implementation, which pins its own prompt, model,
+and settings per version and is not required to match Build AI's. Every result
+names what answered it in `requested_model`.
 
 The same checks are available directly in any pipeline. Execution is selected
 per check, so the two checks may use different executions:
