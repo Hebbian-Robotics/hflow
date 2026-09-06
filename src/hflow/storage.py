@@ -685,6 +685,9 @@ def fetch_uri(uri: "str | Path") -> Path:
     one-off ``app.process("gs://...")`` sources.
     """
     if isinstance(uri, str) and is_bucket_url(uri):
+        _scheme, _sep, remainder = uri.partition("://")
+        if "/" not in remainder or not remainder.partition("/")[2].strip("/"):
+            raise ValueError(f"bucket URI {uri!r} names no object")
         parent_url, _, name = uri.rpartition("/")
         if not name:
             raise ValueError(f"bucket URI {uri!r} names no object")
