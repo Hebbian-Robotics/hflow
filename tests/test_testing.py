@@ -272,6 +272,77 @@ def test_video_episode_adapter_round_trip_and_faults(tmp_path: Path) -> None:
     assert metadata_records["episode/v1"]["source_dataset"] == "test-video"
 
 
+def test_video_episode_shake_segment_reads_as_unstable_footage(tmp_path: Path) -> None:
+    """The injected shake is what camera_stability calls shake, and only there.
+
+    The source is a still texture held for six seconds, the same footage the
+    stability check's own tests call a static camera, so every unstable span
+    the check reports is one the injector put there.
+    """
+    pytest.importorskip("cv2")
+    import hflow
+    from hflow.checks import camera_stability
+
+    texture_path = tmp_path / "texture.png"
+    source_video_path = tmp_path / "source.mp4"
+    for command in (
+        ["-f", "lavfi", "-i", "testsrc2=size=320x180:rate=1:duration=1", "-frames:v", "1"],
+        ["-loop", "1", "-framerate", "15", "-i", str(texture_path), "-t", "6"],
+    ):
+        completed = subprocess.run(
+            [
+                str(ffmpeg_path()),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                *command,
+                *(
+                    ["-c:v", "libx264", "-pix_fmt", "yuv420p", str(source_video_path)]
+                    if command[0] == "-loop"
+                    else [str(texture_path)]
+                ),
+            ],
+            capture_output=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+    shake_segment = (2.0, 4.0)
+    adapted = write_video_episode(
+        source_video_path,
+        tmp_path / "shaken.mcap",
+        VideoEpisodeSpec(
+            duration_s=6.0,
+            image_hz=15.0,
+            image_width=320,
+            image_height=180,
+            shake_segment=shake_segment,
+            shake_amplitude_px=12,
+        ),
+    )
+    canonical = tmp_path / "shaken.canonical.mcap"
+    hflow.write_canonical_episode(adapted, canonical)
+
+    with hflow.Episode(canonical) as episode:
+        time_bounds = episode.time_bounds
+        assert time_bounds is not None
+        result = camera_stability(episode)
+
+    def overlap_seconds(interval: hflow.Interval, window: tuple[float, float]) -> float:
+        start_s = (interval.start_ns - time_bounds.start_ns) / 1e9
+        end_s = (interval.end_ns - time_bounds.start_ns) / 1e9
+        return max(0.0, min(end_s, window[1]) - max(start_s, window[0]))
+
+    unstable = [i for i in result.intervals if i.label == "unstable:/head_camera/compressed"]
+    inside_s = sum(overlap_seconds(i, shake_segment) for i in unstable)
+    outside_s = sum(
+        overlap_seconds(i, (0.0, shake_segment[0])) + overlap_seconds(i, (shake_segment[1], 6.0))
+        for i in unstable
+    )
+    assert inside_s >= 1.0, (inside_s, unstable)
+    assert outside_s <= 0.5, (outside_s, unstable)
+
+
 def test_video_episode_missing_source_names_the_path_with_errno(tmp_path: Path) -> None:
     missing_source = tmp_path / "absent.mp4"
     with pytest.raises(FileNotFoundError) as excinfo:

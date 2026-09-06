@@ -161,6 +161,11 @@ class VideoEpisodeSpec:
     camera_name: str = "head_camera"
     black_segment: tuple[float, float] | None = None
     freeze_segment: tuple[float, float] | None = None
+    # Camera shake: the excerpt is upscaled by the amplitude on every side and
+    # cropped back with a sinusoidal offset several times a second, which is
+    # what ``camera_stability`` separates from deliberate camera motion.
+    shake_segment: tuple[float, float] | None = None
+    shake_amplitude_px: int = 24
     start_time_ns: int = 1_755_000_000_000_000_000
     task: str = "human_egocentric_activity"
     operator: str = "anonymous"
@@ -391,16 +396,24 @@ def _validate_video_episode_spec(spec: VideoEpisodeSpec) -> None:
         )
     if not spec.camera_name.strip():
         raise ValueError(f"camera_name must not be empty, got {spec.camera_name!r}")
-    _validate_video_fault_segment("black_segment", spec.black_segment, spec.duration_s)
-    _validate_video_fault_segment("freeze_segment", spec.freeze_segment, spec.duration_s)
-    if spec.black_segment is not None and spec.freeze_segment is not None:
-        black_start_s, black_end_s = spec.black_segment
-        freeze_start_s, freeze_end_s = spec.freeze_segment
-        if max(black_start_s, freeze_start_s) < min(black_end_s, freeze_end_s):
-            raise ValueError(
-                f"black_segment and freeze_segment must not overlap, "
-                f"got {spec.black_segment!r} and {spec.freeze_segment!r}"
-            )
+    _require_int(spec.shake_amplitude_px, "shake_amplitude_px")
+    if spec.shake_amplitude_px <= 0:
+        raise ValueError(f"shake_amplitude_px must be > 0, got {spec.shake_amplitude_px}")
+    fault_segments = (
+        ("black_segment", spec.black_segment),
+        ("freeze_segment", spec.freeze_segment),
+        ("shake_segment", spec.shake_segment),
+    )
+    for segment_name, segment in fault_segments:
+        _validate_video_fault_segment(segment_name, segment, spec.duration_s)
+    present_segments = [(name, segment) for name, segment in fault_segments if segment is not None]
+    for index, (first_name, first_segment) in enumerate(present_segments):
+        for second_name, second_segment in present_segments[index + 1 :]:
+            if max(first_segment[0], second_segment[0]) < min(first_segment[1], second_segment[1]):
+                raise ValueError(
+                    f"{first_name} and {second_name} must not overlap, "
+                    f"got {first_segment!r} and {second_segment!r}"
+                )
 
 
 def _validate_synthetic_episode_spec(spec: "SyntheticEpisodeSpec") -> None:
@@ -450,13 +463,15 @@ def _render_source_video_frames(
     source_video_path: Path,
     spec: VideoEpisodeSpec,
     work_dir: Path,
+    *,
+    shaken: bool = False,
 ) -> list[bytes]:
     frame_count = round(spec.duration_s * spec.image_hz)
     if frame_count < 1:
         raise ValueError(
             f"duration_s * image_hz must produce at least one frame, got {frame_count}"
         )
-    frames_dir = work_dir / "source_video"
+    frames_dir = work_dir / ("source_video_shaken" if shaken else "source_video")
     frames_dir.mkdir()
     video_filter = (
         f"fps={spec.image_hz:g},"
@@ -464,6 +479,18 @@ def _render_source_video_frames(
         "force_original_aspect_ratio=decrease:flags=lanczos,"
         f"pad={spec.image_width}:{spec.image_height}:(ow-iw)/2:(oh-ih)/2:black"
     )
+    if shaken:
+        # Upscale by the amplitude on every side, then crop back with a
+        # per-frame sinusoidal offset. Two incommensurate rates well above 1 Hz
+        # read as shake to camera_stability, whose deliberate-motion band is
+        # below roughly 1 Hz; the picture content is otherwise the source's.
+        amplitude = spec.shake_amplitude_px
+        video_filter += (
+            f",scale={spec.image_width + 2 * amplitude}:{spec.image_height + 2 * amplitude},"
+            f"crop={spec.image_width}:{spec.image_height}"
+            f":{amplitude}+{amplitude}*sin(2*PI*4.3*t)"
+            f":{amplitude}+{amplitude}*cos(2*PI*5.7*t)"
+        )
     _run_ffmpeg(
         [
             "-ss",
@@ -531,6 +558,11 @@ def _build_video_camera_messages(
         freeze_start_s, _freeze_end_s = spec.freeze_segment
         frozen_frame_index = min(round(freeze_start_s * spec.image_hz), len(frame_jpegs) - 1)
         frozen_frame_jpeg = frame_jpegs[frozen_frame_index]
+    shaken_frame_jpegs = (
+        _render_source_video_frames(source_video_path, spec, work_dir, shaken=True)
+        if spec.shake_segment is not None
+        else None
+    )
 
     messages: list[tuple[int, bytes]] = []
     for frame_index, original_frame_jpeg in enumerate(frame_jpegs):
@@ -542,6 +574,10 @@ def _build_video_camera_messages(
             frame_time_s, spec.freeze_segment
         ):
             frame_jpeg = frozen_frame_jpeg
+        elif shaken_frame_jpegs is not None and _time_is_in_segment(
+            frame_time_s, spec.shake_segment
+        ):
+            frame_jpeg = shaken_frame_jpegs[frame_index]
         log_time_ns = spec.start_time_ns + round(
             frame_index * NANOSECONDS_PER_SECOND / spec.image_hz
         )
