@@ -1499,14 +1499,24 @@ def _write_identity_matching_landing_mcap(
     field and leave the rest matching, which is what separates the individual
     comparisons in ``_episode_identity_matches`` from each other.
     """
-    from mcap.writer import Writer
+    from mcap.writer import CompressionType, Writer
 
     from hflow.format import METADATA_RECORD_EPISODE, METADATA_RECORD_PROVENANCE
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("wb") as stream:
-        writer = Writer(stream)
+        # Uncompressed chunks: the payload-corruption test flips bytes inside
+        # the chunk records region, which is only addressable in place when
+        # the records are plaintext.
+        writer = Writer(stream, compression=CompressionType.NONE)
         writer.start(profile="", library="test-lerobot-resume")
+        schema_id = writer.register_schema(
+            name="test.Pointer", encoding="ros2msg", data=b"int32 x\n"
+        )
+        channel_id = writer.register_channel(
+            topic="/pointer", message_encoding="ros2msg", schema_id=schema_id
+        )
+        writer.add_message(channel_id, log_time=10**9, data=b"\x01\x00\x00\x00", publish_time=10**9)
         writer.add_metadata(
             METADATA_RECORD_EPISODE,
             {
@@ -2110,3 +2120,82 @@ def test_converter_version_bumped_with_the_label_support() -> None:
     """The label changes episode/v1 bytes, which content_episode_id hashes:
     the converter version moves with the change, not after it."""
     assert prep.CONVERTER_VERSION == "lerobot-converter-v7"
+
+
+def test_reuse_refuses_a_landing_episode_with_damaged_payload(
+    tmp_path: Path,
+) -> None:
+    """Payload damage that leaves the MCAP structure and metadata intact is
+    still damaged work: the reuse path CRC-validates before stamping the
+    receipt, and refuses rather than laundering the bytes (#426)."""
+    from reuse_test_helpers import flip_chunk_payload_bytes
+
+    data_root = LocalStorageRoot(tmp_path / "out")
+    landing = tmp_path / "out" / "landing" / "lerobot_episode_0001.mcap"
+    _write_identity_matching_landing_mcap(
+        landing,
+        dataset_source=_MATCHING_SOURCE,
+        episode_index=0,
+        camera_keys=_MATCHING_CAMERA_KEYS,
+        marker="payload-damaged",
+    )
+    receipt_before = prep._try_reuse_completed_episode(
+        data_root,
+        dataset_source=_MATCHING_SOURCE,
+        episode_index=0,
+        camera_keys=_MATCHING_CAMERA_KEYS,
+    )
+    assert receipt_before is not None
+    intact_content_id = receipt_before["content_id"]
+
+    flip_chunk_payload_bytes(landing)
+
+    assert (
+        prep._try_reuse_completed_episode(
+            data_root,
+            dataset_source=_MATCHING_SOURCE,
+            episode_index=0,
+            camera_keys=_MATCHING_CAMERA_KEYS,
+        )
+        is None
+    )
+    # The damaged bytes must not be laundered: the damaged file's hash
+    # differs from the receipt the intact file earned.
+    from reuse_test_helpers import content_id_differs_from_delivery_receipt
+
+    assert content_id_differs_from_delivery_receipt(landing, intact_content_id)
+
+
+def test_reuse_accepts_an_intact_episode_after_the_crc_pass(
+    tmp_path: Path,
+) -> None:
+    """The control: the CRC pass adds no refusal for undamaged bytes."""
+    from reuse_test_helpers import flip_chunk_payload_bytes
+
+    data_root = LocalStorageRoot(tmp_path / "out")
+    landing = tmp_path / "out" / "landing" / "lerobot_episode_0001.mcap"
+    _write_identity_matching_landing_mcap(
+        landing,
+        dataset_source=_MATCHING_SOURCE,
+        episode_index=0,
+        camera_keys=_MATCHING_CAMERA_KEYS,
+        marker="intact",
+    )
+
+    reused = prep._try_reuse_completed_episode(
+        data_root,
+        dataset_source=_MATCHING_SOURCE,
+        episode_index=0,
+        camera_keys=_MATCHING_CAMERA_KEYS,
+    )
+    assert reused is not None
+
+    flip_chunk_payload_bytes(landing)
+
+    damaged = prep._try_reuse_completed_episode(
+        data_root,
+        dataset_source=_MATCHING_SOURCE,
+        episode_index=0,
+        camera_keys=_MATCHING_CAMERA_KEYS,
+    )
+    assert damaged is None

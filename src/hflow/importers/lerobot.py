@@ -29,6 +29,7 @@ from pathlib import Path, PurePosixPath
 from typing import NotRequired, TypedDict
 from urllib.parse import urlsplit
 
+from mcap.reader import make_reader
 from mcap.writer import Writer as McapWriter
 
 from hflow.catalog import content_episode_id
@@ -155,7 +156,13 @@ def _episode_identity_matches(
     episode_index: int,
     camera_keys: tuple[str, ...],
 ) -> bool:
-    """True when a published landing file belongs to this exact import."""
+    """True when a published landing file belongs to this exact import.
+
+    Identity over the metadata records, then a CRC-validated full message
+    pass: a reused episode must be whole, not merely labeled. Metadata-only
+    reads never touch chunk payloads, so without this pass a payload-damaged
+    file would match identity and be stamped with a fresh receipt.
+    """
     from mcap.exceptions import McapError
 
     reader = None
@@ -180,7 +187,7 @@ def _episode_identity_matches(
     if recorded_camera_keys is None:
         return False
     expected_gop = f"{IMPORT_GOP_SECONDS:g}"
-    return (
+    if not (
         episode_metadata.get("source_dataset") == dataset_source.repo_id
         and episode_metadata.get("source_revision") == dataset_source.revision
         and episode_metadata.get("source_episode_index") == str(episode_index)
@@ -189,7 +196,19 @@ def _episode_identity_matches(
         and recorded_camera_keys == camera_keys
         and episode_metadata.get("gop_seconds") == expected_gop
         and provenance_metadata.get("gop_seconds") == expected_gop
-    )
+    ):
+        return False
+    # Metadata matching is not integrity: the metadata records live outside
+    # the chunks, so payload damage never reaches them. Reuse must hold the
+    # file to the same standard hflow doctor applies to any canonical file.
+    try:
+        with local_episode_path.open("rb") as stream:
+            validated_reader = make_reader(stream, validate_crcs=True)
+            for _ in validated_reader.iter_messages(log_time_order=False):
+                pass
+    except (OSError, McapError, ValueError):
+        return False
+    return True
 
 
 def _try_reuse_completed_episode(
@@ -923,7 +942,11 @@ def import_lerobot_dataset(
             camera_keys=resolved_camera_keys,
         )
         if reused_episode is not None:
-            logger.info("reusing completed LeRobot episode %s", reused_episode["uri"])
+            logger.info(
+                "reusing verified completed LeRobot episode %s (content_id %s)",
+                reused_episode["uri"],
+                reused_episode["content_id"],
+            )
             published_episodes.append(reused_episode)
             continue
         published_episodes.append(
