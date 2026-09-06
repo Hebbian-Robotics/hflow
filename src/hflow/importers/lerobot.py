@@ -160,8 +160,6 @@ def _episode_identity_matches(
 
     reader = None
     try:
-        if local_episode_path.stat().st_size < 1:
-            return False
         reader = open_reader(local_episode_path)
         metadata_records = reader.metadata()
     except (OSError, McapError, ValueError):
@@ -206,6 +204,7 @@ def _try_reuse_completed_episode(
     if not storage.exists(relative_key):
         return None
     try:
+        # Avoid fetching an empty remote object only to reject it as invalid MCAP.
         if storage.file_size(relative_key) < 1:
             return None
         local_episode_path = storage.fetch(relative_key)

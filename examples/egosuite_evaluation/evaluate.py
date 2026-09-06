@@ -170,7 +170,7 @@ def load_projected_hand_label_report(
             f"{schema_version!r}; supported value is {SCHEMA_VERSION}"
         )
     label_type = report_payload.get("label_type")
-    if not isinstance(label_type, str) or label_type != PROJECTED_HAND_LABEL_TYPE:
+    if label_type != PROJECTED_HAND_LABEL_TYPE:
         raise ValueError(
             f"projected-hand label report {report_path} field 'label_type' has value "
             f"{label_type!r}; supported value is {PROJECTED_HAND_LABEL_TYPE!r}"
