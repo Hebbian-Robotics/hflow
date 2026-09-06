@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 
-def _write_example_distribution(
+def write_example_distribution(
     temporary_directory: Path,
     *,
     include_record: bool = True,
@@ -79,7 +79,7 @@ def _write_example_distribution(
             relative_path: hash_and_size
             for recorded_file in recorded_files
             for relative_path, hash_and_size in (
-                _record_values_for_file(recorded_file, site_packages_directory),
+                record_values_for_file(recorded_file, site_packages_directory),
             )
         }
         cache_tag = sys.implementation.cache_tag
@@ -92,13 +92,11 @@ def _write_example_distribution(
             }
         )
         recorded_rows[record_path.relative_to(site_packages_directory).as_posix()] = ("", "")
-        _write_record(record_path, recorded_rows)
+        write_record(record_path, recorded_rows)
     return package_root, license_path
 
 
-def _record_values_for_file(
-    file_path: Path, installation_root: Path
-) -> tuple[str, tuple[str, str]]:
+def record_values_for_file(file_path: Path, installation_root: Path) -> tuple[str, tuple[str, str]]:
     contents = file_path.read_bytes()
     encoded_digest = base64.urlsafe_b64encode(hashlib.sha256(contents).digest()).rstrip(b"=")
     return (
@@ -107,7 +105,7 @@ def _record_values_for_file(
     )
 
 
-def _write_record(record_path: Path, rows: dict[str, tuple[str, str]]) -> None:
+def write_record(record_path: Path, rows: dict[str, tuple[str, str]]) -> None:
     serialized_record = io.StringIO(newline="")
     writer = csv.writer(serialized_record, lineterminator="\n")
     for path, (hash_value, size_value) in sorted(rows.items()):
@@ -115,5 +113,5 @@ def _write_record(record_path: Path, rows: dict[str, tuple[str, str]]) -> None:
     record_path.write_text(serialized_record.getvalue(), encoding="utf-8")
 
 
-def _example_record_path(package_root: Path) -> Path:
+def example_record_path(package_root: Path) -> Path:
     return package_root.parent / "sample_native_package-7.2.dist-info" / "RECORD"

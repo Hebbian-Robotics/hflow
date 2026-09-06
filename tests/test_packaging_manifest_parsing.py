@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from packaging_test_helpers import _example_record_path, _write_example_distribution
+from packaging_test_helpers import example_record_path, write_example_distribution
 
 from hflow.packaging import (
     CYTHON_OVERLAY_MANIFEST_FILE_NAME,
@@ -19,10 +19,10 @@ from hflow.packaging import (
 
 
 def _build_overlay(tmp_path: Path) -> tuple[Path, Path, CythonOverlayManifest, bytes, bytes]:
-    package_root, _ = _write_example_distribution(tmp_path)
+    package_root, _ = write_example_distribution(tmp_path)
     source_path = package_root / "worker.py"
     source_bytes = source_path.read_bytes()
-    original_record = _example_record_path(package_root).read_bytes()
+    original_record = example_record_path(package_root).read_bytes()
     overlay_directory = tmp_path / "native-overlay"
     manifest = build_cython_overlay(
         CythonOverlayBuildConfig(
@@ -60,7 +60,7 @@ def _assert_apply_refused_without_mutation(
         for artifact in manifest.artifacts
     )
     assert not (package_root / INSTALLED_CYTHON_OVERLAY_MANIFEST_FILE_NAME).exists()
-    assert _example_record_path(package_root).read_bytes() == original_record
+    assert example_record_path(package_root).read_bytes() == original_record
 
 
 def test_apply_refuses_invalid_manifest_json_before_mutation(tmp_path: Path) -> None:

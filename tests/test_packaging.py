@@ -14,10 +14,10 @@ from typing import cast
 
 import pytest
 from packaging_test_helpers import (
-    _example_record_path,
-    _record_values_for_file,
-    _write_example_distribution,
-    _write_record,
+    example_record_path,
+    record_values_for_file,
+    write_example_distribution,
+    write_record,
 )
 
 import hflow.packaging as packaging
@@ -85,7 +85,7 @@ def _run_example_package(site_packages_directory: Path) -> subprocess.CompletedP
 def test_native_overlay_replaces_only_implementation_sources_and_preserves_distribution(
     tmp_path: Path,
 ) -> None:
-    package_root, license_path = _write_example_distribution(tmp_path)
+    package_root, license_path = write_example_distribution(tmp_path)
     initial_result = _run_example_package(package_root.parent)
     assert initial_result.returncode == 0
     assert initial_result.stdout.strip() == "12 native-result 7.2 True"
@@ -132,7 +132,7 @@ def test_native_overlay_replaces_only_implementation_sources_and_preserves_distr
     for preserved_path, preserved_bytes in preserved_files.items():
         assert preserved_path.read_bytes() == preserved_bytes
 
-    record_rows = _read_record(_example_record_path(package_root))
+    record_rows = _read_record(example_record_path(package_root))
     assert "sample_native_package/worker.py" not in record_rows
     assert "sample_native_package/worker.pyc" not in record_rows
     assert "sample_native_package/nested/labels.py" not in record_rows
@@ -147,7 +147,7 @@ def test_native_overlay_replaces_only_implementation_sources_and_preserves_distr
         installed_artifact_path = f"sample_native_package/{artifact.installed_artifact_path}"
         assert (
             record_rows[installed_artifact_path]
-            == _record_values_for_file(
+            == record_values_for_file(
                 package_root / artifact.installed_artifact_path,
                 package_root.parent,
             )[1]
@@ -155,16 +155,16 @@ def test_native_overlay_replaces_only_implementation_sources_and_preserves_distr
     installed_manifest_path = package_root / INSTALLED_CYTHON_OVERLAY_MANIFEST_FILE_NAME
     assert (
         record_rows[f"sample_native_package/{INSTALLED_CYTHON_OVERLAY_MANIFEST_FILE_NAME}"]
-        == _record_values_for_file(installed_manifest_path, package_root.parent)[1]
+        == record_values_for_file(installed_manifest_path, package_root.parent)[1]
     )
 
     native_result = _run_example_package(package_root.parent)
     assert native_result.returncode == 0
     assert native_result.stdout.strip() == "12 native-result 7.2 True"
 
-    finalized_record = _example_record_path(package_root).read_bytes()
+    finalized_record = example_record_path(package_root).read_bytes()
     apply_cython_overlay(overlay_directory, package_root)
-    assert _example_record_path(package_root).read_bytes() == finalized_record
+    assert example_record_path(package_root).read_bytes() == finalized_record
 
 
 @pytest.mark.parametrize(
@@ -182,7 +182,7 @@ def test_apply_refuses_invalid_manifest_before_mutation(
     mutation: str,
     expected_message: str,
 ) -> None:
-    package_root, _ = _write_example_distribution(tmp_path)
+    package_root, _ = write_example_distribution(tmp_path)
     overlay_directory = tmp_path / "native-overlay"
     manifest = build_cython_overlay(
         CythonOverlayBuildConfig(package_root=package_root),
@@ -205,7 +205,7 @@ def test_apply_refuses_invalid_manifest_before_mutation(
     else:
         raise AssertionError(f"unknown manifest mutation: {mutation}")
     _write_manifest_payload(manifest_path, payload)
-    original_record = _example_record_path(package_root).read_bytes()
+    original_record = example_record_path(package_root).read_bytes()
 
     with pytest.raises(CythonOverlayManifestError, match=expected_message):
         apply_cython_overlay(overlay_directory, package_root)
@@ -216,11 +216,11 @@ def test_apply_refuses_invalid_manifest_before_mutation(
         for artifact in manifest.artifacts
     )
     assert not (package_root / INSTALLED_CYTHON_OVERLAY_MANIFEST_FILE_NAME).exists()
-    assert _example_record_path(package_root).read_bytes() == original_record
+    assert example_record_path(package_root).read_bytes() == original_record
 
 
 def test_schema_version_is_bound_into_the_bundle_digest(tmp_path: Path) -> None:
-    package_root, _ = _write_example_distribution(tmp_path)
+    package_root, _ = write_example_distribution(tmp_path)
     overlay_directory = tmp_path / "native-overlay"
     manifest = build_cython_overlay(
         CythonOverlayBuildConfig(package_root=package_root),
@@ -239,7 +239,7 @@ def test_schema_version_is_bound_into_the_bundle_digest(tmp_path: Path) -> None:
     ).encode("utf-8")
     payload["bundle_digest"] = "sha256:" + hashlib.sha256(canonical_bytes).hexdigest()
     _write_manifest_payload(manifest_path, payload)
-    original_record = _example_record_path(package_root).read_bytes()
+    original_record = example_record_path(package_root).read_bytes()
 
     with pytest.raises(
         CythonOverlayManifestError,
@@ -253,13 +253,13 @@ def test_schema_version_is_bound_into_the_bundle_digest(tmp_path: Path) -> None:
         for artifact in manifest.artifacts
     )
     assert not (package_root / INSTALLED_CYTHON_OVERLAY_MANIFEST_FILE_NAME).exists()
-    assert _example_record_path(package_root).read_bytes() == original_record
+    assert example_record_path(package_root).read_bytes() == original_record
 
 
 def test_apply_refuses_a_changed_source_before_installing_any_artifact(
     tmp_path: Path,
 ) -> None:
-    package_root, _ = _write_example_distribution(tmp_path)
+    package_root, _ = write_example_distribution(tmp_path)
     overlay_directory = tmp_path / "native-overlay"
     manifest = build_cython_overlay(
         CythonOverlayBuildConfig(
@@ -281,7 +281,7 @@ def test_apply_refuses_a_changed_source_before_installing_any_artifact(
 def test_apply_never_follows_a_source_symlink(
     tmp_path: Path,
 ) -> None:
-    package_root, _ = _write_example_distribution(tmp_path)
+    package_root, _ = write_example_distribution(tmp_path)
     overlay_directory = tmp_path / "native-overlay"
     manifest = build_cython_overlay(
         CythonOverlayBuildConfig(
@@ -305,8 +305,8 @@ def test_apply_never_follows_a_source_symlink(
 
 
 def test_apply_resumes_from_a_prepared_wheel_record(tmp_path: Path) -> None:
-    package_root, _ = _write_example_distribution(tmp_path)
-    record_path = _example_record_path(package_root)
+    package_root, _ = write_example_distribution(tmp_path)
+    record_path = example_record_path(package_root)
     original_record_rows = _read_record(record_path)
     overlay_directory = tmp_path / "native-overlay"
     build_cython_overlay(
@@ -326,7 +326,7 @@ def test_apply_resumes_from_a_prepared_wheel_record(tmp_path: Path) -> None:
             "sample_native_package/worker.pyc",
         } or path.startswith("sample_native_package/__pycache__/worker."):
             prepared_record_rows[path] = values
-    _write_record(record_path, prepared_record_rows)
+    write_record(record_path, prepared_record_rows)
 
     apply_cython_overlay(overlay_directory, package_root)
 
@@ -338,7 +338,7 @@ def test_apply_resumes_from_a_prepared_wheel_record(tmp_path: Path) -> None:
 
 
 def test_apply_supports_a_source_checkout_without_a_wheel_record(tmp_path: Path) -> None:
-    package_root, license_path = _write_example_distribution(tmp_path, include_record=False)
+    package_root, license_path = write_example_distribution(tmp_path, include_record=False)
     overlay_directory = tmp_path / "native-overlay"
     manifest = build_cython_overlay(
         CythonOverlayBuildConfig(
@@ -353,14 +353,14 @@ def test_apply_supports_a_source_checkout_without_a_wheel_record(tmp_path: Path)
     assert not (package_root / "worker.py").exists()
     assert (package_root / manifest.artifacts[0].installed_artifact_path).is_file()
     assert license_path.read_text(encoding="utf-8") == "Example license text\n"
-    assert not _example_record_path(package_root).exists()
+    assert not example_record_path(package_root).exists()
 
 
 def test_apply_accepts_spec_valid_blank_alternate_and_absolute_source_rows(
     tmp_path: Path,
 ) -> None:
-    package_root, _ = _write_example_distribution(tmp_path)
-    record_path = _example_record_path(package_root)
+    package_root, _ = write_example_distribution(tmp_path)
+    record_path = example_record_path(package_root)
     record_rows = _read_record(record_path)
     record_rows["sample_native_package/worker.py"] = ("", "")
     nested_source_path = package_root / "nested" / "labels.py"
@@ -371,7 +371,7 @@ def test_apply_accepts_spec_valid_blank_alternate_and_absolute_source_rows(
         "sha512=" + sha512_digest.decode("ascii"),
         str(len(nested_contents)),
     )
-    _write_record(record_path, record_rows)
+    write_record(record_path, record_rows)
     overlay_directory = tmp_path / "native-overlay"
     build_cython_overlay(
         CythonOverlayBuildConfig(package_root=package_root),
@@ -392,11 +392,11 @@ def test_apply_accepts_spec_valid_blank_alternate_and_absolute_source_rows(
 def test_apply_refuses_an_unowned_package_among_installed_distributions(
     tmp_path: Path,
 ) -> None:
-    package_root, _ = _write_example_distribution(tmp_path, include_record=False)
+    package_root, _ = write_example_distribution(tmp_path, include_record=False)
     unrelated_metadata_root = package_root.parent / "unrelated-1.0.dist-info"
     unrelated_metadata_root.mkdir()
     unrelated_record_path = unrelated_metadata_root / "RECORD"
-    _write_record(
+    write_record(
         unrelated_record_path,
         {"unrelated-1.0.dist-info/RECORD": ("", "")},
     )
@@ -417,7 +417,7 @@ def test_apply_refuses_an_unowned_package_among_installed_distributions(
 
 
 def test_apply_refuses_an_unrecorded_native_artifact_collision(tmp_path: Path) -> None:
-    package_root, _ = _write_example_distribution(tmp_path)
+    package_root, _ = write_example_distribution(tmp_path)
     overlay_directory = tmp_path / "native-overlay"
     manifest = build_cython_overlay(
         CythonOverlayBuildConfig(
@@ -429,18 +429,18 @@ def test_apply_refuses_an_unrecorded_native_artifact_collision(tmp_path: Path) -
     artifact = manifest.artifacts[0]
     destination_path = package_root / artifact.installed_artifact_path
     destination_path.write_bytes((overlay_directory / artifact.artifact_path).read_bytes())
-    original_record_bytes = _example_record_path(package_root).read_bytes()
+    original_record_bytes = example_record_path(package_root).read_bytes()
 
     with pytest.raises(CythonOverlayApplyError, match="conflicts with an existing native artifact"):
         apply_cython_overlay(overlay_directory, package_root)
 
     assert (package_root / "worker.py").is_file()
     assert destination_path.is_file()
-    assert _example_record_path(package_root).read_bytes() == original_record_bytes
+    assert example_record_path(package_root).read_bytes() == original_record_bytes
 
 
 def test_apply_refuses_ambiguous_wheel_record_ownership(tmp_path: Path) -> None:
-    package_root, _ = _write_example_distribution(tmp_path)
+    package_root, _ = write_example_distribution(tmp_path)
     overlay_directory = tmp_path / "native-overlay"
     manifest = build_cython_overlay(
         CythonOverlayBuildConfig(
@@ -449,14 +449,14 @@ def test_apply_refuses_ambiguous_wheel_record_ownership(tmp_path: Path) -> None:
         ),
         overlay_directory,
     )
-    original_record_path = _example_record_path(package_root)
+    original_record_path = example_record_path(package_root)
     duplicate_metadata_root = package_root.parent / "duplicate-1.0.dist-info"
     duplicate_metadata_root.mkdir()
     duplicate_record_path = duplicate_metadata_root / "RECORD"
     duplicate_rows = _read_record(original_record_path)
     duplicate_rows.pop("sample_native_package-7.2.dist-info/RECORD")
     duplicate_rows["duplicate-1.0.dist-info/RECORD"] = ("", "")
-    _write_record(duplicate_record_path, duplicate_rows)
+    write_record(duplicate_record_path, duplicate_rows)
     original_record_bytes = original_record_path.read_bytes()
 
     with pytest.raises(CythonOverlayApplyError, match="ambiguous wheel RECORD ownership"):
@@ -468,7 +468,7 @@ def test_apply_refuses_ambiguous_wheel_record_ownership(tmp_path: Path) -> None:
 
 
 def test_apply_refuses_a_malformed_wheel_record_before_mutation(tmp_path: Path) -> None:
-    package_root, _ = _write_example_distribution(tmp_path)
+    package_root, _ = write_example_distribution(tmp_path)
     overlay_directory = tmp_path / "native-overlay"
     manifest = build_cython_overlay(
         CythonOverlayBuildConfig(
@@ -477,7 +477,7 @@ def test_apply_refuses_a_malformed_wheel_record_before_mutation(tmp_path: Path) 
         ),
         overlay_directory,
     )
-    record_path = _example_record_path(package_root)
+    record_path = example_record_path(package_root)
     record_path.write_text("not,three-fields\n", encoding="utf-8")
     malformed_record_bytes = record_path.read_bytes()
 
@@ -494,7 +494,7 @@ def test_apply_refuses_a_signed_wheel_record_before_mutation(
     tmp_path: Path,
     signature_name: str,
 ) -> None:
-    package_root, _ = _write_example_distribution(tmp_path)
+    package_root, _ = write_example_distribution(tmp_path)
     overlay_directory = tmp_path / "native-overlay"
     manifest = build_cython_overlay(
         CythonOverlayBuildConfig(
@@ -503,7 +503,7 @@ def test_apply_refuses_a_signed_wheel_record_before_mutation(
         ),
         overlay_directory,
     )
-    record_path = _example_record_path(package_root)
+    record_path = example_record_path(package_root)
     (record_path.parent / signature_name).write_text("signed", encoding="utf-8")
     original_record_bytes = record_path.read_bytes()
 
@@ -519,7 +519,7 @@ def test_verification_reports_artifact_tampering_and_target_mismatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    package_root, _ = _write_example_distribution(tmp_path)
+    package_root, _ = write_example_distribution(tmp_path)
     overlay_directory = tmp_path / "native-overlay"
     manifest = build_cython_overlay(
         CythonOverlayBuildConfig(
@@ -553,7 +553,7 @@ def test_verification_reports_artifact_tampering_and_target_mismatch(
 def test_verification_reports_a_final_wheel_record_that_lost_native_ownership(
     tmp_path: Path,
 ) -> None:
-    package_root, _ = _write_example_distribution(tmp_path)
+    package_root, _ = write_example_distribution(tmp_path)
     overlay_directory = tmp_path / "native-overlay"
     manifest = build_cython_overlay(
         CythonOverlayBuildConfig(
@@ -563,10 +563,10 @@ def test_verification_reports_a_final_wheel_record_that_lost_native_ownership(
         overlay_directory,
     )
     apply_cython_overlay(overlay_directory, package_root)
-    record_path = _example_record_path(package_root)
+    record_path = example_record_path(package_root)
     record_rows = _read_record(record_path)
     record_rows.pop(f"sample_native_package/{manifest.artifacts[0].installed_artifact_path}")
-    _write_record(record_path, record_rows)
+    write_record(record_path, record_rows)
 
     verification_outcome = verify_cython_overlay(
         overlay_directory,
@@ -582,7 +582,7 @@ def test_verification_reports_a_final_wheel_record_that_lost_native_ownership(
 
 
 def test_build_is_reproducible_across_output_directories(tmp_path: Path) -> None:
-    package_root, _ = _write_example_distribution(tmp_path)
+    package_root, _ = write_example_distribution(tmp_path)
     build_config = CythonOverlayBuildConfig(
         package_root=package_root,
         module_names=("sample_native_package.worker",),
@@ -603,7 +603,7 @@ def test_build_is_reproducible_across_output_directories(tmp_path: Path) -> None
 
 
 def test_verification_rejects_an_unrecorded_directory(tmp_path: Path) -> None:
-    package_root, _ = _write_example_distribution(tmp_path)
+    package_root, _ = write_example_distribution(tmp_path)
     overlay_directory = tmp_path / "native-overlay"
     build_cython_overlay(
         CythonOverlayBuildConfig(
@@ -629,7 +629,7 @@ def test_manifest_is_canonical_json_and_cli_verifies_it(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    package_root, _ = _write_example_distribution(tmp_path)
+    package_root, _ = write_example_distribution(tmp_path)
     overlay_directory = tmp_path / "native-overlay"
     manifest = build_cython_overlay(
         CythonOverlayBuildConfig(
@@ -654,6 +654,6 @@ def test_distribution_version_fixture_is_visible_to_the_current_interpreter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    package_root, _ = _write_example_distribution(tmp_path)
+    package_root, _ = write_example_distribution(tmp_path)
     monkeypatch.syspath_prepend(str(package_root.parent))
     assert importlib.metadata.version("sample-native-package") == "7.2"
