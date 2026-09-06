@@ -393,6 +393,17 @@ class TestFetchUri:
         with pytest.raises(FileNotFoundError):
             fetch_uri(tmp_path / "missing.mcap")
 
+    def test_default_mirror_is_stable_per_url(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HFLOW_MIRROR_DIR", str(tmp_path / "mirrors"))
+        first = BucketStorageRoot("gs://bucket/prefix")
+        second = BucketStorageRoot("gs://bucket/prefix/")
+        other = BucketStorageRoot("gs://bucket/other")
+        assert first.mirror == second.mirror
+        assert first.mirror != other.mirror
+        assert first.mirror.is_relative_to(tmp_path / "mirrors")
+
     def test_bucket_uri_naming_no_object_is_refused(self) -> None:
         refused = [
             "gs://bucket/",
