@@ -945,8 +945,22 @@ def camera_stability(
     *,
     cameras: Sequence[str] | None = None,
     horizontal_field_of_view_degrees: float = DEFAULT_HORIZONTAL_FIELD_OF_VIEW_DEGREES,
+    shake_threshold_dps: float = 0.0,
+    unstable_min_duration_s: float = 0.0,
 ) -> CheckResult:
     """How much of each camera's footage is shaky rather than deliberately moving.
+
+    Two knobs trade sensitivity for legibility, both off by default so the
+    instrument's own rule stands: ``shake_threshold_dps`` is a minimum shake
+    rate a frame pair must clear to count as unstable (the resolution floor,
+    one pixel per frame, still applies), and ``unstable_min_duration_s`` drops
+    unstable runs shorter than it from the intervals. Hand-held footage
+    clears the resolution floor almost continuously by fractions of a degree,
+    which is real motion but not what a person calls a shaky camera; a
+    threshold of a few degrees per second and a quarter second of run leaves
+    the spans a viewer would point at. The threshold also enters the unstable
+    share and seconds, since they count the same pairs; the duration filter
+    shapes the intervals only.
 
     Requires the ``motion`` extra (``pip install 'hflow[motion]'``). This is the
     one built-in with a dependency outside the core install, because optical flow
@@ -993,6 +1007,7 @@ def camera_stability(
             settings=CameraMotionSettings(
                 frames_per_second=1.0 / median_interval_s,
                 horizontal_field_of_view_degrees=horizontal_field_of_view_degrees,
+                minimum_shake_degrees_per_second=shake_threshold_dps,
             ),
         )
         if isinstance(camera_motion_result, InsufficientVideoFrames):
@@ -1030,7 +1045,12 @@ def camera_stability(
         for pair_index in motion.unstable_pair_indices:
             if pair_index < len(unstable_mask):
                 unstable_mask[pair_index] = True
-        intervals.extend(_mask_run_intervals(stamps_ns, unstable_mask, f"unstable:{topic}"))
+        minimum_duration_ns = int(unstable_min_duration_s * 1e9)
+        intervals.extend(
+            interval
+            for interval in _mask_run_intervals(stamps_ns, unstable_mask, f"unstable:{topic}")
+            if interval.end_ns - interval.start_ns >= minimum_duration_ns
+        )
     return CheckResult(measurements=measurements, intervals=intervals)
 
 

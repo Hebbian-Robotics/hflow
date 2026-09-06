@@ -291,6 +291,53 @@ def test_the_check_reports_stability_with_its_coverage(still_texture: Path, tmp_
     assert result.verdict is None
 
 
+def test_the_check_knobs_raise_the_bar_without_changing_the_rate_measurements(
+    still_texture: Path, tmp_path: Path
+) -> None:
+    """A shake threshold above the footage's rates leaves nothing unstable, and
+    a minimum duration longer than the episode drops every interval while
+    the share it was cut from still reports the raw rule."""
+    from hflow.testing import VideoEpisodeSpec, write_video_episode
+    from hflow.transform import TransformConfig, write_canonical_episode
+
+    shaky = _render_camera_path(still_texture, tmp_path / "shaky.mp4", *_shake(24))
+    source = write_video_episode(
+        shaky,
+        tmp_path / "episode.mcap",
+        VideoEpisodeSpec(
+            duration_s=float(_DURATION_S),
+            image_hz=float(_FRAMES_PER_SECOND),
+            image_width=320,
+            image_height=240,
+            camera_name="head_camera",
+        ),
+    )
+    canonical = tmp_path / "episode.canonical.mcap"
+    write_canonical_episode(source, canonical, TransformConfig())
+    with hflow.Episode(canonical) as episode:
+        camera_topic = episode.cameras[0]
+        baseline = camera_stability(episode)
+        above_every_rate = camera_stability(episode, shake_threshold_dps=1e6)
+        longer_than_the_episode = camera_stability(
+            episode, unstable_min_duration_s=float(_DURATION_S) + 1.0
+        )
+
+    assert baseline.intervals
+    assert above_every_rate.intervals == []
+    assert above_every_rate.measurements[f"{camera_topic}/unstable_share"] == 0.0
+    assert longer_than_the_episode.intervals == []
+    assert (
+        longer_than_the_episode.measurements[f"{camera_topic}/unstable_share"]
+        == baseline.measurements[f"{camera_topic}/unstable_share"]
+    )
+    # The rates describe the footage, not the knobs.
+    for key in ("shake_rate_p50_dps", "shake_rate_p95_dps"):
+        assert (
+            above_every_rate.measurements[f"{camera_topic}/{key}"]
+            == (baseline.measurements[f"{camera_topic}/{key}"])
+        )
+
+
 # ``luma_frames`` itself is tested in tests/test_ffmpeg.py, beside the other
 # ffmpeg helpers: it needs only numpy, so keeping it here would have skipped it
 # whenever the motion extra is absent.

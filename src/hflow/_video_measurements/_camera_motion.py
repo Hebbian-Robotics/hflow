@@ -50,10 +50,22 @@ class CameraMotionSettings:
 
     frames_per_second: float
     horizontal_field_of_view_degrees: float = DEFAULT_HORIZONTAL_FIELD_OF_VIEW_DEGREES
+    # A pair counts as unstable only when its shake rate clears this as well as
+    # the instrument's resolution floor. Zero keeps the floor alone.
+    minimum_shake_degrees_per_second: float = 0.0
 
     def __post_init__(self) -> None:
         require_float(self.frames_per_second, "frames_per_second")
         require_float(self.horizontal_field_of_view_degrees, "horizontal_field_of_view_degrees")
+        require_float(self.minimum_shake_degrees_per_second, "minimum_shake_degrees_per_second")
+        if (
+            not math.isfinite(self.minimum_shake_degrees_per_second)
+            or self.minimum_shake_degrees_per_second < 0
+        ):
+            raise ValueError(
+                "minimum_shake_degrees_per_second must be finite and non-negative, "
+                f"got {self.minimum_shake_degrees_per_second}"
+            )
         if not math.isfinite(self.frames_per_second) or self.frames_per_second <= 0:
             raise ValueError(
                 f"frames_per_second must be finite and positive, got {self.frames_per_second}"
@@ -294,8 +306,12 @@ def measure_camera_motion(
     )
     shake_rates = np.linalg.norm(shake_rate_axes, axis=1)
     intentional_rates = np.linalg.norm(angular_rate_axes - shake_rate_axes, axis=1)
+    # The floor a pair's shake must clear is the instrument's own resolution
+    # (one pixel per frame), raised to the caller's minimum when they set one:
+    # sub-degree jitter is real but not what anyone means by a shaky camera.
+    shake_floor = max(resolution_floor, settings.minimum_shake_degrees_per_second)
     unstable_pair_mask = (
-        measurable_pair_mask & (shake_rates > intentional_rates) & (shake_rates > resolution_floor)
+        measurable_pair_mask & (shake_rates > intentional_rates) & (shake_rates > shake_floor)
     )
     measured_pair_count = int(np.count_nonzero(measurable_pair_mask))
     unstable_pair_count = int(np.count_nonzero(unstable_pair_mask))
