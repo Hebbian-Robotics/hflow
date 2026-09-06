@@ -267,3 +267,24 @@ particularly the limitations.
   surface, the measurement-key naming rules, and coverage denominators.
 - [Architecture: quality checks and curation](../ARCHITECTURE.md) -- why checks
   record evidence and gates are optional policy.
+
+
+## `camera_stability`
+
+`camera_stability` monitors the angular velocity of the camera and flags periods of excessive motion.  
+Two optional tuning knobs are available:
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `shake_threshold_dps` | `0.0` | Angular velocity threshold (degrees per second). When the camera’s instantaneous angular velocity exceeds this value, the check considers the camera to be “shaking”. |
+| `unstable_min_duration_s` | `0.0` | Minimum duration (seconds) that the camera must stay above `shake_threshold_dps` to be reported as unstable. This prevents brief spikes from being flagged. |
+
+### Example
+
+```python
+from hflow import CameraStability
+
+check = CameraStability(
+    shake_threshold_dps=5.0,          # 5 °/s threshold
+    unstable_min_duration_s=0.5      # at least 0.5 s of shaking
+)
