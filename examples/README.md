@@ -157,6 +157,31 @@ Guide, exact reproduction commands, and output contract:
 - HFlow pipeline: [`build_ai_evaluation/pipeline.py`](./build_ai_evaluation/pipeline.py)
 - Reproduction adapter: [`build_ai_evaluation/evaluate.py`](./build_ai_evaluation/evaluate.py)
 
+## Fault timeline bundle
+
+**Use it for:** one episode whose every flagged span is exportable to a
+static player: a video excerpt with a blackout and a frozen camera injected,
+run through the default checks, the `camera_video` enrichment, and the sampled
+Build AI checks, then written out as an MP4 plus a `timeline.json` of intervals
+on the episode's recorded time axis.
+
+**Prerequisites:** ffmpeg and a source video. The Build AI checks send one JPEG
+per sampled frame to HFlow's hosted check service (no key), which admits one
+request at a time, so a 30 second excerpt at 1 fps takes about a minute per
+check.
+
+```bash
+uv run python examples/fault_timeline/build.py \
+    --source /path/to/egocentric.mp4 --out data/fault-timeline
+```
+
+Produces `data/fault-timeline/episode.mp4` and `data/fault-timeline/timeline.json`.
+The hflow.dev landing page's player is this bundle rendered with Media Chrome.
+
+- Builder: [`fault_timeline/build.py`](./fault_timeline/build.py)
+- Guides: [Publish browser-playable camera video](../docs/how-to/publish-camera-video.md),
+  [Compare vision models on the Build AI evaluations](../docs/how-to/run-build-ai-evaluation.md)
+
 ## EgoSuite projected-hand evaluation
 
 **Use it for:** comparing image-only VLM hand counts with labels derived from
