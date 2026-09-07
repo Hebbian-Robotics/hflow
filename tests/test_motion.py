@@ -395,7 +395,7 @@ def test_camera_stability_refuses_a_bad_fov_on_a_camera_less_episode(
         tmp_path / "episode.mcap",
         SyntheticEpisodeSpec(duration_s=2.0, cameras=(), joint_jump_at_s=1.0),
     )
-    bad_values: list[float] = [-5.0, 0.0, float("nan"), float("inf"), True]  # type: ignore[arg-type]
+    bad_values: list[float] = [-5.0, 0.0, 361.0, float("nan"), float("inf"), True]
     for bad_value in bad_values:
         with (
             hflow.Episode(episode_path) as episode,
@@ -404,7 +404,13 @@ def test_camera_stability_refuses_a_bad_fov_on_a_camera_less_episode(
                 match=r"^horizontal_field_of_view_degrees must be finite and in \(0, 360\], got .+$",
             ),
         ):
-            camera_stability(episode, horizontal_field_of_view_degrees=bad_value)  # type: ignore[arg-type]
+            camera_stability(episode, horizontal_field_of_view_degrees=bad_value)
+
+    # The bound is inclusive at 360, and the guard must not refuse the widest
+    # legal lens. Without this the whole range check could be `< 360` and every
+    # case above would still pass.
+    with hflow.Episode(episode_path) as episode:
+        assert camera_stability(episode, horizontal_field_of_view_degrees=360.0).measurements == {}
 
 
 def test_the_check_knobs_raise_the_bar_without_changing_the_rate_measurements(
