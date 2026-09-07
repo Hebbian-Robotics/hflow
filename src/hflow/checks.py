@@ -1001,6 +1001,15 @@ def camera_stability(
     ):
         raise ValueError("unstable_min_duration_s must be finite and non-negative")
 
+    if (
+        isinstance(horizontal_field_of_view_degrees, bool)
+        or not np.isfinite(horizontal_field_of_view_degrees)
+        or not 0 < horizontal_field_of_view_degrees <= 360
+    ):
+        raise ValueError(
+            f"horizontal_field_of_view_degrees must be finite and in (0, 360], got {horizontal_field_of_view_degrees}"
+        )
+
     selected_cameras = list(cameras) if cameras is not None else episode.cameras
     measurements: dict[str, MeasurementValue] = {}
     intervals: list[Interval] = []

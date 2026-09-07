@@ -331,8 +331,18 @@ def stability_episode(still_texture: Path, tmp_path_factory: pytest.TempPathFact
             "unstable_min_duration_s",
             lambda episode, value: camera_stability(episode, unstable_min_duration_s=value),
         ),
+        (
+            "horizontal_field_of_view_degrees",
+            lambda episode, value: camera_stability(
+                episode, horizontal_field_of_view_degrees=value
+            ),
+        ),
     ],
-    ids=["shake_threshold_dps", "unstable_min_duration_s"],
+    ids=[
+        "shake_threshold_dps",
+        "unstable_min_duration_s",
+        "horizontal_field_of_view_degrees",
+    ],
 )
 @pytest.mark.parametrize(
     "value",
@@ -345,19 +355,56 @@ def test_camera_stability_refuses_a_bad_tuning_value(
     call_with: Callable[[hflow.Episode, float], hflow.CheckResult],
     value: float,
 ) -> None:
-    """Both knobs refuse the same four values, each under its own name.
+    """All three knobs refuse the same four bad values, each under its own name.
 
     ``True`` is in the list because ``bool`` subclasses ``int``: without the
-    guard it would pass as one degree per second, or one second of run.
+    guard it would pass as one degree per second, one second of run, or one
+    degree of field of view.
 
     Each case passes its argument through a real keyword rather than unpacking
-    a dict, so the call stays type-checked.
+    a dict, so the call stays type-checked. The field-of-view guard needs
+    (0, 360] while the other two accept zero, so zero is covered separately
+    in test_camera_stability_refuses_a_bad_fov_on_a_camera_less_episode.
     """
+    if parameter == "horizontal_field_of_view_degrees":
+        expected_match = (
+            r"^horizontal_field_of_view_degrees must be finite and in \(0, 360\], got .+$"
+        )
+    else:
+        expected_match = rf"^{parameter} must be finite and non-negative$"
     with (
         hflow.Episode(stability_episode) as episode,
-        pytest.raises(ValueError, match=rf"^{parameter} must be finite and non-negative$"),
+        pytest.raises(ValueError, match=expected_match),
     ):
         call_with(episode, value)
+
+
+def test_camera_stability_refuses_a_bad_fov_on_a_camera_less_episode(
+    tmp_path: Path,
+) -> None:
+    """The field-of-view guard must run even when no camera is present.
+
+    The other two guards already ran before the camera loop; the field-of-view
+    check used to live inside that loop, so a state-only episode bypassed it.
+    This is the regression: without the top-level guard the call below would
+    be accepted, while the same bad value on a video episode is refused.
+    """
+    from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
+
+    episode_path = synthesize_episode(
+        tmp_path / "episode.mcap",
+        SyntheticEpisodeSpec(duration_s=2.0, cameras=(), joint_jump_at_s=1.0),
+    )
+    bad_values: list[float] = [-5.0, 0.0, float("nan"), float("inf"), True]  # type: ignore[arg-type]
+    for bad_value in bad_values:
+        with (
+            hflow.Episode(episode_path) as episode,
+            pytest.raises(
+                ValueError,
+                match=r"^horizontal_field_of_view_degrees must be finite and in \(0, 360\], got .+$",
+            ),
+        ):
+            camera_stability(episode, horizontal_field_of_view_degrees=bad_value)  # type: ignore[arg-type]
 
 
 def test_the_check_knobs_raise_the_bar_without_changing_the_rate_measurements(
