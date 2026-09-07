@@ -1229,6 +1229,30 @@ def test_reject_non_single_select_accepts_select_with_leading_comments_and_cte()
     reject_non_single_select("SELECT * FROM pragma_version()")
 
 
+def test_reject_non_single_select_accepts_legal_selects_that_do_not_start_with_select() -> None:
+    # Review of #453: the previous text-prefix heuristic rejected every query
+    # that didn't start with SELECT or WITH, but DuckDB labels FROM-first
+    # queries, parenthesized selects, and VALUES clauses as
+    # StatementType.SELECT and accepts them inside ``FROM (<sql>)`` -- the
+    # shape preview interpolates. The gate must accept them too.
+    reject_non_single_select("FROM range(3)")
+    reject_non_single_select("FROM range(3) WHERE range > 0")
+    reject_non_single_select("(SELECT 1)")
+    reject_non_single_select("(SELECT 1 AS one)")
+    reject_non_single_select("VALUES (1), (2)")
+    reject_non_single_select("VALUES (1, 'a'), (2, 'b')")
+    # FROM-first against a real catalog column. A SELECT previewed from this
+    # is the case the reviewer flagged as "the one that matters".
+    reject_non_single_select("FROM episodes WHERE status = 'ok'")
+
+
+def test_reject_non_single_select_accepts_trailing_line_comment_without_newline() -> None:
+    # Without the fix, ``SELECT * FROM (SELECT 1 -- trailing comment)`` is a
+    # parser error: the trailing line comment swallows the wrapper's closing
+    # paren. Appending a newline before wrapping ends the comment first.
+    reject_non_single_select("SELECT 1 -- trailing comment without newline")
+
+
 def test_constrained_curate_writes_the_manifest_but_refuses_outside_reads(
     tmp_path: Path,
 ) -> None:

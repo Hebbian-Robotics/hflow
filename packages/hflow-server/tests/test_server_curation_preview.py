@@ -237,3 +237,16 @@ def test_preview_accepts_select_with_leading_comments_and_cte(api: TestClient) -
         "WITH c AS (SELECT 1 AS one) SELECT * FROM c",
     ):
         assert api.post("/api/v1/curation/preview", json={"sql": sql}).status_code == 200
+
+
+def test_preview_accepts_from_first_and_parenthesized_selects(api: TestClient) -> None:
+    # Review of #453: FROM-first queries, parenthesized SELECTs, and VALUES
+    # clauses are legal read-only DuckDB statements (StatementType.SELECT)
+    # that the preview endpoint must run end-to-end, not refuse at the gate.
+    for sql in (
+        "FROM episodes WHERE status = 'ok'",
+        "(SELECT episode_id FROM episodes)",
+        "VALUES (1, 'a'), (2, 'b')",
+    ):
+        response = api.post("/api/v1/curation/preview", json={"sql": sql})
+        assert response.status_code == 200, response.text

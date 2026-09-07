@@ -104,6 +104,16 @@ _TABLE_DIRECTORIES = {
 # dataset membership asks the same question and the two answers must agree.
 _RAN_STATUSES = tuple(status.value for status in RAN_STATUSES)
 
+# Leading keywords the curation gate refuses even though DuckDB labels them
+# ``StatementType.SELECT``. ``PRAGMA`` is caught by the subquery parse as
+# well; ``DESCRIBE``, ``SHOW`` and ``SUMMARIZE`` parse cleanly inside
+# ``FROM (<sql>)`` (DuckDB treats them as table functions) so the parse
+# check alone would let them through, which is not what the endpoints
+# advertise (issue #450, review of #453).
+_SUBQUERY_FORBIDDEN_LEADING_KEYWORDS = frozenset({"pragma", "describe", "show", "summarize"})
+# The first SQL identifier after any leading whitespace or comments.
+_LEADING_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
 
 def _column_ddl_for(directory_name: str) -> str:
     """The stored columns of one catalog directory, for an EMPTY relation.
@@ -555,17 +565,17 @@ class NonSingleSelectQueryError(ValueError):
     """
 
 
-def _strip_leading_sql_comments(sql: str) -> str:
-    """Leading whitespace and SQL comments stripped, for SELECT-text check.
+def _leading_keyword(sql: str) -> str:
+    """First SQL identifier at the head of *sql*, after any leading comments.
 
     DuckDB labels ``PRAGMA database_list``, ``DESCRIBE SELECT 1``,
     ``SHOW TABLES`` and ``SUMMARIZE SELECT 1`` as ``StatementType.SELECT``
-    (they are table functions), so a bare type check would accept them.
-    The curation endpoints advertise exactly one read-only SELECT, so the
-    gate also requires the text to look like a SELECT — ``SELECT`` or
-    ``WITH`` (a CTE) after any leading ``--`` / ``/* */`` comments.
+    because they are table functions, and it accepts the latter three
+    inside ``FROM (<sql>)`` (the preview wrapper's shape) -- so a parse-based
+    subquery check alone would let them through. The curation endpoints
+    advertise exactly one read-only SELECT, so the gate also refuses these
+    keywords when they head the original text.
     """
-
     stripped = sql.lstrip()
     while True:
         if stripped.startswith("--"):
@@ -581,7 +591,8 @@ def _strip_leading_sql_comments(sql: str) -> str:
             stripped = stripped[end + 2 :].lstrip()
             continue
         break
-    return stripped
+    match = _LEADING_IDENTIFIER_RE.match(stripped)
+    return match.group(0).lower() if match else ""
 
 
 def reject_non_single_select(sql: str) -> None:
@@ -596,23 +607,52 @@ def reject_non_single_select(sql: str) -> None:
     touches the connection.  A syntactically invalid string propagates the
     parser's ``duckdb.Error`` untouched — that is NOT this exception — so
     the two failure modes stay distinguishable.
+
+    The narrowing for ``PRAGMA`` / ``DESCRIBE`` / ``SHOW`` / ``SUMMARIZE``
+    asks DuckDB the same question the preview wrapper does: does the SQL
+    parse inside ``SELECT * FROM (<sql>)``? ``extract_statements`` on that
+    form accepts everything that runs as a subquery -- including FROM-first
+    queries, parenthesized SELECTs, and VALUES clauses that were
+    mis-rejected by the previous SELECT/WITH text-prefix heuristic (review
+    of #453) -- and refuses the four table-function keywords that the
+    endpoints refuse to advertise. Trailing semicolons and whitespace are
+    stripped before wrapping, and a newline is appended when missing, so
+    a trailing ``--`` line comment cannot swallow the wrapper's closing
+    paren.
     """
     parser_connection = duckdb.connect()
     try:
+        # ``extract_statements`` on the user's SQL surfaces genuine parse
+        # failures (a typoed keyword, an unterminated block comment) as
+        # ``duckdb.Error`` and the gate propagates them untouched so the
+        # server's 400 detail can be DuckDB's own diagnostic -- that
+        # distinction is the rule's failure-mode contract.
         statements = parser_connection.extract_statements(sql)
+        if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
+            raise NonSingleSelectQueryError("sql must be exactly one SELECT statement")
+        # Refuse PRAGMA/DESCRIBE/SHOW/SUMMARIZE by leading keyword. DuckDB
+        # labels them SELECT, and DESCRIBE/SHOW/SUMMARIZE even parse cleanly
+        # as subqueries -- only ``SELECT * FROM (PRAGMA database_list)``
+        # raises a parser error -- so the parse check below is necessary
+        # but not sufficient: this leading-keyword refusal is what keeps
+        # the gate in step with what the endpoints advertise.
+        if _leading_keyword(sql) in _SUBQUERY_FORBIDDEN_LEADING_KEYWORDS:
+            raise NonSingleSelectQueryError("sql must be exactly one read-only SELECT statement")
+        # Parse the SQL inside the wrapper preview actually applies. Trailing
+        # semicolons and whitespace are stripped so a single ``SELECT 1;``
+        # still parses (curate()'s downstream ``connection.sql()`` handles
+        # trailing ``;`` itself; the server-side preview handler strips them
+        # at the boundary), and a newline is appended so a trailing ``--``
+        # comment without one cannot swallow the wrapper's ``)``.
+        wrapped_input = f"SELECT * FROM ({sql.rstrip().rstrip(';').rstrip()}\n)"
+        try:
+            parser_connection.extract_statements(wrapped_input)
+        except duckdb.Error as exc:
+            raise NonSingleSelectQueryError(
+                "sql must be exactly one read-only SELECT statement"
+            ) from exc
     finally:
         parser_connection.close()
-    if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
-        raise NonSingleSelectQueryError("sql must be exactly one SELECT statement")
-    # Narrow to actual SELECT text: DuckDB reports PRAGMA/DESCRIBE/SHOW/
-    # SUMMARIZE as SELECT, but the endpoints advertise SELECT only and preview
-    # interpolates the SQL as a subquery (``SELECT * FROM (<sql>)``) where
-    # those forms are a syntax error. Rejecting them here keeps preview and
-    # pin consistent and avoids blaming the caller for our wrapper's parse
-    # failure (``DESCRIBE SELECT * FROM (PRAGMA database_list)``).
-    stripped = _strip_leading_sql_comments(sql.strip())
-    if not re.match(r"(?i)^(SELECT|WITH)\b", stripped):
-        raise NonSingleSelectQueryError("sql must be exactly one read-only SELECT statement")
 
 
 def _stage_manifest_and_count(

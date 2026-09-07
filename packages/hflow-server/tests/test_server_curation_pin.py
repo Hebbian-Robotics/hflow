@@ -239,3 +239,21 @@ def test_pin_rejects_pragma_and_describe_consistently(
         assert preview_response.json()["detail"] == pin_response.json()["detail"]
         assert "DESCRIBE SELECT * FROM" not in pin_response.json()["detail"]
         assert "syntax error at or near" not in pin_response.json()["detail"]
+
+
+def test_pin_accepts_from_first_and_parenthesized_selects(
+    writable_api: TestClient,
+) -> None:
+    # Parallel coverage with preview: the gate used to refuse every query
+    # that didn't start with SELECT or WITH, so FROM-first queries that
+    # preview accepts silently failed pin. They are legal DuckDB SELECTs
+    # that must reach both endpoints consistently.
+    for sql in (
+        "FROM episodes WHERE status = 'ok'",
+        "(SELECT episode_id FROM episodes)",
+        "VALUES (1, 'a'), (2, 'b')",
+    ):
+        response = writable_api.post(
+            "/api/v1/curation/pin", json={"sql": sql, "name": f"accepts {sql[:10]}"}
+        )
+        assert response.status_code == 200, response.text
