@@ -67,6 +67,29 @@ def test_second_pin_with_the_same_name_gets_a_distinct_file(
     assert listed_ids == [second_entry["id"], first_entry["id"]]
 
 
+def test_pinned_manifest_registry_cap_refuses_the_first_entry_past_the_limit(
+    writable_api: TestClient,
+    writable_workspace: PopulatedWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cap = 1
+    monkeypatch.setattr(_curation, "_MAX_PINNED_MANIFESTS", cap)
+
+    first = _pin(writable_api, "first")
+    over_cap = writable_api.post(
+        "/api/v1/curation/pin", json={"sql": OK_CUT_SQL, "name": "second"}
+    )
+    assert over_cap.status_code == 409
+    assert over_cap.json()["detail"] == (
+        f"this workspace already has {cap} pinned manifests "
+        "(the registry cap); remove some before pinning more"
+    )
+    assert writable_api.get("/api/v1/manifests").json()["manifests"] == [first]
+    assert list((writable_workspace.data_root / "manifests").glob("*.parquet")) == [
+        writable_workspace.data_root / first["manifest_path"]
+    ]
+
+
 def test_a_filename_collision_is_refused_never_overwritten(
     writable_api: TestClient,
     writable_workspace: PopulatedWorkspace,
