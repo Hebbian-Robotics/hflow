@@ -2215,9 +2215,14 @@ def test_success_label_omitted_when_source_has_no_outcome_feature(
 
 
 def test_converter_version_bumped_with_the_label_support() -> None:
-    """The label changes episode/v1 bytes, which content_episode_id hashes:
-    the converter version moves with the change, not after it."""
-    assert prep.CONVERTER_VERSION == "lerobot-converter-v7"
+    """The converter version moves with any change to the published bytes.
+
+    The label changed episode/v1, which content_episode_id hashes. Reading a
+    fractional fps as declared moves every message log time. Reuse keys on
+    this stamp, so a version that lags a byte change makes stale output look
+    like completed work.
+    """
+    assert prep.CONVERTER_VERSION == "lerobot-converter-v8"
 
 
 def test_reuse_refuses_a_landing_episode_with_damaged_payload(

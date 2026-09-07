@@ -55,7 +55,11 @@ DEFAULT_CAMERA_KEY = "observation.image"
 # can prove a landing file belongs to this exact selection (#303). Those
 # fields change the canonical bytes that content_episode_id hashes, so v5
 # and v6 outputs must not share a converter identity.
-CONVERTER_VERSION = "lerobot-converter-v7"
+# "v8": a fractional source fps is no longer floored, so every message log
+# time on a corpus declaring one (29.97, say) moves. A v7 file of such a
+# corpus carries the stretched time axis, and resume would otherwise accept
+# it as completed work.
+CONVERTER_VERSION = "lerobot-converter-v8"
 # Canonical transform knobs that affect published bytes for this importer.
 IMPORT_GOP_SECONDS = 1.0
 # The v3 per-episode aggregate of the collector's frame-level next.success
