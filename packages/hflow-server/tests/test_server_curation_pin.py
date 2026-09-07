@@ -76,9 +76,7 @@ def test_pinned_manifest_registry_cap_refuses_the_first_entry_past_the_limit(
     monkeypatch.setattr(_curation, "_MAX_PINNED_MANIFESTS", cap)
 
     first = _pin(writable_api, "first")
-    over_cap = writable_api.post(
-        "/api/v1/curation/pin", json={"sql": OK_CUT_SQL, "name": "second"}
-    )
+    over_cap = writable_api.post("/api/v1/curation/pin", json={"sql": OK_CUT_SQL, "name": "second"})
     assert over_cap.status_code == 409
     assert over_cap.json()["detail"] == (
         f"this workspace already has {cap} pinned manifests "
