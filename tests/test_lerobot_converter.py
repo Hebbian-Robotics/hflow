@@ -1158,6 +1158,64 @@ def _install_publish_through_convert(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     return published_keys
 
 
+def test_fractional_fps_reaches_conversion_untruncated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fractional source fps must not be floored on the way to conversion.
+
+    meta/info.json is allowed a non-integer fps, and NTSC corpora ship 29.97.
+    Truncating it to 29 stretches the canonical time axis by about a second
+    every thirty and moves the keyframe interval off the GOP the provenance
+    record claims.
+    """
+    received_fps: list[object] = []
+
+    def capture_convert(*, frames_per_second: object, **_kwargs: object) -> prep._PublishedEpisode:
+        received_fps.append(frames_per_second)
+        staged = tmp_path / "staged.mcap"
+        staged.write_bytes(b"episode")
+        return {
+            "uri": "file:///landing/lerobot_episode_0001.mcap",
+            "content_id": prep.content_episode_id(staged),
+            "size_bytes": staged.stat().st_size,
+        }
+
+    info = _stub_single_episode_info()
+    info["fps"] = 29.97
+
+    monkeypatch.setattr(prep, "_convert_single_episode", capture_convert)
+    monkeypatch.setattr(
+        prep, "_hf_repo_info", lambda repo, rev: {"sha": "abc", "license": "apache-2.0"}
+    )
+    monkeypatch.setattr(
+        prep,
+        "_ensure_source_archive",
+        lambda dataset_source, cache_dir: _source_archive(
+            dataset_source,
+            cache_dir,
+            info=info,
+            episodes=[
+                prep._EpisodeRow(
+                    episode_index=0,
+                    task="push",
+                    length=1,
+                    data_chunk="000",
+                    data_file="000",
+                    data_from=0,
+                    data_to=1,
+                )
+            ],
+            video_keys=[prep.DEFAULT_CAMERA_KEY],
+        ),
+    )
+
+    prep.import_lerobot_dataset(
+        dataset_repo="fake/repo", revision="abc", output_dir=tmp_path / "out"
+    )
+
+    assert received_fps == [29.97]
+
+
 @pytest.mark.parametrize(
     "depth_metadata",
     [

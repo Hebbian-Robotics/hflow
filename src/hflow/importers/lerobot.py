@@ -1053,7 +1053,7 @@ def import_lerobot_dataset(
                 episode_index=selected_episode_index,
                 camera_keys=resolved_camera_keys,
                 numeric_schemas=numeric_schemas,
-                frames_per_second=int(source_archive.fps),
+                frames_per_second=source_archive.fps,
             )
         )
         episodes_converted += 1
@@ -1089,7 +1089,7 @@ def _convert_single_episode(
     episode_index: int,
     camera_keys: tuple[str, ...],
     numeric_schemas: dict[str, _NumericSchema],
-    frames_per_second: int,
+    frames_per_second: int | float,
 ) -> _PublishedEpisode:
     """Convert a single episode to canonical MCAP and publish it.
 
@@ -1312,6 +1312,9 @@ def _convert_single_episode(
             )
 
             for frame_index in range(frame_count):
+                # Divided at the source rate, not a truncated one. meta/info.json
+                # is allowed a fractional fps, and 29.97 floored to 29 stretches
+                # the time axis by about a second every thirty.
                 log_time_ns = EPISODE_START_TIME_NS + round(
                     frame_index * NANOSECONDS_PER_SECOND / frames_per_second
                 )
