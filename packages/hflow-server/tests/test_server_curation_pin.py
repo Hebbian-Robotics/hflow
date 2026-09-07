@@ -216,3 +216,26 @@ def test_manifest_download_whose_file_vanished_is_404(
     entry = _pin(writable_api, "soon gone")
     (writable_workspace.data_root / entry["manifest_path"]).unlink()
     assert writable_api.get(f"/api/v1/manifests/{entry['id']}/download").status_code == 404
+
+
+def test_pin_rejects_pragma_and_describe_consistently(
+    writable_api: TestClient, api: TestClient
+) -> None:
+    # Mirrors preview's gate: PRAGMA/DESCRIBE/SHOW are StatementType.SELECT
+    # but not SELECT text, so both endpoints must agree (issue #450).
+    for sql in (
+        "PRAGMA database_list",
+        "PRAGMA show_tables",
+        "PRAGMA version",
+        "DESCRIBE SELECT 1",
+        "SHOW TABLES",
+        "SUMMARIZE SELECT 1",
+    ):
+        pin_response = writable_api.post("/api/v1/curation/pin", json={"sql": sql, "name": "test"})
+        preview_response = api.post("/api/v1/curation/preview", json={"sql": sql})
+        assert pin_response.status_code == 400, pin_response.text
+        assert preview_response.status_code == 400, preview_response.text
+        assert pin_response.json()["detail"] == "sql must be exactly one read-only SELECT statement"
+        assert preview_response.json()["detail"] == pin_response.json()["detail"]
+        assert "DESCRIBE SELECT * FROM" not in pin_response.json()["detail"]
+        assert "syntax error at or near" not in pin_response.json()["detail"]

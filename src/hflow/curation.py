@@ -45,6 +45,7 @@ ran on what fraction of episodes, because a statistic over half a delivery
 must not look like a statistic over all of it.
 """
 
+import re
 import tempfile
 from collections.abc import Sequence
 from contextlib import ExitStack
@@ -554,6 +555,35 @@ class NonSingleSelectQueryError(ValueError):
     """
 
 
+def _strip_leading_sql_comments(sql: str) -> str:
+    """Leading whitespace and SQL comments stripped, for SELECT-text check.
+
+    DuckDB labels ``PRAGMA database_list``, ``DESCRIBE SELECT 1``,
+    ``SHOW TABLES`` and ``SUMMARIZE SELECT 1`` as ``StatementType.SELECT``
+    (they are table functions), so a bare type check would accept them.
+    The curation endpoints advertise exactly one read-only SELECT, so the
+    gate also requires the text to look like a SELECT — ``SELECT`` or
+    ``WITH`` (a CTE) after any leading ``--`` / ``/* */`` comments.
+    """
+
+    stripped = sql.lstrip()
+    while True:
+        if stripped.startswith("--"):
+            newline = stripped.find("\n")
+            if newline == -1:
+                return ""
+            stripped = stripped[newline + 1 :].lstrip()
+            continue
+        if stripped.startswith("/*"):
+            end = stripped.find("*/")
+            if end == -1:
+                return ""
+            stripped = stripped[end + 2 :].lstrip()
+            continue
+        break
+    return stripped
+
+
 def reject_non_single_select(sql: str) -> None:
     """Raise ``NonSingleSelectQueryError`` unless *sql* is one SELECT statement.
 
@@ -574,6 +604,15 @@ def reject_non_single_select(sql: str) -> None:
         parser_connection.close()
     if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
         raise NonSingleSelectQueryError("sql must be exactly one SELECT statement")
+    # Narrow to actual SELECT text: DuckDB reports PRAGMA/DESCRIBE/SHOW/
+    # SUMMARIZE as SELECT, but the endpoints advertise SELECT only and preview
+    # interpolates the SQL as a subquery (``SELECT * FROM (<sql>)``) where
+    # those forms are a syntax error. Rejecting them here keeps preview and
+    # pin consistent and avoids blaming the caller for our wrapper's parse
+    # failure (``DESCRIBE SELECT * FROM (PRAGMA database_list)``).
+    stripped = _strip_leading_sql_comments(sql.strip())
+    if not re.match(r"(?i)^(SELECT|WITH)\b", stripped):
+        raise NonSingleSelectQueryError("sql must be exactly one read-only SELECT statement")
 
 
 def _stage_manifest_and_count(

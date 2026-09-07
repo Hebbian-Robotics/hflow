@@ -204,3 +204,36 @@ def test_preview_over_an_empty_catalog_returns_zero_rows(empty_catalog_api: Test
     assert payload["rows"] == []
     assert payload["row_count"] == 0
     assert payload["truncated"] is False
+
+
+def test_preview_rejects_pragma_and_describe_consistently(api: TestClient) -> None:
+    # DuckDB labels PRAGMA/DESCRIBE/SHOW/SUMMARIZE as SELECT, but the
+    # endpoints advertise exactly one read-only SELECT. Preview previously
+    # interpolated the SQL as ``SELECT * FROM (<sql>)`` where those forms are
+    # a syntax error, leaking the wrapper (``DESCRIBE SELECT * FROM (PRAGMA
+    # database_list)``) as the caller's 400. The shared gate now requires
+    # SELECT/WITH text, so preview and pin agree (issue #450).
+    for sql in (
+        "PRAGMA database_list",
+        "PRAGMA show_tables",
+        "PRAGMA version",
+        "DESCRIBE SELECT 1",
+        "SHOW TABLES",
+        "SUMMARIZE SELECT 1",
+    ):
+        response = api.post("/api/v1/curation/preview", json={"sql": sql})
+        assert response.status_code == 400, response.text
+        assert response.json()["detail"] == "sql must be exactly one read-only SELECT statement"
+        # No wrapper leak: the detail is the fixed gate message, not DuckDB's
+        # parser diagnostic for the rewritten query.
+        assert "DESCRIBE SELECT * FROM" not in response.json()["detail"]
+        assert "syntax error at or near" not in response.json()["detail"]
+
+
+def test_preview_accepts_select_with_leading_comments_and_cte(api: TestClient) -> None:
+    for sql in (
+        "-- comment\nSELECT episode_id FROM episodes",
+        "/* block */ SELECT episode_id FROM episodes",
+        "WITH c AS (SELECT 1 AS one) SELECT * FROM c",
+    ):
+        assert api.post("/api/v1/curation/preview", json={"sql": sql}).status_code == 200
