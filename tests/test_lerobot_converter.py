@@ -1979,14 +1979,16 @@ def test_import_full_reuse_reports_zero_episodes_converted(
 # --- success label: read the collector's outcome, never invent it (#395) -----
 
 
-def _build_success_label_corpus(root: Path, outcome_mode: str) -> dict:
+def _build_success_label_corpus(
+    root: Path, outcome_mode: str, frames_per_second: int | float = 30
+) -> dict:
     """One two-frame episode.
 
     outcome_mode: 'transition', 'all-false', 'empty-aggregate', or 'none'.
     """
     has_outcome = outcome_mode != "none"
     info = {
-        "fps": 30,
+        "fps": frames_per_second,
         "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
         "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
         "features": {
@@ -2076,10 +2078,14 @@ def _build_success_label_corpus(root: Path, outcome_mode: str) -> dict:
 
 
 def _import_success_label_corpus(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome_mode: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome_mode: str,
+    frames_per_second: int | float = 30,
+    transcode_calls: list[float] | None = None,
 ) -> Path:
     root = tmp_path / "corpus"
-    corpus = _build_success_label_corpus(root, outcome_mode)
+    corpus = _build_success_label_corpus(root, outcome_mode, frames_per_second)
     output_dir = tmp_path / "out"
 
     monkeypatch.setattr(
@@ -2106,17 +2112,16 @@ def _import_success_label_corpus(
             shutil.copy(root / "data" / "chunk-000" / "file-000.parquet", dest)
 
     monkeypatch.setattr(prep, "_download_file", fake_download)
-    monkeypatch.setattr(
-        prep,
-        "_transcode_mp4_to_h264",
-        lambda mp4_path, gop, fps: (
-            [
-                b"\x00\x00\x00\x01\x09\x10\x00\x00\x00\x01\x67\x42\x00"
-                b"\x00\x00\x00\x01\x68\x88\x80\x00\x00\x00\x01\x65\x88"
-            ]
-            * 2
-        ),
-    )
+
+    def fake_transcode(mp4_path: Path, gop: float, fps: float) -> list[bytes]:
+        if transcode_calls is not None:
+            transcode_calls.append(fps)
+        return [
+            b"\x00\x00\x00\x01\x09\x10\x00\x00\x00\x01\x67\x42\x00"
+            b"\x00\x00\x00\x01\x68\x88\x80\x00\x00\x00\x01\x65\x88"
+        ] * 2
+
+    monkeypatch.setattr(prep, "_transcode_mp4_to_h264", fake_transcode)
     monkeypatch.setattr(prep, "_get_video_pts_times", lambda path: [0, 0])
     monkeypatch.setattr(prep, "ffmpeg_version", lambda: "test-ffmpeg")
 
@@ -2310,3 +2315,90 @@ def test_reuse_accepts_an_intact_episode_after_the_crc_pass(
         camera_keys=_MATCHING_CAMERA_KEYS,
     )
     assert damaged is None
+
+
+def test_fractional_fps_sets_the_log_times_from_the_declared_rate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """29.97 is the rate NTSC-derived capture writes, and it must reach the
+    time axis unfloored.
+
+    Frame n sits at n / fps seconds. At 29.97 the second frame is 33.3667 ms
+    in; read as 29 it lands at 34.4828 ms, and the error grows with the frame
+    index: about a second by frame 900, six seconds by frame 5400.
+    """
+    from hflow.episode import Episode
+
+    output_dir = _import_success_label_corpus(
+        tmp_path, monkeypatch, "none", frames_per_second=29.97
+    )
+    landing = sorted((output_dir / "landing").glob("*.mcap"))
+    with Episode(landing[0]) as episode:
+        log_times = list(episode.channel("/action").timestamps)
+
+    expected_second_frame = prep.EPISODE_START_TIME_NS + round(prep.NANOSECONDS_PER_SECOND / 29.97)
+    floored = prep.EPISODE_START_TIME_NS + round(prep.NANOSECONDS_PER_SECOND / 29)
+    assert log_times[0] == prep.EPISODE_START_TIME_NS
+    assert log_times[1] == expected_second_frame
+    assert log_times[1] != floored
+
+
+def test_fractional_fps_reaches_the_transcoder_for_the_keyframe_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The GOP is the half that makes provenance false rather than imprecise.
+
+    _transcode_mp4_to_h264 sets the keyframe interval to
+    ``round(gop_seconds * frames_per_second)``. At the declared 29.97 that is
+    30, at the floored 29 it is 29, so the file carried a 29 frame GOP while
+    provenance/v1 stamped gop_seconds as 1. #376 is open because that field is
+    recorded as actually used and never checked; this was one way it could
+    already be wrong.
+    """
+    transcode_calls: list[float] = []
+    _import_success_label_corpus(
+        tmp_path,
+        monkeypatch,
+        "none",
+        frames_per_second=29.97,
+        transcode_calls=transcode_calls,
+    )
+
+    assert transcode_calls, "the transcoder was never called"
+    assert transcode_calls[0] == 29.97
+    keyframe_interval = max(1, round(prep.IMPORT_GOP_SECONDS * transcode_calls[0]))
+    assert keyframe_interval == 30
+    assert keyframe_interval != max(1, round(prep.IMPORT_GOP_SECONDS * 29))
+
+
+def test_reuse_refuses_an_episode_written_before_the_fps_fix(tmp_path: Path) -> None:
+    """The resume half, which is the part a reader would assume rather than check.
+
+    _episode_identity_matches never looks at fps, so a fractional-fps episode
+    delivered with the stretched time axis still matches on dataset, revision,
+    episode index, camera keys and gop_seconds. Only the converter version
+    separates it from a correct one, which is why the bump is what makes the
+    fix reach an existing landing tree instead of stopping at new imports.
+    """
+    data_root = LocalStorageRoot(tmp_path / "out")
+    landing = tmp_path / "out" / "landing" / "lerobot_episode_0001.mcap"
+    _write_identity_matching_landing_mcap(
+        landing,
+        dataset_source=_MATCHING_SOURCE,
+        episode_index=0,
+        camera_keys=_MATCHING_CAMERA_KEYS,
+        marker="pre-fps-fix",
+        episode_record_overrides={"converter_version": "lerobot-converter-v7"},
+        source_provenance_overrides={"converter_version": "lerobot-converter-v7"},
+        provenance_overrides=None,
+    )
+
+    assert (
+        prep._try_reuse_completed_episode(
+            data_root,
+            dataset_source=_MATCHING_SOURCE,
+            episode_index=0,
+            camera_keys=_MATCHING_CAMERA_KEYS,
+        )
+        is None
+    )
