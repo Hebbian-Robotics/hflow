@@ -44,15 +44,15 @@ The observable result is:
 
 ```text
 dataset-snapshot/
-├── format.json
-├── samples.parquet
-├── measurements.parquet
-├── observations.parquet
-├── media.parquet
-├── check_runs.parquet
-├── tags.parquet
-├── intervals.parquet
-└── assets/                 # copy mode only, when artifacts exist
+|-- format.json
+|-- samples.parquet
+|-- measurements.parquet
+|-- observations.parquet
+|-- media.parquet
+|-- check_runs.parquet
+|-- tags.parquet
+|-- intervals.parquet
+`-- assets/                 # copy mode only, when artifacts exist
 ```
 
 ## Format contract
@@ -79,11 +79,20 @@ external readers; receipts live only under `integrity`:
 Copy mode re-reads each copied asset once after the copy to compute its hash
 (a second full read of media bytes on export).
 
-This is a receipt, not a verify command: export does not re-read the
-destination after transfer, and there is no public `verify_dataset_snapshot`
-API or CLI yet. Older HFlow overwrite checks only `format` and
-`format_version`, and readers that only consume the string `tables` map keep
-working; the `integrity` key is purely additive under format version `1`.
+Verify the delivery after transfer with
+`hflow verify snapshot <directory>` or
+`verify_dataset_snapshot(<directory>)`: every table and copied asset named
+in the receipt is re-read and compared by size and sha256, and every finding
+is returned in one report built from the shared verification types in
+`hflow.verification` (a `VerificationReport` with status `ok`, `damaged`,
+or `unverifiable`). Recorded paths are joined only onto the handed
+directory, so a copied delivery verifies in place. Exit `0` clean,
+`1` damaged, `3` unverifiable, `2` unreadable input. A pre-#401
+`format.json` with no `integrity` key is reported as `no-receipt`,
+unverifiable, not corrupt. Older HFlow overwrite checks only
+`format` and `format_version`, and readers that only consume the string
+`tables` map keep working; the `integrity` key is purely additive under
+format version `1`.
 
 The receipt travels unsigned inside the `format.json` it describes, so it
 catches corruption and accidental loss, not tampering: anyone who can edit a

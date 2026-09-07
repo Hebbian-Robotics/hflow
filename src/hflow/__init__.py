@@ -72,6 +72,7 @@ from hflow.snapshot import (
     RetainedDatasetSnapshotBackup,
     SnapshotMediaMode,
     export_dataset_snapshot,
+    verify_dataset_snapshot,
 )
 from hflow.steps import (
     RUN_PROFILES,
@@ -208,5 +209,6 @@ __all__ = [
     "step_version_from_contract",
     "testing",
     "to_grid",
+    "verify_dataset_snapshot",
     "write_canonical_episode",
 ]

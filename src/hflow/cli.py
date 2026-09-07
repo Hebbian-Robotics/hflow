@@ -377,6 +377,31 @@ def _build_parser() -> argparse.ArgumentParser:
         help="atomically replace an existing export directory",
     )
 
+    verify_parser = subparsers.add_parser(
+        "verify",
+        help="verify a delivery against its receipt",
+        description=(
+            "Group commands for verifying deliveries against their recorded "
+            "receipts. Use `snapshot` to re-check a delivered dataset snapshot "
+            "directory against the integrity receipt inside its format.json."
+        ),
+    )
+    verify_subparsers = verify_parser.add_subparsers(dest="verify_command", required=True)
+    verify_snapshot_parser = verify_subparsers.add_parser(
+        "snapshot",
+        help="verify a delivered dataset snapshot against its integrity receipt",
+        description=(
+            "Re-reads every table and copied asset named in the snapshot's "
+            "integrity receipt and reports bytes changed, files missing, and "
+            "size mismatches. Exit 0 clean, 1 damaged, 2 unreadable input, "
+            "3 no receipt (unverifiable)."
+        ),
+    )
+    verify_snapshot_parser.add_argument(
+        "directory",
+        help="the delivered dataset snapshot directory to verify",
+    )
+
     stale_parser = subparsers.add_parser(
         "stale",
         help="list episodes whose latest cataloged run predates the current pipeline version",
@@ -1472,6 +1497,25 @@ def _command_export_snapshot(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _command_verify_snapshot(arguments: argparse.Namespace) -> int:
+    from hflow.snapshot import verify_dataset_snapshot
+    from hflow.verification import exit_code_for
+
+    try:
+        report = verify_dataset_snapshot(Path(arguments.directory))
+    except (ValueError, FileNotFoundError, NotADirectoryError, OSError) as error:
+        print(f"verify snapshot: {error}", file=sys.stderr)
+        return 2
+    if report.ok:
+        print("verified: every receipted file matches its size and sha256")
+        return exit_code_for(report)
+    print(f"not verified: {len(report.findings)} finding(s)")
+    for finding in report.findings:
+        print(f"  [{finding.reason}] {finding.uri}")
+        print(f"    {finding.detail}")
+    return exit_code_for(report)
+
+
 def _command_doctor(arguments: argparse.Namespace) -> int:
     # Findings, not exceptions, across files as well: an unreadable path is a
     # finding about the corpus, reported in place, so a batch run never loses
@@ -1644,6 +1688,10 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.export_command == "snapshot":
             return _command_export_snapshot(arguments)
         raise AssertionError(f"unhandled export command {arguments.export_command!r}")
+    if arguments.command == "verify":
+        if arguments.verify_command == "snapshot":
+            return _command_verify_snapshot(arguments)
+        raise AssertionError(f"unhandled verify command {arguments.verify_command!r}")
     if arguments.command == "stale":
         return _command_stale(arguments)
     if arguments.command == "doctor":

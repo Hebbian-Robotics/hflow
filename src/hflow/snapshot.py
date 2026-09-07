@@ -15,6 +15,7 @@ import tempfile
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import duckdb
@@ -23,6 +24,9 @@ from hflow.app import ARTIFACT_MEASUREMENT_KEY_PREFIX, MEDIA_CONTACT_SHEET_STEP_
 from hflow.catalog import episode_status_case_sql
 from hflow.curation import open_catalog_connection
 from hflow.storage import StorageRoot, fetch_uri
+
+if TYPE_CHECKING:
+    from hflow.verification import VerificationReport
 
 DATASET_SNAPSHOT_FORMAT_NAME = "hflow-dataset-snapshot"
 DATASET_SNAPSHOT_FORMAT_VERSION = "1"
@@ -797,3 +801,129 @@ def export_dataset_snapshot(
         media_mode=resolved_media_mode,
         retained_backup=retained_backup,
     )
+
+
+def verify_dataset_snapshot(
+    snapshot_directory: Path | str,
+) -> "VerificationReport":
+    """Check a delivered dataset snapshot against the receipt inside it.
+
+    Re-reads every table and copied asset named in the ``integrity`` block of
+    ``format.json`` and compares sizes and SHA-256 digests, resolving every
+    recorded path strictly relative to the handed snapshot directory. A
+    recorded path is never read as absolute, so a snapshot moved or copied
+    to another root verifies in place. Returns every finding in one report
+    instead of raising at the first mismatch, because a partial transfer
+    usually damages more than one file.
+
+    Findings use the shared reason vocabulary from ``hflow.verification``
+    (#432 contract, #454 shape), each meaning something different:
+
+    - ``content-id-mismatch``: the sha256 of the file under this root does
+      not match the sha256 recorded in the receipt.
+    - ``missing``: named in the receipt, absent under this root.
+    - ``size-mismatch``: size differs first; the hash read is skipped.
+    - ``no-receipt``: a valid pre-#401 ``format.json`` with no
+      ``integrity`` key. That snapshot is unverifiable, not corrupt.
+
+    Unreadable input (a missing directory, a missing or unparsable
+    ``format.json``) raises instead: that is not a finding about a delivered
+    snapshot, it is the wrong input entirely.
+
+    Extra files under ``assets/`` that the receipt does not name are ignored:
+    the receipt covers what was exported, not everything a recipient may add.
+
+    This catches corruption, truncation, and partial transfer. It is not a
+    tamper defence: the receipt travels unsigned inside the same
+    ``format.json`` it describes, so anyone who can rewrite a table can
+    recompute the hashes to match.
+    """
+    from hflow.verification import (
+        REASON_CONTENT_ID_MISMATCH,
+        REASON_MISSING,
+        REASON_NO_RECEIPT,
+        REASON_SIZE_MISMATCH,
+        VerificationFinding,
+        VerificationReport,
+        VerificationStatus,
+    )
+
+    resolved_directory = Path(snapshot_directory)
+    findings: list[VerificationFinding] = []
+
+    if not resolved_directory.is_dir():
+        raise NotADirectoryError(f"snapshot directory does not exist: {resolved_directory}")
+    marker_path = resolved_directory / "format.json"
+    if not marker_path.is_file():
+        raise FileNotFoundError(f"no format.json in {resolved_directory}; not a dataset snapshot")
+    try:
+        format_marker = json.loads(marker_path.read_text())
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ValueError(f"format.json is unreadable: {error}") from error
+
+    integrity = format_marker.get("integrity")
+    if not isinstance(integrity, dict):
+        # A valid v1 snapshot from before #401: verifiable nothing, corrupt nothing.
+        return VerificationReport(
+            status=VerificationStatus.UNVERIFIABLE,
+            findings=[
+                VerificationFinding(
+                    uri="format.json",
+                    reason=REASON_NO_RECEIPT,
+                    detail=(
+                        "format.json carries no integrity receipt "
+                        "(pre-#401 snapshot); the delivery is unverifiable, not corrupt"
+                    ),
+                ),
+            ],
+        )
+
+    receipt_entries: list[dict[str, str | int]] = [
+        *integrity.get("tables", {}).values(),
+        *integrity.get("assets", []),
+    ]
+    for entry in receipt_entries:
+        relative_path = str(entry["path"])
+        delivered_path = resolved_directory / relative_path
+        if not delivered_path.is_file():
+            findings.append(
+                VerificationFinding(
+                    uri=relative_path,
+                    reason=REASON_MISSING,
+                    detail=(
+                        f"receipted file missing at {relative_path!r} "
+                        "under the verified snapshot root"
+                    ),
+                )
+            )
+            continue
+        delivered_size = delivered_path.stat().st_size
+        receipt_size = int(entry["size_bytes"])
+        if delivered_size != receipt_size:
+            findings.append(
+                VerificationFinding(
+                    uri=relative_path,
+                    reason=REASON_SIZE_MISMATCH,
+                    detail=(
+                        f"size under the verified root {delivered_size} bytes "
+                        f"!= receipt {receipt_size} bytes"
+                    ),
+                )
+            )
+            continue
+        delivered_sha256 = _sha256_hex(delivered_path)
+        if delivered_sha256 != entry["sha256"]:
+            findings.append(
+                VerificationFinding(
+                    uri=relative_path,
+                    reason=REASON_CONTENT_ID_MISMATCH,
+                    detail=(
+                        f"sha256 under the verified root {delivered_sha256!r} "
+                        f"!= receipt sha256 {entry['sha256']!r}"
+                    ),
+                )
+            )
+
+    if findings:
+        return VerificationReport(status=VerificationStatus.DAMAGED, findings=findings)
+    return VerificationReport(status=VerificationStatus.OK)
