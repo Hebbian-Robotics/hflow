@@ -2,8 +2,9 @@
 
 from collections.abc import Iterator
 
+import pytest
 from fastapi.testclient import TestClient
-from hflow_server import ServerSettings, create_app
+from hflow_server import ServerSettings, _curation, create_app
 from ui_test_fixtures import PopulatedWorkspace
 
 
@@ -15,6 +16,24 @@ def _created_query(api: TestClient, name: str, sql: str) -> dict:
 
 def test_queries_start_empty(writable_api: TestClient) -> None:
     assert writable_api.get("/api/v1/queries").json() == {"queries": []}
+
+
+def test_saved_query_registry_cap_refuses_the_first_entry_past_the_limit(
+    writable_api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cap = 1
+    monkeypatch.setattr(_curation, "_MAX_SAVED_QUERIES", cap)
+
+    first = writable_api.post("/api/v1/queries", json={"name": "first", "sql": "SELECT 1"})
+    assert first.status_code == 200
+
+    over_cap = writable_api.post("/api/v1/queries", json={"name": "second", "sql": "SELECT 2"})
+    assert over_cap.status_code == 409
+    assert over_cap.json()["detail"] == (
+        f"this workspace already has {cap} saved queries "
+        "(the sidecar cap); remove some before saving more"
+    )
+    assert writable_api.get("/api/v1/queries").json()["queries"] == [first.json()]
 
 
 def test_create_list_update_delete_roundtrip(writable_api: TestClient) -> None:
