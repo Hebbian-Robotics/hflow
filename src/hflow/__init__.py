@@ -49,7 +49,7 @@ from hflow.fingerprints import (
     step_version_from_contract,
 )
 from hflow.format import GopPreset
-from hflow.importers import import_lerobot_dataset
+from hflow.importers import import_lerobot_dataset, verify_lerobot_import
 from hflow.manifest import (
     DerivedChannelManifest,
     PipelineManifest,
@@ -105,6 +105,11 @@ from hflow.storage import (
     parse_storage_root,
 )
 from hflow.transform import EpisodeStamps, TransformConfig, write_canonical_episode
+from hflow.verification import (
+    VerificationFinding,
+    VerificationReport,
+    VerificationStatus,
+)
 from hflow.workspace import Workspace, WorkspaceIdentity
 
 __all__ = [
@@ -182,6 +187,9 @@ __all__ = [
     "Threshold",
     "TopicInfo",
     "TransformConfig",
+    "VerificationFinding",
+    "VerificationReport",
+    "VerificationStatus",
     "Workspace",
     "WorkspaceIdentity",
     "__version__",
@@ -210,5 +218,6 @@ __all__ = [
     "testing",
     "to_grid",
     "verify_dataset_snapshot",
+    "verify_lerobot_import",
     "write_canonical_episode",
 ]

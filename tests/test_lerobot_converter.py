@@ -1428,6 +1428,13 @@ def test_manifest_content_id_detects_a_truncated_episode(
 ) -> None:
     """The #379 controlled result as a test: truncating one episode to zero
     bytes is detectable from the delivery by re-hashing against the manifest."""
+    from hflow.importers.lerobot_verify import verify_lerobot_import
+    from hflow.verification import (
+        REASON_CONTENT_ID_MISMATCH,
+        REASON_SIZE_MISMATCH,
+        VerificationStatus,
+    )
+
     output_dir = tmp_path / "out"
     monkeypatch.setattr(
         prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
@@ -1452,6 +1459,13 @@ def test_manifest_content_id_detects_a_truncated_episode(
     episode_path.write_bytes(b"")
     assert episode_path.stat().st_size != entry["size_bytes"]
     assert prep.content_episode_id(episode_path) != entry["content_id"]
+
+    report = verify_lerobot_import(output_dir)
+    assert report.status is VerificationStatus.DAMAGED
+    assert {finding.reason for finding in report.findings} == {
+        REASON_SIZE_MISMATCH,
+        REASON_CONTENT_ID_MISMATCH,
+    }
 
 
 def test_import_skips_bucket_manifest_when_an_episode_publish_fails(

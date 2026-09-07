@@ -59,8 +59,21 @@ Durable outputs land as `landing/*.mcap` and `prepared-manifest.json` under
 that prefix. The manifest (schema version 3) carries a `episodes` receipt
 list: every delivered episode's published URI, its `content_id` (the sha256
 content address of the canonical bytes, the same value the catalog uses for
-dedupe), and its `size_bytes`, so a delivery can be checked against the
-manifest without re-running the import. Hugging Face downloads stay in the
+dedupe), and its `size_bytes`. Check a delivery without re-running the import:
+
+```bash
+uv run hflow verify lerobot-import ./data/lerobot_pusht
+# or, from Python:
+# hflow.verify_lerobot_import("./data/lerobot_pusht")
+```
+
+Verification resolves each episode as `landing/<basename>` under the data root
+you pass in (the same layout the importer writes). The receipt `uri` is
+publish-time provenance kept on findings; it is not opened as a lookup path,
+so a copied delivery is checked in place even when the original publish path
+still exists elsewhere.
+
+Hugging Face downloads stay in the
 local mirror under
 `_lerobot_cache/` (`HFLOW_MIRROR_DIR`, or `$XDG_CACHE_HOME/hflow/mirrors`) and
 are never uploaded into the bucket. The success manifest is published only
