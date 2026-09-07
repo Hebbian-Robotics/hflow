@@ -140,11 +140,11 @@ class EpisodeReader(Protocol):
 class PythonMcapEpisodeReader:
     """Pure-Python :class:`EpisodeReader` backend over the stock ``mcap`` package."""
 
-    def __init__(self, path: Path | str) -> None:
+    def __init__(self, path: Path | str, *, validate_crcs: bool = False) -> None:
         self.path = Path(path)
         self._stream: IO[bytes] = self.path.open("rb")
         try:
-            self._reader: McapReader = make_reader(self._stream)
+            self._reader: McapReader = make_reader(self._stream, validate_crcs=validate_crcs)
         except BaseException:
             # make_reader validates the magic bytes; don't leak the handle
             # when it rejects a non-MCAP, empty, or truncated file.
@@ -293,6 +293,14 @@ class PythonMcapEpisodeReader:
         self.close()
 
 
-def open_reader(path: Path | str) -> EpisodeReader:
-    """Open an episode file with the default (pure-Python) reader backend."""
-    return PythonMcapEpisodeReader(path)
+def open_reader(path: Path | str, *, validate_crcs: bool = False) -> EpisodeReader:
+    """Open an episode file with the default (pure-Python) reader backend.
+
+    ``validate_crcs`` checks each chunk's CRC as it is decoded, catching
+    payload damage that magic-byte and summary checks alone cannot see. It
+    defaults to ``False`` because most callers re-read a canonical file HFlow
+    already produced and already identifies by content hash; pass ``True``
+    only when reading a source that has not been trusted yet (see
+    ``hflow.transform``).
+    """
+    return PythonMcapEpisodeReader(path, validate_crcs=validate_crcs)

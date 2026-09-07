@@ -201,6 +201,54 @@ def test_a_failed_source_is_recorded_where_it_can_be_found(
     assert rows == [("episodes-in/corrupt.mcap", "sync", "source-unreadable", "InvalidMagic")]
 
 
+def test_a_payload_damaged_source_is_classified_the_same_as_unreadable(
+    project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Chunk-payload damage inside an otherwise valid MCAP (bit rot, a
+    partial copy) must fail ingest the same way a not-MCAP file does (#431),
+    not transcode quietly into a canonical episode with a receipt over
+    corrupt bytes. Distinct from the not-MCAP case only in ``error_type``."""
+    from mcap.writer import CompressionType
+    from mcap.writer import Writer as StockWriter
+    from reuse_test_helpers import flip_chunk_payload_bytes
+
+    from hflow.curation import open_catalog_connection
+
+    monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
+    monkeypatch.delenv("HFLOW_AIRFLOW_URL", raising=False)
+
+    damaged = project / "data" / "episodes-in" / "payload-damaged.mcap"
+    with damaged.open("wb") as stream:
+        # Uncompressed chunk: flip_chunk_payload_bytes corrupts the records
+        # region in place, which is only addressable when it is plaintext.
+        writer = StockWriter(stream, compression=CompressionType.NONE)
+        writer.start(profile="", library="test")
+        schema_id = writer.register_schema(
+            name="test.Pointer", encoding="ros2msg", data=b"int32 x\n"
+        )
+        channel_id = writer.register_channel(
+            topic="/pointer", message_encoding="ros2msg", schema_id=schema_id
+        )
+        writer.add_message(channel_id, log_time=10**9, data=b"\x01\x00\x00\x00", publish_time=10**9)
+        writer.finish()
+    flip_chunk_payload_bytes(damaged)
+    monkeypatch.chdir(project)
+
+    assert cli_main(["ingest", "episodes-in/payload-damaged.mcap"]) == 1
+    assert "ingest_failures" in capsys.readouterr().err
+
+    connection = open_catalog_connection(project / "data" / "catalog")
+    try:
+        rows = connection.execute(
+            "SELECT source_uri, stage, failure_kind, error_type FROM ingest_failures"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert rows == [
+        ("episodes-in/payload-damaged.mcap", "sync", "source-unreadable", "CRCValidationError")
+    ]
+
+
 def test_a_source_that_is_not_there_is_not_blamed_on_the_data(
     project: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
