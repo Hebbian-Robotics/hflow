@@ -573,7 +573,11 @@ def write_canonical_episode(
         {derived_topic: version for derived_topic, _series, version in derived_channels},
     )
 
-    reader = open_reader(source_path)
+    # validate_crcs=True: this is a source nobody has trusted yet, unlike the
+    # canonical-file reads elsewhere in the tree. The transcode below already
+    # decodes every chunk over the full iteration, so this piggybacks a CRC
+    # check on a pass that was already happening rather than adding one.
+    reader = open_reader(source_path, validate_crcs=True)
     try:
         # Keyed by CHANNEL id: several channels may legally share a topic and
         # each must survive the transform as its own output channel.

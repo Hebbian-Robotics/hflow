@@ -5,6 +5,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 from mcap.exceptions import InvalidMagic
+from mcap.stream_reader import CRCValidationError
+from mcap.writer import CompressionType
 from mcap.writer import Writer as StockWriter
 
 from hflow import transform
@@ -26,6 +28,24 @@ def test_classify_mcap_error_as_source_unreadable() -> None:
     assert classify_ingest_failure(error) == IngestFailureKind.SOURCE_UNREADABLE
 
 
+def test_classify_crc_validation_error_as_source_unreadable() -> None:
+    """``CRCValidationError`` subclasses ``ValueError``, not ``McapError`` (#431):
+    without its own branch it would fall through to ``INFRASTRUCTURE`` and
+    blame the platform for a damaged recording."""
+    from mcap.records import Chunk
+
+    chunk = Chunk(
+        compression="",
+        data=b"",
+        message_end_time=0,
+        message_start_time=0,
+        uncompressed_crc=1,
+        uncompressed_size=0,
+    )
+    error = CRCValidationError(expected=1, actual=2, record=chunk)
+    assert classify_ingest_failure(error) == IngestFailureKind.SOURCE_UNREADABLE
+
+
 def test_classify_source_not_conforming_as_source_unsupported() -> None:
     error = SourceNotConforming("x")
     assert classify_ingest_failure(error) == IngestFailureKind.SOURCE_UNSUPPORTED
@@ -34,6 +54,36 @@ def test_classify_source_not_conforming_as_source_unsupported() -> None:
 def test_classify_unrecognized_error_as_infrastructure() -> None:
     error = RuntimeError("unknown")
     assert classify_ingest_failure(error) == IngestFailureKind.INFRASTRUCTURE
+
+
+def test_ingest_refuses_a_source_with_a_damaged_chunk_payload(tmp_path: Path) -> None:
+    """A structurally valid MCAP whose chunk payload does not match its
+    recorded CRC must not transcode quietly into a canonical episode with a
+    fresh receipt over corrupt bytes (#431). ``open_reader`` only checks CRCs
+    when told to; ingest's read now asks for it."""
+    from reuse_test_helpers import flip_chunk_payload_bytes
+
+    source = tmp_path / "payload-damaged.mcap"
+    with source.open("wb") as stream:
+        # Uncompressed chunk: flip_chunk_payload_bytes corrupts the records
+        # region in place, which is only addressable when it is plaintext.
+        writer = StockWriter(stream, compression=CompressionType.NONE)
+        writer.start(profile="", library="test")
+        schema_id = writer.register_schema(
+            name="test.Pointer", encoding="ros2msg", data=b"int32 x\n"
+        )
+        channel_id = writer.register_channel(
+            topic="/pointer", message_encoding="ros2msg", schema_id=schema_id
+        )
+        writer.add_message(channel_id, log_time=10**9, data=b"\x01\x00\x00\x00", publish_time=10**9)
+        writer.finish()
+    flip_chunk_payload_bytes(source)
+
+    output = tmp_path / "out.mcap"
+    with pytest.raises(CRCValidationError):
+        write_canonical_episode(source, output)
+
+    assert not output.exists()
 
 
 def test_unsupported_compressed_image_format_classifies_as_source_unsupported() -> None:

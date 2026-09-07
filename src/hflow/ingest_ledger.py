@@ -100,12 +100,24 @@ def classify_ingest_failure(error: BaseException) -> IngestFailureKind:
         return IngestFailureKind.SOURCE_UNSUPPORTED
     try:
         from mcap.exceptions import McapError
+        from mcap.stream_reader import CRCValidationError
     except ImportError:  # pragma: no cover - mcap is a hard dependency
         return IngestFailureKind.INFRASTRUCTURE
     if isinstance(error, McapError):
         # The single base of InvalidMagic, EndOfFile, RecordLengthLimitExceeded
         # and friends: the file is not a readable MCAP, which is a fact about
         # the recording rather than about this machine.
+        return IngestFailureKind.SOURCE_UNREADABLE
+    if isinstance(error, CRCValidationError):
+        # Raised by a CRC-validated read (transform.py's ingest read passes
+        # validate_crcs=True) on a structurally valid MCAP whose chunk payload
+        # does not match its recorded checksum. mcap does not root this on
+        # McapError -- it subclasses ValueError instead -- so it needs its own
+        # branch or it silently falls to INFRASTRUCTURE below, blaming the
+        # platform for a damaged recording. Same failure kind as McapError:
+        # the file is a fact about the recording, not the machine. error_type
+        # still distinguishes "not MCAP" (InvalidMagic) from "MCAP with a
+        # damaged payload" (CRCValidationError) in the stored row.
         return IngestFailureKind.SOURCE_UNREADABLE
     return IngestFailureKind.INFRASTRUCTURE
 
