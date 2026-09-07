@@ -137,6 +137,27 @@ def test_concurrent_pins_all_land_in_the_registry(
     assert len(manifest_files) == len(names)
 
 
+def test_pin_refuses_sql_that_is_not_a_single_select(
+    writable_api: TestClient, writable_workspace: PopulatedWorkspace
+) -> None:
+    # Well-formed SQL that is not exactly one read-only SELECT is refused
+    # with the fixed sentence, and nothing is registered or written.
+    hostile_sql = [
+        "SELECT 1; DROP TABLE episodes",
+        "COPY (SELECT 1) TO '/tmp/hflow-nope.csv'",
+        "CREATE TABLE should_not_exist AS SELECT 1",
+        "DELETE FROM episodes",
+    ]
+    for sql in hostile_sql:
+        response = writable_api.post("/api/v1/curation/pin", json={"sql": sql, "name": "hostile"})
+        assert response.status_code == 400
+        assert response.json()["detail"] == "sql must be exactly one read-only SELECT statement"
+    manifests_directory = writable_workspace.data_root / "manifests"
+    if manifests_directory.exists():
+        assert list(manifests_directory.glob("*.parquet")) == []
+    assert writable_api.get("/api/v1/manifests").json()["manifests"] == []
+
+
 def test_pin_with_bad_sql_is_400_and_registers_nothing(
     writable_api: TestClient, writable_workspace: PopulatedWorkspace
 ) -> None:

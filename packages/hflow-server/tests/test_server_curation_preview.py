@@ -111,6 +111,16 @@ def test_preview_handles_json_hostile_result_types(api: TestClient) -> None:
     assert payload["rows"] == [{"a_decimal": 1.5, "a_list": [1, 2]}]
 
 
+def test_preview_refuses_sql_that_is_not_a_single_select(api: TestClient) -> None:
+    # The parser accepts these; the gate refuses them because they are not
+    # exactly one read-only SELECT, with the same sentence pin uses.
+    hostile_sql = ["SELECT 1; DROP TABLE episodes", "DELETE FROM episodes"]
+    for sql in hostile_sql:
+        response = api.post("/api/v1/curation/preview", json={"sql": sql})
+        assert response.status_code == 400
+        assert response.json()["detail"] == "sql must be exactly one read-only SELECT statement"
+
+
 def test_preview_bad_sql_is_400_with_the_duckdb_message(api: TestClient) -> None:
     response = api.post("/api/v1/curation/preview", json={"sql": "SELEC 1"})
     assert response.status_code == 400
