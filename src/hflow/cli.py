@@ -1,7 +1,8 @@
 """Command-line entry point.
 
 Subcommands: ``curate``, ``catalog ui``, ``dataset create``, ``import lerobot``,
-``export snapshot``, ``stale``, ``doctor``, ``manifest``, ``package``, the Compose runtime family
+``export snapshot``, ``verify snapshot``, ``verify lerobot-import``, ``stale``,
+``doctor``, ``manifest``, ``package``, the Compose runtime family
 ``up``/``down``/``ingest``/``status``, ``deploy`` for bring-your-own Airflow,
 and ``serve`` for the workspace HTTP server (a separate ``hflow-server``
 package, imported only when invoked).
@@ -383,7 +384,8 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Group commands for verifying deliveries against their recorded "
             "receipts. Use `snapshot` to re-check a delivered dataset snapshot "
-            "directory against the integrity receipt inside its format.json."
+            "directory against the integrity receipt inside its format.json. "
+            "Use `lerobot-import` to re-check a LeRobot prepared-manifest delivery."
         ),
     )
     verify_subparsers = verify_parser.add_subparsers(dest="verify_command", required=True)
@@ -400,6 +402,23 @@ def _build_parser() -> argparse.ArgumentParser:
     verify_snapshot_parser.add_argument(
         "directory",
         help="the delivered dataset snapshot directory to verify",
+    )
+    verify_lerobot_import_parser = verify_subparsers.add_parser(
+        "lerobot-import",
+        help="verify a LeRobot import against prepared-manifest.json",
+        description=(
+            "Read schema-3 prepared-manifest.json under a data root and check every "
+            "episode receipt against landing/<basename> under that root. Unlisted "
+            "files under landing/ are ignored. Exit 0 clean, 1 damaged, 2 unreadable "
+            "input, 3 unverifiable (no prepared-manifest)."
+        ),
+    )
+    verify_lerobot_import_parser.add_argument(
+        "data_root",
+        help=(
+            "data root that holds prepared-manifest.json and landing/: local "
+            "directory or object-store prefix (s3://, gs://, az://)"
+        ),
     )
 
     stale_parser = subparsers.add_parser(
@@ -1516,6 +1535,30 @@ def _command_verify_snapshot(arguments: argparse.Namespace) -> int:
     return exit_code_for(report)
 
 
+def _command_verify_lerobot_import(arguments: argparse.Namespace) -> int:
+    from hflow.importers.lerobot_verify import verify_lerobot_import
+    from hflow.verification import exit_code_for
+
+    try:
+        report = verify_lerobot_import(arguments.data_root)
+    except (ValueError, OSError, ModuleNotFoundError) as error:
+        print(f"verify lerobot-import: {error}", file=sys.stderr)
+        return 2
+
+    if report.ok:
+        print("verify lerobot-import: ok")
+        return 0
+
+    for finding in report.findings:
+        print(
+            f"verify lerobot-import: {finding.reason}: {finding.uri}: {finding.detail}",
+            file=sys.stderr,
+        )
+    if not report.findings:
+        print("verify lerobot-import: unverifiable: no prepared-manifest receipt", file=sys.stderr)
+    return exit_code_for(report)
+
+
 def _command_doctor(arguments: argparse.Namespace) -> int:
     # Findings, not exceptions, across files as well: an unreadable path is a
     # finding about the corpus, reported in place, so a batch run never loses
@@ -1691,6 +1734,8 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.command == "verify":
         if arguments.verify_command == "snapshot":
             return _command_verify_snapshot(arguments)
+        if arguments.verify_command == "lerobot-import":
+            return _command_verify_lerobot_import(arguments)
         raise AssertionError(f"unhandled verify command {arguments.verify_command!r}")
     if arguments.command == "stale":
         return _command_stale(arguments)

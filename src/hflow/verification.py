@@ -3,9 +3,11 @@
 ``VerificationReport`` is the common surface for delivery verifiers: a
 verifier reads the receipt a delivery carries, compares it to the bytes
 under the root being verified, and returns one report. Files nobody
-listed are ignored. The LeRobot import verifier (#454) and the dataset
-snapshot verifier (#428) both return this shape, so one CLI and one
-exit-code mapping cover every delivered artifact.
+listed are ignored. The LeRobot import verifier
+(:func:`hflow.importers.lerobot_verify.verify_lerobot_import`, #454) and the
+dataset snapshot verifier (:func:`hflow.snapshot.verify_dataset_snapshot`,
+#428) both return this shape, so one CLI and one exit-code mapping cover
+every delivered artifact.
 
 Reasons are fixed strings so callers can branch on them.
 ``exit_code_for`` maps a report to the verify-family exit codes: 0 clean,
