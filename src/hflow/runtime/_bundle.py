@@ -91,6 +91,7 @@ from hflow.storage import (
     BucketStorageRoot,
     LocalStorageRoot,
     StorageRoot,
+    _refuse_unusable_file_path,
     is_bucket_url,
     parse_storage_root,
 )
@@ -1026,19 +1027,7 @@ def render_bundle(config: RuntimeConfig, bundle_dir: Path | str) -> BundlePaths:
     """
     bundle_directory = Path(bundle_dir)
     pipeline_source = Path(config.pipeline_file)
-    if pipeline_source.is_dir():
-        # Deliberately FileNotFoundError and not IsADirectoryError: the accurate
-        # class subclasses OSError, not FileNotFoundError, so an `except
-        # FileNotFoundError` stops catching it. Two such handlers sit in this
-        # call path, cli.py:560 for `up` and cli.py:601 for `deploy`, and both
-        # turn this into exit 2; thirteen more name it elsewhere under
-        # src/hflow/, and callers outside the repo are the real unknown.
-        # The errno carries the accurate text without moving the class. #100.
-        raise FileNotFoundError(errno.EISDIR, os.strerror(errno.EISDIR), str(pipeline_source))
-    if not pipeline_source.is_file():
-        # Three-argument form, as storage.py does: str() then carries the errno
-        # text, so the CLI prints why the path failed and not just the path.
-        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(pipeline_source))
+    _refuse_unusable_file_path(pipeline_source)
 
     dags_dir = bundle_directory / "dags"
     logs_dir = bundle_directory / "logs"

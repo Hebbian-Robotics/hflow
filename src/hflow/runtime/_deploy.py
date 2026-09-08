@@ -53,7 +53,7 @@ from hflow.runtime._templates import (
 )
 from hflow.stage_execution import USER_DIRECTORY_DEFAULT
 from hflow.steps import RUN_PROFILES, Stage
-from hflow.storage import is_bucket_url, parse_storage_root
+from hflow.storage import _refuse_unusable_file_path, is_bucket_url, parse_storage_root
 
 # The interpreter of the user venv on the deployment's workers. Matches the
 # Compose runtime's convention so a venv built from these instructions is
@@ -169,17 +169,7 @@ def render_deploy_bundle(config: DeployConfig, output_dir: Path | str) -> Deploy
     """
     output_directory = Path(output_dir)
     pipeline_source = Path(config.pipeline_file)
-    if pipeline_source.is_dir():
-        # Deliberately FileNotFoundError and not IsADirectoryError: the accurate
-        # class subclasses OSError, not FileNotFoundError, so an `except
-        # FileNotFoundError` stops catching it. Two such handlers sit in this
-        # call path, cli.py:560 for `up` and cli.py:601 for `deploy`, and both
-        # turn this into exit 2; thirteen more name it elsewhere under
-        # src/hflow/, and callers outside the repo are the real unknown.
-        # The errno carries the accurate text without moving the class. #100.
-        raise FileNotFoundError(errno.EISDIR, os.strerror(errno.EISDIR), str(pipeline_source))
-    if not pipeline_source.is_file():
-        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(pipeline_source))
+    _refuse_unusable_file_path(pipeline_source)
 
     dags_dir = output_directory / "dags"
     user_dir = output_directory / "user"
