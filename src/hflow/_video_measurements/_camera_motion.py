@@ -7,7 +7,8 @@ from types import ModuleType
 
 import numpy as np
 
-from ._field_guards import require_float
+from hflow._field_guards import require_float
+
 from ._raw_frames import LUMA_FRAME_FILTER_GRAPH, luma_frames
 from ._toolchain import VideoMeasurementToolchain
 

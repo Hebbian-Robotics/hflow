@@ -14,7 +14,8 @@ from io import StringIO
 from pathlib import Path
 from typing import Protocol
 
-from ._field_guards import require_float, require_int
+from hflow._field_guards import require_float, require_int
+
 from ._toolchain import VideoMeasurementToolchain
 
 FRAME_STATISTICS_DEFINITION_VERSION = "video-frame-statistics/v1"

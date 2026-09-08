@@ -1,13 +1,13 @@
-"""Shared numeric-field validation for the video-measurement settings dataclasses.
+"""Shared numeric-field type guards for caller-constructed settings.
 
 Range checks alone (``0 <= x <= 100``) do not reject the wrong *type*: ``bool``
 subclasses ``int``, so ``True``/``False`` satisfy every numeric comparison and
-range test the settings below already run, and a ``str``/``None`` would raise
-a bare ``TypeError`` from the comparison itself instead of a clear message
+range test a settings dataclass runs, and a ``str``/``None`` would raise a
+bare ``TypeError`` from the comparison itself instead of a clear message
 naming the field. This closes that hole the same way ``catalog.py`` already
 does for interval bounds and measurement values.
 
-These settings are caller-constructed configuration, not measurement-pipeline
+These guards are for caller-constructed configuration, not measurement-pipeline
 output, so unlike ``catalog.py``'s NumPy-scalar coercion, no NumPy handling is
 added here: a caller building a ``np.float64`` threshold can call ``.item()``
 itself, the same way any other non-native-Python value would need to.
