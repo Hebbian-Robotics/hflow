@@ -107,6 +107,7 @@ def _refuse_unusable_file_path(path: Path) -> None:
     if not path.is_file():
         raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(path))
 
+
 def is_bucket_url(value: str) -> bool:
     """Whether ``value`` is an object-store URL (``gs://bucket/...`` etc.)."""
     scheme, separator, _rest = value.partition("://")
