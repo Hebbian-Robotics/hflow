@@ -31,9 +31,6 @@ Implementation notes:
   ``MSG: pkg/msg/Type`` headers) so any ROS 2-aware reader decodes them.
 - Everything is deterministic: fixed ``start_time_ns``, seeded noise, no
   wall-clock reads.
-- ``_require_int`` / ``_require_float`` are copied here rather than imported
-  from ``hflow._video_measurements`` so that incubating package can stay
-  dependency-free and extractable (see ``src/hflow/_video_measurements/__init__.py``).
 """
 
 import errno
@@ -49,23 +46,13 @@ from pathlib import Path
 
 from mcap.writer import Writer
 
+from hflow._field_guards import require_float, require_int
 from hflow.ffmpeg import ffmpeg_path
 from hflow.format import (
     EPISODE_KEY_ROBOT_SOFTWARE_VERSION,
     METADATA_RECORD_EPISODE,
     NANOSECONDS_PER_SECOND,
 )
-
-
-def _require_int(value: object, name: str) -> None:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{name} must be an int, got {type(value).__name__}")
-
-
-def _require_float(value: object, name: str) -> None:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise ValueError(f"{name} must be an int or float, got {type(value).__name__}")
-
 
 JOINT_STATES_TOPIC = "/joint_states"
 JOINT_STATE_SCHEMA_NAME = "sensor_msgs/msg/JointState"
@@ -361,9 +348,9 @@ def _validate_numeric_spec_fields(
 ) -> None:
     """Require the declared numeric field types and finite real-valued fields."""
     for field_name, value in float_fields:
-        _require_float(value, field_name)
+        require_float(value, field_name)
     for field_name, value in int_fields:
-        _require_int(value, field_name)
+        require_int(value, field_name)
     for field_name, value in float_fields:
         if not math.isfinite(float(value)):
             raise ValueError(f"{field_name} must be finite, got {value!r}")
@@ -396,7 +383,7 @@ def _validate_video_episode_spec(spec: VideoEpisodeSpec) -> None:
         )
     if not spec.camera_name.strip():
         raise ValueError(f"camera_name must not be empty, got {spec.camera_name!r}")
-    _require_int(spec.shake_amplitude_px, "shake_amplitude_px")
+    require_int(spec.shake_amplitude_px, "shake_amplitude_px")
     if spec.shake_amplitude_px <= 0:
         raise ValueError(f"shake_amplitude_px must be > 0, got {spec.shake_amplitude_px}")
     fault_segments = (
