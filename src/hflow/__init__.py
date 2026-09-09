@@ -82,6 +82,13 @@ from hflow.snapshot import (
     export_dataset_snapshot,
     verify_dataset_snapshot,
 )
+from hflow.statistics import (
+    WeightedDistribution,
+    WeightedHistogramBin,
+    WeightedPercentile,
+    WeightedValue,
+    summarize_weighted_distribution,
+)
 from hflow.steps import (
     RUN_PROFILES,
     Aggregation,
@@ -202,6 +209,10 @@ __all__ = [
     "VerificationReport",
     "VerificationStatus",
     "VideoImportConfig",
+    "WeightedDistribution",
+    "WeightedHistogramBin",
+    "WeightedPercentile",
+    "WeightedValue",
     "Workspace",
     "WorkspaceIdentity",
     "__version__",
@@ -228,6 +239,7 @@ __all__ = [
     "stages_for_profile",
     "stale_episodes",
     "step_version_from_contract",
+    "summarize_weighted_distribution",
     "testing",
     "to_grid",
     "verify_dataset_snapshot",

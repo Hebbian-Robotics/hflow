@@ -57,6 +57,25 @@ Guide: [Run HFlow inside a worker](../docs/how-to/run-embedded-workers.md)
 
 Code: [`embedded_worker.py`](./embedded_worker.py)
 
+## Weighted measurement distributions
+
+**Use it for:** comparing measurement spread with an explicit observation
+weight, histogram, and percentiles rather than a pass/fail cutoff.
+
+**Prerequisites:** the normal root development environment; no recordings,
+FFmpeg, network service, or API key.
+
+```bash
+uv run python examples/measurement_distribution.py
+```
+
+The example prints a weighted mean of 18, median of 10, and 95th percentile of
+90 as JSON. It makes no external calls and writes no files.
+
+Guide: [Summarize weighted measurements](../docs/how-to/summarize-measurements.md)
+
+Code: [`measurement_distribution.py`](./measurement_distribution.py)
+
 ## Recommended real-episode evaluation
 
 **Use it for:** seeing HFlow's default deterministic checks and hosted semantic
