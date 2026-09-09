@@ -1,7 +1,10 @@
 from collections import Counter
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 from mcap.writer import CompressionType, Writer
+
 from hflow.episode import Episode
 
 path = Path("/tmp/hflow-channel-filter-probe.mcap")
@@ -51,19 +54,24 @@ mcap_reader = hflow_reader._reader
 
 original_iter_messages = mcap_reader.iter_messages
 
-calls = []
-seen_topics = []
+calls: list[list[str] | None] = []
+seen_topics: list[str] = []
 
 
-def traced_iter_messages(*args, **kwargs):
-    topics = kwargs.get(
-        "topics",
-        args[0] if args else None,
-    )
-
+def traced_iter_messages(
+    topics: list[str] | None = None,
+    start_time: int | None = None,
+    end_time: int | None = None,
+    log_time_order: bool = False,
+) -> Iterator[Any]:
     calls.append(topics)
 
-    for schema, channel, message in original_iter_messages(*args, **kwargs):
+    for schema, channel, message in original_iter_messages(
+        topics=topics,
+        start_time=start_time,
+        end_time=end_time,
+        log_time_order=log_time_order,
+    ):
         seen_topics.append(channel.topic)
         yield schema, channel, message
 

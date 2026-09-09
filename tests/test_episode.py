@@ -1,5 +1,8 @@
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
+import pytest
 from mcap.writer import CompressionType, Writer
 
 from hflow.episode import Episode
@@ -7,7 +10,7 @@ from hflow.episode import Episode
 
 def test_episode_channel_propagates_topic_filter(
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     mcap_path = tmp_path / "test_channel_filter.mcap"
 
@@ -51,16 +54,18 @@ def test_episode_channel_propagates_topic_filter(
     topics_passed: list[list[str] | None] = []
     channel_ids_passed: list[list[int] | None] = []
 
-    def traced_iter_batches(*args, **kwargs):
-        topics_passed.append(kwargs.get("topics"))
-        channel_ids_passed.append(kwargs.get("channel_ids"))
-        yield from original_iter_batches(*args, **kwargs)
+    def traced_iter_batches(
+        topics: list[str] | None = None,
+        channel_ids: list[int] | None = None,
+    ) -> Iterator[Any]:
+        topics_passed.append(topics)
+        channel_ids_passed.append(channel_ids)
+        yield from original_iter_batches(
+            topics=topics,
+            channel_ids=channel_ids,
+        )
 
-    monkeypatch.setattr(
-        ep._reader,
-        "iter_batches",
-        traced_iter_batches,
-    )
+    monkeypatch.setattr(ep._reader, "iter_batches", traced_iter_batches)
 
     channel = ep.channel("/target")
 
@@ -76,7 +81,7 @@ def test_episode_channel_propagates_topic_filter(
 
 def test_episode_channel_keeps_channel_id_filter_for_duplicate_topics(
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     mcap_path = tmp_path / "test_duplicate_topic.mcap"
 
@@ -120,16 +125,18 @@ def test_episode_channel_keeps_channel_id_filter_for_duplicate_topics(
     topics_passed: list[list[str] | None] = []
     channel_ids_passed: list[list[int] | None] = []
 
-    def traced_iter_batches(*args, **kwargs):
-        topics_passed.append(kwargs.get("topics"))
-        channel_ids_passed.append(kwargs.get("channel_ids"))
-        yield from original_iter_batches(*args, **kwargs)
+    def traced_iter_batches(
+        topics: list[str] | None = None,
+        channel_ids: list[int] | None = None,
+    ) -> Iterator[Any]:
+        topics_passed.append(topics)
+        channel_ids_passed.append(channel_ids)
+        yield from original_iter_batches(
+            topics=topics,
+            channel_ids=channel_ids,
+        )
 
-    monkeypatch.setattr(
-        ep._reader,
-        "iter_batches",
-        traced_iter_batches,
-    )
+    monkeypatch.setattr(ep._reader, "iter_batches", traced_iter_batches)
 
     channel = ep.channel(first_channel_id)
 
