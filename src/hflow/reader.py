@@ -236,6 +236,28 @@ class PythonMcapEpisodeReader:
         batch_max_bytes: int = DEFAULT_BATCH_MAX_BYTES,
     ) -> Iterator[MessageBatch]:
         wanted_channel_ids = frozenset(channel_ids) if channel_ids is not None else None
+        if topics is None and wanted_channel_ids is not None:
+            # Constrain the underlying read to the topics the requested
+            # channels live on, so the MCAP reader can skip unrelated streams
+            # (e.g. multi-gigabyte camera topics) instead of yielding messages
+            # that would be discarded below. Topic filtering alone is not
+            # exact -- several channels may share one topic -- so the
+            # channel-id filter in the loop still applies.
+            try:
+                known_channels = self.channels()
+            except ValueError:
+                # No summary section to derive topics from (unindexed or
+                # truncated file); fall back to the unconstrained read.
+                known_channels = {}
+            derived_topics = sorted(
+                {
+                    known_channels[channel_id].topic
+                    for channel_id in wanted_channel_ids
+                    if channel_id in known_channels
+                }
+            )
+            if derived_topics:
+                topics = derived_topics
         topics_by_channel_id: dict[int, str] = {}
         pending_log_times: dict[int, list[int]] = {}
         pending_publish_times: dict[int, list[int]] = {}
