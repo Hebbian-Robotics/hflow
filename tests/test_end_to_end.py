@@ -2,6 +2,7 @@
 infrastructure. Mirrors the README design-target example."""
 
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import numpy as np
@@ -9,6 +10,7 @@ import pytest
 
 import hflow
 from hflow.checks import camera_frame_stats
+from hflow.curation import open_catalog_connection
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
 
@@ -110,11 +112,16 @@ def test_report_returns_a_named_check_and_explains_missing_names(
     assert named_check_run.result is not None
     with pytest.raises(KeyError) as missing_check_error:
         report.check("unregistered_check")
-    assert "test report has no check named 'unregistered_check'" in str(missing_check_error.value)
+    assert "process report has no check named 'unregistered_check'" in str(
+        missing_check_error.value
+    )
     assert "'joint_smoothness'" in str(missing_check_error.value)
 
 
-def test_many_runs_distinct_episodes_and_preserves_input_order(tmp_path: Path) -> None:
+@pytest.mark.parametrize("worker_api", (False, True), ids=("test_many", "process_many"))
+def test_batch_runs_distinct_episodes_and_preserves_input_order(
+    tmp_path: Path, worker_api: bool
+) -> None:
     source_paths = tuple(
         synthesize_episode(
             tmp_path / "sources" / f"episode_{episode_number:04d}.mcap",
@@ -138,7 +145,8 @@ def test_many_runs_distinct_episodes_and_preserves_input_order(tmp_path: Path) -
 
     requested_source_paths = (source_paths[2], source_paths[0], source_paths[1])
     progress_events: list[hflow.TestManyProgress] = []
-    batch_report = application.test_many(
+    process_batch = application.process_many if worker_api else application.test_many
+    batch_report = process_batch(
         requested_source_paths,
         max_workers=2,
         stages=(hflow.Stage.SYNC, hflow.Stage.META),
@@ -161,32 +169,44 @@ def test_many_runs_distinct_episodes_and_preserves_input_order(tmp_path: Path) -
         assert task_check_run.result is not None
         measured_tasks.append(str(task_check_run.result.measurements["episode/task"]))
     assert measured_tasks == ["task-2", "task-0", "task-1"]
+    output_root = (
+        application.workspace.episodes_root if worker_api else application.workspace.test_runs_root
+    )
+    assert all(report.canonical_path.parent.parent == output_root.workspace for report in reports)
+    assert all((report.catalog_entry is not None) is worker_api for report in reports)
 
 
-def test_many_refuses_duplicate_source_identities(tmp_path: Path) -> None:
+@pytest.mark.parametrize("worker_api", (False, True), ids=("test_many", "process_many"))
+def test_batch_refuses_duplicate_source_identities(tmp_path: Path, worker_api: bool) -> None:
     source_path = synthesize_episode(
         tmp_path / "episode.mcap",
         SyntheticEpisodeSpec(duration_s=0.1, cameras=()),
     )
     application = hflow.App("batch-test", data_root=tmp_path / "data", default_checks=())
+    process_batch = application.process_many if worker_api else application.test_many
 
     with pytest.raises(ValueError, match="duplicate episode source identity"):
-        application.test_many((source_path, source_path), max_workers=2)
+        process_batch((source_path, source_path), max_workers=2)
 
 
 @pytest.mark.parametrize("invalid_max_workers", (0, -1, True))
-def test_many_refuses_invalid_concurrency_limits(
+@pytest.mark.parametrize("worker_api", (False, True), ids=("test_many", "process_many"))
+def test_batch_refuses_invalid_concurrency_limits(
     tmp_path: Path,
     invalid_max_workers: int,
+    worker_api: bool,
 ) -> None:
     application = hflow.App("batch-test", data_root=tmp_path / "data", default_checks=())
+    process_batch = application.process_many if worker_api else application.test_many
 
     with pytest.raises(ValueError, match="max_workers must be a positive integer"):
-        application.test_many((), max_workers=invalid_max_workers)
+        process_batch((), max_workers=invalid_max_workers)
 
 
-def test_many_stops_scheduling_new_episodes_after_preparation_failure(
+@pytest.mark.parametrize("worker_api", (False, True), ids=("test_many", "process_many"))
+def test_batch_stops_scheduling_new_episodes_after_preparation_failure(
     tmp_path: Path,
+    worker_api: bool,
 ) -> None:
     first_valid_source = synthesize_episode(
         tmp_path / "sources" / "first-valid.mcap",
@@ -198,22 +218,29 @@ def test_many_stops_scheduling_new_episodes_after_preparation_failure(
     )
     missing_source = tmp_path / "sources" / "missing.mcap"
     application = hflow.App("batch-test", data_root=tmp_path / "data", default_checks=())
+    process_batch = application.process_many if worker_api else application.test_many
 
     with pytest.raises(FileNotFoundError):
-        application.test_many(
+        process_batch(
             (missing_source, first_valid_source, source_that_must_not_start),
             max_workers=2,
             stages=(hflow.Stage.SYNC,),
         )
 
-    test_run_directories = tuple(application.workspace.test_runs_root.workspace.iterdir())
+    output_root = (
+        application.workspace.episodes_root if worker_api else application.workspace.test_runs_root
+    )
+    run_directories = tuple(output_root.workspace.iterdir())
     assert not any(
         run_directory.name.startswith(f"{source_that_must_not_start.stem}-")
-        for run_directory in test_run_directories
+        for run_directory in run_directories
     )
 
 
-def test_many_stops_scheduling_new_episodes_after_progress_failure(tmp_path: Path) -> None:
+@pytest.mark.parametrize("worker_api", (False, True), ids=("test_many", "process_many"))
+def test_batch_stops_scheduling_new_episodes_after_progress_failure(
+    tmp_path: Path, worker_api: bool
+) -> None:
     source_paths = tuple(
         synthesize_episode(
             tmp_path / "sources" / f"episode_{episode_number}.mcap",
@@ -222,23 +249,116 @@ def test_many_stops_scheduling_new_episodes_after_progress_failure(tmp_path: Pat
         for episode_number in range(3)
     )
     application = hflow.App("batch-test", data_root=tmp_path / "data", default_checks=())
+    process_batch = application.process_many if worker_api else application.test_many
 
     def reject_first_progress(_progress: hflow.TestManyProgress) -> None:
         raise RuntimeError("progress consumer failed")
 
     with pytest.raises(RuntimeError, match="progress consumer failed"):
-        application.test_many(
+        process_batch(
             source_paths,
             max_workers=2,
             stages=(hflow.Stage.SYNC,),
             on_progress=reject_first_progress,
         )
 
-    test_run_directories = tuple(application.workspace.test_runs_root.workspace.iterdir())
+    output_root = (
+        application.workspace.episodes_root if worker_api else application.workspace.test_runs_root
+    )
+    run_directories = tuple(output_root.workspace.iterdir())
     assert not any(
         run_directory.name.startswith(f"{source_paths[2].stem}-")
-        for run_directory in test_run_directories
+        for run_directory in run_directories
     )
+
+
+def test_stateless_batch_retains_error_reports_and_uses_caller_owned_workspace(
+    tmp_path: Path,
+) -> None:
+    source_paths = tuple(
+        synthesize_episode(
+            tmp_path / "sources" / task_name / "episode.mcap",
+            SyntheticEpisodeSpec(duration_s=0.1, cameras=(), task=task_name),
+        )
+        for task_name in ("unavailable", "measured")
+    )
+    with TemporaryDirectory(dir=tmp_path) as temporary_directory:
+        workspace = Path(temporary_directory)
+        output_root = workspace / "batch"
+        application = hflow.App("stateless-worker", data_root=workspace, default_checks=())
+
+        @application.check(version="1")
+        def episode_task(episode: hflow.Episode) -> hflow.CheckResult:
+            task_name = str(episode.metadata["task"])
+            if task_name == "unavailable":
+                raise RuntimeError("measurement unavailable")
+            return hflow.CheckResult(measurements={"episode/task": task_name})
+
+        @application.check(version="1")
+        def unrelated_measurement(episode: hflow.Episode) -> hflow.CheckResult:
+            return hflow.CheckResult(measurements={"unrelated": True})
+
+        batch_report = application.process_many(
+            source_paths,
+            output_dir=output_root,
+            max_workers=2,
+            record=False,
+            stages=(stage for stage in (hflow.Stage.SYNC, hflow.Stage.META)),
+            step_names=(step_name for step_name in ("episode_task",)),
+        )
+
+        assert batch_report.has_errors
+        failed_measurement = batch_report.reports[0].check("episode_task")
+        assert failed_measurement.error is not None
+        assert "measurement unavailable" in failed_measurement.error
+        measured_result = batch_report.reports[1].check("episode_task").result
+        assert measured_result is not None
+        assert measured_result.measurements == {"episode/task": "measured"}
+        assert len({report.canonical_path for report in batch_report.reports}) == 2
+        assert all(report.canonical_path.is_file() for report in batch_report.reports)
+        assert all(
+            report.canonical_path.parent.parent == output_root for report in batch_report.reports
+        )
+        assert all(report.catalog_entry is None for report in batch_report.reports)
+        assert all(len(report.checks) == 1 for report in batch_report.reports)
+        assert not tuple(application.workspace.catalog_root.workspace.rglob("*.parquet"))
+
+    assert not workspace.exists()
+    assert all(source_path.is_file() for source_path in source_paths)
+    assert measured_result.measurements == {"episode/task": "measured"}
+
+
+def test_process_many_records_orchestrator_provenance_by_default(
+    state_only_source_episode: Path, tmp_path: Path
+) -> None:
+    application = hflow.App("batch-worker", data_root=tmp_path / "data", default_checks=())
+    batch_report = application.process_many(
+        (state_only_source_episode,),
+        stages=(hflow.Stage.SYNC, hflow.Stage.META),
+        orchestrator_run_id="worker-run-17",
+    )
+
+    assert batch_report.reports[0].catalog_entry is not None
+    connection = open_catalog_connection(application.workspace.catalog_root)
+    try:
+        assert connection.execute("SELECT orchestrator_run_id FROM episodes").fetchall() == [
+            ("worker-run-17",)
+        ]
+    finally:
+        connection.close()
+
+
+def test_process_many_rejects_unknown_steps_before_source_io(tmp_path: Path) -> None:
+    application = hflow.App("batch-worker", data_root=tmp_path / "data", default_checks=())
+
+    with pytest.raises(ValueError, match=r"unknown step names.*not_registered"):
+        application.process_many(
+            (tmp_path / "missing.mcap",),
+            output_dir=tmp_path / "batch",
+            step_names=("not_registered",),
+        )
+
+    assert not (tmp_path / "batch").exists()
 
 
 def test_ported_user_check_saw_real_joints(

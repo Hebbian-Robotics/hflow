@@ -35,6 +35,28 @@ argument to process your own recording.
 
 Code: [`quickstart.py`](./quickstart.py)
 
+## Embedded video worker
+
+**Use it for:** importing local video excerpts and returning check measurements
+from a container or batch worker without a scheduler or persistent catalog.
+
+**Prerequisites:** the root development environment, FFmpeg, and local videos
+at least five seconds long. HFlow may download its managed FFmpeg build; no
+model service or API key is used.
+
+```bash
+uv run python examples/embedded_worker.py recording-a.mp4 recording-b.mp4 \
+    --duration-s 5 --max-workers 2
+```
+
+The example prints input-ordered camera measurements as JSON. It reads the
+source videos without modifying them, uses a temporary local workspace for
+imports and canonical episodes, and removes that workspace before returning.
+
+Guide: [Run HFlow inside a worker](../docs/how-to/run-embedded-workers.md)
+
+Code: [`embedded_worker.py`](./embedded_worker.py)
+
 ## Recommended real-episode evaluation
 
 **Use it for:** seeing HFlow's default deterministic checks and hosted semantic

@@ -325,8 +325,9 @@ from report order. Sources must be distinct because each source owns one
 test-run directory. A source-preparation or progress-callback failure stops new
 submissions and is raised after already-running episodes finish, so no worker
 keeps writing after control returns to the caller. This remains an in-process
-development tool; use `app.run()` or a deployed runtime when the corpus needs
-durable scheduling and retries.
+development convenience. Use [`app.process_many()`](./how-to/run-embedded-workers.md)
+for an embedded production worker, or `app.run()` / a deployed runtime when the
+corpus needs durable scheduling and retries.
 
 ### Test one check directly
 

@@ -469,25 +469,25 @@ def _resolve_stages(stages: Iterable[Stage] | str | None) -> frozenset[Stage]:
     return frozenset(Stage(stage) for stage in stages)
 
 
-_ConcurrentTestLimit = NewType("_ConcurrentTestLimit", int)
-_ConcurrentTestLimit.__module__ = __name__
+_ConcurrentEpisodeLimit = NewType("_ConcurrentEpisodeLimit", int)
+_ConcurrentEpisodeLimit.__module__ = __name__
 _ConcurrentInputT = TypeVar("_ConcurrentInputT")
 _ConcurrentResultT = TypeVar("_ConcurrentResultT")
 
 
-def _parse_concurrent_test_limit(max_workers: int) -> _ConcurrentTestLimit:
+def _parse_concurrent_episode_limit(max_workers: int) -> _ConcurrentEpisodeLimit:
     """Refine the public integer before the scheduler can consume it."""
 
     if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers <= 0:
         raise ValueError("max_workers must be a positive integer")
-    return _ConcurrentTestLimit(max_workers)
+    return _ConcurrentEpisodeLimit(max_workers)
 
 
 def _run_with_bounded_concurrency(
     inputs: Sequence[_ConcurrentInputT],
     operation: Callable[[_ConcurrentInputT], _ConcurrentResultT],
     *,
-    concurrency_limit: _ConcurrentTestLimit,
+    concurrency_limit: _ConcurrentEpisodeLimit,
     on_completion: Callable[[int, _ConcurrentResultT, int, int], None] | None = None,
 ) -> list[_ConcurrentResultT]:
     """Run at most ``concurrency_limit`` submitted operations, retaining input order.
@@ -892,7 +892,7 @@ def _execute_enrichment(
     )
 
 
-def _check_run_rows(report: "TestReport") -> list[CheckRunRow]:
+def _check_run_rows(report: "ProcessReport") -> list[CheckRunRow]:
     """The catalog rows one processed episode records: every check, then every
     enrichment's labels and published artifact keys.
 
@@ -1072,8 +1072,13 @@ def _status_mark(status: CheckStatus) -> str:
 
 
 @dataclass
-class TestReport:
-    """Everything ``app.test()`` produced for one episode."""
+class ProcessReport:
+    """Measurements, outcomes, provenance, and artifact paths for one processed episode.
+
+    Paths refer to the caller's workspace and are not kept alive by this report.
+    Check and enrichment execution errors are reported through ``has_errors``;
+    a failed quality verdict instead contributes to ``quarantined`` when critical.
+    """
 
     source_path: Path
     canonical_path: Path
@@ -1104,7 +1109,7 @@ class TestReport:
         if not available_check_names:
             available_check_names = "(none)"
         raise KeyError(
-            f"test report has no check named {name!r}; available checks: {available_check_names}"
+            f"process report has no check named {name!r}; available checks: {available_check_names}"
         )
 
     @property
@@ -1212,13 +1217,13 @@ class TestReport:
 
 
 @dataclass(frozen=True)
-class TestManyProgress:
-    """One completed episode reported from the ``test_many`` coordinator."""
+class ProcessManyProgress:
+    """One completed episode reported from the ``process_many`` coordinator."""
 
     input_index: int
     completed_count: int
     total_count: int
-    report: TestReport
+    report: ProcessReport
 
     def summary(self) -> str:
         """Return a concise completion line suitable for ``on_progress=print``."""
@@ -1230,16 +1235,22 @@ class TestManyProgress:
 
 
 @dataclass(frozen=True)
-class TestManyReport:
-    """The input-ordered reports produced by one bounded local corpus test."""
+class ProcessManyReport:
+    """The input-ordered reports produced by one bounded episode batch."""
 
-    reports: tuple[TestReport, ...]
+    reports: tuple[ProcessReport, ...]
 
     @property
     def has_errors(self) -> bool:
         """Whether any episode report contains a check or enrichment error."""
 
         return any(report.has_errors for report in self.reports)
+
+
+# Development helpers return the same reports as production workers.
+TestReport = ProcessReport
+TestManyProgress = ProcessManyProgress
+TestManyReport = ProcessManyReport
 
 
 class App:
@@ -1287,7 +1298,7 @@ class App:
         self._default_check_names: set[str] = set()
         self._register_default_checks(default_checks)
 
-    def _yield_defaults_superseded_by_the_pipeline(self, report: "TestReport") -> None:
+    def _yield_defaults_superseded_by_the_pipeline(self, report: "ProcessReport") -> None:
         """A pipeline's own step outranks a default measuring the same thing.
 
         The documented way to configure a built-in is to wrap it under a name
@@ -1923,26 +1934,73 @@ class App:
     ) -> TestManyReport:
         """Run the in-process dev loop over distinct episodes with bounded concurrency.
 
-        The returned :class:`TestManyReport` preserves input order even when
-        ``max_workers`` allows episodes to finish out of order. ``on_progress`` receives
-        a :class:`TestManyProgress` on this coordinator thread immediately after each
-        episode completes; progress events follow completion order and carry the original
-        input index. At most ``max_workers`` episodes are submitted at once.
+        A thin adapter over :meth:`process_many` with :meth:`test` defaults:
+        outputs land under ``<data_root>/test-runs/`` and catalog recording is
+        disabled unless requested. Ordering, concurrency, progress, and failure
+        semantics are those of :meth:`process_many`. Use that production-facing
+        API for embedded workers and batch jobs.
+        """
+        return self.process_many(
+            episodes,
+            output_dir=self.workspace.test_runs_root,
+            max_workers=max_workers,
+            verbose=verbose,
+            record=record,
+            stages=stages,
+            step_names=step_names,
+            on_progress=on_progress,
+        )
 
-        Each episode keeps the same output-directory, recording, stage-selection, and
-        error behavior as :meth:`test`; an exception raised while preparing one episode
-        or by ``on_progress`` stops new submissions, waits for already-running episodes,
-        and propagates to the caller. Duplicate source identities are refused because
-        concurrent writes to one test-run directory are ambiguous.
+    def process_many(
+        self,
+        episodes: Iterable[Path | str],
+        *,
+        output_dir: Path | str | StorageRoot | None = None,
+        max_workers: int = 1,
+        verbose: bool = False,
+        record: bool = True,
+        stages: Iterable[Stage] | str | None = None,
+        step_names: Iterable[str] | None = None,
+        orchestrator_run_id: str | None = None,
+        on_progress: Callable[[ProcessManyProgress], None] | None = None,
+    ) -> ProcessManyReport:
+        """Process distinct episodes in-process, with bounded thread concurrency.
 
-        ``verbose`` defaults to ``False`` so concurrent reports do not interleave on
-        stdout. Use this for local corpus experiments; use :meth:`run` or a deployed
-        runtime when durable orchestration, retries, and scheduling are required.
+        Each episode uses :meth:`process`, including catalog recording by
+        default. ``output_dir`` is a batch root: every source gets its own
+        ``<stem>-<source-identity-hash>/`` subdirectory. Omit it to use
+        ``<data_root>/episodes/``. Duplicate source identities are refused.
+        Stage and step selection is resolved once before processing begins.
+
+        For a stateless worker, use a caller-owned temporary local ``data_root``
+        and ``record=False``. Disabling recording only suppresses catalog appends:
+        canonical files, scratch files, artifacts, and existing catalog reads
+        retain :meth:`process` semantics. No files are automatically removed;
+        collect results and required artifacts before cleaning up the workspace.
+
+        Reports preserve input order. At most ``max_workers`` episodes are
+        submitted at once, sharing this application's registered functions and
+        their state; those functions must be thread-safe when concurrency is
+        greater than one. Do not change registrations during a batch.
+        ``on_progress`` runs on the calling coordinator thread after each
+        completion, with the original input index. ``verbose=False`` avoids
+        interleaved summaries from worker threads.
+
+        Check and enrichment errors remain in each :class:`ProcessReport` and
+        do not abort the batch; inspect ``has_errors`` as well as quality
+        verdicts. Exceptions outside those per-step outcomes, such as source
+        preparation, transform, or callback failures, stop new submissions,
+        wait for already-running episodes, and raise to the caller. Completed
+        files and catalog appends are not rolled back.
+        This method provides no automatic retries, scheduling, or durable job
+        state; the caller owns those policies and any partial results it keeps
+        through ``on_progress``. ``orchestrator_run_id`` is passed to each
+        episode's catalog append when recording is enabled.
         """
 
         if isinstance(episodes, Path | str):
             raise TypeError("episodes must be an iterable of episode paths, not one path")
-        concurrency_limit = _parse_concurrent_test_limit(max_workers)
+        concurrency_limit = _parse_concurrent_episode_limit(max_workers)
         if isinstance(step_names, str):
             raise TypeError("step_names must be an iterable of names, not one string")
         if on_progress is not None and not callable(on_progress):
@@ -1950,7 +2008,14 @@ class App:
 
         episode_references = tuple(episodes)
         if not episode_references:
-            return TestManyReport(reports=())
+            return ProcessManyReport(reports=())
+
+        stable_stages = stages if stages is None or isinstance(stages, str) else tuple(stages)
+        stable_step_names = None if step_names is None else tuple(step_names)
+        prepared_process_configuration = self._prepare_process_configuration(
+            stages=stable_stages,
+            step_names=stable_step_names,
+        )
         source_reference_by_identity: dict[str, Path | str] = {}
         for episode_reference in episode_references:
             source_identity = self.source_identity(episode_reference)
@@ -1962,33 +2027,33 @@ class App:
                 )
             source_reference_by_identity[source_identity] = episode_reference
 
-        stable_stages = stages if stages is None or isinstance(stages, str) else tuple(stages)
-        stable_step_names = None if step_names is None else tuple(step_names)
-        prepared_process_configuration = self._prepare_process_configuration(
-            stages=stable_stages,
-            step_names=stable_step_names,
-        )
+        batch_storage_root = parse_storage_root(output_dir) if output_dir is not None else None
 
-        def test_episode(episode_reference: Path | str) -> TestReport:
+        def process_episode(episode_reference: Path | str) -> ProcessReport:
             return self.process(
                 episode_reference,
-                output_dir=self.workspace.test_runs_root.child(
-                    _source_artifact_directory_name(episode_reference, self.storage_root)
+                output_dir=(
+                    batch_storage_root.child(
+                        _source_artifact_directory_name(episode_reference, self.storage_root)
+                    )
+                    if batch_storage_root is not None
+                    else None
                 ),
                 verbose=verbose,
                 record=record,
+                orchestrator_run_id=orchestrator_run_id,
                 _prepared_process_configuration=prepared_process_configuration,
             )
 
         def report_completion(
             input_index: int,
-            report: TestReport,
+            report: ProcessReport,
             completed_count: int,
             total_count: int,
         ) -> None:
             if on_progress is not None:
                 on_progress(
-                    TestManyProgress(
+                    ProcessManyProgress(
                         input_index=input_index,
                         completed_count=completed_count,
                         total_count=total_count,
@@ -1997,9 +2062,9 @@ class App:
                 )
 
         if concurrency_limit == 1:
-            sequential_reports: list[TestReport] = []
+            sequential_reports: list[ProcessReport] = []
             for input_index, episode_reference in enumerate(episode_references):
-                report = test_episode(episode_reference)
+                report = process_episode(episode_reference)
                 sequential_reports.append(report)
                 report_completion(
                     input_index,
@@ -2007,14 +2072,14 @@ class App:
                     len(sequential_reports),
                     len(episode_references),
                 )
-            return TestManyReport(reports=tuple(sequential_reports))
+            return ProcessManyReport(reports=tuple(sequential_reports))
         reports = _run_with_bounded_concurrency(
             episode_references,
-            test_episode,
+            process_episode,
             concurrency_limit=concurrency_limit,
             on_completion=report_completion,
         )
-        return TestManyReport(reports=tuple(reports))
+        return ProcessManyReport(reports=tuple(reports))
 
     def run(
         self,
@@ -2105,7 +2170,7 @@ class App:
         orchestrator_run_id: str | None = None,
         _registered_step_selection: RegisteredStepSelection | None = None,
         _prepared_process_configuration: _PreparedProcessConfiguration | None = None,
-    ) -> TestReport:
+    ) -> ProcessReport:
         """Process one episode through the enabled stages of the stage
         graph: transform to canonical (``sync``), run checks with gate
         semantics (``meta``), run enrichments (``labels``), render derived
@@ -2335,7 +2400,7 @@ class App:
             else:
                 canonical_uri = run_storage_root.uri_for(canonical_file_name)
 
-            report = TestReport(
+            report = ProcessReport(
                 source_path=source_path,
                 canonical_path=canonical_path,
                 stamps=stamps,
