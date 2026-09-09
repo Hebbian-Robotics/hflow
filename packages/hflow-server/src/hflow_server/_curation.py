@@ -8,8 +8,10 @@ can read the data but can never touch the catalog's files -- hosted parity,
 and defense in depth even locally. The server wraps that SQL as a subquery
 (``SELECT ... FROM (<sql>)``) for LIMITing, counting, and SUMMARIZE, so a
 smuggled second statement is a parser error, and every DuckDB parser/binder
-error travels back as a 400 whose detail is DuckDB's own message -- the
-useful part -- never a 500.
+error about the CALLER'S SQL travels back as a 400 whose detail is DuckDB's
+own message -- the useful part -- never a 500. A parse failure of a wrapper
+this server constructed is answered with the gate's fixed refusal sentence
+instead: no 400 body ever contains SQL the caller did not send (#450).
 
 Workspace convention: pinned manifests are immutable files at
 ``<data_root>/manifests/<slug>-<utc timestamp>.parquet`` -- never the
@@ -76,6 +78,21 @@ CATALOG_TABLE_BROWSING_ORDER = (
 )
 
 _TIMESTAMPTZ_TYPE = "TIMESTAMP WITH TIME ZONE"
+
+# The one sentence every curation route answers when SQL is well-formed but
+# not the accepted shape. Pinned by tests (#448); reused verbatim so preview,
+# report, and pin can never drift apart on wording.
+_SINGLE_SELECT_REFUSAL = "sql must be exactly one read-only SELECT statement"
+
+# Statement texts the curation gate accepts: every way DuckDB spells a query
+# that is both genuinely a SELECT and legal as a subquery (preview wraps the
+# SQL in ``SELECT ... FROM (<sql>)``). DuckDB types introspection statements
+# such as ``PRAGMA database_list``, ``DESCRIBE``, ``SUMMARIZE``, and ``SHOW``
+# as StatementType.SELECT because it implements them as table functions, but
+# they are illegal as subqueries -- so preview's wrapper failed to parse while
+# pin ran them as-is, and the two routes disagreed (#450). Judging the leading
+# keyword too keeps both routes refusing them with the same sentence.
+_ACCEPTED_LEADING_SQL_KEYWORDS = frozenset({"SELECT", "WITH", "FROM", "VALUES"})
 
 # What a read-only launch refuses on this router; the sentence around it (and
 # the 403) belongs to _settings.refuse_when_read_only.
@@ -158,24 +175,70 @@ def _bad_sql_refusal(error: duckdb.Error) -> HTTPException:
     return HTTPException(status_code=400, detail=str(error))
 
 
-def _reject_non_single_select(user_sql: str) -> None:
-    """Refuse anything that is not exactly one SELECT statement.
+def _leading_sql_keyword(sql: str) -> str:
+    """The statement's first word, uppercased -- past whitespace, comments, parens.
 
-    ``hflow.reject_non_single_select`` owns the rule (exactly one statement
-    whose type is SELECT, judged by parsing with ``extract_statements``
-    WITHOUT executing anything); this route only maps its two failure modes
-    onto the two client-facing 400s: DuckDB's own diagnostic for SQL the
-    parser rejects, the fixed sentence for SQL that is well-formed but not a
-    single SELECT.
+    A tiny scan, not a SQL parser: the gate has already confirmed *sql* parses
+    as exactly one statement, so this only needs to find where that statement's
+    first keyword starts. It skips runs of whitespace, ``--`` line comments,
+    ``/* */`` block comments (nested, as DuckDB nests them following Postgres),
+    and ``(`` -- a parenthesized query like ``(SELECT 1)`` is still SELECT
+    text, and no non-query statement can appear inside parentheses and survive
+    the parse the gate already ran.
+    """
+    index = 0
+    end = len(sql)
+    while index < end:
+        character = sql[index]
+        if character.isspace() or character == "(":
+            index += 1
+        elif sql.startswith("--", index):
+            line_end = sql.find("\n", index)
+            index = end if line_end == -1 else line_end + 1
+        elif sql.startswith("/*", index):
+            comment_depth = 1
+            index += 2
+            while index < end and comment_depth > 0:
+                if sql.startswith("/*", index):
+                    comment_depth += 1
+                    index += 2
+                elif sql.startswith("*/", index):
+                    comment_depth -= 1
+                    index += 2
+                else:
+                    index += 1
+        else:
+            break
+    keyword_start = index
+    while index < end and (sql[index].isalpha() or sql[index] == "_"):
+        index += 1
+    return sql[keyword_start:index].upper()
+
+
+def _reject_non_single_select(user_sql: str) -> None:
+    """Refuse anything that is not exactly one SELECT-text statement.
+
+    ``hflow.reject_non_single_select`` owns the base rule (exactly one
+    statement whose type is SELECT, judged by parsing with
+    ``extract_statements`` WITHOUT executing anything); this route only maps
+    its two failure modes onto the two client-facing 400s: DuckDB's own
+    diagnostic for SQL the parser rejects, the fixed sentence for SQL that is
+    well-formed but not a single SELECT.
+
+    On top of that, the statement must READ as a SELECT: its leading keyword
+    has to be one of ``_ACCEPTED_LEADING_SQL_KEYWORDS``. Statement TYPE alone
+    let DuckDB's SELECT-typed introspection statements (``PRAGMA``,
+    ``DESCRIBE``, ``SUMMARIZE``, ``SHOW``) through, which pin could run but
+    preview's subquery wrapper could not even parse (#450).
     """
     try:
         reject_non_single_select(user_sql)
     except duckdb.Error as error:
         raise _bad_sql_refusal(error) from error
     except NonSingleSelectQueryError:
-        raise HTTPException(
-            status_code=400, detail="sql must be exactly one read-only SELECT statement"
-        ) from None
+        raise HTTPException(status_code=400, detail=_SINGLE_SELECT_REFUSAL) from None
+    if _leading_sql_keyword(user_sql) not in _ACCEPTED_LEADING_SQL_KEYWORDS:
+        raise HTTPException(status_code=400, detail=_SINGLE_SELECT_REFUSAL)
 
 
 def _browsable_relations(
@@ -213,7 +276,17 @@ def _browsable_relations(
 def _described_columns(
     connection: duckdb.DuckDBPyConnection, user_sql: str
 ) -> list[ColumnDescriptor]:
-    described_rows = connection.execute(f"DESCRIBE SELECT * FROM ({user_sql})").fetchall()
+    # The DESCRIBE wrapper is OUR text, not the caller's: the gate already
+    # parsed user_sql standalone, so a parse failure here means the wrapper
+    # choked on a statement shape the gate should have refused. Answer with
+    # the gate's fixed sentence -- never DuckDB's diagnostic for a rewrite the
+    # caller did not send and cannot act on (#450). Binder/catalog errors
+    # (unknown table, unknown column) still propagate to the route's handler
+    # and travel back with DuckDB's own message, which IS about their SQL.
+    try:
+        described_rows = connection.execute(f"DESCRIBE SELECT * FROM ({user_sql})").fetchall()
+    except (duckdb.ParserException, duckdb.SyntaxException) as error:
+        raise HTTPException(status_code=400, detail=_SINGLE_SELECT_REFUSAL) from error
     return [ColumnDescriptor(name=str(row[0]), type=str(row[1])) for row in described_rows]
 
 
