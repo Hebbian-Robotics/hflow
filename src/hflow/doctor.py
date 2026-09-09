@@ -181,6 +181,17 @@ def _check_video_payload(
         )
 
 
+class VideoEncodingUnsupported(ValueError):
+    """No decoder factory in the supported set handles this message encoding.
+
+    A subclass of ``ValueError`` because every existing caller treats
+    resolution failure as a ``ValueError``; the distinct type lets the video
+    check report the true cause, an encoding outside the supported set, a
+    fact about the file paired with the reader, instead of wrapping it in a
+    corruption assertion. #460.
+    """
+
+
 def _resolve_video_decoder(topic: str, channel: Channel, schema: Schema) -> Callable[[bytes], Any]:
     """Resolve either supported encoded-video payload representation."""
     from mcap_protobuf.decoder import DecoderFactory as ProtobufDecoderFactory
@@ -190,7 +201,7 @@ def _resolve_video_decoder(topic: str, channel: Channel, schema: Schema) -> Call
         decoder = factory.decoder_for(channel.message_encoding, schema)
         if decoder is not None:
             return decoder
-    raise ValueError(
+    raise VideoEncodingUnsupported(
         f"video topic {topic!r} has message encoding {channel.message_encoding!r} "
         "that no available decoder handles"
     )
@@ -237,6 +248,26 @@ def diagnose(path: Path | str) -> DoctorReport:
 
         metadata_records = {record.name: dict(record.metadata) for record in reader.iter_metadata()}
         provenance = metadata_records.get(METADATA_RECORD_PROVENANCE)
+
+        # Schema pre-pass (#460): a channel naming a schema id the file does
+        # not carry makes the reader raise KeyError mid-iteration, and the
+        # broad read handler would wrap that in a corruption assertion. The
+        # true defect is a missing schema record, reported here per channel;
+        # those channels are then read nowhere, so read-failed stays reserved
+        # for genuine read and CRC errors. A schema_id of 0 means schemaless
+        # and is legitimate, not a dangling reference.
+        topics_with_missing_schema = [
+            channel.topic
+            for channel in summary.channels.values()
+            if channel.schema_id != 0 and channel.schema_id not in summary.schemas
+        ]
+        for topic in topics_with_missing_schema:
+            collector.add(
+                DiagnosticLevel.ERROR,
+                "channel-schema-missing",
+                f"{topic}: channel names a schema id that has no schema record in "
+                "the file; its messages are unreadable and its checks are skipped",
+            )
 
         group_by_topic = {}
         if provenance:
@@ -344,13 +375,23 @@ def diagnose(path: Path | str) -> DoctorReport:
 
         # Full message pass: CRC validation happens as a side effect of
         # reading every chunk; per-topic time order and video constraints are
-        # checked message by message.
+        # checked message by message. Channels named in the schema pre-pass
+        # are excluded: reading them raises KeyError on the missing schema,
+        # which is a reported defect, not a corrupt chunk (#460).
         def iter_all_messages() -> Iterator[tuple[int, int, bytes]]:
-            for _schema, channel, message in reader.iter_messages(log_time_order=False):
+            readable_topics = [
+                topic
+                for topic in topics_by_channel_id.values()
+                if topic not in set(topics_with_missing_schema)
+            ]
+            for _schema, channel, message in reader.iter_messages(
+                log_time_order=False, topics=readable_topics
+            ):
                 yield channel.id, message.log_time, message.data
 
         last_log_time_by_channel: dict[int, int] = {}
         video_message_counts: dict[int, int] = {}
+        video_check_skipped_topics: set[str] = set(topics_with_missing_schema)
         try:
             video_decoders: dict[int, Callable[[bytes], Any]] = {}
 
@@ -365,17 +406,28 @@ def diagnose(path: Path | str) -> DoctorReport:
                     )
                 last_log_time_by_channel[channel_id] = log_time
                 if channel_id in video_channel_ids:
+                    if topics_by_channel_id[channel_id] in video_check_skipped_topics:
+                        # Already reported for this topic: its payloads cannot
+                        # be video-checked, but they are not damage and must
+                        # not read as such.
+                        continue
                     message_index = video_message_counts.get(channel_id, 0)
                     video_message_counts[channel_id] = message_index + 1
                     decoder = video_decoders.get(channel_id)
                     if decoder is None:
                         channel = summary.channels[channel_id]
-                        schema = summary.schemas.get(channel.schema_id)
-                        if schema is None:
-                            raise ValueError(
-                                f"video topic {channel.topic!r} has no readable schema record"
+                        schema = summary.schemas[channel.schema_id]
+                        try:
+                            decoder = _resolve_video_decoder(channel.topic, channel, schema)
+                        except VideoEncodingUnsupported as error:
+                            video_check_skipped_topics.add(topics_by_channel_id[channel_id])
+                            collector.add(
+                                DiagnosticLevel.ERROR,
+                                "video-encoding-unsupported",
+                                f"{topics_by_channel_id[channel_id]}: {error}; video checks "
+                                "cannot run on this topic (the file bytes are not implicated)",
                             )
-                        decoder = _resolve_video_decoder(channel.topic, channel, schema)
+                            continue
                         video_decoders[channel_id] = decoder
                     decoded = decoder(payload)
                     _check_video_payload(
