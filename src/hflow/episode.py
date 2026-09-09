@@ -437,7 +437,10 @@ class Episode:
         log_time_parts: list[np.ndarray] = []
         publish_time_parts: list[np.ndarray] = []
         raw: list[bytes] = []
-        for batch in self._reader.iter_batches(channel_ids=[info.channel_id]):
+        for batch in self._reader.iter_batches(
+            topics=[info.topic],
+            channel_ids=[info.channel_id],
+        ):
             log_time_parts.append(batch.log_times)
             publish_time_parts.append(batch.publish_times)
             raw.extend(batch.data)
