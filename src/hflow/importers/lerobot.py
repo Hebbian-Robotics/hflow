@@ -617,6 +617,46 @@ def _episode_metadata_cache_path(
     return episodes_metadata_directory / relative_path
 
 
+# Exactly the fields _convert_single_episode supplies to each template's
+# str.format call: data_path gets integer chunk/file indexes; video_path
+# additionally gets the camera name under both of its historical spellings.
+# Values mirror the runtime types so format specs are checked honestly
+# ({chunk_index:06d} needs an int, {camera_key} a str).
+_DATA_PATH_TEMPLATE_TEST_FIELDS: dict[str, int | str] = {"chunk_index": 0, "file_index": 0}
+_VIDEO_PATH_TEMPLATE_TEST_FIELDS: dict[str, int | str] = {
+    "chunk_index": 0,
+    "file_index": 0,
+    "video_key": "camera",
+    "camera_key": "camera",
+}
+
+
+def _validate_path_template(
+    template: str, field_name: str, converter_supplied_fields: dict[str, int | str]
+) -> None:
+    """Refuse a path template that ``str.format`` would reject during conversion.
+
+    Episode conversion formats these templates with a fixed set of fields.
+    Test-formatting once here, with exactly those fields and value types,
+    keeps a malformed or wrong-placeholder template at this boundary instead
+    of surfacing as a bare ``KeyError``/``ValueError``/``IndexError`` after
+    every episode metadata shard has already been downloaded (#471).
+    """
+    try:
+        template.format(**converter_supplied_fields)
+    except (KeyError, IndexError, ValueError) as format_error:
+        match format_error:
+            case KeyError():
+                reason = f"unknown field {format_error.args[0]!r}"
+            case IndexError():
+                reason = "positional fields are not supported"
+            case _:
+                reason = str(format_error)
+        raise ValueError(
+            f"LeRobot meta/info.json has an invalid {field_name} template {template!r}: {reason}"
+        ) from format_error
+
+
 def _parse_dataset_information(dataset_information: dict) -> _DatasetInformation:
     """Turn a raw ``meta/info.json`` document into immutable internal values.
 
@@ -639,11 +679,15 @@ def _parse_dataset_information(dataset_information: dict) -> _DatasetInformation
     data_path_template = dataset_information.get("data_path")
     if not isinstance(data_path_template, str) or not data_path_template.strip():
         raise ValueError("LeRobot meta/info.json must define a non-empty data_path template")
+    _validate_path_template(data_path_template, "data_path", _DATA_PATH_TEMPLATE_TEST_FIELDS)
     video_path_template = dataset_information.get(
         "video_path", "videos/{camera_key}/{chunk_index:06d}/{file_index:06d}.mp4"
     )
     if not isinstance(video_path_template, str) or not video_path_template.strip():
         raise ValueError("LeRobot meta/info.json must define a non-empty video_path template")
+    # Validated after the default is applied: the parsed value, default
+    # included, is exactly what episode conversion will format.
+    _validate_path_template(video_path_template, "video_path", _VIDEO_PATH_TEMPLATE_TEST_FIELDS)
 
     dataset_features = dataset_information.get("features")
     if not isinstance(dataset_features, dict):
