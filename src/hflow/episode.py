@@ -308,7 +308,11 @@ class Episode:
 
     @cached_property
     def _reader(self) -> EpisodeReader:
-        return open_reader(self.path)
+        # validate_crcs=True: a content hash proved this file at sync time,
+        # not at read time. Every post-sync lane (META, relabel, re-check)
+        # consumes this reader, so a canonical episode that decayed on disk
+        # must be diagnosed here rather than re-certified (#474).
+        return open_reader(self.path, validate_crcs=True)
 
     def close(self) -> None:
         if "_reader" in self.__dict__:

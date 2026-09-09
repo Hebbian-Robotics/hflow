@@ -465,6 +465,38 @@ def _state_only_episode(tmp_path: Path) -> Path:
     )
 
 
+def test_check_lanes_refuse_a_canonical_episode_that_decayed_after_sync(tmp_path: Path) -> None:
+    """A canonical episode whose stored chunk CRC no longer matches its bytes
+    must not be re-certified by a post-sync check run (#474): every check that
+    consumes message data errors with the CRC diagnosis instead of stamping
+    fresh findings over bytes the file's own integrity stamp disowns. #429
+    closed this hole on the LeRobot resume path and #462 on the primary ingest
+    read; the post-sync ``Episode`` read is the same trust boundary.
+    """
+    from reuse_test_helpers import flip_first_chunk_stored_crc
+
+    source = _state_only_episode(tmp_path)
+    app = hflow.App("post-sync-crc", data_root=tmp_path / "data")
+    app.process(source, record=False)
+
+    # The control: a healthy canonical runs the check lane unchanged.
+    healthy = app.process(source, record=False, stages={hflow.Stage.META})
+    assert {run.status for run in healthy.checks} == {hflow.CheckStatus.MEASURED}
+
+    flip_first_chunk_stored_crc(healthy.canonical_path)
+
+    damaged = app.process(source, record=False, stages={hflow.Stage.META})
+    digest_run = damaged.check("content_digest")
+    assert digest_run.status == hflow.CheckStatus.ERROR
+    assert digest_run.error is not None
+    assert "CRCValidationError" in digest_run.error
+    assert damaged.has_errors
+    # No fresh evidence lands over the damaged bytes: the only checks still
+    # measuring are the camera ones, which read nothing on a camera-less
+    # episode and record no keys.
+    assert all(not run.result.measurements for run in damaged.checks if run.result is not None)
+
+
 def test_two_checks_recording_one_measurement_key_are_refused(tmp_path: Path) -> None:
     """Every step of one run shares its fingerprint and timestamp, so a shared
     key is a tie the catalog resolves arbitrarily -- one step's value silently

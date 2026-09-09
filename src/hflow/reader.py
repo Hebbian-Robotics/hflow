@@ -298,9 +298,10 @@ def open_reader(path: Path | str, *, validate_crcs: bool = False) -> EpisodeRead
 
     ``validate_crcs`` checks each chunk's CRC as it is decoded, catching
     payload damage that magic-byte and summary checks alone cannot see. It
-    defaults to ``False`` because most callers re-read a canonical file HFlow
-    already produced and already identifies by content hash; pass ``True``
-    only when reading a source that has not been trusted yet (see
-    ``hflow.transform``).
+    defaults to ``False`` for reads that stay out of the message data
+    (summary, metadata, provenance), which chunk CRCs cannot vouch for
+    anyway. Any read that consumes messages should pass ``True``: a content
+    hash or receipt proved the file when it was written, not the bytes on
+    disk at read time (see ``hflow.transform`` and ``hflow.episode``, #474).
     """
     return PythonMcapEpisodeReader(path, validate_crcs=validate_crcs)

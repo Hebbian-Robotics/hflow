@@ -44,6 +44,30 @@ def flip_chunk_payload_bytes(episode_path: Path, *, count: int = 4) -> None:
     episode_path.write_bytes(bytes(data))
 
 
+def flip_first_chunk_stored_crc(episode_path: Path) -> None:
+    """Flip one bit of the first chunk's stored ``uncompressed_crc`` in place.
+
+    The complement of :func:`flip_chunk_payload_bytes` for compressed files:
+    a canonical episode's chunk records region is compressed, so its payload
+    bytes are not addressable in place -- but the CRC field in the chunk
+    header is. The payload still decompresses fine; the bytes simply no
+    longer match the file's own integrity stamp (real-world header rot),
+    which only a CRC-validated read can tell.
+    """
+    from mcap.reader import make_reader
+
+    data = bytearray(episode_path.read_bytes())
+    summary = make_reader(io.BytesIO(bytes(data))).get_summary()
+    if summary is None or not summary.chunk_indexes:
+        raise ValueError(f"{episode_path} has no chunk records to corrupt")
+    chunk_start = summary.chunk_indexes[0].chunk_start_offset
+    # Chunk record per the MCAP spec: opcode(1) length(8) then
+    # message_start_time(8) message_end_time(8) uncompressed_size(8)
+    # uncompressed_crc(4), so the stored CRC begins at offset 33.
+    data[chunk_start + 33] ^= 0x01
+    episode_path.write_bytes(bytes(data))
+
+
 def content_id_differs_from_delivery_receipt(episode_path: Path, receipt_content_id: str) -> bool:
     """True when the file on disk no longer matches the recorded content id."""
     return content_episode_id(episode_path) != receipt_content_id
