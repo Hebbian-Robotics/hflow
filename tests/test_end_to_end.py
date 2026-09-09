@@ -230,11 +230,9 @@ def test_batch_stops_scheduling_new_episodes_after_preparation_failure(
     output_root = (
         application.workspace.episodes_root if worker_api else application.workspace.test_runs_root
     )
-    run_directories = tuple(output_root.workspace.iterdir())
-    assert not any(
-        run_directory.name.startswith(f"{source_that_must_not_start.stem}-")
-        for run_directory in run_directories
-    )
+    # Preparation can fail before the other submitted episode creates any
+    # output directory, so an absent root is also a valid cancellation outcome.
+    assert not any(output_root.workspace.glob(f"{source_that_must_not_start.stem}-*"))
 
 
 @pytest.mark.parametrize("worker_api", (False, True), ids=("test_many", "process_many"))
