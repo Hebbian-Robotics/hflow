@@ -16,7 +16,7 @@ rather than a shared ``message_count``.
 """
 
 import hashlib
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -1828,21 +1828,34 @@ class _KeyframeIntervalPerCamera:
 
 def _keyframe_indices(channel: ChannelData) -> tuple[int, ...]:
     """Shared payload-scan helper for ``keyframe_interval``: which message
-    indices in ``channel.raw`` are keyframes. The fact and the body call
-    this; the cost is one Annex B scan per camera per call, which is the
-    irreducible price the default pays to know its own key set. Caching
-    the result on the channel would let the pre-decode supersession
-    consult the fact without a second scan, but no caller needs that
-    today -- the body is the only reader, and the fact is only consulted
-    when the default will run anyway. Revisit if a future change makes
-    the pre-decode check the hot path for this default.
+    indices in ``channel.raw`` are keyframes. The body shares the result
+    with the key-set fact so each camera's payloads are scanned once.
     """
     return tuple(
         index for index, payload in enumerate(channel.raw) if _payload_starts_a_keyframe(payload)
     )
 
 
-def _keyframe_interval_keys(episode: Episode, *, cameras: Sequence[str] | None = None) -> set[str]:
+def _keyframe_interval_intermediates(channel: ChannelData) -> _KeyframeIntervalPerCamera:
+    """One camera's keyframe scan, computed once and shared by the body and
+    the key-set fact (#480).
+
+    No empty-channel shortcut: ``_keyframe_indices`` on a channel with no
+    messages already returns ``()`` without inspecting a payload, so guarding
+    it would only add a branch that reads as if it saved something.
+    """
+    return _KeyframeIntervalPerCamera(
+        frame_count=channel.timestamps.size,
+        keyframe_indices=_keyframe_indices(channel),
+    )
+
+
+def _keyframe_interval_keys(
+    episode: Episode,
+    *,
+    cameras: Sequence[str] | None = None,
+    intermediates_by_camera: Mapping[str, _KeyframeIntervalPerCamera] | None = None,
+) -> set[str]:
     """The one statement of ``keyframe_interval``'s measurement key set.
 
     Per selected camera: ``scanned_frame_count`` and ``keyframe_count``
@@ -1851,23 +1864,26 @@ def _keyframe_interval_keys(episode: Episode, *, cameras: Sequence[str] | None =
     found; ``median_keyframe_interval_s`` only when at least two
     keyframes are found. ``App``'s pre-decode supersession reads this
     through the routing map, which only ever sees the automatic bare
-    registration.
+    registration. The body supplies its already-computed intermediates;
+    standalone callers compute them here.
     """
     selected_cameras = list(cameras) if cameras is not None else episode.cameras
     keys: set[str] = set()
     for topic in selected_cameras:
-        channel = episode.channel(topic)
-        frame_count = channel.timestamps.size
+        inter = (
+            _keyframe_interval_intermediates(episode.channel(topic))
+            if intermediates_by_camera is None
+            else intermediates_by_camera[topic]
+        )
         keys.add(f"{topic}/scanned_frame_count")
-        if frame_count == 0:
+        if inter.frame_count == 0:
             continue
-        keyframe_indices = _keyframe_indices(channel)
         keys.add(f"{topic}/keyframe_count")
         keys.add(f"{topic}/first_frame_is_keyframe")
-        if not keyframe_indices:
+        if not inter.keyframe_indices:
             continue
         keys.add(f"{topic}/max_keyframe_gap_s")
-        if len(keyframe_indices) >= 2:
+        if len(inter.keyframe_indices) >= 2:
             keys.add(f"{topic}/median_keyframe_interval_s")
     return keys
 
@@ -1928,18 +1944,29 @@ def keyframe_interval(episode: Episode, *, cameras: Sequence[str] | None = None)
     them as perfect.
     """
     selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    timestamps_by_camera: dict[str, np.ndarray] = {}
+    intermediates_by_camera: dict[str, _KeyframeIntervalPerCamera] = {}
+    # dict.fromkeys, not set: a repeated camera is loaded once but the
+    # measurement loop below still walks selected_cameras in the order the
+    # caller gave. Only the timestamps and the small keyframe struct are kept,
+    # so the channel's raw payloads are released as the loop moves on rather
+    # than all C being held at once.
+    for topic in dict.fromkeys(selected_cameras):
+        channel = episode.channel(topic)
+        timestamps_by_camera[topic] = channel.timestamps
+        intermediates_by_camera[topic] = _keyframe_interval_intermediates(channel)
+    keys = sorted(
+        _keyframe_interval_keys(
+            episode,
+            cameras=selected_cameras,
+            intermediates_by_camera=intermediates_by_camera,
+        )
+    )
     measurements: dict[str, MeasurementValue] = {}
     for topic in selected_cameras:
-        channel = episode.channel(topic)
-        stamps_ns = channel.timestamps
-        if stamps_ns.size == 0:
-            measurements[f"{topic}/scanned_frame_count"] = 0
-            continue
-        inter = _KeyframeIntervalPerCamera(
-            frame_count=stamps_ns.size,
-            keyframe_indices=_keyframe_indices(channel),
-        )
-        for key in sorted(_keyframe_interval_keys(episode, cameras=selected_cameras)):
+        stamps_ns = timestamps_by_camera[topic]
+        inter = intermediates_by_camera[topic]
+        for key in keys:
             if not key.startswith(f"{topic}/"):
                 continue
             name = key[len(topic) + 1 :]

@@ -1118,6 +1118,42 @@ def test_keyframe_interval_emits_exactly_the_documented_measurements(
     _assert_measurements_match_pinned(dict(run.result.measurements), expected_subset)
 
 
+@pytest.mark.parametrize(
+    ("measurement_name", "superseded"),
+    [("max_keyframe_gap_s", True), ("median_keyframe_interval_s", False)],
+)
+def test_keyframe_supersession_uses_only_keys_the_camera_would_emit(
+    measurement_name: str, superseded: bool, camera_source: Path, tmp_path: Path
+) -> None:
+    # This one-GOP camera has a maximum gap but no median keyframe interval.
+    app = hflow.App(
+        "keyframe-overlap",
+        data_root=tmp_path / "data",
+        default_checks=(hflow.checks.keyframe_interval,),
+    )
+    key = f"/wrist_cam/compressed/{measurement_name}"
+
+    @app.check(version="1")
+    def pipeline_cadence(episode: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={key: 42.0})
+
+    report = app.test(camera_source, verbose=False)
+    pipeline_result = report.check("pipeline_cadence").result
+    assert pipeline_result is not None
+    assert pipeline_result.measurements == {key: 42.0}
+    default = report.check("keyframe_interval")
+    if superseded:
+        assert default.status is hflow.CheckStatus.SUPERSEDED
+        assert default.result is None
+        assert default.duration_s == 0.0
+        assert isinstance(default.not_run, hflow.SupersededByPipeline)
+        assert default.not_run.superseded_keys == (key,)
+    else:
+        assert default.result is not None
+        assert key not in default.result.measurements
+        assert default.result.measurements["/wrist_cam/compressed/keyframe_count"] == 1
+
+
 # content_digest: the single key ``content_digest`` carries a 64-char hex
 # SHA-256. The exact value is runner- and codec-build dependent, so the
 # fixture pins only its type and length.
