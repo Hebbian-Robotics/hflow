@@ -828,7 +828,11 @@ def verify_dataset_snapshot(
 
     Unreadable input (a missing directory, a missing or unparsable
     ``format.json``) raises instead: that is not a finding about a delivered
-    snapshot, it is the wrong input entirely.
+    snapshot, it is the wrong input entirely. The same applies to a receipt
+    that is internally inconsistent with itself: a missing or malformed
+    ``content_id``, or a recomputed inventory hash that disagrees with the
+    stored one, means the receipt no longer describes the delivered set
+    (tampering or a truncated write), which is exit 2, not damaged bytes.
 
     Extra files under ``assets/`` that the receipt does not name are ignored:
     the receipt covers what was exported, not everything a recipient may add.
@@ -882,6 +886,29 @@ def verify_dataset_snapshot(
         *integrity.get("tables", {}).values(),
         *integrity.get("assets", []),
     ]
+
+    # The deleted-member gate (#473): when a receipt entry and its file are
+    # both gone, the surviving entries are self-consistent and every per-file
+    # check passes; only the stored inventory hash, computed over the original
+    # set, differs from the hash of what remains. Recompute it exactly as the
+    # exporter did (:194) and refuse a receipt that no longer describes the
+    # delivered set. Internal inconsistency is unreadable input, not damage,
+    # so it raises to exit 2 like an unparsable marker rather than reporting
+    # findings.
+    stored_content_id = integrity.get("content_id")
+    if not isinstance(stored_content_id, str) or not stored_content_id:
+        raise ValueError(
+            "format.json integrity receipt carries no usable content_id; "
+            "the delivered member set cannot be checked against the receipt"
+        )
+    recomputed_content_id = _inventory_content_id(receipt_entries)
+    if recomputed_content_id != stored_content_id:
+        raise ValueError(
+            "format.json integrity receipt is internally inconsistent: recomputed "
+            f"inventory content_id {recomputed_content_id!r} != stored "
+            f"{stored_content_id!r}; the receipt no longer describes the delivered set"
+        )
+
     for entry in receipt_entries:
         relative_path = str(entry["path"])
         delivered_path = resolved_directory / relative_path
