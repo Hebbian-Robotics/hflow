@@ -865,6 +865,28 @@ def verify_dataset_snapshot(
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise ValueError(f"format.json is unreadable: {error}") from error
 
+    # Format identity gate (#472): the exporter's replace guard (:618-625) and
+    # the writer (:772-773) both pin this identity; the verifier refuses the
+    # same markers, so exit 0 means "this is an HFlow snapshot and the receipt
+    # matched", never "some directory with an integrity-shaped key matched".
+    # The comparison is deliberately strict, exactly like the writer: the
+    # version is recorded as a string, so a JSON number 1 is refused, and the
+    # error says so because that mistake is an easy one to make.
+    found_format = format_marker.get("format")
+    found_version = format_marker.get("format_version")
+    if (
+        found_format != DATASET_SNAPSHOT_FORMAT_NAME
+        or found_version != DATASET_SNAPSHOT_FORMAT_VERSION
+    ):
+        raise ValueError(
+            f"format.json is not a {DATASET_SNAPSHOT_FORMAT_NAME!r} format version "
+            f"{DATASET_SNAPSHOT_FORMAT_VERSION!r} dataset snapshot: found format "
+            f"{found_format!r}, format_version {found_version!r}. Both must match "
+            "the exporter exactly, including the version's type: the writer records "
+            f"it as the string {DATASET_SNAPSHOT_FORMAT_VERSION!r}, so a JSON number "
+            "1 is refused"
+        )
+
     integrity = format_marker.get("integrity")
     if not isinstance(integrity, dict):
         # A valid v1 snapshot from before #401: verifiable nothing, corrupt nothing.
