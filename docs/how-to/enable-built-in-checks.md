@@ -80,10 +80,11 @@ app.check(version="1")(action_integrity)
 ```
 
 To pass configuration, bind it -- either with `functools.partial` or a wrapper,
-whichever reads better to you. The version is explicit, so bump it when a
-retuned number makes the new measurements or verdicts incompatible with the
-old ones. These replace the bare registration of the same check rather than
-adding to it:
+whichever reads better to you. A `functools.partial` has no `__name__`, so it
+needs `name=`; a wrapper takes its name from the function. The version is
+explicit, so bump it when a retuned number makes the new measurements or
+verdicts incompatible with the old ones. These replace the bare registration of
+the same check rather than adding to it:
 
 ```python
 import functools
@@ -174,6 +175,43 @@ One check needs a dependency the core install does not carry:
 optional `motion` extra (`pip install 'hflow[motion]'`). Everything else here
 runs on the core install. Enabling it without the extra raises at the first
 episode with the install command in the message, rather than failing obscurely.
+
+`camera_stability` reads hand-held footage as almost continuously unstable, and
+that is the report to expect on it rather than a sign the check is broken. Its
+rule is not a number anyone picked: a frame pair counts as unstable when its
+shake rate beats the deliberate camera movement in that same pair and clears
+the instrument's resolution floor of one pixel per frame. A camera in someone's
+hand crosses that floor constantly, by fractions of a degree. That is real
+motion, and it is not what a person means by a shaky camera.
+
+Two knobs raise the bar, both off by default so the instrument's own rule
+stands:
+
+```python
+import functools
+
+from hflow.checks import camera_stability
+
+# Instead of `app.check(version="1")(camera_stability)`:
+app.check(version="1", name="camera_stability")(
+    functools.partial(camera_stability, shake_threshold_dps=3.0, unstable_min_duration_s=0.25)
+)
+```
+
+`shake_threshold_dps` is a minimum shake rate a pair must clear on top of the
+resolution floor, so raising it moves every measurement: `unstable_share` and
+`unstable_s` count the same pairs the intervals do.
+
+`unstable_min_duration_s` drops unstable runs shorter than it **from the
+intervals only**. Raise it and the intervals get shorter and fewer while
+`unstable_share` and `unstable_s` do not move at all. That asymmetry is worth
+knowing before you tune, because someone who raises the duration and watches
+the share will conclude the knob does nothing.
+
+A few degrees per second and a quarter second of run is a reasonable starting
+point for hand-held work, and leaves the spans a viewer would point at. Read
+`unstable_share` next to `coverage_share` either way: footage no transform
+could be fitted to is reported as unclassified rather than as steady.
 
 The trajectory checks report in the stream's own units. If your dimensions share
 no unit -- a gripper width beside a shoulder angle -- pass `dimension_scales=`,
@@ -267,24 +305,3 @@ particularly the limitations.
   surface, the measurement-key naming rules, and coverage denominators.
 - [Architecture: quality checks and curation](../ARCHITECTURE.md) -- why checks
   record evidence and gates are optional policy.
-
-
-## `camera_stability`
-
-`camera_stability` monitors the angular velocity of the camera and flags periods of excessive motion.  
-Two optional tuning knobs are available:
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `shake_threshold_dps` | `0.0` | Angular velocity threshold (degrees per second). When the camera’s instantaneous angular velocity exceeds this value, the check considers the camera to be “shaking”. |
-| `unstable_min_duration_s` | `0.0` | Minimum duration (seconds) that the camera must stay above `shake_threshold_dps` to be reported as unstable. This prevents brief spikes from being flagged. |
-
-### Example
-
-```python
-from hflow import CameraStability
-
-check = CameraStability(
-    shake_threshold_dps=5.0,          # 5 °/s threshold
-    unstable_min_duration_s=0.5      # at least 0.5 s of shaking
-)
