@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from functools import partial
 from pathlib import Path
 from types import TracebackType
+from typing import Any
 
 import httpx2
 import pytest
@@ -174,7 +176,7 @@ def test_build_ai_check_version_changes_with_hosted_check_version(tmp_path: Path
             None,
             "32",
             5,
-            "max_tokens must be an integer",
+            "max_tokens must be an int",
         ),
         (
             "http://localhost:8000/v1",
@@ -184,7 +186,7 @@ def test_build_ai_check_version_changes_with_hosted_check_version(tmp_path: Path
             None,
             True,
             5,
-            "max_tokens must be an integer",
+            "max_tokens must be an int",
         ),
         (
             "http://localhost:8000/v1",
@@ -194,7 +196,7 @@ def test_build_ai_check_version_changes_with_hosted_check_version(tmp_path: Path
             None,
             0,
             5,
-            "max_tokens must be greater than zero",
+            "max_tokens must be > 0",
         ),
         (
             "http://localhost:8000/v1",
@@ -204,7 +206,7 @@ def test_build_ai_check_version_changes_with_hosted_check_version(tmp_path: Path
             None,
             32,
             "5",
-            "max_retries must be an integer",
+            "max_retries must be an int",
         ),
         (
             "http://localhost:8000/v1",
@@ -214,7 +216,7 @@ def test_build_ai_check_version_changes_with_hosted_check_version(tmp_path: Path
             None,
             32,
             True,
-            "max_retries must be an integer",
+            "max_retries must be an int",
         ),
         (
             "http://localhost:8000/v1",
@@ -224,7 +226,7 @@ def test_build_ai_check_version_changes_with_hosted_check_version(tmp_path: Path
             None,
             32,
             -1,
-            "max_retries must not be negative",
+            "max_retries must be >= 0",
         ),
         (
             "http://localhost:8000/v1",
@@ -286,7 +288,7 @@ def test_openai_compatible_execution_refuses_non_integer_max_retries(
 ) -> None:
     # bool is an int subclass, so the isinstance(int) check alone would let
     # True through; both shapes must raise the same error.
-    with pytest.raises(ValueError, match="max_retries must be an integer"):
+    with pytest.raises(ValueError, match="max_retries must be an int"):
         hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
             endpoint="https://example.com/v1",
             model="model",
@@ -421,16 +423,159 @@ def test_hosted_unparsed_response_remains_an_evaluation_outcome() -> None:
     assert outcome.parse_error == 'active manipulation must be "yes" or "no"'
 
 
-def test_hosted_response_refuses_a_prediction_outside_the_check_contract() -> None:
+@pytest.mark.parametrize("prediction", [True, False, -1, 3, 1.0, "1", None])
+def test_hosted_response_refuses_a_prediction_outside_the_check_contract(
+    prediction: object,
+) -> None:
     with pytest.raises(RuntimeError, match="outside 0, 1, or 2"):
         hflow.build_ai_vlm_checks._parse_hosted_check_response(
             hflow.build_ai_vlm_checks.EvaluationTask.HAND_COUNT,
             {
                 "outcome": "parsed",
-                "prediction": 3,
+                "prediction": prediction,
                 "raw_response": "3",
             },
         )
+
+
+@pytest.mark.parametrize(
+    ("factory", "field", "boundary", "valid"),
+    [
+        (
+            partial(
+                hflow.build_ai_vlm_checks.OpenAICompatibleExecution,
+                endpoint="https://example.com/v1",
+                model="model",
+            ),
+            "max_tokens",
+            0,
+            1,
+        ),
+        (
+            partial(
+                hflow.build_ai_vlm_checks.OpenAICompatibleExecution,
+                endpoint="https://example.com/v1",
+                model="model",
+            ),
+            "max_retries",
+            -1,
+            0,
+        ),
+        (hflow.build_ai_vlm_checks.HFlowHostedExecution, "max_retries", -1, 0),
+        (hflow.build_ai_vlm_checks.HFlowHostedExecution, "check_version", 0, 1),
+        (hflow.build_ai_vlm_checks.HFlowHostedExecution, "request_timeout_seconds", 0, 0.5),
+        (hflow.build_ai_vlm_checks.FrameSampling, "fps", 0, 0.5),
+        (hflow.build_ai_vlm_checks.FrameSampling, "start_s", -1, 0),
+        (partial(hflow.build_ai_vlm_checks.FrameSampling, start_s=2), "end_s", 2, 3),
+    ],
+)
+def test_numeric_configuration_boundaries(
+    factory: Callable[..., Any], field: str, boundary: int, valid: int | float
+) -> None:
+    for value in [True, False, "1", None, float("nan"), float("inf"), float("-inf"), boundary]:
+        if field == "end_s" and value is None:
+            continue
+        with pytest.raises(ValueError, match=field):
+            factory(**{field: value})
+    assert getattr(factory(**{field: valid}), field) == valid
+
+
+@pytest.mark.parametrize("value", [True, False, "1", float("nan"), float("inf"), float("-inf")])
+def test_temperature_requires_a_finite_number(value: Any) -> None:
+    with pytest.raises(ValueError, match="temperature"):
+        hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
+            endpoint="https://example.com/v1", model="model", temperature=value
+        )
+
+
+@pytest.mark.parametrize("value", [1, 0, "true", None, 1.0])
+def test_skip_black_frames_requires_an_actual_bool(value: Any) -> None:
+    # The one guard in this file that _field_guards cannot express: the field
+    # wants a bool, so the bool exclusion every other guard makes is inverted
+    # here. Deleting it left the whole suite green, hence this case. 1 and 0
+    # are the interesting rows, since they compare equal to True and False.
+    with pytest.raises(ValueError, match="skip_black_frames must be a bool"):
+        hflow.build_ai_vlm_checks.FrameSampling(fps=1.0, skip_black_frames=value)
+
+
+def test_skip_black_frames_accepts_both_bools() -> None:
+    # False is the row that matters: a truthiness check instead of a type
+    # check would let it through and a falsy-value guard would refuse it.
+    assert (
+        hflow.build_ai_vlm_checks.FrameSampling(fps=1.0, skip_black_frames=False).skip_black_frames
+        is False
+    )
+    assert (
+        hflow.build_ai_vlm_checks.FrameSampling(fps=1.0, skip_black_frames=True).skip_black_frames
+        is True
+    )
+
+
+@pytest.mark.parametrize("value", [None, -1, 0, 0.5])
+def test_temperature_accepts_optional_finite_numbers(value: float | None) -> None:
+    execution = hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
+        endpoint="https://example.com/v1", model="model", temperature=value
+    )
+    assert execution.temperature == value
+
+
+@pytest.mark.parametrize(
+    "value", [True, False, "1", None, -1, float("nan"), float("inf"), float("-inf")]
+)
+def test_registration_refuses_invalid_frame_times(tmp_path: Path, value: Any) -> None:
+    application = hflow.App("frame-times", data_root=tmp_path, default_checks=())
+    with pytest.raises(ValueError, match="frame_time_seconds"):
+        hflow.build_ai_vlm_checks.register_hand_visibility(
+            application,
+            execution=hflow.build_ai_vlm_checks.HFlowHostedExecution(),
+            frame_time_seconds=value,
+        )
+
+
+@pytest.mark.parametrize(
+    "value", [True, False, -1, 3, 1.0, None, "01", "3", float("nan"), float("inf")]
+)
+def test_hand_count_response_refuses_invalid_numbers(value: object) -> None:
+    with pytest.raises(ValueError, match=r"^hand count must be 0, 1, or 2$"):
+        hflow.build_ai_vlm_checks.parse_hand_count_response(json.dumps({"hand_count": value}))
+
+
+@pytest.mark.parametrize("value", [0, 1, 2, "0", "1", "2", " 1 "])
+def test_hand_count_response_accepts_integer_and_text_counts(value: int | str) -> None:
+    assert hflow.build_ai_vlm_checks.parse_hand_count_response(
+        json.dumps({"hand_count": value})
+    ) == int(value)
+
+
+def test_usage_booleans_are_observations_but_not_numeric_measurements() -> None:
+    checks = hflow.build_ai_vlm_checks
+    result = checks.model_output_check_result(
+        task=checks.EvaluationTask.HAND_COUNT,
+        requested_model="model",
+        outcome=checks.ParsedVisionModelOutcome(
+            raw_response="1",
+            response_metadata=checks.ModelResponseMetadata(
+                response_model=None,
+                usage={
+                    "tokens": 2,
+                    "cost": 0.5,
+                    "cached": True,
+                    "empty": False,
+                    "label": "text",
+                    "missing": None,
+                },
+            ),
+            predicted_value=1,
+        ),
+        observation_id="frame:0",
+        timestamp_ns=0,
+    )
+    assert {key: value for key, value in result.measurements.items() if "/usage/" in key} == {
+        "build_ai/hand_count/usage/tokens": 2,
+        "build_ai/hand_count/usage/cost": 0.5,
+    }
+    assert result.observations[0].values["usage/cached"] is True
+    assert result.observations[0].values["usage/empty"] is False
 
 
 # --- version contract covers every knob that changes result completeness (#404)

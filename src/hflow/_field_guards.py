@@ -1,4 +1,4 @@
-"""Shared numeric-field type guards for caller-constructed settings.
+"""Shared numeric-field type and range guards for caller-constructed settings.
 
 Range checks alone (``0 <= x <= 100``) do not reject the wrong *type*: ``bool``
 subclasses ``int``, so ``True``/``False`` satisfy every numeric comparison and
@@ -11,16 +11,25 @@ These guards are for caller-constructed configuration, not measurement-pipeline
 output, so unlike ``catalog.py``'s NumPy-scalar coercion, no NumPy handling is
 added here: a caller building a ``np.float64`` threshold can call ``.item()``
 itself, the same way any other non-native-Python value would need to.
+
+Range guards compose the type guards so callers can state the whole invariant
+without repeating the bool exclusion. The Real guard preserves batching's
+broader numeric contract without adding coercion to the native-number guards.
+Each guard returns the validated value with its refined type, without coercion.
 """
 
+import math
+from numbers import Real
 
-def require_int(value: object, name: str) -> None:
+
+def require_int(value: object, name: str) -> int:
     """Refuse anything but a plain ``int``, ``bool`` included."""
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be an int, got {type(value).__name__}")
+    return value
 
 
-def require_float(value: object, name: str) -> None:
+def require_float(value: object, name: str) -> int | float:
     """Refuse anything but a plain ``int`` or ``float``, ``bool`` included.
 
     An ``int`` is accepted for a float-declared field: it is a perfectly good
@@ -28,3 +37,63 @@ def require_float(value: object, name: str) -> None:
     """
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise ValueError(f"{name} must be an int or float, got {type(value).__name__}")
+    return value
+
+
+def require_positive_int(value: object, name: str) -> int:
+    """Refuse anything but a strictly positive int, excluding bool."""
+    number = require_int(value, name)
+    if number <= 0:
+        raise ValueError(f"{name} must be > 0, got {number}")
+    return number
+
+
+def require_non_negative_int(value: object, name: str) -> int:
+    """Refuse anything but a non-negative int, excluding bool."""
+    number = require_int(value, name)
+    if number < 0:
+        raise ValueError(f"{name} must be >= 0, got {number}")
+    return number
+
+
+def require_int_in_range(value: object, name: str, *, minimum: int, maximum: int) -> int:
+    """Refuse anything but an int within the inclusive bounds, excluding bool."""
+    number = require_int(value, name)
+    if not minimum <= number <= maximum:
+        raise ValueError(f"{name} must be in [{minimum}, {maximum}], got {number}")
+    return number
+
+
+def require_finite_float(value: object, name: str) -> int | float:
+    """Refuse anything but a finite int or float, excluding bool."""
+    number = require_float(value, name)
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite, got {number}")
+    return number
+
+
+def require_positive_float(value: object, name: str) -> int | float:
+    """Refuse anything but a finite, strictly positive int or float."""
+    number = require_finite_float(value, name)
+    if number <= 0:
+        raise ValueError(f"{name} must be > 0, got {number}")
+    return number
+
+
+def require_non_negative_float(value: object, name: str) -> int | float:
+    """Refuse anything but a finite, non-negative int or float."""
+    number = require_finite_float(value, name)
+    if number < 0:
+        raise ValueError(f"{name} must be >= 0, got {number}")
+    return number
+
+
+def require_non_negative_real(value: object, name: str) -> Real:
+    """Preserve batching's finite, non-negative Real contract, excluding bool."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a real number, got {type(value).__name__}")
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite, got {value}")
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0, got {value}")
+    return value
