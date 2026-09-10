@@ -571,10 +571,16 @@ def _leading_keyword(sql: str) -> str:
     DuckDB labels ``PRAGMA database_list``, ``DESCRIBE SELECT 1``,
     ``SHOW TABLES`` and ``SUMMARIZE SELECT 1`` as ``StatementType.SELECT``
     because they are table functions, and it accepts the latter three
-    inside ``FROM (<sql>)`` (the preview wrapper's shape) -- so a parse-based
+    inside ``FROM (<sql>)`` (the preview wrapper's shape), so a parse-based
     subquery check alone would let them through. The curation endpoints
     advertise exactly one read-only SELECT, so the gate also refuses these
     keywords when they head the original text.
+
+    This is a rule about the shape callers write, not a containment boundary.
+    ``(DESCRIBE SELECT 1)`` is not headed by the keyword and is accepted, and
+    that is fine: preview and pin both run it and agree, which is what #450
+    asked for. Read-only introspection of an in-memory catalog was never the
+    thing being kept out.
     """
     stripped = sql.lstrip()
     while True:
@@ -611,11 +617,9 @@ def reject_non_single_select(sql: str) -> None:
     The narrowing for ``PRAGMA`` / ``DESCRIBE`` / ``SHOW`` / ``SUMMARIZE``
     asks DuckDB the same question the preview wrapper does: does the SQL
     parse inside ``SELECT * FROM (<sql>)``? ``extract_statements`` on that
-    form accepts everything that runs as a subquery -- including FROM-first
-    queries, parenthesized SELECTs, and VALUES clauses that were
-    mis-rejected by the previous SELECT/WITH text-prefix heuristic (review
-    of #453) -- and refuses the four table-function keywords that the
-    endpoints refuse to advertise. Trailing semicolons and whitespace are
+    form accepts everything that runs as a subquery, including FROM-first
+    queries, parenthesized SELECTs, and VALUES clauses that a SELECT/WITH
+    text prefix would refuse (review of #453). Trailing semicolons and whitespace are
     stripped before wrapping, and a newline is appended when missing, so
     a trailing ``--`` line comment cannot swallow the wrapper's closing
     paren.
@@ -625,17 +629,17 @@ def reject_non_single_select(sql: str) -> None:
         # ``extract_statements`` on the user's SQL surfaces genuine parse
         # failures (a typoed keyword, an unterminated block comment) as
         # ``duckdb.Error`` and the gate propagates them untouched so the
-        # server's 400 detail can be DuckDB's own diagnostic -- that
+        # server's 400 detail can be DuckDB's own diagnostic. That
         # distinction is the rule's failure-mode contract.
         statements = parser_connection.extract_statements(sql)
         if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
             raise NonSingleSelectQueryError("sql must be exactly one SELECT statement")
         # Refuse PRAGMA/DESCRIBE/SHOW/SUMMARIZE by leading keyword. DuckDB
         # labels them SELECT, and DESCRIBE/SHOW/SUMMARIZE even parse cleanly
-        # as subqueries -- only ``SELECT * FROM (PRAGMA database_list)``
-        # raises a parser error -- so the parse check below is necessary
-        # but not sufficient: this leading-keyword refusal is what keeps
-        # the gate in step with what the endpoints advertise.
+        # as subqueries. Only ``SELECT * FROM (PRAGMA database_list)`` raises
+        # a parser error, so the parse check below is necessary but not
+        # sufficient: this leading-keyword refusal is what keeps the gate in
+        # step with what the endpoints advertise.
         if _leading_keyword(sql) in _SUBQUERY_FORBIDDEN_LEADING_KEYWORDS:
             raise NonSingleSelectQueryError("sql must be exactly one read-only SELECT statement")
         # Parse the SQL inside the wrapper preview actually applies. Trailing

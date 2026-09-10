@@ -222,7 +222,8 @@ def test_pin_rejects_pragma_and_describe_consistently(
     writable_api: TestClient, api: TestClient
 ) -> None:
     # Mirrors preview's gate: PRAGMA/DESCRIBE/SHOW are StatementType.SELECT
-    # but not SELECT text, so both endpoints must agree (issue #450).
+    # but the endpoints advertise one read-only SELECT, so both must agree
+    # on refusing them (issue #450).
     for sql in (
         "PRAGMA database_list",
         "PRAGMA show_tables",

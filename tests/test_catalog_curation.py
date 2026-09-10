@@ -1196,9 +1196,9 @@ def test_reject_non_single_select_refuses_pragma_and_describe_labeled_as_select(
     # DuckDB labels PRAGMA, DESCRIBE, SHOW, SUMMARIZE as StatementType.SELECT
     # because they are table functions, but the curation endpoints advertise
     # exactly one read-only SELECT. Preview interpolated the SQL as
-    # ``SELECT * FROM (<sql>)`` where those forms are a syntax error, so the
+    # ``SELECT * FROM (<sql>)`` where PRAGMA is a syntax error, so the
     # wrapper's parse failure leaked as the caller's error and preview/pin
-    # disagreed. The gate now requires SELECT/WITH text (issue #450).
+    # disagreed. The gate now refuses these four by leading keyword (#450).
     for sql in (
         "PRAGMA database_list",
         "PRAGMA show_tables",
@@ -1233,7 +1233,7 @@ def test_reject_non_single_select_accepts_legal_selects_that_do_not_start_with_s
     # Review of #453: the previous text-prefix heuristic rejected every query
     # that didn't start with SELECT or WITH, but DuckDB labels FROM-first
     # queries, parenthesized selects, and VALUES clauses as
-    # StatementType.SELECT and accepts them inside ``FROM (<sql>)`` -- the
+    # StatementType.SELECT and accepts them inside ``FROM (<sql>)``, the
     # shape preview interpolates. The gate must accept them too.
     reject_non_single_select("FROM range(3)")
     reject_non_single_select("FROM range(3) WHERE range > 0")
@@ -1251,6 +1251,18 @@ def test_reject_non_single_select_accepts_trailing_line_comment_without_newline(
     # parser error: the trailing line comment swallows the wrapper's closing
     # paren. Appending a newline before wrapping ends the comment first.
     reject_non_single_select("SELECT 1 -- trailing comment without newline")
+
+
+def test_reject_non_single_select_keyword_refusal_is_about_the_leading_word() -> None:
+    # The PRAGMA/DESCRIBE/SHOW/SUMMARIZE refusal reads the first identifier,
+    # so a parenthesized DESCRIBE is not headed by the keyword and is
+    # accepted. Pinned deliberately: preview and pin both run that form and
+    # agree on it, which is the #450 requirement. Read-only introspection of
+    # an in-memory catalog was never what the gate was keeping out.
+    reject_non_single_select("(DESCRIBE SELECT 1)")
+    reject_non_single_select("SELECT * FROM (SHOW TABLES)")
+    with pytest.raises(NonSingleSelectQueryError):
+        reject_non_single_select("DESCRIBE SELECT 1")
 
 
 def test_constrained_curate_writes_the_manifest_but_refuses_outside_reads(

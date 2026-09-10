@@ -211,8 +211,8 @@ def test_preview_rejects_pragma_and_describe_consistently(api: TestClient) -> No
     # endpoints advertise exactly one read-only SELECT. Preview previously
     # interpolated the SQL as ``SELECT * FROM (<sql>)`` where those forms are
     # a syntax error, leaking the wrapper (``DESCRIBE SELECT * FROM (PRAGMA
-    # database_list)``) as the caller's 400. The shared gate now requires
-    # SELECT/WITH text, so preview and pin agree (issue #450).
+    # database_list)``) as the caller's 400. The shared gate now refuses
+    # these four by leading keyword, so preview and pin agree (issue #450).
     for sql in (
         "PRAGMA database_list",
         "PRAGMA show_tables",
