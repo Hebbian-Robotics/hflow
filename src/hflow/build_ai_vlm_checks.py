@@ -40,11 +40,20 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, assert_never
+from typing import TYPE_CHECKING, Any, assert_never, cast
 from urllib.parse import urlsplit
 
 import httpx2
 
+from hflow._field_guards import (
+    require_finite_float,
+    require_float,
+    require_int_in_range,
+    require_non_negative_float,
+    require_non_negative_int,
+    require_positive_float,
+    require_positive_int,
+)
 from hflow._version import __version__
 from hflow._video_measurement_toolchain import measure_video_frame_statistics_for_hflow
 from hflow._video_measurements import FrameStatisticsSettings
@@ -215,16 +224,10 @@ class OpenAICompatibleExecution:
             raise ValueError(
                 "api_key_environment_variable must be a valid environment variable name"
             )
-        if not isinstance(self.max_tokens, int) or isinstance(self.max_tokens, bool):
-            raise ValueError("max_tokens must be an integer")
-        if self.max_tokens <= 0:
-            raise ValueError("max_tokens must be greater than zero")
-        if not isinstance(self.max_retries, int) or isinstance(self.max_retries, bool):
-            raise ValueError("max_retries must be an integer")
-        if self.max_retries < 0:
-            raise ValueError("max_retries must not be negative")
-        if self.temperature is not None and not math.isfinite(self.temperature):
-            raise ValueError("temperature must be finite")
+        require_positive_int(self.max_tokens, "max_tokens")
+        require_non_negative_int(self.max_retries, "max_retries")
+        if self.temperature is not None:
+            require_finite_float(self.temperature, "temperature")
 
 
 @dataclass(frozen=True)
@@ -250,24 +253,12 @@ class HFlowHostedExecution:
 
     def __post_init__(self) -> None:
         _require_absolute_http_url(self.base_url, name="base_url")
-        if not isinstance(self.max_retries, int) or isinstance(self.max_retries, bool):
-            raise ValueError("max_retries must be an integer")
-        if self.max_retries < 0:
-            raise ValueError("max_retries must not be negative")
+        require_non_negative_int(self.max_retries, "max_retries")
         parsed_base_url = urlsplit(self.base_url)
         if parsed_base_url.query or parsed_base_url.fragment:
             raise ValueError("base_url must not contain a query string or fragment")
-        if not isinstance(self.check_version, int) or isinstance(self.check_version, bool):
-            raise ValueError("check_version must be an integer")
-        if self.check_version <= 0:
-            raise ValueError("check_version must be greater than zero")
-        if (
-            isinstance(self.request_timeout_seconds, bool)
-            or not isinstance(self.request_timeout_seconds, int | float)
-            or not math.isfinite(self.request_timeout_seconds)
-            or self.request_timeout_seconds <= 0
-        ):
-            raise ValueError("request_timeout_seconds must be finite and greater than zero")
+        require_positive_int(self.check_version, "check_version")
+        require_positive_float(self.request_timeout_seconds, "request_timeout_seconds")
 
 
 BuildAIExecution = OpenAICompatibleExecution | HFlowHostedExecution
@@ -297,18 +288,14 @@ class FrameSampling:
     skip_black_frames: bool = True
 
     def __post_init__(self) -> None:
-        if not isinstance(self.skip_black_frames, bool):
+        if type(self.skip_black_frames) is not bool:
             raise ValueError("skip_black_frames must be a bool")
-        if isinstance(self.fps, bool) or not math.isfinite(self.fps) or self.fps <= 0:
-            raise ValueError("fps must be finite and greater than zero")
-        if isinstance(self.start_s, bool) or not math.isfinite(self.start_s) or self.start_s < 0:
-            raise ValueError("start_s must be finite and non-negative")
-        if self.end_s is not None and (
-            isinstance(self.end_s, bool)
-            or not math.isfinite(self.end_s)
-            or self.end_s <= self.start_s
-        ):
-            raise ValueError("end_s must be finite and greater than start_s")
+        require_positive_float(self.fps, "fps")
+        require_non_negative_float(self.start_s, "start_s")
+        if self.end_s is not None:
+            require_finite_float(self.end_s, "end_s")
+            if self.end_s <= self.start_s:
+                raise ValueError("end_s must be greater than start_s")
 
 
 @dataclass(frozen=True)
@@ -337,10 +324,7 @@ class _RegisteredBuildAICheckConfiguration:
                 "HFlowHostedExecution uses the hosted check's fixed prompt and does not support "
                 "prompt overrides"
             )
-        if isinstance(self.frame_time_seconds, bool) or not math.isfinite(self.frame_time_seconds):
-            raise ValueError("frame_time_seconds must be finite and non-negative")
-        if self.frame_time_seconds < 0:
-            raise ValueError("frame_time_seconds must be finite and non-negative")
+        require_non_negative_float(self.frame_time_seconds, "frame_time_seconds")
         if self.camera == "":
             raise ValueError("camera must be None or a non-empty topic name")
 
@@ -376,17 +360,10 @@ def parse_hand_count_response(response_text: str) -> int:
     parsed_response = _parse_json_or_scalar(response_text)
     if isinstance(parsed_response, dict):
         parsed_response = parsed_response.get("hand_count")
-    if isinstance(parsed_response, bool):
-        raise ValueError("hand count must be 0, 1, or 2")
-    if isinstance(parsed_response, int):
-        hand_count = parsed_response
-    elif isinstance(parsed_response, str) and re.fullmatch(r"[012]", parsed_response.strip()):
-        hand_count = int(parsed_response)
-    else:
-        raise ValueError("hand count must be 0, 1, or 2")
-    if hand_count not in {0, 1, 2}:
-        raise ValueError("hand count must be 0, 1, or 2")
-    return hand_count
+    if isinstance(parsed_response, str) and re.fullmatch(r"[012]", parsed_response.strip()):
+        parsed_response = int(parsed_response)
+    require_int_in_range(parsed_response, "hand count", minimum=0, maximum=2)
+    return cast(int, parsed_response)
 
 
 def parse_active_manipulation_response(response_text: str) -> str:
@@ -536,8 +513,11 @@ def model_output_check_result(
             outcome.response_metadata.response_model
         )
     for usage_name, usage_value in outcome.response_metadata.usage.items():
-        if isinstance(usage_value, int | float) and not isinstance(usage_value, bool):
-            measurements[f"{measurement_prefix}/usage/{usage_name}"] = usage_value
+        try:
+            require_float(usage_value, f"usage/{usage_name}")
+        except ValueError:
+            continue
+        measurements[f"{measurement_prefix}/usage/{usage_name}"] = cast(int | float, usage_value)
 
     observation_values: dict[str, MeasurementValue] = {
         "task": task.value,
@@ -799,12 +779,14 @@ def _read_bounded_hosted_response(response: httpx2.Response) -> bytes:
 def _parse_hosted_prediction(task: EvaluationTask, value: object) -> int | str:
     match task:
         case EvaluationTask.HAND_COUNT:
-            if isinstance(value, bool) or not isinstance(value, int) or value not in {0, 1, 2}:
+            try:
+                require_int_in_range(value, "hand count", minimum=0, maximum=2)
+            except ValueError as error:
                 raise RuntimeError(
                     "HFlow hosted hand-visibility check returned a parsed prediction "
                     "outside 0, 1, or 2"
-                )
-            return value
+                ) from error
+            return cast(int, value)
         case EvaluationTask.ACTIVE_MANIPULATION:
             if not isinstance(value, str) or value not in {"yes", "no"}:
                 raise RuntimeError(
