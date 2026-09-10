@@ -140,11 +140,20 @@ def test_hand_count_parser_accepts_published_and_compatible_shapes(
     assert parse_hand_count_response(response_text) == expected_hand_count
 
 
-@pytest.mark.parametrize("response_text", ["3", '{"hand_count": true}', "two", ""])
+@pytest.mark.parametrize(
+    ("response_text", "message"),
+    [
+        ("3", r"hand count must be in \[0, 2\], got 3"),
+        ('{"hand_count": true}', "hand count must be an int, got bool"),
+        ("two", "hand count must be an int, got str"),
+        ("", "hand count must be an int, got str"),
+    ],
+)
 def test_hand_count_parser_rejects_values_outside_the_evaluation_contract(
     response_text: str,
+    message: str,
 ) -> None:
-    with pytest.raises(ValueError, match="0, 1, or 2"):
+    with pytest.raises(ValueError, match=message):
         parse_hand_count_response(response_text)
 
 
@@ -237,7 +246,7 @@ def test_unparsed_model_judgment_is_an_explicit_recoverable_outcome() -> None:
         timestamp_ns=123,
     )
     assert check_result.measurements["build_ai/hand_count/parse_error"] == (
-        "hand count must be 0, 1, or 2"
+        "hand count must be an int, got str"
     )
     assert check_result.observations[0].values["valid"] is False
     assert check_result.tags == ["build_ai/hand_count/unparsed"]
@@ -417,7 +426,7 @@ def test_sample_result_outcome_variants_are_exclusive() -> None:
     assert not hasattr(success, "error")
     invalid = results[1].outcome
     assert isinstance(invalid, InvalidResponseSampleOutcome)
-    assert invalid.parse_error == "hand count must be 0, 1, or 2"
+    assert invalid.parse_error == "hand count must be an int, got str"
     assert invalid.raw_response == "not a count"
     assert not hasattr(invalid, "predicted_value")
     error = results[2].outcome
