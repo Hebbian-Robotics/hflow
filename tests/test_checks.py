@@ -487,6 +487,53 @@ def test_fps_conformance_classifies_matching_and_half_rate_streams(tmp_path: Pat
     assert undeclared.measurements[f"{camera_topic}/fps_resolution"] == "no-nominal-declared"
 
 
+def test_fps_conformance_rejects_invalid_thresholds(tmp_path: Path) -> None:
+    source = synthesize_episode(
+        tmp_path / "episode.mcap",
+        SyntheticEpisodeSpec(
+            cameras=(),
+            black_segment=None,
+            timestamp_offset_segment=None,
+        ),
+    )
+
+    with hflow.Episode(source) as episode:
+        with pytest.raises(ValueError, match=r"^max_plausible_fps must be a float, got bool$"):
+            camera_fps_conformance(episode, max_plausible_fps=True)
+
+        with pytest.raises(ValueError, match=r"^max_plausible_fps must be finite and positive$"):
+            camera_fps_conformance(episode, max_plausible_fps=float("nan"))
+
+        with pytest.raises(ValueError, match=r"^max_plausible_fps must be finite and positive$"):
+            camera_fps_conformance(episode, max_plausible_fps=float("inf"))
+
+        with pytest.raises(ValueError, match=r"^max_plausible_fps must be finite and positive$"):
+            camera_fps_conformance(episode, max_plausible_fps=0)
+
+        with pytest.raises(
+            ValueError, match=r"^downsample_tolerance_fps must be a float, got bool$"
+        ):
+            camera_fps_conformance(episode, downsample_tolerance_fps=True)
+
+        with pytest.raises(
+            ValueError,
+            match=r"^downsample_tolerance_fps must be finite and non-negative$",
+        ):
+            camera_fps_conformance(episode, downsample_tolerance_fps=float("nan"))
+
+        with pytest.raises(
+            ValueError,
+            match=r"^downsample_tolerance_fps must be finite and non-negative$",
+        ):
+            camera_fps_conformance(episode, downsample_tolerance_fps=float("inf"))
+
+        with pytest.raises(
+            ValueError,
+            match=r"^downsample_tolerance_fps must be finite and non-negative$",
+        ):
+            camera_fps_conformance(episode, downsample_tolerance_fps=-1)
+
+
 def test_action_integrity_finds_the_injected_frozen_run(tmp_path: Path) -> None:
     """A stalled publisher repeats samples bit-for-bit; a still robot does not.
     The fixture holds every joint for 1 s of a 4 s stream.
