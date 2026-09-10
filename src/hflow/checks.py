@@ -1626,8 +1626,8 @@ def camera_fps_conformance(
     *,
     nominal_fps: dict[str, int] | None = None,
     cameras: Sequence[str] | None = None,
-    max_plausible_fps: int = 240,
-    downsample_tolerance_fps: int = 1,
+    max_plausible_fps: float = 240,
+    downsample_tolerance_fps: float = 1,
 ) -> CheckResult:
     """Classify each camera's timestamp-derived rate against the rate declared.
 
@@ -1655,6 +1655,17 @@ def camera_fps_conformance(
     classifies; it never rewrites the stream -- decimating an episode is a
     transform concern that would move episode identity.
     """
+
+    if isinstance(max_plausible_fps, bool):
+        raise ValueError("max_plausible_fps must be a float, got bool")
+    if not np.isfinite(max_plausible_fps) or max_plausible_fps <= 0:
+        raise ValueError("max_plausible_fps must be finite and positive")
+
+    if isinstance(downsample_tolerance_fps, bool):
+        raise ValueError("downsample_tolerance_fps must be a float, got bool")
+    if not np.isfinite(downsample_tolerance_fps) or downsample_tolerance_fps < 0:
+        raise ValueError("downsample_tolerance_fps must be finite and non-negative")
+
     selected_cameras = list(cameras) if cameras is not None else episode.cameras
     measurements: dict[str, MeasurementValue] = {}
     for topic in selected_cameras:
@@ -1693,8 +1704,8 @@ def _classify_derived_fps(
     *,
     derived_fps: int,
     declared_fps: int,
-    max_plausible_fps: int,
-    downsample_tolerance_fps: int,
+    max_plausible_fps: float,
+    downsample_tolerance_fps: float,
 ) -> str:
     """Branch order is the classification: equality first, then plausibility,
     then the 2x window. A declared rate at or above half the plausibility
