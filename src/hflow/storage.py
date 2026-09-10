@@ -96,6 +96,21 @@ def _load_obstore() -> Any:
     return obstore
 
 
+def _refuse_unusable_file_path(path: Path) -> None:
+    """Raise the errno-carrying FileNotFoundError for a directory or missing file."""
+    # Deliberately FileNotFoundError and not IsADirectoryError: the accurate
+    # class subclasses OSError, not FileNotFoundError, so an `except
+    # FileNotFoundError` stops catching it. The errno carries the accurate
+    # text without changing the exception class. Same decision as #100, #120
+    # and #144. The three-argument form is load-bearing too: str(path) as the
+    # filename lets errno supply the text, so a CLI prints why the path failed
+    # and not just which path it was.
+    if path.is_dir():
+        raise FileNotFoundError(errno.EISDIR, os.strerror(errno.EISDIR), str(path))
+    if not path.is_file():
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(path))
+
+
 def is_bucket_url(value: str) -> bool:
     """Whether ``value`` is an object-store URL (``gs://bucket/...`` etc.)."""
     scheme, separator, _rest = value.partition("://")
@@ -361,18 +376,7 @@ class LocalStorageRoot:
     def fetch(self, relative: str) -> Path:
         """The local file at ``relative`` (it already lives here)."""
         local_file = self.path / _validated_relative_key(relative)
-        if local_file.is_dir():
-            # Deliberately FileNotFoundError and not IsADirectoryError: the accurate
-            # class subclasses OSError, not FileNotFoundError, so an `except
-            # FileNotFoundError` stops catching it. `_command_doctor` is one such
-            # handler, reached through fetch_uri below, and it turns this into a
-            # finding rather than a traceback; sixteen more name the class
-            # elsewhere under src/hflow/, and callers outside the repo are the real
-            # unknown. The errno carries the accurate text without moving the class.
-            # Same decision as the four sites #102 covered. #144.
-            raise FileNotFoundError(errno.EISDIR, os.strerror(errno.EISDIR), str(local_file))
-        if not local_file.is_file():
-            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(local_file))
+        _refuse_unusable_file_path(local_file)
         return local_file
 
     def uri_for(self, relative: str) -> str:
@@ -696,9 +700,5 @@ def fetch_uri(uri: "str | Path") -> Path:
         parent_url, _, name = uri.rpartition("/")
         return BucketStorageRoot(parent_url).fetch(name)
     local_file = Path(uri)
-    if local_file.is_dir():
-        # FileNotFoundError, not IsADirectoryError, for the reason above.
-        raise FileNotFoundError(errno.EISDIR, os.strerror(errno.EISDIR), str(local_file))
-    if not local_file.is_file():
-        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(local_file))
+    _refuse_unusable_file_path(local_file)
     return local_file

@@ -6,6 +6,7 @@ verify_dataset_snapshot must report exactly the damage -- nothing more,
 nothing less.
 """
 
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -89,6 +90,81 @@ def test_missing_file_reports_missing_alone(tmp_path: Path) -> None:
     assert marker["integrity"]["tables"]["samples"]["path"] in report.findings[0].uri
 
 
+def test_removed_receipt_entry_and_file_raise_inventory_mismatch(tmp_path: Path) -> None:
+    """#473's deleted-member case: when a receipt entry and its file are both
+    gone, the surviving entries agree with each other and every per-file
+    check passes; only the stored inventory content_id, computed over the
+    original set, can witness the loss. The marker is internally
+    inconsistent, so verify raises (CLI exit 2) instead of certifying."""
+
+    def strip_measurements(output_directory: Path) -> str:
+        marker_path = output_directory / "format.json"
+        marker = json.loads(marker_path.read_text())
+        entry = marker["integrity"]["tables"].pop("measurements")
+        marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+        (output_directory / entry["path"]).unlink()
+        return entry["path"]
+
+    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
+    removed = strip_measurements(output_directory)
+
+    with pytest.raises(ValueError, match="content_id"):
+        verify_dataset_snapshot(output_directory)
+
+    # A fresh export for the CLI path: the raise must map to exit 2, the
+    # unreadable-input code, not to a findings-based exit.
+    output_directory, _ = _export_two_episode_snapshot(tmp_path / "cli", "references")
+    strip_measurements(output_directory)
+    assert cli_main(["verify", "snapshot", str(output_directory)]) == 2
+    assert removed
+
+
+def test_deleted_file_with_intact_receipt_reports_missing(tmp_path: Path) -> None:
+    """Negative control for #473: delete the file but keep its receipt entry.
+    This is the ordinary ``missing`` path and must keep reporting DAMAGED
+    with or without the inventory gate; it exercises the per-file loop, not
+    the gate."""
+    output_directory, marker = _export_two_episode_snapshot(tmp_path, "references")
+    (output_directory / marker["integrity"]["tables"]["measurements"]["path"]).unlink()
+
+    report = verify_dataset_snapshot(output_directory)
+
+    assert not report.ok
+    assert [f.reason for f in report.findings] == ["missing"]
+
+
+@pytest.mark.parametrize(
+    ("replacement", "label"),
+    [(None, "absent"), ("", "empty"), (0, "not-a-string"), ([], "wrong-type")],
+    ids=["absent", "empty", "not-a-string", "wrong-type"],
+)
+def test_receipt_without_a_usable_content_id_is_refused(
+    tmp_path: Path, replacement: object, label: str
+) -> None:
+    """The other half of the #473 gate, which the mismatch test cannot reach.
+
+    A receipt whose ``content_id`` is missing or unusable cannot witness a
+    deleted member at all, so certifying it would be certifying that the
+    check ran. Deleting this branch left the whole suite green, so it needs
+    its own case. An ``integrity`` block with no ``content_id`` is not
+    something hflow writes (both arrived in #401), which is exactly why a
+    marker carrying one is unreadable input rather than damaged bytes.
+    """
+    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
+    marker_path = output_directory / "format.json"
+    marker = json.loads(marker_path.read_text())
+    if replacement is None:
+        marker["integrity"].pop("content_id")
+    else:
+        marker["integrity"]["content_id"] = replacement
+    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+
+    with pytest.raises(ValueError, match="no usable content_id"):
+        verify_dataset_snapshot(output_directory)
+
+    assert cli_main(["verify", "snapshot", str(output_directory)]) == 2, label
+
+
 def test_truncated_file_reports_size_mismatch_and_skips_the_hash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -146,6 +222,81 @@ def test_pre_401_format_json_is_unverifiable_not_corrupt(tmp_path: Path) -> None
 
     assert not report.ok
     assert [f.reason for f in report.findings] == ["no-receipt"]
+
+
+def test_foreign_marker_is_refused_at_the_boundary(tmp_path: Path) -> None:
+    """#472: a directory the exporter would refuse cannot be certified. A
+    marker with an integrity-shaped key but no format identity never reaches
+    the receipt logic; verify raises and the CLI maps to exit 2."""
+    foreign = tmp_path / "some-other-tools-output"
+    foreign.mkdir()
+    payload = b"not-a-hflow-snapshot-at-all"
+    (foreign / "data.parquet").write_bytes(payload)
+    (foreign / "format.json").write_text(
+        json.dumps(
+            {
+                "producer": "not-hflow",
+                "integrity": {
+                    "tables": {
+                        "data": {
+                            "path": "data.parquet",
+                            "size_bytes": len(payload),
+                            "sha256": hashlib.sha256(payload).hexdigest(),
+                        }
+                    }
+                },
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="not a 'hflow-dataset-snapshot'"):
+        verify_dataset_snapshot(foreign)
+
+    assert cli_main(["verify", "snapshot", str(foreign)]) == 2
+
+
+def test_unsupported_or_mistyped_version_is_refused(tmp_path: Path) -> None:
+    """#472: version 1 is the only version there has ever been, and the
+    comparison is deliberately identical to the writer, which records the
+    version as a string. A future version raises, and so does a JSON number
+    1: an easy honest mistake, so the error says exactly why."""
+    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
+    marker_path = output_directory / "format.json"
+
+    marker = json.loads(marker_path.read_text())
+    marker["format_version"] = "2"
+    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+    with pytest.raises(ValueError, match="format_version '2'"):
+        verify_dataset_snapshot(output_directory)
+
+    marker["format_version"] = 1
+    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+    with pytest.raises(ValueError, match="JSON number 1 is refused"):
+        verify_dataset_snapshot(output_directory)
+
+    marker["format_version"] = "1"
+    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+    assert cli_main(["verify", "snapshot", str(output_directory)]) == 0
+
+
+def test_a_right_version_with_a_foreign_format_name_is_refused(tmp_path: Path) -> None:
+    """The other half of the identity predicate.
+
+    `test_foreign_marker_is_refused_at_the_boundary` uses a marker carrying
+    neither field, so the version check alone refuses it and the format-name
+    check is never the thing that fires. Dropping the name comparison from
+    the predicate left the whole suite green. This pins it: a marker claiming
+    version 1 of somebody else's format is still not ours to certify.
+    """
+    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
+    marker_path = output_directory / "format.json"
+    marker = json.loads(marker_path.read_text())
+    marker["format"] = "someone-elses-dataset-snapshot"
+    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+
+    with pytest.raises(ValueError, match="someone-elses-dataset-snapshot"):
+        verify_dataset_snapshot(output_directory)
+    assert cli_main(["verify", "snapshot", str(output_directory)]) == 2
 
 
 def test_extra_files_under_assets_are_ignored(tmp_path: Path) -> None:

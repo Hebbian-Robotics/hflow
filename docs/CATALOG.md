@@ -177,6 +177,16 @@ HFlow's optional workspace REST API and does not ship a browser client.
 
 ### Query from Python or the CLI
 
+Curation takes exactly one read-only `SELECT` statement. Common table
+expressions count, and so do the SELECTs that do not start with the word:
+`FROM episodes WHERE status = 'ok'`, a parenthesized `(SELECT ...)`, and
+`VALUES` are all accepted. Anything that is not one read-only SELECT is
+refused before it reaches the catalog, including multiple statements, DDL,
+`PIVOT` (DuckDB rewrites it into a `CREATE` followed by a `SELECT`), and the
+introspection forms `DESCRIBE`, `SUMMARIZE`, `SHOW` and `PRAGMA`. Those last
+four parse as SELECT but describe columns rather than selecting episodes, so
+a manifest built from one has no `episode_id` and every consumer refuses it.
+
 ```python
 import hflow
 

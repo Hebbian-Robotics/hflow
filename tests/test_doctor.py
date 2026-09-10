@@ -52,6 +52,86 @@ def test_raw_input_recording_is_not_conforming(tmp_path: Path) -> None:
     assert "missing-provenance" in codes
 
 
+def test_unsupported_video_encoding_is_reported_not_corrupt(tmp_path: Path) -> None:
+    """An encoding outside hflow's supported decoder set stops video checks
+    on that topic, but the finding says exactly that instead of asserting
+    corrupt chunk or bad CRC. Real path: json encoding, which neither the
+    ros2 nor the protobuf decoder factory handles (#460)."""
+    path = tmp_path / "unsupported_encoding.mcap"
+    with path.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        schema_id = writer.register_schema(
+            name="foxglove.CompressedVideo",
+            encoding="protobuf",
+            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
+        )
+        channel_id = writer.register_channel(
+            topic="/cam", message_encoding="json", schema_id=schema_id
+        )
+        writer.add_message(channel_id, log_time=10**9, data=b"{}", publish_time=10**9)
+        writer.finish()
+
+    report = diagnose(path)
+
+    codes = {finding.code for finding in report.findings}
+    assert "video-encoding-unsupported" in codes
+    encoding_finding = next(
+        finding for finding in report.findings if finding.code == "video-encoding-unsupported"
+    )
+    assert "/cam" in encoding_finding.message
+    assert "no available decoder handles" in encoding_finding.message
+    assert "video checks cannot run" in encoding_finding.message
+    assert not any(finding.code == "read-failed" for finding in report.findings)
+
+
+def test_video_channel_with_missing_schema_is_reported_not_corrupt(tmp_path: Path) -> None:
+    """A channel naming a schema id the file does not carry is a real defect,
+    but a missing record is not a damaged chunk: it gets its own finding, the
+    reader never KeyErrors on it, and a healthy sibling topic on the same
+    file is still fully checked (#460)."""
+    path = tmp_path / "missing_schema.mcap"
+    with path.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        schema_id = writer.register_schema(
+            name="foxglove.CompressedVideo",
+            encoding="protobuf",
+            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
+        )
+        broken_channel_id = writer.register_channel(
+            topic="/broken-cam", message_encoding="protobuf", schema_id=99
+        )
+        good_channel_id = writer.register_channel(
+            topic="/good-cam", message_encoding="protobuf", schema_id=schema_id
+        )
+        writer.add_message(broken_channel_id, log_time=10**9, data=b"payload", publish_time=10**9)
+        message = CompressedVideo()
+        message.timestamp.FromNanoseconds(10**9)
+        message.frame_id = "cam"
+        message.data = b"\x00\x00\x00\x01\x09\x10\x00\x00\x00\x01\x41\xa8"
+        message.format = "h264"
+        writer.add_message(
+            good_channel_id, log_time=10**9, data=message.SerializeToString(), publish_time=10**9
+        )
+        writer.finish()
+
+    report = diagnose(path)
+
+    codes = {finding.code for finding in report.findings}
+    assert "channel-schema-missing" in codes
+    schema_finding = next(
+        finding for finding in report.findings if finding.code == "channel-schema-missing"
+    )
+    assert "/broken-cam" in schema_finding.message
+    assert "no schema record" in schema_finding.message
+    assert not any(finding.code == "read-failed" for finding in report.findings)
+    # The healthy sibling is still video-checked: its payload is a deliberate
+    # B picture, so the video path must have run and classified it.
+    b_finding = next(finding for finding in report.findings if finding.code == "video-b-picture")
+    assert "/good-cam" in b_finding.message
+
+
 def test_nonconforming_video_is_reported(tmp_path: Path) -> None:
     path = tmp_path / "bad_video.mcap"
     with path.open("wb") as stream:

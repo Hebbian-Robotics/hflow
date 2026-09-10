@@ -437,6 +437,45 @@ def test_dataset_snapshot_overwrite_refuses_a_symlinked_format_marker(tmp_path: 
     assert format_marker.is_symlink()
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("format", "someone-elses-dataset-snapshot"),
+        ("format_version", "2"),
+        ("format_version", 1),
+    ],
+    ids=["foreign-format-name", "future-version", "version-as-a-json-number"],
+)
+def test_dataset_snapshot_overwrite_refuses_a_marker_without_our_format_identity(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    """Overwrite is destructive, so identity is what makes it safe.
+
+    This guard shares its predicate with the verifier's #472 gate, and it had
+    no test of its own: disabling it left the whole suite green while the
+    verifier's tests kept passing. A shared predicate needs a case on both
+    sides or it can be loosened from one and noticed by neither.
+
+    The directory keeps its contents, which is the part that matters: a
+    refused overwrite must not have deleted anything first.
+    """
+    catalog = Catalog(tmp_path / "catalog")
+    output_directory = tmp_path / "dataset-snapshot"
+    hflow.export_dataset_snapshot(catalog.location, output_directory)
+    format_marker = output_directory / "format.json"
+    marker = json.loads(format_marker.read_text())
+    marker[field] = value
+    format_marker.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+    sentinel = output_directory / "samples.parquet"
+    sentinel_bytes = sentinel.read_bytes()
+
+    with pytest.raises(ValueError, match="does not identify supported"):
+        hflow.export_dataset_snapshot(catalog.location, output_directory, overwrite=True)
+
+    assert sentinel.read_bytes() == sentinel_bytes
+    assert json.loads(format_marker.read_text())[field] == value
+
+
 def test_dataset_snapshot_excludes_check_runs_without_a_committed_episode(tmp_path: Path) -> None:
     catalog = Catalog(tmp_path / "catalog")
     canonical_episode = tmp_path / "committed.canonical.mcap"

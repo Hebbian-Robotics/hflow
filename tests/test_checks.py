@@ -4,7 +4,9 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
 from mcap.writer import Writer as StockWriter
+from mcap_protobuf.schema import build_file_descriptor_set
 
 import hflow
 from hflow.checks import (
@@ -463,6 +465,111 @@ def test_keyframe_interval_reports_the_encoders_gop(tmp_path: Path) -> None:
     # encoder applies when converting seconds to a frame count.
     assert 0.5 < max_gap_s < 1.6
     assert result.verdict is None
+
+
+@pytest.mark.parametrize(
+    ("cameras", "expected_payload_checks"),
+    [
+        pytest.param(None, 15, id="all-cameras"),
+        pytest.param([], 0, id="no-cameras"),
+        pytest.param(["/empty/compressed"], 0, id="empty-camera"),
+        pytest.param(["/multiple/compressed"], 5, id="one-camera"),
+        pytest.param(["/single/compressed", "/empty/compressed"], 5, id="nonempty-and-empty"),
+        pytest.param(["/multiple/compressed", "/multiple/compressed"], 5, id="repeated-selection"),
+    ],
+)
+def test_keyframe_interval_preserves_measurements_with_one_scan_per_camera(
+    cameras: list[str] | None,
+    expected_payload_checks: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Load each camera once and check its payloads once (#480).
+
+    Pin every measurement for zero, one, and multiple keyframes, including
+    irregular timestamps, a keyframe at the tail, and an empty channel.
+    """
+    source = tmp_path / "keyframes.mcap"
+    aud = b"\x00\x00\x00\x01\x09\xf0"
+    keyframe = aud + b"\x00\x00\x00\x01\x65\xb0"
+    non_keyframe = aud + b"\x00\x00\x00\x01\x41\xc0"
+    with source.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        schema_id = writer.register_schema(
+            name="foxglove.CompressedVideo",
+            encoding="protobuf",
+            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
+        )
+        for camera, keyframes in (("none", ()), ("single", (4,)), ("multiple", (0, 2, 3))):
+            channel_id = writer.register_channel(
+                topic=f"/{camera}/compressed", message_encoding="protobuf", schema_id=schema_id
+            )
+            for index, timestamp_s in enumerate((1, 2, 4, 7, 8)):
+                timestamp_ns = timestamp_s * 1_000_000_000
+                message = CompressedVideo(
+                    frame_id=camera,
+                    format="h264",
+                    data=keyframe if index in keyframes else non_keyframe,
+                )
+                message.timestamp.FromNanoseconds(timestamp_ns)
+                writer.add_message(
+                    channel_id,
+                    log_time=timestamp_ns,
+                    publish_time=timestamp_ns,
+                    data=message.SerializeToString(),
+                )
+        writer.register_channel(
+            topic="/empty/compressed", message_encoding="protobuf", schema_id=schema_id
+        )
+        writer.finish()
+
+    expected = {
+        "/empty/compressed/scanned_frame_count": 0,
+        "/none/compressed/scanned_frame_count": 5,
+        "/none/compressed/keyframe_count": 0,
+        "/none/compressed/first_frame_is_keyframe": 0,
+        "/single/compressed/scanned_frame_count": 5,
+        "/single/compressed/keyframe_count": 1,
+        "/single/compressed/first_frame_is_keyframe": 0,
+        "/single/compressed/max_keyframe_gap_s": 0.0,
+        "/multiple/compressed/scanned_frame_count": 5,
+        "/multiple/compressed/keyframe_count": 3,
+        "/multiple/compressed/first_frame_is_keyframe": 1,
+        "/multiple/compressed/max_keyframe_gap_s": 3.0,
+        "/multiple/compressed/median_keyframe_interval_s": 3.0,
+    }
+    if cameras is not None:
+        expected = {
+            key: value for key, value in expected.items() if key.rsplit("/", 1)[0] in cameras
+        }
+
+    payload_checks = 0
+    real_payload_check = hflow.checks._payload_starts_a_keyframe
+
+    def count_payload_check(payload: bytes) -> bool:
+        nonlocal payload_checks
+        payload_checks += 1
+        return real_payload_check(payload)
+
+    with hflow.Episode(source) as episode:
+        channel_calls: list[str | int] = []
+        real_channel = episode.channel
+
+        def count_channel_call(key: str | int) -> hflow.ChannelData:
+            channel_calls.append(key)
+            return real_channel(key)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(hflow.checks, "_payload_starts_a_keyframe", count_payload_check)
+            patch.setattr(episode, "channel", count_channel_call)
+            result = keyframe_interval(episode, cameras=cameras)
+        assert result.measurements == expected
+        assert result.verdict is None
+        assert payload_checks == expected_payload_checks
+        assert channel_calls == list(dict.fromkeys(episode.cameras if cameras is None else cameras))
+        # App's supersession path asks for keys without precomputed records.
+        assert hflow.checks._keyframe_interval_keys(episode, cameras=cameras) == set(expected)
 
 
 def test_fps_conformance_classifies_matching_and_half_rate_streams(tmp_path: Path) -> None:

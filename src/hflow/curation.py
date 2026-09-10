@@ -45,6 +45,7 @@ ran on what fraction of episodes, because a statistic over half a delivery
 must not look like a statistic over all of it.
 """
 
+import re
 import tempfile
 from collections.abc import Sequence
 from contextlib import ExitStack
@@ -102,6 +103,16 @@ _TABLE_DIRECTORIES = {
 # "The check actually ran on this episode", owned by hflow.steps because
 # dataset membership asks the same question and the two answers must agree.
 _RAN_STATUSES = tuple(status.value for status in RAN_STATUSES)
+
+# Leading keywords the curation gate refuses even though DuckDB labels them
+# ``StatementType.SELECT``. ``PRAGMA`` is caught by the subquery parse as
+# well; ``DESCRIBE``, ``SHOW`` and ``SUMMARIZE`` parse cleanly inside
+# ``FROM (<sql>)`` (DuckDB treats them as table functions) so the parse
+# check alone would let them through, which is not what the endpoints
+# advertise (issue #450, review of #453).
+_SUBQUERY_FORBIDDEN_LEADING_KEYWORDS = frozenset({"pragma", "describe", "show", "summarize"})
+# The first SQL identifier after any leading whitespace or comments.
+_LEADING_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def _column_ddl_for(directory_name: str) -> str:
@@ -554,6 +565,42 @@ class NonSingleSelectQueryError(ValueError):
     """
 
 
+def _leading_keyword(sql: str) -> str:
+    """First SQL identifier at the head of *sql*, after any leading comments.
+
+    DuckDB labels ``PRAGMA database_list``, ``DESCRIBE SELECT 1``,
+    ``SHOW TABLES`` and ``SUMMARIZE SELECT 1`` as ``StatementType.SELECT``
+    because they are table functions, and it accepts the latter three
+    inside ``FROM (<sql>)`` (the preview wrapper's shape), so a parse-based
+    subquery check alone would let them through. The curation endpoints
+    advertise exactly one read-only SELECT, so the gate also refuses these
+    keywords when they head the original text.
+
+    This is a rule about the shape callers write, not a containment boundary.
+    ``(DESCRIBE SELECT 1)`` is not headed by the keyword and is accepted, and
+    that is fine: preview and pin both run it and agree, which is what #450
+    asked for. Read-only introspection of an in-memory catalog was never the
+    thing being kept out.
+    """
+    stripped = sql.lstrip()
+    while True:
+        if stripped.startswith("--"):
+            newline = stripped.find("\n")
+            if newline == -1:
+                return ""
+            stripped = stripped[newline + 1 :].lstrip()
+            continue
+        if stripped.startswith("/*"):
+            end = stripped.find("*/")
+            if end == -1:
+                return ""
+            stripped = stripped[end + 2 :].lstrip()
+            continue
+        break
+    match = _LEADING_IDENTIFIER_RE.match(stripped)
+    return match.group(0).lower() if match else ""
+
+
 def reject_non_single_select(sql: str) -> None:
     """Raise ``NonSingleSelectQueryError`` unless *sql* is one SELECT statement.
 
@@ -566,14 +613,50 @@ def reject_non_single_select(sql: str) -> None:
     touches the connection.  A syntactically invalid string propagates the
     parser's ``duckdb.Error`` untouched — that is NOT this exception — so
     the two failure modes stay distinguishable.
+
+    The narrowing for ``PRAGMA`` / ``DESCRIBE`` / ``SHOW`` / ``SUMMARIZE``
+    asks DuckDB the same question the preview wrapper does: does the SQL
+    parse inside ``SELECT * FROM (<sql>)``? ``extract_statements`` on that
+    form accepts everything that runs as a subquery, including FROM-first
+    queries, parenthesized SELECTs, and VALUES clauses that a SELECT/WITH
+    text prefix would refuse (review of #453). Trailing semicolons and whitespace are
+    stripped before wrapping, and a newline is appended when missing, so
+    a trailing ``--`` line comment cannot swallow the wrapper's closing
+    paren.
     """
     parser_connection = duckdb.connect()
     try:
+        # ``extract_statements`` on the user's SQL surfaces genuine parse
+        # failures (a typoed keyword, an unterminated block comment) as
+        # ``duckdb.Error`` and the gate propagates them untouched so the
+        # server's 400 detail can be DuckDB's own diagnostic. That
+        # distinction is the rule's failure-mode contract.
         statements = parser_connection.extract_statements(sql)
+        if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
+            raise NonSingleSelectQueryError("sql must be exactly one SELECT statement")
+        # Refuse PRAGMA/DESCRIBE/SHOW/SUMMARIZE by leading keyword. DuckDB
+        # labels them SELECT, and DESCRIBE/SHOW/SUMMARIZE even parse cleanly
+        # as subqueries. Only ``SELECT * FROM (PRAGMA database_list)`` raises
+        # a parser error, so the parse check below is necessary but not
+        # sufficient: this leading-keyword refusal is what keeps the gate in
+        # step with what the endpoints advertise.
+        if _leading_keyword(sql) in _SUBQUERY_FORBIDDEN_LEADING_KEYWORDS:
+            raise NonSingleSelectQueryError("sql must be exactly one read-only SELECT statement")
+        # Parse the SQL inside the wrapper preview actually applies. Trailing
+        # semicolons and whitespace are stripped so a single ``SELECT 1;``
+        # still parses (curate()'s downstream ``connection.sql()`` handles
+        # trailing ``;`` itself; the server-side preview handler strips them
+        # at the boundary), and a newline is appended so a trailing ``--``
+        # comment without one cannot swallow the wrapper's ``)``.
+        wrapped_input = f"SELECT * FROM ({sql.rstrip().rstrip(';').rstrip()}\n)"
+        try:
+            parser_connection.extract_statements(wrapped_input)
+        except duckdb.Error as exc:
+            raise NonSingleSelectQueryError(
+                "sql must be exactly one read-only SELECT statement"
+            ) from exc
     finally:
         parser_connection.close()
-    if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
-        raise NonSingleSelectQueryError("sql must be exactly one SELECT statement")
 
 
 def _stage_manifest_and_count(

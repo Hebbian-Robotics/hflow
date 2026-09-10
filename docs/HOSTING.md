@@ -16,6 +16,12 @@ data-plane unit (the Dagster+/Prefect hybrid pattern). The design
 consequence taken throughout: **only metadata, states, and pointers cross
 the control boundary -- never episode bytes.**
 
+For stateless containers or batch workers without a durable catalog, use the
+[embedded worker workflow](./how-to/run-embedded-workers.md):
+`App.process_many(record=False)` with a task-local workspace and caller-owned
+result delivery. The bucket-workspace requirements below describe durable,
+remotely accessible workspaces, not a requirement to persist stateless jobs.
+
 ## The workspace
 
 A workspace is one data root plus everything the engine derives from it:
@@ -90,7 +96,10 @@ error/quarantine budgets (`max(8, ceil(1% of total))`, all-errors always
 fails). The generated Airflow DAGs are thin callers -- so any other
 execution backend (a hosted executor, a different scheduler, a plain worker
 loop around `app.process()`) reuses the same semantics instead of copying
-generated code. Bundles pin `hflow==<renderer's version>`, so rendered DAGs
+generated code. `App.process_many()` adds bounded in-process concurrency and
+ordered reports around that same episode engine; it does not apply the stage
+runner's error budgets or add retries. Bundles pin `hflow==<renderer's version>`,
+so rendered DAGs
 and the library they call cannot skew inside one bundle.
 
 Hosted executors can limit a stage invocation to registered steps without
@@ -172,9 +181,11 @@ deployment against facts:
   real places and people: if your workspaces hold personal data, plan
   retention and erasure obligations at the storage layer, because the
   engine offers no episode-level erasure today.
-- **No result-submission API.** Workers write the catalog directly, so
-  every machine that executes steps needs credentials for the workspace's
-  store.
+- **No remote catalog result-submission API.** Catalog-recording workers write
+  the catalog directly, so those workers need credentials for its store.
+  Embedded workers can instead disable catalog appends and return in-memory
+  reports through their caller's result channel; that does not populate a
+  durable HFlow catalog.
 - **No tenant-facing log or metrics API.** Observability is Airflow's own
   UI and task logs on the workspace.
 - **The workspace server (`hflow serve`) authenticates nobody.** It is a local

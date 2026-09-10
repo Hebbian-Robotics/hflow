@@ -15,7 +15,10 @@ from hflow.storage import BucketStorageRoot
 from hflow.verification import (
     REASON_CONTENT_ID_MISMATCH,
     REASON_MISSING,
+    REASON_NO_RECEIPT,
     REASON_SIZE_MISMATCH,
+    VerificationFinding,
+    VerificationReason,
     VerificationStatus,
     exit_code_for,
 )
@@ -42,6 +45,21 @@ def _write_prepared_delivery(root: Path, *, payload: bytes = b"episode-0") -> Pa
     }
     (root / "prepared-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     return episode_path
+
+
+def test_verification_reason_constants_are_enum_members() -> None:
+    assert REASON_MISSING is VerificationReason.MISSING
+    assert REASON_SIZE_MISMATCH is VerificationReason.SIZE_MISMATCH
+    assert REASON_CONTENT_ID_MISMATCH is VerificationReason.CONTENT_ID_MISMATCH
+    assert REASON_NO_RECEIPT is VerificationReason.NO_RECEIPT
+    assert VerificationReason.NO_RECEIPT == "no-receipt"
+
+    finding = VerificationFinding(
+        uri="landing/episode.mcap",
+        reason=VerificationReason.NO_RECEIPT,
+        detail="receipt is missing",
+    )
+    assert finding.reason is VerificationReason.NO_RECEIPT
 
 
 def test_verify_lerobot_import_accepts_an_unchanged_delivery(tmp_path: Path) -> None:

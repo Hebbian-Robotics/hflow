@@ -126,6 +126,25 @@ def _sha256_hex(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _marker_identifies_dataset_snapshot(format_marker: dict) -> bool:
+    """Whether ``format_marker`` claims to be a snapshot this version handles.
+
+    Two callers ask this and must never disagree: the exporter deciding
+    whether a destination is one of ours to replace, and the verifier
+    deciding whether a directory is one of ours to certify (#472). If the
+    verifier were the looser of the two, exit 0 would mean "some directory
+    with an integrity-shaped key matched".
+
+    Deliberately strict about the version's type. The writer records the
+    string ``"1"``, so a JSON number ``1`` is a different value and is
+    refused. Callers phrase their own message; only the predicate is shared.
+    """
+    return (
+        format_marker.get("format") == DATASET_SNAPSHOT_FORMAT_NAME
+        and format_marker.get("format_version") == DATASET_SNAPSHOT_FORMAT_VERSION
+    )
+
+
 def _file_integrity_record(relative_path: str, absolute_path: Path) -> dict[str, str | int]:
     """Receipt for one delivered snapshot file (table or copied asset)."""
     return {
@@ -614,10 +633,7 @@ def _parse_dataset_snapshot_destination(
             f"snapshot export destination {output_directory} cannot be replaced because "
             f"{_FORMAT_MARKER_FILE_NAME} is not a JSON object"
         )
-    if (
-        format_marker.get("format") != DATASET_SNAPSHOT_FORMAT_NAME
-        or format_marker.get("format_version") != DATASET_SNAPSHOT_FORMAT_VERSION
-    ):
+    if not _marker_identifies_dataset_snapshot(format_marker):
         raise ValueError(
             f"snapshot export destination {output_directory} cannot be replaced because "
             f"{_FORMAT_MARKER_FILE_NAME} does not identify supported "
@@ -828,7 +844,11 @@ def verify_dataset_snapshot(
 
     Unreadable input (a missing directory, a missing or unparsable
     ``format.json``) raises instead: that is not a finding about a delivered
-    snapshot, it is the wrong input entirely.
+    snapshot, it is the wrong input entirely. The same applies to a receipt
+    that is internally inconsistent with itself: a missing or malformed
+    ``content_id``, or a recomputed inventory hash that disagrees with the
+    stored one, means the receipt no longer describes the delivered set
+    (tampering or a truncated write), which is exit 2, not damaged bytes.
 
     Extra files under ``assets/`` that the receipt does not name are ignored:
     the receipt covers what was exported, not everything a recipient may add.
@@ -861,6 +881,23 @@ def verify_dataset_snapshot(
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise ValueError(f"format.json is unreadable: {error}") from error
 
+    # Format identity gate (#472), sharing the exporter's predicate so the two
+    # can never drift apart. Exit 0 then means "this is an HFlow snapshot and
+    # the receipt matched", never "some directory with an integrity-shaped key
+    # matched". The message names the values found and calls out the version's
+    # type, because a JSON number 1 is the easy mistake to make.
+    found_format = format_marker.get("format")
+    found_version = format_marker.get("format_version")
+    if not _marker_identifies_dataset_snapshot(format_marker):
+        raise ValueError(
+            f"format.json is not a {DATASET_SNAPSHOT_FORMAT_NAME!r} format version "
+            f"{DATASET_SNAPSHOT_FORMAT_VERSION!r} dataset snapshot: found format "
+            f"{found_format!r}, format_version {found_version!r}. Both must match "
+            "the exporter exactly, including the version's type: the writer records "
+            f"it as the string {DATASET_SNAPSHOT_FORMAT_VERSION!r}, so a JSON number "
+            "1 is refused"
+        )
+
     integrity = format_marker.get("integrity")
     if not isinstance(integrity, dict):
         # A valid v1 snapshot from before #401: verifiable nothing, corrupt nothing.
@@ -882,6 +919,29 @@ def verify_dataset_snapshot(
         *integrity.get("tables", {}).values(),
         *integrity.get("assets", []),
     ]
+
+    # The deleted-member gate (#473): when a receipt entry and its file are
+    # both gone, the surviving entries are self-consistent and every per-file
+    # check passes; only the stored inventory hash, computed over the original
+    # set, differs from the hash of what remains. Recompute it exactly as the
+    # exporter did (:194) and refuse a receipt that no longer describes the
+    # delivered set. Internal inconsistency is unreadable input, not damage,
+    # so it raises to exit 2 like an unparsable marker rather than reporting
+    # findings.
+    stored_content_id = integrity.get("content_id")
+    if not isinstance(stored_content_id, str) or not stored_content_id:
+        raise ValueError(
+            "format.json integrity receipt carries no usable content_id; "
+            "the delivered member set cannot be checked against the receipt"
+        )
+    recomputed_content_id = _inventory_content_id(receipt_entries)
+    if recomputed_content_id != stored_content_id:
+        raise ValueError(
+            "format.json integrity receipt is internally inconsistent: recomputed "
+            f"inventory content_id {recomputed_content_id!r} != stored "
+            f"{stored_content_id!r}; the receipt no longer describes the delivered set"
+        )
+
     for entry in receipt_entries:
         relative_path = str(entry["path"])
         delivered_path = resolved_directory / relative_path

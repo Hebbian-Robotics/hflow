@@ -16,6 +16,9 @@ from hflow.app import (
     Errored,
     Measured,
     NotRun,
+    ProcessManyProgress,
+    ProcessManyReport,
+    ProcessReport,
     PublishFailed,
     SkippedByQuarantine,
     StepNotRun,
@@ -49,7 +52,12 @@ from hflow.fingerprints import (
     step_version_from_contract,
 )
 from hflow.format import GopPreset
-from hflow.importers import import_lerobot_dataset, verify_lerobot_import
+from hflow.importers import (
+    VideoImportConfig,
+    import_lerobot_dataset,
+    import_video_episode,
+    verify_lerobot_import,
+)
 from hflow.manifest import (
     DerivedChannelManifest,
     PipelineManifest,
@@ -73,6 +81,13 @@ from hflow.snapshot import (
     SnapshotMediaMode,
     export_dataset_snapshot,
     verify_dataset_snapshot,
+)
+from hflow.statistics import (
+    WeightedDistribution,
+    WeightedHistogramBin,
+    WeightedPercentile,
+    WeightedValue,
+    summarize_weighted_distribution,
 )
 from hflow.steps import (
     RUN_PROFILES,
@@ -107,6 +122,7 @@ from hflow.storage import (
 from hflow.transform import EpisodeStamps, TransformConfig, write_canonical_episode
 from hflow.verification import (
     VerificationFinding,
+    VerificationReason,
     VerificationReport,
     VerificationStatus,
 )
@@ -165,6 +181,9 @@ __all__ = [
     "Observation",
     "PipelineManifest",
     "PlannedBatch",
+    "ProcessManyProgress",
+    "ProcessManyReport",
+    "ProcessReport",
     "PublishFailed",
     "PythonMcapEpisodeReader",
     "RegisteredCheck",
@@ -188,8 +207,14 @@ __all__ = [
     "TopicInfo",
     "TransformConfig",
     "VerificationFinding",
+    "VerificationReason",
     "VerificationReport",
     "VerificationStatus",
+    "VideoImportConfig",
+    "WeightedDistribution",
+    "WeightedHistogramBin",
+    "WeightedPercentile",
+    "WeightedValue",
     "Workspace",
     "WorkspaceIdentity",
     "__version__",
@@ -204,6 +229,7 @@ __all__ = [
     "fingerprint_contract",
     "import_lerobot_dataset",
     "import_pipeline_application",
+    "import_video_episode",
     "is_bucket_url",
     "open_catalog_connection",
     "open_reader",
@@ -215,6 +241,7 @@ __all__ = [
     "stages_for_profile",
     "stale_episodes",
     "step_version_from_contract",
+    "summarize_weighted_distribution",
     "testing",
     "to_grid",
     "verify_dataset_snapshot",
