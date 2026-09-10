@@ -29,8 +29,6 @@ spool-through-mirror boundary; workers therefore keep the processing core on
 local files without pretending bucket keys have ``pathlib.Path`` semantics.
 """
 
-import errno
-import os
 import shlex
 import shutil
 from dataclasses import dataclass
@@ -188,15 +186,7 @@ def render_deploy_bundle(config: DeployConfig, output_dir: Path | str) -> Deploy
     requirements_copied = False
     if config.requirements_file is not None:
         requirements_source = Path(config.requirements_file)
-        if requirements_source.is_dir():
-            # FileNotFoundError, not IsADirectoryError, for the reason above.
-            raise FileNotFoundError(
-                errno.EISDIR, os.strerror(errno.EISDIR), str(requirements_source)
-            )
-        if not requirements_source.is_file():
-            raise FileNotFoundError(
-                errno.ENOENT, os.strerror(errno.ENOENT), str(requirements_source)
-            )
+        _refuse_unusable_file_path(requirements_source)
         shutil.copyfile(requirements_source, user_dir / "requirements.txt")
         requirements_copied = True
 

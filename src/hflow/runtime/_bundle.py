@@ -61,7 +61,6 @@ extracts them to temp files):
    mass failure visible.
 """
 
-import errno
 import hashlib
 import json
 import logging
@@ -1065,15 +1064,7 @@ def render_bundle(config: RuntimeConfig, bundle_dir: Path | str) -> BundlePaths:
     )
     if config.requirements_file is not None:
         requirements_source = Path(config.requirements_file)
-        if requirements_source.is_dir():
-            # FileNotFoundError, not IsADirectoryError, for the reason above.
-            raise FileNotFoundError(
-                errno.EISDIR, os.strerror(errno.EISDIR), str(requirements_source)
-            )
-        if not requirements_source.is_file():
-            raise FileNotFoundError(
-                errno.ENOENT, os.strerror(errno.ENOENT), str(requirements_source)
-            )
+        _refuse_unusable_file_path(requirements_source)
         shutil.copyfile(requirements_source, user_dir / "requirements.txt")
 
     hflow_source = (

@@ -101,7 +101,10 @@ def _refuse_unusable_file_path(path: Path) -> None:
     # Deliberately FileNotFoundError and not IsADirectoryError: the accurate
     # class subclasses OSError, not FileNotFoundError, so an `except
     # FileNotFoundError` stops catching it. The errno carries the accurate
-    # text without changing the exception class. Same decision as #100 and #144.
+    # text without changing the exception class. Same decision as #100, #120
+    # and #144. The three-argument form is load-bearing too: str(path) as the
+    # filename lets errno supply the text, so a CLI prints why the path failed
+    # and not just which path it was.
     if path.is_dir():
         raise FileNotFoundError(errno.EISDIR, os.strerror(errno.EISDIR), str(path))
     if not path.is_file():
