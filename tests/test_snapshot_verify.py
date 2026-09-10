@@ -89,6 +89,49 @@ def test_missing_file_reports_missing_alone(tmp_path: Path) -> None:
     assert marker["integrity"]["tables"]["samples"]["path"] in report.findings[0].uri
 
 
+def test_removed_receipt_entry_and_file_raise_inventory_mismatch(tmp_path: Path) -> None:
+    """#473's deleted-member case: when a receipt entry and its file are both
+    gone, the surviving entries agree with each other and every per-file
+    check passes; only the stored inventory content_id, computed over the
+    original set, can witness the loss. The marker is internally
+    inconsistent, so verify raises (CLI exit 2) instead of certifying."""
+
+    def strip_measurements(output_directory: Path) -> str:
+        marker_path = output_directory / "format.json"
+        marker = json.loads(marker_path.read_text())
+        entry = marker["integrity"]["tables"].pop("measurements")
+        marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+        (output_directory / entry["path"]).unlink()
+        return entry["path"]
+
+    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
+    removed = strip_measurements(output_directory)
+
+    with pytest.raises(ValueError, match="content_id"):
+        verify_dataset_snapshot(output_directory)
+
+    # A fresh export for the CLI path: the raise must map to exit 2, the
+    # unreadable-input code, not to a findings-based exit.
+    output_directory, _ = _export_two_episode_snapshot(tmp_path / "cli", "references")
+    strip_measurements(output_directory)
+    assert cli_main(["verify", "snapshot", str(output_directory)]) == 2
+    assert removed
+
+
+def test_deleted_file_with_intact_receipt_reports_missing(tmp_path: Path) -> None:
+    """Negative control for #473: delete the file but keep its receipt entry.
+    This is the ordinary ``missing`` path and must keep reporting DAMAGED
+    with or without the inventory gate; it exercises the per-file loop, not
+    the gate."""
+    output_directory, marker = _export_two_episode_snapshot(tmp_path, "references")
+    (output_directory / marker["integrity"]["tables"]["measurements"]["path"]).unlink()
+
+    report = verify_dataset_snapshot(output_directory)
+
+    assert not report.ok
+    assert [f.reason for f in report.findings] == ["missing"]
+
+
 def test_truncated_file_reports_size_mismatch_and_skips_the_hash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
