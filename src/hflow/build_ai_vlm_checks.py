@@ -40,15 +40,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, assert_never, cast
+from typing import TYPE_CHECKING, Any, assert_never
 from urllib.parse import urlsplit
 
 import httpx2
 
 from hflow._field_guards import (
     require_finite_float,
-    require_float,
-    require_int_in_range,
     require_non_negative_float,
     require_non_negative_int,
     require_positive_float,
@@ -360,10 +358,17 @@ def parse_hand_count_response(response_text: str) -> int:
     parsed_response = _parse_json_or_scalar(response_text)
     if isinstance(parsed_response, dict):
         parsed_response = parsed_response.get("hand_count")
-    if isinstance(parsed_response, str) and re.fullmatch(r"[012]", parsed_response.strip()):
-        parsed_response = int(parsed_response)
-    require_int_in_range(parsed_response, "hand count", minimum=0, maximum=2)
-    return cast(int, parsed_response)
+    if isinstance(parsed_response, bool):
+        raise ValueError("hand count must be 0, 1, or 2")
+    if isinstance(parsed_response, int):
+        hand_count = parsed_response
+    elif isinstance(parsed_response, str) and re.fullmatch(r"[012]", parsed_response.strip()):
+        hand_count = int(parsed_response)
+    else:
+        raise ValueError("hand count must be 0, 1, or 2")
+    if hand_count not in {0, 1, 2}:
+        raise ValueError("hand count must be 0, 1, or 2")
+    return hand_count
 
 
 def parse_active_manipulation_response(response_text: str) -> str:
@@ -513,11 +518,9 @@ def model_output_check_result(
             outcome.response_metadata.response_model
         )
     for usage_name, usage_value in outcome.response_metadata.usage.items():
-        try:
-            require_float(usage_value, f"usage/{usage_name}")
-        except ValueError:
+        if isinstance(usage_value, bool) or not isinstance(usage_value, int | float):
             continue
-        measurements[f"{measurement_prefix}/usage/{usage_name}"] = cast(int | float, usage_value)
+        measurements[f"{measurement_prefix}/usage/{usage_name}"] = usage_value
 
     observation_values: dict[str, MeasurementValue] = {
         "task": task.value,
@@ -779,14 +782,12 @@ def _read_bounded_hosted_response(response: httpx2.Response) -> bytes:
 def _parse_hosted_prediction(task: EvaluationTask, value: object) -> int | str:
     match task:
         case EvaluationTask.HAND_COUNT:
-            try:
-                require_int_in_range(value, "hand count", minimum=0, maximum=2)
-            except ValueError as error:
+            if isinstance(value, bool) or not isinstance(value, int) or value not in {0, 1, 2}:
                 raise RuntimeError(
                     "HFlow hosted hand-visibility check returned a parsed prediction "
                     "outside 0, 1, or 2"
-                ) from error
-            return cast(int, value)
+                )
+            return value
         case EvaluationTask.ACTIVE_MANIPULATION:
             if not isinstance(value, str) or value not in {"yes", "no"}:
                 raise RuntimeError(

@@ -513,7 +513,7 @@ def test_registration_refuses_invalid_frame_times(tmp_path: Path, value: Any) ->
     "value", [True, False, -1, 3, 1.0, None, "01", "3", float("nan"), float("inf")]
 )
 def test_hand_count_response_refuses_invalid_numbers(value: object) -> None:
-    with pytest.raises(ValueError, match="hand count must be"):
+    with pytest.raises(ValueError, match=r"^hand count must be 0, 1, or 2$"):
         hflow.build_ai_vlm_checks.parse_hand_count_response(json.dumps({"hand_count": value}))
 
 

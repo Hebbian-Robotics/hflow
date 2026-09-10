@@ -47,12 +47,12 @@ from hflow._field_guards import (
     ],
 )
 def test_numeric_guard_contract(
-    guard: Callable[[object, str], None],
+    guard: Callable[[object, str], object],
     valid_values: list[object],
     invalid_values: list[object],
 ) -> None:
     for value in valid_values:
-        assert guard(value, "setting") is None
+        assert guard(value, "setting") is value
     for value in [
         *invalid_values,
         True,
