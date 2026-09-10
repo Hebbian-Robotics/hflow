@@ -86,7 +86,7 @@ the video. The writer provides presets for common access patterns:
 | `vla` | 1.0 s | Short sparse windows (a keyframe seek per sample, so keep it cheap) |
 | `world_model` | 6.0 s | Long contiguous sequences (keyframe cost amortizes, so favor compression) |
 
-`gop_frames = max(1, round(gop_seconds × fps))`, with `fps` measured from the source stream (`1e9 / median(Δ log_time)`). The seconds values are configurable defaults, now with measured results in [the benchmark report](./BENCHMARKS.md); the provenance record (below) stamps what was used.
+`gop_frames = max(1, round(gop_seconds × fps))`, with `fps` measured from the source stream (`1e9 / median(Δ log_time)`). The seconds values are configurable defaults, now with measured results in [the benchmark report](./BENCHMARKS.md); the provenance record (below) stamps the selected `gop_seconds` target.
 
 ## State channels
 
@@ -147,8 +147,14 @@ outcome feature.
 | `pipeline_version` | Content hash (12 hex chars, SHA-256 prefix) of the producing transform configuration; two files with equal `pipeline_version` were produced by identical configuration |
 | `ffmpeg_version` | Version line of the encoding instrument |
 | `gop_preset` | `vla` or `world_model` |
-| `gop_seconds` | The keyframe interval actually used |
+| `gop_seconds` | Configured keyframe interval target. Re-encoded video uses this target to build its fixed GOP; pass-through video currently carries the configured target without measuring its cadence. |
 | `source_uri` | Where the source recording came from (optional) |
+
+For pass-through video, `provenance/v1.gop_seconds` is therefore a target rather
+than an observed measurement. `hflow doctor` compares that stamped target with
+the keyframes it observes in the channel and reports mismatches as
+`video-keyframe-cadence`. A future provenance revision can distinguish configured
+and measured values; the current record shape remains unchanged.
 
 During a rewrite, the derived episode replaces `provenance/v1`; all other source `Metadata`
 records are copied through unchanged. A corpus may be mixed-version while regeneration is in

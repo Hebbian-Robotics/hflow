@@ -221,7 +221,7 @@ def _write_video_message_mcap(path: Path, payload: bytes) -> None:
 
 
 def _write_video_cadence_mcap(
-    path: Path, *, keyframe_positions: set[int], message_count: int
+    path: Path, *, keyframe_positions: set[int], message_count: int, gop_seconds: str = "1"
 ) -> None:
     with path.open("wb") as stream:
         writer = StockWriter(stream)
@@ -253,7 +253,11 @@ def _write_video_cadence_mcap(
             )
         writer.add_metadata(
             "provenance/v1",
-            {"schema_version": "1", "pipeline_version": "test", "gop_seconds": "1"},
+            {
+                "schema_version": "1",
+                "pipeline_version": "test",
+                "gop_seconds": gop_seconds,
+            },
         )
         writer.finish()
 
@@ -289,6 +293,25 @@ def test_doctor_accepts_keyframes_on_stamped_fixed_gop_grid(tmp_path: Path) -> N
     report = diagnose(path)
 
     assert not any(finding.code == "video-keyframe-cadence" for finding in report.findings)
+
+
+def test_doctor_reports_non_finite_gop_frame_count_instead_of_raising(tmp_path: Path) -> None:
+    path = tmp_path / "overflowing_gop_frames.mcap"
+    _write_video_cadence_mcap(
+        path,
+        keyframe_positions={0},
+        message_count=2,
+        gop_seconds="1e308",
+    )
+
+    report = diagnose(path)
+
+    finding = next(
+        finding for finding in report.findings if finding.code == "video-keyframe-cadence"
+    )
+    assert finding.level is DiagnosticLevel.ERROR
+    assert "cannot validate fixed GOP cadence" in finding.message
+    assert "non-finite GOP frame count" in finding.message
 
 
 def test_doctor_does_not_duplicate_first_message_mid_gop_as_cadence(tmp_path: Path) -> None:

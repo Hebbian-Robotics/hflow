@@ -481,7 +481,17 @@ def diagnose(path: Path | str) -> DoctorReport:
                             continue
                     else:
                         fps = 1.0
-                    gop_frames = max(1, round(stamped_gop_seconds * fps))
+                    gop_frames_value = stamped_gop_seconds * fps
+                    if not math.isfinite(gop_frames_value):
+                        collector.add(
+                            DiagnosticLevel.ERROR,
+                            "video-keyframe-cadence",
+                            f"{topic} channel {channel_id}: cannot validate fixed GOP cadence: "
+                            f"gop_seconds={stamped_gop_seconds:g} and fps={fps:g} produce a "
+                            "non-finite GOP frame count",
+                        )
+                        continue
+                    gop_frames = max(1, round(gop_frames_value))
                     for message_index, is_keyframe in enumerate(keyframes):
                         if message_index == 0:
                             continue
