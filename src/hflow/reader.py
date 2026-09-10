@@ -246,8 +246,12 @@ class PythonMcapEpisodeReader:
             try:
                 known_channels = self.channels()
             except ValueError:
-                # No summary section to derive topics from (unindexed or
-                # truncated file); fall back to the unconstrained read.
+                # No summary section to derive topics from: a legitimately
+                # unindexed file, still readable by linear scan, so fall back
+                # to the unconstrained read. A truncated file is not this
+                # case -- channels() raises mcap's RecordLengthLimitExceeded,
+                # and the same error surfaces from iter_messages below with
+                # or without this catch, so damage stays loud.
                 known_channels = {}
             derived_topics = sorted(
                 {

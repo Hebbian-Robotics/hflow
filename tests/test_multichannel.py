@@ -19,7 +19,7 @@ from mcap.writer import Writer as StockWriter
 from hflow.doctor import diagnose
 from hflow.episode import Episode
 from hflow.format import METADATA_RECORD_EPISODE
-from hflow.reader import PythonMcapEpisodeReader, open_reader
+from hflow.reader import EpisodeReader, PythonMcapEpisodeReader, open_reader
 from hflow.transform import write_canonical_episode
 
 SHARED_TOPIC = "/status"
@@ -124,12 +124,45 @@ def test_episode_addresses_channels_by_id(dual_channel_source: Path) -> None:
         ]
 
 
+def _write_two_topic_mcap(
+    path: Path,
+    target_payloads: list[bytes],
+    camera_payloads: list[bytes],
+    **writer_kwargs: Any,
+) -> tuple[int, int]:
+    """Write a small ``/target`` channel and a large ``/camera`` channel.
+
+    The default small chunk size keeps the two streams in separate chunks,
+    the layout where an early topic filter can skip unrelated data. Returns
+    the two channel ids in registration order.
+    """
+    writer_kwargs.setdefault("chunk_size", 1024)
+    with path.open("wb") as stream:
+        writer = StockWriter(stream, compression=CompressionType.NONE, **writer_kwargs)
+        writer.start(profile="", library="test")
+        target_channel_id = writer.register_channel(
+            topic="/target", message_encoding="json", schema_id=0
+        )
+        camera_channel_id = writer.register_channel(
+            topic="/camera", message_encoding="json", schema_id=0
+        )
+        for index, payload in enumerate(target_payloads):
+            writer.add_message(
+                target_channel_id, log_time=1 + index, data=payload, publish_time=1 + index
+            )
+        for index, payload in enumerate(camera_payloads):
+            writer.add_message(
+                camera_channel_id, log_time=10 + index, data=payload, publish_time=10 + index
+            )
+        writer.finish()
+    return target_channel_id, camera_channel_id
+
+
 def _trace_mcap_iter_messages(
-    episode: Episode, monkeypatch: pytest.MonkeyPatch
+    hflow_reader: EpisodeReader, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[list[Any], list[str]]:
     """Record the ``topics`` argument HFlow passes to the stock mcap reader
     and the topic of every message that crosses that library boundary."""
-    hflow_reader = episode._reader
     assert isinstance(hflow_reader, PythonMcapEpisodeReader)
     mcap_reader = hflow_reader._reader
     original_iter_messages = mcap_reader.iter_messages
@@ -155,26 +188,10 @@ def test_channel_read_is_constrained_to_the_requested_topic(
     path = tmp_path / "two_topics.mcap"
     target_payload = b"t" * 4096
     camera_payloads = [bytes([65 + index]) * 4096 for index in range(8)]
-    with path.open("wb") as stream:
-        # A small chunk size keeps the two streams in separate chunks, the
-        # layout where an early topic filter can skip unrelated data.
-        writer = StockWriter(stream, chunk_size=1024, compression=CompressionType.NONE)
-        writer.start(profile="", library="test")
-        target_channel_id = writer.register_channel(
-            topic="/target", message_encoding="json", schema_id=0
-        )
-        camera_channel_id = writer.register_channel(
-            topic="/camera", message_encoding="json", schema_id=0
-        )
-        writer.add_message(target_channel_id, log_time=1, data=target_payload, publish_time=1)
-        for index, payload in enumerate(camera_payloads):
-            writer.add_message(
-                camera_channel_id, log_time=10 + index, data=payload, publish_time=10 + index
-            )
-        writer.finish()
+    _write_two_topic_mcap(path, [target_payload], camera_payloads)
 
     with Episode(path) as episode:
-        topics_passed, topics_yielded = _trace_mcap_iter_messages(episode, monkeypatch)
+        topics_passed, topics_yielded = _trace_mcap_iter_messages(episode._reader, monkeypatch)
         channel = episode.channel("/target")
         assert channel.raw == [target_payload]
         assert channel.timestamps.tolist() == [1]
@@ -191,12 +208,71 @@ def test_shared_topic_channel_read_keeps_channel_id_selection(
     messages come back."""
     with Episode(dual_channel_source) as episode:
         by_encoding = {info.message_encoding: info for info in episode.channels.values()}
-        topics_passed, topics_yielded = _trace_mcap_iter_messages(episode, monkeypatch)
+        topics_passed, topics_yielded = _trace_mcap_iter_messages(episode._reader, monkeypatch)
         cdr_channel = episode.channel(by_encoding["cdr"].channel_id)
         assert topics_passed == [[SHARED_TOPIC]]
         assert set(topics_yielded) == {SHARED_TOPIC}
         assert cdr_channel.channel_id == by_encoding["cdr"].channel_id
         assert cdr_channel.raw == CDR_PAYLOADS
+
+
+def test_decoded_batches_by_channel_id_derive_the_topic_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``Episode.channel()`` passes its topic explicitly, but
+    ``iter_decoded_batches(channel_ids=...)`` still reaches the reader with
+    ``topics=None`` -- the reader itself must derive the topic filter from
+    the channel ids so the underlying read narrows to the requested stream."""
+    path = tmp_path / "two_topics_decoded.mcap"
+    target_payloads = [json.dumps({"joint": index}).encode() for index in range(2)]
+    camera_payloads = [json.dumps({"pad": "y" * 4096}).encode() for _ in range(8)]
+    target_channel_id, _ = _write_two_topic_mcap(path, target_payloads, camera_payloads)
+
+    with Episode(path) as episode:
+        topics_passed, topics_yielded = _trace_mcap_iter_messages(episode._reader, monkeypatch)
+        batches = list(episode.iter_decoded_batches(channel_ids=[target_channel_id]))
+        assert [message for batch in batches for message in batch.messages] == [
+            {"joint": 0},
+            {"joint": 1},
+        ]
+        assert topics_passed == [["/target"]]
+        assert topics_yielded == ["/target", "/target"]
+
+
+def test_channel_id_read_without_a_summary_falls_back_to_a_full_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file with no summary section cannot map channel ids to topics, so a
+    channel-id read falls back to the unconstrained scan instead of refusing,
+    and the channel-id filter still selects the right messages. A truncated
+    file is deliberately not this case: ``channels()`` raises mcap's
+    ``RecordLengthLimitExceeded`` rather than ``ValueError``, and any read of
+    such a file surfaces the same error, so damage stays loud."""
+    path = tmp_path / "unindexed.mcap"
+    target_payload = b'{"v": 1}'
+    target_channel_id, _ = _write_two_topic_mcap(
+        path,
+        [target_payload],
+        [b"y" * 4096 for _ in range(8)],
+        use_chunking=False,
+        use_statistics=False,
+        use_summary_offsets=False,
+        repeat_channels=False,
+        repeat_schemas=False,
+    )
+
+    reader = open_reader(path)
+    try:
+        with pytest.raises(ValueError, match="no MCAP summary section"):
+            reader.channels()
+        topics_passed, topics_yielded = _trace_mcap_iter_messages(reader, monkeypatch)
+        batches = list(reader.iter_batches(channel_ids=[target_channel_id]))
+        assert [payload for batch in batches for payload in batch.data] == [target_payload]
+        assert [batch.topic for batch in batches] == ["/target"]
+        assert topics_passed == [None]
+        assert set(topics_yielded) == {"/target", "/camera"}
+    finally:
+        reader.close()
 
 
 def test_episode_streams_several_decoded_channels_in_bounded_batches(
