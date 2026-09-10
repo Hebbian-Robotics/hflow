@@ -1192,6 +1192,79 @@ def test_reject_non_single_select_distinguishes_parse_failure_from_rule_rejectio
         reject_non_single_select("CREATE TABLE t(x INT)")
 
 
+def test_reject_non_single_select_refuses_pragma_and_describe_labeled_as_select() -> None:
+    # DuckDB labels PRAGMA, DESCRIBE, SHOW, SUMMARIZE as StatementType.SELECT
+    # because they are table functions, but the curation endpoints advertise
+    # exactly one read-only SELECT. Preview interpolated the SQL as
+    # ``SELECT * FROM (<sql>)`` where PRAGMA is a syntax error, so the
+    # wrapper's parse failure leaked as the caller's error and preview/pin
+    # disagreed. The gate now refuses these four by leading keyword (#450).
+    for sql in (
+        "PRAGMA database_list",
+        "PRAGMA show_tables",
+        "PRAGMA version",
+        "DESCRIBE SELECT 1",
+        "SHOW TABLES",
+        "SUMMARIZE SELECT 1",
+    ):
+        with pytest.raises(NonSingleSelectQueryError, match=r"exactly one.*SELECT"):
+            reject_non_single_select(sql)
+    # Case-insensitive and comment-prefixed forms are likewise rejected.
+    with pytest.raises(NonSingleSelectQueryError):
+        reject_non_single_select("pragma database_list")
+    with pytest.raises(NonSingleSelectQueryError):
+        reject_non_single_select("-- comment\nPRAGMA database_list")
+    with pytest.raises(NonSingleSelectQueryError):
+        reject_non_single_select("/* block */ DESCRIBE SELECT 1")
+
+
+def test_reject_non_single_select_accepts_select_with_leading_comments_and_cte() -> None:
+    # Leading -- and /* */ comments do not change the statement type.
+    reject_non_single_select("-- comment\nSELECT 1")
+    reject_non_single_select("/* block comment */ SELECT 1")
+    reject_non_single_select("/*c*/--line\n  SELECT 1")
+    reject_non_single_select("WITH c AS (SELECT 1) SELECT * FROM c")
+    reject_non_single_select("with c as (select 1) select * from c")
+    # A SELECT that reads a pragma as a table function is still SELECT text.
+    reject_non_single_select("SELECT * FROM pragma_version()")
+
+
+def test_reject_non_single_select_accepts_legal_selects_that_do_not_start_with_select() -> None:
+    # Review of #453: the previous text-prefix heuristic rejected every query
+    # that didn't start with SELECT or WITH, but DuckDB labels FROM-first
+    # queries, parenthesized selects, and VALUES clauses as
+    # StatementType.SELECT and accepts them inside ``FROM (<sql>)``, the
+    # shape preview interpolates. The gate must accept them too.
+    reject_non_single_select("FROM range(3)")
+    reject_non_single_select("FROM range(3) WHERE range > 0")
+    reject_non_single_select("(SELECT 1)")
+    reject_non_single_select("(SELECT 1 AS one)")
+    reject_non_single_select("VALUES (1), (2)")
+    reject_non_single_select("VALUES (1, 'a'), (2, 'b')")
+    # FROM-first against a real catalog column. A SELECT previewed from this
+    # is the case the reviewer flagged as "the one that matters".
+    reject_non_single_select("FROM episodes WHERE status = 'ok'")
+
+
+def test_reject_non_single_select_accepts_trailing_line_comment_without_newline() -> None:
+    # Without the fix, ``SELECT * FROM (SELECT 1 -- trailing comment)`` is a
+    # parser error: the trailing line comment swallows the wrapper's closing
+    # paren. Appending a newline before wrapping ends the comment first.
+    reject_non_single_select("SELECT 1 -- trailing comment without newline")
+
+
+def test_reject_non_single_select_keyword_refusal_is_about_the_leading_word() -> None:
+    # The PRAGMA/DESCRIBE/SHOW/SUMMARIZE refusal reads the first identifier,
+    # so a parenthesized DESCRIBE is not headed by the keyword and is
+    # accepted. Pinned deliberately: preview and pin both run that form and
+    # agree on it, which is the #450 requirement. Read-only introspection of
+    # an in-memory catalog was never what the gate was keeping out.
+    reject_non_single_select("(DESCRIBE SELECT 1)")
+    reject_non_single_select("SELECT * FROM (SHOW TABLES)")
+    with pytest.raises(NonSingleSelectQueryError):
+        reject_non_single_select("DESCRIBE SELECT 1")
+
+
 def test_constrained_curate_writes_the_manifest_but_refuses_outside_reads(
     tmp_path: Path,
 ) -> None:
