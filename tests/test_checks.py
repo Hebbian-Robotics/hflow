@@ -533,6 +533,16 @@ def test_fps_conformance_rejects_invalid_thresholds(tmp_path: Path) -> None:
         ):
             camera_fps_conformance(episode, downsample_tolerance_fps=-1)
 
+        # Zero tolerance is a meaningful setting, not a missing one: it asks
+        # for an exact rate match. The two parameters therefore take different
+        # bars, > 0 for the plausibility ceiling and >= 0 here. Tightening
+        # this one to > 0 went unnoticed by every other case, so it is pinned.
+        camera_fps_conformance(episode, downsample_tolerance_fps=0)
+
+        # Fractional thresholds are why these widened from int to float:
+        # 29.97 and 23.976 are real camera rates.
+        camera_fps_conformance(episode, max_plausible_fps=29.97, downsample_tolerance_fps=0.5)
+
 
 def test_action_integrity_finds_the_injected_frozen_run(tmp_path: Path) -> None:
     """A stalled publisher repeats samples bit-for-bit; a still robot does not.
