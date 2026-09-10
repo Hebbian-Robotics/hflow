@@ -9,7 +9,8 @@ dataset snapshot verifier (:func:`hflow.snapshot.verify_dataset_snapshot`,
 #428) both return this shape, so one CLI and one exit-code mapping cover
 every delivered artifact.
 
-Reasons are fixed strings so callers can branch on them.
+Reasons use a closed string enum so callers can branch on a documented set of
+values.
 ``exit_code_for`` maps a report to the verify-family exit codes: 0 clean,
 1 damaged, 3 unverifiable. Exit 2 (unreadable input) is raised as an
 exception before a report exists.
@@ -20,11 +21,23 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-REASON_MISSING = "missing"
-REASON_SIZE_MISMATCH = "size-mismatch"
-REASON_CONTENT_ID_MISMATCH = "content-id-mismatch"
-# #428: a readable snapshot format.json that carries no integrity receipt.
-REASON_NO_RECEIPT = "no-receipt"
+
+class VerificationReason(StrEnum):
+    """Machine-readable reason for a verification finding."""
+
+    MISSING = "missing"
+    SIZE_MISMATCH = "size-mismatch"
+    CONTENT_ID_MISMATCH = "content-id-mismatch"
+    # #428: a readable snapshot format.json that carries no integrity receipt.
+    NO_RECEIPT = "no-receipt"
+
+
+# Keep the original names as public aliases for callers that already import
+# the reason constants.
+REASON_MISSING = VerificationReason.MISSING
+REASON_SIZE_MISMATCH = VerificationReason.SIZE_MISMATCH
+REASON_CONTENT_ID_MISMATCH = VerificationReason.CONTENT_ID_MISMATCH
+REASON_NO_RECEIPT = VerificationReason.NO_RECEIPT
 
 
 class VerificationStatus(StrEnum):
@@ -40,7 +53,7 @@ class VerificationFinding:
     """One claimed object that does not match its receipt."""
 
     uri: str
-    reason: str
+    reason: VerificationReason
     detail: str
 
 
