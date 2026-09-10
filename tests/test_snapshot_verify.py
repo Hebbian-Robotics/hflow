@@ -132,6 +132,38 @@ def test_deleted_file_with_intact_receipt_reports_missing(tmp_path: Path) -> Non
     assert [f.reason for f in report.findings] == ["missing"]
 
 
+@pytest.mark.parametrize(
+    ("replacement", "label"),
+    [(None, "absent"), ("", "empty"), (0, "not-a-string"), ([], "wrong-type")],
+    ids=["absent", "empty", "not-a-string", "wrong-type"],
+)
+def test_receipt_without_a_usable_content_id_is_refused(
+    tmp_path: Path, replacement: object, label: str
+) -> None:
+    """The other half of the #473 gate, which the mismatch test cannot reach.
+
+    A receipt whose ``content_id`` is missing or unusable cannot witness a
+    deleted member at all, so certifying it would be certifying that the
+    check ran. Deleting this branch left the whole suite green, so it needs
+    its own case. An ``integrity`` block with no ``content_id`` is not
+    something hflow writes (both arrived in #401), which is exactly why a
+    marker carrying one is unreadable input rather than damaged bytes.
+    """
+    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
+    marker_path = output_directory / "format.json"
+    marker = json.loads(marker_path.read_text())
+    if replacement is None:
+        marker["integrity"].pop("content_id")
+    else:
+        marker["integrity"]["content_id"] = replacement
+    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+
+    with pytest.raises(ValueError, match="no usable content_id"):
+        verify_dataset_snapshot(output_directory)
+
+    assert cli_main(["verify", "snapshot", str(output_directory)]) == 2, label
+
+
 def test_truncated_file_reports_size_mismatch_and_skips_the_hash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
