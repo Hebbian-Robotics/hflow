@@ -279,6 +279,26 @@ def test_unsupported_or_mistyped_version_is_refused(tmp_path: Path) -> None:
     assert cli_main(["verify", "snapshot", str(output_directory)]) == 0
 
 
+def test_a_right_version_with_a_foreign_format_name_is_refused(tmp_path: Path) -> None:
+    """The other half of the identity predicate.
+
+    `test_foreign_marker_is_refused_at_the_boundary` uses a marker carrying
+    neither field, so the version check alone refuses it and the format-name
+    check is never the thing that fires. Dropping the name comparison from
+    the predicate left the whole suite green. This pins it: a marker claiming
+    version 1 of somebody else's format is still not ours to certify.
+    """
+    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
+    marker_path = output_directory / "format.json"
+    marker = json.loads(marker_path.read_text())
+    marker["format"] = "someone-elses-dataset-snapshot"
+    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+
+    with pytest.raises(ValueError, match="someone-elses-dataset-snapshot"):
+        verify_dataset_snapshot(output_directory)
+    assert cli_main(["verify", "snapshot", str(output_directory)]) == 2
+
+
 def test_extra_files_under_assets_are_ignored(tmp_path: Path) -> None:
     """Files the receipt does not name produce no finding and no warning:
     unlisted extras are outside the receipt's contract."""
