@@ -1066,41 +1066,76 @@ def test_constrained_connection_confines_sql_to_the_catalog(tmp_path: Path) -> N
         connection.close()
 
 
-_MULTI_STATEMENT_PAYLOADS = [
-    # (id, sql_template, expected_refused)
-    # The sql_template may include {decoy} which is replaced at runtime with
-    # a path inside the constrained connection's known writable directory.
+# The SQL surface curate() accepts, written down (#279). Each row is
+# (sql_template, expected_refused, expected_rows). ``{decoy}`` is replaced at
+# runtime with a path inside the constrained connection's writable directory.
+#
+# This table is the one statement of the surface. When the gate changes, this
+# is the thing that has to change with it, deliberately and in one place.
+_SQL_SURFACE_PAYLOADS = [
+    # Injection shapes, from the #271 review. Refused.
     pytest.param(
         "SELECT 1) TO {decoy} ...; CREATE TABLE p(x TEXT); --",
         True,
+        0,
         id="copy-escape-old-pr-shape",
     ),
     pytest.param(
         "SELECT 1; CREATE TABLE pwned AS SELECT 1 AS x",
         True,
+        0,
         id="direct-multistatement-select-plus-create",
     ),
+    pytest.param("CREATE TABLE t(x INT)", True, 0, id="ddl-only-no-select"),
+    # PIVOT looks like a false positive and is not. DuckDB rewrites it, and
+    # extract_statements reports two statements, [CREATE, SELECT], so a
+    # user-written PIVOT really does run a CREATE first. The count check is
+    # what catches it. Do not "fix" this row by relaxing that check.
     pytest.param(
-        "CREATE TABLE t(x INT)",
+        "PIVOT episodes ON status USING count(*)",
         True,
-        id="ddl-only-no-select",
+        0,
+        id="pivot-expands-to-create-then-select",
     ),
+    # Table functions DuckDB labels SELECT. Refused since #453: they parse as
+    # SELECT but produce a description of columns, not a set of episodes, so a
+    # manifest from one has no episode_id and every consumer refuses it.
+    pytest.param("DESCRIBE SELECT episode_id FROM episodes", True, 0, id="describe"),
+    pytest.param("SUMMARIZE SELECT episode_id FROM episodes", True, 0, id="summarize"),
+    pytest.param("PRAGMA database_list", True, 0, id="pragma"),
+    pytest.param("SHOW TABLES", True, 0, id="show"),
+    # Accepted. The catalog holds exactly one episode, so a query selecting
+    # from it yields one row.
+    pytest.param("SELECT episode_id FROM episodes", False, 1, id="legitimate-single-select"),
+    pytest.param("TABLE episodes", False, 1, id="table-episodes"),
     pytest.param(
-        "SELECT episode_id FROM episodes",
+        "WITH picked AS (SELECT episode_id FROM episodes) SELECT * FROM picked",
         False,
-        id="legitimate-single-select",
+        1,
+        id="cte",
     ),
+    # Legal SELECTs that do not start with the word SELECT. #453 accepts these;
+    # its first attempt refused them on a text prefix, which is the regression
+    # these three rows exist to catch.
+    pytest.param("FROM episodes", False, 1, id="from-first"),
+    pytest.param("(SELECT episode_id FROM episodes)", False, 1, id="parenthesized-select"),
+    pytest.param("VALUES (1), (2)", False, 2, id="values"),
 ]
 
 
-@pytest.mark.parametrize("sql_template,expected_refused", _MULTI_STATEMENT_PAYLOADS)
-def test_stage_manifest_and_count_rejects_non_single_select(
+@pytest.mark.parametrize(
+    ("sql_template", "expected_refused", "expected_rows"), _SQL_SURFACE_PAYLOADS
+)
+def test_curate_sql_surface_is_pinned(
     tmp_path: Path,
     sql_template: str,
     expected_refused: bool,
+    expected_rows: int,
 ) -> None:
-    """_stage_manifest_and_count must refuse anything that is not exactly one
-    SELECT statement.
+    """The SQL `curate()` accepts and refuses, stated rather than discovered.
+
+    _stage_manifest_and_count must refuse anything that is not exactly one
+    read-only SELECT statement.
 
     ``connection.sql()`` and ``connection.execute()`` both silently execute
     every semicolon-separated statement in their input (verified on duckdb
@@ -1109,16 +1144,9 @@ def test_stage_manifest_and_count_rejects_non_single_select(
     ``connection.extract_statements`` to parse WITHOUT executing; it requires
     exactly one statement whose type is SELECT.
 
-    Payloads are drawn from the PR #271 reviewer's attack-shape table
-    (kstonekuan):
-      - COPY-escape (old PR shape) — refused
-      - Direct multi-statement SELECT + CREATE — refused
-      - DDL-only, no SELECT — refused
-      - Legitimate single SELECT — allowed
-
-    For refused cases: ValueError is raised BEFORE any table is created and
-    BEFORE any file is written.  For the allowed case: the manifest is
-    produced with the correct row count.
+    The payload table above is the surface. For refused cases, ValueError is
+    raised BEFORE any table is created and BEFORE any file is written. For
+    accepted cases, the manifest is produced with the expected row count.
     """
     from hflow.curation import _open_connection_over_root, _stage_manifest_and_count
 
@@ -1142,7 +1170,9 @@ def test_stage_manifest_and_count_rejects_non_single_select(
     )
     try:
         if expected_refused:
-            with pytest.raises(ValueError, match="exactly one SELECT"):
+            # #453 gave the table-function refusals their own wording, so the
+            # pattern has to admit both spellings of the same rule.
+            with pytest.raises(ValueError, match=r"exactly one (read-only )?SELECT"):
                 _stage_manifest_and_count(connection, sql, staged_manifest)
             # Guard fires before any file is written or any table is created.
             assert not staged_manifest.is_file()
@@ -1154,9 +1184,10 @@ def test_stage_manifest_and_count_rejects_non_single_select(
             with pytest.raises(duckdb.Error):
                 connection.execute("SELECT * FROM p")
         else:
-            # Legitimate query: manifest must be written with correct row count.
+            # Accepted query: manifest written, with the row count this shape
+            # yields over a one-episode catalog.
             row_count = _stage_manifest_and_count(connection, sql, staged_manifest)
-            assert row_count == 1
+            assert row_count == expected_rows
             assert staged_manifest.is_file()
     finally:
         connection.close()
