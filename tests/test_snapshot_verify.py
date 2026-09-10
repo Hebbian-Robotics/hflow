@@ -6,6 +6,7 @@ verify_dataset_snapshot must report exactly the damage -- nothing more,
 nothing less.
 """
 
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -221,6 +222,81 @@ def test_pre_401_format_json_is_unverifiable_not_corrupt(tmp_path: Path) -> None
 
     assert not report.ok
     assert [f.reason for f in report.findings] == ["no-receipt"]
+
+
+def test_foreign_marker_is_refused_at_the_boundary(tmp_path: Path) -> None:
+    """#472: a directory the exporter would refuse cannot be certified. A
+    marker with an integrity-shaped key but no format identity never reaches
+    the receipt logic; verify raises and the CLI maps to exit 2."""
+    foreign = tmp_path / "some-other-tools-output"
+    foreign.mkdir()
+    payload = b"not-a-hflow-snapshot-at-all"
+    (foreign / "data.parquet").write_bytes(payload)
+    (foreign / "format.json").write_text(
+        json.dumps(
+            {
+                "producer": "not-hflow",
+                "integrity": {
+                    "tables": {
+                        "data": {
+                            "path": "data.parquet",
+                            "size_bytes": len(payload),
+                            "sha256": hashlib.sha256(payload).hexdigest(),
+                        }
+                    }
+                },
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="not a 'hflow-dataset-snapshot'"):
+        verify_dataset_snapshot(foreign)
+
+    assert cli_main(["verify", "snapshot", str(foreign)]) == 2
+
+
+def test_unsupported_or_mistyped_version_is_refused(tmp_path: Path) -> None:
+    """#472: version 1 is the only version there has ever been, and the
+    comparison is deliberately identical to the writer, which records the
+    version as a string. A future version raises, and so does a JSON number
+    1: an easy honest mistake, so the error says exactly why."""
+    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
+    marker_path = output_directory / "format.json"
+
+    marker = json.loads(marker_path.read_text())
+    marker["format_version"] = "2"
+    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+    with pytest.raises(ValueError, match="format_version '2'"):
+        verify_dataset_snapshot(output_directory)
+
+    marker["format_version"] = 1
+    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+    with pytest.raises(ValueError, match="JSON number 1 is refused"):
+        verify_dataset_snapshot(output_directory)
+
+    marker["format_version"] = "1"
+    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+    assert cli_main(["verify", "snapshot", str(output_directory)]) == 0
+
+
+def test_a_right_version_with_a_foreign_format_name_is_refused(tmp_path: Path) -> None:
+    """The other half of the identity predicate.
+
+    `test_foreign_marker_is_refused_at_the_boundary` uses a marker carrying
+    neither field, so the version check alone refuses it and the format-name
+    check is never the thing that fires. Dropping the name comparison from
+    the predicate left the whole suite green. This pins it: a marker claiming
+    version 1 of somebody else's format is still not ours to certify.
+    """
+    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
+    marker_path = output_directory / "format.json"
+    marker = json.loads(marker_path.read_text())
+    marker["format"] = "someone-elses-dataset-snapshot"
+    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+
+    with pytest.raises(ValueError, match="someone-elses-dataset-snapshot"):
+        verify_dataset_snapshot(output_directory)
+    assert cli_main(["verify", "snapshot", str(output_directory)]) == 2
 
 
 def test_extra_files_under_assets_are_ignored(tmp_path: Path) -> None:
