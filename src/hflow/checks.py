@@ -1837,10 +1837,16 @@ def _keyframe_indices(channel: ChannelData) -> tuple[int, ...]:
 
 
 def _keyframe_interval_intermediates(channel: ChannelData) -> _KeyframeIntervalPerCamera:
-    frame_count = channel.timestamps.size
+    """One camera's keyframe scan, computed once and shared by the body and
+    the key-set fact (#480).
+
+    No empty-channel shortcut: ``_keyframe_indices`` on a channel with no
+    messages already returns ``()`` without inspecting a payload, so guarding
+    it would only add a branch that reads as if it saved something.
+    """
     return _KeyframeIntervalPerCamera(
-        frame_count=frame_count,
-        keyframe_indices=_keyframe_indices(channel) if frame_count else (),
+        frame_count=channel.timestamps.size,
+        keyframe_indices=_keyframe_indices(channel),
     )
 
 
@@ -1940,11 +1946,15 @@ def keyframe_interval(episode: Episode, *, cameras: Sequence[str] | None = None)
     selected_cameras = list(cameras) if cameras is not None else episode.cameras
     timestamps_by_camera: dict[str, np.ndarray] = {}
     intermediates_by_camera: dict[str, _KeyframeIntervalPerCamera] = {}
+    # dict.fromkeys, not set: a repeated camera is loaded once but the
+    # measurement loop below still walks selected_cameras in the order the
+    # caller gave. Only the timestamps and the small keyframe struct are kept,
+    # so the channel's raw payloads are released as the loop moves on rather
+    # than all C being held at once.
     for topic in dict.fromkeys(selected_cameras):
         channel = episode.channel(topic)
         timestamps_by_camera[topic] = channel.timestamps
         intermediates_by_camera[topic] = _keyframe_interval_intermediates(channel)
-        del channel
     keys = sorted(
         _keyframe_interval_keys(
             episode,
