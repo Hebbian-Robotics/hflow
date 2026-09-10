@@ -126,6 +126,25 @@ def _sha256_hex(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _marker_identifies_dataset_snapshot(format_marker: dict) -> bool:
+    """Whether ``format_marker`` claims to be a snapshot this version handles.
+
+    Two callers ask this and must never disagree: the exporter deciding
+    whether a destination is one of ours to replace, and the verifier
+    deciding whether a directory is one of ours to certify (#472). If the
+    verifier were the looser of the two, exit 0 would mean "some directory
+    with an integrity-shaped key matched".
+
+    Deliberately strict about the version's type. The writer records the
+    string ``"1"``, so a JSON number ``1`` is a different value and is
+    refused. Callers phrase their own message; only the predicate is shared.
+    """
+    return (
+        format_marker.get("format") == DATASET_SNAPSHOT_FORMAT_NAME
+        and format_marker.get("format_version") == DATASET_SNAPSHOT_FORMAT_VERSION
+    )
+
+
 def _file_integrity_record(relative_path: str, absolute_path: Path) -> dict[str, str | int]:
     """Receipt for one delivered snapshot file (table or copied asset)."""
     return {
@@ -614,10 +633,7 @@ def _parse_dataset_snapshot_destination(
             f"snapshot export destination {output_directory} cannot be replaced because "
             f"{_FORMAT_MARKER_FILE_NAME} is not a JSON object"
         )
-    if (
-        format_marker.get("format") != DATASET_SNAPSHOT_FORMAT_NAME
-        or format_marker.get("format_version") != DATASET_SNAPSHOT_FORMAT_VERSION
-    ):
+    if not _marker_identifies_dataset_snapshot(format_marker):
         raise ValueError(
             f"snapshot export destination {output_directory} cannot be replaced because "
             f"{_FORMAT_MARKER_FILE_NAME} does not identify supported "
@@ -865,19 +881,14 @@ def verify_dataset_snapshot(
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise ValueError(f"format.json is unreadable: {error}") from error
 
-    # Format identity gate (#472): the exporter's replace guard (:618-625) and
-    # the writer (:772-773) both pin this identity; the verifier refuses the
-    # same markers, so exit 0 means "this is an HFlow snapshot and the receipt
-    # matched", never "some directory with an integrity-shaped key matched".
-    # The comparison is deliberately strict, exactly like the writer: the
-    # version is recorded as a string, so a JSON number 1 is refused, and the
-    # error says so because that mistake is an easy one to make.
+    # Format identity gate (#472), sharing the exporter's predicate so the two
+    # can never drift apart. Exit 0 then means "this is an HFlow snapshot and
+    # the receipt matched", never "some directory with an integrity-shaped key
+    # matched". The message names the values found and calls out the version's
+    # type, because a JSON number 1 is the easy mistake to make.
     found_format = format_marker.get("format")
     found_version = format_marker.get("format_version")
-    if (
-        found_format != DATASET_SNAPSHOT_FORMAT_NAME
-        or found_version != DATASET_SNAPSHOT_FORMAT_VERSION
-    ):
+    if not _marker_identifies_dataset_snapshot(format_marker):
         raise ValueError(
             f"format.json is not a {DATASET_SNAPSHOT_FORMAT_NAME!r} format version "
             f"{DATASET_SNAPSHOT_FORMAT_VERSION!r} dataset snapshot: found format "
