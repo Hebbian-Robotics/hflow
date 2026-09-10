@@ -488,6 +488,29 @@ def test_temperature_requires_a_finite_number(value: Any) -> None:
         )
 
 
+@pytest.mark.parametrize("value", [1, 0, "true", None, 1.0])
+def test_skip_black_frames_requires_an_actual_bool(value: Any) -> None:
+    # The one guard in this file that _field_guards cannot express: the field
+    # wants a bool, so the bool exclusion every other guard makes is inverted
+    # here. Deleting it left the whole suite green, hence this case. 1 and 0
+    # are the interesting rows, since they compare equal to True and False.
+    with pytest.raises(ValueError, match="skip_black_frames must be a bool"):
+        hflow.build_ai_vlm_checks.FrameSampling(fps=1.0, skip_black_frames=value)
+
+
+def test_skip_black_frames_accepts_both_bools() -> None:
+    # False is the row that matters: a truthiness check instead of a type
+    # check would let it through and a falsy-value guard would refuse it.
+    assert (
+        hflow.build_ai_vlm_checks.FrameSampling(fps=1.0, skip_black_frames=False).skip_black_frames
+        is False
+    )
+    assert (
+        hflow.build_ai_vlm_checks.FrameSampling(fps=1.0, skip_black_frames=True).skip_black_frames
+        is True
+    )
+
+
 @pytest.mark.parametrize("value", [None, -1, 0, 0.5])
 def test_temperature_accepts_optional_finite_numbers(value: float | None) -> None:
     execution = hflow.build_ai_vlm_checks.OpenAICompatibleExecution(

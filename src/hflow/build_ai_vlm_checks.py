@@ -286,7 +286,7 @@ class FrameSampling:
     skip_black_frames: bool = True
 
     def __post_init__(self) -> None:
-        if type(self.skip_black_frames) is not bool:
+        if not isinstance(self.skip_black_frames, bool):
             raise ValueError("skip_black_frames must be a bool")
         require_positive_float(self.fps, "fps")
         require_non_negative_float(self.start_s, "start_s")
