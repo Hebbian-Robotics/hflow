@@ -122,6 +122,7 @@ from hflow.storage import (
 from hflow.transform import EpisodeStamps, TransformConfig, write_canonical_episode
 from hflow.verification import (
     VerificationFinding,
+    VerificationReason,
     VerificationReport,
     VerificationStatus,
 )
@@ -206,6 +207,7 @@ __all__ = [
     "TopicInfo",
     "TransformConfig",
     "VerificationFinding",
+    "VerificationReason",
     "VerificationReport",
     "VerificationStatus",
     "VideoImportConfig",
