@@ -478,6 +478,38 @@ def test_inventory_digest_is_byte_identical_through_the_record_bridge() -> None:
     assert hflow.snapshot._inventory_content_id(records) == _GOLDEN_INVENTORY_CONTENT_ID
 
 
+def test_the_digest_covers_the_three_delivery_fields_and_nothing_else() -> None:
+    """Typing the entries narrowed what the digest is computed over, and that
+    is a decision rather than an accident.
+
+    Hashing raw dicts meant the digest depended on every key an entry
+    happened to carry. Hashing records means it depends on exactly ``path``,
+    ``size_bytes`` and ``sha256``, which are the three facts that define a
+    delivery. An entry carrying an extra key therefore hashes the same now
+    and used to hash differently.
+
+    The consequence to keep: additive metadata in a later format revision
+    cannot silently invalidate the digest of every snapshot already
+    exported. The consequence to know: a marker whose entries were edited to
+    add a field is no longer caught here. That is not a loss, because the
+    receipt travels unsigned inside the file it describes and was never a
+    tamper defence, and the guarantee the docs make (a deleted member stays
+    visible) is unaffected. Restoring raw-dict hashing to "tighten" this
+    would trade a real compatibility property for an imaginary one.
+    """
+    entries_with_an_extra_field = [
+        {**entry, "injected_field": "not written by hflow"} for entry in _KNOWN_RECEIPT_ENTRIES
+    ]
+    records = [
+        hflow.snapshot._parse_file_integrity_record(entry) for entry in entries_with_an_extra_field
+    ]
+
+    assert hflow.snapshot._inventory_content_id(records) == _GOLDEN_INVENTORY_CONTENT_ID
+
+    # And the deleted-member guarantee still holds over the narrowed digest.
+    assert hflow.snapshot._inventory_content_id(records[:-1]) != _GOLDEN_INVENTORY_CONTENT_ID
+
+
 def test_receipt_entry_with_numeric_sha256_is_refused_at_the_boundary() -> None:
     """#489's silent bug: a receipt whose sha256 arrived as a JSON number
     used to reach a per-file comparison that can never succeed and was

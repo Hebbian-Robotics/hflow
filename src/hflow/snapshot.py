@@ -154,6 +154,16 @@ class FileIntegrityRecord:
     them. ``to_dict_for_hashing`` rebuilds exactly the dict shape the
     exporter has always serialized, so the ``content_id`` digest stays
     byte-identical with every snapshot ever exported (#489).
+
+    Typing the entries also fixed what the digest covers. Hashing raw dicts
+    made it depend on every key an entry happened to carry; it now depends on
+    these three fields, which are the ones that define a delivery. So an
+    entry with an extra key hashes the same, where it used to hash
+    differently. That is deliberate: a later format revision can add metadata
+    without invalidating the digest of every snapshot already exported. It
+    does mean a marker edited to add a field is not caught here, which costs
+    nothing, because this receipt travels unsigned inside the file it
+    describes and was never a tamper defence.
     """
 
     path: str
