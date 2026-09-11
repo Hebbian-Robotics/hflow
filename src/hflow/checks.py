@@ -414,7 +414,7 @@ def _camera_frame_stats_keys(episode: Episode, *, cameras: Sequence[str] | None 
     inside the per-topic selection, so an episode with no cameras emits
     nothing at all.
     """
-    selected = list(cameras) if cameras is not None else episode.cameras
+    selected = _resolve_selected_cameras(episode, cameras)
     keys: set[str] = set()
     for topic in selected:
         keys.add(f"{topic}/message_count")
@@ -603,7 +603,7 @@ def camera_frame_stats(
     The trade is one right-to-left key parse (``rpartition``) plus one dict
     lookup per key on top of the ffmpeg decode each topic already pays (#182).
     """
-    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    selected_cameras = _resolve_selected_cameras(episode, cameras)
     intermediates_by_topic = {
         topic: _camera_intermediates(
             episode,
@@ -703,6 +703,18 @@ def _timestamp_regularity_resolve_selected(
         if topic not in episode.cameras and infos[topic].message_count >= 2
     ]
     return selected, state_topics
+
+
+def _resolve_selected_cameras(episode: Episode, cameras: Sequence[str] | None) -> list[str]:
+    """The cameras a check ran over: the caller's list, or every camera.
+
+    ``is not None`` rather than truthiness, and that is the whole reason this
+    is worth stating once. ``cameras=[]`` asks for no cameras and must select
+    none; ``cameras=None`` asks for the default and selects all of them.
+    Collapsing the two would silently turn nine checks into whole-episode
+    scans for a caller who passed an empty selection on purpose.
+    """
+    return list(cameras) if cameras is not None else episode.cameras
 
 
 @dataclass(frozen=True)
@@ -1048,7 +1060,7 @@ def camera_stability(
             f"horizontal_field_of_view_degrees must be finite and in (0, 360], got {horizontal_field_of_view_degrees}"
         )
 
-    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    selected_cameras = _resolve_selected_cameras(episode, cameras)
     measurements: dict[str, MeasurementValue] = {}
     intervals: list[Interval] = []
     for topic in selected_cameras:
@@ -1393,7 +1405,7 @@ def camera_signal_quality(
     ``camera_frame_stats`` records which one measured; compare across a pin bump
     only after re-measuring, not by reading old rows next to new ones.
     """
-    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    selected_cameras = _resolve_selected_cameras(episode, cameras)
     measurements: dict[str, MeasurementValue] = {}
     for topic in selected_cameras:
         frame_statistics = measure_video_frame_statistics_for_hflow(
@@ -1704,7 +1716,7 @@ def camera_fps_conformance(
     if not np.isfinite(downsample_tolerance_fps) or downsample_tolerance_fps < 0:
         raise ValueError("downsample_tolerance_fps must be finite and non-negative")
 
-    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    selected_cameras = _resolve_selected_cameras(episode, cameras)
     measurements: dict[str, MeasurementValue] = {}
     for topic in selected_cameras:
         stamps_ns = episode.channel(topic).timestamps
@@ -1807,7 +1819,7 @@ def _media_digest_keys(episode: Episode, *, cameras: Sequence[str] | None = None
     both are produced in the same byte walk, so the fact's two-key claim
     holds for every camera the default runs over.
     """
-    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    selected_cameras = _resolve_selected_cameras(episode, cameras)
     keys: set[str] = set()
     for topic in selected_cameras:
         keys.add(f"{topic}/media_digest")
@@ -1846,7 +1858,7 @@ def media_digest(episode: Episode, *, cameras: Sequence[str] | None = None) -> C
     ``{topic}/media_bytes`` weights it by what the duplication costs to store.
     Reads no pixels and runs no decode, so it is exact and cheap.
     """
-    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    selected_cameras = _resolve_selected_cameras(episode, cameras)
     measurements: dict[str, MeasurementValue] = {}
     for topic in selected_cameras:
         inter = _media_digest_intermediates(episode, topic)
@@ -1916,7 +1928,7 @@ def _keyframe_interval_keys(
     registration. The body supplies its already-computed intermediates;
     standalone callers compute them here.
     """
-    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    selected_cameras = _resolve_selected_cameras(episode, cameras)
     keys: set[str] = set()
     for topic in selected_cameras:
         inter = (
@@ -1992,7 +2004,7 @@ def keyframe_interval(episode: Episode, *, cameras: Sequence[str] | None = None)
     count as keyframes), so a ``<=`` filter excludes those rather than reading
     them as perfect.
     """
-    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    selected_cameras = _resolve_selected_cameras(episode, cameras)
     timestamps_by_camera: dict[str, np.ndarray] = {}
     intermediates_by_camera: dict[str, _KeyframeIntervalPerCamera] = {}
     # dict.fromkeys, not set: a repeated camera is loaded once but the
