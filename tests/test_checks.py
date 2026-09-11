@@ -1,5 +1,6 @@
 """Direct unit tests for the built-in checks (paths e2e only grazes)."""
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +30,44 @@ from hflow.checks import (
 )
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import TransformConfig, write_canonical_episode
+
+
+@pytest.fixture(scope="module")
+def camera_less_episode_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """An episode with no camera topics at all.
+
+    #447's finding was that these guards were skipped entirely when an episode
+    had no cameras, so a test on a camera-bearing episode cannot tell a guard
+    refusal apart from a camera-processing failure. Every guard case below
+    runs against this one.
+    """
+    return synthesize_episode(
+        tmp_path_factory.mktemp("camera-less") / "episode.mcap",
+        SyntheticEpisodeSpec(cameras=(), black_segment=None, timestamp_offset_segment=None),
+    )
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value", "expected_message"),
+    [
+        ("black_pixel_threshold", True, "black_pixel_threshold must be an int, got bool"),
+        ("black_pixel_threshold", 300, "black_pixel_threshold must be between 0 and 255"),
+        ("freeze_noise_db", True, "freeze_noise_db must be a float, got bool"),
+        ("freeze_noise_db", float("nan"), "freeze_noise_db must be finite"),
+        ("freeze_min_duration_s", True, "freeze_min_duration_s must be a float, got bool"),
+        ("freeze_min_duration_s", -1.0, "freeze_min_duration_s must be finite and positive"),
+    ],
+)
+def test_camera_signal_quality_refuses_bad_thresholds_without_cameras(
+    camera_less_episode_path: Path, parameter: str, value: object, expected_message: str
+) -> None:
+    # match= matters as much as the raise: without it a camera-processing
+    # ValueError satisfies the assertion and the guard could be gone.
+    with (
+        hflow.Episode(camera_less_episode_path) as episode,
+        pytest.raises(ValueError, match=re.escape(expected_message)),
+    ):
+        camera_signal_quality(episode, **{parameter: value})  # ty: ignore
 
 
 def test_no_two_builtin_checks_claim_the_same_measurement_key(tmp_path: Path) -> None:
