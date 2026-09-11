@@ -1,10 +1,15 @@
 """Direct unit tests for the built-in checks (paths e2e only grazes)."""
 
+from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
 import numpy as np
 import pytest
 from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
+from mcap.data_stream import RecordBuilder
+from mcap.records import Statistics
+from mcap.writer import CompressionType, IndexType
 from mcap.writer import Writer as StockWriter
 from mcap_protobuf.schema import build_file_descriptor_set
 
@@ -212,6 +217,206 @@ def test_episode_duration_matches_the_synthesized_span(jittery_episode: hflow.Ep
     assert duration_s == pytest.approx(4.0, abs=0.1)
     message_count_total = result.measurements["message_count_total"]
     assert isinstance(message_count_total, int) and message_count_total > 0
+
+
+@pytest.fixture
+def duration_source(tmp_path: Path) -> Path:
+    path = tmp_path / "duration.mcap"
+    with path.open("wb") as stream:
+        writer = StockWriter(stream, chunk_size=64 * 1024, compression=CompressionType.NONE)
+        writer.start()
+        state = writer.register_channel(topic="/joint_states", message_encoding="json", schema_id=0)
+        camera = writer.register_channel(topic="/camera", message_encoding="json", schema_id=0)
+        writer.register_channel(topic="/empty", message_encoding="json", schema_id=0)
+        for index, second in enumerate((1, 3), start=1):
+            writer.add_message(
+                state, second * 10**9, f'{{"state": {index}}}'.encode(), second * 10**9
+            )
+        for second in range(2, 10):
+            writer.add_message(camera, second * 10**9, b"x" * 100_000, second * 10**9)
+        writer.finish()
+    return path
+
+
+def test_episode_duration_does_not_materialize_channels(
+    duration_source: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with hflow.Episode(duration_source) as episode:
+
+        def refuse_channel(key: str | int) -> hflow.ChannelData:
+            pytest.fail(f"episode_duration materialized channel {key!r}")
+
+        monkeypatch.setattr(episode, "channel", refuse_channel)
+        # Exercise aggregation across several batches, including the camera's
+        # final batch extending beyond the other topic's end timestamp.
+        monkeypatch.setattr(
+            episode._reader,
+            "iter_batches",
+            partial(episode._reader.iter_batches, batch_max_messages=2),
+        )
+        assert episode_duration(episode).measurements == {
+            "duration_s": 8.0,
+            "message_count_total": 10,
+            "topic_count": 2,
+        }
+        assert episode._channel_data_by_id == {}
+
+
+def test_episode_duration_paths_agree_on_the_same_selection(duration_source: Path) -> None:
+    """#499 left two aggregations behind, and they have to stay in step.
+
+    The default path streams batches and keeps no payloads; passing ``topics``
+    explicitly still goes through ``episode.channel()``. Handed the same set
+    of topics they must produce identical measurements, or the check answers
+    differently depending on whether the caller named the topics it would
+    have selected anyway.
+    """
+    with hflow.Episode(duration_source) as episode:
+        streamed = episode_duration(episode).measurements
+        selected = sorted(topic for topic, info in episode.topics.items() if info.message_count)
+
+    with hflow.Episode(duration_source) as fresh_episode:
+        through_channels = episode_duration(fresh_episode, topics=selected).measurements
+
+    assert streamed == through_channels
+    assert streamed["topic_count"] == len(selected)
+
+
+@pytest.mark.parametrize(
+    ("topics", "duration_s", "message_count", "topic_count"),
+    [
+        (None, 8.0, 10, 2),
+        ([], 0.0, 0, 0),
+        (["/joint_states"], 2.0, 2, 1),
+        (["/joint_states", "/camera"], 8.0, 10, 2),
+        (["/joint_states", "/joint_states"], 2.0, 4, 2),
+        (["/empty"], 0.0, 0, 1),
+    ],
+)
+def test_episode_duration_selection(
+    duration_source: Path,
+    topics: list[str] | None,
+    duration_s: float,
+    message_count: int,
+    topic_count: int,
+) -> None:
+    with hflow.Episode(duration_source) as episode:
+        result = episode_duration(episode, topics=topics)
+    assert result.measurements == {
+        "duration_s": duration_s,
+        "message_count_total": message_count,
+        "topic_count": topic_count,
+    }
+
+
+@pytest.mark.parametrize("declared_channel", [False, True])
+def test_episode_duration_empty_episode(tmp_path: Path, declared_channel: bool) -> None:
+    path = tmp_path / "empty.mcap"
+    with path.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start()
+        if declared_channel:
+            writer.register_channel(topic="/empty", message_encoding="json", schema_id=0)
+        writer.finish()
+    with hflow.Episode(path) as episode:
+        assert episode.time_bounds is None
+        assert episode_duration(episode).measurements == {
+            "duration_s": 0.0,
+            "message_count_total": 0,
+            "topic_count": 0,
+        }
+
+
+@pytest.mark.parametrize("summary_present", [False, True])
+def test_episode_duration_without_statistics(tmp_path: Path, summary_present: bool) -> None:
+    path = tmp_path / "no-statistics.mcap"
+    with path.open("wb") as stream:
+        writer = StockWriter(
+            stream,
+            use_statistics=False,
+            repeat_channels=summary_present,
+            repeat_schemas=False,
+            use_summary_offsets=False,
+            index_types=IndexType.NONE,
+        )
+        writer.start()
+        channel = writer.register_channel(topic="/state", message_encoding="json", schema_id=0)
+        for second in (1, 3):
+            writer.add_message(channel, second * 10**9, b"{}", second * 10**9)
+        writer.finish()
+    with hflow.Episode(path) as episode:
+        assert episode.time_bounds is None
+        if not summary_present:
+            with pytest.raises(ValueError, match="has no MCAP summary section"):
+                episode_duration(episode)
+            return
+        assert episode.topics["/state"].message_count == 0
+        assert episode_duration(episode).measurements == {
+            "duration_s": 0.0,
+            "message_count_total": 0,
+            "topic_count": 0,
+        }
+        assert episode_duration(episode, topics=["/state"]).measurements == {
+            "duration_s": 2.0,
+            "message_count_total": 2,
+            "topic_count": 1,
+        }
+
+
+@pytest.mark.parametrize("message_counts", [(2, 2), (2, 0), (0, 0)])
+@pytest.mark.parametrize("topics", [None, [], ["/status"]])
+def test_episode_duration_rejects_duplicate_topics(
+    tmp_path: Path, message_counts: tuple[int, int], topics: list[str] | None
+) -> None:
+    path = tmp_path / "duplicates.mcap"
+    with path.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start()
+        for count in message_counts:
+            channel = writer.register_channel(topic="/status", message_encoding="json", schema_id=0)
+            for stamp in range(count):
+                writer.add_message(channel, stamp, b"{}", stamp)
+        writer.finish()
+    with hflow.Episode(path) as episode:
+        assert len(episode.channels) == 2
+        with pytest.raises(ValueError, match="multiple channels for topic '/status'"):
+            episode_duration(episode, topics=topics)
+
+
+@pytest.mark.parametrize("reported_count", [0, 1, 9])
+def test_episode_duration_statistics_select_topics_but_do_not_supply_measurements(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reported_count: int
+) -> None:
+    original_write = Statistics.write
+
+    def write_statistics(statistics: Statistics, builder: RecordBuilder) -> None:
+        original_write(
+            replace(
+                statistics,
+                channel_message_counts={1: reported_count} if reported_count else {},
+                message_start_time=0,
+                message_end_time=100 * 10**9,
+            ),
+            builder,
+        )
+
+    monkeypatch.setattr(Statistics, "write", write_statistics)
+    path = tmp_path / "inconsistent-statistics.mcap"
+    with path.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start()
+        channel = writer.register_channel(topic="/state", message_encoding="json", schema_id=0)
+        for second in (1, 3):
+            writer.add_message(channel, second * 10**9, b"{}", second * 10**9)
+        writer.finish()
+    with hflow.Episode(path) as episode:
+        assert episode.topics["/state"].message_count == reported_count
+        assert episode.time_bounds == hflow.EpisodeTimeBounds(0, 100 * 10**9)
+        assert episode_duration(episode).measurements == {
+            "duration_s": 2.0 if reported_count else 0.0,
+            "message_count_total": 2 if reported_count else 0,
+            "topic_count": 1 if reported_count else 0,
+        }
 
 
 def test_required_topics_records_present_topic_inventory(

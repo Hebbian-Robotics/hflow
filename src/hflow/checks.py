@@ -718,14 +718,52 @@ def _episode_duration_intermediates(
     episode: Episode,
     topics: Sequence[str] | None,
 ) -> _EpisodeDurationIntermediates:
-    """Verbatim aggregation from the pre-fact body: explicit ``topics``
-    select as given, otherwise every topic carrying at least one message."""
+    """Explicit ``topics`` select as given; otherwise stream nonempty topics
+    without retaining their payloads in the episode's channel cache."""
     infos = episode.topics
     selected = (
         list(topics)
         if topics is not None
         else sorted(topic for topic, info in infos.items() if info.message_count >= 1)
     )
+    if topics is None:
+        # Statistics select topics, but need not agree with the messages.
+        # Keep measuring actual timestamps/counts rather than summary values.
+        #
+        # Reaching past Episode to its reader is the point rather than an
+        # oversight: episode.channel() caches every payload it decodes, and
+        # this check wants only the timestamps (#499). Going through the
+        # public accessor would populate the cache, which is the cost being
+        # removed. Batches arrive per channel in log-time order, so the first
+        # and last stamps of a batch are its bounds.
+        #
+        # The explicit-topics path below stays on episode.channel(), which
+        # refuses an unknown topic with a message naming it; indexing `infos`
+        # here would raise a bare KeyError instead. The two must agree on
+        # measurements for the same selection, which
+        # test_episode_duration_paths_agree_on_the_same_selection pins.
+        start_ns: int | None = None
+        end_ns: int | None = None
+        message_count_total = 0
+        if selected:
+            for batch in episode._reader.iter_batches(
+                topics=selected,
+                channel_ids=[infos[topic].channel_id for topic in selected],
+            ):
+                stamps_ns = batch.log_times
+                if len(stamps_ns) == 0:
+                    continue
+                message_count_total += len(stamps_ns)
+                first_ns, last_ns = int(stamps_ns[0]), int(stamps_ns[-1])
+                start_ns = first_ns if start_ns is None else min(start_ns, first_ns)
+                end_ns = last_ns if end_ns is None else max(end_ns, last_ns)
+        return _EpisodeDurationIntermediates(
+            duration_s=(end_ns - start_ns) / 1e9
+            if start_ns is not None and end_ns is not None
+            else 0.0,
+            message_count_total=message_count_total,
+            topic_count=len(selected),
+        )
     start_candidates_ns: list[int] = []
     end_candidates_ns: list[int] = []
     message_count_total = 0
