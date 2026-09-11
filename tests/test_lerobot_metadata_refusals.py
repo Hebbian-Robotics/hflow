@@ -119,6 +119,97 @@ def test_import_refuses_empty_path_templates(
     _assert_no_dataset_output(output_dir)
 
 
+_VALID_DATA_PATH = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
+_VALID_VIDEO_PATH = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+
+
+def _info(**overrides: object) -> dict[str, object]:
+    info: dict[str, object] = {
+        "fps": 30,
+        "data_path": _VALID_DATA_PATH,
+        "video_path": _VALID_VIDEO_PATH,
+        "features": {},
+    }
+    info.update(overrides)
+    return info
+
+
+@pytest.mark.parametrize(
+    ("field", "template", "detail"),
+    [
+        ("data_path", "data/{episode_index:03d}/f.parquet", "unknown field 'episode_index'"),
+        ("data_path", "data/{chunk_index:03d/f.parquet", "unmatched '{' in format spec"),
+        (
+            "data_path",
+            "data/{chunk_index:qq}/f.parquet",
+            "Invalid format specifier 'qq' for object of type 'int'",
+        ),
+        (
+            "data_path",
+            "data/{0}/f.parquet",
+            "positional fields are not supported, name the field instead",
+        ),
+        ("data_path", "data/}chunk/f.parquet", "Single '}' encountered in format string"),
+        # Subscripting a field raises TypeError rather than the other three,
+        # so without it in the caught set this one escapes the boundary raw.
+        ("data_path", "data/{chunk_index[0]}/f.parquet", "'int' object is not subscriptable"),
+        ("video_path", "videos/{episode_index}/f.mp4", "unknown field 'episode_index'"),
+        (
+            "video_path",
+            "videos/{0}/f.mp4",
+            "positional fields are not supported, name the field instead",
+        ),
+    ],
+)
+def test_import_refuses_a_template_the_converter_could_not_format(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    template: str,
+    detail: str,
+) -> None:
+    """Each of these used to pass the boundary and raise at ``str.format``.
+
+    The second assertion is the point. The old failure arrived after
+    ``meta/episodes`` had been listed and every episode metadata parquet
+    downloaded; asserting only the message would pass either way.
+    """
+    _stub_repo_info(monkeypatch)
+    monkeypatch.setattr(
+        prep, "_fetch_info_json", lambda _repo, _revision, _cache: _info(**{field: template})
+    )
+    listed_paths: list[str] = []
+
+    def recording_hf_tree(_repo: str, _revision: str, path: str) -> list[dict[str, str]]:
+        listed_paths.append(path)
+        return []
+
+    monkeypatch.setattr(prep, "_hf_tree", recording_hf_tree)
+    output_dir = tmp_path / "out"
+
+    message = f"LeRobot meta/info.json has an invalid {field} template {template!r}: {detail}"
+    with pytest.raises(ValueError, match=_exactly(message)):
+        _import(output_dir)
+
+    assert listed_paths == []
+    _assert_no_dataset_output(output_dir)
+
+
+def test_the_two_templates_are_checked_against_different_field_sets() -> None:
+    """``camera_key`` is legal in ``video_path`` and not in ``data_path``.
+
+    ``_convert_episode`` formats ``data_path`` with ``chunk_index`` and
+    ``file_index`` only, and ``video_path`` with ``video_key`` and
+    ``camera_key`` as well. Checking both against the union would accept a
+    ``data_path`` naming ``camera_key``, which is one of the failures this
+    boundary is meant to catch.
+    """
+    prep._parse_dataset_information(_info(video_path="videos/{camera_key}/f.mp4"))
+
+    with pytest.raises(ValueError, match="unknown field 'camera_key'"):
+        prep._parse_dataset_information(_info(data_path="data/{camera_key}/f.parquet"))
+
+
 def test_import_refuses_info_json_without_features_before_listing_episodes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -617,6 +617,59 @@ def _episode_metadata_cache_path(
     return episodes_metadata_directory / relative_path
 
 
+#: The fields ``_convert_episode`` supplies to each template's ``format`` call.
+#: They differ, and validating against the union would accept a ``data_path``
+#: naming ``camera_key`` that then fails at the data call site. The values are
+#: representative rather than real: the format spec is checked against the type
+#: the call site passes, so ``{chunk_index:03d}`` has to see an int.
+_DATA_PATH_FORMAT_FIELDS: dict[str, object] = {"chunk_index": 0, "file_index": 0}
+_VIDEO_PATH_FORMAT_FIELDS: dict[str, object] = {
+    "chunk_index": 0,
+    "file_index": 0,
+    "video_key": "camera",
+    "camera_key": "camera",
+}
+
+
+def _validate_path_template(
+    template: str, field_name: str, format_fields: dict[str, object]
+) -> None:
+    """Refuse a path template the converter could not format.
+
+    ``_parse_dataset_information`` is the one place the external document is
+    read, but these two templates used to reach ``str.format`` five hundred
+    lines later, after the episode metadata had already been downloaded. The
+    failure arrived as a bare ``KeyError`` naming neither the file nor the
+    field. Formatting once here moves it to the boundary and gives it the same
+    shape as every other refusal.
+
+    What this proves is that the template formats, not that it names a
+    sensible path. ``{chunk_index.bit_length}`` formats fine and yields a
+    directory named after a bound method; that becomes a 404 at download time
+    rather than something to catch here.
+    """
+    try:
+        template.format(**format_fields)
+    except KeyError as error:
+        raise ValueError(
+            f"LeRobot meta/info.json has an invalid {field_name} template "
+            f"{template!r}: unknown field {error.args[0]!r}"
+        ) from error
+    except IndexError as error:
+        raise ValueError(
+            f"LeRobot meta/info.json has an invalid {field_name} template "
+            f"{template!r}: positional fields are not supported, name the field instead"
+        ) from error
+    except (ValueError, TypeError) as error:
+        # TypeError belongs here for the same reason as the rest: subscripting
+        # a field, ``{chunk_index[0]}``, raises it from str.format and would
+        # otherwise leave the boundary as a bare "'int' object is not
+        # subscriptable" naming neither the file nor the field.
+        raise ValueError(
+            f"LeRobot meta/info.json has an invalid {field_name} template {template!r}: {error}"
+        ) from error
+
+
 def _parse_dataset_information(dataset_information: dict) -> _DatasetInformation:
     """Turn a raw ``meta/info.json`` document into immutable internal values.
 
@@ -624,6 +677,10 @@ def _parse_dataset_information(dataset_information: dict) -> _DatasetInformation
     boundary inspects the external document again. Unknown upstream fields are
     ignored: LeRobot adds them, and refusing one would fail imports that
     convert correctly.
+
+    The two path templates are checked by formatting them, each against the
+    fields its own call site supplies, so a template the converter could not
+    use is refused before any download.
     """
     frames_per_second = dataset_information.get("fps")
     if (
@@ -639,11 +696,13 @@ def _parse_dataset_information(dataset_information: dict) -> _DatasetInformation
     data_path_template = dataset_information.get("data_path")
     if not isinstance(data_path_template, str) or not data_path_template.strip():
         raise ValueError("LeRobot meta/info.json must define a non-empty data_path template")
+    _validate_path_template(data_path_template, "data_path", _DATA_PATH_FORMAT_FIELDS)
     video_path_template = dataset_information.get(
         "video_path", "videos/{camera_key}/{chunk_index:06d}/{file_index:06d}.mp4"
     )
     if not isinstance(video_path_template, str) or not video_path_template.strip():
         raise ValueError("LeRobot meta/info.json must define a non-empty video_path template")
+    _validate_path_template(video_path_template, "video_path", _VIDEO_PATH_FORMAT_FIELDS)
 
     dataset_features = dataset_information.get("features")
     if not isinstance(dataset_features, dict):
