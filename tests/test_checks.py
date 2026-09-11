@@ -262,6 +262,26 @@ def test_episode_duration_does_not_materialize_channels(
         assert episode._channel_data_by_id == {}
 
 
+def test_episode_duration_paths_agree_on_the_same_selection(duration_source: Path) -> None:
+    """#499 left two aggregations behind, and they have to stay in step.
+
+    The default path streams batches and keeps no payloads; passing ``topics``
+    explicitly still goes through ``episode.channel()``. Handed the same set
+    of topics they must produce identical measurements, or the check answers
+    differently depending on whether the caller named the topics it would
+    have selected anyway.
+    """
+    with hflow.Episode(duration_source) as episode:
+        streamed = episode_duration(episode).measurements
+        selected = sorted(topic for topic, info in episode.topics.items() if info.message_count)
+
+    with hflow.Episode(duration_source) as fresh_episode:
+        through_channels = episode_duration(fresh_episode, topics=selected).measurements
+
+    assert streamed == through_channels
+    assert streamed["topic_count"] == len(selected)
+
+
 @pytest.mark.parametrize(
     ("topics", "duration_s", "message_count", "topic_count"),
     [

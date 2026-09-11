@@ -729,6 +729,19 @@ def _episode_duration_intermediates(
     if topics is None:
         # Statistics select topics, but need not agree with the messages.
         # Keep measuring actual timestamps/counts rather than summary values.
+        #
+        # Reaching past Episode to its reader is the point rather than an
+        # oversight: episode.channel() caches every payload it decodes, and
+        # this check wants only the timestamps (#499). Going through the
+        # public accessor would populate the cache, which is the cost being
+        # removed. Batches arrive per channel in log-time order, so the first
+        # and last stamps of a batch are its bounds.
+        #
+        # The explicit-topics path below stays on episode.channel(), which
+        # refuses an unknown topic with a message naming it; indexing `infos`
+        # here would raise a bare KeyError instead. The two must agree on
+        # measurements for the same selection, which
+        # test_episode_duration_paths_agree_on_the_same_selection pins.
         start_ns: int | None = None
         end_ns: int | None = None
         message_count_total = 0
