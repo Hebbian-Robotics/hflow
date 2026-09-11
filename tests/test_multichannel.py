@@ -239,6 +239,34 @@ def test_decoded_batches_by_channel_id_derive_the_topic_filter(
         assert topics_yielded == ["/target", "/target"]
 
 
+def test_an_explicit_topic_filter_is_never_replaced_by_the_derived_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The derivation fires only when the caller left ``topics`` unset.
+
+    ``Episode.channel()`` passes both a topic and a channel id (#475), so if
+    the ``topics is None`` condition were dropped, the caller's explicit
+    filter would be silently replaced by one derived from the channel ids.
+    For that caller the two agree, which is why deleting the condition left
+    the whole suite green. Asking for one topic while naming a channel on a
+    different one is what separates them: the reader must receive what the
+    caller asked for, and yield nothing, rather than quietly reading the
+    other stream instead.
+    """
+    path = tmp_path / "two_topics_explicit.mcap"
+    _, camera_channel_id = _write_two_topic_mcap(path, [b"t" * 16], [b"c" * 16])
+
+    with Episode(path) as episode:
+        topics_passed, topics_yielded = _trace_mcap_iter_messages(episode._reader, monkeypatch)
+        batches = list(
+            episode._reader.iter_batches(topics=["/target"], channel_ids=[camera_channel_id])
+        )
+
+    assert topics_passed == [["/target"]]
+    assert topics_yielded == ["/target"]
+    assert batches == []
+
+
 def test_channel_id_read_without_a_summary_falls_back_to_a_full_scan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
