@@ -23,6 +23,7 @@ from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from hflow._field_guards import require_positive_int
 from hflow.ffmpeg._binary import ffmpeg_path
 
 if TYPE_CHECKING:
@@ -139,21 +140,16 @@ def contact_sheet(
     tile_width: int = 320,
     max_tiles: int = 24,
 ) -> ContactSheet:
-    """Composite ``frames`` (from ``Episode.frames()``) into one JPEG grid."""
+    """Composite ``frames`` (from ``Episode.frames()``) into one JPEG grid.
+
+    ``columns``, ``tile_width`` and ``max_tiles`` must be positive integers,
+    excluding booleans. Invalid settings raise ``ValueError`` before frame work.
+    """
     if not frames:
         raise ValueError("contact_sheet needs at least one frame")
-    if not isinstance(columns, int) or isinstance(columns, bool):
-        raise ValueError(f"columns must be an int, got {columns!r}")
-    if columns < 1:
-        raise ValueError(f"columns must be >= 1, got {columns}")
-    if not isinstance(tile_width, int) or isinstance(tile_width, bool):
-        raise ValueError(f"tile_width must be an int, got {tile_width!r}")
-    if tile_width < 1:
-        raise ValueError(f"tile_width must be >= 1, got {tile_width}")
-    if not isinstance(max_tiles, int) or isinstance(max_tiles, bool):
-        raise ValueError(f"max_tiles must be an int, got {max_tiles!r}")
-    if max_tiles < 1:
-        raise ValueError(f"max_tiles must be >= 1, got {max_tiles}")
+    require_positive_int(columns, "columns")
+    require_positive_int(tile_width, "tile_width")
+    require_positive_int(max_tiles, "max_tiles")
     selected_frames = [frames[index] for index in _evenly_sampled_indices(len(frames), max_tiles)]
     rows = math.ceil(len(selected_frames) / columns)
 
