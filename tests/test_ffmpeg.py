@@ -975,37 +975,59 @@ def _unreadable_frame(tmp_path: Path) -> ExtractedFrame:
     return ExtractedFrame(path=tmp_path / "must-not-be-read.jpg", log_time_ns=0)
 
 
-@pytest.mark.parametrize("tile_width", [0, -320])
-def test_contact_sheet_rejects_non_positive_tile_width_before_ffmpeg(
-    tile_width: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("parameter", ["columns", "tile_width", "max_tiles"])
+@pytest.mark.parametrize("value", [0, -320])
+def test_contact_sheet_rejects_non_positive_dimensions_before_ffmpeg(
+    parameter: str, value: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _refuse_ffmpeg_for_invalid_contact_sheet_arguments(monkeypatch)
-    with pytest.raises(ValueError, match=rf"tile_width must be >= 1, got {tile_width}"):
-        contact_sheet([_unreadable_frame(tmp_path)], tmp_path / "never.jpg", tile_width=tile_width)
+    with pytest.raises(ValueError, match=rf"^{parameter} must be > 0, got {value}$"):
+        contact_sheet([_unreadable_frame(tmp_path)], tmp_path / "never.jpg", **{parameter: value})
 
 
-def test_contact_sheet_rejects_boolean_columns_before_ffmpeg(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("columns", [True, False, 1.0, "1", None])
+def test_contact_sheet_rejects_non_integer_columns_before_ffmpeg(
+    columns: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _refuse_ffmpeg_for_invalid_contact_sheet_arguments(monkeypatch)
-    with pytest.raises(ValueError, match=r"columns must be an int, got True"):
-        contact_sheet([_unreadable_frame(tmp_path)], tmp_path / "never.jpg", columns=True)
+    with pytest.raises(
+        ValueError, match=rf"^columns must be an int, got {type(columns).__name__}$"
+    ):
+        contact_sheet(
+            [_unreadable_frame(tmp_path)],
+            tmp_path / "never.jpg",
+            columns=columns,  # ty: ignore[invalid-argument-type]
+        )
 
 
-def test_contact_sheet_rejects_boolean_tile_width_before_ffmpeg(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("tile_width", [True, False, 1.0, "1", None])
+def test_contact_sheet_rejects_non_integer_tile_width_before_ffmpeg(
+    tile_width: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _refuse_ffmpeg_for_invalid_contact_sheet_arguments(monkeypatch)
-    with pytest.raises(ValueError, match=r"tile_width must be an int, got True"):
-        contact_sheet([_unreadable_frame(tmp_path)], tmp_path / "never.jpg", tile_width=True)
+    with pytest.raises(
+        ValueError, match=rf"^tile_width must be an int, got {type(tile_width).__name__}$"
+    ):
+        contact_sheet(
+            [_unreadable_frame(tmp_path)],
+            tmp_path / "never.jpg",
+            tile_width=tile_width,  # ty: ignore[invalid-argument-type]
+        )
 
 
-def test_contact_sheet_rejects_boolean_max_tiles_before_ffmpeg(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("max_tiles", [True, False, 1.0, "1", None])
+def test_contact_sheet_rejects_non_integer_max_tiles_before_ffmpeg(
+    max_tiles: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _refuse_ffmpeg_for_invalid_contact_sheet_arguments(monkeypatch)
-    with pytest.raises(ValueError, match=r"max_tiles must be an int, got True"):
-        contact_sheet([_unreadable_frame(tmp_path)], tmp_path / "never.jpg", max_tiles=True)
+    with pytest.raises(
+        ValueError, match=rf"^max_tiles must be an int, got {type(max_tiles).__name__}$"
+    ):
+        contact_sheet(
+            [_unreadable_frame(tmp_path)],
+            tmp_path / "never.jpg",
+            max_tiles=max_tiles,  # ty: ignore[invalid-argument-type]
+        )
 
 
 def test_coding_range_is_derived_from_luma_and_selects_the_exposure_gates() -> None:
