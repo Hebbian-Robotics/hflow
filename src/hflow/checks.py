@@ -414,7 +414,7 @@ def _camera_frame_stats_keys(episode: Episode, *, cameras: Sequence[str] | None 
     inside the per-topic selection, so an episode with no cameras emits
     nothing at all.
     """
-    selected = list(cameras) if cameras is not None else episode.cameras
+    selected = _resolve_selected_cameras(episode, cameras)
     keys: set[str] = set()
     for topic in selected:
         keys.add(f"{topic}/message_count")
@@ -706,7 +706,14 @@ def _timestamp_regularity_resolve_selected(
 
 
 def _resolve_selected_cameras(episode: Episode, cameras: Sequence[str] | None) -> list[str]:
-    """The cameras a check ran over: the caller's list, or every camera."""
+    """The cameras a check ran over: the caller's list, or every camera.
+
+    ``is not None`` rather than truthiness, and that is the whole reason this
+    is worth stating once. ``cameras=[]`` asks for no cameras and must select
+    none; ``cameras=None`` asks for the default and selects all of them.
+    Collapsing the two would silently turn nine checks into whole-episode
+    scans for a caller who passed an empty selection on purpose.
+    """
     return list(cameras) if cameras is not None else episode.cameras
 
 
