@@ -193,8 +193,11 @@ def test_dataset_snapshot_is_tool_neutral_and_selected_by_manifest(tmp_path: Pat
         assert receipt["path"] == file_name
         assert receipt["size_bytes"] == (output_directory / file_name).stat().st_size
         assert receipt["sha256"] == snapshot_module._sha256_hex(output_directory / file_name)
-    inventory = [*integrity["tables"].values(), *integrity["assets"]]
-    assert integrity["content_id"] == snapshot_module._inventory_content_id(inventory)
+    inventory_records = [
+        snapshot_module._parse_file_integrity_record(entry)
+        for entry in [*integrity["tables"].values(), *integrity["assets"]]
+    ]
+    assert integrity["content_id"] == snapshot_module._inventory_content_id(inventory_records)
     assert len(integrity["content_id"]) == 64
 
     sample_row = duckdb.execute(
@@ -739,8 +742,11 @@ def test_dataset_snapshot_copy_mode_records_asset_integrity(tmp_path: Path) -> N
     assert asset_receipt["path"].startswith("assets/")
     assert asset_receipt["size_bytes"] == asset_path.stat().st_size
     assert asset_receipt["sha256"] == snapshot_module._sha256_hex(asset_path)
-    inventory = [*integrity["tables"].values(), *integrity["assets"]]
-    assert integrity["content_id"] == snapshot_module._inventory_content_id(inventory)
+    inventory_records = [
+        snapshot_module._parse_file_integrity_record(entry)
+        for entry in [*integrity["tables"].values(), *integrity["assets"]]
+    ]
+    assert integrity["content_id"] == snapshot_module._inventory_content_id(inventory_records)
     assert len(integrity["content_id"]) == 64
 
 

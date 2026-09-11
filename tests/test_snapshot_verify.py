@@ -425,3 +425,97 @@ def test_damage_is_reported_from_the_verified_root_not_the_export_root(
     damaged_report = verify_dataset_snapshot(root_b)
     assert not damaged_report.ok
     assert [f.reason for f in damaged_report.findings] == ["content-id-mismatch"]
+
+
+_KNOWN_RECEIPT_ENTRIES: list[dict[str, str | int]] = [
+    {
+        "path": "samples.parquet",
+        "size_bytes": 164981,
+        "sha256": "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    },
+    {
+        "path": "measurements.parquet",
+        "size_bytes": 5223,
+        "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    },
+    {
+        "path": "assets/wrist_cam/frame_0000000001.jpg",
+        "size_bytes": 20481,
+        "sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+    },
+]
+
+# The digest over these exact entries, serialized the way the exporter has
+# always done it (sorted by path, keys sorted, compact separators). If this
+# value changes, every snapshot ever exported fails verification.
+_GOLDEN_INVENTORY_CONTENT_ID = "b4cd6b846051175bbf1c57e5f5fcd5edee479b5cf2afd8294335c071561217bf"
+
+
+def test_inventory_digest_is_byte_identical_through_the_record_bridge() -> None:
+    """#489's hard constraint: typing the receipt entries must not move the
+    content_id hash by one byte. The old path hashes raw dicts straight from
+    the marker; the new path hashes records converted back through
+    ``to_dict_for_hashing``. Both must produce the same string and the same
+    digest, and the digest must equal the golden value."""
+    old_payload = json.dumps(
+        sorted(_KNOWN_RECEIPT_ENTRIES, key=lambda entry: str(entry["path"])),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    records = [
+        hflow.snapshot._parse_file_integrity_record(entry) for entry in _KNOWN_RECEIPT_ENTRIES
+    ]
+    new_payload = json.dumps(
+        [record.to_dict_for_hashing() for record in sorted(records, key=lambda r: r.path)],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    assert new_payload == old_payload
+    assert hflow.snapshot._inventory_content_id(records) == hflow.snapshot._inventory_content_id(
+        [hflow.snapshot._parse_file_integrity_record(entry) for entry in _KNOWN_RECEIPT_ENTRIES]
+    )
+    assert hflow.snapshot._inventory_content_id(records) == _GOLDEN_INVENTORY_CONTENT_ID
+
+
+def test_the_digest_covers_the_three_delivery_fields_and_nothing_else() -> None:
+    """Typing the entries narrowed what the digest is computed over, and that
+    is a decision rather than an accident.
+
+    Hashing raw dicts meant the digest depended on every key an entry
+    happened to carry. Hashing records means it depends on exactly ``path``,
+    ``size_bytes`` and ``sha256``, which are the three facts that define a
+    delivery. An entry carrying an extra key therefore hashes the same now
+    and used to hash differently.
+
+    The consequence to keep: additive metadata in a later format revision
+    cannot silently invalidate the digest of every snapshot already
+    exported. The consequence to know: a marker whose entries were edited to
+    add a field is no longer caught here. That is not a loss, because the
+    receipt travels unsigned inside the file it describes and was never a
+    tamper defence, and the guarantee the docs make (a deleted member stays
+    visible) is unaffected. Restoring raw-dict hashing to "tighten" this
+    would trade a real compatibility property for an imaginary one.
+    """
+    entries_with_an_extra_field = [
+        {**entry, "injected_field": "not written by hflow"} for entry in _KNOWN_RECEIPT_ENTRIES
+    ]
+    records = [
+        hflow.snapshot._parse_file_integrity_record(entry) for entry in entries_with_an_extra_field
+    ]
+
+    assert hflow.snapshot._inventory_content_id(records) == _GOLDEN_INVENTORY_CONTENT_ID
+
+    # And the deleted-member guarantee still holds over the narrowed digest.
+    assert hflow.snapshot._inventory_content_id(records[:-1]) != _GOLDEN_INVENTORY_CONTENT_ID
+
+
+def test_receipt_entry_with_numeric_sha256_is_refused_at_the_boundary() -> None:
+    """#489's silent bug: a receipt whose sha256 arrived as a JSON number
+    used to reach a per-file comparison that can never succeed and was
+    reported as damaged bytes. The boundary refuses it instead, naming the
+    field, because a malformed receipt is unreadable input."""
+    from hflow.snapshot import _parse_file_integrity_record
+
+    with pytest.raises(ValueError, match="sha256"):
+        _parse_file_integrity_record({"path": "samples.parquet", "size_bytes": 10, "sha256": 123})

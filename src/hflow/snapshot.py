@@ -145,16 +145,79 @@ def _marker_identifies_dataset_snapshot(format_marker: dict) -> bool:
     )
 
 
-def _file_integrity_record(relative_path: str, absolute_path: Path) -> dict[str, str | int]:
+@dataclass(frozen=True)
+class FileIntegrityRecord:
+    """One receipt entry with known field types.
+
+    Receipt entries arrive from external JSON where every field could be
+    anything; this type is what they become once the boundary has checked
+    them. ``to_dict_for_hashing`` rebuilds exactly the dict shape the
+    exporter has always serialized, so the ``content_id`` digest stays
+    byte-identical with every snapshot ever exported (#489).
+
+    Typing the entries also fixed what the digest covers. Hashing raw dicts
+    made it depend on every key an entry happened to carry; it now depends on
+    these three fields, which are the ones that define a delivery. So an
+    entry with an extra key hashes the same, where it used to hash
+    differently. That is deliberate: a later format revision can add metadata
+    without invalidating the digest of every snapshot already exported. It
+    does mean a marker edited to add a field is not caught here, which costs
+    nothing, because this receipt travels unsigned inside the file it
+    describes and was never a tamper defence.
+    """
+
+    path: str
+    size_bytes: int
+    sha256: str
+
+    def to_dict_for_hashing(self) -> dict[str, str | int]:
+        return {
+            "path": self.path,
+            "size_bytes": self.size_bytes,
+            "sha256": self.sha256,
+        }
+
+
+def _parse_file_integrity_record(entry: object) -> FileIntegrityRecord:
+    """Check one raw marker entry at the boundary and type it.
+
+    Strict, no coercion: a receipt whose ``sha256`` arrived as a JSON number
+    used to fall through to a per-file comparison that can never succeed and
+    was reported as damaged bytes; the truth is that the receipt itself is
+    malformed, which is unreadable input (#489).
+    """
+    if not isinstance(entry, dict):
+        raise ValueError(
+            f"integrity receipt entry must be a JSON object, got {type(entry).__name__}"
+        )
+    for field_name, expected_type in (
+        ("path", str),
+        ("sha256", str),
+        ("size_bytes", int),
+    ):
+        value = entry.get(field_name)
+        if isinstance(value, bool) or not isinstance(value, expected_type):
+            raise ValueError(
+                f"integrity receipt entry field {field_name!r} must be "
+                f"{expected_type.__name__}, got {type(value).__name__}"
+            )
+    return FileIntegrityRecord(
+        path=entry["path"],
+        size_bytes=entry["size_bytes"],
+        sha256=entry["sha256"],
+    )
+
+
+def _file_integrity_record(relative_path: str, absolute_path: Path) -> FileIntegrityRecord:
     """Receipt for one delivered snapshot file (table or copied asset)."""
-    return {
-        "path": relative_path,
-        "size_bytes": absolute_path.stat().st_size,
-        "sha256": _sha256_hex(absolute_path),
-    }
+    return FileIntegrityRecord(
+        path=relative_path,
+        size_bytes=absolute_path.stat().st_size,
+        sha256=_sha256_hex(absolute_path),
+    )
 
 
-def _inventory_content_id(entries: list[dict[str, str | int]]) -> str:
+def _inventory_content_id(entries: list[FileIntegrityRecord]) -> str:
     """Full SHA-256 of the normalized integrity inventory.
 
     Entries are sorted by ``path`` and serialized with stable separators so the
@@ -169,8 +232,12 @@ def _inventory_content_id(entries: list[dict[str, str | int]]) -> str:
     full-length like the per-file hashes and Croissant's SHA-256
     recommendation.
     """
-    normalized = sorted(entries, key=lambda entry: str(entry["path"]))
-    payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    normalized = sorted(entries, key=lambda record: record.path)
+    payload = json.dumps(
+        [record.to_dict_for_hashing() for record in normalized],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -186,7 +253,7 @@ def _build_snapshot_integrity_marker_fields(
     fetched for hashing. Copy mode re-reads each copied asset once after the
     copy to compute its hash.
     """
-    tables: dict[str, dict[str, str | int]] = {}
+    tables: dict[str, FileIntegrityRecord] = {}
     for table_name, file_name in _REQUIRED_TABLE_FILES.items():
         absolute_path = staging_directory / file_name
         if not absolute_path.is_file():
@@ -196,7 +263,7 @@ def _build_snapshot_integrity_marker_fields(
             )
         tables[table_name] = _file_integrity_record(file_name, absolute_path)
 
-    assets: list[dict[str, str | int]] = []
+    assets: list[FileIntegrityRecord] = []
     assets_directory = staging_directory / _COPIED_ASSETS_DIRECTORY_NAME
     if assets_directory.is_dir():
         for absolute_path in sorted(assets_directory.rglob("*")):
@@ -208,8 +275,10 @@ def _build_snapshot_integrity_marker_fields(
     inventory = [*tables.values(), *assets]
     return {
         "integrity": {
-            "tables": tables,
-            "assets": assets,
+            "tables": {
+                table_name: record.to_dict_for_hashing() for table_name, record in tables.items()
+            },
+            "assets": [record.to_dict_for_hashing() for record in assets],
             "content_id": _inventory_content_id(inventory),
         }
     }
@@ -915,18 +984,27 @@ def verify_dataset_snapshot(
             ],
         )
 
-    receipt_entries: list[dict[str, str | int]] = [
-        *integrity.get("tables", {}).values(),
-        *integrity.get("assets", []),
+    # Boundary parse (#489): receipt entries arrive from external JSON with
+    # unknown types; they become typed records here or the verify refuses,
+    # naming the field. Refusal is exit 2 unreadable input, not a finding:
+    # a receipt whose sha256 arrived as a number used to fall through to a
+    # per-file comparison that can never succeed and was reported as damaged
+    # bytes.
+    receipt_records = [
+        _parse_file_integrity_record(entry)
+        for entry in [
+            *integrity.get("tables", {}).values(),
+            *integrity.get("assets", []),
+        ]
     ]
 
     # The deleted-member gate (#473): when a receipt entry and its file are
     # both gone, the surviving entries are self-consistent and every per-file
     # check passes; only the stored inventory hash, computed over the original
     # set, differs from the hash of what remains. Recompute it exactly as the
-    # exporter did (:194) and refuse a receipt that no longer describes the
-    # delivered set. Internal inconsistency is unreadable input, not damage,
-    # so it raises to exit 2 like an unparsable marker rather than reporting
+    # exporter did and refuse a receipt that no longer describes the delivered
+    # set. Internal inconsistency is unreadable input, not damage, so it
+    # raises to exit 2 like an unparsable marker rather than reporting
     # findings.
     stored_content_id = integrity.get("content_id")
     if not isinstance(stored_content_id, str) or not stored_content_id:
@@ -934,7 +1012,7 @@ def verify_dataset_snapshot(
             "format.json integrity receipt carries no usable content_id; "
             "the delivered member set cannot be checked against the receipt"
         )
-    recomputed_content_id = _inventory_content_id(receipt_entries)
+    recomputed_content_id = _inventory_content_id(receipt_records)
     if recomputed_content_id != stored_content_id:
         raise ValueError(
             "format.json integrity receipt is internally inconsistent: recomputed "
@@ -942,8 +1020,8 @@ def verify_dataset_snapshot(
             f"{stored_content_id!r}; the receipt no longer describes the delivered set"
         )
 
-    for entry in receipt_entries:
-        relative_path = str(entry["path"])
+    for record in receipt_records:
+        relative_path = record.path
         delivered_path = resolved_directory / relative_path
         if not delivered_path.is_file():
             findings.append(
@@ -958,28 +1036,27 @@ def verify_dataset_snapshot(
             )
             continue
         delivered_size = delivered_path.stat().st_size
-        receipt_size = int(entry["size_bytes"])
-        if delivered_size != receipt_size:
+        if delivered_size != record.size_bytes:
             findings.append(
                 VerificationFinding(
                     uri=relative_path,
                     reason=REASON_SIZE_MISMATCH,
                     detail=(
                         f"size under the verified root {delivered_size} bytes "
-                        f"!= receipt {receipt_size} bytes"
+                        f"!= receipt {record.size_bytes} bytes"
                     ),
                 )
             )
             continue
         delivered_sha256 = _sha256_hex(delivered_path)
-        if delivered_sha256 != entry["sha256"]:
+        if delivered_sha256 != record.sha256:
             findings.append(
                 VerificationFinding(
                     uri=relative_path,
                     reason=REASON_CONTENT_ID_MISMATCH,
                     detail=(
                         f"sha256 under the verified root {delivered_sha256!r} "
-                        f"!= receipt sha256 {entry['sha256']!r}"
+                        f"!= receipt sha256 {record.sha256!r}"
                     ),
                 )
             )
