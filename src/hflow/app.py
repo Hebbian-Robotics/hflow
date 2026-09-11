@@ -54,7 +54,7 @@ from hflow.manifest import (
     PipelineManifest,
     StepManifest,
 )
-from hflow.reader import open_reader
+from hflow.reader import open_reader, verify_canonical_integrity
 from hflow.resample import DerivedSeries
 from hflow.step_selection import (
     ALL_REGISTERED_STEPS,
@@ -228,6 +228,12 @@ MEDIA_CONTACT_SHEET_STEP_VERSION = parse_step_version("1")
 # Published artifacts are recorded as measurements under this prefix, so a
 # reader can tell "here is where the file went" from an ordinary label.
 ARTIFACT_MEASUREMENT_KEY_PREFIX = "artifact/"
+# The framework-owned step that records a check-lane refusal: one row naming
+# why the lane stood down, queryable by its error value. Not registered on
+# the App; it exists only on the refusal record (see
+# :func:`_canonical_integrity_refusal_run`).
+CANONICAL_INTEGRITY_STEP_NAME = "integrity/canonical"
+CANONICAL_INTEGRITY_STEP_VERSION = parse_step_version("1")
 _MEDIA_CONTACT_SHEET_FPS = 0.5
 _SYNC_COMPLETION_MARKER_NAME = ".sync-complete.json"
 
@@ -897,11 +903,26 @@ def _check_run_rows(report: "ProcessReport") -> list[CheckRunRow]:
     enrichment's labels and published artifact keys.
 
     One owner, so the collision guard below and the catalog append can never
-    disagree about what would be written. Artifact keys come from
-    ``artifact_uris`` rather than the result's declared artifacts: a step whose
-    artifact failed to publish contributes no key.
+    disagree about what would be written. A refused episode contributes one
+    framework-owned row naming the refusal (its ``critical`` flag is what
+    makes the curation views read the episode as unverified rather than ok).
+    Artifact keys come from ``artifact_uris`` rather than the result's
+    declared artifacts: a step whose artifact failed to publish contributes
+    no key.
     """
-    check_rows = [
+    check_rows: list[CheckRunRow] = []
+    if report.refusal_reason is not None:
+        check_rows.append(
+            CheckRunRow(
+                check_name=CANONICAL_INTEGRITY_STEP_NAME,
+                check_version=CANONICAL_INTEGRITY_STEP_VERSION,
+                critical=True,
+                status=CheckStatus.ERROR,
+                duration_s=0.0,
+                error=report.refusal_reason,
+            )
+        )
+    check_rows.extend(
         CheckRunRow.from_result(
             check_name=run.check.name,
             check_version=run.check.version,
@@ -912,7 +933,7 @@ def _check_run_rows(report: "ProcessReport") -> list[CheckRunRow]:
             result=run.result,
         )
         for run in report.checks
-    ]
+    )
     _raise_if_measurement_keys_claim_artifact_namespace(
         (row.check_name, key) for row in check_rows for key in row.measurements
     )
@@ -1092,6 +1113,11 @@ class ProcessReport:
     # a reused run and a transcoded run are otherwise indistinguishable
     # without comparing file timestamps.
     sync_reused: bool = False
+    # The named reason the canonical episode was refused at the check lane
+    # entry, or None when it entered clean. Mirrored verbatim on the refusal
+    # row's error field in the catalog, where downstream tooling filters for
+    # it by equality.
+    refusal_reason: str | None = None
 
     def check(self, name: str) -> CheckRunReport:
         """Return the run report for the uniquely named check.
@@ -1125,8 +1151,10 @@ class ProcessReport:
     @property
     def has_errors(self) -> bool:
         """Whether any enabled check or enrichment failed to execute correctly."""
-        return any(run.status is CheckStatus.ERROR for run in self.checks) or any(
-            run.status is CheckStatus.ERROR for run in self.enrichments
+        return (
+            self.refusal_reason is not None
+            or any(run.status is CheckStatus.ERROR for run in self.checks)
+            or any(run.status is CheckStatus.ERROR for run in self.enrichments)
         )
 
     def _stages_line(self) -> str:
@@ -1152,6 +1180,11 @@ class ProcessReport:
         ]
         if self.sync_reused:
             lines.append("sync: reused the existing canonical episode (source unchanged)")
+        if self.refusal_reason is not None:
+            lines.append(
+                f"REFUSED: {self.refusal_reason} -- the canonical episode failed its "
+                "integrity stamp; no checks ran"
+            )
         if self.catalog_entry is not None:
             record_verb = "recorded" if self.catalog_entry.written else "already recorded"
             lines.append(
@@ -1291,6 +1324,16 @@ class App:
         self.enrichments: list[RegisteredEnrichment] = []
         self.derived: list[DerivedChannel] = []
         self.transform_override: TransformFunction | None = None
+        # Front-door integrity verdicts for canonical files, keyed by path and
+        # held with a size+mtime witness of the bytes the verdict describes.
+        # Lives on the App because the App is the run context: the same
+        # episode is opened again by later stage runs and retries in this
+        # process. The witness matters as much as the cache: decay can happen
+        # between two opens in one process, and a verdict must never outlive
+        # the file state it was read from.
+        self._canonical_integrity_cache: dict[
+            str, tuple[tuple[int, int], tuple[bool, str | None]]
+        ] = {}
         # Which registrations came from ``default_checks`` rather than from
         # the pipeline: registering one of these yourself replaces it (that
         # is how a default gets a gate or a bound parameter), while two USER
@@ -1342,6 +1385,28 @@ class App:
             if not superseded_keys:
                 continue
             run.outcome = NotRun(SupersededByPipeline(superseded_keys=tuple(superseded_keys)))
+
+    def _canonical_integrity_verdict(self, canonical_path: Path) -> "tuple[bool, str | None]":
+        """The check lane's front-door verdict for one canonical file.
+
+        At most one full CRC read per file state per run: the same episode is
+        re-opened by later stage runs and retried stage batches in this
+        process (a metadata backfill after a full run, a replayed META lane),
+        and re-validating unchanged bytes would pay the pass again for the
+        same answer. The cached verdict is keyed to the file's size and
+        mtime, so bytes that changed under the cache are re-validated rather
+        than trusted -- a verdict describes a file state, not a path. Sync
+        rewriting the file drops the cached entry outright.
+        """
+        cache_key = str(canonical_path)
+        file_state = canonical_path.stat()
+        witness = (file_state.st_size, file_state.st_mtime_ns)
+        cached = self._canonical_integrity_cache.get(cache_key)
+        if cached is not None and cached[0] == witness:
+            return cached[1]
+        verdict = verify_canonical_integrity(canonical_path)
+        self._canonical_integrity_cache[cache_key] = (witness, verdict)
+        return verdict
 
     def _reusable_canonical_episode(
         self,
@@ -2324,6 +2389,9 @@ class App:
             # ones from a different source episode sharing this run dir's stem.
             if scratch_dir.exists():
                 shutil.rmtree(scratch_dir)
+            # So is any cached integrity verdict: it describes bytes that no
+            # longer exist.
+            self._canonical_integrity_cache.pop(str(canonical_path), None)
         else:
             try:
                 canonical_path = run_storage_root.fetch(canonical_file_name)
@@ -2417,6 +2485,43 @@ class App:
                 if Stage.META in enabled_stages
                 else []
             )
+            enrichments_to_run = (
+                [
+                    registered
+                    for registered in self._ordered_enrichments()
+                    if registered_step_is_selected(registered_step_selection, registered.name)
+                ]
+                if Stage.LABELS in enabled_stages
+                else []
+            )
+            # The media stage is silently absent on a camera-less episode:
+            # there is nothing to render, so no row claims otherwise.
+            media_will_run = (
+                Stage.MEDIA in enabled_stages
+                and bool(canonical_episode.cameras)
+                and registered_step_is_selected(
+                    registered_step_selection, MEDIA_CONTACT_SHEET_STEP_NAME
+                )
+            )
+            if checks_to_run or enrichments_to_run or media_will_run:
+                # The front door every consuming lane shares: whatever is about
+                # to spend step work over the canonical's bytes pays one strict
+                # read first, so a canonical that decayed on disk after sync is
+                # refused with a named reason instead of measured, labeled, or
+                # rendered over (#474). A run with no step work to do pays
+                # nothing.
+                is_intact, refusal_reason = self._canonical_integrity_verdict(canonical_path)
+                if not is_intact:
+                    # Refuse the episode with ONE diagnosis: the named reason
+                    # lands on the report and on one catalog row (built with
+                    # the other check rows in _check_run_rows), and no step
+                    # runs. Exact replays of the refusal dedupe through the
+                    # run fingerprint, so retries stay one record.
+                    assert refusal_reason is not None
+                    report.refusal_reason = refusal_reason
+                    checks_to_run = []
+                    enrichments_to_run = []
+                    media_will_run = False
             # Keys already emitted by the pipeline's own steps in this run.
             # A default that has any key in common with what is here can be
             # superseded at the top of the loop, before paying its ffmpeg
@@ -2452,7 +2557,7 @@ class App:
                 # A default with a registered key pattern: if any pipeline
                 # step has already emitted a key the default would emit,
                 # the default's measurement would be a duplicate and would
-                # be thrown away by ``_yield_defaults_superseded_by_the_…``
+                # be thrown away by ``_yield_defaults_superseded_by_the_...``
                 # anyway. Skip the ffmpeg work entirely and record the same
                 # superseded reason, with the same key list, as the
                 # post-execution path. Same-parameter wrappers and steps
@@ -2543,28 +2648,14 @@ class App:
             )
 
             if Stage.LABELS in enabled_stages:
-                for registered_enrichment in self._ordered_enrichments():
-                    if not registered_step_is_selected(
-                        registered_step_selection, registered_enrichment.name
-                    ):
-                        continue
+                for registered_enrichment in enrichments_to_run:
                     report.enrichments.append(
                         _execute_enrichment(
                             registered_enrichment, canonical_episode, quarantine_skip
                         )
                     )
 
-            # The media stage is silently absent on a camera-less episode:
-            # there is nothing to render, so no row claims otherwise.
-            if (
-                Stage.MEDIA in enabled_stages
-                and canonical_episode.cameras
-                and (
-                    registered_step_is_selected(
-                        registered_step_selection, MEDIA_CONTACT_SHEET_STEP_NAME
-                    )
-                )
-            ):
+            if media_will_run:
                 media_directory = run_dir / "media"
 
                 def render_contact_sheets(media_episode: Episode) -> EnrichmentResult:
