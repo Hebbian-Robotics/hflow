@@ -28,11 +28,17 @@ from typing import IO, Protocol
 import numpy as np
 from mcap.reader import McapReader, make_reader
 from mcap.records import Attachment
+from mcap.stream_reader import CRCValidationError
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_MAX_MESSAGES = 1024
 DEFAULT_BATCH_MAX_BYTES = 32 * 1024 * 1024
+
+# The named reason a file fails its own integrity stamp, returned by
+# :func:`verify_canonical_integrity` and recorded on the check lane's refusal
+# row, so downstream tooling can filter for damaged canonicals by exact value.
+CANONICAL_CRC_MISMATCH_REASON = "canonical-crc-mismatch"
 
 
 @dataclass(frozen=True)
@@ -304,3 +310,31 @@ def open_reader(path: Path | str, *, validate_crcs: bool = False) -> EpisodeRead
     ``hflow.transform``).
     """
     return PythonMcapEpisodeReader(path, validate_crcs=validate_crcs)
+
+
+def verify_canonical_integrity(path: Path | str) -> tuple[bool, str | None]:
+    """Validate one episode file's chunk CRCs with a strict full read.
+
+    The check lane's front door. ``Episode`` reads run with CRC validation
+    off (the reader docstring's trust argument covers bytes identified by
+    content hash at sync time), so a canonical that decayed on disk after
+    sync would otherwise be measured by checks as if it were intact. This
+    re-opens the file the strict way and reads every message, which forces
+    the chunk CRC pass over exactly the bytes the checks are about to
+    certify.
+
+    Returns ``(is_valid, reason)``: ``(True, None)`` when every chunk
+    matches its stored CRC, and ``(False, CANONICAL_CRC_MISMATCH_REASON)``
+    when the file refuses its own integrity stamp. ``CRCValidationError``
+    is caught by its precise type -- it subclasses ``ValueError``, and the
+    broader type would also swallow unrelated boundary errors this function
+    must not answer for.
+    """
+    with Path(path).open("rb") as stream:
+        try:
+            reader = make_reader(stream, validate_crcs=True)
+            for _schema, _channel, _message in reader.iter_messages(log_time_order=False):
+                pass
+        except CRCValidationError:
+            return (False, CANONICAL_CRC_MISMATCH_REASON)
+    return (True, None)
