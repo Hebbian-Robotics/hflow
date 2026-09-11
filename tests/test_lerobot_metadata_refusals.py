@@ -150,6 +150,9 @@ def _info(**overrides: object) -> dict[str, object]:
             "positional fields are not supported, name the field instead",
         ),
         ("data_path", "data/}chunk/f.parquet", "Single '}' encountered in format string"),
+        # Subscripting a field raises TypeError rather than the other three,
+        # so without it in the caught set this one escapes the boundary raw.
+        ("data_path", "data/{chunk_index[0]}/f.parquet", "'int' object is not subscriptable"),
         ("video_path", "videos/{episode_index}/f.mp4", "unknown field 'episode_index'"),
         (
             "video_path",

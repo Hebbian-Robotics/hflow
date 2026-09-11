@@ -642,6 +642,11 @@ def _validate_path_template(
     failure arrived as a bare ``KeyError`` naming neither the file nor the
     field. Formatting once here moves it to the boundary and gives it the same
     shape as every other refusal.
+
+    What this proves is that the template formats, not that it names a
+    sensible path. ``{chunk_index.bit_length}`` formats fine and yields a
+    directory named after a bound method; that becomes a 404 at download time
+    rather than something to catch here.
     """
     try:
         template.format(**format_fields)
@@ -655,7 +660,11 @@ def _validate_path_template(
             f"LeRobot meta/info.json has an invalid {field_name} template "
             f"{template!r}: positional fields are not supported, name the field instead"
         ) from error
-    except ValueError as error:
+    except (ValueError, TypeError) as error:
+        # TypeError belongs here for the same reason as the rest: subscripting
+        # a field, ``{chunk_index[0]}``, raises it from str.format and would
+        # otherwise leave the boundary as a bare "'int' object is not
+        # subscriptable" naming neither the file nor the field.
         raise ValueError(
             f"LeRobot meta/info.json has an invalid {field_name} template {template!r}: {error}"
         ) from error
