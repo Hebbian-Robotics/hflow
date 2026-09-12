@@ -519,3 +519,89 @@ def test_receipt_entry_with_numeric_sha256_is_refused_at_the_boundary() -> None:
 
     with pytest.raises(ValueError, match="sha256"):
         _parse_file_integrity_record({"path": "samples.parquet", "size_bytes": 10, "sha256": 123})
+
+
+def _hand_built_snapshot_with_receipt_path(
+    snap: Path, *, receipt_path: str, payload: bytes = b"secret-bytes"
+) -> None:
+    """Minimal identity+integrity marker whose single receipt uses ``receipt_path``.
+
+    ``content_id`` matches that one-entry inventory so the deleted-member gate
+    is not the thing that fires; the path containment check is.
+    """
+    from hflow.snapshot import (
+        DATASET_SNAPSHOT_FORMAT_NAME,
+        DATASET_SNAPSHOT_FORMAT_VERSION,
+        FileIntegrityRecord,
+        _inventory_content_id,
+    )
+
+    digest = hashlib.sha256(payload).hexdigest()
+    record = FileIntegrityRecord(path=receipt_path, size_bytes=len(payload), sha256=digest)
+    marker = {
+        "format": DATASET_SNAPSHOT_FORMAT_NAME,
+        "format_version": DATASET_SNAPSHOT_FORMAT_VERSION,
+        "media_mode": "references",
+        "media_uri_base": None,
+        "tables": ["samples.parquet"],
+        "integrity": {
+            "tables": {
+                "samples": {
+                    "path": record.path,
+                    "size_bytes": record.size_bytes,
+                    "sha256": record.sha256,
+                }
+            },
+            "assets": [],
+            "content_id": _inventory_content_id([record]),
+        },
+    }
+    snap.mkdir(parents=True, exist_ok=True)
+    (snap / "format.json").write_text(json.dumps(marker, indent=2) + "\n")
+
+
+def test_receipt_path_escaping_the_handed_directory_is_refused(tmp_path: Path) -> None:
+    """#469: relative ``..`` and absolute paths hash outside the root today;
+    both must raise before any read (exit 2), not report ok."""
+    snap = tmp_path / "snap"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.bin"
+    secret.write_bytes(b"secret-bytes")
+
+    for escape_path in (f"../outside/{secret.name}", str(secret.resolve())):
+        _hand_built_snapshot_with_receipt_path(snap, receipt_path=escape_path)
+        with pytest.raises(ValueError, match="must stay under the handed snapshot directory"):
+            verify_dataset_snapshot(snap)
+        assert cli_main(["verify", "snapshot", str(snap)]) == 2
+
+
+def test_normalized_parent_escape_through_an_existing_subdir_is_refused(
+    tmp_path: Path,
+) -> None:
+    """Kingston's third shape: ``tables/../../outside/...`` only looks like it
+    failed before because ``snap/tables/`` was missing. Create it and the bare
+    join escapes; containment must still refuse before the read."""
+    snap = tmp_path / "snap"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (snap / "tables").mkdir(parents=True)
+    secret = outside / "secret.bin"
+    secret.write_bytes(b"secret-bytes")
+
+    _hand_built_snapshot_with_receipt_path(snap, receipt_path=f"tables/../../outside/{secret.name}")
+    with pytest.raises(ValueError, match="must stay under the handed snapshot directory"):
+        verify_dataset_snapshot(snap)
+    assert cli_main(["verify", "snapshot", str(snap)]) == 2
+
+
+def test_honest_relative_receipt_path_still_verifies_after_containment_gate(
+    tmp_path: Path,
+) -> None:
+    """Containment must not break a clean export: relative keys under the root
+    still pass size and sha256 checks."""
+    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
+    report = verify_dataset_snapshot(output_directory)
+    assert report.ok
+    assert report.findings == []
+    assert cli_main(["verify", "snapshot", str(output_directory)]) == 0
