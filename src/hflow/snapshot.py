@@ -23,7 +23,7 @@ import duckdb
 from hflow.app import ARTIFACT_MEASUREMENT_KEY_PREFIX, MEDIA_CONTACT_SHEET_STEP_NAME
 from hflow.catalog import episode_status_case_sql
 from hflow.curation import open_catalog_connection
-from hflow.storage import StorageRoot, fetch_uri
+from hflow.storage import StorageRoot, _validated_relative_key, fetch_uri
 
 if TYPE_CHECKING:
     from hflow.verification import VerificationReport
@@ -912,12 +912,16 @@ def verify_dataset_snapshot(
       ``integrity`` key. That snapshot is unverifiable, not corrupt.
 
     Unreadable input (a missing directory, a missing or unparsable
-    ``format.json``) raises instead: that is not a finding about a delivered
-    snapshot, it is the wrong input entirely. The same applies to a receipt
-    that is internally inconsistent with itself: a missing or malformed
-    ``content_id``, or a recomputed inventory hash that disagrees with the
-    stored one, means the receipt no longer describes the delivered set
-    (tampering or a truncated write), which is exit 2, not damaged bytes.
+    ``format.json``, or a receipt ``path`` that is absolute / contains ``..``
+    / carries a Windows drive letter) raises instead: that is not a finding
+    about a delivered snapshot, it is the wrong input entirely. Path
+    containment reuses :func:`hflow.storage._validated_relative_key` so the
+    verifier and storage roots share one answer to "is this key inside the
+    root", and the check runs before any file read (#469). The same exit-2
+    class applies to a receipt that is internally inconsistent with itself:
+    a missing or malformed ``content_id``, or a recomputed inventory hash
+    that disagrees with the stored one, means the receipt no longer
+    describes the delivered set (tampering or a truncated write).
 
     Extra files under ``assets/`` that the receipt does not name are ignored:
     the receipt covers what was exported, not everything a recipient may add.
@@ -1021,7 +1025,18 @@ def verify_dataset_snapshot(
         )
 
     for record in receipt_records:
-        relative_path = record.path
+        # Containment (#469): refuse before any read. Absolute paths discard
+        # the handed root under pathlib; ``..`` climbs out of it. Both are
+        # malformed receipts (exit 2), not damaged bytes. Reuse the storage
+        # key validator so this family has one implementation.
+        try:
+            relative_path = _validated_relative_key(record.path)
+        except ValueError as error:
+            raise ValueError(
+                f"format.json integrity receipt path {record.path!r} must stay "
+                "under the handed snapshot directory (no leading '/', no '..', "
+                "no Windows drive letter); refused before any file read"
+            ) from error
         delivered_path = resolved_directory / relative_path
         if not delivered_path.is_file():
             findings.append(
