@@ -47,3 +47,27 @@ def flip_chunk_payload_bytes(episode_path: Path, *, count: int = 4) -> None:
 def content_id_differs_from_delivery_receipt(episode_path: Path, receipt_content_id: str) -> bool:
     """True when the file on disk no longer matches the recorded content id."""
     return content_episode_id(episode_path) != receipt_content_id
+
+
+def corrupt_zstd_chunk_payload(episode_path: Path) -> None:
+    """Invalidate the first chunk's zstd frame magic, inside compressed records.
+
+    Use the summary chunk index and the same MCAP field layout as
+    ``flip_chunk_payload_bytes``. Only the first byte of the zstd frame magic
+    changes (0x28 -> 0x29), forcing the actual decompressor to reject it.
+    The stored CRC, compression name, record lengths, and all MCAP headers,
+    indexes, metadata, and footer remain byte-for-byte intact.
+    """
+    from mcap.reader import make_reader
+
+    data = bytearray(episode_path.read_bytes())
+    summary = make_reader(io.BytesIO(bytes(data))).get_summary()
+    assert summary is not None and summary.chunk_indexes
+    chunk_start = summary.chunk_indexes[0].chunk_start_offset
+    compression_length = struct.unpack_from("<I", data, chunk_start + 37)[0]
+    compression_start = chunk_start + 41
+    assert data[compression_start : compression_start + compression_length] == b"zstd"
+    records_start = compression_start + compression_length + 8
+    assert data[records_start : records_start + 4] == b"\x28\xb5\x2f\xfd"
+    data[records_start] ^= 0x01
+    episode_path.write_bytes(data)

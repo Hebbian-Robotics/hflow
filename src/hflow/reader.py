@@ -29,16 +29,18 @@ import numpy as np
 from mcap.reader import McapReader, make_reader
 from mcap.records import Attachment
 from mcap.stream_reader import CRCValidationError
+from zstandard import ZstdError
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_MAX_MESSAGES = 1024
 DEFAULT_BATCH_MAX_BYTES = 32 * 1024 * 1024
 
-# The named reason a file fails its own integrity stamp, returned by
+# Named reasons a file fails its own integrity stamp, returned by
 # :func:`verify_canonical_integrity` and recorded on the check lane's refusal
 # row, so downstream tooling can filter for damaged canonicals by exact value.
 CANONICAL_CRC_MISMATCH_REASON = "canonical-crc-mismatch"
+CANONICAL_DECOMPRESSION_FAILED_REASON = "canonical-decompression-failed"
 
 
 @dataclass(frozen=True)
@@ -339,7 +341,7 @@ def open_reader(path: Path | str, *, validate_crcs: bool = False) -> EpisodeRead
 
 
 def verify_canonical_integrity(path: Path | str) -> tuple[bool, str | None]:
-    """Validate one episode file's chunk CRCs with a strict full read.
+    """Validate one episode file's decompression and chunk CRCs with a strict full read.
 
     The check lane's front door. ``Episode`` reads run with CRC validation
     off (the reader docstring's trust argument covers bytes identified by
@@ -350,11 +352,11 @@ def verify_canonical_integrity(path: Path | str) -> tuple[bool, str | None]:
     certify.
 
     Returns ``(is_valid, reason)``: ``(True, None)`` when every chunk
-    matches its stored CRC, and ``(False, CANONICAL_CRC_MISMATCH_REASON)``
-    when the file refuses its own integrity stamp. ``CRCValidationError``
-    is caught by its precise type -- it subclasses ``ValueError``, and the
-    broader type would also swallow unrelated boundary errors this function
-    must not answer for.
+    decompresses and matches its stored CRC, or ``(False, reason)`` for a
+    CRC mismatch or zstd decompression failure. Both exceptions are caught
+    by precise type: MCAP propagates ``ZstdError`` directly from the chunk
+    decompressor, before it can validate the CRC. Filesystem failures and
+    unrelated reader errors still propagate to the caller.
     """
     with Path(path).open("rb") as stream:
         try:
@@ -363,4 +365,6 @@ def verify_canonical_integrity(path: Path | str) -> tuple[bool, str | None]:
                 pass
         except CRCValidationError:
             return (False, CANONICAL_CRC_MISMATCH_REASON)
+        except ZstdError:
+            return (False, CANONICAL_DECOMPRESSION_FAILED_REASON)
     return (True, None)
