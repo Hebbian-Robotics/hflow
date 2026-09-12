@@ -662,7 +662,7 @@ def reject_non_single_select(sql: str) -> None:
 def _stage_manifest_and_count(
     connection: duckdb.DuckDBPyConnection, sql: str, staged_manifest: Path
 ) -> int:
-    """COPY the query's result to the staged manifest; return its row count.
+    """Write the query's result to the staged manifest; return its row count.
 
     ``sql`` is tenant-supplied on constrained connections.
     ``reject_non_single_select`` parses the input **without executing it**

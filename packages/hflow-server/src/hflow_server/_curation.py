@@ -167,17 +167,23 @@ _LOCATION_ECHO_PATTERN = re.compile(r"^LINE \d+: ")
 def _wrapper_execution_refusal(error: duckdb.Error) -> HTTPException:
     """A 400 carrying DuckDB's diagnostic, minus the echoed rewrite (#482).
 
-    Inside a curation route's execution phase, every executed statement is a
-    wrapper built around the caller's SQL, never the SQL verbatim: preview
-    runs ``DESCRIBE SELECT * FROM (...)``, the LIMIT projection, the count,
-    and the SUMMARIZE; report and pin run the library's count, COPY, and
-    coverage wrappers through ``curate``/``write_dataset_manifest``. The gate
-    already parsed the caller's SQL standalone before anything executed. So a
-    location block here always quotes a rewrite the caller never sent, with a
-    caret pointing into it. The diagnostic sentences above the block are
-    about the caller's SQL and survive unchanged; parse errors of the
-    caller's own text keep their full message through
-    :func:`_bad_sql_refusal` at the gate.
+    Inside preview's and report's execution phases, every executed statement
+    is a wrapper built around the caller's SQL, never the SQL verbatim:
+    preview runs ``DESCRIBE SELECT * FROM (...)``, the LIMIT projection, the
+    count, and the SUMMARIZE; report runs the library's count, staging, and
+    coverage wrappers through ``curate``. The gate already parsed the
+    caller's SQL standalone before anything executed. So a location block
+    here always quotes a rewrite the caller never sent, with a caret pointing
+    into it. The diagnostic sentences above the block are about the caller's
+    SQL and survive unchanged; parse errors of the caller's own text keep
+    their full message through :func:`_bad_sql_refusal` at the gate.
+
+    Pin is deliberately NOT routed through this: ``_stage_manifest_and_count``
+    runs the caller's SQL verbatim via ``connection.sql(sql)``, so a location
+    block there would quote the caller's own text and must be kept. Its
+    errors carry no location block on current DuckDB either way, so pin stays
+    on :func:`_bad_sql_refusal`. Before extending this refusal to a new
+    route, check that every statement the route executes wraps the SQL.
     """
     kept_lines: list[str] = []
     dropping_caret = False
@@ -417,7 +423,10 @@ def create_curation_router(settings: ServerSettings) -> APIRouter:
             except (FileNotFoundError, ValueError) as error:
                 raise _connections.catalog_unavailable_refusal(error) from error
             except duckdb.Error as error:
-                raise _wrapper_execution_refusal(error) from error
+                # Not _wrapper_execution_refusal: pin runs the caller's SQL
+                # verbatim (see that function's docstring), so any location
+                # block here would be the caller's own text and stays.
+                raise _bad_sql_refusal(error) from error
             entry = PinnedManifestEntry(
                 manifest_id=uuid.uuid4().hex,
                 name=request.name,
