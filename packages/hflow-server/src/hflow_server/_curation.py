@@ -167,14 +167,17 @@ _LOCATION_ECHO_PATTERN = re.compile(r"^LINE \d+: ")
 def _wrapper_execution_refusal(error: duckdb.Error) -> HTTPException:
     """A 400 carrying DuckDB's diagnostic, minus the echoed rewrite (#482).
 
-    Inside preview every executed statement is one of this module's wrappers
-    (``DESCRIBE SELECT * FROM (...)``, the LIMIT projection, the count, the
-    SUMMARIZE), never the caller's SQL verbatim: the gate already parsed that
-    standalone before preview ran. So a location block here always quotes a
-    rewrite the caller never sent, with a caret pointing into it. The
-    diagnostic sentences above the block are about the caller's SQL and
-    survive unchanged; parse errors of the caller's own text keep their full
-    message through :func:`_bad_sql_refusal` at the gate.
+    Inside a curation route's execution phase, every executed statement is a
+    wrapper built around the caller's SQL, never the SQL verbatim: preview
+    runs ``DESCRIBE SELECT * FROM (...)``, the LIMIT projection, the count,
+    and the SUMMARIZE; report and pin run the library's count, COPY, and
+    coverage wrappers through ``curate``/``write_dataset_manifest``. The gate
+    already parsed the caller's SQL standalone before anything executed. So a
+    location block here always quotes a rewrite the caller never sent, with a
+    caret pointing into it. The diagnostic sentences above the block are
+    about the caller's SQL and survive unchanged; parse errors of the
+    caller's own text keep their full message through
+    :func:`_bad_sql_refusal` at the gate.
     """
     kept_lines: list[str] = []
     dropping_caret = False
@@ -317,7 +320,7 @@ def _curated_or_refused(data_root: str, user_sql: str, *, output: Path | None) -
     except (FileNotFoundError, ValueError) as error:
         raise _connections.catalog_unavailable_refusal(error) from error
     except duckdb.Error as error:
-        raise _bad_sql_refusal(error) from error
+        raise _wrapper_execution_refusal(error) from error
 
 
 def _coverage_entries(report: CurationReport) -> list[CheckCoverageEntry]:
@@ -414,7 +417,7 @@ def create_curation_router(settings: ServerSettings) -> APIRouter:
             except (FileNotFoundError, ValueError) as error:
                 raise _connections.catalog_unavailable_refusal(error) from error
             except duckdb.Error as error:
-                raise _bad_sql_refusal(error) from error
+                raise _wrapper_execution_refusal(error) from error
             entry = PinnedManifestEntry(
                 manifest_id=uuid.uuid4().hex,
                 name=request.name,

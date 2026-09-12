@@ -32,6 +32,29 @@ def test_report_bad_sql_is_400_with_the_duckdb_message(api: TestClient) -> None:
     assert "nope" in response.json()["detail"]
 
 
+def test_report_binder_and_catalog_errors_never_quote_the_wrapper(api: TestClient) -> None:
+    """Report executes the caller's SQL inside the library's count and COPY
+    wrappers, so DuckDB's location block echoes a rewrite the caller never
+    sent (``LINE 1: SELECT count(*) FROM (...)``), with a caret pointing into
+    it. The diagnostic survives; the echo and caret do not (#482). Asserting
+    on the ``LINE`` echo rather than any one wrapper's text keeps this red on
+    a leaking route no matter which wrapper it leaks."""
+    binder = api.post("/api/v1/curation/report", json={"sql": "SELECT nope FROM episodes"})
+    assert binder.status_code == 400
+    assert "Binder Error" in binder.json()["detail"]
+    assert "nope" in binder.json()["detail"]
+
+    catalog = api.post("/api/v1/curation/report", json={"sql": "SELECT * FROM no_such_table"})
+    assert catalog.status_code == 400
+    assert "Catalog Error" in catalog.json()["detail"]
+    assert "no_such_table" in catalog.json()["detail"]
+
+    for response in (binder, catalog):
+        detail = response.json()["detail"]
+        assert "LINE 1:" not in detail
+        assert all(line.strip() != "^" for line in detail.splitlines())
+
+
 def test_report_refuses_smuggled_second_statement_and_reports_honestly(api: TestClient) -> None:
     # A paren-closing smuggle used to slip past the subquery wrapper: the
     # extra CREATE ran and the reported row_count came from a trailing SELECT.

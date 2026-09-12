@@ -192,6 +192,29 @@ def test_pin_with_bad_sql_is_400_and_registers_nothing(
     assert writable_api.get("/api/v1/manifests").json()["manifests"] == []
 
 
+def test_pin_binder_and_catalog_errors_never_quote_a_wrapper(writable_api: TestClient) -> None:
+    """Pin executes the caller's SQL inside ``write_dataset_manifest``'s
+    wrappers, so any location block in its 400 would quote a rewrite the
+    caller never sent. Measured on current DuckDB these errors arrive without
+    one, and this pins that a future wrapper cannot start leaking (#482)."""
+    binder = writable_api.post(
+        "/api/v1/curation/pin", json={"sql": "SELECT nope FROM episodes", "name": "never lands"}
+    )
+    assert binder.status_code == 400
+    assert "Binder Error" in binder.json()["detail"]
+
+    catalog = writable_api.post(
+        "/api/v1/curation/pin", json={"sql": "SELECT * FROM no_such_table", "name": "never lands"}
+    )
+    assert catalog.status_code == 400
+    assert "Catalog Error" in catalog.json()["detail"]
+
+    for response in (binder, catalog):
+        detail = response.json()["detail"]
+        assert "LINE 1:" not in detail
+        assert all(line.strip() != "^" for line in detail.splitlines())
+
+
 def test_pin_is_403_when_read_only(read_only_api: TestClient) -> None:
     response = read_only_api.post(
         "/api/v1/curation/pin", json={"sql": OK_CUT_SQL, "name": "should not land"}
