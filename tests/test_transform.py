@@ -49,24 +49,27 @@ def test_pipeline_version_is_a_content_hash() -> None:
 
 
 @pytest.mark.parametrize(
-    ("construct", "field"),
+    ("construct", "message"),
     [
-        (lambda: TransformConfig(crf=True), "crf"),
-        (lambda: TransformConfig(crf=-1), "crf"),
-        (lambda: TransformConfig(crf=52), "crf"),
-        (lambda: TransformConfig(gop_seconds=True), "gop_seconds"),
-        (lambda: TransformConfig(gop_seconds=0), "gop_seconds"),
-        (lambda: TransformConfig(gop_seconds=float("nan")), "gop_seconds"),
-        (lambda: TransformConfig(gop_seconds=float("inf")), "gop_seconds"),
-        (lambda: TransformConfig(chunk_size_bytes=True), "chunk_size_bytes"),
-        (lambda: TransformConfig(chunk_size_bytes=0), "chunk_size_bytes"),
-        (lambda: TransformConfig(chunk_size_bytes=-1), "chunk_size_bytes"),
+        (lambda: TransformConfig(crf=True), "crf must be an int, got bool"),
+        (lambda: TransformConfig(crf=-1), "crf must be in [0, 51], got -1"),
+        (lambda: TransformConfig(crf=52), "crf must be in [0, 51], got 52"),
+        (lambda: TransformConfig(gop_seconds=True), "gop_seconds must be an int or float, got bool"),
+        (lambda: TransformConfig(gop_seconds=0), "gop_seconds must be > 0, got 0"),
+        (lambda: TransformConfig(gop_seconds=float("nan")), "gop_seconds must be finite, got nan"),
+        (lambda: TransformConfig(gop_seconds=float("inf")), "gop_seconds must be finite, got inf"),
+        (
+            lambda: TransformConfig(chunk_size_bytes=True),
+            "chunk_size_bytes must be an int, got bool",
+        ),
+        (lambda: TransformConfig(chunk_size_bytes=0), "chunk_size_bytes must be > 0, got 0"),
+        (lambda: TransformConfig(chunk_size_bytes=-1), "chunk_size_bytes must be > 0, got -1"),
     ],
 )
 def test_transform_config_rejects_invalid_numeric_settings(
-    construct: Callable[[], TransformConfig], field: str
+    construct: Callable[[], TransformConfig], message: str
 ) -> None:
-    with pytest.raises(ValueError, match=field):
+    with pytest.raises(ValueError, match=f"^{message}$"):
         construct()
 
 
