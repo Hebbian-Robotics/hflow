@@ -1,6 +1,7 @@
 """Enrichment step registration, execution, and catalog outcomes."""
 
 import json
+import logging
 from pathlib import Path
 from typing import cast
 
@@ -60,7 +61,9 @@ def test_quarantine_skips_enrichments(source_episode: Path, tmp_path: Path) -> N
     assert report.enrichments[0].status == hflow.CheckStatus.SKIPPED
 
 
-def test_enrichment_wrong_return_type_is_an_error(source_episode: Path, tmp_path: Path) -> None:
+def test_enrichment_wrong_return_type_is_an_error(
+    source_episode: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     app = hflow.App("enrich-boundary", data_root=tmp_path / "data")
 
     @app.enrich(version="1")
@@ -71,6 +74,46 @@ def test_enrichment_wrong_return_type_is_an_error(source_episode: Path, tmp_path
     assert report.enrichments[0].status == hflow.CheckStatus.ERROR
     assert report.enrichments[0].error is not None
     assert "expected hflow.EnrichmentResult" in report.enrichments[0].error
+    (record,) = caplog.records
+    assert record.levelno == logging.ERROR
+    assert "returns_a_string" in record.getMessage()
+    assert str(report.canonical_path) in record.getMessage()
+    assert "expected hflow.EnrichmentResult" in record.getMessage()
+
+
+def test_enrichment_crash_is_logged_and_later_steps_continue(
+    source_episode: Path,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    app = hflow.App("enrich-crash", data_root=tmp_path / "data", default_checks=())
+
+    @app.enrich(version="1")
+    def exploding(ep: hflow.Episode) -> hflow.EnrichmentResult:
+        raise RuntimeError("labeler unavailable")
+
+    @app.enrich(version="1")
+    def still_runs(ep: hflow.Episode) -> hflow.EnrichmentResult:
+        return hflow.EnrichmentResult(labels={"caption": "robot arm"})
+
+    report = app.process(source_episode)
+    assert report.has_errors
+    assert not report.quarantined
+    failed, measured = report.enrichments
+    assert failed.status == hflow.CheckStatus.ERROR
+    assert "RuntimeError: labeler unavailable" in (failed.error or "")
+    assert "Traceback" in (failed.error or "")
+    assert measured.status == hflow.CheckStatus.MEASURED
+    assert measured.result is not None
+    assert measured.result.labels == {"caption": "robot arm"}
+    (record,) = caplog.records
+    assert record.levelno == logging.ERROR
+    assert "exploding" in record.getMessage()
+    assert str(report.canonical_path) in record.getMessage()
+    assert "RuntimeError: labeler unavailable" in record.getMessage()
+    assert "Traceback" not in record.getMessage()
+    assert capsys.readouterr().out == ""
 
 
 def test_enrichment_labels_and_artifacts_land_in_the_catalog(
