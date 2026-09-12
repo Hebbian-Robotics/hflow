@@ -2,6 +2,9 @@
 
 import functools
 import json
+import logging
+import subprocess
+import sys
 import textwrap
 from collections.abc import Callable
 from pathlib import Path
@@ -432,7 +435,9 @@ def test_failed_sync_clears_completion_proof_and_blocks_later_stages(tmp_path: P
         app.process(source, record=False, stages={hflow.Stage.META})
 
 
-def test_check_returning_wrong_type_is_an_error_not_a_crash(tmp_path: Path) -> None:
+def test_check_returning_wrong_type_is_an_error_not_a_crash(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     source = synthesize_episode(
         tmp_path / "episode.mcap", SyntheticEpisodeSpec(duration_s=2.0, cameras=())
     )
@@ -455,6 +460,49 @@ def test_check_returning_wrong_type_is_an_error_not_a_crash(tmp_path: Path) -> N
     assert "expected hflow.CheckResult" in by_name["returns_a_dict"].error
     assert by_name["well_behaved"].status == hflow.CheckStatus.MEASURED
     assert report.has_errors
+    (record,) = caplog.records
+    assert record.levelno == logging.ERROR
+    assert "returns_a_dict" in record.getMessage()
+    assert str(report.canonical_path) in record.getMessage()
+    assert "expected hflow.CheckResult" in record.getMessage()
+
+
+def test_direct_process_loop_logs_errors_without_logging_configuration(tmp_path: Path) -> None:
+    source = _state_only_episode(tmp_path)
+    script = textwrap.dedent(
+        """\
+        import sys
+        from pathlib import Path
+        import hflow
+
+        source = Path(sys.argv[1])
+        app = hflow.App("error-loop", data_root=source.parent / "data", default_checks=())
+
+        @app.check(version="1", critical=True)
+        def exploding(ep: hflow.Episode) -> hflow.CheckResult:
+            raise RuntimeError("intentional probe failure")
+
+        completed = 0
+        for index in range(3):
+            episode = source.with_name(f"episode_{index}.mcap")
+            episode.write_bytes(source.read_bytes())
+            report = app.process(episode)
+            assert report.has_errors
+            assert not report.quarantined
+            completed += 1
+        assert completed == 3
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(source)], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    assert result.stderr.count("RuntimeError: intentional probe failure") == 3
+    assert result.stderr.count("exploding") == 3
+    for index in range(3):
+        assert f"episode_{index}" in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 def _state_only_episode(tmp_path: Path) -> Path:
@@ -801,7 +849,9 @@ def test_non_sync_stages_never_fetch_the_raw_source(tmp_path: Path) -> None:
     assert report.stamps.pipeline_version
 
 
-def test_missing_artifact_is_the_steps_error_not_the_runs(tmp_path: Path) -> None:
+def test_missing_artifact_is_the_steps_error_not_the_runs(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
     from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
     episode_file = synthesize_episode(
@@ -818,6 +868,16 @@ def test_missing_artifact_is_the_steps_error_not_the_runs(tmp_path: Path) -> Non
     assert enrichment_run.status is hflow.CheckStatus.ERROR
     assert "never-written.png" in (enrichment_run.error or "")
     assert report.catalog_entry is not None and report.catalog_entry.written
+    assert report.has_errors
+    assert not report.quarantined
+    (record,) = caplog.records
+    assert record.levelno == logging.ERROR
+    assert "declares_a_ghost" in record.getMessage()
+    assert str(report.canonical_path) in record.getMessage()
+    assert "FileNotFoundError:" in record.getMessage()
+    assert "never-written.png" in record.getMessage()
+    assert "Traceback" not in record.getMessage()
+    assert capsys.readouterr().out == ""
 
 
 def test_source_identity_is_stable_across_vantage_points(

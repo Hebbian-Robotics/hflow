@@ -17,6 +17,7 @@ quality outcome.
 import hashlib
 import inspect
 import json
+import logging
 import os
 import re
 import shutil
@@ -99,6 +100,8 @@ from hflow.transform import (
     write_canonical_episode,
 )
 from hflow.workspace import RUNTIME_BUNDLE_DIRECTORY_NAME, Workspace
+
+logger = logging.getLogger(__name__)
 
 # The contract a @app.transform override implements: (source, output, config)
 # -> the stamps it wrote. See :meth:`App.transform`.
@@ -884,8 +887,21 @@ def _execute_enrichment(
                 "expected hflow.EnrichmentResult -- wrap it: return "
                 "hflow.EnrichmentResult(labels=...)"
             )
-    except Exception:
+            logger.error(
+                "Enrichment %s errored on episode %s: %s",
+                registered_enrichment.name,
+                canonical_episode.path,
+                outcome.error,
+            )
+    except Exception as error:
         outcome = Errored(traceback.format_exc(limit=8))
+        logger.error(
+            "Enrichment %s errored on episode %s: %s: %s",
+            registered_enrichment.name,
+            canonical_episode.path,
+            type(error).__name__,
+            error,
+        )
     duration_s = time.perf_counter() - started
     return EnrichmentRunReport(
         enrichment=registered_enrichment, outcome=outcome, duration_s=duration_s
@@ -2182,6 +2198,11 @@ class App:
         ``<data_root>/episodes/<stem>-<source-identity-hash>/`` unless
         ``output_dir`` is given.
 
+        Check and enrichment execution errors, including artifact publication
+        failures, are logged at ERROR level independently of ``verbose``.
+        They remain in the returned report without raising or quarantining
+        the episode. ``verbose=True`` additionally prints the full summary.
+
         ``stages`` is a run-profile name (see ``hflow.RUN_PROFILES``), an
         explicit stage set, or ``None`` for the full profile. Without
         ``sync``, the canonical file must already exist in the run dir and
@@ -2487,9 +2508,22 @@ class App:
                             "hflow.CheckResult -- wrap it: return hflow.CheckResult("
                             "measurements=...)"
                         )
-                except Exception:
+                        logger.error(
+                            "Check %s errored on episode %s: %s",
+                            registered.name,
+                            canonical_episode.path,
+                            outcome.error,
+                        )
+                except Exception as error:
                     # Infrastructure, not data: never recorded as a quality outcome.
                     outcome = Errored(traceback.format_exc(limit=8))
+                    logger.error(
+                        "Check %s errored on episode %s: %s: %s",
+                        registered.name,
+                        canonical_episode.path,
+                        type(error).__name__,
+                        error,
+                    )
                 duration_s = time.perf_counter() - started
                 run = CheckRunReport(check=registered, outcome=outcome, duration_s=duration_s)
                 report.checks.append(run)
@@ -2608,7 +2642,7 @@ class App:
                     enrichment_run.artifact_uris[artifact_name] = run_storage_root.publish(
                         artifact_path, artifact_key
                     )
-                except Exception:
+                except Exception as error:
                     # A missing or unreadable artifact file is the STEP's
                     # failure (user code declared a path it never wrote), not
                     # the run's: record it like any other step error and keep
@@ -2627,6 +2661,16 @@ class App:
                         PublishFailed(result=enrichment_result_so_far, error=combined_error)
                         if enrichment_result_so_far is not None
                         else Errored(combined_error)
+                    )
+                    logger.error(
+                        "Enrichment %s errored on episode %s: artifact %r at %s "
+                        "could not be published: %s: %s",
+                        enrichment_run.enrichment.name,
+                        canonical_path,
+                        artifact_name,
+                        artifact_path,
+                        type(error).__name__,
+                        error,
                     )
 
         # Assembled even when not recording, so the dev loop refuses a key

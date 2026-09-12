@@ -1,6 +1,7 @@
 """The vertical slice, end to end: one episode in, measurements out, zero
 infrastructure. Mirrors the README design-target example."""
 
+import logging
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -535,12 +536,17 @@ def test_failed_critical_verdict_quarantines_and_skips_downstream(
     assert by_name["camera_blackout"].status == "failed"
 
 
+@pytest.mark.parametrize("dev_loop", [False, True])
 def test_crashing_check_is_infrastructure_not_data(
-    state_only_source_episode: Path, tmp_path: Path
+    state_only_source_episode: Path,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    dev_loop: bool,
 ) -> None:
     app = hflow.App("crashy-pipeline", data_root=tmp_path)
 
-    @app.check(version="1")
+    @app.check(version="1", critical=True)
     def exploding(ep: hflow.Episode) -> hflow.CheckResult:
         raise RuntimeError("boom")
 
@@ -548,12 +554,23 @@ def test_crashing_check_is_infrastructure_not_data(
     def still_runs(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"ran": True})
 
-    report = app.test(state_only_source_episode, verbose=False)
+    report = (
+        app.test(state_only_source_episode) if dev_loop else app.process(state_only_source_episode)
+    )
+    assert report.has_errors
     assert not report.quarantined
     by_name = {run.check.name: run for run in report.checks}
     assert by_name["exploding"].status == "error"
     assert by_name["exploding"].error is not None and "boom" in by_name["exploding"].error
     assert by_name["still_runs"].status == "measured"
+    (record,) = caplog.records
+    assert record.name == "hflow.app"
+    assert record.levelno == logging.ERROR
+    assert "exploding" in record.getMessage()
+    assert str(report.canonical_path) in record.getMessage()
+    assert "RuntimeError: boom" in record.getMessage()
+    assert "Traceback" not in record.getMessage()
+    assert capsys.readouterr().out == (report.summary() + "\n" if dev_loop else "")
 
 
 def test_resource_declaring_checks_run_after_plain_ones(
