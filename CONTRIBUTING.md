@@ -19,7 +19,7 @@ You need:
 - Git and [uv](https://docs.astral.sh/uv/)
 - Python 3.11 or newer
 - A system C compiler/toolchain that provides `cc` for the native-overlay tests
-- ffmpeg and ffprobe on `PATH` for the test suite
+- ffmpeg and ffprobe on `PATH` for the test suite (ffmpeg 5.1 or newer; the suite uses `-fps_mode`, which is not in the 4.4.x builds Ubuntu 22.04 ships)
 - Docker with Compose v2 only when working on the Airflow runtime integration
 - [lychee](https://github.com/lycheeverse/lychee) when editing Markdown links
 
