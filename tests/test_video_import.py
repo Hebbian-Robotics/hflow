@@ -14,6 +14,7 @@ from mcap_protobuf.decoder import DecoderFactory
 import hflow
 from hflow.ffmpeg import ffmpeg_path
 from hflow.importers.video import VideoImportConfig, import_video_episode
+from hflow.media import VideoLimits
 
 
 @pytest.fixture
@@ -228,3 +229,118 @@ def test_invalid_sources_and_incomplete_excerpts_publish_nothing(
 def test_invalid_import_configuration_is_rejected(config: dict[str, object]) -> None:
     with pytest.raises(ValueError):
         replace(VideoImportConfig(duration_s=1), **config)
+
+
+def test_preparation_distinguishes_rejected_media_from_tool_failures(
+    source_video: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hflow.media as media
+    from hflow.importers.video import ImportedVideoEpisode, prepare_video_episode
+
+    output = tmp_path / "episode.mcap"
+    unreadable = tmp_path / "invalid.mp4"
+    unreadable.write_bytes(b"not a recording")
+    assert isinstance(
+        prepare_video_episode(unreadable, output, VideoImportConfig(duration_s=1)),
+        media.UnreadableVideo,
+    )
+    assert isinstance(
+        prepare_video_episode(
+            source_video,
+            output,
+            VideoImportConfig(duration_s=1),
+            limits=media.VideoLimits(maximum_frame_pixels=10),
+        ),
+        media.UnsupportedVideo,
+    )
+    assert not output.exists()
+    assert isinstance(
+        prepare_video_episode(source_video, output, VideoImportConfig(duration_s=1)),
+        ImportedVideoEpisode,
+    )
+    missing_tool = tmp_path / "missing-ffprobe"
+    monkeypatch.setattr(media, "ffprobe_path", lambda: missing_tool)
+    with pytest.raises(media.MediaToolError):
+        prepare_video_episode(
+            source_video, tmp_path / "absent.mcap", VideoImportConfig(duration_s=1)
+        )
+    assert not (tmp_path / "absent.mcap").exists()
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [VideoLimits(maximum_frame_pixels=160 * 90), VideoLimits(maximum_frames_per_second=4)],
+)
+def test_both_import_entrypoints_reject_output_exceeding_limits(
+    source_video: Path, tmp_path: Path, limits: VideoLimits
+) -> None:
+    from hflow.importers.video import prepare_video_episode
+    from hflow.media import UnsupportedVideo
+
+    config = VideoImportConfig(duration_s=1)
+    output_path = tmp_path / "unsupported.mcap"
+    with pytest.raises(ValueError, match="output exceeds supported limits"):
+        import_video_episode(source_video, output_path, config, limits=limits)
+    assert isinstance(
+        prepare_video_episode(source_video, output_path, config, limits=limits), UnsupportedVideo
+    )
+    assert not output_path.exists()
+    assert not tuple(tmp_path.glob(".video-import-*"))
+
+
+def test_window_preparation_preserves_requested_sampling_and_first_video_stream(
+    source_video: Path, tmp_path: Path
+) -> None:
+    from hflow.media import PreparedVideoWindow, VideoWindow, prepare_video_window
+
+    multiple_streams = tmp_path / "multiple.mp4"
+    subprocess.run(
+        [
+            str(ffmpeg_path()),
+            "-v",
+            "error",
+            "-i",
+            str(source_video),
+            "-f",
+            "lavfi",
+            "-i",
+            "color=green:size=320x180:rate=4:duration=2",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:v:0",
+            "-c:v",
+            "libx264",
+            str(multiple_streams),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    output = tmp_path / "window.mp4"
+    prepared = prepare_video_window(multiple_streams, output, VideoWindow(0.5, 1.0, 4.0))
+    assert isinstance(prepared, PreparedVideoWindow)
+    assert prepared.properties.width == 160
+    assert prepared.properties.height == 90
+    assert prepared.properties.duration_seconds == 1
+    assert prepared.properties.frames_per_second == 4
+    with pytest.raises(FileExistsError):
+        prepare_video_window(multiple_streams, output, VideoWindow(0.5, 1, 4))
+    assert not tuple(tmp_path.glob(".video-window-*"))
+
+
+def test_tagged_video_duration_is_shared_by_probe_and_import(
+    source_video: Path, tmp_path: Path
+) -> None:
+    from hflow.importers.video import ImportedVideoEpisode, prepare_video_episode
+
+    matroska = tmp_path / "source.mkv"
+    subprocess.run(
+        [str(ffmpeg_path()), "-v", "error", "-i", str(source_video), "-c", "copy", str(matroska)],
+        check=True,
+        capture_output=True,
+    )
+    outcome = prepare_video_episode(
+        matroska, tmp_path / "tagged.mcap", VideoImportConfig(duration_s=1, image_hz=4)
+    )
+    assert isinstance(outcome, ImportedVideoEpisode)
+    assert len(hflow.Episode(outcome.path).channel("/camera/compressed")) == 4

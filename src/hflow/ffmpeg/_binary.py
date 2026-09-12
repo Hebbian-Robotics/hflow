@@ -33,7 +33,6 @@ import logging
 import os
 import platform
 import shutil
-import subprocess
 import tarfile
 import tempfile
 from dataclasses import dataclass
@@ -265,13 +264,13 @@ def ffprobe_path() -> Path:
 
 
 def _first_version_line(binary: Path) -> str:
-    completed = subprocess.run(
-        [str(binary), "-version"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return completed.stdout.splitlines()[0].strip()
+    from hflow.ffmpeg._process import MediaToolError, run_media_command
+
+    completed = run_media_command([str(binary), "-version"], timeout_seconds=10)
+    lines = completed.stdout.decode(errors="replace").splitlines()
+    if completed.returncode or not lines:
+        raise MediaToolError("media binary version is unavailable")
+    return lines[0].strip()
 
 
 @lru_cache(maxsize=1)

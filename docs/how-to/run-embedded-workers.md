@@ -139,8 +139,9 @@ The importer reads a local video and emits an input-shaped MCAP for the normal
 canonical transform. It selects the first video stream, resamples the requested
 excerpt to a fixed image rate, and letterboxes to the configured dimensions;
 it is not a lossless video archival operation. The default image dimensions are
-640 × 360. The stream must declare its duration (as MP4 streams do); sources
-without a known duration are refused rather than silently truncating an excerpt.
+640 × 360. Duration comes from the selected video stream, its duration tag, or
+a single-stream container. Sources without a known video duration are refused
+rather than silently truncating an excerpt.
 Timestamp zero is the excerpt start unless `start_time_ns` is supplied;
 the importer does not infer an absolute recording time. It does not invent
 task, operator, or success labels. Caller metadata and importer provenance are
@@ -150,3 +151,7 @@ The output is published only after a successful import, existing destinations
 are refused, and temporary conversion files are removed on failure. Downloading
 objects, selecting shards, and retaining originals remain the caller's job.
 For generated fixtures and injected faults, keep using `hflow.testing`.
+
+For explicit unreadable/unsupported outcomes, resource limits, verified source
+downloads, typed evidence, and selected result exports, see the
+[embedded integration API reference](../EMBEDDED_BOUNDARIES.md).

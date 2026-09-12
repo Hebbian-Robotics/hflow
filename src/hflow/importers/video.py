@@ -1,10 +1,8 @@
 """Import a local video excerpt as an input episode for the processing engine."""
 
 import errno
-import json
 import math
 import os
-import subprocess
 import tempfile
 from dataclasses import dataclass
 from fractions import Fraction
@@ -15,8 +13,10 @@ from mcap.writer import Writer
 from mcap_protobuf.schema import build_file_descriptor_set
 
 from hflow._pinned_asset import sha256_hex_of_file
-from hflow.ffmpeg import ffmpeg_path, ffmpeg_version, ffprobe_path
+from hflow.ffmpeg import ffmpeg_path, ffmpeg_version
+from hflow.ffmpeg._process import media_input_was_rejected, run_media_command
 from hflow.format import METADATA_RECORD_EPISODE, NANOSECONDS_PER_SECOND
+from hflow.media import UnreadableVideo, UnsupportedVideo, VideoLimits, VideoProperties, probe_video
 
 _IMPORT_METADATA_RECORD = "video_import/v1"
 _MAXIMUM_TIMESTAMP_NS = (1 << 64) - 1
@@ -110,44 +110,22 @@ def _sample_timestamp_ns(config: VideoImportConfig, frame_index: int) -> int:
     )
 
 
-def _require_excerpt_duration(source_video: Path, config: VideoImportConfig) -> None:
-    completed = subprocess.run(
-        [
-            str(ffprobe_path()),
-            "-v",
-            "error",
-            "-protocol_whitelist",
-            "file",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=duration",
-            "-of",
-            "json",
-            str(source_video),
-        ],
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode:
-        raise RuntimeError(
-            "could not inspect source video: " + completed.stderr.decode(errors="replace").strip()
-        )
-    source_information = json.loads(completed.stdout)
-    streams = source_information.get("streams", [])
-    if not streams:
-        raise ValueError("source file has no video stream")
-    try:
-        video_duration_s = float(streams[0]["duration"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("source video stream must declare its duration") from error
-    if not math.isfinite(video_duration_s) or video_duration_s <= 0:
-        raise ValueError("source video stream must declare a finite positive duration")
-    if config.source_start_s + config.duration_s > video_duration_s + 1e-6:
-        raise ValueError("the requested excerpt extends past the source video")
+class _UnreadableImport(RuntimeError):
+    pass
 
 
-def _render_frames(source_video: Path, config: VideoImportConfig, working_directory: Path) -> None:
+class _UnsupportedExcerpt(ValueError):
+    pass
+
+
+def _require_excerpt_duration(properties: VideoProperties, config: VideoImportConfig) -> None:
+    if config.source_start_s + config.duration_s > float(properties.duration_seconds) + 1e-6:
+        raise _UnsupportedExcerpt("the requested excerpt extends past the source video")
+
+
+def _render_frames(
+    source_video: Path, config: VideoImportConfig, working_directory: Path, limits: VideoLimits
+) -> None:
     # Keep the preceding keyframe's negative, excerpt-relative timestamps.
     # Accurate seeking would discard the frame covering a non-frame-aligned
     # start, letting fps pad the excerpt with a later (potentially different)
@@ -159,7 +137,7 @@ def _render_frames(source_video: Path, config: VideoImportConfig, working_direct
         "force_original_aspect_ratio=decrease:flags=lanczos,"
         f"pad={config.image_width}:{config.image_height}:(ow-iw)/2:(oh-ih)/2:black"
     )
-    completed = subprocess.run(
+    completed = run_media_command(
         [
             str(ffmpeg_path()),
             "-hide_banner",
@@ -191,22 +169,25 @@ def _render_frames(source_video: Path, config: VideoImportConfig, working_direct
             "image2",
             str(working_directory / "frame_%010d.jpg"),
         ],
-        capture_output=True,
-        check=False,
+        timeout_seconds=limits.timeout_seconds,
+        maximum_output_bytes=limits.maximum_probe_bytes,
     )
-    if completed.returncode:
-        raise RuntimeError(
-            "could not decode source video: " + completed.stderr.decode(errors="replace").strip()
-        )
+    if media_input_was_rejected(completed):
+        raise _UnreadableImport("could not decode source video")
 
 
 def import_video_episode(
-    source_video: Path | str, output: Path | str, config: VideoImportConfig
+    source_video: Path | str,
+    output: Path | str,
+    config: VideoImportConfig,
+    *,
+    limits: VideoLimits = VideoLimits(),
 ) -> Path:
     """Import a local excerpt into an MCAP for :meth:`hflow.App.process`.
 
-    The first video stream must declare its duration (as MP4 video streams
-    do). Missing, incomplete, corrupt, or out-of-range excerpts raise without
+    The first video stream must have a known duration from stream metadata,
+    a duration tag, or an unambiguous single-stream container. Missing,
+    incomplete, corrupt, or out-of-range excerpts raise without
     publishing an output. URL inputs and network references are not read.
     FFmpeg uses HFlow's usual managed-binary policy.
 
@@ -227,12 +208,37 @@ def import_video_episode(
     output_path = Path(output)
     if output_path.exists() or output_path.is_symlink():
         raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(output_path))
-    _require_excerpt_duration(source_video_path, config)
+    inspection = probe_video(source_video_path, limits=limits)
+    match inspection:
+        case UnreadableVideo():
+            raise _UnreadableImport("could not inspect source video")
+        case UnsupportedVideo():
+            raise _UnsupportedExcerpt("source video exceeds supported limits")
+        case VideoProperties():
+            return _import_inspected_video(
+                source_video_path, output_path, config, limits, inspection
+            )
+
+
+def _import_inspected_video(
+    source_video_path: Path,
+    output_path: Path,
+    config: VideoImportConfig,
+    limits: VideoLimits,
+    properties: VideoProperties,
+) -> Path:
+    if (
+        config.image_width * config.image_height > limits.maximum_frame_pixels
+        or config.image_hz > limits.maximum_frames_per_second
+        or config.duration_s > limits.maximum_duration_seconds
+    ):
+        raise _UnsupportedExcerpt("requested video output exceeds supported limits")
+    _require_excerpt_duration(properties, config)
     source_sha256 = sha256_hex_of_file(source_video_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=output_path.parent, prefix=".video-import-") as directory:
         working_directory = Path(directory)
-        _render_frames(source_video_path, config, working_directory)
+        _render_frames(source_video_path, config, working_directory, limits)
         staged_episode = working_directory / "episode.mcap"
         with staged_episode.open("wb") as output_stream:
             writer = Writer(output_stream)
@@ -267,7 +273,7 @@ def import_video_episode(
             for frame_index in range(config.frame_count):
                 frame_path = working_directory / f"frame_{frame_index + 1:010d}.jpg"
                 if not frame_path.is_file():
-                    raise RuntimeError(
+                    raise _UnreadableImport(
                         f"expected {config.frame_count} video samples, decoded only {frame_index}"
                     )
                 timestamp_ns = _sample_timestamp_ns(config, frame_index)
@@ -291,3 +297,37 @@ def import_video_episode(
         # rename/replace would overwrite a concurrent caller's finished file.
         os.link(staged_episode, output_path)
     return output_path
+
+
+@dataclass(frozen=True)
+class ImportedVideoEpisode:
+    path: Path
+
+
+def prepare_video_episode(
+    source_video: Path,
+    output: Path,
+    config: VideoImportConfig,
+    *,
+    limits: VideoLimits = VideoLimits(),
+) -> ImportedVideoEpisode | UnreadableVideo | UnsupportedVideo:
+    """Import supported media with explicit rejection outcomes.
+
+    Unlike rejection outcomes, operational errors propagate to the caller.
+    Output and sampling semantics are identical to import_video_episode.
+    """
+    inspection = probe_video(source_video, limits=limits)
+    if not isinstance(inspection, VideoProperties):
+        return inspection
+    try:
+        if output.exists() or output.is_symlink():
+            raise FileExistsError("episode output already exists")
+        return ImportedVideoEpisode(
+            _import_inspected_video(
+                source_video.resolve(strict=True), output, config, limits, inspection
+            )
+        )
+    except _UnreadableImport:
+        return UnreadableVideo()
+    except _UnsupportedExcerpt:
+        return UnsupportedVideo()

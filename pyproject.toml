@@ -1,6 +1,6 @@
 [project]
 name = "hflow"
-version = "0.2.6"
+version = "0.2.7"
 description = "Open source SDK for building Physical AI data pipelines"
 readme = "README.md"
 license = "Apache-2.0"
@@ -82,6 +82,8 @@ requires = ["uv_build>=0.12.5,<0.13"]
 build-backend = "uv_build"
 
 [tool.uv]
+# Local non-editable consumers must rebuild when SDK implementation changes.
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.py" }]
 # Supply-chain hardening: refuse PyPI releases younger than 5 days.
 # Override per-package via `exclude-newer-package = { foo = false }` for
 # trusted first-party packages.
