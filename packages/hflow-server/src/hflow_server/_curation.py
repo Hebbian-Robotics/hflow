@@ -158,6 +158,38 @@ def _bad_sql_refusal(error: duckdb.Error) -> HTTPException:
     return HTTPException(status_code=400, detail=str(error))
 
 
+# DuckDB appends a location block to parser, binder, and catalog errors: a
+# "LINE n: <query text>" echo of the statement it executed plus a caret line
+# pointing into it.
+_LOCATION_ECHO_PATTERN = re.compile(r"^LINE \d+: ")
+
+
+def _wrapper_execution_refusal(error: duckdb.Error) -> HTTPException:
+    """A 400 carrying DuckDB's diagnostic, minus the echoed rewrite (#482).
+
+    Inside preview every executed statement is one of this module's wrappers
+    (``DESCRIBE SELECT * FROM (...)``, the LIMIT projection, the count, the
+    SUMMARIZE), never the caller's SQL verbatim: the gate already parsed that
+    standalone before preview ran. So a location block here always quotes a
+    rewrite the caller never sent, with a caret pointing into it. The
+    diagnostic sentences above the block are about the caller's SQL and
+    survive unchanged; parse errors of the caller's own text keep their full
+    message through :func:`_bad_sql_refusal` at the gate.
+    """
+    kept_lines: list[str] = []
+    dropping_caret = False
+    for line in str(error).splitlines():
+        if _LOCATION_ECHO_PATTERN.match(line):
+            dropping_caret = True
+            continue
+        if dropping_caret and line.strip() == "^":
+            dropping_caret = False
+            continue
+        dropping_caret = False
+        kept_lines.append(line)
+    return HTTPException(status_code=400, detail="\n".join(kept_lines).rstrip())
+
+
 def _reject_non_single_select(user_sql: str) -> None:
     """Refuse anything that is not exactly one SELECT statement.
 
@@ -330,7 +362,7 @@ def create_curation_router(settings: ServerSettings) -> APIRouter:
                     connection, user_sql, limit=request.limit, include_stats=request.stats
                 )
             except duckdb.Error as error:
-                raise _bad_sql_refusal(error) from error
+                raise _wrapper_execution_refusal(error) from error
 
     @router.post("/curation/report")
     def run_curation_report(request: ReportRequest) -> CurationReportResponse:
