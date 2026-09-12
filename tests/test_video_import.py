@@ -215,12 +215,18 @@ def test_invalid_sources_and_incomplete_excerpts_publish_nothing(
     [
         {"duration_s": 0},
         {"duration_s": float("nan")},
+        {"duration_s": "fast"},
         {"source_start_s": -1},
+        {"source_start_s": False},
         {"image_hz": 0},
         {"image_hz": float("inf")},
+        {"image_width": 0},
         {"image_width": 3},
+        {"image_height": 3},
         {"image_height": True},
         {"start_time_ns": -1},
+        {"start_time_ns": True},
+        {"start_time_ns": (1 << 64)},
         {"start_time_ns": (1 << 64) - 1},
         {"camera_name": ""},
         {"metadata": (("task", "one"), ("task", "two"))},
@@ -344,3 +350,37 @@ def test_tagged_video_duration_is_shared_by_probe_and_import(
     )
     assert isinstance(outcome, ImportedVideoEpisode)
     assert len(hflow.Episode(outcome.path).channel("/camera/compressed")) == 4
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("image_width", 0, "image_width must be > 0, got 0"),
+        ("image_width", 3, "image_width must be an even integer, got 3"),
+        ("image_height", -4, "image_height must be > 0, got -4"),
+        ("image_height", 3, "image_height must be an even integer, got 3"),
+    ],
+)
+def test_image_dimensions_distinguish_non_positive_from_odd(
+    field: str, value: object, message: str
+) -> None:
+    """Positivity comes from the shared guard; evenness keeps its own message."""
+    with pytest.raises(ValueError, match=f"^{message}$"):
+        replace(VideoImportConfig(duration_s=1), **{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("duration_s", "fast", "duration_s must be an int or float, got str"),
+        ("duration_s", float("nan"), "duration_s must be finite, got nan"),
+        ("source_start_s", False, "source_start_s must be an int or float, got bool"),
+        ("image_hz", float("inf"), "image_hz must be finite, got inf"),
+    ],
+)
+def test_finite_fields_name_the_field_and_the_defect(
+    field: str, value: object, message: str
+) -> None:
+    """The shared guard splits the old blanket message into type vs finiteness."""
+    with pytest.raises(ValueError, match=f"^{message}$"):
+        replace(VideoImportConfig(duration_s=1), **{field: value})

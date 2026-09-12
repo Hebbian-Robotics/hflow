@@ -12,6 +12,11 @@ from foxglove_schemas_protobuf.CompressedImage_pb2 import CompressedImage
 from mcap.writer import Writer
 from mcap_protobuf.schema import build_file_descriptor_set
 
+from hflow._field_guards import (
+    require_finite_float,
+    require_int_in_range,
+    require_positive_int,
+)
 from hflow._pinned_asset import sha256_hex_of_file
 from hflow.ffmpeg import ffmpeg_path, ffmpeg_version
 from hflow.ffmpeg._process import media_input_was_rejected, run_media_command
@@ -52,10 +57,7 @@ class VideoImportConfig:
             ("source_start_s", self.source_start_s),
             ("image_hz", self.image_hz),
         ):
-            if isinstance(value, bool) or not isinstance(value, int | float):
-                raise ValueError(f"{name} must be a finite number")
-            if not math.isfinite(value):
-                raise ValueError(f"{name} must be a finite number")
+            require_finite_float(value, name)
         if self.duration_s <= 0 or self.source_start_s < 0:
             raise ValueError("duration_s must be positive and source_start_s nonnegative")
         if not 0 < self.image_hz <= NANOSECONDS_PER_SECOND:
@@ -66,14 +68,16 @@ class VideoImportConfig:
             ("image_width", self.image_width),
             ("image_height", self.image_height),
         ):
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0 or value % 2:
-                raise ValueError(f"{name} must be a positive even integer")
-        if (
-            isinstance(self.start_time_ns, bool)
-            or not isinstance(self.start_time_ns, int)
-            or not 0 <= self.start_time_ns <= _MAXIMUM_TIMESTAMP_NS
-        ):
-            raise ValueError("start_time_ns must be an unsigned 64-bit integer")
+            require_positive_int(value, name)
+            # H.264 chroma subsampling needs even dimensions. Evenness is a
+            # domain rule about this config, not a shared numeric invariant,
+            # so it stays here with its own message instead of moving into
+            # _field_guards (see #508).
+            if value % 2:
+                raise ValueError(f"{name} must be an even integer, got {value}")
+        require_int_in_range(
+            self.start_time_ns, "start_time_ns", minimum=0, maximum=_MAXIMUM_TIMESTAMP_NS
+        )
         if self.frame_count > (1 << 32):
             raise ValueError("the excerpt exceeds the MCAP sequence number range")
         final_timestamp_ns = _sample_timestamp_ns(self, self.frame_count - 1)
