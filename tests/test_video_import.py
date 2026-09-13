@@ -211,23 +211,32 @@ def test_invalid_sources_and_incomplete_excerpts_publish_nothing(
 
 
 @pytest.mark.parametrize(
-    "config",
+    ("config", "refusal"),
     [
-        {"duration_s": 0},
-        {"duration_s": float("nan")},
-        {"source_start_s": -1},
-        {"image_hz": 0},
-        {"image_hz": float("inf")},
-        {"image_width": 3},
-        {"image_height": True},
-        {"start_time_ns": -1},
-        {"start_time_ns": (1 << 64) - 1},
-        {"camera_name": ""},
-        {"metadata": (("task", "one"), ("task", "two"))},
+        ({"duration_s": 0}, r"duration_s must be positive"),
+        ({"duration_s": True}, r"duration_s must be an int or float, got bool"),
+        ({"duration_s": "1"}, r"duration_s must be an int or float, got str"),
+        ({"duration_s": float("nan")}, r"duration_s must be finite, got nan"),
+        ({"source_start_s": -1}, r"source_start_s nonnegative"),
+        ({"image_hz": 0}, r"image_hz must be positive"),
+        ({"image_hz": float("inf")}, r"image_hz must be finite, got inf"),
+        ({"image_width": 0}, r"image_width must be > 0, got 0"),
+        ({"image_width": -2}, r"image_width must be > 0, got -2"),
+        ({"image_width": 3}, r"image_width must be even, got 3"),
+        ({"image_height": True}, r"image_height must be an int, got bool"),
+        ({"image_height": 359}, r"image_height must be even, got 359"),
+        ({"start_time_ns": False}, r"start_time_ns must be an int, got bool"),
+        ({"start_time_ns": -1}, r"start_time_ns must be in \[0, 18446744073709551615\], got -1"),
+        ({"start_time_ns": 1 << 64}, r"start_time_ns must be in \[0, 18446744073709551615\]"),
+        # The maximum start time is accepted by the range guard; what refuses
+        # it is the excerpt's final sample landing past the MCAP range.
+        ({"start_time_ns": (1 << 64) - 1}, r"excerpt exceeds the MCAP timestamp range"),
+        ({"camera_name": ""}, r"camera_name must be nonempty"),
+        ({"metadata": (("task", "one"), ("task", "two"))}, r"duplicate key 'task'"),
     ],
 )
-def test_invalid_import_configuration_is_rejected(config: dict[str, object]) -> None:
-    with pytest.raises(ValueError):
+def test_invalid_import_configuration_is_rejected(config: dict[str, object], refusal: str) -> None:
+    with pytest.raises(ValueError, match=refusal):
         replace(VideoImportConfig(duration_s=1), **config)
 
 
