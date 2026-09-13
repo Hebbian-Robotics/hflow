@@ -384,3 +384,11 @@ def test_finite_fields_name_the_field_and_the_defect(
     """The shared guard splits the old blanket message into type vs finiteness."""
     with pytest.raises(ValueError, match=f"^{message}$"):
         replace(VideoImportConfig(duration_s=1), **{field: value})
+
+
+def test_start_time_upper_bound_uses_field_guard() -> None:
+    """The field guard owns the start_time_ns upper-bound refusal."""
+    value = 1 << 64
+    with pytest.raises(ValueError) as exc_info:
+        replace(VideoImportConfig(duration_s=1), start_time_ns=value)
+    assert str(exc_info.value) == (f"start_time_ns must be in [0, {value - 1}], got {value}")
