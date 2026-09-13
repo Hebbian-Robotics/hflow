@@ -160,7 +160,7 @@ def _write_shard_tar(
     video_source: Path,
     factory_id: str,
     worker_id: str,
-) -> str:
+) -> tuple[str, str, str]:
     """One pinned shard tar: a single video plus its sidecar.
 
     Returns the archive sha256 so the manifest can pin it.
