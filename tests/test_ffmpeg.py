@@ -5,6 +5,8 @@ resolution tests below must clear the ``lru_cache`` around any environment
 mutation. The one real-download test is opt-in via ``HFLOW_NETWORK_TESTS=1``.
 """
 
+import calendar
+import datetime
 import hashlib
 import logging
 import os
@@ -12,6 +14,7 @@ import platform
 import shutil
 import subprocess
 import tarfile
+import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -47,6 +50,8 @@ from hflow.ffmpeg import _binary, _contact_sheet
 from hflow.ffmpeg._binary import (
     FFMPEG_ENV_VAR,
     FFPROBE_ENV_VAR,
+    PINNED_BUILDS_BY_MACHINE,
+    PINNED_RELEASE_TAG,
     PINNED_VERSION_LABEL,
     FfmpegNotFoundError,
     FfprobeNotFoundError,
@@ -296,6 +301,42 @@ def test_cache_dir_with_only_ffmpeg_is_healed_by_reinstall(
     # The heal reinstalled ffmpeg from the fresh archive too, not just ffprobe.
     assert (install_dir / "ffmpeg").read_text() != stale_ffmpeg_contents
     assert ffmpeg_path() == install_dir / "ffmpeg"
+
+
+def test_pinned_release_tag_is_a_month_final_build() -> None:
+    """The pin must survive BtbN's retention policy, which keeps the last ~14
+    daily builds plus each month's FINAL build (kept two years). A mid-month
+    daily pin therefore 404s for fresh installs about a fortnight after it is
+    chosen, which is #521. Every surviving month-final tag observed on the
+    release list (2026-02 through 2026-08, including February's 28th) falls on
+    the last calendar day of its month, so that is the enforced rule. If BtbN
+    ever skips a month-end build, the true month-final lands a day early and
+    this test refuses it: that failure is deliberate, forcing whoever updates
+    the pin to re-verify retention rather than trust the tag's shape."""
+    _, year, month, day = PINNED_RELEASE_TAG.split("-")[:4]
+    tag_date = datetime.date(int(year), int(month), int(day))
+    days_in_month = calendar.monthrange(tag_date.year, tag_date.month)[1]
+    assert tag_date.day == days_in_month, (
+        f"{PINNED_RELEASE_TAG} is a daily build, not a month-final one: BtbN deletes "
+        f"it about fourteen days after publication and every fresh Linux install "
+        f"404s from then on (#521). Pin the autobuild tag dated the last day of a "
+        f"month instead."
+    )
+
+
+@pytest.mark.skipif(
+    os.environ.get("HFLOW_NETWORK_TESTS") != "1",
+    reason="network integration test; set HFLOW_NETWORK_TESTS=1 to run",
+)
+def test_pinned_urls_are_reachable() -> None:
+    """A HEAD against every pinned asset URL, cheap enough to run on a
+    schedule: it turns a silent upstream expiry into a signal before a fresh
+    install finds it (#521). The full download test below proves identity and
+    extraction; this one proves availability, the property that failed."""
+    for machine, build in sorted(PINNED_BUILDS_BY_MACHINE.items()):
+        request = urllib.request.Request(build.url, method="HEAD")
+        with urllib.request.urlopen(request, timeout=30) as response:
+            assert response.status == 200, (machine, build.url, response.status)
 
 
 @pytest.mark.skipif(

@@ -1,0 +1,33 @@
+name: pinned-assets
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    # Weekly. BtbN deletes daily builds about fourteen days after publication,
+    # so a wrongly pinned daily is caught while it is still downloadable, and
+    # an upstream expiry of the month-final pin becomes a red run within a
+    # week instead of a fresh install's 404 (#521).
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+jobs:
+  reachability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install ffmpeg (the suite conftest pins to the system binary)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: "3.14"
+      - name: Sync environment
+        run: uv sync --locked
+      - name: Verify the pinned ffmpeg assets are still retained upstream
+        env:
+          HFLOW_NETWORK_TESTS: "1"
+        run: >-
+          uv run pytest -q
+          "tests/test_ffmpeg.py::test_pinned_urls_are_reachable"
+          "tests/test_ffmpeg.py::test_pinned_release_tag_is_a_month_final_build"
