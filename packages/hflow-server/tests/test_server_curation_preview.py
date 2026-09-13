@@ -132,6 +132,29 @@ def test_preview_bad_sql_is_400_with_the_duckdb_message(api: TestClient) -> None
     assert "no_such_table" in unknown_table.json()["detail"]
 
 
+def test_preview_binder_and_catalog_errors_never_quote_the_wrapper(api: TestClient) -> None:
+    """DuckDB's diagnostic survives, but the location block does not: binder
+    and catalog errors are found while executing the preview's own DESCRIBE
+    rewrite, so their ``LINE n:`` echo and caret point into text the caller
+    never sent (#482). The two errors take different paths through DuckDB, so
+    both are pinned."""
+    binder = api.post("/api/v1/curation/preview", json={"sql": "SELECT nope FROM episodes"})
+    assert binder.status_code == 400
+    assert "Binder Error" in binder.json()["detail"]
+    assert "nope" in binder.json()["detail"]
+
+    catalog = api.post("/api/v1/curation/preview", json={"sql": "SELECT * FROM no_such_table"})
+    assert catalog.status_code == 400
+    assert "Catalog Error" in catalog.json()["detail"]
+    assert "no_such_table" in catalog.json()["detail"]
+
+    for response in (binder, catalog):
+        detail = response.json()["detail"]
+        assert "DESCRIBE SELECT * FROM" not in detail
+        assert "LINE 1:" not in detail
+        assert "^" not in detail
+
+
 def test_preview_refuses_a_paren_closing_smuggle_as_400_not_500(api: TestClient) -> None:
     # This shape closes the subquery wrapper's paren and smuggles a second
     # statement; it used to 500 (an unhandled IndexError), and its CREATE
