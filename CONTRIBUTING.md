@@ -123,6 +123,23 @@ HFLOW_TEST_BUCKET_URL=gs://your-bucket/tmp-prefix uv run pytest tests/test_stora
 HFLOW_MEDIAPIPE_TESTS=1 uv run --extra mediapipe pytest tests/test_mediapipe_hands.py -q
 ```
 
+Normal CI uses system FFmpeg and does not check the managed Linux download.
+For a cheap availability check of both pinned Linux archives, run:
+
+```bash
+HFLOW_NETWORK_TESTS=1 uv run pytest tests/test_ffmpeg.py::test_pinned_release_assets_available -q
+```
+
+This follows release-asset redirects with HTTP HEAD, without downloading the
+archives. The publish workflow runs it before building distributions; there
+is no scheduled check between releases. The separate
+`test_real_pinned_download_and_version` downloads into an isolated cache and
+executes both binaries for the host architecture. Run it when changing the
+pin, and independently download, hash, and inspect the other architecture's
+archive. Select the last successful BtbN build of a completed month from its
+release list: these are retained for two years, while ordinary daily builds
+expire quickly. A tag's calendar date alone cannot establish retention.
+
 The MediaPipe one brings its own OpenCV, and the OpenCV wheels share one
 `cv2/` directory, so syncing back out can leave `import cv2` broken while
 `uv sync` still calls the environment correct. One command puts it back:

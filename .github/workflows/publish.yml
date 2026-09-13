@@ -24,6 +24,10 @@ jobs:
             echo "Release tag ${GITHUB_REF_NAME} must equal v${package_version}." >&2
             exit 1
           fi
+      - name: Check both pinned Linux FFmpeg assets are available
+        env:
+          HFLOW_NETWORK_TESTS: "1"
+        run: uv run --locked pytest tests/test_ffmpeg.py::test_pinned_release_assets_available -q
       - name: Build distributions
         run: uv build
       - name: Smoke-test the wheel in a clean environment

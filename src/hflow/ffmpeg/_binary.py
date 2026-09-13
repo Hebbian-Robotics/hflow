@@ -9,7 +9,7 @@ policy. Resolution order for ffmpeg:
 1. Explicit user override via ``HFLOW_FFMPEG`` (a deliberate choice;
    used by tests and users with their own managed builds).
 2. The pinned static build, auto-downloaded once into the user cache dir and
-   sha256-verified (Linux x86_64/aarch64 from BtbN/FFmpeg-Builds immutable
+   sha256-verified (Linux x86_64/aarch64 from BtbN/FFmpeg-Builds dated
    release assets; Windows runs the Linux path under WSL2). On Linux there is
    deliberately NO PATH fallback: either the pinned build resolves or we raise
    with instructions, so two Linux machines can never silently disagree.
@@ -55,11 +55,13 @@ FFPROBE_ENV_VAR = "HFLOW_FFPROBE"
 # BOTH in the versioned install dir is the completion condition.
 _PINNED_BINARY_NAMES = ("ffmpeg", "ffprobe")
 
-# The pinned build is a dated BtbN/FFmpeg-Builds autobuild tag (NOT the
-# floating "latest" tag): dated release assets are immutable, so the URL and
-# bytes below can never change underneath the sha256 pins.
-PINNED_RELEASE_TAG = "autobuild-2026-08-16-13-00"
-PINNED_VERSION_LABEL = "n8.1.2-44-g7c533d0f86"
+# SHA256 pins prevent silently accepting changed bytes; they do not keep assets
+# available. Choose the last successful build of a completed month from BtbN's
+# release list (not just a calendar month-end date): it is retained for two years,
+# while ordinary daily builds expire quickly. Refresh before that retention ends;
+# never pin the floating "latest" tag.
+PINNED_RELEASE_TAG = "autobuild-2026-08-31-13-27"
+PINNED_VERSION_LABEL = "n8.1.2-50-g1a748fe2cd"
 
 _RELEASE_DOWNLOAD_BASE_URL = (
     f"https://github.com/BtbN/FFmpeg-Builds/releases/download/{PINNED_RELEASE_TAG}"
@@ -80,12 +82,12 @@ class PinnedBuild:
 PINNED_BUILDS_BY_MACHINE: dict[str, PinnedBuild] = {
     "x86_64": PinnedBuild(
         url=f"{_RELEASE_DOWNLOAD_BASE_URL}/ffmpeg-{PINNED_VERSION_LABEL}-linux64-gpl-8.1.tar.xz",
-        sha256_hex="17780994c4679806fb227676f66a0af30c6379afc770324829f48f2a379be558",
+        sha256_hex="c733b4b2951e5957e15505f788b2c65a7a41b6da4b289e295852cc38079b4d2b",
         archive_bin_dir=f"ffmpeg-{PINNED_VERSION_LABEL}-linux64-gpl-8.1/bin",
     ),
     "aarch64": PinnedBuild(
         url=f"{_RELEASE_DOWNLOAD_BASE_URL}/ffmpeg-{PINNED_VERSION_LABEL}-linuxarm64-gpl-8.1.tar.xz",
-        sha256_hex="e970a7dd450b440a21126a8bac3a1c95178b6ba05bee2465a4d2a586345c81ac",
+        sha256_hex="ae5da4f51b9052390f414005f8ab26c1eed1268f327cce7cb79aa076b29bd66e",
         archive_bin_dir=f"ffmpeg-{PINNED_VERSION_LABEL}-linuxarm64-gpl-8.1/bin",
     ),
 }

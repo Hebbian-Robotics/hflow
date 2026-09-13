@@ -2,7 +2,8 @@
 
 The suite conftest pins ``HFLOW_FFMPEG`` to the system binary, so the
 resolution tests below must clear the ``lru_cache`` around any environment
-mutation. The one real-download test is opt-in via ``HFLOW_NETWORK_TESTS=1``.
+mutation. Remote availability and real-download tests are opt-in via
+``HFLOW_NETWORK_TESTS=1``.
 """
 
 import hashlib
@@ -15,6 +16,7 @@ import tarfile
 from collections.abc import Iterator
 from pathlib import Path
 
+import httpx2
 import numpy as np
 import pytest
 
@@ -302,16 +304,36 @@ def test_cache_dir_with_only_ffmpeg_is_healed_by_reinstall(
     os.environ.get("HFLOW_NETWORK_TESTS") != "1",
     reason="network integration test; set HFLOW_NETWORK_TESTS=1 to run",
 )
+@pytest.mark.parametrize("machine", ["x86_64", "aarch64"])
+def test_pinned_release_assets_available(machine: str) -> None:
+    """Probe both remote pins without downloading either archive or using the cache."""
+    build = _binary.PINNED_BUILDS_BY_MACHINE[machine]
+    try:
+        # Preserve HEAD across GitHub's redirect, including on Python 3.11.
+        response = httpx2.head(build.url, follow_redirects=True, timeout=30)
+    except httpx2.HTTPError as error:
+        pytest.fail(f"pinned FFmpeg asset unavailable for {machine}: {build.url}: {error}")
+    assert response.status_code == 200, (
+        f"pinned FFmpeg asset unavailable for {machine}: {build.url} (HTTP {response.status_code})"
+    )
+
+
+@pytest.mark.skipif(
+    os.environ.get("HFLOW_NETWORK_TESTS") != "1",
+    reason="network integration test; set HFLOW_NETWORK_TESTS=1 to run",
+)
 @pytest.mark.skipif(
     platform.system() != "Linux" or platform.machine() not in ("x86_64", "aarch64"),
     reason="pinned builds exist for Linux x86_64/aarch64 only",
 )
 def test_real_pinned_download_and_version(
-    monkeypatch: pytest.MonkeyPatch, cleared_binary_caches: None
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cleared_binary_caches: None
 ) -> None:
     monkeypatch.delenv(FFMPEG_ENV_VAR, raising=False)
     monkeypatch.delenv(FFPROBE_ENV_VAR, raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     resolved = ffmpeg_path()
+    assert resolved == _pinned_install_dir(platform.machine()) / "ffmpeg"
     assert resolved.is_file()
     version_line = ffmpeg_version()
     assert PINNED_VERSION_LABEL in version_line
