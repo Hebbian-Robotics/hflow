@@ -1,8 +1,12 @@
 """The egocentric converter lands H.264 directly and preserves its planted faults."""
 
+import hashlib
 import importlib.util
+import io
+import json
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 from types import ModuleType
 
@@ -124,7 +128,10 @@ def test_egocentric_h264_lands_once_and_faults_survive_transform(
     landing_path = tmp_path / f"{fault}.mcap"
     canonical_path = tmp_path / f"{fault}.canonical.mcap"
 
-    PREPARE._write_video_episode(moving_hevc_video, landing_path, _manifest(episode), episode, 0)
+    identity = PREPARE.SourceIdentity(factory_id="factory_002", worker_id="worker_001")
+    PREPARE._write_video_episode(
+        moving_hevc_video, landing_path, _manifest(episode), episode, 0, identity
+    )
     write_canonical_episode(landing_path, canonical_path, TransformConfig())
 
     landing_schemas, landing_payloads = _video_payloads(landing_path)
@@ -145,3 +152,146 @@ def test_egocentric_h264_lands_once_and_faults_survive_transform(
     assert isinstance(freeze_total_seconds, float)
     assert freeze_total_seconds >= 2.0
     assert decoded_frame_count == 200
+
+
+def _write_shard_tar(
+    tar_path: Path,
+    member_stem: str,
+    video_source: Path,
+    factory_id: str,
+    worker_id: str,
+) -> tuple[str, str, str]:
+    """One pinned shard tar: a single video plus its sidecar.
+
+    Returns the archive sha256 so the manifest can pin it.
+    """
+    video_member = f"{member_stem}.mp4"
+    sidecar_member = f"{member_stem}.json"
+    video_bytes = video_source.read_bytes()
+    sidecar = json.dumps(
+        {
+            "factory_id": factory_id,
+            "worker_id": worker_id,
+            "video_index": 0,
+            "duration_sec": 24.0,
+            "width": 160,
+            "height": 90,
+            "fps": 10.0,
+            "size_bytes": len(video_bytes),
+            "codec": "h265",
+        }
+    )
+    with tarfile.open(tar_path, "w") as tar:
+        video_info = tarfile.TarInfo(video_member)
+        video_info.size = len(video_bytes)
+        tar.addfile(video_info, io.BytesIO(video_bytes))
+        sidecar_info = tarfile.TarInfo(sidecar_member)
+        sidecar_info.size = len(sidecar.encode())
+        tar.addfile(sidecar_info, io.BytesIO(sidecar.encode()))
+    return (
+        video_member,
+        hashlib.sha256(video_bytes).hexdigest(),
+        hashlib.sha256(tar_path.read_bytes()).hexdigest(),
+    )
+
+
+def _manifest_json(
+    archive_path: str,
+    archive_sha256: str,
+    member: str,
+    member_sha256: str,
+    task: str,
+) -> str:
+    manifest = {
+        "schema_version": 2,
+        "dataset": {"repo_id": "e/c", "revision": "abc123", "license": "apache-2.0"},
+        "archive": {"path": archive_path, "sha256": archive_sha256},
+        "sources": [
+            {
+                "member": member,
+                "sha256": member_sha256,
+                "duration_s": 24.0,
+                "task": task,
+            }
+        ],
+        "episode_plan": {
+            "total_episodes": 1,
+            "duration_s": 20.0,
+            "first_source_start_s": 1.0,
+            "source_stride_s": 0.0,
+            "faults": [],
+        },
+    }
+    return json.dumps(manifest, indent=2)
+
+
+def _episode_provenance(landing_path: Path) -> dict[str, str]:
+    with Episode(landing_path) as episode:
+        return episode.metadata_records["episode/v1"]
+
+
+def test_two_shards_coexist_in_one_output_root(tmp_path: Path, moving_hevc_video: Path) -> None:
+    """#519: two factories' shards into one output root must coexist. With the
+    old hardcoded ids the second prepare silently overwrote the first."""
+    source_root = tmp_path / "source"
+    output_root = tmp_path / "corpus"
+    shard_specs = [
+        ("factory002_worker001_00000", "factory_002", "worker_001"),
+        ("factory012_worker003_00000", "factory_012", "worker_003"),
+    ]
+    for index, (stem, factory_id, worker_id) in enumerate(shard_specs):
+        tar_path = source_root / "huggingface" / f"shard{index}.tar"
+        tar_path.parent.mkdir(parents=True, exist_ok=True)
+        member, member_sha, archive_sha = _write_shard_tar(
+            tar_path, stem, moving_hevc_video, factory_id, worker_id
+        )
+        manifest_path = tmp_path / f"manifest-{index}.json"
+        manifest_path.write_text(
+            _manifest_json(
+                f"shard{index}.tar", archive_sha, member, member_sha, f"{factory_id} task"
+            ),
+            encoding="utf-8",
+        )
+        PREPARE.prepare_corpus(manifest_path, source_root, output_root)
+
+    landing_paths = sorted((output_root / "landing").glob("*.mcap"))
+    assert len(landing_paths) == len({p.name for p in landing_paths}) == 2, landing_paths
+    for landing_path in (output_root / "landing").glob("*.mcap"):
+        with Episode(landing_path) as episode:
+            metadata = episode.metadata_records["episode/v1"]
+        expected_operator = {
+            "factory002_worker001_00000": "factory_002_worker_001",
+            "factory012_worker003_00000": "factory_012_worker_003",
+        }[metadata["source_member"].rsplit(".", 1)[0]]
+        assert metadata["operator"] == expected_operator, metadata["operator"]
+        assert (
+            metadata["factory"]
+            == expected_operator.split("_")[0] + "_" + expected_operator.split("_")[1]
+        )
+
+
+def test_single_shard_provenance_names_the_real_source(
+    tmp_path: Path, moving_hevc_video: Path
+) -> None:
+    """One shard, one episode: operator and factory come from the sidecar."""
+    source_root = tmp_path / "source"
+    output_root = tmp_path / "corpus"
+    tar_path = source_root / "huggingface" / "shard.tar"
+    tar_path.parent.mkdir(parents=True, exist_ok=True)
+    member, member_sha, archive_sha = _write_shard_tar(
+        tar_path, "factory002_worker001_00000", moving_hevc_video, "factory_002", "worker_001"
+    )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        _manifest_json("shard.tar", archive_sha, member, member_sha, "factory_002 task"),
+        encoding="utf-8",
+    )
+
+    report = PREPARE.prepare_corpus(manifest_path, source_root, output_root)
+
+    assert len(report) == 1
+    with Episode(report[0]) as episode:
+        metadata = episode.metadata_records["episode/v1"]
+    assert metadata["operator"] == "factory_002_worker_001"
+    assert metadata["factory"] == "factory_002"
+    assert metadata["source_member"] == member
