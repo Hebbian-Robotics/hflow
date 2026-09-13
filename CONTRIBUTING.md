@@ -131,8 +131,9 @@ HFLOW_NETWORK_TESTS=1 uv run pytest tests/test_ffmpeg.py::test_pinned_release_as
 ```
 
 This follows release-asset redirects with HTTP HEAD, without downloading the
-archives. The publish workflow runs it before building distributions; there
-is no scheduled check between releases. The separate
+archives. The `pinned-assets` workflow runs it weekly on Mondays and supports
+manual dispatch. The publish workflow repeats it before building distributions.
+The separate
 `test_real_pinned_download_and_version` downloads into an isolated cache and
 executes both binaries for the host architecture. Run it when changing the
 pin, and independently download, hash, and inspect the other architecture's
