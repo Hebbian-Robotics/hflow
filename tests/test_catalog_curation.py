@@ -1278,9 +1278,8 @@ def test_reject_non_single_select_accepts_legal_selects_that_do_not_start_with_s
 
 
 def test_reject_non_single_select_accepts_trailing_line_comment_without_newline() -> None:
-    # Without the fix, ``SELECT * FROM (SELECT 1 -- trailing comment)`` is a
-    # parser error: the trailing line comment swallows the wrapper's closing
-    # paren. Appending a newline before wrapping ends the comment first.
+    # The gate parses the caller's statement directly, so a trailing line
+    # comment needs no wrapper-specific newline workaround.
     reject_non_single_select("SELECT 1 -- trailing comment without newline")
 
 
@@ -2637,3 +2636,22 @@ def test_status_builder_refuses_an_unqualified_column() -> None:
         episode_status_case_sql(
             quarantined_column="quarantined", check_runs_relation="check_runs_latest"
         )
+
+
+def test_reject_non_single_select_parses_user_sql_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_connection = duckdb.connect()
+    parsed: list[str] = []
+
+    class CountingConnection:
+        def extract_statements(self, sql: str) -> object:
+            parsed.append(sql)
+            return real_connection.extract_statements(sql)
+
+        def close(self) -> None:
+            real_connection.close()
+
+    monkeypatch.setattr(duckdb, "connect", lambda: CountingConnection())
+
+    reject_non_single_select("SELECT 1")
+
+    assert parsed == ["SELECT 1"]
