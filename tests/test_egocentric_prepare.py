@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import re
 import subprocess
 import sys
 import tarfile
@@ -154,12 +155,20 @@ def test_egocentric_h264_lands_once_and_faults_survive_transform(
     assert decoded_frame_count == 200
 
 
+def _exactly(message: str) -> str:
+    """A ``match=`` pattern pinning the whole message, metacharacters and all."""
+    return rf"^{re.escape(message)}$"
+
+
 def _write_shard_tar(
     tar_path: Path,
     member_stem: str,
     video_source: Path,
     factory_id: str,
     worker_id: str,
+    *,
+    sidecar_fields: dict[str, object] | None = None,
+    include_sidecar: bool = True,
 ) -> tuple[str, str, str]:
     """One pinned shard tar: a single video plus its sidecar.
 
@@ -168,8 +177,8 @@ def _write_shard_tar(
     video_member = f"{member_stem}.mp4"
     sidecar_member = f"{member_stem}.json"
     video_bytes = video_source.read_bytes()
-    sidecar = json.dumps(
-        {
+    if sidecar_fields is None:
+        sidecar_fields = {
             "factory_id": factory_id,
             "worker_id": worker_id,
             "video_index": 0,
@@ -180,14 +189,15 @@ def _write_shard_tar(
             "size_bytes": len(video_bytes),
             "codec": "h265",
         }
-    )
+    sidecar = json.dumps(sidecar_fields)
     with tarfile.open(tar_path, "w") as tar:
         video_info = tarfile.TarInfo(video_member)
         video_info.size = len(video_bytes)
         tar.addfile(video_info, io.BytesIO(video_bytes))
-        sidecar_info = tarfile.TarInfo(sidecar_member)
-        sidecar_info.size = len(sidecar.encode())
-        tar.addfile(sidecar_info, io.BytesIO(sidecar.encode()))
+        if include_sidecar:
+            sidecar_info = tarfile.TarInfo(sidecar_member)
+            sidecar_info.size = len(sidecar.encode())
+            tar.addfile(sidecar_info, io.BytesIO(sidecar.encode()))
     return (
         video_member,
         hashlib.sha256(video_bytes).hexdigest(),
@@ -295,3 +305,94 @@ def test_single_shard_provenance_names_the_real_source(
     assert metadata["operator"] == "factory_002_worker_001"
     assert metadata["factory"] == "factory_002"
     assert metadata["source_member"] == member
+
+
+def test_same_member_stem_from_two_shards_never_collides(
+    tmp_path: Path, moving_hevc_video: Path
+) -> None:
+    """The digest in the episode id is load-bearing: source basenames are not
+    identities, so two different shards whose members share one stem must land
+    as two episodes instead of the second overwriting the first."""
+    source_root = tmp_path / "source"
+    output_root = tmp_path / "corpus"
+    shared_stem = "factory002_worker001_00000"
+    shard_factories = ["factory_002", "factory_012"]
+    for index, factory_id in enumerate(shard_factories):
+        tar_path = source_root / "huggingface" / f"shard{index}.tar"
+        tar_path.parent.mkdir(parents=True, exist_ok=True)
+        member, member_sha, archive_sha = _write_shard_tar(
+            tar_path, shared_stem, moving_hevc_video, factory_id, "worker_001"
+        )
+        manifest_path = tmp_path / f"manifest-{index}.json"
+        manifest_path.write_text(
+            _manifest_json(
+                f"shard{index}.tar", archive_sha, member, member_sha, f"{factory_id} task"
+            ),
+            encoding="utf-8",
+        )
+        PREPARE.prepare_corpus(manifest_path, source_root, output_root)
+
+    landing_paths = sorted((output_root / "landing").glob("*.mcap"))
+    assert len(landing_paths) == 2, [path.name for path in landing_paths]
+    assert len({path.name for path in landing_paths}) == len(landing_paths)
+    observed = {
+        landing_path.name: _episode_provenance(landing_path)["factory"]
+        for landing_path in landing_paths
+    }
+    assert set(observed.values()) == set(shard_factories), observed
+
+
+@pytest.mark.parametrize(
+    ("sidecar_case", "expected_message"),
+    [
+        (
+            "absent",
+            "missing sidecar 'factory002_worker001_00000.json' for source video "
+            "'factory002_worker001_00000.mp4' in the source archive",
+        ),
+        (
+            "empty_worker_id",
+            "sidecar 'factory002_worker001_00000.json' is missing a usable 'worker_id'",
+        ),
+    ],
+)
+def test_unusable_sidecar_refuses_the_source(
+    tmp_path: Path,
+    moving_hevc_video: Path,
+    sidecar_case: str,
+    expected_message: str,
+) -> None:
+    """A missing or malformed sidecar must fail the prepare loudly, naming the
+    member and the unusable field, instead of stamping false provenance."""
+    source_root = tmp_path / "source"
+    output_root = tmp_path / "corpus"
+    tar_path = source_root / "huggingface" / "shard.tar"
+    tar_path.parent.mkdir(parents=True, exist_ok=True)
+    stem = "factory002_worker001_00000"
+    if sidecar_case == "absent":
+        member, member_sha, archive_sha = _write_shard_tar(
+            tar_path,
+            stem,
+            moving_hevc_video,
+            "factory_002",
+            "worker_001",
+            include_sidecar=False,
+        )
+    else:
+        member, member_sha, archive_sha = _write_shard_tar(
+            tar_path,
+            stem,
+            moving_hevc_video,
+            "factory_002",
+            "worker_001",
+            sidecar_fields={"factory_id": "factory_002", "worker_id": ""},
+        )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        _manifest_json("shard.tar", archive_sha, member, member_sha, "factory_002 task"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match=_exactly(expected_message)):
+        PREPARE.prepare_corpus(manifest_path, source_root, output_root)
+    assert list((output_root / "landing").glob("*.mcap")) == []
