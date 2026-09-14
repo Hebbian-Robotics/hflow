@@ -680,3 +680,77 @@ def test_validate_v3_rejects_missing_video(fake_corpus: dict, tmp_path: Path) ->
     video.unlink()
     with pytest.raises(ValueError, match="references missing video"):
         export._validate_v3(dest)
+
+
+def _add_multitask_labels(corpus: dict, *, invalid_pointer: bool = False) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    root = Path(corpus["cache_dir"])
+    ep_path = root / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    ep_rows = pq.read_table(ep_path).to_pylist()
+    ep_rows[0]["tasks"] = ["pick cup", "place cup"]
+    pq.write_table(pa.Table.from_pylist(ep_rows), ep_path)
+
+    data_path = root / "data" / "chunk-000" / "file-000.parquet"
+    data_rows = pq.read_table(data_path).to_pylist()
+    for row in data_rows:
+        task_index = 1 if row["episode_index"] == 0 and row["frame_index"] >= 30 else 0
+        if invalid_pointer and row["episode_index"] == 0 and row["frame_index"] == 59:
+            task_index = 2
+        row["task_index"] = task_index
+    pq.write_table(pa.Table.from_pylist(data_rows), data_path)
+
+    info_path = root / "meta" / "info.json"
+    info = json.loads(info_path.read_text())
+    info["features"]["task_index"] = {"dtype": "int64", "shape": [1]}
+    info_path.write_text(json.dumps(info))
+
+
+def test_export_preserves_multitask_task_index_labels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    corpus = _fake_corpus(tmp_path)
+    _add_multitask_labels(corpus)
+    _install_fake_import(corpus, tmp_path, monkeypatch)
+    manifest = _fake_manifest(
+        tmp_path, [{"metadata_json": _provenance_meta(0, task="pick cup")}],
+    )
+    dest = tmp_path / "out-multitask"
+    export.export(dest, manifest=manifest, camera_keys=CAMS)
+
+    info = json.loads((dest / "meta" / "info.json").read_text())
+    assert info["features"]["task_index"] == {"dtype": "int64", "shape": [1]}
+
+    conn = duckdb.connect()
+    try:
+        ep_tasks = conn.execute(
+            "SELECT tasks FROM read_parquet(?)",
+            [str(dest / "meta" / "episodes" / "chunk-000" / "file-000.parquet")],
+        ).fetchone()
+        task_indexes = conn.execute(
+            "SELECT min(task_index), max(task_index), count(DISTINCT task_index) "
+            "FROM read_parquet(?)",
+            [str(dest / "data" / "chunk-000" / "file-000.parquet")],
+        ).fetchone()
+    finally:
+        conn.close()
+    assert ep_tasks == (["pick cup", "place cup"],)
+    assert task_indexes == (0, 1, 2)
+
+
+def test_export_rejects_task_index_outside_published_task_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    corpus = _fake_corpus(tmp_path)
+    _add_multitask_labels(corpus, invalid_pointer=True)
+    _install_fake_import(corpus, tmp_path, monkeypatch)
+    manifest = _fake_manifest(
+        tmp_path, [{"metadata_json": _provenance_meta(0, task="pick cup")}],
+    )
+    dest = tmp_path / "out-invalid-task-index"
+    with pytest.raises(
+        ValueError, match=r"source episode 0 frame 59 references task_index 2"
+    ):
+        export.export(dest, manifest=manifest, camera_keys=CAMS)
+    assert not dest.exists()

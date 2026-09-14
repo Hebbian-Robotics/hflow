@@ -204,15 +204,19 @@ def _read_corpus_from_cache(cache_dir: Path) -> dict:
             for row in data:
                 d = dict(zip(cols, row, strict=True))
                 ep_idx = int(d["episode_index"])
-                tasks = d.get("tasks")
-                if isinstance(tasks, list):
-                    task = str(tasks[0]) if tasks else ""
+                raw_tasks = d.get("tasks")
+                if isinstance(raw_tasks, list):
+                    tasks = [str(task) for task in raw_tasks]
+                elif raw_tasks is None:
+                    tasks = []
                 else:
-                    task = str(tasks or "")
+                    tasks = [str(raw_tasks)]
+                task = tasks[0] if tasks else ""
                 rows.append(
                     {
                         "episode_index": ep_idx,
                         "task": task,
+                        "tasks": tasks,
                         "length": int(d["length"]),
                         "data_chunk": str(d["data/chunk_index"]).split("/")[-1],
                         "data_file": str(d["data/file_index"]).split("/")[-1],
@@ -336,6 +340,9 @@ def _write_v3_repository(
         length = int(src["length"])
         if length < 1:
             raise ValueError(f"source episode {sel.source_episode_index} has no frames")
+        source_tasks = [str(task) for task in src.get("tasks", [])]
+        if not source_tasks and src.get("task"):
+            source_tasks = [str(src["task"])]
         data_local = _fetch_data(src)
         conn = duckdb.connect()
         try:
@@ -374,6 +381,15 @@ def _write_v3_repository(
         frame_rows: list[dict] = []
         for local_frame, row in enumerate(rows):
             d = dict(zip(cols, row, strict=True))
+            if "task_index" in d and d["task_index"] is not None:
+                task_index = int(d["task_index"])
+                if task_index < 0 or task_index >= len(source_tasks):
+                    raise ValueError(
+                        f"source episode {sel.source_episode_index} frame {local_frame} "
+                        f"references task_index {task_index}, but only "
+                        f"{len(source_tasks)} tasks are published"
+                    )
+                d["task_index"] = task_index
             d["episode_index"] = new_idx
             d["frame_index"] = local_frame
             d[index_col] = len(data_frames)
@@ -412,7 +428,7 @@ def _write_v3_repository(
         ep_out: dict = {
             "episode_index": new_idx,
             "length": length,
-            "tasks": [sel.task] if sel.task else [],
+            "tasks": source_tasks,
             "data/chunk_index": 0,
             "data/file_index": new_idx,
             "dataset_from_index": (total_frames - length),
@@ -435,10 +451,10 @@ def _write_v3_repository(
         cam: corpus["info"]["features"].get(cam, {"dtype": "video", "shape": [480, 640, 3]})
         for cam in camera_keys
     }
-    numeric_features = {
+    data_features = {
         k: v
         for k, v in corpus["info"].get("features", {}).items()
-        if isinstance(v, dict) and v.get("dtype") == "float32"
+        if isinstance(v, dict) and (v.get("dtype") == "float32" or k == "task_index")
     }
     out_info = {
         "code": "LeRobotDataset/v3",
@@ -450,7 +466,7 @@ def _write_v3_repository(
         "splits": {"train": [f"episode_{i:06d}" for i in range(len(selections))]},
         "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
         "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
-        "features": {**numeric_features, **video_features},
+        "features": {**data_features, **video_features},
         "version": 1,
     }
     (destination / "meta" / "info.json").write_text(json.dumps(out_info, indent=2))
