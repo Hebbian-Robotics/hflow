@@ -673,7 +673,8 @@ def write_canonical_episode(
             payloads = camera_payloads[channel_id]
             topic = infos[channel_id].topic
             if not payloads:
-                logger.warning("camera topic %r has no messages; dropping it", topic)
+                # The declaration still carries topic/schema provenance. Keep it
+                # as an empty canonical video channel instead of erasing it.
                 continue
             images, frame_ids, input_codec = _decode_compressed_images(
                 topic, infos[channel_id], payloads
@@ -812,8 +813,8 @@ def write_canonical_episode(
             for source_channel_id in sorted(infos, key=lambda cid: (infos[cid].topic, cid)):
                 info = infos[source_channel_id]
                 if source_channel_id in camera_payloads:
-                    if not camera_payloads[source_channel_id]:
-                        continue
+                    # Register even declared-but-empty cameras. Channel declarations
+                    # are part of canonical provenance and therefore content identity.
                     if video_schema_id is None:
                         video_schema_id = writer.register_schema(
                             name=CANONICAL_VIDEO_SCHEMA_NAME,

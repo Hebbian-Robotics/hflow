@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from foxglove_schemas_protobuf.CompressedImage_pb2 import CompressedImage
 from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
 from mcap.exceptions import InvalidMagic
 from mcap.reader import make_reader
@@ -23,6 +24,7 @@ from mcap_ros2.writer import Writer as Ros2Writer
 import hflow
 from hflow import transform
 from hflow._grouped_mcap_writer import NO_SCHEMA_ID, GroupedMcapWriter
+from hflow.catalog import content_episode_id
 from hflow.doctor import diagnose
 from hflow.format import METADATA_RECORD_EPISODE
 from hflow.reader import TopicInfo
@@ -956,3 +958,52 @@ def test_vanished_cwd_relative_source_keeps_its_persisted_identity(
     assert app.source_identity("external/e.mcap") == expected_identity
     relabel_report = app.process("external/e.mcap", record=True, stages={hflow.Stage.LABELS})
     assert relabel_report.canonical_path.resolve() == full_report.canonical_path.resolve()
+
+
+def _write_source_with_optional_empty_camera(
+    path: Path, *, include_camera: bool
+) -> None:
+    with path.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        if include_camera:
+            schema_id = writer.register_schema(
+                name="foxglove.CompressedImage",
+                encoding="protobuf",
+                data=build_file_descriptor_set(CompressedImage).SerializeToString(),
+            )
+            writer.register_channel(
+                topic="/empty_cam/compressed",
+                message_encoding="protobuf",
+                schema_id=schema_id,
+            )
+        state_channel = writer.register_channel(
+            topic="/status", message_encoding="json", schema_id=0
+        )
+        writer.add_message(
+            state_channel, log_time=1, data=b"{\"ok\":true}", publish_time=1
+        )
+        writer.finish()
+
+
+def test_transform_preserves_declared_empty_camera_in_content_identity(tmp_path: Path) -> None:
+    with_camera_source = tmp_path / "with-empty-camera.mcap"
+    without_camera_source = tmp_path / "without-empty-camera.mcap"
+    _write_source_with_optional_empty_camera(with_camera_source, include_camera=True)
+    _write_source_with_optional_empty_camera(without_camera_source, include_camera=False)
+
+    with_camera = tmp_path / "with-empty-camera.canonical.mcap"
+    without_camera = tmp_path / "without-empty-camera.canonical.mcap"
+    write_canonical_episode(with_camera_source, with_camera)
+    write_canonical_episode(without_camera_source, without_camera)
+
+    with with_camera.open("rb") as stream:
+        summary = make_reader(stream).get_summary()
+        assert summary is not None
+        channels = {channel.topic: channel for channel in summary.channels.values()}
+        assert "/empty_cam/compressed" in channels
+        camera_channel = channels["/empty_cam/compressed"]
+        assert summary.schemas[camera_channel.schema_id].name == "foxglove.CompressedVideo"
+        assert "/status" in channels
+
+    assert content_episode_id(with_camera) != content_episode_id(without_camera)
