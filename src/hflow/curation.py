@@ -479,37 +479,57 @@ def _sync_catalog_mirror(catalog_root: "Path | str | StorageRoot") -> None:
         location.sync_into_mirror(tuple(_TABLE_DIRECTORIES.values()))
 
 
-def _completed_append_exists(catalog_root: "Path | str | StorageRoot") -> bool:
-    """Whether a completed catalog append is present.
+def _empty_table_relations_have_landed_parquet(
+    connection: duckdb.DuckDBPyConnection,
+    catalog_root: "Path | str | StorageRoot",
+) -> bool:
+    """Whether any in-memory empty catalog table now has Parquet on disk.
 
-    ``Catalog.append_episode`` writes the episodes file last, so any
-    ``episodes/*.parquet`` object proves the whole append finished.
+    Empty catalogs register ``CREATE TABLE`` shells because DuckDB refuses a
+    Parquet glob with no matches. Those shells stay sticky on a long-lived
+    connection until relations are re-registered. Episode appends are one
+    trigger; ``ingest_failures`` (and any other long table that gains files
+    later) is another. Syncs a bucket mirror first so remote files are visible
+    under the local query root.
     """
     location = parse_storage_root(catalog_root)
-    if isinstance(location, BucketStorageRoot):
-        _sync_catalog_mirror(location)
-        episodes_dir = location.mirror / "episodes"
-        return episodes_dir.is_dir() and any(episodes_dir.glob("*.parquet"))
-    return any(location.path.joinpath("episodes").glob("*.parquet"))
+    query_root = _local_query_root(location)
+    for relation_name in _LONG_TABLE_NAMES:
+        relation_type_row = connection.execute(
+            """
+            SELECT table_type
+            FROM information_schema.tables
+            WHERE table_schema = 'main' AND table_name = ?
+            """,
+            [relation_name],
+        ).fetchone()
+        if relation_type_row is None or str(relation_type_row[0]) != "BASE TABLE":
+            continue
+        table_directory = query_root / _TABLE_DIRECTORIES[relation_name]
+        if table_directory.is_dir() and any(table_directory.glob("*.parquet")):
+            return True
+    return False
 
 
 def _refresh_local_catalog_connection(
     connection: duckdb.DuckDBPyConnection, catalog_root: "Path | str | StorageRoot"
 ) -> None:
-    """Replace an empty catalog surface after its first append completes.
+    """Re-register catalog relations after empty in-memory shells gain Parquet.
 
     An empty catalog has real in-memory tables because DuckDB cannot define a
-    ``read_parquet`` view over a glob with no matches. Once the episodes file
-    from the first append exists, all dependent table files are complete too:
-    ``Catalog.append_episode`` deliberately writes the episodes file last.
-    Replacing the empty tables with the normal Parquet-backed views in one
-    transaction lets a long-running local explorer see that first run without
-    replacing its DuckDB connection.
+    ``read_parquet`` view over a glob with no matches. Replacing those tables
+    with the normal Parquet-backed views in one transaction lets a long-running
+    explorer see newly landed files without replacing its DuckDB connection.
+
+    ``Catalog.append_episode`` writes the episodes file last, so the first
+    episodes Parquet is enough to rebind every table that append wrote.
+    Tables outside that write set — notably ``ingest_failures`` — can land
+    Parquet later and need the same rebind when their directory gains files.
 
     For bucket catalogs the query root is the synced mirror directory; this
-    re-syncs before re-registering views so the first remote append is
-    visible. Constrained connections have locked their configuration and
-    materialized their data and must not call this.
+    re-syncs before re-registering views so remote files are visible.
+    Constrained connections have locked their configuration and materialized
+    their data and must not call this.
     """
     location = parse_storage_root(catalog_root)
     _verify_catalog_format(location)
