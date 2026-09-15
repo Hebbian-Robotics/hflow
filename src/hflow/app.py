@@ -2348,7 +2348,10 @@ class App:
         run_dir.mkdir(parents=True, exist_ok=True)
         canonical_file_name = f"{source_path.stem}.canonical.mcap"
         canonical_path = run_dir / canonical_file_name
-        scratch_dir = run_dir / "scratch"
+        # Remux/frame scratch must follow canonical bytes, not the source-keyed
+        # run directory. A sync-omitted fetch can replace those bytes in place
+        # while leaving run_dir (and a flat scratch/) untouched (#536).
+        scratch_root = run_dir / "scratch"
         sync_completion_marker_path = run_dir / _SYNC_COMPLETION_MARKER_NAME
 
         stamps: EpisodeStamps | None = None
@@ -2406,10 +2409,10 @@ class App:
                     derived=derived_series or None,
                 )
             # The canonical file was just rewritten, so any mp4/frame artifacts
-            # a previous run cached in the scratch dir are stale -- including
-            # ones from a different source episode sharing this run dir's stem.
-            if scratch_dir.exists():
-                shutil.rmtree(scratch_dir)
+            # a previous run cached under scratch/ are stale -- including ones
+            # keyed on older content hashes for this same source run dir.
+            if scratch_root.exists():
+                shutil.rmtree(scratch_root)
             # So is any cached integrity verdict: it describes bytes that no
             # longer exist.
             self._canonical_integrity_cache.pop(str(canonical_path), None)
@@ -2437,6 +2440,13 @@ class App:
                     f"{sync_completion.source_path!r}, not {source_identifier!r}; "
                     "run the sync or full profile again"
                 )
+
+        # episode_id is the content hash of the canonical on disk now -- after
+        # sync rewrite, reuse, or sync-omitted fetch. Keying scratch here means
+        # Episode.video()'s output.exists() short-circuit can only hit a remux
+        # built from these exact bytes.
+        episode_id = content_episode_id(canonical_path)
+        scratch_dir = scratch_root / episode_id
 
         with Episode(canonical_path, workdir=scratch_dir) as canonical_episode:
             canonical_stamps = stamps_from_provenance(canonical_episode.metadata)
@@ -2656,7 +2666,6 @@ class App:
             if Stage.META not in enabled_stages or isinstance(
                 registered_step_selection, SelectedRegisteredSteps
             ):
-                episode_id = content_episode_id(canonical_path)
                 if quarantine_history is not None:
                     carried_tags = quarantine_history.quarantine_tags(episode_id)
                 else:
