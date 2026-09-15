@@ -2716,22 +2716,53 @@ class App:
                 continue
             for artifact_name, artifact_path in enrichment_result.artifacts.items():
                 resolved_artifact_path = artifact_path.resolve()
+                # Artifact under scratch_dir is transient; stage it to artifacts/
+                # so the published URI remains valid across reprocess.
+                in_scratch = False
                 try:
-                    artifact_relative_path = resolved_artifact_path.relative_to(run_dir.resolve())
-                    artifact_key = artifact_relative_path.as_posix()
+                    resolved_artifact_path.relative_to(scratch_dir.resolve())
+                    in_scratch = True
                 except ValueError:
+                    pass
+                if in_scratch:
                     step_directory = (
                         f"{_sanitize_topic(enrichment_run.enrichment.name)}-"
                         f"{enrichment_run.enrichment.version}"
                     )
                     artifact_name_digest = hashlib.sha256(artifact_name.encode()).hexdigest()[:8]
+                    # Stage the artifact to a stable location within run_dir.
+                    staging_dir = run_dir / "artifacts" / step_directory
+                    staging_dir.mkdir(parents=True, exist_ok=True)
+                    staged_artifact_path = staging_dir / artifact_path.name
+                    if not staged_artifact_path.exists():
+                        shutil.copy2(resolved_artifact_path, staged_artifact_path)
+                    publish_path = staged_artifact_path
                     artifact_key = (
                         f"artifacts/{step_directory}/{_sanitize_topic(artifact_name)}-"
                         f"{artifact_name_digest}/{artifact_path.name}"
                     )
+                else:
+                    try:
+                        artifact_relative_path = resolved_artifact_path.relative_to(
+                            run_dir.resolve()
+                        )
+                        artifact_key = artifact_relative_path.as_posix()
+                    except ValueError:
+                        step_directory = (
+                            f"{_sanitize_topic(enrichment_run.enrichment.name)}-"
+                            f"{enrichment_run.enrichment.version}"
+                        )
+                        artifact_name_digest = hashlib.sha256(artifact_name.encode()).hexdigest()[
+                            :8
+                        ]
+                        artifact_key = (
+                            f"artifacts/{step_directory}/{_sanitize_topic(artifact_name)}-"
+                            f"{artifact_name_digest}/{artifact_path.name}"
+                        )
+                    publish_path = artifact_path
                 try:
                     enrichment_run.artifact_uris[artifact_name] = run_storage_root.publish(
-                        artifact_path, artifact_key
+                        publish_path, artifact_key
                     )
                 except Exception as error:
                     # A missing or unreadable artifact file is the STEP's

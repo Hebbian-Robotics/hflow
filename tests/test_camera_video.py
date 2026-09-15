@@ -63,8 +63,11 @@ def test_camera_video_publishes_a_playable_mp4_per_camera_with_its_clock(
         }
     for topic in camera_topics:
         published_mp4 = Path(video_run.artifact_uris[video_artifact_name(topic)])
-        # Published under the data root, not left in the scratch workdir.
+        # Published under the data root but NOT in the scratch workdir.
         assert published_mp4.is_relative_to(data_root)
+        assert "scratch" not in published_mp4.parts, (
+            f"Artifact published under scratch: {published_mp4}"
+        )
         assert published_mp4.suffix == ".mp4"
         labels = video_run.result.labels
         assert labels[f"{topic}/video_fps"] == pytest.approx(15.0, rel=0.05)
