@@ -79,11 +79,19 @@ RECOMMENDED_CAMERA_INTEGRITY = Gate(
 @dataclass(frozen=True)
 class _JointMotionProfile:
     """Finite-difference motion facts of one state channel, computed once for
-    every check that reasons about joint speed."""
+    every check that reasons about joint speed.
+
+    ``per_step_max_speed`` is max over joints of |dq/dt|, one per step, and is
+    NaN exactly where the step is not measurable; ``measurable`` is that mask
+    spelled out -- strictly positive duration AND finite positions on every
+    joint (#546). A NaN step is not a clean step and not a moving step: it is
+    unmeasured, and every consumer must compute over ``measurable`` only.
+    """
 
     stamps_ns: np.ndarray
     deltas_s: np.ndarray
-    per_step_max_speed: np.ndarray  # max over joints of |dq/dt|, one per step
+    per_step_max_speed: np.ndarray  # max over joints of |dq/dt|, NaN if unmeasurable
+    measurable: np.ndarray  # bool, one per step: finite speed on a positive dt
     nonpositive_dt_count: int
 
 
@@ -100,12 +108,16 @@ def _joint_motion_profile(
     if len(stamps_ns) < 2:
         return None
     deltas_s = np.diff(stamps_ns) / 1e9
+    position_jumps = np.diff(positions, axis=0)
+    finite_jump = np.all(np.isfinite(position_jumps), axis=1)
+    measurable = (deltas_s > 0) & finite_jump
     safe_deltas_s = np.where(deltas_s > 0, deltas_s, np.nan)
-    velocities = np.abs(np.diff(positions, axis=0)) / safe_deltas_s[:, np.newaxis]
+    velocities = np.abs(position_jumps) / safe_deltas_s[:, np.newaxis]
     return _JointMotionProfile(
         stamps_ns=stamps_ns,
         deltas_s=deltas_s,
         per_step_max_speed=np.nanmax(velocities, axis=1),
+        measurable=measurable,
         nonpositive_dt_count=int(np.sum(deltas_s <= 0)),
     )
 
@@ -372,19 +384,39 @@ def joint_discontinuity(
     Ships as measurements and intervals only -- never a default reject rule:
     motion-smoothness heuristics are known to invert on real defects (the
     Voxel51 result), so the threshold and any verdict stay user-owned.
+
+    A duplicate-stamped or NaN-positioned step has no velocity at all, and a
+    NaN comparison is False: counting such steps as compliant (or letting
+    them dilute the percentage denominator) fails the gate open (#546).
+    Every percentage and maximum here covers measurable steps only, and a
+    stream with nothing measurable reports its counts and withholds the
+    verdict-shaped keys rather than emitting 0% or NaN.
     """
     profile = _joint_motion_profile(episode, topic, field)
     if profile is None:
         return CheckResult(
             measurements={f"{topic}/velocity_sample_count": len(episode.channel(topic).timestamps)}
         )
-    violation_mask = profile.per_step_max_speed > velocity_limit
+    measurable = profile.measurable
+    measurable_step_count = int(np.count_nonzero(measurable))
+    if measurable_step_count == 0:
+        return CheckResult(
+            measurements={
+                f"{topic}/velocity_sample_count": len(profile.stamps_ns),
+                f"{topic}/velocity_measurable_step_count": 0,
+                f"{topic}/nonpositive_dt_count": profile.nonpositive_dt_count,
+            }
+        )
+    speed = profile.per_step_max_speed
+    violation_mask = np.zeros(measurable.shape, dtype=bool)
+    violation_mask[measurable] = speed[measurable] > velocity_limit
     return CheckResult(
         measurements={
-            f"{topic}/max_abs_velocity": float(np.nanmax(profile.per_step_max_speed)),
+            f"{topic}/max_abs_velocity": float(np.max(speed[measurable])),
             f"{topic}/velocity_limit": velocity_limit,
-            f"{topic}/violation_count": int(np.sum(violation_mask)),
-            f"{topic}/violation_pct": float(np.mean(violation_mask) * 100.0),
+            f"{topic}/violation_count": int(np.count_nonzero(violation_mask)),
+            f"{topic}/violation_pct": float(np.mean(violation_mask[measurable]) * 100.0),
+            f"{topic}/velocity_measurable_step_count": measurable_step_count,
             f"{topic}/nonpositive_dt_count": profile.nonpositive_dt_count,
         },
         intervals=_mask_run_intervals(
@@ -651,7 +683,7 @@ def idle_fraction(
     velocity_epsilon: float = 0.05,
     min_interval_s: float = 1.0,
 ) -> CheckResult:
-    """Time-weighted fraction of the episode spent with no joint moving.
+    """Time-weighted fraction of the MEASURED episode spent with no joint moving.
 
     A step is idle when every joint's finite-difference speed is below
     ``velocity_epsilon``; the fraction weights each step by its own duration,
@@ -659,21 +691,40 @@ def idle_fraction(
     ``min_interval_s`` long become labeled ``idle:<topic>`` intervals.
     Evidence for curation cuts over mostly-stationary demonstrations -- the
     keep/drop policy (and any verdict) stays user-owned.
+
+    Unmeasurable steps (duplicate stamps, NaN positions) belong in neither the
+    numerator nor the denominator: they had no velocity to be idle under, and
+    counting their time as "moving" understates the fraction (#546). A stream
+    with nothing measurable reports its counts and withholds
+    ``idle_fraction`` rather than storing 0.0 for a dead channel.
     """
     profile = _joint_motion_profile(episode, topic, field)
     if profile is None:
         return CheckResult(
             measurements={f"{topic}/idle_sample_count": len(episode.channel(topic).timestamps)}
         )
-    idle_mask = profile.per_step_max_speed < velocity_epsilon
-    positive_deltas_s = np.where(profile.deltas_s > 0, profile.deltas_s, 0.0)
-    total_span_s = float(np.sum(positive_deltas_s))
-    idle_total_s = float(np.sum(positive_deltas_s[idle_mask]))
+    measurable = profile.measurable
+    measurable_step_count = int(np.count_nonzero(measurable))
+    if measurable_step_count == 0:
+        return CheckResult(
+            measurements={
+                f"{topic}/idle_sample_count": len(profile.stamps_ns),
+                f"{topic}/idle_measurable_step_count": 0,
+                f"{topic}/idle_nonpositive_dt_count": profile.nonpositive_dt_count,
+            }
+        )
+    speed = profile.per_step_max_speed
+    idle_mask = np.zeros(measurable.shape, dtype=bool)
+    idle_mask[measurable] = speed[measurable] < velocity_epsilon
+    total_span_s = float(np.sum(profile.deltas_s[measurable]))
+    idle_total_s = float(np.sum(profile.deltas_s[idle_mask]))
     return CheckResult(
         measurements={
-            f"{topic}/idle_fraction": idle_total_s / total_span_s if total_span_s else 0.0,
+            f"{topic}/idle_fraction": idle_total_s / total_span_s,
             f"{topic}/idle_total_s": idle_total_s,
             f"{topic}/velocity_epsilon": velocity_epsilon,
+            f"{topic}/idle_measurable_step_count": measurable_step_count,
+            f"{topic}/idle_nonpositive_dt_count": profile.nonpositive_dt_count,
         },
         intervals=_mask_run_intervals(
             profile.stamps_ns, idle_mask, f"idle:{topic}", min_duration_s=min_interval_s
