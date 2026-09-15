@@ -248,10 +248,10 @@ def _build_snapshot_integrity_marker_fields(
 
     Required Parquet tables and every regular file under ``assets/`` (copy mode)
     get ``path`` / ``size_bytes`` / ``sha256``. ``content_id`` digests that
-    normalized inventory so a deleted member is detectable without a verifier
-    product yet. References mode leaves ``assets`` empty: remote media are not
-    fetched for hashing. Copy mode re-reads each copied asset once after the
-    copy to compute its hash.
+    normalized inventory so ``verify_dataset_snapshot`` can detect a deleted
+    member even when every remaining file still matches. References mode leaves
+    ``assets`` empty: remote media are not fetched for hashing. Copy mode
+    re-reads each copied asset once after the copy to compute its hash.
     """
     tables: dict[str, FileIntegrityRecord] = {}
     for table_name, file_name in _REQUIRED_TABLE_FILES.items():
