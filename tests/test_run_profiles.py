@@ -1,5 +1,6 @@
 """Run profiles: the ingest stage graph's toggleable stages driven through App.process."""
 
+import re
 from pathlib import Path
 
 import duckdb
@@ -305,7 +306,9 @@ def test_media_stage_records_a_contact_sheet_artifact(tmp_path: Path) -> None:
     sheet_path = media_runs[0].result.artifacts["/wrist_cam/compressed"]
     assert sheet_path.is_file()
     assert sheet_path.parent.name == "media"
-    assert sheet_path.name == "wrist_cam_compressed.jpg"
+    assert re.fullmatch(r"wrist_cam_compressed-[0-9a-f]{12}\.jpg", sheet_path.name), (
+        f"sheet name must be the readable stem plus its topic digest (#535): {sheet_path.name}"
+    )
 
     connection = open_catalog_connection(data_root / "catalog")
     try:
@@ -316,7 +319,7 @@ def test_media_stage_records_a_contact_sheet_artifact(tmp_path: Path) -> None:
     finally:
         connection.close()
     assert artifact_row is not None
-    assert str(artifact_row[0]).endswith("wrist_cam_compressed.jpg")
+    assert re.search(r"wrist_cam_compressed-[0-9a-f]{12}\.jpg$", str(artifact_row[0]))
 
 
 def test_media_step_selection_distinguishes_unselected_from_requested(tmp_path: Path) -> None:

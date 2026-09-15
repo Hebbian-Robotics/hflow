@@ -42,7 +42,9 @@ NANOSECONDS_PER_SECOND = 1_000_000_000
 
 # The author-owned compatibility promise for this step's outputs. Bump when the
 # artifact names, label keys, or the muxed file's timing model change.
-CAMERA_VIDEO_VERSION = "1"
+# "2": the per-camera MP4 cache name gained its collision-resistant topic
+# digest (#535), so the published artifact URIs change.
+CAMERA_VIDEO_VERSION = "2"
 
 VIDEO_ARTIFACT_PREFIX = "video:"
 

@@ -72,7 +72,19 @@ class DecodedMessageBatch:
 
 
 def _sanitize_topic(topic: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", topic.strip("/")) or "root"
+    """A readable, collision-resistant cache name for one topic (#535).
+
+    Sanitizing is not identifying: ``/cam/front`` and ``/cam_front`` both
+    collapse to ``cam_front``, and the existence-keyed scratch caches would
+    then serve the first camera's remuxed pixels to the second camera's
+    checks, contact sheets, and published artifacts. The digest of the FULL
+    topic makes the name injective, the same shape as
+    ``App._source_artifact_directory_name``: readable stem, dash, and the
+    first twelve hex characters of the sha256.
+    """
+    readable = re.sub(r"[^A-Za-z0-9_.-]+", "_", topic.strip("/")) or "root"
+    digest = hashlib.sha256(topic.encode()).hexdigest()[:12]
+    return f"{readable}-{digest}"
 
 
 def _frame_selection_expression(frame_indices: Sequence[int]) -> str:

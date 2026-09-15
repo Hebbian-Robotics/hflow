@@ -227,7 +227,9 @@ def _resolve_data_root(data_root: "Path | str | StorageRoot | None") -> "Path | 
 # contact sheet per camera topic, recorded exactly like an enrichment so its
 # catalog rows flow through CheckRunRow like everything else.
 MEDIA_CONTACT_SHEET_STEP_NAME = "media/contact_sheet"
-MEDIA_CONTACT_SHEET_STEP_VERSION = parse_step_version("1")
+# "2": sheet file names gained the collision-resistant topic digest (#535),
+# so the published artifact URIs this step records change.
+MEDIA_CONTACT_SHEET_STEP_VERSION = parse_step_version("2")
 # Published artifacts are recorded as measurements under this prefix, so a
 # reader can tell "here is where the file went" from an ordinary label.
 ARTIFACT_MEASUREMENT_KEY_PREFIX = "artifact/"
