@@ -21,6 +21,11 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from hflow._field_guards import (
+    require_finite_float,
+    require_int_in_range,
+    require_positive_float,
+)
 from hflow._video_measurement_toolchain import (
     measure_video_frame_statistics_for_hflow,
     resolved_video_measurement_toolchain,
@@ -603,6 +608,20 @@ def camera_frame_stats(
     The trade is one right-to-left key parse (``rpartition``) plus one dict
     lookup per key on top of the ffmpeg decode each topic already pays (#182).
     """
+    # Above selected_cameras so a bad threshold is refused on a camera-less
+    # episode too: guards inside the per-camera loop never fire there, which
+    # is what #445 found and #447 is about. Each message names the parameter
+    # as the signature spells it, never the internal settings field.
+    require_int_in_range(black_frame_amount_pct, "black_frame_amount_pct", minimum=0, maximum=100)
+    require_int_in_range(black_pixel_threshold, "black_pixel_threshold", minimum=0, maximum=255)
+    require_finite_float(freeze_noise_db, "freeze_noise_db")
+    require_positive_float(freeze_min_duration_s, "freeze_min_duration_s")
+    # A float, so it composes rather than mapping onto require_int_in_range:
+    # the helper owns finiteness and the bound stays here.
+    require_finite_float(bright_luma_threshold, "bright_luma_threshold")
+    if not 0 <= bright_luma_threshold <= 255:
+        raise ValueError(f"bright_luma_threshold must be in [0, 255], got {bright_luma_threshold}")
+
     selected_cameras = _resolve_selected_cameras(episode, cameras)
     intermediates_by_topic = {
         topic: _camera_intermediates(
@@ -1405,6 +1424,11 @@ def camera_signal_quality(
     ``camera_frame_stats`` records which one measured; compare across a pin bump
     only after re-measuring, not by reading old rows next to new ones.
     """
+    # Same placement and reason as camera_frame_stats above (#447).
+    require_int_in_range(black_pixel_threshold, "black_pixel_threshold", minimum=0, maximum=255)
+    require_finite_float(freeze_noise_db, "freeze_noise_db")
+    require_positive_float(freeze_min_duration_s, "freeze_min_duration_s")
+
     selected_cameras = _resolve_selected_cameras(episode, cameras)
     measurements: dict[str, MeasurementValue] = {}
     for topic in selected_cameras:

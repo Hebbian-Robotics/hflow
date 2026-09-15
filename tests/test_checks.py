@@ -1,5 +1,6 @@
 """Direct unit tests for the built-in checks (paths e2e only grazes)."""
 
+import re
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -1172,3 +1173,83 @@ def test_trajectory_metrics_omits_unsettled_ratio_for_a_motionless_episode(
 
     assert "/joint_states/final_pose_speed" in result.measurements
     assert "/joint_states/final_pose_unsettled_ratio" not in result.measurements
+
+
+@pytest.fixture(scope="module")
+def camera_less_episode(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """An episode with no camera topics.
+
+    #445 and #447: these guards used to sit inside the per-camera loop, so on
+    an episode with no cameras they never ran and a bad threshold was accepted
+    silently. Every case below runs here, because an episode WITH cameras also
+    raises ValueError from camera processing and cannot tell the two apart.
+    """
+    return synthesize_episode(
+        tmp_path_factory.mktemp("guards") / "episode.mcap",
+        SyntheticEpisodeSpec(
+            duration_s=0.2,
+            cameras=(),
+            joint_hz=10.0,
+            joint_count=1,
+            black_segment=None,
+            joint_jump_at_s=None,
+            timestamp_offset_segment=None,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value", "message"),
+    [
+        ("black_frame_amount_pct", True, "black_frame_amount_pct must be an int, got bool"),
+        ("black_frame_amount_pct", 101, "black_frame_amount_pct must be in [0, 100], got 101"),
+        ("black_pixel_threshold", True, "black_pixel_threshold must be an int, got bool"),
+        ("black_pixel_threshold", 256, "black_pixel_threshold must be in [0, 255], got 256"),
+        ("freeze_noise_db", True, "freeze_noise_db must be an int or float, got bool"),
+        ("freeze_noise_db", float("nan"), "freeze_noise_db must be finite, got nan"),
+        ("freeze_min_duration_s", True, "freeze_min_duration_s must be an int or float, got bool"),
+        ("freeze_min_duration_s", 0, "freeze_min_duration_s must be > 0, got 0"),
+        ("bright_luma_threshold", True, "bright_luma_threshold must be an int or float, got bool"),
+        ("bright_luma_threshold", float("inf"), "bright_luma_threshold must be finite, got inf"),
+        ("bright_luma_threshold", 255.5, "bright_luma_threshold must be in [0, 255], got 255.5"),
+    ],
+)
+def test_camera_frame_stats_refuses_bad_thresholds_without_cameras(
+    camera_less_episode: Path, parameter: str, value: object, message: str
+) -> None:
+    with (
+        hflow.Episode(camera_less_episode) as episode,
+        pytest.raises(ValueError, match=f"^{re.escape(message)}$"),
+    ):
+        camera_frame_stats(episode, **{parameter: value})  # ty: ignore
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value", "message"),
+    [
+        ("black_pixel_threshold", True, "black_pixel_threshold must be an int, got bool"),
+        ("black_pixel_threshold", -1, "black_pixel_threshold must be in [0, 255], got -1"),
+        ("freeze_noise_db", True, "freeze_noise_db must be an int or float, got bool"),
+        ("freeze_noise_db", float("-inf"), "freeze_noise_db must be finite, got -inf"),
+        ("freeze_min_duration_s", True, "freeze_min_duration_s must be an int or float, got bool"),
+        ("freeze_min_duration_s", -1.0, "freeze_min_duration_s must be > 0, got -1.0"),
+    ],
+)
+def test_camera_signal_quality_refuses_bad_thresholds_without_cameras(
+    camera_less_episode: Path, parameter: str, value: object, message: str
+) -> None:
+    with (
+        hflow.Episode(camera_less_episode) as episode,
+        pytest.raises(ValueError, match=f"^{re.escape(message)}$"),
+    ):
+        camera_signal_quality(episode, **{parameter: value})  # ty: ignore
+
+
+def test_camera_threshold_guards_accept_their_defaults_without_cameras(
+    camera_less_episode: Path,
+) -> None:
+    # The guards must not refuse the signature's own defaults, and a
+    # camera-less episode measures nothing rather than erroring.
+    with hflow.Episode(camera_less_episode) as episode:
+        assert camera_frame_stats(episode).measurements == {}
+        assert camera_signal_quality(episode).measurements == {}
