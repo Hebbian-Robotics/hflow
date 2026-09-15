@@ -144,6 +144,23 @@ def test_selective_appends_do_not_replay_an_obsolete_full_outcome(tmp_path: Path
         connection.close()
 
 
+@pytest.mark.parametrize("execution_id", ["", "  ", "\t\n"])
+def test_append_rejects_blank_execution_id(tmp_path: Path, execution_id: str) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    canonical = _fake_canonical(tmp_path)
+
+    with pytest.raises(ValueError, match=r"^execution_id must be non-empty when supplied$"):
+        catalog.append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[_check_row()],
+            execution_id=execution_id,
+        )
+
+    assert not list((catalog.root / "episodes").glob("*.parquet"))
+
+
 @pytest.mark.parametrize("bucket", [False, True])
 def test_execution_identity_replays_history_without_reordering_it(
     tmp_path: Path,

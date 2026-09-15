@@ -868,6 +868,8 @@ class Catalog:
         # it has to compare equal to what the orchestrator's own API reports.
         if orchestrator_run_id is not None and not orchestrator_run_id.strip():
             orchestrator_run_id = None
+        if execution_id is not None and not execution_id.strip():
+            raise ValueError("execution_id must be non-empty when supplied")
         episode_id = content_episode_id(canonical_path)
         # One normalized shape feeds every consumer below -- the run
         # fingerprint, the replay repair pass, and the dependent-table
