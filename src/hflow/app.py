@@ -2249,6 +2249,7 @@ class App:
         step_names: Iterable[str] | None = None,
         quarantine_history: QuarantineHistory | None = None,
         orchestrator_run_id: str | None = None,
+        execution_id: str | None = None,
         _registered_step_selection: RegisteredStepSelection | None = None,
         _prepared_process_configuration: _PreparedProcessConfiguration | None = None,
     ) -> ProcessReport:
@@ -2302,6 +2303,12 @@ class App:
         equivalent. The dev loop passes nothing and records NULL. Provenance
         only, never part of any identity hash (see
         :meth:`hflow.catalog.Catalog.append_episode`).
+
+        ``execution_id`` optionally identifies a catalog append across delayed
+        retries, independently of intervening runs. Persist it before the first
+        attempt and reuse it only for retries of that execution. Without it,
+        consecutive identical outcomes deduplicate and a recurring outcome
+        after another append becomes current again.
         """
         if _prepared_process_configuration is not None:
             if (
@@ -2788,6 +2795,7 @@ class App:
                 quarantine_tags=report.quarantine_tags,
                 source_uri=source_identifier,
                 orchestrator_run_id=orchestrator_run_id,
+                execution_id=execution_id,
                 time_bounds=episode_time_bounds,
             )
 

@@ -51,7 +51,7 @@ class _CreateIfAbsentRace:
         monkeypatch.setattr(BucketStorageRoot, "store_file_if_absent", gated_store_file_if_absent)
 
 
-def _append_outcome(catalog: Catalog, canonical_path: Path) -> AppendResult:
+def _append_outcome(catalog: Catalog, canonical_path: Path, value: float = 1.0) -> AppendResult:
     stamps = EpisodeStamps(
         schema_version="1",
         pipeline_version="abc123def456",
@@ -64,7 +64,7 @@ def _append_outcome(catalog: Catalog, canonical_path: Path) -> AppendResult:
         critical=False,
         status=hflow.CheckStatus.MEASURED,
         duration_s=0.01,
-        measurements={"score": 1.0},
+        measurements={"score": value},
         tags=["seen"],
         intervals=[hflow.Interval(start_ns=0, end_ns=10, label="span")],
     )
@@ -76,22 +76,32 @@ def _append_outcome(catalog: Catalog, canonical_path: Path) -> AppendResult:
     )
 
 
+@pytest.mark.parametrize("recurring", [False, True])
 def test_concurrent_bucket_catalog_appends_publish_one_complete_outcome(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     bucket_over_tmp: tuple[BucketStorageRoot, Path],
+    recurring: bool,
 ) -> None:
     bucket_root, remote_dir = bucket_over_tmp
     catalog = Catalog(bucket_root.child("catalog"))
     canonical = tmp_path / "episode.canonical.mcap"
     canonical.write_bytes(b"canonical episode")
+    if recurring:
+        assert _append_outcome(catalog, canonical).written
+        assert _append_outcome(catalog, canonical, value=2.0).written
     race = _CreateIfAbsentRace(
         monkeypatch,
         lambda _root, relative: relative.startswith("episodes/"),
     )
 
-    def append(_label: str) -> AppendResult:
-        return _append_outcome(catalog, canonical)
+    def append(label: str) -> AppendResult:
+        # Separate workers must discover the same predecessor from the store,
+        # without relying on a shared, already-warm mirror.
+        worker_root = BucketStorageRoot(
+            bucket_root.child("catalog").url, mirror=tmp_path / f"worker-{label}"
+        )
+        return _append_outcome(Catalog(worker_root), canonical)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(append, ("A", "B")))

@@ -27,8 +27,8 @@ is the point. Either way, `report.catalog_entry` tells you what happened:
 ```python
 entry = report.catalog_entry
 entry.episode_id  # content address of the canonical file
-entry.run_fingerprint  # content hash of versions + the observable run outcome
-entry.written  # False when this exact run was already recorded
+entry.run_fingerprint  # outcome hash, with an occurrence suffix when needed
+entry.written  # False when this occurrence was already recorded
 ```
 
 For a targeted backfill, `step_names=` records only the selected registered
@@ -83,15 +83,17 @@ the ground truth for any row, which is exactly why they are kept verbatim
 next to the heuristic. Only rows written by an ingest binary that already
 raises `SourceNotConforming` (see below) can carry `source-unsupported`.
 
-Three durability rules govern writes:
+These durability rules govern writes:
 
 - **Content-addressed**: `episode_id` is a sha256 of the canonical file's
   bytes. Re-ingesting an unchanged episode dedupes; a reprocessed episode
   (new `pipeline_version`) is a distinct fact.
 - **Create-if-absent**: an append whose `(episode_id, run_fingerprint)` file
-  already exists is a no-op (`written=False`). The fingerprint includes the
-  observable outcome: exact retries deduplicate, while a successful retry
-  after an error appends the repaired result.
+  already exists is a no-op (`written=False`). Consecutive identical outcomes
+  deduplicate. If an outcome recurs after a different append for the same
+  episode or source, it gets a new occurrence fingerprint and timestamp:
+  error → success → identical error ends with `status = 'unverified'`, and
+  success → error → identical success ends with `status = 'ok'`.
 - **Append, never overwrite**: when a check's results are no longer comparable,
   bump its explicit version. Re-running then adds rows under the new
   `check_version` next to the old ones. The corpus is assumed permanently
@@ -100,7 +102,7 @@ Three durability rules govern writes:
   orchestrated run recorded the row (the generated Airflow DAGs pass their
   stage sub-DAG's own run id; a local run records NULL). It is deliberately
   outside `run_fingerprint`, or a rerun producing the same outcome would stop
-  deduplicating. So it names the run that FIRST recorded an outcome, and since
+  deduplicating. So it names the run that FIRST recorded an occurrence, and since
   filters read the latest row per episode, selecting on it answers "whose work
   is the current answer" rather than "which runs ever touched this".
 
@@ -111,6 +113,47 @@ committing, and a replayed append re-checks and heals any dependent a
 crashed earlier attempt left with a stale timestamp -- so concurrent
 duplicate appends and retried tasks converge instead of stitching two runs'
 rows together.
+
+### Occurrences and delayed retries
+
+The outcome hash still depends only on content and versions. First occurrences
+keep their existing filenames. A recurring outcome's `run_fingerprint` is
+`<outcome-hash>.<scope-hash>`, where the scope hashes the preceding append's
+episode identity and fingerprint. It contains no random value and does not
+change canonical bytes, `episode_id`, `pipeline_version`, or check versions.
+The preceding append is selected using the same timestamp/fingerprint ordering
+as curation. Selective-stage runs participate in this history too, so a full
+run cannot replay an old success over a later metadata-only failure. Checks
+omitted from a selective run retain their own latest recorded results.
+
+Without an explicit execution identity, identical current content is treated
+as a retry; identical historical content is treated as a new occurrence. Content
+alone cannot tell a delayed retry from a fresh execution. Callers that need
+retries to remain idempotent across intervening executions must persist an
+`execution_id` **before the first attempt** and reuse it:
+
+```python
+report = app.process("episode_0001.mcap", execution_id="durable-task-attempt-42")
+```
+
+`Catalog.append_episode()` accepts the same argument. With an explicit id, the
+scope hashes that id instead of the predecessor. The same id and outcome always
+address the original append, even after another execution commits or a writer
+crashes before returning. A new execution must get a new id. If a retry actually
+produces a different outcome, that different content still gets its own append.
+Do not reuse an id across fresh executions that may return to an older outcome.
+The scheduler's provenance-only `orchestrator_run_id` is not used as this token.
+
+This is a change to append identity semantics, with no Parquet schema change:
+catalog format version 1 remains readable, existing first-occurrence hashes
+remain valid, and historical timestamps are never advanced. Upgrade all writers
+to obtain these recurrence semantics; old writers still deduplicate globally.
+Already suppressed executions cannot be recovered from the catalog; rerun the
+checks to record current state. Implicit appends now scan episode history
+(including syncing the bucket mirror); explicit ids avoid this scan. This is
+not a globally serialized execution log: concurrent different outcomes retain
+the existing `recorded_at`/fingerprint ordering and require synchronized clocks
+for meaningful cross-worker time ordering.
 
 ## Querying
 

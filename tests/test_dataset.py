@@ -1,6 +1,7 @@
 """`hflow dataset create`: the pipeline's own policy as an immutable artifact."""
 
 import json
+import os
 from pathlib import Path
 
 import duckdb
@@ -14,6 +15,7 @@ from hflow.dataset import (
     dataset_slug,
     default_dataset_sql,
 )
+from hflow.storage import BucketStorageRoot
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.workspace import Workspace
 
@@ -334,6 +336,73 @@ def duration(ep: hflow.Episode) -> hflow.CheckResult:
 
 class TestSettledThenCrashed:
     """The one case the settled-steps rule cannot see on its own."""
+
+    @pytest.mark.parametrize("first_errors", [True, False])
+    @pytest.mark.parametrize("stages", ["full", "metadata_backfill"])
+    @pytest.mark.parametrize("bucket", [False, True])
+    @pytest.mark.parametrize("explicit_execution", [False, True])
+    def test_recurring_outcome_becomes_current_and_consecutive_retries_deduplicate(
+        self,
+        tmp_path: Path,
+        source_episode: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        bucket_over_tmp: tuple[BucketStorageRoot, Path],
+        first_errors: bool,
+        stages: str,
+        bucket: bool,
+        explicit_execution: bool,
+    ) -> None:
+        data_root = bucket_over_tmp[0] if bucket else tmp_path / "data"
+        app = hflow.App("recurring-outcome", data_root=data_root, default_checks=())
+
+        @app.check(critical=True, version="1")
+        def duration(_episode: hflow.Episode) -> hflow.CheckResult:
+            if os.environ.get("CRASH_DURATION") == "1":
+                raise RuntimeError("temporary service failure")
+            return hflow.CheckResult(measurements={"seconds": 1.0})
+
+        entries: list[hflow.catalog.AppendResult] = []
+        for attempt, errors in enumerate([first_errors, not first_errors, first_errors]):
+            monkeypatch.setenv("CRASH_DURATION", "1" if errors else "0")
+            for retry in range(2):
+                report = app.process(
+                    source_episode,
+                    record=True,
+                    stages="full" if attempt == retry == 0 else stages,
+                    execution_id=f"attempt-{attempt}" if explicit_execution else None,
+                )
+                expected_check_status = "error" if errors else "measured"
+                assert report.check("duration").status == expected_check_status
+                entry = report.catalog_entry
+                assert entry is not None
+                assert entry.written is (retry == 0)
+                if retry == 0:
+                    entries.append(entry)
+                else:
+                    assert entry.run_fingerprint == entries[-1].run_fingerprint
+
+                # Each observation uses a fresh connection; bucket reads must
+                # discover newly committed occurrences despite a warm mirror.
+                connection = hflow.open_catalog_connection(app.workspace.catalog_root)
+                try:
+                    assert connection.execute("SELECT status FROM episodes").fetchone() == (
+                        "unverified" if errors else "ok",
+                    )
+                    assert connection.execute(
+                        "SELECT status FROM check_runs_latest WHERE check_name = 'duration'"
+                    ).fetchone() == (expected_check_status,)
+                    assert connection.execute("SELECT count(*) FROM episodes_raw").fetchone() == (
+                        attempt + 1,
+                    )
+                finally:
+                    connection.close()
+                assert create_dataset(app, f"attempt-{attempt}-retry-{retry}").row_count == (
+                    0 if errors else 1
+                )
+
+        assert len({entry.episode_id for entry in entries}) == 1
+        assert entries[0].run_fingerprint.split(".")[0] == entries[2].run_fingerprint.split(".")[0]
+        assert len({entry.run_fingerprint for entry in entries}) == 3
 
     @pytest.fixture
     def project(self, tmp_path: Path, source_episode: Path) -> Path:

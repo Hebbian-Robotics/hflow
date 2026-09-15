@@ -14,7 +14,8 @@ Durability idioms honored here:
 - **Create-if-absent appends**: each append writes one Parquet file per table
   named ``<episode_id>-<run_fingerprint>.parquet``; if the file already
   exists the append is a no-op. The fingerprint includes the observable
-  outcome, so an exact replay deduplicates while a repaired retry appends.
+  outcome and, when it recurs, its predecessor. Consecutive identical
+  outcomes deduplicate; returning to an older outcome appends a new fact.
 - **Append, never overwrite**: re-running a changed check (new
   ``check_version``) adds new-version rows; curation picks or pins versions.
 
@@ -111,8 +112,8 @@ _DEPENDENT_TABLE_NAMES = tuple(name for name in TABLE_COLUMN_DDL if name != "epi
 # Appends this process already verified (or repaired) as recorded_at-aligned,
 # keyed by (location, file_stem). Once aligned a stem can never go stale
 # again -- the episodes file is immutable and every post-commit dependent
-# write carries its recorded_at -- so replays skip straight back to the
-# single existence check instead of re-reading every dependent file each time.
+# write carries its recorded_at -- so replays need not re-read every
+# dependent file after resolving the occurrence's identity.
 _reconciled_append_stems: set[tuple[str, str]] = set()
 
 _FORMAT_MARKER_NAME = "format_version"
@@ -603,12 +604,12 @@ def _run_fingerprint(
     check_rows: Sequence[CheckRunRow],
     quarantine_tags: Sequence[str],
 ) -> str:
-    """Identify one observable run outcome while keeping exact retries idempotent.
+    """Identify observable content, independently of when it occurred.
 
     Step versions identify intended behavior, not whether a particular
     attempt timed out or what it measured. Outcome data belongs in the append
-    identity so a successful retry after a transient error is preserved,
-    while replaying the exact same result remains a no-op.
+    identity so a successful retry after a transient error is preserved.
+    Catalog._append_fingerprint scopes this content to an occurrence.
     """
     check_outcomes: list[dict[str, object]] = []
     for row in check_rows:
@@ -818,9 +819,22 @@ class Catalog:
         source_uri: str | None = None,
         uri: str | None = None,
         orchestrator_run_id: str | None = None,
+        execution_id: str | None = None,
         time_bounds: EpisodeTimeBounds | None = None,
     ) -> AppendResult:
-        """Record one outcome; replaying that exact outcome is idempotent.
+        """Record an outcome; consecutive identical outcomes are idempotent.
+
+        Without ``execution_id``, the latest append for this episode or source
+        defines the retry boundary. An older outcome recurring after another
+        append gets a new, deterministic fingerprint scoped to that predecessor.
+        Selective-stage appends participate in the same history.
+
+        For retries that may arrive after intervening executions, persist and
+        reuse an explicit ``execution_id`` before the first append attempt.
+        Together with the outcome it identifies the append independently of
+        current state, including after a crash before this method returns.
+        Use a new id for new executions; reusing an id and outcome deliberately
+        replays the original append without making it current again.
 
         ``time_bounds`` is the episode's own time axis (``Episode.time_bounds``),
         recorded as the ``start_ns``/``end_ns`` columns. It is a fact about the
@@ -840,7 +854,7 @@ class Catalog:
 
         The consequence is worth stating rather than discovering. A replay
         returns ``written=False`` above without touching the stored row, so
-        this column names the run that FIRST recorded an outcome, not every
+        this column names the run that FIRST recorded an occurrence, not every
         run that has since produced it. That is the honest reading of an
         append that did nothing. ``None`` (the local dev loop, any caller
         outside the runtime) records NULL.
@@ -854,6 +868,8 @@ class Catalog:
         # it has to compare equal to what the orchestrator's own API reports.
         if orchestrator_run_id is not None and not orchestrator_run_id.strip():
             orchestrator_run_id = None
+        if execution_id is not None and not execution_id.strip():
+            raise ValueError("execution_id must be non-empty when supplied")
         episode_id = content_episode_id(canonical_path)
         # One normalized shape feeds every consumer below -- the run
         # fingerprint, the replay repair pass, and the dependent-table
@@ -869,11 +885,17 @@ class Catalog:
             for row in check_rows
         ]
         _raise_if_measurement_keys_shadow_episode_columns(check_rows)
-        run_fingerprint = _run_fingerprint(
+        outcome_fingerprint = _run_fingerprint(
             episode_id,
             stamps.pipeline_version,
             check_rows,
             quarantine_tags,
+        )
+        run_fingerprint = self._append_fingerprint(
+            episode_id=episode_id,
+            outcome_fingerprint=outcome_fingerprint,
+            source_uri=source_uri,
+            execution_id=execution_id,
         )
         file_stem = f"{episode_id}-{run_fingerprint}"
 
@@ -999,6 +1021,56 @@ class Catalog:
             episode_id=episode_id, run_fingerprint=run_fingerprint, written=episodes_created
         )
 
+    def _append_fingerprint(
+        self,
+        *,
+        episode_id: str,
+        outcome_fingerprint: str,
+        source_uri: str | None,
+        execution_id: str | None,
+    ) -> str:
+        """Keep outcome content stable while identifying each recurrence.
+
+        A suffix is an identity scope, never a clock or random salt. All tables
+        continue joining on the same (episode_id, run_fingerprint), and the
+        existing create-if-absent commit and repair protocol applies unchanged.
+        Racing identical appends observing the same predecessor choose the same
+        stem. Explicit execution ids also survive intervening commits.
+        """
+        if execution_id is not None:
+            scope = ["execution", execution_id]
+        else:
+            self.sync_for_read(("episodes",))
+            if not any(self.table_dir("episodes").glob("*.parquet")):
+                return outcome_fingerprint
+            connection = duckdb.connect()
+            try:
+                latest = connection.execute(
+                    "SELECT episode_id, run_fingerprint FROM read_parquet(?, union_by_name=true) "
+                    "WHERE episode_id = ? OR (source_uri IS NOT NULL AND source_uri = ?) "
+                    "ORDER BY recorded_at DESC, run_fingerprint DESC LIMIT 1",
+                    [str(self.table_dir("episodes") / "*.parquet"), episode_id, source_uri],
+                ).fetchone()
+            finally:
+                connection.close()
+            if latest is None:
+                # Let replay reconciliation diagnose an empty commit marker.
+                return outcome_fingerprint
+            latest_episode_id, latest_fingerprint = map(str, latest)
+            if (
+                latest_episode_id == episode_id
+                and latest_fingerprint.split(".", 1)[0] == outcome_fingerprint
+            ):
+                return latest_fingerprint
+            # Preserve existing v1 filenames for first occurrences, including
+            # crash debris whose episode commit marker has not landed yet.
+            original_key = f"episodes/{episode_id}-{outcome_fingerprint}.parquet"
+            if not self.location.exists(original_key):
+                return outcome_fingerprint
+            scope = ["after", latest_episode_id, latest_fingerprint]
+        suffix = hashlib.sha256(json.dumps(scope, separators=(",", ":")).encode()).hexdigest()[:16]
+        return f"{outcome_fingerprint}.{suffix}"
+
     def _reconcile_replayed_append(
         self,
         *,
@@ -1024,9 +1096,8 @@ class Catalog:
         with the same committed ``recorded_at``, so concurrent replays
         converge instead of fighting.
 
-        Verified stems are memoized per process: the steady-state replay
-        (the idempotent-dedupe hot path) pays this pass's dependent file reads at
-        most once, then returns to the single existence check.
+        Verified stems are memoized per process: a replay pays this pass's
+        dependent file reads at most once per occurrence.
         """
         memo_key = (str(self.location), file_stem)
         if memo_key in _reconciled_append_stems:

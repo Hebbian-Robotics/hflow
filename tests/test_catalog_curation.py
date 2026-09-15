@@ -1,6 +1,7 @@
 """Catalog appends and curation queries (issues #16/#17)."""
 
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -99,6 +100,106 @@ def test_checks_without_observations_keep_the_pre_observation_fingerprint() -> N
     )
 
     assert _run_fingerprint("episode-id", "pipeline-v1", [check_row], []) == "b47ee98776b1"
+
+
+def test_selective_appends_do_not_replay_an_obsolete_full_outcome(tmp_path: Path) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    canonical = _fake_canonical(tmp_path)
+    measured = replace(_check_row(), critical=True)
+    other = replace(_check_row(), check_name="other", measurements={"other_score": 1.0})
+    errored = CheckRunRow(
+        check_name=measured.check_name,
+        check_version=measured.check_version,
+        critical=True,
+        status=hflow.CheckStatus.ERROR,
+        duration_s=0.1,
+        error="temporary service failure",
+    )
+    full_outcome = [measured, other]
+    for rows, expected_status in [
+        (full_outcome, "ok"),
+        ([errored], "unverified"),
+        ([other], "unverified"),
+        (full_outcome, "ok"),
+    ]:
+        result = catalog.append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=rows,
+        )
+        assert result.written
+        assert _status_of_only_episode(catalog.root) == expected_status
+
+    connection = open_catalog_connection(catalog.root)
+    try:
+        assert connection.execute("SELECT count(*) FROM episodes_raw").fetchone() == (4,)
+        assert connection.execute(
+            "SELECT DISTINCT run_fingerprint FROM check_runs_latest"
+        ).fetchall() == [(result.run_fingerprint,)]
+        assert connection.execute(
+            "SELECT DISTINCT run_fingerprint FROM observations_latest"
+        ).fetchall() == [(result.run_fingerprint,)]
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("bucket", [False, True])
+def test_execution_identity_replays_history_without_reordering_it(
+    tmp_path: Path,
+    bucket_over_tmp: tuple[hflow.storage.BucketStorageRoot, Path],
+    bucket: bool,
+) -> None:
+    root = bucket_over_tmp[0].child("catalog") if bucket else tmp_path / "catalog"
+    canonical = _fake_canonical(tmp_path)
+
+    def append(execution_id: str, value: float = 1.0) -> hflow.catalog.AppendResult:
+        return Catalog(root).append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[_check_row(value=value)],
+            execution_id=execution_id,
+        )
+
+    first = append("first")
+    assert first.written
+    newer = append("second", value=2.0)
+    assert newer.written
+    location = Catalog(root).location
+    original_files = {
+        table: location.read_bytes(f"{table}/{first.episode_id}-{first.run_fingerprint}.parquet")
+        for table in TABLE_COLUMN_DDL
+    }
+    hflow.catalog._reconciled_append_stems.clear()
+    replay = append("first")
+    assert not replay.written
+    assert replay.run_fingerprint == first.run_fingerprint
+    connection = open_catalog_connection(root)
+    try:
+        assert connection.execute("SELECT example_metric FROM episodes").fetchone() == (2.0,)
+    finally:
+        connection.close()
+    returned = append("third")
+    assert returned.written
+    assert returned.run_fingerprint != first.run_fingerprint
+    assert not append("third").written
+    for table, content in original_files.items():
+        assert (
+            location.read_bytes(f"{table}/{first.episode_id}-{first.run_fingerprint}.parquet")
+            == content
+        )
+    connection = open_catalog_connection(root)
+    try:
+        assert connection.execute("SELECT example_metric FROM episodes").fetchone() == (1.0,)
+        assert connection.execute("SELECT count(*) FROM episodes_raw").fetchone() == (3,)
+        for table in TABLE_COLUMN_DDL:
+            relation = "episodes_raw" if table == "episodes" else table
+            assert connection.execute(
+                f"SELECT count(DISTINCT run_fingerprint) FROM {relation}"
+            ).fetchone() == (3,)
+    finally:
+        connection.close()
 
 
 def test_timestamped_observations_round_trip_as_typed_long_rows(tmp_path: Path) -> None:
@@ -2064,7 +2165,10 @@ def test_measurement_key_shadowing_is_case_insensitive(tmp_path: Path) -> None:
         )
 
 
-def test_crash_repaired_append_keeps_one_recorded_at_across_tables(tmp_path: Path) -> None:
+@pytest.mark.parametrize("recurring", [False, True])
+def test_crash_repaired_append_keeps_one_recorded_at_across_tables(
+    tmp_path: Path, recurring: bool
+) -> None:
     """A retry after a crashed append must not mix timestamps across tables.
 
     Mixed recorded_at would let the per-key 'latest' views attribute another
@@ -2095,6 +2199,14 @@ def test_crash_repaired_append_keeps_one_recorded_at_across_tables(tmp_path: Pat
             check_rows=[row],
         )
 
+    if recurring:
+        append_same_outcome()
+        catalog.append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[replace(row, measurements={"score": 2.0})],
+        )
     first = append_same_outcome()
     stem = f"{first.episode_id}-{first.run_fingerprint}"
     # Simulate the crash: the episodes file (written last) and one dependent
@@ -2131,8 +2243,10 @@ def test_crash_repaired_append_keeps_one_recorded_at_across_tables(tmp_path: Pat
         connection.close()
 
 
+@pytest.mark.parametrize("recurring", [False, True])
 def test_replaying_an_append_heals_dependents_left_stale_by_a_crashed_repair(
     tmp_path: Path,
+    recurring: bool,
 ) -> None:
     """#51's residual window: a winner that created the episodes file but
     crashed before force-aligning the dependents leaves them carrying a stale
@@ -2154,6 +2268,14 @@ def test_replaying_an_append_heals_dependents_left_stale_by_a_crashed_repair(
             check_rows=[row],
         )
 
+    if recurring:
+        append_same_outcome()
+        catalog.append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[_check_row(value=2.0)],
+        )
     first = append_same_outcome()
     stem = f"{first.episode_id}-{first.run_fingerprint}"
 
@@ -2239,8 +2361,10 @@ def test_replaying_an_append_refuses_a_corrupt_empty_commit_marker(tmp_path: Pat
         append_same_outcome()
 
 
+@pytest.mark.parametrize("recurring", [False, True])
 def test_concurrent_append_of_the_identical_outcome_keeps_one_recorded_at(
     tmp_path: Path,
+    recurring: bool,
 ) -> None:
     """Two callers racing ``append_episode`` for the identical outcome (a
     retried or duplicate-dispatched batch task, not a crash) must not split
@@ -2260,6 +2384,15 @@ def test_concurrent_append_of_the_identical_outcome_keeps_one_recorded_at(
     canonical = _fake_canonical(tmp_path)
     catalog = Catalog(tmp_path / "catalog")
     row = _check_row()
+
+    if recurring:
+        for prior_row in [row, _check_row(value=2.0)]:
+            catalog.append_episode(
+                canonical_path=canonical,
+                stamps=FAKE_STAMPS,
+                episode_metadata={},
+                check_rows=[prior_row],
+            )
 
     # A storage-boundary test double: gate the first two dependent-table
     # writes on a barrier so both threads are guaranteed to reach
