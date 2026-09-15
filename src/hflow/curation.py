@@ -633,16 +633,6 @@ def reject_non_single_select(sql: str) -> None:
     touches the connection.  A syntactically invalid string propagates the
     parser's ``duckdb.Error`` untouched — that is NOT this exception — so
     the two failure modes stay distinguishable.
-
-    The narrowing for ``PRAGMA`` / ``DESCRIBE`` / ``SHOW`` / ``SUMMARIZE``
-    asks DuckDB the same question the preview wrapper does: does the SQL
-    parse inside ``SELECT * FROM (<sql>)``? ``extract_statements`` on that
-    form accepts everything that runs as a subquery, including FROM-first
-    queries, parenthesized SELECTs, and VALUES clauses that a SELECT/WITH
-    text prefix would refuse (review of #453). Trailing semicolons and whitespace are
-    stripped before wrapping, and a newline is appended when missing, so
-    a trailing ``--`` line comment cannot swallow the wrapper's closing
-    paren.
     """
     parser_connection = duckdb.connect()
     try:
@@ -656,25 +646,10 @@ def reject_non_single_select(sql: str) -> None:
             raise NonSingleSelectQueryError("sql must be exactly one SELECT statement")
         # Refuse PRAGMA/DESCRIBE/SHOW/SUMMARIZE by leading keyword. DuckDB
         # labels them SELECT, and DESCRIBE/SHOW/SUMMARIZE even parse cleanly
-        # as subqueries. Only ``SELECT * FROM (PRAGMA database_list)`` raises
-        # a parser error, so the parse check below is necessary but not
-        # sufficient: this leading-keyword refusal is what keeps the gate in
+        # as subqueries. This leading-keyword refusal is what keeps the gate in
         # step with what the endpoints advertise.
         if _leading_keyword(sql) in _SUBQUERY_FORBIDDEN_LEADING_KEYWORDS:
             raise NonSingleSelectQueryError("sql must be exactly one read-only SELECT statement")
-        # Parse the SQL inside the wrapper preview actually applies. Trailing
-        # semicolons and whitespace are stripped so a single ``SELECT 1;``
-        # still parses (curate()'s downstream ``connection.sql()`` handles
-        # trailing ``;`` itself; the server-side preview handler strips them
-        # at the boundary), and a newline is appended so a trailing ``--``
-        # comment without one cannot swallow the wrapper's ``)``.
-        wrapped_input = f"SELECT * FROM ({sql.rstrip().rstrip(';').rstrip()}\n)"
-        try:
-            parser_connection.extract_statements(wrapped_input)
-        except duckdb.Error as exc:
-            raise NonSingleSelectQueryError(
-                "sql must be exactly one read-only SELECT statement"
-            ) from exc
     finally:
         parser_connection.close()
 
