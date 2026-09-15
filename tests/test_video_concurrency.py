@@ -1,38 +1,95 @@
 from __future__ import annotations
 
-import threading
+import hashlib
+import shutil
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import SimpleNamespace
+
+import pytest
 
 import hflow.video as video
 
+_FFMPEG = shutil.which("ffmpeg")
+_FFPROBE = shutil.which("ffprobe")
+_requires_system_ffmpeg = pytest.mark.skipif(
+    _FFMPEG is None or _FFPROBE is None,
+    reason="system ffmpeg/ffprobe required for remux concurrency regression",
+)
 
-def test_concurrent_remuxes_use_distinct_temp_files(tmp_path, monkeypatch) -> None:
+
+def _frame_count(path: Path) -> int:
+    assert _FFPROBE is not None
+    result = subprocess.run(
+        [
+            _FFPROBE,
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "csv=p=0",
+            str(path),
+        ],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    return int(result.stdout.strip())
+
+
+@_requires_system_ffmpeg
+def test_concurrent_remuxes_match_single_process_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert _FFMPEG is not None
+    system_ffmpeg = Path(_FFMPEG)
+    monkeypatch.setattr(video, "ffmpeg_path", lambda: system_ffmpeg)
+
+    encoded = subprocess.run(
+        [
+            _FFMPEG,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=30:duration=2,format=yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-bf",
+            "0",
+            "-g",
+            "30",
+            "-f",
+            "h264",
+            "-",
+        ],
+        capture_output=True,
+        check=True,
+    ).stdout
+
+    reference = video.write_access_units_to_mp4(
+        [encoded], fps=30.0, output=tmp_path / "reference.mp4"
+    )
     output = tmp_path / "camera.mp4"
-    barrier = threading.Barrier(2)
-    seen: list[Path] = []
-    seen_lock = threading.Lock()
-
-    monkeypatch.setattr(video, "scan_picture_coding_types", lambda _stream: SimpleNamespace(b_picture_count=0))
-    monkeypatch.setattr(video, "ffmpeg_path", lambda: Path("/usr/bin/ffmpeg"))
-
-    def fake_run(command, *, input, capture_output):
-        temp_path = Path(command[-1])
-        with seen_lock:
-            seen.append(temp_path)
-        barrier.wait(timeout=5)
-        temp_path.write_bytes(b"valid-mp4")
-        return SimpleNamespace(returncode=0, stderr=b"")
-
-    monkeypatch.setattr(video.subprocess, "run", fake_run)
-
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(video.write_access_units_to_mp4, [b"frame"], fps=30.0, output=output) for _ in range(2)]
+        futures = [
+            pool.submit(video.write_access_units_to_mp4, [encoded], fps=30.0, output=output)
+            for _ in range(2)
+        ]
         for future in futures:
             assert future.result() == output
 
-    assert len(seen) == 2
-    assert len(set(seen)) == 2
-    assert output.read_bytes() == b"valid-mp4"
-    assert all(not path.exists() for path in seen)
+    assert (
+        hashlib.sha256(output.read_bytes()).digest()
+        == hashlib.sha256(reference.read_bytes()).digest()
+    )
+    assert _frame_count(output) == 60
+    assert not list(tmp_path.glob(f".{output.name}.*.tmp"))
