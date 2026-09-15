@@ -254,6 +254,43 @@ def test_transform_losslessly_inserts_missing_passthrough_video_auds(tmp_path: P
     assert report.conforming, report.summary()
 
 
+def test_transform_repairs_auds_without_refusing_irregular_passthrough_gop(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "irregular-gop-missing-auds.mcap"
+    original_payloads = _write_passthrough_video_source(
+        source,
+        [
+            ("/cam", 0, KEYFRAME_WITHOUT_AUD),
+            ("/cam", 100_000_000, NON_KEYFRAME_WITHOUT_AUD),
+            ("/cam", 200_000_000, KEYFRAME_WITHOUT_AUD),
+        ],
+    )["/cam"]
+    output = tmp_path / "out.mcap"
+
+    write_canonical_episode(source, output)
+
+    with output.open("rb") as stream:
+        output_payloads = [
+            message.data for _schema, _channel, message in make_reader(stream).iter_messages()
+        ]
+    original_messages = [CompressedVideo.FromString(payload) for payload in original_payloads]
+    output_messages = [CompressedVideo.FromString(payload) for payload in output_payloads]
+    for original, repaired in zip(original_messages, output_messages, strict=True):
+        assert bytes(repaired.data).endswith(bytes(original.data))
+        assert len(repaired.data) == len(original.data) + 6
+
+    report = diagnose(output)
+    cadence_findings = [
+        finding for finding in report.findings if finding.code == "video-keyframe-cadence"
+    ]
+    assert cadence_findings
+    assert any(
+        "message 2: is_keyframe=True, expected False" in finding.message
+        for finding in cadence_findings
+    )
+
+
 def test_transform_still_rejects_undelimited_video_starting_mid_gop(tmp_path: Path) -> None:
     source = tmp_path / "undelimited-mid-gop.mcap"
     _write_passthrough_video_source(source, [("/cam", 1, NON_KEYFRAME_WITHOUT_AUD)])
