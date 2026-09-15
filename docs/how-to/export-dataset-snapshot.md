@@ -63,9 +63,9 @@ media paths are relative to the export directory. The JSON marker is written
 last and the completed directory is activated atomically.
 
 Under the same format version `1`, an additive `integrity` block records
-delivery integrity so a later verifier (not shipped here) can tell whether the
-published bytes are still intact. The original `tables` map is unchanged for
-external readers; receipts live only under `integrity`:
+delivery integrity so `hflow verify snapshot` (or `verify_dataset_snapshot`)
+can tell whether the published bytes are still intact. The original `tables`
+map is unchanged for external readers; receipts live only under `integrity`:
 
 | Field | Meaning |
 | --- | --- |
