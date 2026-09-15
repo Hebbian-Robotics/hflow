@@ -466,9 +466,9 @@ def create_curation_router(settings: ServerSettings) -> APIRouter:
             raise HTTPException(
                 status_code=404, detail=f"no pinned manifest with id {manifest_id!r}"
             )
-        # Fetched through the storage root, so a bucket-backed workspace serves
-        # its manifests like any other: fetch downloads into the mirror there
-        # and is the file itself for a local root.
+        # Fetch uses the storage root (a local file or a bucket mirror). HTTP
+        # download still requires a local data root at the served-file check
+        # below; bucket pinning/persistence does not imply download support.
         try:
             manifest_file = Workspace.parse(settings.data_root).storage_root.fetch(
                 entry.manifest_path

@@ -253,11 +253,11 @@ def create_app(settings: ServerSettings) -> FastAPI:
             workspace_id=identity.workspace_id if identity is not None else None,
             capabilities=WorkspaceCapabilities(
                 catalog=_catalog_marker_readable(workspace),
-                # Media bytes and the studio's writes both need the workspace
-                # reachable as local paths; they are separate flags because
-                # bucket support will arrive for them separately.
+                # Media bytes still need local paths (501 on buckets until
+                # serving exists). Curation pin/sidecar/manifest writes already
+                # go through StorageRoot, so buckets advertise curation too.
                 media=workspace_is_local,
-                curation=workspace_is_local,
+                curation=True,
                 # Addressed (bundle dir or HFLOW_AIRFLOW_URL), not necessarily
                 # reachable -- /runtime/status owns liveness, and it is also
                 # the one endpoint that serves the Airflow deep-link base.
