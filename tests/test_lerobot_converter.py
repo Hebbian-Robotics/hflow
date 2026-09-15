@@ -163,6 +163,11 @@ def _build_fake_corpus(tmp_path: Path) -> dict:
         't(index, episode_index, frame_index, timestamp, "observation.state", action)) '
         f"TO '{data_quoted}' (FORMAT parquet)"
     )
+    conn.execute(
+        "COPY (SELECT index, episode_index, frame_index, CAST(timestamp AS DOUBLE) AS timestamp, "
+        f"\"observation.state\", action FROM read_parquet('{data_quoted}')) "
+        f"TO '{data_quoted}' (FORMAT parquet)"
+    )
     conn.close()
 
     return {
@@ -723,6 +728,216 @@ def test_converter_output_remuxes_without_tail_loss(
         check=True,
     )
     assert "nb_read_frames=90" in probe.stdout, probe.stdout
+
+
+def test_converter_slices_exactly_the_declared_frame_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A window end landing exactly on a frame boundary must not pull the
+    next episode's first frame into the slice.
+
+    Source end timestamps are exclusive ([from, to) like the data rows), but
+    an end that lands exactly on the frame grid rounds UP to the next frame's
+    timestamp when ffmpeg receives it, so the -to cut includes one frame too
+    many and the converter refuses the episode. The slice is cut by the
+    declared frame count instead, so the parquet and the video cannot
+    disagree by one. The first episode of the pinned svla corpus reproduces
+    this on real recordings (length 226 vs 227 access units).
+    """
+    assert _FFMPEG is not None and _FFPROBE is not None
+    source = tmp_path / "source.mp4"
+    subprocess.run(
+        [
+            _FFMPEG,
+            "-hide_banner",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=30:duration=3,format=yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-bf",
+            "0",
+            "-g",
+            "30",
+            "-keyint_min",
+            "30",
+            "-sc_threshold",
+            "0",
+            str(source),
+        ],
+        capture_output=True,
+        check=True,
+    )
+    system_ffmpeg_path = Path(_FFMPEG)
+    system_ffprobe_path = Path(_FFPROBE)
+    monkeypatch.setattr(prep, "ffmpeg_path", lambda: system_ffmpeg_path)
+    monkeypatch.setattr(prep, "ffprobe_path", lambda: system_ffprobe_path)
+    monkeypatch.setattr(prep, "ffmpeg_version", lambda: "test-ffmpeg")
+
+    camera_key = "observation.images.up"
+    corpus = _build_fake_corpus(tmp_path)
+
+    # Two episodes sharing one 90-frame video. Episode 0 declares 62 frames
+    # and its window ends at 62/30 s -- exactly the boundary where a
+    # timestamp cut includes frame 62 (the first frame of episode 1).
+    boundary = 62 / 30.0
+
+    def episode_row(index: int, length: int, data_from: int) -> dict:
+        return {
+            "episode_index": index,
+            "task": f"task-{index}",
+            "length": length,
+            "data_chunk": "000",
+            "data_file": "000",
+            "data_from": data_from,
+            "data_to": data_from + length,
+            "video_windows": {
+                camera_key: {
+                    "chunk_index": "000",
+                    "file_index": "000",
+                    "from_timestamp": 0.0 if index == 0 else boundary,
+                    "to_timestamp": boundary if index == 0 else 3.0,
+                }
+            },
+        }
+
+    data_rows = []
+    for index in range(2):
+        length = 62 if index == 0 else 28
+        for frame in range(length):
+            state = "[" + ",".join(str(float(frame)) for _ in range(6)) + "]"
+            action = "[" + ",".join(str(float(frame + 0.5)) for _ in range(6)) + "]"
+            data_rows.append(
+                [index * 62 + frame, index, frame, round(frame / 30.0, 6), state, action]
+            )
+    data_path = tmp_path / "data" / "chunk-000" / "file-000.parquet"
+    data_path.parent.mkdir(parents=True, exist_ok=True)
+    data_quoted = str(data_path).replace("'", "''")
+    data_vals = ",".join("(" + ",".join(str(v) for v in row) + ")" for row in data_rows)
+    import duckdb
+
+    conn = duckdb.connect()
+    conn.execute(
+        f"COPY (SELECT * FROM (VALUES {data_vals}) AS "
+        't(index, episode_index, frame_index, timestamp, "observation.state", action)) '
+        f"TO '{data_quoted}' (FORMAT parquet)"
+    )
+    conn.execute(
+        "COPY (SELECT index, episode_index, frame_index, CAST(timestamp AS DOUBLE) AS timestamp, "
+        f"\"observation.state\", action FROM read_parquet('{data_quoted}')) "
+        f"TO '{data_quoted}' (FORMAT parquet)"
+    )
+    conn.close()
+
+    dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
+
+    def typed_episode_row(index: int, length: int, data_from: int) -> prep._EpisodeRow:
+        row = episode_row(index, length, data_from)
+        return prep._EpisodeRow(
+            episode_index=row["episode_index"],
+            task=row["task"],
+            length=row["length"],
+            data_chunk=row["data_chunk"],
+            data_file=row["data_file"],
+            data_from=row["data_from"],
+            data_to=row["data_to"],
+            video_windows={
+                camera_key: prep._VideoWindow(
+                    chunk_index=window["chunk_index"],
+                    file_index=window["file_index"],
+                    from_timestamp=window["from_timestamp"],
+                    to_timestamp=window["to_timestamp"],
+                )
+                for camera_key, window in row["video_windows"].items()
+            },
+        )
+
+    source_archive = prep._SourceArchive(
+        dataset_information=prep._parse_dataset_information(corpus["info"]),
+        episodes=(typed_episode_row(0, 62, 0), typed_episode_row(1, 28, 62)),
+        video_keys=(camera_key,),
+        cache_dir=corpus["cache_dir"],
+        dataset=dataset_source,
+    )
+    numeric_schemas = {
+        "observation.state": prep._NumericSchema(name="observation.state", dim=6),
+        "action": prep._NumericSchema(name="action", dim=6),
+    }
+
+    def fake_download(url: str, destination_path: Path, **_kwargs: object) -> None:
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        if "/videos/" in url:
+            shutil.copy(source, destination_path)
+            return
+        shutil.copy(data_path, destination_path)
+
+    monkeypatch.setattr(prep, "_download_file", fake_download)
+
+    storage = LocalStorageRoot(tmp_path / "output")
+    for index in (0, 1):
+        receipt = prep._convert_single_episode(
+            source_archive=source_archive,
+            dataset_source=dataset_source,
+            storage=storage,
+            episode_index=index,
+            camera_keys=(camera_key,),
+            numeric_schemas=numeric_schemas,
+            frames_per_second=30,
+        )
+        assert Path(receipt["uri"]).name == f"lerobot_episode_{index + 1:04d}.mcap"
+        landed_path = Path(receipt["uri"])
+        assert receipt["content_id"] == prep.content_episode_id(landed_path)
+        assert receipt["size_bytes"] == landed_path.stat().st_size
+
+    # The canonical landing records the source episode it was converted from.
+    episode_metadata = open_reader(
+        storage.path / "landing" / "lerobot_episode_0001.mcap"
+    ).metadata()
+    assert episode_metadata["episode/v1"]["source_episode_index"] == "0"
+
+
+def test_window_times_are_count_anchored_not_boundary_filtered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Quantized container timestamps at the window edges must not change the
+    frame count: the episode's extent is its data-row count, not a half-open
+    time filter that float32 rounding can tip by one frame in either
+    direction. The pinned svla corpus reproduces both directions (231
+    packets in a 230-row window; 214 in a 215-row window) on current main.
+    """
+    import struct
+
+    def f32(value: float) -> float:
+        return struct.unpack("f", struct.pack("f", value))[0]
+
+    fps = 30.0
+    start_seconds = 10.0
+    frame_count = 230
+    end_seconds = start_seconds + frame_count / fps
+    # Two hundred thirty data rows (indexes 300..529); the chunk carries
+    # frames 299..535, and the next episode's first frame (index 530, at
+    # exactly ``end_seconds``) quantizes to a hair BELOW the float64 end --
+    # inside a half-open [start, end) filter, outside a count-anchored one.
+    packets = [f32(index / fps) for index in range(299, 536)]
+
+    monkeypatch.setattr(prep, "_get_video_pts_times", lambda _path: packets)
+    rebased = prep._relative_video_pts_times(
+        Path("chunk.mp4"), start_seconds, end_seconds, frame_count, fps
+    )
+    assert len(rebased) == frame_count
+    assert rebased == [f32(index / fps) - start_seconds for index in range(300, 530)]
+
+    # A video with too few packets after the window start is refused loudly
+    # rather than silently producing a short episode.
+    monkeypatch.setattr(prep, "_get_video_pts_times", lambda _path: packets[: frame_count - 1])
+    with pytest.raises(ValueError, match=r"video has \d+ packets"):
+        prep._relative_video_pts_times(
+            Path("chunk.mp4"), start_seconds, end_seconds, frame_count, fps
+        )
 
 
 # --- Hugging Face JSON boundary contextual errors (#301) ---------------------
@@ -2237,11 +2452,12 @@ def test_converter_version_bumped_with_the_label_support() -> None:
     """The converter version moves with any change to the published bytes.
 
     The label changed episode/v1, which content_episode_id hashes. Reading a
-    fractional fps as declared moves every message log time. Reuse keys on
-    this stamp, so a version that lags a byte change makes stale output look
-    like completed work.
+    fractional fps as declared moves every message log time. The frame-exact
+    window extraction also changes canonical bytes for windowed corpora.
+    Reuse keys on this stamp, so a version that lags a byte change makes
+    stale output look like completed work.
     """
-    assert prep.CONVERTER_VERSION == "lerobot-converter-v8"
+    assert prep.CONVERTER_VERSION == "lerobot-converter-v9"
 
 
 def test_reuse_refuses_a_landing_episode_with_damaged_payload(
