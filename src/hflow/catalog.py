@@ -884,15 +884,25 @@ class Catalog:
         # dependents), so it reconciles dependent recorded_at before
         # returning instead of trusting the previous attempt blindly.
         if self.location.exists(f"episodes/{file_stem}.parquet"):
+            current_latest_fingerprint = self._latest_run_fingerprint(episode_id)
+            if current_latest_fingerprint is not None and current_latest_fingerprint != run_fingerprint:
+                # This exact outcome was recorded before, but something DIFFERENT
+                # happened more recently (current_latest_fingerprint != run_fingerprint).
+                # Re-publish with a fresh recorded_at so latest-ranking views pick
+                # this back up as current, instead of leaving a stale result "latest".
+                self._revive_stale_outcome(
+                    file_stem=file_stem, episode_id=episode_id, run_fingerprint=run_fingerprint,
+                    check_rows=check_rows, episode_metadata=episode_metadata,
+                    quarantine_tags=quarantine_tags, stamps=stamps, source_uri=source_uri,
+                    uri=uri, orchestrator_run_id=orchestrator_run_id, time_bounds=time_bounds,
+                )
+                return AppendResult(episode_id=episode_id, run_fingerprint=run_fingerprint, written=True)
+
             self._reconcile_replayed_append(
-                file_stem=file_stem,
-                episode_id=episode_id,
-                run_fingerprint=run_fingerprint,
-                check_rows=check_rows,
+                file_stem=file_stem, episode_id=episode_id,
+                run_fingerprint=run_fingerprint, check_rows=check_rows,
             )
-            return AppendResult(
-                episode_id=episode_id, run_fingerprint=run_fingerprint, written=False
-            )
+            return AppendResult(episode_id=episode_id, run_fingerprint=run_fingerprint, written=False)
 
         recorded_at = datetime.now(UTC)
         promoted = {key: episode_metadata.get(key) for key in _PROMOTED_EPISODE_KEYS}
@@ -1102,5 +1112,113 @@ class Catalog:
                     )
                     self.location.publish(staged_file, f"{table_name}/{file_stem}.parquet")
             _reconciled_append_stems.add(memo_key)
+        finally:
+            connection.close()
+
+    def _latest_run_fingerprint(self, episode_id: str) -> str | None:
+        """The run_fingerprint currently ranked 'latest' for this episode, or None."""
+        all_episode_files = self.location.list_names("episodes")
+        matching = [
+            name for name in all_episode_files
+            if name.startswith(f"episodes/{episode_id}-")
+        ]
+        if not matching:
+            return None
+        connection = duckdb.connect()
+        try:
+            best_fingerprint: str | None = None
+            best_recorded_at = None
+            for name in matching:
+                local_file = self.location.fetch(name)
+                pattern = str(local_file).replace("'", "''")
+                row = connection.execute(
+                    f"SELECT run_fingerprint, recorded_at FROM read_parquet('{pattern}') LIMIT 1"
+                ).fetchone()
+                if row is None:
+                    continue
+                fingerprint, recorded_at = row
+                if best_recorded_at is None or recorded_at > best_recorded_at:
+                    best_recorded_at, best_fingerprint = recorded_at, fingerprint
+            return best_fingerprint
+        finally:
+            connection.close()
+
+    def _revive_stale_outcome(
+        self,
+        *,
+        file_stem: str,
+        episode_id: str,
+        run_fingerprint: str,
+        check_rows: Sequence[CheckRunRow],
+        episode_metadata: dict[str, str],
+        quarantine_tags: Sequence[str],
+        stamps: EpisodeStamps,
+        source_uri: str | None,
+        uri: str | None,
+        orchestrator_run_id: str | None,
+        time_bounds: EpisodeTimeBounds | None,
+    ) -> None:
+        """Re-publish an existing, content-identical outcome with a fresh
+        recorded_at, because a DIFFERENT outcome was recorded after it and is
+        currently 'latest' -- this occurrence is new, even though its content
+        matches something already stored under this fingerprint.
+        """
+        recorded_at = datetime.now(UTC)
+        promoted = {key: episode_metadata.get(key) for key in _PROMOTED_EPISODE_KEYS}
+        extra_metadata = {
+            key: value
+            for key, value in episode_metadata.items()
+            if key not in _PROMOTED_EPISODE_KEYS
+        }
+        connection = duckdb.connect()
+        try:
+            for table_name, column_ddl in TABLE_COLUMN_DDL.items():
+                connection.execute(f"CREATE TABLE {table_name} ({column_ddl})")
+            connection.execute(
+                "INSERT INTO episodes VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    episode_id,
+                    run_fingerprint,
+                    orchestrator_run_id,
+                    uri,
+                    source_uri,
+                    stamps.schema_version,
+                    stamps.pipeline_version,
+                    stamps.robot_software_version,
+                    stamps.ffmpeg_version,
+                    promoted["task"],
+                    promoted["operator"],
+                    promoted["success"],
+                    promoted["embodiment"],
+                    json.dumps(extra_metadata, sort_keys=True),
+                    bool(quarantine_tags),
+                    json.dumps(list(quarantine_tags)),
+                    recorded_at,
+                    time_bounds.start_ns if time_bounds is not None else None,
+                    time_bounds.end_ns if time_bounds is not None else None,
+                ],
+            )
+            _insert_dependent_rows(
+                connection,
+                episode_id=episode_id,
+                run_fingerprint=run_fingerprint,
+                check_rows=check_rows,
+                recorded_at=recorded_at,
+            )
+            with tempfile.TemporaryDirectory(prefix="hflow-catalog-revive-") as staging_name:
+                staging_dir = Path(staging_name)
+                for table_name in _TABLE_NAMES:
+                    staged_file = staging_dir / f"{table_name}.parquet"
+                    escaped = str(staged_file).replace("'", "''")
+                    connection.execute(f"COPY {table_name} TO '{escaped}' (FORMAT PARQUET)")
+                for table_name in _DEPENDENT_TABLE_NAMES:
+                    staged_file = staging_dir / f"{table_name}.parquet"
+                    dependent_key = f"{table_name}/{file_stem}.parquet"
+                    self.location.publish(staged_file, dependent_key)
+                self.location.publish(
+                    staging_dir / "episodes.parquet", f"episodes/{file_stem}.parquet"
+                )
+                _reconciled_append_stems.add((str(self.location), file_stem))
         finally:
             connection.close()
