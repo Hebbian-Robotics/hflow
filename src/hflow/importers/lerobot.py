@@ -59,7 +59,11 @@ DEFAULT_CAMERA_KEY = "observation.image"
 # time on a corpus declaring one (29.97, say) moves. A v7 file of such a
 # corpus carries the stretched time axis, and resume would otherwise accept
 # it as completed work.
-CONVERTER_VERSION = "lerobot-converter-v8"
+# "v9": an episode cut from a shared chunk video is extracted frame-exactly
+# (accurate input seek, encoder frame cap, presentation timestamps rebased
+# to the window start) instead of a stream-copied slice, so windowed
+# outputs have different canonical bytes and must not share a v8 identity.
+CONVERTER_VERSION = "lerobot-converter-v9"
 # Canonical transform knobs that affect published bytes for this importer.
 IMPORT_GOP_SECONDS = 1.0
 # The v3 per-episode aggregate of the collector's frame-level next.success
@@ -325,13 +329,35 @@ def _encode_cdr_float32_array(values: list[float] | tuple[float, ...]) -> bytes:
 
 
 def _transcode_mp4_to_h264(
-    mp4_path: Path, gop_seconds: float, frames_per_second: float
+    mp4_path: Path,
+    gop_seconds: float,
+    frames_per_second: float,
+    frame_count: int | None = None,
+    seek_seconds: float | None = None,
 ) -> list[bytes]:
-    """Transcode an mp4 to H.264 access units split on AUD markers."""
+    """Transcode an mp4 to H.264 access units split on AUD markers.
+
+    With ``seek_seconds`` the source is cut from that timestamp with an
+    accurate input seek (decode from the preceding keyframe, output
+    starting at the seek point); with ``frame_count`` the encoder output is
+    capped at exactly that many frames. Together they extract an episode
+    window frame-exactly from a shared chunk video. A stream-copied slice
+    cannot: a cut at a non-keyframe boundary drops the pre-window frames
+    the seek decoded but the muxer cannot timestamp, and a window end that
+    lands exactly on a frame boundary drags the next episode's first frame
+    in (the source's end timestamps are exclusive). Callers transcoding a
+    whole file leave both unset: the frame-count guard downstream still
+    verifies the encoder output against the parquet, and an over-long video
+    must not be silently truncated here.
+    """
     keyframe_interval = max(1, round(gop_seconds * frames_per_second))
     ffmpeg_command = [
         str(ffmpeg_path()),
         "-y",
+    ]
+    if seek_seconds is not None:
+        ffmpeg_command += ["-ss", f"{seek_seconds:.6f}"]
+    ffmpeg_command += [
         "-i",
         str(mp4_path),
         "-c:v",
@@ -350,6 +376,10 @@ def _transcode_mp4_to_h264(
         # bframes=0: B-frame streams lose their reorder-buffer tail through
         # the raw Annex B -> MP4 remux, undercounting decoded_frame_count (#250).
         "aud=1:bframes=0",
+    ]
+    if frame_count is not None:
+        ffmpeg_command += ["-frames:v", str(frame_count)]
+    ffmpeg_command += [
         "-f",
         "h264",
         "pipe:1",
@@ -407,36 +437,32 @@ def _get_video_pts_times(mp4_path: Path) -> list[float]:
     return times
 
 
-def _slice_video(
-    video_path: Path,
+def _relative_video_pts_times(
+    mp4_path: Path,
     start_seconds: float,
     end_seconds: float,
-    output_path: Path | None = None,
-) -> Path:
-    """Slice a video to a time window with stream copy (no re-encode)."""
-    resolved_output_path = output_path or (
-        video_path.parent / f"{video_path.stem}_slice{video_path.suffix}"
-    )
-    ffmpeg_command = [
-        str(ffmpeg_path()),
-        "-y",
-        "-ss",
-        f"{start_seconds:.6f}",
-        "-to",
-        f"{end_seconds:.6f}",
-        "-i",
-        str(video_path),
-        "-c",
-        "copy",
-        "-an",
-        str(resolved_output_path),
-    ]
-    completed_process = subprocess.run(ffmpeg_command, capture_output=True, timeout=600)
-    if completed_process.returncode != 0:
-        raise RuntimeError(
-            "ffmpeg slice failed: " + completed_process.stderr.decode(errors="ignore")
+    frame_count: int,
+    frames_per_second: float,
+) -> list[float]:
+    """Packet times of an episode window, rebased to the window start.
+
+    The window anchors on the left: the first ``frame_count`` packets at or
+    within one frame period of ``start_seconds`` are the episode's frames.
+    Container timestamps are quantized while the metadata window is exact,
+    so a half-open ``[start, end)`` filter over the raw times drags the next
+    episode's first frame in or drops this episode's last frame by one; the
+    data row count is the window's true extent on both edges, and the
+    per-frame timestamp check downstream still validates the alignment.
+    """
+    frame_period = 1.0 / frames_per_second
+    times = _get_video_pts_times(mp4_path)
+    windowed = [time for time in times if time >= start_seconds - frame_period]
+    if len(windowed) < frame_count:
+        raise ValueError(
+            f"video has {len(windowed)} packets at or after the window start "
+            f"but the episode has {frame_count} data rows: {mp4_path}"
         )
-    return resolved_output_path
+    return [time - start_seconds for time in windowed[:frame_count]]
 
 
 def _hf_repo_info(repo_id: str, revision: str) -> _DatasetRepositoryInformation:
@@ -1283,21 +1309,20 @@ def _convert_single_episode(
             _download_file(f"{dataset_base_url}/{video_relative_path}", local_video_path)
 
         if video_start_seconds > 0.0 or video_end_seconds > 0.0:
-            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temporary_video_file:
-                temporary_video_path = Path(temporary_video_file.name)
-            try:
-                sliced_video_path = _slice_video(
-                    local_video_path,
-                    video_start_seconds,
-                    video_end_seconds,
-                    temporary_video_path,
-                )
-                access_units = _transcode_mp4_to_h264(
-                    sliced_video_path, IMPORT_GOP_SECONDS, float(frames_per_second)
-                )
-                presentation_timestamps = _get_video_pts_times(sliced_video_path)
-            finally:
-                temporary_video_path.unlink(missing_ok=True)
+            access_units = _transcode_mp4_to_h264(
+                local_video_path,
+                IMPORT_GOP_SECONDS,
+                float(frames_per_second),
+                frame_count=frame_count,
+                seek_seconds=video_start_seconds,
+            )
+            presentation_timestamps = _relative_video_pts_times(
+                local_video_path,
+                video_start_seconds,
+                video_end_seconds,
+                frame_count,
+                float(frames_per_second),
+            )
         else:
             access_units = _transcode_mp4_to_h264(
                 local_video_path, IMPORT_GOP_SECONDS, float(frames_per_second)
