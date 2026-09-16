@@ -757,13 +757,22 @@ def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _S
     episode_metadata_files: list[Path] = []
     entries = _hf_tree(dataset_source.repo_id, dataset_source.revision, "meta/episodes")
     for entry in entries:
-        if entry.get("type") == "file" and entry["path"].endswith(".parquet"):
-            destination_path = _episode_metadata_cache_path(
-                episodes_metadata_directory, entry["path"], repo_id=dataset_source.repo_id
+        if entry.get("type") != "file":
+            continue
+        tree_entry_path = entry.get("path")
+        if not isinstance(tree_entry_path, str) or not tree_entry_path:
+            raise ValueError(
+                f"Hugging Face tree response for {dataset_source.repo_id} lists an entry "
+                "with no usable 'path'"
             )
-            if not destination_path.exists():
-                _download_file(f"{dataset_base_url}/{entry['path']}", destination_path)
-            episode_metadata_files.append(destination_path)
+        if not tree_entry_path.endswith(".parquet"):
+            continue
+        destination_path = _episode_metadata_cache_path(
+            episodes_metadata_directory, tree_entry_path, repo_id=dataset_source.repo_id
+        )
+        if not destination_path.exists():
+            _download_file(f"{dataset_base_url}/{tree_entry_path}", destination_path)
+        episode_metadata_files.append(destination_path)
 
     if not episode_metadata_files:
         raise RuntimeError("no meta/episodes parquet files found")
