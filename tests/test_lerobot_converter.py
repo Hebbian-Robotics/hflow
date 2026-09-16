@@ -730,6 +730,81 @@ def test_converter_output_remuxes_without_tail_loss(
     assert "nb_read_frames=90" in probe.stdout, probe.stdout
 
 
+def _decoded_gray_frame_stdin(access_units: "list[bytes]") -> bytes:
+    """Decode the first frame of an Annex B H.264 stream fed on stdin."""
+    completed = subprocess.run(
+        [
+            str(_FFMPEG),
+            "-v",
+            "error",
+            "-f",
+            "h264",
+            "-i",
+            "pipe:0",
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            "gray",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ],
+        input=b"".join(access_units),
+        capture_output=True,
+        check=True,
+    )
+    return completed.stdout
+
+
+def _source_gray_frame(video: Path, index: int) -> bytes:
+    """Decode one frame of the source video by its absolute frame index."""
+    completed = subprocess.run(
+        [
+            str(_FFMPEG),
+            "-v",
+            "error",
+            "-i",
+            str(video),
+            "-vf",
+            f"select=eq(n\\,{index})",
+            "-frames:v",
+            "1",
+            "-fps_mode",
+            "passthrough",
+            "-pix_fmt",
+            "gray",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ],
+        capture_output=True,
+        check=True,
+    )
+    return completed.stdout
+
+
+def _mean_absolute_difference(left: bytes, right: bytes) -> float:
+    assert left and len(left) == len(right)
+    return sum(abs(a - b) for a, b in zip(left, right, strict=True)) / len(left)
+
+
+def _episode_video_access_units(mcap: Path, camera_key: str) -> "list[bytes]":
+    """The episode's stored H.264 access units, in log order."""
+    from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
+
+    reader = open_reader(mcap)
+    units: list[bytes] = []
+    try:
+        for batch in reader.iter_batches(topics=[f"/{camera_key}"]):
+            for message in batch.data:
+                video_message = CompressedVideo()
+                video_message.ParseFromString(message)
+                units.append(video_message.data)
+    finally:
+        reader.close()
+    return units
+
+
 def test_converter_slices_exactly_the_declared_frame_count(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -878,6 +953,7 @@ def test_converter_slices_exactly_the_declared_frame_count(
     monkeypatch.setattr(prep, "_download_file", fake_download)
 
     storage = LocalStorageRoot(tmp_path / "output")
+    landed_by_index: dict[int, Path] = {}
     for index in (0, 1):
         receipt = prep._convert_single_episode(
             source_archive=source_archive,
@@ -890,6 +966,7 @@ def test_converter_slices_exactly_the_declared_frame_count(
         )
         assert Path(receipt["uri"]).name == f"lerobot_episode_{index + 1:04d}.mcap"
         landed_path = Path(receipt["uri"])
+        landed_by_index[index] = landed_path
         assert receipt["content_id"] == prep.content_episode_id(landed_path)
         assert receipt["size_bytes"] == landed_path.stat().st_size
 
@@ -898,6 +975,28 @@ def test_converter_slices_exactly_the_declared_frame_count(
         storage.path / "landing" / "lerobot_episode_0001.mcap"
     ).metadata()
     assert episode_metadata["episode/v1"]["source_episode_index"] == "0"
+
+    # The two episodes share one source video, so counts and receipts alone
+    # cannot tell their windows apart: a dropped input seek gives episode 1
+    # episode 0's frames with a correct count (silent wrong footage). Pin each
+    # episode's first decoded frame to its own window's source frame instead.
+    episode_openers = {
+        index: _decoded_gray_frame_stdin(_episode_video_access_units(path, camera_key))
+        for index, path in landed_by_index.items()
+    }
+    source_frame_0 = _source_gray_frame(source, 0)
+    source_frame_62 = _source_gray_frame(source, 62)
+
+    for index, window_start_frame in ((0, 0), (1, 62)):
+        opener = episode_openers[index]
+        own = source_frame_0 if window_start_frame == 0 else source_frame_62
+        other = source_frame_62 if window_start_frame == 0 else source_frame_0
+        assert _mean_absolute_difference(opener, own) < _mean_absolute_difference(opener, other), (
+            f"episode {index} does not open on source frame {window_start_frame}"
+        )
+    assert _mean_absolute_difference(episode_openers[0], episode_openers[1]) > 5.0, (
+        "the two episodes' opening frames are not distinguishable"
+    )
 
 
 def test_window_times_are_count_anchored_not_boundary_filtered(
