@@ -113,10 +113,19 @@ def _joint_motion_profile(
     measurable = (deltas_s > 0) & finite_jump
     safe_deltas_s = np.where(deltas_s > 0, deltas_s, np.nan)
     velocities = np.abs(position_jumps) / safe_deltas_s[:, np.newaxis]
+    # The mask picks the measurable rows, and every measurable row is finite,
+    # so the per-step maximum is an ordinary max over those rows; unmeasurable
+    # rows stay NaN because they are exactly the rows not filled. np.nanmax
+    # here computed the same values but warned "All-NaN slice encountered" on
+    # every duplicate-stamped or NaN stream -- numpy noise aimed at precisely
+    # the users this profile exists to serve (#549 review).
+    per_step_max_speed = np.full(len(deltas_s), np.nan)
+    if measurable.any():
+        per_step_max_speed[measurable] = np.max(velocities[measurable], axis=1)
     return _JointMotionProfile(
         stamps_ns=stamps_ns,
         deltas_s=deltas_s,
-        per_step_max_speed=np.nanmax(velocities, axis=1),
+        per_step_max_speed=per_step_max_speed,
         measurable=measurable,
         nonpositive_dt_count=int(np.sum(deltas_s <= 0)),
     )
