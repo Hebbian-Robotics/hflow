@@ -270,11 +270,23 @@ def test_import_refuses_repository_without_episode_parquets(
     _assert_no_dataset_output(output_dir)
 
 
-def test_import_refuses_an_episode_parquet_entry_with_no_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "entry",
+    [
+        pytest.param({"type": "file", "size": 4096}, id="path-missing"),
+        # A truthy, non-string path (e.g. an integer) passes a bare
+        # `not tree_entry_path` check, then reaches `.endswith` and raises the
+        # bare AttributeError this guard exists to replace. isinstance is
+        # load-bearing, not redundant with the truthiness check.
+        pytest.param({"type": "file", "path": 123}, id="path-not-a-string"),
+    ],
+)
+def test_import_refuses_an_episode_parquet_entry_with_no_usable_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: dict[str, object]
 ) -> None:
-    """``_hf_tree`` tolerates a missing ``path`` (it only dedupes on one when
-    present); the ``meta/episodes`` file loop must not assume it is there."""
+    """``_hf_tree`` tolerates a missing or non-string ``path`` (it only dedupes
+    on one when it is a string); the ``meta/episodes`` file loop must not
+    assume it is there or that it is a string."""
     _stub_repo_info(monkeypatch)
     monkeypatch.setattr(
         prep,
@@ -286,9 +298,7 @@ def test_import_refuses_an_episode_parquet_entry_with_no_path(
             "features": {},
         },
     )
-    monkeypatch.setattr(
-        prep, "_hf_tree", lambda _repo, _revision, _path: [{"type": "file", "size": 4096}]
-    )
+    monkeypatch.setattr(prep, "_hf_tree", lambda _repo, _revision, _path: [entry])
     output_dir = tmp_path / "out"
 
     with pytest.raises(
