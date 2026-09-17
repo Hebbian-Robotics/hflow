@@ -451,6 +451,56 @@ previously valid destination.
 
 Code: [`lerobot/export.py`](./lerobot/export.py)
 
+### Reproducible real-camera LeRobot workflow
+
+**Use it for:** the bounded end-to-end composition of the LeRobot adapter:
+import a pinned real SO-100 corpus subset (two 640 x 480 cameras,
+six-dimensional state and action), run the quality gates, curate from the
+recorded evidence, and export both an HFlow snapshot and a loadable
+LeRobot Dataset v3 selection -- twice from a clean checkout, with the same
+selection. The pinned repository, revision, cameras, and episode subset
+live in [`lerobot/source-manifest.json`](./lerobot/source-manifest.json);
+edit that file to change the run.
+
+**Prerequisites:** the normal development environment, network access to
+the Hugging Face Hub, and about 1 GB of free disk. The pinned corpus
+(`lerobot/svla_so101_pickplace` at commit `f641879`) is about 86 MB. The
+first run takes roughly 30-60 minutes: the export step materializes the
+full pinned source archive through the public importer (`hflow import
+lerobot` with no episode list converts every episode), while the import
+step itself converts only the listed subset. Later runs reuse downloads,
+skip already-converted episodes, and finish much faster. No LeRobot,
+PyTorch, or Hugging Face SDK installation is required.
+
+```bash
+uv run python examples/lerobot/workflow.py
+```
+
+The workflow imports the pinned subset with every declared camera, runs
+`hflow doctor` on the converted inputs (any non-conforming input aborts
+the run), processes the episodes through an `hflow.App` with the
+applicable default checks and the built-in contact-sheet enrichment, cuts
+the selection with the documented curation policy (regenerated from the
+camera list as [`lerobot/curation.sql`](./lerobot/curation.sql)), writes
+an HFlow dataset snapshot with copied media, exports the selection as a
+LeRobot Dataset v3 repository, verifies the export in a clean process, and
+prints a summary: source episode count, processed count, status counts,
+selected count, output paths, and the immutable source revision. All
+downloads and generated artifacts stay under the gitignored data
+directory. Re-running without source or configuration changes is safe and
+reproduces the same selection; if no episode is rejected under the
+documented policy, the run says so instead of manufacturing a failure.
+
+Observable outputs (under `./data/lerobot_workflow`):
+`prepared-manifest.json` (converter version, per-episode receipts, the
+resolved immutable source revision), `catalog/` (append-only quality
+evidence), `manifest.parquet` (the selection with coverage denominators),
+`snapshot/` (standard Parquet tables plus the copied media under
+`assets/`), and `v3/` (the exported LeRobot Dataset v3 repository).
+
+Code: [`lerobot/workflow.py`](./lerobot/workflow.py) and
+[`lerobot/verify.py`](./lerobot/verify.py)
+
 
 ## Example requirements
 

@@ -1,0 +1,9 @@
+{
+  "repository": "lerobot/svla_so101_pickplace",
+  "revision": "f641879e22172be7e8161d5e6c1503c2d2feb657",
+  "license": "Apache-2.0",
+  "shape": "50 real SO-100 episodes, 30 fps, two 640x480 cameras, six-dimensional state and action",
+  "cameras": ["observation.images.up", "observation.images.side"],
+  "episodes": [0, 1, 2],
+  "note": "Bounded, explicitly listed subset of the pinned corpus. Edit `episodes` (or `cameras`) here to change the run; the curation SQL is regenerated from `cameras` by workflow.py."
+}
