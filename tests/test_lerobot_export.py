@@ -680,3 +680,82 @@ def test_validate_v3_rejects_missing_video(fake_corpus: dict, tmp_path: Path) ->
     video.unlink()
     with pytest.raises(ValueError, match="references missing video"):
         export._validate_v3(dest)
+
+
+def test_export_refuses_frame_referencing_unpublished_task(
+    fake_corpus: dict, tmp_path: Path
+) -> None:
+    """#529: frame task_index referencing an unpublished task must be refused.
+
+    When an episode's data frames carry a task_index referencing a task that the
+    single-task output does not publish, export must fail loudly before writing
+    destination files, naming episode, frame, and index.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    # Add task_index column to source data: frame 0 has task_index=0, frame 1 has task_index=1
+    src_pq = Path(fake_corpus["cache_dir"]) / "data" / "chunk-000" / "file-000.parquet"
+    table = pq.read_table(str(src_pq))
+    task_indices = [0] * table.num_rows
+    task_indices[1] = 1  # frame 1 points to task 1 (unpublished in single-task episode)
+    table = table.append_column("task_index", pa.array(task_indices, pa.int64()))
+    pq.write_table(table, str(src_pq))
+
+    _make_data_local(fake_corpus)
+    manifest = _fake_manifest(
+        tmp_path,
+        [{"metadata_json": _provenance_meta(0, task="pick cup")}],
+    )
+    dest = tmp_path / "out_refuse"
+    with pytest.raises(
+        ValueError,
+        match=r"source episode 0 frame 1: task_index 1 references an unpublished task",
+    ):
+        export.export(dest, manifest=manifest, camera_keys=CAMS)
+    assert not dest.exists()
+
+
+def test_export_preserves_valid_task_index(fake_corpus: dict, tmp_path: Path) -> None:
+    """A task_index matching the published task (index 0) exports cleanly."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    src_pq = Path(fake_corpus["cache_dir"]) / "data" / "chunk-000" / "file-000.parquet"
+    table = pq.read_table(str(src_pq))
+    task_indices = [0] * table.num_rows
+    table = table.append_column("task_index", pa.array(task_indices, pa.int64()))
+    pq.write_table(table, str(src_pq))
+
+    _make_data_local(fake_corpus)
+    manifest = _fake_manifest(
+        tmp_path,
+        [{"metadata_json": _provenance_meta(0, task="pick cup")}],
+    )
+    dest = tmp_path / "out_valid_task"
+    export.export(dest, manifest=manifest, camera_keys=CAMS)
+
+    out_pq = dest / "data" / "chunk-000" / "file-000.parquet"
+    out_table = pq.read_table(str(out_pq))
+    assert "task_index" in out_table.column_names
+    assert out_table.column("task_index").to_pylist() == [0] * LENGTHS[0]
+
+
+def test_validate_v3_rejects_corrupted_task_index(fake_corpus: dict, tmp_path: Path) -> None:
+    """_validate_v3 refuses staged datasets where task_index resolves out-of-bounds."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    dest = _exported_dataset(fake_corpus, tmp_path)
+    data_pq = dest / "data" / "chunk-000" / "file-000.parquet"
+    table = pq.read_table(str(data_pq))
+    corrupted_indices = [0] * table.num_rows
+    corrupted_indices[3] = 99  # unpublished task index
+    table = table.append_column("task_index", pa.array(corrupted_indices, pa.int64()))
+    pq.write_table(table, str(data_pq))
+
+    with pytest.raises(
+        ValueError,
+        match=r"episode 0 frame 3: task_index 99 references an unpublished task",
+    ):
+        export._validate_v3(dest)

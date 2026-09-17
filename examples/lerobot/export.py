@@ -319,18 +319,8 @@ def _write_v3_repository(
             raise FileNotFoundError(f"source video chunk missing: {local}")
         return local
 
-    episodes_dir = destination / "meta" / "episodes" / "chunk-000"
-    data_dir = destination / "data" / "chunk-000"
-    episodes_dir.mkdir(parents=True, exist_ok=True)
-    data_dir.mkdir(parents=True, exist_ok=True)
-
-    # one data parquet per selected episode: windowed rows, renumbered
-    ep_rows_out: list[dict] = []
-    data_frames: list[dict] = []
-    total_frames = 0
-    video_paths: list[Path] = []
-    copied_videos: set[tuple[str, int, int]] = set()
-
+    # Pre-validate all selections and frame rows before creating directories or writing any files
+    staged_episodes = []
     for new_idx, sel in enumerate(selections):
         src = src_by_index[sel.source_episode_index]
         length = int(src["length"])
@@ -371,6 +361,41 @@ def _write_v3_repository(
                 f"found {len(rows)}"
             )
 
+        published_tasks = [sel.task] if sel.task else []
+        if "task_index" in cols:
+            task_col_idx = cols.index("task_index")
+            for local_frame, row in enumerate(rows):
+                task_idx = row[task_col_idx]
+                if task_idx is not None and not (0 <= int(task_idx) < len(published_tasks)):
+                    raise ValueError(
+                        f"source episode {sel.source_episode_index} frame {local_frame}: "
+                        f"task_index {task_idx} references an unpublished task"
+                    )
+
+        for cam in camera_keys:
+            vw = (src.get("video_windows") or {}).get(cam)
+            if vw is None:
+                raise ValueError(
+                    f"source episode {sel.source_episode_index} has no video window "
+                    f"for camera {cam}"
+                )
+            _fetch_video(cam, vw)
+
+        staged_episodes.append((new_idx, sel, src, length, cols, rows, index_col))
+
+    episodes_dir = destination / "meta" / "episodes" / "chunk-000"
+    data_dir = destination / "data" / "chunk-000"
+    episodes_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # one data parquet per selected episode: windowed rows, renumbered
+    ep_rows_out: list[dict] = []
+    data_frames: list[dict] = []
+    total_frames = 0
+    video_paths: list[Path] = []
+    copied_videos: set[tuple[str, int, int]] = set()
+
+    for new_idx, sel, src, length, cols, rows, index_col in staged_episodes:
         frame_rows: list[dict] = []
         for local_frame, row in enumerate(rows):
             d = dict(zip(cols, row, strict=True))
@@ -386,11 +411,6 @@ def _write_v3_repository(
         ep_video_refs: dict[str, dict] = {}
         for cam in camera_keys:
             vw = (src.get("video_windows") or {}).get(cam)
-            if vw is None:
-                raise ValueError(
-                    f"source episode {sel.source_episode_index} has no video window "
-                    f"for camera {cam}"
-                )
             vlocal = _fetch_video(cam, vw)
             vchunk = _window_index(vw, "chunk_index", cam)
             vfile = _window_index(vw, "file_index", cam)
@@ -540,6 +560,28 @@ def _validate_v3(dataset_dir: Path) -> None:
                 dpath = dataset_dir / drel
                 if not dpath.exists():
                     raise ValueError(f"episode {ep} references missing data file {dpath}")
+                dquoted = str(dpath).replace("'", "''")
+                dcols = [
+                    c[0]
+                    for c in conn.execute(
+                        f"SELECT * FROM read_parquet('{dquoted}') LIMIT 0"
+                    ).description
+                ]
+                if "task_index" in dcols:
+                    tasks = d.get("tasks") or []
+                    published_task_count = (
+                        len(tasks) if isinstance(tasks, list) else (1 if tasks else 0)
+                    )
+                    t_idx_col = dcols.index("task_index")
+                    for f_idx, drow in enumerate(
+                        conn.execute(f"SELECT * FROM read_parquet('{dquoted}')").fetchall()
+                    ):
+                        t_val = drow[t_idx_col]
+                        if t_val is not None and not (0 <= int(t_val) < published_task_count):
+                            raise ValueError(
+                                f"episode {ep} frame {f_idx}: task_index {t_val} "
+                                "references an unpublished task"
+                            )
     finally:
         conn.close()
 
