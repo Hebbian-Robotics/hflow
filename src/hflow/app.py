@@ -41,6 +41,7 @@ from hflow.catalog import (
     Catalog,
     CheckRunRow,
     QuarantineHistory,
+    _raise_if_measurement_keys_case_collide,
     content_episode_id,
 )
 from hflow.episode import Episode, _sanitize_topic
@@ -1033,6 +1034,7 @@ def _raise_if_measurement_keys_collide(check_rows: Sequence[CheckRunRow]) -> Non
     deliberately unguarded: those tables carry ``check_name`` and have no
     per-key latest ranking, so two steps sharing one loses nothing.
     """
+    _raise_if_measurement_keys_case_collide(key for row in check_rows for key in row.measurements)
     steps_by_key: dict[str, list[str]] = {}
     for row in check_rows:
         for key in row.measurements:

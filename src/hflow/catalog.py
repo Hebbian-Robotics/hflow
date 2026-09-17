@@ -37,7 +37,7 @@ import hashlib
 import json
 import math
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -570,6 +570,26 @@ def _normalized_observations(check_name: str, observations: list[Observation]) -
     return normalized
 
 
+_ASCII_IDENTIFIER_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def _raise_if_measurement_keys_case_collide(keys: Iterable[str]) -> None:
+    """Validate the full pivot key set using DuckDB's ASCII identifier comparison."""
+    original_by_identifier: dict[str, str] = {}
+    for key in keys:
+        # Unicode lower()/casefold() would reject names DuckDB keeps distinct.
+        identifier = key.translate(_ASCII_IDENTIFIER_FOLD)
+        original = original_by_identifier.setdefault(identifier, key)
+        if original != key:
+            raise ValueError(
+                f"measurement keys {original!r} and {key!r} collide as DuckDB column names: "
+                "quoted identifiers compare case-insensitively for ASCII letters. "
+                "Rename one measurement key at its producer so the names differ beyond "
+                "ASCII letter case. Existing evidence remains available in the long "
+                "measurements table; inspect measurements/*.parquet directly."
+            )
+
+
 def _raise_if_measurement_keys_shadow_episode_columns(
     check_rows: Sequence[CheckRunRow],
 ) -> None:
@@ -583,10 +603,10 @@ def _raise_if_measurement_keys_shadow_episode_columns(
     shadows ``task`` all the same.
     """
     shadowed = [
-        f"{key!r} from {row.check_name!r} shadows {_EPISODES_VIEW_RESERVED_COLUMNS[key.lower()]!r}"
+        f"{key!r} from {row.check_name!r} shadows {_EPISODES_VIEW_RESERVED_COLUMNS[identifier]!r}"
         for row in check_rows
         for key in row.measurements
-        if key.lower() in _EPISODES_VIEW_RESERVED_COLUMNS
+        if (identifier := key.translate(_ASCII_IDENTIFIER_FOLD)) in _EPISODES_VIEW_RESERVED_COLUMNS
     ]
     if not shadowed:
         return
@@ -885,6 +905,9 @@ class Catalog:
             for row in check_rows
         ]
         _raise_if_measurement_keys_shadow_episode_columns(check_rows)
+        _raise_if_measurement_keys_case_collide(
+            key for row in check_rows for key in row.measurements
+        )
         outcome_fingerprint = _run_fingerprint(
             episode_id,
             stamps.pipeline_version,

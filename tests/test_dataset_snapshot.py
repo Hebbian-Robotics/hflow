@@ -26,6 +26,7 @@ def _append_snapshot_episode(
     name: str,
     score: float,
     with_media: bool,
+    score_key: str = "quality/score",
 ) -> tuple[str, Path | None]:
     canonical_episode = working_directory / f"{name}.canonical.mcap"
     canonical_episode.write_bytes(f"canonical bytes for {name}".encode())
@@ -47,7 +48,7 @@ def _append_snapshot_episode(
                 critical=False,
                 status=hflow.CheckStatus.MEASURED,
                 duration_s=0.1,
-                measurements={"quality/score": score, "caption": f"sample {name}"},
+                measurements={score_key: score, "caption": f"sample {name}"},
                 observations=[
                     hflow.Observation(
                         observation_id="frame:1",
@@ -69,6 +70,34 @@ def _append_snapshot_episode(
         ],
     )
     return append_result.episode_id, preview_file
+
+
+def test_case_collisions_refuse_snapshot_without_replacing_existing_output(tmp_path: Path) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    _append_snapshot_episode(
+        catalog, tmp_path, name="first", score=0.1, with_media=False, score_key="/Camera/score"
+    )
+    destination = tmp_path / "snapshot"
+    hflow.export_dataset_snapshot(catalog.root, destination)
+    original = {
+        path.relative_to(destination): path.read_bytes()
+        for path in destination.rglob("*")
+        if path.is_file()
+    }
+    _append_snapshot_episode(
+        catalog, tmp_path, name="second", score=0.9, with_media=False, score_key="/camera/score"
+    )
+
+    with pytest.raises(ValueError, match=r"'/Camera/score'.*'/camera/score'.*collide"):
+        hflow.export_dataset_snapshot(catalog.root, destination, overwrite=True)
+
+    assert {
+        path.relative_to(destination): path.read_bytes()
+        for path in destination.rglob("*")
+        if path.is_file()
+    } == original
+    assert not list(tmp_path.glob(".snapshot.staging-*"))
+    assert not list(tmp_path.glob(".snapshot.previous-*"))
 
 
 def _append_media_priority_episode(

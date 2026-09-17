@@ -2152,6 +2152,131 @@ def test_measurement_key_shadowing_is_case_insensitive(tmp_path: Path) -> None:
         )
 
 
+def test_append_refuses_case_colliding_keys_before_writing(tmp_path: Path) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    row = replace(_check_row(), measurements={"/Camera/score": 0.1, "/camera/score": 0.9})
+    with pytest.raises(ValueError, match=r"'/Camera/score'.*'/camera/score'.*collide"):
+        catalog.append_episode(
+            canonical_path=_fake_canonical(tmp_path),
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[row],
+        )
+    assert list(catalog.root.rglob("*.parquet")) == []
+
+
+@pytest.mark.parametrize("same_episode", [False, True])
+@pytest.mark.parametrize("constrained", [False, True])
+def test_case_collisions_across_appends_refuse_curation_without_replacing_output(
+    tmp_path: Path, same_episode: bool, constrained: bool
+) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    manifest = tmp_path / "manifest.parquet"
+    for index, key in enumerate(("/Camera/score", "/camera/score")):
+        catalog.append_episode(
+            canonical_path=_fake_canonical(
+                tmp_path, b"same episode" if same_episode else f"episode {index}".encode()
+            ),
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[replace(_check_row(), measurements={key: 0.1 + index * 0.8})],
+        )
+        if index == 0:
+            curate(catalog.root, "SELECT episode_id FROM episodes", output=manifest)
+    previous_manifest = manifest.read_bytes()
+    previous_catalog = {path: path.read_bytes() for path in catalog.root.rglob("*.parquet")}
+
+    with pytest.raises(ValueError, match=r"'/Camera/score'.*'/camera/score'.*collide") as failure:
+        open_catalog_connection(catalog.root, constrained=constrained)
+    assert "Rename" in str(failure.value)
+    assert "measurements/*.parquet" in str(failure.value)
+    with pytest.raises(ValueError, match=r"measurement keys.*collide"):
+        curate(
+            catalog.root,
+            'SELECT episode_id FROM episodes WHERE "/camera/score" < 0.5',
+            output=manifest,
+            constrained=constrained,
+        )
+    assert manifest.read_bytes() == previous_manifest
+    assert not list(tmp_path.glob(".hflow-manifest-*"))
+    assert {path: path.read_bytes() for path in catalog.root.rglob("*.parquet")} == previous_catalog
+    with duckdb.connect() as connection:
+        assert connection.execute(
+            "SELECT key, value_double FROM read_parquet(?) ORDER BY key",
+            [str(catalog.root / "measurements" / "*.parquet")],
+        ).fetchall() == [("/Camera/score", 0.1), ("/camera/score", 0.9)]
+
+
+def test_existing_catalog_with_case_colliding_keys_is_refused(tmp_path: Path) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    catalog.append_episode(
+        canonical_path=_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[replace(_check_row(), measurements={"/Camera/score": 0.1, "other": 0.9})],
+    )
+    # Model evidence written before validation existed, without bypassing the
+    # reader under test or relying on today's append accepting invalid input.
+    (measurements,) = (catalog.root / "measurements").glob("*.parquet")
+    legacy = tmp_path / "legacy.parquet"
+    with duckdb.connect() as connection:
+        connection.execute(
+            "COPY (SELECT * REPLACE (CASE WHEN key = 'other' THEN '/camera/score' "
+            "ELSE key END AS key) FROM read_parquet($source)) TO $destination (FORMAT PARQUET)",
+            {"source": str(measurements), "destination": str(legacy)},
+        )
+    legacy.replace(measurements)
+    previous = measurements.read_bytes()
+    with pytest.raises(ValueError, match=r"'/Camera/score'.*'/camera/score'.*collide"):
+        open_catalog_connection(catalog.root)
+    assert measurements.read_bytes() == previous
+
+
+def test_distinct_unicode_keys_and_exact_key_reuse_remain_queryable(tmp_path: Path) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    # lower() would merge Ä/ä and Kelvin sign/k; casefold() also merges ß/ss.
+    keys = [
+        "/Ä/score",
+        "/ä/score",
+        "/\N{KELVIN SIGN}/score",
+        "/k/score",
+        "/ß/score",
+        "/ss/score",
+        "tas\N{KELVIN SIGN}",
+    ]
+    for index in range(2):
+        catalog.append_episode(
+            canonical_path=_fake_canonical(tmp_path, f"episode {index}".encode()),
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[
+                replace(
+                    _check_row(), measurements={key: index + n / 10 for n, key in enumerate(keys)}
+                )
+            ],
+        )
+    columns = ", ".join(f'"{key}"' for key in keys)
+    expected = [tuple(index + n / 10 for n in range(len(keys))) for index in range(2)]
+    with open_catalog_connection(catalog.root) as connection:
+        assert (
+            connection.execute(f'SELECT {columns} FROM episodes ORDER BY "{keys[0]}"').fetchall()
+            == expected
+        )
+        assert connection.execute(
+            "SELECT DISTINCT key FROM measurements ORDER BY key"
+        ).fetchall() == [(key,) for key in sorted(keys)]
+    snapshot = tmp_path / "snapshot"
+    hflow.export_dataset_snapshot(catalog.root, snapshot)
+    with duckdb.connect() as connection:
+        assert (
+            connection.execute(
+                f'SELECT {columns} FROM read_parquet(?) ORDER BY "{keys[0]}"',
+                [str(snapshot / "samples.parquet")],
+            ).fetchall()
+            == expected
+        )
+
+
 @pytest.mark.parametrize("recurring", [False, True])
 def test_crash_repaired_append_keeps_one_recorded_at_across_tables(
     tmp_path: Path, recurring: bool

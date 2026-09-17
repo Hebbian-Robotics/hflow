@@ -351,7 +351,7 @@ the catalog.
 
 Because every numeric key becomes a column of the wide view, key names are a
 queryable surface with no rename path: old rows keep the old name forever.
-Three rules, in decreasing order of how much it hurts to get them wrong.
+Four rules keep that surface unambiguous.
 
 **One key, one owner.** Every step of a run shares that run's fingerprint and
 timestamp, so two steps recording the same key on one episode is a tie
@@ -360,6 +360,34 @@ and the survivor is attributed to whichever step the reader assumes. The runner
 refuses this at the point it happens, naming both steps. Prefixing keys with
 their topic avoids it by construction; where a quantity is genuinely
 episode-scoped, prefix it with the check instead.
+
+**Keys must be distinct under DuckDB's ASCII case-insensitive identifier
+comparison.** `/Camera/score` and `/camera/score` cannot coexist as wide
+columns, even when quoted in SQL. Only ASCII letters are folded: `/Ä/score`
+and `/ä/score` remain distinct. Reusing the exact same key across episodes is
+supported. HFlow preserves the original spelling and values; it never
+lowercases, merges, or renames stored evidence.
+
+Conflicting keys within a run are refused before recording. Separate appends
+can each be valid on their own, so HFlow also validates the complete key set
+when opening a catalog's wide view and before pivoting snapshot samples.
+Conflicts across episodes, appends, or older catalogs cause curation and
+snapshot export to refuse with both original names. Any existing manifest or
+snapshot destination stays intact. Rename one key at its producer so that the
+names differ beyond ASCII letter case. This does not repair old evidence:
+the append-only catalog retains the original keys.
+
+For an already ambiguous catalog, inspect the long `measurements` table
+directly with DuckDB instead of opening HFlow's wide views. Keys here are
+string values, so equality distinguishes their exact spelling:
+
+```sql
+SELECT episode_id, run_fingerprint, check_name, key,
+       value_double, value_bool, value_text
+FROM read_parquet('data/catalog/measurements/*.parquet', union_by_name=true)
+WHERE key IN ('/Camera/score', '/camera/score')
+ORDER BY episode_id, key;
+```
 
 **Name keys `<topic>/<metric>_<unit>`.** The topic prefix is what keeps two
 cameras (or two checks) from colliding, and it also keeps a key from clashing

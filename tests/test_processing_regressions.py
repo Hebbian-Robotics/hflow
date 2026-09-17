@@ -513,6 +513,29 @@ def _state_only_episode(tmp_path: Path) -> Path:
     )
 
 
+@pytest.mark.parametrize("record", [False, True])
+@pytest.mark.parametrize("prefix", ["Camera", "ÉCamera"])
+def test_one_check_with_case_colliding_measurement_keys_is_refused(
+    tmp_path: Path, record: bool, prefix: str
+) -> None:
+    app = hflow.App("case-collision", data_root=tmp_path / "data", default_checks=())
+    first_key = f"/{prefix}/score"
+    second_key = first_key.replace("Camera", "camera")
+
+    @app.check(version="1")
+    def scores(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={first_key: 0.1, second_key: 0.9})
+
+    with pytest.raises(ValueError, match=r"measurement keys.*collide") as failure:
+        app.process(_state_only_episode(tmp_path), record=record)
+
+    message = str(failure.value)
+    assert repr(first_key) in message
+    assert repr(second_key) in message
+    assert "Rename" in message
+    assert list((tmp_path / "data" / "catalog").rglob("*.parquet")) == []
+
+
 def test_two_checks_recording_one_measurement_key_are_refused(tmp_path: Path) -> None:
     """Every step of one run shares its fingerprint and timestamp, so a shared
     key is a tie the catalog resolves arbitrarily -- one step's value silently

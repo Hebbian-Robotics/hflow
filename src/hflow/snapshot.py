@@ -21,7 +21,7 @@ from uuid import uuid4
 import duckdb
 
 from hflow.app import ARTIFACT_MEASUREMENT_KEY_PREFIX, MEDIA_CONTACT_SHEET_STEP_NAME
-from hflow.catalog import episode_status_case_sql
+from hflow.catalog import _raise_if_measurement_keys_case_collide, episode_status_case_sql
 from hflow.curation import open_catalog_connection
 from hflow.storage import StorageRoot, _validated_relative_key, fetch_uri
 
@@ -368,6 +368,7 @@ def _samples_snapshot_query(connection: duckdb.DuckDBPyConnection) -> str:
             """
         ).fetchall()
     ]
+    _raise_if_measurement_keys_case_collide(numeric_measurement_keys)
     if not numeric_measurement_keys:
         return f"""
             SELECT

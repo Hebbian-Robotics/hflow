@@ -57,6 +57,7 @@ import duckdb
 from hflow.catalog import (
     EPISODES_VIEW_STATUS_COLUMN,
     TABLE_COLUMN_DDL,
+    _raise_if_measurement_keys_case_collide,
     episode_status_case_sql,
 )
 from hflow.format import CATALOG_FORMAT_VERSION
@@ -302,12 +303,16 @@ def _open_connection_over_root(
     catalog's own files stay unreachable for reads and, crucially, writes.
     """
     connection = duckdb.connect()
-    _register_catalog_relations(
-        connection,
-        root,
-        constrained=constrained,
-        writable_directories=writable_directories,
-    )
+    try:
+        _register_catalog_relations(
+            connection,
+            root,
+            constrained=constrained,
+            writable_directories=writable_directories,
+        )
+    except Exception:
+        connection.close()
+        raise
     return connection
 
 
@@ -426,6 +431,7 @@ def _register_catalog_relations(
             "SELECT DISTINCT key FROM measurements_latest ORDER BY key"
         ).fetchall()
     ]
+    _raise_if_measurement_keys_case_collide(measurement_keys)
     if measurement_keys:
         # A PIVOT inside a view needs its values enumerated, so the wide view
         # is bound to the keys present when this connection was opened; a key
