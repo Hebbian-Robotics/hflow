@@ -1128,6 +1128,86 @@ def test_contact_sheet_rejects_non_integer_dimensions_before_ffmpeg(
         )
 
 
+def test_contact_sheet_failure_cleans_up_temp_and_leaves_no_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #556: contact_sheet must write to a per-call temporary sibling and
+    never leave a partial or truncated file at the final destination path if ffmpeg fails."""
+    monkeypatch.setattr(_contact_sheet, "ffmpeg_path", lambda: Path("/bin/echo"))
+    monkeypatch.setattr(_contact_sheet, "_find_usable_font_file", lambda: None)
+    output = tmp_path / "contact_sheet.jpg"
+    frame = ExtractedFrame(path=tmp_path / "frame.jpg", log_time_ns=1000)
+    frame.path.write_bytes(b"dummy")
+
+    def mock_run_failure(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        temp_dest = Path(command[-1])
+        temp_dest.write_bytes(b"partial truncated jpeg data")
+        return subprocess.CompletedProcess(command, returncode=1, stdout="", stderr="ffmpeg crash")
+
+    monkeypatch.setattr(_contact_sheet.subprocess, "run", mock_run_failure)
+
+    with pytest.raises(RuntimeError, match="ffmpeg contact sheet failed"):
+        contact_sheet([frame], output, columns=1, tile_width=160)
+
+    assert not output.exists(), "Final output must not exist when ffmpeg fails"
+    temp_files = list(tmp_path.glob(".*.tmp"))
+    assert not temp_files, f"Temporary file was not cleaned up: {temp_files}"
+
+
+def test_contact_sheet_zero_byte_output_cleans_up_and_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #556: Zero-byte output must not be renamed to destination."""
+    monkeypatch.setattr(_contact_sheet, "ffmpeg_path", lambda: Path("/bin/echo"))
+    monkeypatch.setattr(_contact_sheet, "_find_usable_font_file", lambda: None)
+    output = tmp_path / "contact_sheet.jpg"
+    frame = ExtractedFrame(path=tmp_path / "frame.jpg", log_time_ns=1000)
+    frame.path.write_bytes(b"dummy")
+
+    def mock_run_empty(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        temp_dest = Path(command[-1])
+        temp_dest.write_bytes(b"")
+        return subprocess.CompletedProcess(command, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(_contact_sheet.subprocess, "run", mock_run_empty)
+
+    with pytest.raises(RuntimeError, match="produced no output"):
+        contact_sheet([frame], output, columns=1, tile_width=160)
+
+    assert not output.exists()
+    temp_files = list(tmp_path.glob(".*.tmp"))
+    assert not temp_files
+
+
+def test_contact_sheet_atomic_rename_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #556: Successful contact sheet writes atomically to final destination."""
+    monkeypatch.setattr(_contact_sheet, "ffmpeg_path", lambda: Path("/bin/echo"))
+    monkeypatch.setattr(_contact_sheet, "_find_usable_font_file", lambda: None)
+    output = tmp_path / "contact_sheet.jpg"
+    frame = ExtractedFrame(path=tmp_path / "frame.jpg", log_time_ns=1000)
+    frame.path.write_bytes(b"dummy")
+
+    def mock_run_success(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert "-f" in command
+        assert "image2" in command
+        temp_dest = Path(command[-1])
+        assert temp_dest.name.startswith(f".{output.name}.")
+        assert temp_dest.suffix == ".tmp"
+        temp_dest.write_bytes(b"\xff\xd8\xff\xe0valid_jpeg_data\xff\xd9")
+        return subprocess.CompletedProcess(command, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(_contact_sheet.subprocess, "run", mock_run_success)
+
+    sheet = contact_sheet([frame], output, columns=1, tile_width=160)
+    assert sheet.path == output
+    assert output.is_file()
+    assert output.read_bytes() == b"\xff\xd8\xff\xe0valid_jpeg_data\xff\xd9"
+    temp_files = list(tmp_path.glob(".*.tmp"))
+    assert not temp_files
+
+
 def test_coding_range_is_derived_from_luma_and_selects_the_exposure_gates() -> None:
     """Trusting a container's declared range published a defect share off by a
     factor of hundreds on real footage, so the range is measured from the pixels.
