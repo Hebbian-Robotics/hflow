@@ -411,6 +411,8 @@ def _write_v3_repository(
         ep_video_refs: dict[str, dict] = {}
         for cam in camera_keys:
             vw = (src.get("video_windows") or {}).get(cam)
+            if not isinstance(vw, dict):
+                raise ValueError(f"source video window missing for camera {cam}")
             vlocal = _fetch_video(cam, vw)
             vchunk = _window_index(vw, "chunk_index", cam)
             vfile = _window_index(vw, "file_index", cam)
