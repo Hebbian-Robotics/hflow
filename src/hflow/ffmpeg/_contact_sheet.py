@@ -166,6 +166,15 @@ def contact_sheet(
     with tempfile.TemporaryDirectory(prefix="contact-sheet-") as staging_dir_name:
         concat_list_path = Path(staging_dir_name) / "frames.txt"
         _write_concat_list(selected_frames, concat_list_path)
+        # Write to a unique sibling temp path and replace atomically: the
+        # publish step catalogs on bare file existence, so the final path must
+        # never hold a partial JPEG from a SIGKILL/OOM mid-write.
+        # A fixed ``<output>.tmp`` name lets concurrent sheets truncate/unlink
+        # the same file; a per-call path keeps each ffmpeg process isolated.
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{output.name}.", suffix=".tmp", dir=output.parent, delete=False
+        ) as temp_file:
+            temporary_output = Path(temp_file.name)
         command = [
             str(ffmpeg_binary),
             "-hide_banner",
@@ -183,12 +192,24 @@ def contact_sheet(
             "1",
             "-q:v",
             "2",
-            str(output),
+            # The .tmp suffix defeats extension sniffing; name the muxer explicitly.
+            "-f",
+            "image2",
+            str(temporary_output),
         ]
-        completed = subprocess.run(command, capture_output=True, text=True, check=False)
-    if completed.returncode != 0:
-        stderr_tail = "\n".join(completed.stderr.strip().splitlines()[-5:])
-        raise RuntimeError(f"ffmpeg contact sheet failed for {output}: {stderr_tail}")
+        try:
+            completed = subprocess.run(command, capture_output=True, text=True, check=False)
+            if completed.returncode != 0:
+                stderr_tail = "\n".join(completed.stderr.strip().splitlines()[-5:])
+                raise RuntimeError(f"ffmpeg contact sheet failed for {output}: {stderr_tail}")
+            if not temporary_output.is_file() or temporary_output.stat().st_size == 0:
+                raise RuntimeError(
+                    f"ffmpeg contact sheet exited 0 but produced no output at {output}"
+                )
+            temporary_output.replace(output)
+        except BaseException:
+            temporary_output.unlink(missing_ok=True)
+            raise
 
     return ContactSheet(
         path=output,
