@@ -28,11 +28,19 @@ from typing import IO, Protocol
 import numpy as np
 from mcap.reader import McapReader, make_reader
 from mcap.records import Attachment
+from mcap.stream_reader import CRCValidationError
+from zstandard import ZstdError
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_MAX_MESSAGES = 1024
 DEFAULT_BATCH_MAX_BYTES = 32 * 1024 * 1024
+
+# Named reasons a file fails its own integrity stamp, returned by
+# :func:`verify_canonical_integrity` and recorded on the check lane's refusal
+# row, so downstream tooling can filter for damaged canonicals by exact value.
+CANONICAL_CRC_MISMATCH_REASON = "canonical-crc-mismatch"
+CANONICAL_DECOMPRESSION_FAILED_REASON = "canonical-decompression-failed"
 
 
 @dataclass(frozen=True)
@@ -236,6 +244,32 @@ class PythonMcapEpisodeReader:
         batch_max_bytes: int = DEFAULT_BATCH_MAX_BYTES,
     ) -> Iterator[MessageBatch]:
         wanted_channel_ids = frozenset(channel_ids) if channel_ids is not None else None
+        if topics is None and wanted_channel_ids is not None:
+            # Constrain the underlying read to the topics the requested
+            # channels live on, so the MCAP reader can skip unrelated streams
+            # (e.g. multi-gigabyte camera topics) instead of yielding messages
+            # that would be discarded below. Topic filtering alone is not
+            # exact -- several channels may share one topic -- so the
+            # channel-id filter in the loop still applies.
+            try:
+                known_channels = self.channels()
+            except ValueError:
+                # No summary section to derive topics from: a legitimately
+                # unindexed file, still readable by linear scan, so fall back
+                # to the unconstrained read. A truncated file is not this
+                # case -- channels() raises mcap's RecordLengthLimitExceeded,
+                # and the same error surfaces from iter_messages below with
+                # or without this catch, so damage stays loud.
+                known_channels = {}
+            derived_topics = sorted(
+                {
+                    known_channels[channel_id].topic
+                    for channel_id in wanted_channel_ids
+                    if channel_id in known_channels
+                }
+            )
+            if derived_topics:
+                topics = derived_topics
         topics_by_channel_id: dict[int, str] = {}
         pending_log_times: dict[int, list[int]] = {}
         pending_publish_times: dict[int, list[int]] = {}
@@ -304,3 +338,33 @@ def open_reader(path: Path | str, *, validate_crcs: bool = False) -> EpisodeRead
     ``hflow.transform``).
     """
     return PythonMcapEpisodeReader(path, validate_crcs=validate_crcs)
+
+
+def verify_canonical_integrity(path: Path | str) -> tuple[bool, str | None]:
+    """Validate one episode file's decompression and chunk CRCs with a strict full read.
+
+    The check lane's front door. ``Episode`` reads run with CRC validation
+    off (the reader docstring's trust argument covers bytes identified by
+    content hash at sync time), so a canonical that decayed on disk after
+    sync would otherwise be measured by checks as if it were intact. This
+    re-opens the file the strict way and reads every message, which forces
+    the chunk CRC pass over exactly the bytes the checks are about to
+    certify.
+
+    Returns ``(is_valid, reason)``: ``(True, None)`` when every chunk
+    decompresses and matches its stored CRC, or ``(False, reason)`` for a
+    CRC mismatch or zstd decompression failure. Both exceptions are caught
+    by precise type: MCAP propagates ``ZstdError`` directly from the chunk
+    decompressor, before it can validate the CRC. Filesystem failures and
+    unrelated reader errors still propagate to the caller.
+    """
+    with Path(path).open("rb") as stream:
+        try:
+            reader = make_reader(stream, validate_crcs=True)
+            for _schema, _channel, _message in reader.iter_messages(log_time_order=False):
+                pass
+        except CRCValidationError:
+            return (False, CANONICAL_CRC_MISMATCH_REASON)
+        except ZstdError:
+            return (False, CANONICAL_DECOMPRESSION_FAILED_REASON)
+    return (True, None)

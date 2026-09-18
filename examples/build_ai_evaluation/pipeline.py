@@ -8,6 +8,7 @@ OpenAI-compatible vision endpoint instead.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 from collections.abc import Mapping
 from pathlib import Path
@@ -121,7 +122,7 @@ def _argument_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     arguments = _argument_parser().parse_args()
-    report = app.test(arguments.episode)
+    report = asyncio.run(app.test(arguments.episode))
     if report.has_errors:
         raise SystemExit(1)
 

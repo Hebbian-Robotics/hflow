@@ -1,6 +1,7 @@
 """The opt-in ``camera_video`` enrichment: a playable MP4 per camera, aligned
 to the episode's time axis through its labels."""
 
+import asyncio
 import subprocess
 from pathlib import Path
 
@@ -47,7 +48,7 @@ def test_camera_video_publishes_a_playable_mp4_per_camera_with_its_clock(
     app.enrich(version=CAMERA_VIDEO_VERSION)(camera_video)
     source = synthesize_episode(tmp_path / "episode.mcap", TWO_CAMERAS_AT_15_HZ)
 
-    report = app.test(source, verbose=False, record=True)
+    report = asyncio.run(app.test(source, verbose=False, record=True))
 
     (video_run,) = [run for run in report.enrichments if run.enrichment.name == "camera_video"]
     assert video_run.status is hflow.CheckStatus.MEASURED, video_run.error
@@ -93,7 +94,7 @@ def test_camera_video_on_a_camera_less_episode_records_nothing(tmp_path: Path) -
         tmp_path / "episode.mcap", SyntheticEpisodeSpec(duration_s=1.0, cameras=())
     )
 
-    report = app.test(source, verbose=False)
+    report = asyncio.run(app.test(source, verbose=False))
 
     (video_run,) = report.enrichments
     assert video_run.status is hflow.CheckStatus.MEASURED, video_run.error

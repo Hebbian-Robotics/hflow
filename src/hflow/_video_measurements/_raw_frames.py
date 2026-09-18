@@ -1,5 +1,6 @@
 """Stream decoded frames without resampling or image re-encoding."""
 
+import json
 import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -30,7 +31,7 @@ def _probe_frame_shape(video: Path, toolchain: VideoMeasurementToolchain) -> tup
             "-show_entries",
             "stream=width,height",
             "-of",
-            "csv=p=0:s=x",
+            "json",
             str(video),
         ],
         capture_output=True,
@@ -39,16 +40,20 @@ def _probe_frame_shape(video: Path, toolchain: VideoMeasurementToolchain) -> tup
     )
     if completed_process.returncode != 0:
         raise RawFrameError(f"ffprobe failed for {video}: {completed_process.stderr.strip()}")
-    reported_dimensions = (
-        completed_process.stdout.strip().splitlines()[0].split("x")
-        if completed_process.stdout
-        else []
-    )
-    if len(reported_dimensions) != 2:
-        raise RawFrameError(f"ffprobe reported no video dimensions for {video}")
-    frame_width, frame_height = (int(value) for value in reported_dimensions)
-    if frame_width <= 0 or frame_height <= 0:
-        raise RawFrameError(f"{video} reports a {frame_width}x{frame_height} frame")
+    # CSV also appends stream side data (for example display rotation). Read
+    # named fields so that metadata cannot change the dimension record's shape.
+    try:
+        stream = json.loads(completed_process.stdout)["streams"][0]
+        frame_width, frame_height = stream["width"], stream["height"]
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+        raise RawFrameError(f"ffprobe reported no video dimensions for {video}") from None
+    if (
+        type(frame_width) is not int
+        or type(frame_height) is not int
+        or frame_width <= 0
+        or frame_height <= 0
+    ):
+        raise RawFrameError(f"ffprobe reported invalid video dimensions for {video}")
     return frame_height, frame_width
 
 
@@ -80,18 +85,24 @@ def _raw_frame_stream(
     frame_byte_count = int(np.prod(frame_shape))
     command = [
         str(toolchain.ffmpeg_executable),
+        "-nostdin",
         "-hide_banner",
         "-loglevel",
         "error",
+        "-noautorotate",
         "-i",
         str(video),
+        "-map",
+        "0:v:0",
         "-vf",
         filter_graph,
         "-f",
         "rawvideo",
         "-",
     ]
-    decoding_process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # Undrained stderr can fill its pipe and deadlock a slow/abandoned frame
+    # consumer. Decoder diagnostics are not part of the measurement contract.
+    decoding_process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     reached_end_of_stream = False
 
     def read_frames() -> Iterator[np.ndarray]:
@@ -112,16 +123,20 @@ def _raw_frame_stream(
     try:
         yield read_frames()
     finally:
+        if not reached_end_of_stream:
+            decoding_process.terminate()
         if decoding_process.stdout is not None:
             decoding_process.stdout.close()
-        standard_error = (
-            decoding_process.stderr.read().decode() if decoding_process.stderr is not None else ""
-        )
-        if decoding_process.stderr is not None:
-            decoding_process.stderr.close()
-        return_code = decoding_process.wait()
+        try:
+            return_code = decoding_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            decoding_process.kill()
+            decoding_process.wait()
+            if reached_end_of_stream:
+                raise RawFrameError("decoder did not exit after its output ended") from None
+            return_code = decoding_process.returncode
         if reached_end_of_stream and return_code != 0:
-            raise RawFrameError(f"decode failed for {video}: {standard_error.strip()}")
+            raise RawFrameError(f"decode failed for {video}")
 
 
 @contextmanager

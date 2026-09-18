@@ -617,12 +617,16 @@ $stage_plan_filter        return plan_stage_batches(
         stage_step_names = resolve_step_names_for_stage(
             app, step_names, enabled_stage_names, "$stage_name"
         )
-        return process_stage_batch(
-            app,
-            batch["items"],
-            "$stage_name",
-            orchestrator_run_id,
-            step_names=stage_step_names,
+        import asyncio
+
+        return asyncio.run(
+            process_stage_batch(
+                app,
+                batch["items"],
+                "$stage_name",
+                orchestrator_run_id,
+                step_names=stage_step_names,
+            )
         )
 '''
 

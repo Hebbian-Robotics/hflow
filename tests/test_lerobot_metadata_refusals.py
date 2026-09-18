@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from urllib.request import Request
+from types import SimpleNamespace
 
 import pytest
+from httpx import Request, Response
+from huggingface_hub.errors import RemoteEntryNotFoundError
 
 import hflow.importers.lerobot as prep
 
@@ -21,21 +23,6 @@ def _exactly(message: str) -> str:
     (``meta/info.json``), which unescaped would also match ``meta/infoXjson``.
     """
     return rf"^{re.escape(message)}$"
-
-
-class _Response:
-    def __init__(self, body: bytes, *, link: str | None = None) -> None:
-        self._body = body
-        self.headers = {} if link is None else {"Link": link}
-
-    def read(self) -> bytes:
-        return self._body
-
-    def __enter__(self) -> _Response:
-        return self
-
-    def __exit__(self, *_args: object) -> None:
-        return None
 
 
 def _stub_repo_info(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -59,7 +46,14 @@ def test_import_refuses_repository_without_lerobot_v3_info(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _stub_repo_info(monkeypatch)
-    monkeypatch.setattr(prep, "_hf_tree", lambda _repo, _revision, _path: [])
+
+    def missing_info(*_args: object, **_kwargs: object) -> str:
+        raise RemoteEntryNotFoundError(
+            "missing meta/info.json",
+            response=Response(404, request=Request("GET", "https://huggingface.co/missing")),
+        )
+
+    monkeypatch.setattr(prep, "hf_hub_download", missing_info)
     output_dir = tmp_path / "out"
 
     with pytest.raises(
@@ -74,12 +68,9 @@ def test_import_refuses_info_json_that_is_not_an_object(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _stub_repo_info(monkeypatch)
-    monkeypatch.setattr(
-        prep,
-        "_hf_tree",
-        lambda _repo, _revision, _path: [{"path": "meta/info.json", "type": "file"}],
-    )
-    monkeypatch.setattr(prep.urllib.request, "urlopen", lambda *_args, **_kwargs: _Response(b"[]"))
+    metadata_file = tmp_path / "info.json"
+    metadata_file.write_text("[]")
+    monkeypatch.setattr(prep, "hf_hub_download", lambda *_args, **_kwargs: str(metadata_file))
     output_dir = tmp_path / "out"
 
     with pytest.raises(ValueError, match=_exactly("LeRobot meta/info.json is not a JSON object")):
@@ -119,6 +110,97 @@ def test_import_refuses_empty_path_templates(
     _assert_no_dataset_output(output_dir)
 
 
+_VALID_DATA_PATH = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
+_VALID_VIDEO_PATH = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+
+
+def _info(**overrides: object) -> dict[str, object]:
+    info: dict[str, object] = {
+        "fps": 30,
+        "data_path": _VALID_DATA_PATH,
+        "video_path": _VALID_VIDEO_PATH,
+        "features": {},
+    }
+    info.update(overrides)
+    return info
+
+
+@pytest.mark.parametrize(
+    ("field", "template", "detail"),
+    [
+        ("data_path", "data/{episode_index:03d}/f.parquet", "unknown field 'episode_index'"),
+        ("data_path", "data/{chunk_index:03d/f.parquet", "unmatched '{' in format spec"),
+        (
+            "data_path",
+            "data/{chunk_index:qq}/f.parquet",
+            "Invalid format specifier 'qq' for object of type 'int'",
+        ),
+        (
+            "data_path",
+            "data/{0}/f.parquet",
+            "positional fields are not supported, name the field instead",
+        ),
+        ("data_path", "data/}chunk/f.parquet", "Single '}' encountered in format string"),
+        # Subscripting a field raises TypeError rather than the other three,
+        # so without it in the caught set this one escapes the boundary raw.
+        ("data_path", "data/{chunk_index[0]}/f.parquet", "'int' object is not subscriptable"),
+        ("video_path", "videos/{episode_index}/f.mp4", "unknown field 'episode_index'"),
+        (
+            "video_path",
+            "videos/{0}/f.mp4",
+            "positional fields are not supported, name the field instead",
+        ),
+    ],
+)
+def test_import_refuses_a_template_the_converter_could_not_format(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    template: str,
+    detail: str,
+) -> None:
+    """Each of these used to pass the boundary and raise at ``str.format``.
+
+    The second assertion is the point. The old failure arrived after
+    ``meta/episodes`` had been listed and every episode metadata parquet
+    downloaded; asserting only the message would pass either way.
+    """
+    _stub_repo_info(monkeypatch)
+    monkeypatch.setattr(
+        prep, "_fetch_info_json", lambda _repo, _revision, _cache: _info(**{field: template})
+    )
+    listed_repositories: list[str] = []
+
+    def recording_metadata_files(repo: str, _revision: str) -> list[str]:
+        listed_repositories.append(repo)
+        return []
+
+    monkeypatch.setattr(prep, "_hf_episode_metadata_files", recording_metadata_files)
+    output_dir = tmp_path / "out"
+
+    message = f"LeRobot meta/info.json has an invalid {field} template {template!r}: {detail}"
+    with pytest.raises(ValueError, match=_exactly(message)):
+        _import(output_dir)
+
+    assert listed_repositories == []
+    _assert_no_dataset_output(output_dir)
+
+
+def test_the_two_templates_are_checked_against_different_field_sets() -> None:
+    """``camera_key`` is legal in ``video_path`` and not in ``data_path``.
+
+    ``_convert_single_episode`` formats ``data_path`` with ``chunk_index`` and
+    ``file_index`` only, and ``video_path`` with ``video_key`` and
+    ``camera_key`` as well. Checking both against the union would accept a
+    ``data_path`` naming ``camera_key``, which is one of the failures this
+    boundary is meant to catch.
+    """
+    prep._parse_dataset_information(_info(video_path="videos/{camera_key}/f.mp4"))
+
+    with pytest.raises(ValueError, match="unknown field 'camera_key'"):
+        prep._parse_dataset_information(_info(data_path="data/{camera_key}/f.parquet"))
+
+
 def test_import_refuses_info_json_without_features_before_listing_episodes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -138,13 +220,13 @@ def test_import_refuses_info_json_without_features_before_listing_episodes(
             "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
         },
     )
-    listed_paths: list[str] = []
+    listed_repositories: list[str] = []
 
-    def recording_hf_tree(_repo: str, _revision: str, path: str) -> list[dict[str, str]]:
-        listed_paths.append(path)
+    def recording_metadata_files(repo: str, _revision: str) -> list[str]:
+        listed_repositories.append(repo)
         return []
 
-    monkeypatch.setattr(prep, "_hf_tree", recording_hf_tree)
+    monkeypatch.setattr(prep, "_hf_episode_metadata_files", recording_metadata_files)
     output_dir = tmp_path / "out"
 
     with pytest.raises(
@@ -152,7 +234,7 @@ def test_import_refuses_info_json_without_features_before_listing_episodes(
     ):
         _import(output_dir)
 
-    assert listed_paths == []
+    assert listed_repositories == []
     _assert_no_dataset_output(output_dir)
 
 
@@ -170,7 +252,7 @@ def test_import_refuses_repository_without_episode_parquets(
             "features": {},
         },
     )
-    monkeypatch.setattr(prep, "_hf_tree", lambda _repo, _revision, _path: [])
+    monkeypatch.setattr(prep, "_hf_episode_metadata_files", lambda _repo, _revision: [])
     output_dir = tmp_path / "out"
 
     with pytest.raises(RuntimeError, match=_exactly("no meta/episodes parquet files found")):
@@ -179,68 +261,24 @@ def test_import_refuses_repository_without_episode_parquets(
     _assert_no_dataset_output(output_dir)
 
 
-def test_import_refuses_tree_response_that_is_not_a_list_of_objects(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("filename", [None, "", 123])
+def test_import_refuses_inventory_with_invalid_filename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, filename: object
 ) -> None:
     _stub_repo_info(monkeypatch)
-    monkeypatch.setattr(prep.urllib.request, "urlopen", lambda *_args, **_kwargs: _Response(b"{}"))
+    monkeypatch.setattr(prep, "_fetch_info_json", lambda *_args: _info())
+    monkeypatch.setattr(
+        prep,
+        "HfApi",
+        lambda: SimpleNamespace(
+            dataset_info=lambda *_args, **_kwargs: SimpleNamespace(
+                siblings=[SimpleNamespace(rfilename=filename)]
+            )
+        ),
+    )
     output_dir = tmp_path / "out"
 
-    with pytest.raises(
-        ValueError,
-        match=_exactly("Hugging Face tree response for 'meta' is not a list of objects"),
-    ):
-        _import(output_dir)
-
-    _assert_no_dataset_output(output_dir)
-
-
-def test_import_refuses_repeated_pagination_url(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _stub_repo_info(monkeypatch)
-    initial_url = f"https://huggingface.co/api/datasets/{_REPO}/tree/{_SHA}/meta?recursive=true"
-
-    fetched_urls: list[str] = []
-
-    def fake_urlopen(request: Request, **_kwargs: object) -> _Response:
-        assert request.full_url == initial_url
-        fetched_urls.append(request.full_url)
-        # Bounded on purpose. Without the visited-URL guard this server would
-        # feed the loop its own URL forever, and the test would hang rather
-        # than fail: CI would report nothing and a human would wait. Dropping
-        # the `next` link after a few passes lets a guard-less loop terminate
-        # and fail on the missing refusal instead.
-        if len(fetched_urls) > 4:
-            return _Response(b"[]")
-        return _Response(b"[]", link=f'<{initial_url}>; rel="next"')
-
-    monkeypatch.setattr(prep.urllib.request, "urlopen", fake_urlopen)
-    output_dir = tmp_path / "out"
-
-    with pytest.raises(ValueError, match="repeated an already fetched pagination URL"):
-        _import(output_dir)
-
-    # The guard fires on the second pass, before a second fetch: one request
-    # went out, not five. Without this the bound above could be doing the
-    # stopping and the test would still pass.
-    assert fetched_urls == [initial_url]
-    _assert_no_dataset_output(output_dir)
-
-
-def test_import_refuses_invalid_pagination_url(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _stub_repo_info(monkeypatch)
-    invalid_url = "https://[invalid"
-
-    def fake_urlopen(_request: Request, **_kwargs: object) -> _Response:
-        return _Response(b"[]", link=f'<{invalid_url}>; rel="next"')
-
-    monkeypatch.setattr(prep.urllib.request, "urlopen", fake_urlopen)
-    output_dir = tmp_path / "out"
-
-    with pytest.raises(ValueError, match="contains an invalid pagination URL"):
+    with pytest.raises(ValueError, match="Hugging Face listed an invalid filename"):
         _import(output_dir)
 
     _assert_no_dataset_output(output_dir)

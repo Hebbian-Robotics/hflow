@@ -66,7 +66,7 @@ def test_cli_manifest_prints_the_pipeline_manifest_json(
         "import hflow\n\n"
         "my_app = hflow.App('kitchen', data_root='./data', default_checks=())\n\n"
         '@my_app.check(version="1", critical=True)\n'
-        "def blackout(ep: hflow.Episode) -> hflow.CheckResult:\n"
+        "async def blackout(ep: hflow.Episode) -> hflow.CheckResult:\n"
         "    return hflow.CheckResult()\n"
     )
     exit_code = main(["manifest", "--pipeline", f"{pipeline_file}:my_app"])

@@ -120,8 +120,20 @@ OpenAI-compatible checks can use different services through the
 `BUILD_AI_HAND_VISIBILITY_API_KEY_ENV` and corresponding
 `BUILD_AI_ACTIVE_MANIPULATION_*` overrides.
 
-`HFlowHostedExecution` owns only the hosted base URL, check version, and request
-timeout; its server owns every model setting.
+`HFlowHostedExecution` owns the hosted base URL, check version, and request policy;
+its server owns every model setting. `request_timeout_seconds` defaults to 60,
+`total_timeout_seconds` to 360, and `max_retries` to five additional attempts.
+Tenacity retries transport failures and HTTP 429/502/503/504, respecting numeric
+`Retry-After` delays (capped at 120 seconds) or exponential backoff. Authorization
+errors, malformed responses, and invalid predictions are not retried.
+
+The total budget includes attempts, response reads, and backoff. A retry whose
+delay would exhaust the budget is refused. An enclosing `asyncio.timeout`
+interrupts requests, streamed reads, and retry waits when the budget expires.
+Socket timeouts are also capped by the remaining budget at the start of each
+attempt. Cancellation closes the active response and stops further frame
+requests. A 64 KiB response limit also applies. Both timeout settings and the
+retry count enter the check version.
 
 The two checks are contracts, not a particular model: one egocentric frame in,
 a hand count of 0, 1, or 2 or a yes/no on active manipulation out, recorded as
@@ -130,6 +142,20 @@ Build AI's published prompts through a model you name. `HFlowHostedExecution`
 answers with HFlow's hosted implementation, whose implementation is pinned per
 version and is not required to match Build AI's. Every result
 names what answered it in `requested_model`.
+
+Structured answers are validated against the same typed models that generate
+their JSON schemas. Hand counts must be integers from 0 through 2, and active
+manipulation answers must be `yes` or `no`. Unknown answer fields, duplicate JSON
+keys, nonfinite numbers, and responses larger than 64 KiB are rejected. Plain-text
+response mode still accepts a count or a yes/no answer; structured fields are not
+coerced from strings or normalized from other labels.
+
+Only one completed, non-refused OpenAI-compatible answer can produce a prediction.
+Truncated, filtered, refused, tool-calling, or ambiguous completions become
+unparsed observations, as do invalid answer values. Transport errors still fail
+the check. Structured validation errors expose a generic reason rather than raw
+validator input details. These acceptance rules change both single-frame and
+sampled check versions; recompute checks when comparing results across versions.
 
 The same checks are available directly in any pipeline. Execution is selected
 per check, so the two checks may use different executions:

@@ -179,7 +179,9 @@ teleoperation episode, but the same step interface applies to egocentric video
 and other physical-AI recordings.
 
 ```python
+import asyncio
 import hflow
+from hflow.asyncio_utils import run_blocking
 from hflow.checks import camera_frame_stats
 from your_existing_qc import check_joint_smoothness  # use your existing checks
 
@@ -187,16 +189,17 @@ app = hflow.App("kitchen-pipeline")  # data root: $HFLOW_DATA_ROOT, hflow.toml, 
 
 
 @app.check(version="1")
-def joint_smoothness(ep: hflow.Episode) -> hflow.CheckResult:
-    joints = ep.channel("/joint_states").to_numpy()  # our line: extract
-    result = check_joint_smoothness(joints, rate_hz=100)  # your line: unchanged
+async def joint_smoothness(ep: hflow.Episode) -> hflow.CheckResult:
+    channel = await run_blocking(ep.channel, "/joint_states")
+    joints = await run_blocking(channel.to_numpy)  # our line: extract
+    result = await run_blocking(check_joint_smoothness, joints, rate_hz=100)  # your line: unchanged
     return hflow.CheckResult(measurements=result)  # our line: record
 
 
 @app.check(version="1", critical=True)
-def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
+async def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
     camera_topic = next(topic for topic in ep.cameras if "wrist_cam" in topic)
-    evidence = camera_frame_stats(ep, cameras=[camera_topic])
+    evidence = await camera_frame_stats(ep, cameras=[camera_topic])
     black_frame_percent = evidence.measurements[f"{camera_topic}/black_frame_pct"]
     assert isinstance(black_frame_percent, float)
     return hflow.CheckResult(
@@ -206,7 +209,7 @@ def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
 
 
 if __name__ == "__main__":
-    app.test("episode_0001.mcap")  # whole pipeline, in-process, no infra
+    asyncio.run(app.test("episode_0001.mcap"))  # whole pipeline, in-process, no infra
     # Or call app.run() here to start the Compose runtime, then use `hflow ingest`.
 ```
 

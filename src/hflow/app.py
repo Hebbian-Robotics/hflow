@@ -14,9 +14,11 @@ infrastructure, not data: it is reported as an error, never recorded as a
 quality outcome.
 """
 
+import asyncio
 import hashlib
 import inspect
 import json
+import logging
 import os
 import re
 import shutil
@@ -24,8 +26,7 @@ import sys
 import tempfile
 import time
 import traceback
-from collections.abc import Callable, Iterable, Sequence
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from collections.abc import Awaitable, Callable, Generator, Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -35,11 +36,13 @@ from typing import TYPE_CHECKING, Generic, NewType, TypeVar, assert_never
 if TYPE_CHECKING:
     from hflow.runtime import BundlePaths
 
+from hflow.asyncio_utils import run_blocking
 from hflow.catalog import (
     AppendResult,
     Catalog,
     CheckRunRow,
     QuarantineHistory,
+    _raise_if_measurement_keys_case_collide,
     content_episode_id,
 )
 from hflow.episode import Episode, _sanitize_topic
@@ -54,7 +57,7 @@ from hflow.manifest import (
     PipelineManifest,
     StepManifest,
 )
-from hflow.reader import open_reader
+from hflow.reader import open_reader, verify_canonical_integrity
 from hflow.resample import DerivedSeries
 from hflow.step_selection import (
     ALL_REGISTERED_STEPS,
@@ -99,6 +102,8 @@ from hflow.transform import (
     write_canonical_episode,
 )
 from hflow.workspace import RUNTIME_BUNDLE_DIRECTORY_NAME, Workspace
+
+logger = logging.getLogger(__name__)
 
 # The contract a @app.transform override implements: (source, output, config)
 # -> the stamps it wrote. See :meth:`App.transform`.
@@ -224,10 +229,18 @@ def _resolve_data_root(data_root: "Path | str | StorageRoot | None") -> "Path | 
 # contact sheet per camera topic, recorded exactly like an enrichment so its
 # catalog rows flow through CheckRunRow like everything else.
 MEDIA_CONTACT_SHEET_STEP_NAME = "media/contact_sheet"
-MEDIA_CONTACT_SHEET_STEP_VERSION = parse_step_version("1")
+# "2": sheet file names gained the collision-resistant topic digest (#535),
+# so the published artifact URIs this step records change.
+MEDIA_CONTACT_SHEET_STEP_VERSION = parse_step_version("2")
 # Published artifacts are recorded as measurements under this prefix, so a
 # reader can tell "here is where the file went" from an ordinary label.
 ARTIFACT_MEASUREMENT_KEY_PREFIX = "artifact/"
+# The framework-owned step that records a check-lane refusal: one row naming
+# why the lane stood down, queryable by its error value. Not registered on
+# the App; it exists only on the refusal record (see
+# :func:`_canonical_integrity_refusal_run`).
+CANONICAL_INTEGRITY_STEP_NAME = "integrity/canonical"
+CANONICAL_INTEGRITY_STEP_VERSION = parse_step_version("1")
 _MEDIA_CONTACT_SHEET_FPS = 0.5
 _SYNC_COMPLETION_MARKER_NAME = ".sync-complete.json"
 
@@ -473,6 +486,7 @@ _ConcurrentEpisodeLimit = NewType("_ConcurrentEpisodeLimit", int)
 _ConcurrentEpisodeLimit.__module__ = __name__
 _ConcurrentInputT = TypeVar("_ConcurrentInputT")
 _ConcurrentResultT = TypeVar("_ConcurrentResultT")
+_CheckFunctionT = TypeVar("_CheckFunctionT", bound=CheckFunction)
 
 
 def _parse_concurrent_episode_limit(max_workers: int) -> _ConcurrentEpisodeLimit:
@@ -483,80 +497,59 @@ def _parse_concurrent_episode_limit(max_workers: int) -> _ConcurrentEpisodeLimit
     return _ConcurrentEpisodeLimit(max_workers)
 
 
-def _run_with_bounded_concurrency(
+async def _run_with_bounded_concurrency(
     inputs: Sequence[_ConcurrentInputT],
-    operation: Callable[[_ConcurrentInputT], _ConcurrentResultT],
+    operation: Callable[[_ConcurrentInputT], Awaitable[_ConcurrentResultT]],
     *,
     concurrency_limit: _ConcurrentEpisodeLimit,
     on_completion: Callable[[int, _ConcurrentResultT, int, int], None] | None = None,
 ) -> list[_ConcurrentResultT]:
-    """Run at most ``concurrency_limit`` submitted operations, retaining input order.
-
-    A rolling window matters even though the executor also limits active threads:
-    ``Executor.map`` submits its complete input eagerly on Python 3.11-3.13. Keeping
-    submitted work bounded means a preparation failure can stop later episodes before
-    they create files or make endpoint calls. Already-running operations finish before
-    the exception escapes, so no worker keeps mutating a workspace after the caller has
-    regained control. Completion callbacks run on the coordinator before replacement
-    work is submitted, so a callback failure has the same stop-scheduling guarantee.
-    """
-
-    if not inputs:
-        return []
-
+    """Bound admission, preserve input order, and drain cancelled siblings on failure."""
     results_by_input_index: dict[int, _ConcurrentResultT] = {}
     next_input_index = 0
-    completed_result_count = 0
-    with ThreadPoolExecutor(max_workers=int(concurrency_limit)) as thread_pool:
-        input_index_by_future: dict[Future[_ConcurrentResultT], int] = {}
+    input_index_by_task: dict[asyncio.Task[_ConcurrentResultT], int] = {}
 
-        def submit_next_input() -> bool:
-            nonlocal next_input_index
-            if next_input_index >= len(inputs):
-                return False
-            submitted_input_index = next_input_index
+    async def execute_input(value: _ConcurrentInputT) -> _ConcurrentResultT:
+        return await operation(value)
+
+    def submit_next_input() -> None:
+        nonlocal next_input_index
+        if next_input_index < len(inputs):
+            input_index_by_task[asyncio.create_task(execute_input(inputs[next_input_index]))] = (
+                next_input_index
+            )
             next_input_index += 1
-            future = thread_pool.submit(operation, inputs[submitted_input_index])
-            input_index_by_future[future] = submitted_input_index
-            return True
 
-        for _ in range(min(int(concurrency_limit), len(inputs))):
-            submit_next_input()
-
-        try:
-            while input_index_by_future:
-                completed_futures, _ = wait(
-                    input_index_by_future,
-                    return_when=FIRST_COMPLETED,
-                )
-                ordered_completed_futures = sorted(
-                    completed_futures,
-                    key=input_index_by_future.__getitem__,
-                )
-                completed_results: list[tuple[int, _ConcurrentResultT]] = []
-                for completed_future in ordered_completed_futures:
-                    completed_input_index = input_index_by_future.pop(completed_future)
-                    completed_results.append((completed_input_index, completed_future.result()))
-                for completed_input_index, completed_result in completed_results:
-                    results_by_input_index[completed_input_index] = completed_result
-                    completed_result_count += 1
-                    if on_completion is not None:
-                        on_completion(
-                            completed_input_index,
-                            completed_result,
-                            completed_result_count,
-                            len(inputs),
-                        )
-                for _ in completed_results:
-                    submit_next_input()
-        except BaseException:
-            # Cancellation must also cover KeyboardInterrupt/SystemExit: returning control
-            # while queued workers can still write is unsafe regardless of failure kind.
-            for outstanding_future in input_index_by_future:
-                outstanding_future.cancel()
-            raise
-
-    return [results_by_input_index[input_index] for input_index in range(len(inputs))]
+    for _ in range(min(int(concurrency_limit), len(inputs))):
+        submit_next_input()
+    try:
+        while input_index_by_task:
+            completed_tasks, _ = await asyncio.wait(
+                input_index_by_task, return_when=asyncio.FIRST_COMPLETED
+            )
+            completed_results = [
+                (input_index_by_task[task], task.result())
+                for task in sorted(completed_tasks, key=input_index_by_task.__getitem__)
+            ]
+            for task in completed_tasks:
+                del input_index_by_task[task]
+            for input_index, result in completed_results:
+                results_by_input_index[input_index] = result
+                if on_completion is not None:
+                    on_completion(input_index, result, len(results_by_input_index), len(inputs))
+            for _ in completed_results:
+                submit_next_input()
+    finally:
+        for task in input_index_by_task:
+            task.cancel()
+        if input_index_by_task:
+            drain_task = asyncio.gather(*input_index_by_task, return_exceptions=True)
+            while not drain_task.done():
+                try:
+                    await asyncio.shield(drain_task)
+                except asyncio.CancelledError:
+                    continue
+    return [results_by_input_index[index] for index in range(len(inputs))]
 
 
 @dataclass(frozen=True)
@@ -840,6 +833,8 @@ def _raise_if_step_cannot_take_only_an_episode(
     # valid identifier, so the pasteable example needs a sanitized wrapper name.
     identifier_stem = re.sub(r"\W+", "_", step_name).strip("_")
     wrapper_name = f"{identifier_stem}_{wrapper_suffix}"
+    definition_prefix = "async " if step_kind is _RegistrationStepKind.CHECK else ""
+    await_prefix = "await " if step_kind is _RegistrationStepKind.CHECK else ""
     if unsatisfiable:
         # Bind every unsatisfiable parameter, not just the first: the example is
         # meant to be pasted, and a snippet binding one of two still fails.
@@ -850,15 +845,15 @@ def _raise_if_step_cannot_take_only_an_episode(
             f"required parameter(s) without defaults: {', '.join(sorted_names)}. "
             "Wrap it in a function that binds them, e.g.\n\n"
             f"    {decorator}\n"
-            f"    def {wrapper_name}(ep: hflow.Episode) -> {return_type}:\n"
-            f"        return {getattr(function, '__name__', step_name)}(ep, {bindings})\n"
+            f"    {definition_prefix}def {wrapper_name}(ep: hflow.Episode) -> {return_type}:\n"
+            f"        return {await_prefix}{getattr(function, '__name__', step_name)}(ep, {bindings})\n"
         )
     if not accepts_episode:
         raise ValueError(
             f"{step_kind.value} {step_name!r} cannot accept the episode: it must take "
             "the episode as its first positional parameter, e.g.\n\n"
             f"    {decorator}\n"
-            f"    def {wrapper_name}(ep: hflow.Episode) -> {return_type}:\n"
+            f"    {definition_prefix}def {wrapper_name}(ep: hflow.Episode) -> {return_type}:\n"
             "        ...\n"
         )
 
@@ -884,8 +879,21 @@ def _execute_enrichment(
                 "expected hflow.EnrichmentResult -- wrap it: return "
                 "hflow.EnrichmentResult(labels=...)"
             )
-    except Exception:
+            logger.error(
+                "Enrichment %s errored on episode %s: %s",
+                registered_enrichment.name,
+                canonical_episode.path,
+                outcome.error,
+            )
+    except Exception as error:
         outcome = Errored(traceback.format_exc(limit=8))
+        logger.error(
+            "Enrichment %s errored on episode %s: %s: %s",
+            registered_enrichment.name,
+            canonical_episode.path,
+            type(error).__name__,
+            error,
+        )
     duration_s = time.perf_counter() - started
     return EnrichmentRunReport(
         enrichment=registered_enrichment, outcome=outcome, duration_s=duration_s
@@ -897,11 +905,26 @@ def _check_run_rows(report: "ProcessReport") -> list[CheckRunRow]:
     enrichment's labels and published artifact keys.
 
     One owner, so the collision guard below and the catalog append can never
-    disagree about what would be written. Artifact keys come from
-    ``artifact_uris`` rather than the result's declared artifacts: a step whose
-    artifact failed to publish contributes no key.
+    disagree about what would be written. A refused episode contributes one
+    framework-owned row naming the refusal (its ``critical`` flag is what
+    makes the curation views read the episode as unverified rather than ok).
+    Artifact keys come from ``artifact_uris`` rather than the result's
+    declared artifacts: a step whose artifact failed to publish contributes
+    no key.
     """
-    check_rows = [
+    check_rows: list[CheckRunRow] = []
+    if report.refusal_reason is not None:
+        check_rows.append(
+            CheckRunRow(
+                check_name=CANONICAL_INTEGRITY_STEP_NAME,
+                check_version=CANONICAL_INTEGRITY_STEP_VERSION,
+                critical=True,
+                status=CheckStatus.ERROR,
+                duration_s=0.0,
+                error=report.refusal_reason,
+            )
+        )
+    check_rows.extend(
         CheckRunRow.from_result(
             check_name=run.check.name,
             check_version=run.check.version,
@@ -912,7 +935,7 @@ def _check_run_rows(report: "ProcessReport") -> list[CheckRunRow]:
             result=run.result,
         )
         for run in report.checks
-    ]
+    )
     _raise_if_measurement_keys_claim_artifact_namespace(
         (row.check_name, key) for row in check_rows for key in row.measurements
     )
@@ -994,6 +1017,7 @@ def _raise_if_measurement_keys_collide(check_rows: Sequence[CheckRunRow]) -> Non
     deliberately unguarded: those tables carry ``check_name`` and have no
     per-key latest ranking, so two steps sharing one loses nothing.
     """
+    _raise_if_measurement_keys_case_collide(key for row in check_rows for key in row.measurements)
     steps_by_key: dict[str, list[str]] = {}
     for row in check_rows:
         for key in row.measurements:
@@ -1092,6 +1116,11 @@ class ProcessReport:
     # a reused run and a transcoded run are otherwise indistinguishable
     # without comparing file timestamps.
     sync_reused: bool = False
+    # The named reason the canonical episode was refused at the check lane
+    # entry, or None when it entered clean. Mirrored verbatim on the refusal
+    # row's error field in the catalog, where downstream tooling filters for
+    # it by equality.
+    refusal_reason: str | None = None
 
     def check(self, name: str) -> CheckRunReport:
         """Return the run report for the uniquely named check.
@@ -1125,8 +1154,10 @@ class ProcessReport:
     @property
     def has_errors(self) -> bool:
         """Whether any enabled check or enrichment failed to execute correctly."""
-        return any(run.status is CheckStatus.ERROR for run in self.checks) or any(
-            run.status is CheckStatus.ERROR for run in self.enrichments
+        return (
+            self.refusal_reason is not None
+            or any(run.status is CheckStatus.ERROR for run in self.checks)
+            or any(run.status is CheckStatus.ERROR for run in self.enrichments)
         )
 
     def _stages_line(self) -> str:
@@ -1152,6 +1183,11 @@ class ProcessReport:
         ]
         if self.sync_reused:
             lines.append("sync: reused the existing canonical episode (source unchanged)")
+        if self.refusal_reason is not None:
+            lines.append(
+                f"REFUSED: {self.refusal_reason} -- the canonical episode failed its "
+                "integrity stamp; no checks ran"
+            )
         if self.catalog_entry is not None:
             record_verb = "recorded" if self.catalog_entry.written else "already recorded"
             lines.append(
@@ -1253,6 +1289,35 @@ TestManyProgress = ProcessManyProgress
 TestManyReport = ProcessManyReport
 
 
+@dataclass(frozen=True)
+class _PendingCheck:
+    function: CheckFunction
+    episode: Episode
+
+
+@dataclass(frozen=True)
+class _CompletedProcessing:
+    report: ProcessReport
+
+
+def _advance_processing(
+    processing: Generator[_PendingCheck, CheckResult | None, ProcessReport],
+    outcome: CheckResult | Exception | None,
+) -> _PendingCheck | _CompletedProcessing:
+    # Keeping the blocking phases in one generator preserves the episode context
+    # across awaits without duplicating gates, publication, or catalog behavior.
+    try:
+        return (
+            processing.throw(outcome)
+            if isinstance(outcome, Exception)
+            else processing.send(outcome)
+        )
+    except StopIteration as completed:
+        if not isinstance(completed.value, ProcessReport):
+            raise TypeError("episode processing did not produce a report") from None
+        return _CompletedProcessing(completed.value)
+
+
 class App:
     """A named pipeline: registered checks plus transform configuration.
 
@@ -1291,6 +1356,16 @@ class App:
         self.enrichments: list[RegisteredEnrichment] = []
         self.derived: list[DerivedChannel] = []
         self.transform_override: TransformFunction | None = None
+        # Front-door integrity verdicts for canonical files, keyed by path and
+        # held with a size+mtime witness of the bytes the verdict describes.
+        # Lives on the App because the App is the run context: the same
+        # episode is opened again by later stage runs and retries in this
+        # process. The witness matters as much as the cache: decay can happen
+        # between two opens in one process, and a verdict must never outlive
+        # the file state it was read from.
+        self._canonical_integrity_cache: dict[
+            str, tuple[tuple[int, int], tuple[bool, str | None]]
+        ] = {}
         # Which registrations came from ``default_checks`` rather than from
         # the pipeline: registering one of these yourself replaces it (that
         # is how a default gets a gate or a bound parameter), while two USER
@@ -1342,6 +1417,28 @@ class App:
             if not superseded_keys:
                 continue
             run.outcome = NotRun(SupersededByPipeline(superseded_keys=tuple(superseded_keys)))
+
+    def _canonical_integrity_verdict(self, canonical_path: Path) -> "tuple[bool, str | None]":
+        """The check lane's front-door verdict for one canonical file.
+
+        At most one full CRC read per file state per run: the same episode is
+        re-opened by later stage runs and retried stage batches in this
+        process (a metadata backfill after a full run, a replayed META lane),
+        and re-validating unchanged bytes would pay the pass again for the
+        same answer. The cached verdict is keyed to the file's size and
+        mtime, so bytes that changed under the cache are re-validated rather
+        than trusted -- a verdict describes a file state, not a path. Sync
+        rewriting the file drops the cached entry outright.
+        """
+        cache_key = str(canonical_path)
+        file_state = canonical_path.stat()
+        witness = (file_state.st_size, file_state.st_mtime_ns)
+        cached = self._canonical_integrity_cache.get(cache_key)
+        if cached is not None and cached[0] == witness:
+            return cached[1]
+        verdict = verify_canonical_integrity(canonical_path)
+        self._canonical_integrity_cache[cache_key] = (witness, verdict)
+        return verdict
 
     def _reusable_canonical_episode(
         self,
@@ -1652,8 +1749,12 @@ class App:
         critical: bool = False,
         requires: Iterable[str] | None = None,
         gate: Gate | None = None,
-    ) -> Callable[[CheckFunction], CheckFunction]:
-        """Register a check function. See ``hflow.steps.CheckResult``.
+    ) -> Callable[[_CheckFunctionT], _CheckFunctionT]:
+        """Register a check returning an awaitable ``hflow.steps.CheckResult``.
+
+        Use ``async def`` and await I/O. HFlow awaits checks on the caller's
+        event loop; blocking work must be explicitly offloaded with
+        ``hflow.asyncio_utils.run_blocking``.
 
         ``gate`` attaches a pass/fail policy the runner evaluates over the
         measurements this check returns, so a built-in that records evidence
@@ -1668,7 +1769,7 @@ class App:
         """
         step_version = parse_step_version(version)
 
-        def register(function: CheckFunction) -> CheckFunction:
+        def register(function: _CheckFunctionT) -> _CheckFunctionT:
             check_name = name if name is not None else getattr(function, "__name__", "")
             if not check_name:
                 raise ValueError("pass name=... when registering a callable without __name__")
@@ -1693,8 +1794,8 @@ class App:
                     "you build once and pass in, e.g.\n\n"
                     '    @app.check(version="1", critical=True, '
                     "gate=hflow.checks.RECOMMENDED_CAMERA_INTEGRITY)\n"
-                    f"    def {check_name}(ep: hflow.Episode) -> hflow.CheckResult:\n"
-                    "        return hflow.checks.camera_frame_stats(ep)\n"
+                    f"    async def {check_name}(ep: hflow.Episode) -> hflow.CheckResult:\n"
+                    "        return await hflow.checks.camera_frame_stats(ep)\n"
                 )
             requires_set = frozenset(requires) if requires is not None else frozenset()
             self.checks.append(
@@ -1884,7 +1985,7 @@ class App:
             key=lambda registered: bool(registered.requires),
         )
 
-    def test(
+    async def test(
         self,
         episode: Path | str,
         *,
@@ -1906,13 +2007,13 @@ class App:
         optionally limits execution to named registered steps within those
         stages.
         """
-        return self.process(
+        return await self.process(
             episode,
             output_dir=(
                 output_dir
                 if output_dir is not None
                 else self.workspace.test_runs_root.child(
-                    _source_artifact_directory_name(episode, self.storage_root)
+                    await run_blocking(_source_artifact_directory_name, episode, self.storage_root)
                 )
             ),
             verbose=verbose,
@@ -1921,7 +2022,7 @@ class App:
             step_names=step_names,
         )
 
-    def test_many(
+    async def test_many(
         self,
         episodes: Iterable[Path | str],
         *,
@@ -1940,7 +2041,7 @@ class App:
         semantics are those of :meth:`process_many`. Use that production-facing
         API for embedded workers and batch jobs.
         """
-        return self.process_many(
+        return await self.process_many(
             episodes,
             output_dir=self.workspace.test_runs_root,
             max_workers=max_workers,
@@ -1951,7 +2052,7 @@ class App:
             on_progress=on_progress,
         )
 
-    def process_many(
+    async def process_many(
         self,
         episodes: Iterable[Path | str],
         *,
@@ -1964,7 +2065,7 @@ class App:
         orchestrator_run_id: str | None = None,
         on_progress: Callable[[ProcessManyProgress], None] | None = None,
     ) -> ProcessManyReport:
-        """Process distinct episodes in-process, with bounded thread concurrency.
+        """Process distinct episodes in-process, with bounded async concurrency.
 
         Each episode uses :meth:`process`, including catalog recording by
         default. ``output_dir`` is a batch root: every source gets its own
@@ -1980,17 +2081,16 @@ class App:
 
         Reports preserve input order. At most ``max_workers`` episodes are
         submitted at once, sharing this application's registered functions and
-        their state; those functions must be thread-safe when concurrency is
-        greater than one. Do not change registrations during a batch.
-        ``on_progress`` runs on the calling coordinator thread after each
+        their state; check callbacks must offload blocking work explicitly. Do not change registrations during a batch.
+        ``on_progress`` runs on the caller's event loop after each
         completion, with the original input index. ``verbose=False`` avoids
-        interleaved summaries from worker threads.
+        interleaved summaries from concurrent episodes.
 
         Check and enrichment errors remain in each :class:`ProcessReport` and
         do not abort the batch; inspect ``has_errors`` as well as quality
         verdicts. Exceptions outside those per-step outcomes, such as source
         preparation, transform, or callback failures, stop new submissions,
-        wait for already-running episodes, and raise to the caller. Completed
+        cancel active checks, drain started blocking work, and raise to the caller. Completed
         files and catalog appends are not rolled back.
         This method provides no automatic retries, scheduling, or durable job
         state; the caller owns those policies and any partial results it keeps
@@ -2016,25 +2116,31 @@ class App:
             stages=stable_stages,
             step_names=stable_step_names,
         )
-        source_reference_by_identity: dict[str, Path | str] = {}
-        for episode_reference in episode_references:
-            source_identity = self.source_identity(episode_reference)
-            previous_reference = source_reference_by_identity.get(source_identity)
-            if previous_reference is not None:
-                raise ValueError(
-                    f"duplicate episode source identity {source_identity!r}: "
-                    f"{str(previous_reference)!r} and {str(episode_reference)!r}"
-                )
-            source_reference_by_identity[source_identity] = episode_reference
+
+        def validate_source_identities() -> None:
+            source_reference_by_identity: dict[str, Path | str] = {}
+            for episode_reference in episode_references:
+                source_identity = self.source_identity(episode_reference)
+                previous_reference = source_reference_by_identity.get(source_identity)
+                if previous_reference is not None:
+                    raise ValueError(
+                        f"duplicate episode source identity {source_identity!r}: "
+                        f"{str(previous_reference)!r} and {str(episode_reference)!r}"
+                    )
+                source_reference_by_identity[source_identity] = episode_reference
+
+        await run_blocking(validate_source_identities)
 
         batch_storage_root = parse_storage_root(output_dir) if output_dir is not None else None
 
-        def process_episode(episode_reference: Path | str) -> ProcessReport:
-            return self.process(
+        async def process_episode(episode_reference: Path | str) -> ProcessReport:
+            return await self.process(
                 episode_reference,
                 output_dir=(
                     batch_storage_root.child(
-                        _source_artifact_directory_name(episode_reference, self.storage_root)
+                        await run_blocking(
+                            _source_artifact_directory_name, episode_reference, self.storage_root
+                        )
                     )
                     if batch_storage_root is not None
                     else None
@@ -2064,7 +2170,7 @@ class App:
         if concurrency_limit == 1:
             sequential_reports: list[ProcessReport] = []
             for input_index, episode_reference in enumerate(episode_references):
-                report = process_episode(episode_reference)
+                report = await process_episode(episode_reference)
                 sequential_reports.append(report)
                 report_completion(
                     input_index,
@@ -2073,7 +2179,7 @@ class App:
                     len(episode_references),
                 )
             return ProcessManyReport(reports=tuple(sequential_reports))
-        reports = _run_with_bounded_concurrency(
+        reports = await _run_with_bounded_concurrency(
             episode_references,
             process_episode,
             concurrency_limit=concurrency_limit,
@@ -2157,7 +2263,7 @@ class App:
         print(started_summary(paths))
         return paths
 
-    def process(
+    async def process(
         self,
         episode: Path | str,
         *,
@@ -2168,6 +2274,7 @@ class App:
         step_names: Iterable[str] | None = None,
         quarantine_history: QuarantineHistory | None = None,
         orchestrator_run_id: str | None = None,
+        execution_id: str | None = None,
         _registered_step_selection: RegisteredStepSelection | None = None,
         _prepared_process_configuration: _PreparedProcessConfiguration | None = None,
     ) -> ProcessReport:
@@ -2181,6 +2288,11 @@ class App:
         :meth:`test` wraps it for the dev loop. Outputs land under
         ``<data_root>/episodes/<stem>-<source-identity-hash>/`` unless
         ``output_dir`` is given.
+
+        Check and enrichment execution errors, including artifact publication
+        failures, are logged at ERROR level independently of ``verbose``.
+        They remain in the returned report without raising or quarantining
+        the episode. ``verbose=True`` additionally prints the full summary.
 
         ``stages`` is a run-profile name (see ``hflow.RUN_PROFILES``), an
         explicit stage set, or ``None`` for the full profile. Without
@@ -2216,7 +2328,60 @@ class App:
         equivalent. The dev loop passes nothing and records NULL. Provenance
         only, never part of any identity hash (see
         :meth:`hflow.catalog.Catalog.append_episode`).
+
+        ``execution_id`` optionally identifies a catalog append across delayed
+        retries, independently of intervening runs. Persist it before the first
+        attempt and reuse it only for retries of that execution. Without it,
+        consecutive identical outcomes deduplicate and a recurring outcome
+        after another append becomes current again.
+
+        Check callbacks must return awaitable results. Transform, enrichment,
+        media, and catalog phases run off the event loop. Cancellation stops
+        checks and drains started blocking work before closing the episode;
+        completed files and catalog appends are not rolled back.
         """
+        processing = self._process_steps(
+            episode,
+            output_dir=output_dir,
+            verbose=verbose,
+            record=record,
+            stages=stages,
+            step_names=step_names,
+            quarantine_history=quarantine_history,
+            orchestrator_run_id=orchestrator_run_id,
+            execution_id=execution_id,
+            _registered_step_selection=_registered_step_selection,
+            _prepared_process_configuration=_prepared_process_configuration,
+        )
+        check_outcome: CheckResult | Exception | None = None
+        try:
+            while True:
+                step = await run_blocking(_advance_processing, processing, check_outcome)
+                if isinstance(step, _CompletedProcessing):
+                    return step.report
+                try:
+                    check_outcome = await step.function(step.episode)
+                except Exception as error:
+                    check_outcome = error
+        finally:
+            await run_blocking(processing.close)
+
+    def _process_steps(
+        self,
+        episode: Path | str,
+        *,
+        output_dir: Path | str | StorageRoot | None = None,
+        verbose: bool = False,
+        record: bool = True,
+        stages: Iterable[Stage] | str | None = None,
+        step_names: Iterable[str] | None = None,
+        quarantine_history: QuarantineHistory | None = None,
+        orchestrator_run_id: str | None = None,
+        execution_id: str | None = None,
+        _registered_step_selection: RegisteredStepSelection | None = None,
+        _prepared_process_configuration: _PreparedProcessConfiguration | None = None,
+    ) -> Generator[_PendingCheck, CheckResult | None, ProcessReport]:
+        """Yield checks while retaining one blocking engine for all pipeline phases."""
         if _prepared_process_configuration is not None:
             if (
                 stages is not None
@@ -2262,7 +2427,10 @@ class App:
         run_dir.mkdir(parents=True, exist_ok=True)
         canonical_file_name = f"{source_path.stem}.canonical.mcap"
         canonical_path = run_dir / canonical_file_name
-        scratch_dir = run_dir / "scratch"
+        # Remux/frame scratch must follow canonical bytes, not the source-keyed
+        # run directory. A sync-omitted fetch can replace those bytes in place
+        # while leaving run_dir (and a flat scratch/) untouched (#536).
+        scratch_root = run_dir / "scratch"
         sync_completion_marker_path = run_dir / _SYNC_COMPLETION_MARKER_NAME
 
         stamps: EpisodeStamps | None = None
@@ -2320,10 +2488,13 @@ class App:
                     derived=derived_series or None,
                 )
             # The canonical file was just rewritten, so any mp4/frame artifacts
-            # a previous run cached in the scratch dir are stale -- including
-            # ones from a different source episode sharing this run dir's stem.
-            if scratch_dir.exists():
-                shutil.rmtree(scratch_dir)
+            # a previous run cached under scratch/ are stale -- including ones
+            # keyed on older content hashes for this same source run dir.
+            if scratch_root.exists():
+                shutil.rmtree(scratch_root)
+            # So is any cached integrity verdict: it describes bytes that no
+            # longer exist.
+            self._canonical_integrity_cache.pop(str(canonical_path), None)
         else:
             try:
                 canonical_path = run_storage_root.fetch(canonical_file_name)
@@ -2348,6 +2519,13 @@ class App:
                     f"{sync_completion.source_path!r}, not {source_identifier!r}; "
                     "run the sync or full profile again"
                 )
+
+        # episode_id is the content hash of the canonical on disk now -- after
+        # sync rewrite, reuse, or sync-omitted fetch. Keying scratch here means
+        # Episode.video()'s output.exists() short-circuit can only hit a remux
+        # built from these exact bytes.
+        episode_id = content_episode_id(canonical_path)
+        scratch_dir = scratch_root / episode_id
 
         with Episode(canonical_path, workdir=scratch_dir) as canonical_episode:
             canonical_stamps = stamps_from_provenance(canonical_episode.metadata)
@@ -2417,6 +2595,43 @@ class App:
                 if Stage.META in enabled_stages
                 else []
             )
+            enrichments_to_run = (
+                [
+                    registered
+                    for registered in self._ordered_enrichments()
+                    if registered_step_is_selected(registered_step_selection, registered.name)
+                ]
+                if Stage.LABELS in enabled_stages
+                else []
+            )
+            # The media stage is silently absent on a camera-less episode:
+            # there is nothing to render, so no row claims otherwise.
+            media_will_run = (
+                Stage.MEDIA in enabled_stages
+                and bool(canonical_episode.cameras)
+                and registered_step_is_selected(
+                    registered_step_selection, MEDIA_CONTACT_SHEET_STEP_NAME
+                )
+            )
+            if checks_to_run or enrichments_to_run or media_will_run:
+                # The front door every consuming lane shares: whatever is about
+                # to spend step work over the canonical's bytes pays one strict
+                # read first, so a canonical that decayed on disk after sync is
+                # refused with a named reason instead of measured, labeled, or
+                # rendered over (#474). A run with no step work to do pays
+                # nothing.
+                is_intact, refusal_reason = self._canonical_integrity_verdict(canonical_path)
+                if not is_intact:
+                    # Refuse the episode with ONE diagnosis: the named reason
+                    # lands on the report and on one catalog row (built with
+                    # the other check rows in _check_run_rows), and no step
+                    # runs. Exact replays of the refusal dedupe through the
+                    # run fingerprint, so retries stay one record.
+                    assert refusal_reason is not None
+                    report.refusal_reason = refusal_reason
+                    checks_to_run = []
+                    enrichments_to_run = []
+                    media_will_run = False
             # Keys already emitted by the pipeline's own steps in this run.
             # A default that has any key in common with what is here can be
             # superseded at the top of the loop, before paying its ffmpeg
@@ -2452,7 +2667,7 @@ class App:
                 # A default with a registered key pattern: if any pipeline
                 # step has already emitted a key the default would emit,
                 # the default's measurement would be a duplicate and would
-                # be thrown away by ``_yield_defaults_superseded_by_the_…``
+                # be thrown away by ``_yield_defaults_superseded_by_the_...``
                 # anyway. Skip the ffmpeg work entirely and record the same
                 # superseded reason, with the same key list, as the
                 # post-execution path. Same-parameter wrappers and steps
@@ -2477,7 +2692,7 @@ class App:
                 outcome: CheckOutcome
                 started = time.perf_counter()
                 try:
-                    returned = registered.function(canonical_episode)
+                    returned = yield _PendingCheck(registered.function, canonical_episode)
                     # Parse the boundary: user code may return anything.
                     if isinstance(returned, CheckResult):
                         outcome = Measured(returned)
@@ -2487,9 +2702,22 @@ class App:
                             "hflow.CheckResult -- wrap it: return hflow.CheckResult("
                             "measurements=...)"
                         )
-                except Exception:
+                        logger.error(
+                            "Check %s errored on episode %s: %s",
+                            registered.name,
+                            canonical_episode.path,
+                            outcome.error,
+                        )
+                except Exception as error:
                     # Infrastructure, not data: never recorded as a quality outcome.
                     outcome = Errored(traceback.format_exc(limit=8))
+                    logger.error(
+                        "Check %s errored on episode %s: %s: %s",
+                        registered.name,
+                        canonical_episode.path,
+                        type(error).__name__,
+                        error,
+                    )
                 duration_s = time.perf_counter() - started
                 run = CheckRunReport(check=registered, outcome=outcome, duration_s=duration_s)
                 report.checks.append(run)
@@ -2517,7 +2745,6 @@ class App:
             if Stage.META not in enabled_stages or isinstance(
                 registered_step_selection, SelectedRegisteredSteps
             ):
-                episode_id = content_episode_id(canonical_path)
                 if quarantine_history is not None:
                     carried_tags = quarantine_history.quarantine_tags(episode_id)
                 else:
@@ -2543,28 +2770,14 @@ class App:
             )
 
             if Stage.LABELS in enabled_stages:
-                for registered_enrichment in self._ordered_enrichments():
-                    if not registered_step_is_selected(
-                        registered_step_selection, registered_enrichment.name
-                    ):
-                        continue
+                for registered_enrichment in enrichments_to_run:
                     report.enrichments.append(
                         _execute_enrichment(
                             registered_enrichment, canonical_episode, quarantine_skip
                         )
                     )
 
-            # The media stage is silently absent on a camera-less episode:
-            # there is nothing to render, so no row claims otherwise.
-            if (
-                Stage.MEDIA in enabled_stages
-                and canonical_episode.cameras
-                and (
-                    registered_step_is_selected(
-                        registered_step_selection, MEDIA_CONTACT_SHEET_STEP_NAME
-                    )
-                )
-            ):
+            if media_will_run:
                 media_directory = run_dir / "media"
 
                 def render_contact_sheets(media_episode: Episode) -> EnrichmentResult:
@@ -2608,7 +2821,7 @@ class App:
                     enrichment_run.artifact_uris[artifact_name] = run_storage_root.publish(
                         artifact_path, artifact_key
                     )
-                except Exception:
+                except Exception as error:
                     # A missing or unreadable artifact file is the STEP's
                     # failure (user code declared a path it never wrote), not
                     # the run's: record it like any other step error and keep
@@ -2628,6 +2841,16 @@ class App:
                         if enrichment_result_so_far is not None
                         else Errored(combined_error)
                     )
+                    logger.error(
+                        "Enrichment %s errored on episode %s: artifact %r at %s "
+                        "could not be published: %s: %s",
+                        enrichment_run.enrichment.name,
+                        canonical_path,
+                        artifact_name,
+                        artifact_path,
+                        type(error).__name__,
+                        error,
+                    )
 
         # Assembled even when not recording, so the dev loop refuses a key
         # collision on episode one instead of at the first curation query.
@@ -2644,6 +2867,7 @@ class App:
                 quarantine_tags=report.quarantine_tags,
                 source_uri=source_identifier,
                 orchestrator_run_id=orchestrator_run_id,
+                execution_id=execution_id,
                 time_bounds=episode_time_bounds,
             )
 

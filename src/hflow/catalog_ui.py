@@ -14,7 +14,7 @@ import duckdb
 
 from hflow.catalog import Catalog
 from hflow.curation import (
-    _completed_append_exists,
+    _empty_table_relations_have_landed_parquet,
     _refresh_local_catalog_connection,
     _sync_catalog_mirror,
     open_catalog_connection,
@@ -134,8 +134,16 @@ def _catalog_connection_contains_episodes(
     return episode_count_row is not None and int(episode_count_row[0]) > 0
 
 
-def _first_completed_append_exists(catalog_root: Path | str | StorageRoot) -> bool:
-    return _completed_append_exists(catalog_root)
+def _catalog_connection_awaits_parquet(
+    catalog_connection: duckdb.DuckDBPyConnection,
+) -> bool:
+    """Whether the open surface still has no episodes and no ingest failures."""
+    if _catalog_connection_contains_episodes(catalog_connection):
+        return False
+    failure_count_row = catalog_connection.execute(
+        "SELECT count(*) FROM ingest_failures"
+    ).fetchone()
+    return failure_count_row is None or int(failure_count_row[0]) == 0
 
 
 def _prepare_catalog_for_ui(location: StorageRoot) -> None:
@@ -148,9 +156,11 @@ def serve_catalog_ui(settings: CatalogUiSettings, *, shutdown_event: Event | Non
     """Serve DuckDB UI now, including when the catalog is still empty.
 
     Empty catalog relations begin as in-memory tables because DuckDB refuses a
-    Parquet glob with no matches. The first completed append replaces those
-    tables with the normal Parquet-backed HFlow views on the same connection,
-    so the already-open UI becomes queryable without restarting this command.
+    Parquet glob with no matches. Whenever those empty shells gain Parquet on
+    disk — the first episode append, a later ``ingest_failures`` ledger write,
+    or any other long table that lands files mid-session — the poll loop
+    rebinds them to Parquet-backed views on the same connection so the open UI
+    stays current without restarting this command.
 
     Bucket catalogs are read-only: the remote ``format_version`` marker must
     already exist and this command never creates or changes object-store keys.
@@ -181,24 +191,31 @@ def serve_catalog_ui(settings: CatalogUiSettings, *, shutdown_event: Event | Non
                     flush=True,
                 )
 
-        if not _catalog_connection_contains_episodes(catalog_connection):
+        waiting_for_first_parquet = _catalog_connection_awaits_parquet(catalog_connection)
+        if waiting_for_first_parquet:
             print(
-                "Catalog is empty. The UI is ready and is waiting for the first completed append.",
+                "Catalog is empty. The UI is ready and is waiting for catalog "
+                "Parquet (episodes or ingest_failures).",
                 flush=True,
             )
-            while not effective_shutdown_event.wait(settings.catalog_poll_interval_seconds):
-                if _first_completed_append_exists(catalog_root):
-                    _refresh_local_catalog_connection(catalog_connection, catalog_root)
-                    print(
-                        "First completed append detected. Catalog views are now "
-                        "available in the open UI.",
-                        flush=True,
-                    )
-                    break
 
         while not effective_shutdown_event.wait(settings.catalog_poll_interval_seconds):
             if bucket_catalog:
                 _sync_catalog_mirror(catalog_root)
+            if not _empty_table_relations_have_landed_parquet(catalog_connection, catalog_root):
+                continue
+            _refresh_local_catalog_connection(catalog_connection, catalog_root)
+            if waiting_for_first_parquet:
+                print(
+                    "Catalog Parquet detected. Views are now available in the open UI.",
+                    flush=True,
+                )
+                waiting_for_first_parquet = False
+            else:
+                print(
+                    "New catalog Parquet bound into the open UI.",
+                    flush=True,
+                )
     except KeyboardInterrupt:
         pass
     finally:

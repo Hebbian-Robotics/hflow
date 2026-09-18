@@ -7,6 +7,7 @@ which is the whole question the check exists to answer, so a fixture that blurs
 it proves nothing.
 """
 
+import asyncio
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -252,7 +253,7 @@ def test_footage_with_nothing_to_track_reports_no_coverage_not_steadiness(
     write_canonical_episode(source, canonical, TransformConfig())
     with hflow.Episode(canonical) as episode:
         camera_topic = episode.cameras[0]
-        result = camera_stability(episode)
+        result = asyncio.run(camera_stability(episode))
     assert result.measurements[f"{camera_topic}/coverage_share"] == 0.0
     assert result.intervals == []
 
@@ -278,7 +279,7 @@ def test_the_check_reports_stability_with_its_coverage(still_texture: Path, tmp_
     write_canonical_episode(source, canonical, TransformConfig())
     with hflow.Episode(canonical) as episode:
         camera_topic = episode.cameras[0]
-        result = camera_stability(episode)
+        result = asyncio.run(camera_stability(episode))
 
     unstable_share = result.measurements[f"{camera_topic}/unstable_share"]
     coverage_share = result.measurements[f"{camera_topic}/coverage_share"]
@@ -325,16 +326,20 @@ def stability_episode(still_texture: Path, tmp_path_factory: pytest.TempPathFact
     [
         (
             "shake_threshold_dps",
-            lambda episode, value: camera_stability(episode, shake_threshold_dps=value),
+            lambda episode, value: asyncio.run(
+                camera_stability(episode, shake_threshold_dps=value)
+            ),
         ),
         (
             "unstable_min_duration_s",
-            lambda episode, value: camera_stability(episode, unstable_min_duration_s=value),
+            lambda episode, value: asyncio.run(
+                camera_stability(episode, unstable_min_duration_s=value)
+            ),
         ),
         (
             "horizontal_field_of_view_degrees",
-            lambda episode, value: camera_stability(
-                episode, horizontal_field_of_view_degrees=value
+            lambda episode, value: asyncio.run(
+                camera_stability(episode, horizontal_field_of_view_degrees=value)
             ),
         ),
     ],
@@ -404,13 +409,18 @@ def test_camera_stability_refuses_a_bad_fov_on_a_camera_less_episode(
                 match=r"^horizontal_field_of_view_degrees must be finite and in \(0, 360\], got .+$",
             ),
         ):
-            camera_stability(episode, horizontal_field_of_view_degrees=bad_value)
+            asyncio.run(camera_stability(episode, horizontal_field_of_view_degrees=bad_value))
 
     # The bound is inclusive at 360, and the guard must not refuse the widest
     # legal lens. Without this the whole range check could be `< 360` and every
     # case above would still pass.
     with hflow.Episode(episode_path) as episode:
-        assert camera_stability(episode, horizontal_field_of_view_degrees=360.0).measurements == {}
+        assert (
+            asyncio.run(
+                camera_stability(episode, horizontal_field_of_view_degrees=360.0)
+            ).measurements
+            == {}
+        )
 
 
 def test_the_check_knobs_raise_the_bar_without_changing_the_rate_measurements(
@@ -438,10 +448,10 @@ def test_the_check_knobs_raise_the_bar_without_changing_the_rate_measurements(
     write_canonical_episode(source, canonical, TransformConfig())
     with hflow.Episode(canonical) as episode:
         camera_topic = episode.cameras[0]
-        baseline = camera_stability(episode)
-        above_every_rate = camera_stability(episode, shake_threshold_dps=1e6)
-        longer_than_the_episode = camera_stability(
-            episode, unstable_min_duration_s=float(_DURATION_S) + 1.0
+        baseline = asyncio.run(camera_stability(episode))
+        above_every_rate = asyncio.run(camera_stability(episode, shake_threshold_dps=1e6))
+        longer_than_the_episode = asyncio.run(
+            camera_stability(episode, unstable_min_duration_s=float(_DURATION_S) + 1.0)
         )
 
     assert baseline.intervals

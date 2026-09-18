@@ -192,6 +192,26 @@ def test_pin_with_bad_sql_is_400_and_registers_nothing(
     assert writable_api.get("/api/v1/manifests").json()["manifests"] == []
 
 
+def test_pin_binder_and_catalog_errors_carry_the_diagnostic(writable_api: TestClient) -> None:
+    """Unlike preview and report, pin runs the caller's SQL verbatim
+    (``_stage_manifest_and_count``), so a location block in its 400 would be
+    the caller's own text and is legitimate to show. What this pins is the
+    diagnostic reaching the caller for both error classes (#482)."""
+    binder = writable_api.post(
+        "/api/v1/curation/pin", json={"sql": "SELECT nope FROM episodes", "name": "never lands"}
+    )
+    assert binder.status_code == 400
+    assert "Binder Error" in binder.json()["detail"]
+    assert "nope" in binder.json()["detail"]
+
+    catalog = writable_api.post(
+        "/api/v1/curation/pin", json={"sql": "SELECT * FROM no_such_table", "name": "never lands"}
+    )
+    assert catalog.status_code == 400
+    assert "Catalog Error" in catalog.json()["detail"]
+    assert "no_such_table" in catalog.json()["detail"]
+
+
 def test_pin_is_403_when_read_only(read_only_api: TestClient) -> None:
     response = read_only_api.post(
         "/api/v1/curation/pin", json={"sql": OK_CUT_SQL, "name": "should not land"}

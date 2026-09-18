@@ -1,5 +1,6 @@
 """Byte-balanced bin-packing and staggered batch starts."""
 
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -48,16 +49,53 @@ def test_more_batches_than_items_collapses() -> None:
     assert len(batches) == 1
 
 
+@pytest.mark.parametrize("sizes", [[0] * 7, [900, 500, 200, 100, 80, 10, 0]])
+def test_item_cap_keeps_complete_coverage_in_fixed_batches(sizes: list[int]) -> None:
+    item_sizes = {f"video-{index}": size for index, size in enumerate(sizes)}
+    batches = plan_batches(item_sizes, batch_count=3, maximum_items_per_batch=3)
+    assert len(batches) == 3
+    assigned = [item for batch in batches for item in batch.items]
+    assert sorted(assigned) == sorted(item_sizes)
+    assert all(len(batch.items) <= 3 for batch in batches)
+    assert sum(batch.total_bytes for batch in batches) == sum(sizes)
+    assert batches == plan_batches(
+        dict(reversed(list(item_sizes.items()))), batch_count=3, maximum_items_per_batch=3
+    )
+    with pytest.raises(ValueError, match="cannot fit all items"):
+        plan_batches(item_sizes, batch_count=2, maximum_items_per_batch=3)
+
+
+def test_item_cap_opens_capacity_batches_and_reaches_file_entrypoint(tmp_path: Path) -> None:
+    files = [tmp_path / f"video-{index}" for index in range(5)]
+    for video_file, size in zip(files, [120, 40, 30, 0, 0], strict=True):
+        video_file.write_bytes(b"x" * size)
+    batches = plan_batches_from_files(
+        files, target_batch_bytes=100, maximum_items_per_batch=2, stagger_interval_s=1
+    )
+    assert [batch.items for batch in batches] == [
+        (str(files[0]),),
+        (str(files[1]), str(files[2])),
+        (str(files[3]), str(files[4])),
+    ]
+    assert [batch.start_delay_s for batch in batches] == [0, 1, 2]
+
+
+@pytest.mark.parametrize("cap", [True, 1.5, 0, -1])
+def test_invalid_item_cap_is_rejected_even_for_empty_input(cap: Any) -> None:
+    with pytest.raises(ValueError, match="maximum_items_per_batch"):
+        plan_batches({}, batch_count=1, maximum_items_per_batch=cap)
+
+
 def test_argument_validation() -> None:
     with pytest.raises(ValueError, match="exactly one"):
         plan_batches({"a": 1})
     with pytest.raises(ValueError, match="exactly one"):
         plan_batches({"a": 1}, batch_count=1, target_batch_bytes=1)
-    with pytest.raises(ValueError, match="negative"):
+    with pytest.raises(ValueError, match="item 'a' size_bytes must be >= 0"):
         plan_batches({"a": -1}, batch_count=1)
-    with pytest.raises(ValueError, match="batch_count must be >= 1, got 0"):
+    with pytest.raises(ValueError, match="batch_count must be > 0, got 0"):
         plan_batches({"a": 1}, batch_count=0)
-    with pytest.raises(ValueError, match="target_batch_bytes must be >= 1, got 0"):
+    with pytest.raises(ValueError, match="target_batch_bytes must be > 0, got 0"):
         plan_batches({"a": 1}, target_batch_bytes=0)
     assert plan_batches({}, batch_count=3) == []
 
@@ -79,8 +117,8 @@ def test_batch_parameters_require_real_integers(kwargs: dict[str, Any], message:
 @pytest.mark.parametrize(
     ("size", "message"),
     [
-        (True, "item 'a' has type bool, expected int bytes"),
-        (1.0, "item 'a' has type float, expected int bytes"),
+        (True, "item 'a' size_bytes must be an int, got bool"),
+        (1.0, "item 'a' size_bytes must be an int, got float"),
     ],
 )
 def test_item_sizes_require_real_integers(size: Any, message: str) -> None:
@@ -91,9 +129,9 @@ def test_item_sizes_require_real_integers(size: Any, message: str) -> None:
 @pytest.mark.parametrize(
     ("stagger", "message"),
     [
-        (True, "stagger_interval_s must be a number, got bool"),
-        ("1.0", "stagger_interval_s must be a number, got str"),
-        (-1.0, "stagger_interval_s must be nonnegative, got -1.0"),
+        (True, "stagger_interval_s must be a real number, got bool"),
+        ("1.0", "stagger_interval_s must be a real number, got str"),
+        (-1.0, "stagger_interval_s must be >= 0, got -1.0"),
         (float("nan"), "stagger_interval_s must be finite, got nan"),
         (float("inf"), "stagger_interval_s must be finite, got inf"),
     ],
@@ -103,8 +141,9 @@ def test_stagger_interval_requires_a_finite_nonnegative_number(stagger: Any, mes
         plan_batches({"a": 1}, batch_count=1, stagger_interval_s=stagger)  # type: ignore[arg-type]
 
 
-def test_zero_size_items_and_zero_stagger_remain_valid() -> None:
-    batches = plan_batches({"empty": 0}, batch_count=1, stagger_interval_s=0)
+@pytest.mark.parametrize("stagger", [0, 0.0, Fraction(0)])
+def test_zero_size_items_and_zero_stagger_remain_valid(stagger: Any) -> None:
+    batches = plan_batches({"empty": 0}, batch_count=1, stagger_interval_s=stagger)
     assert batches == [PlannedBatch(items=("empty",), total_bytes=0, start_delay_s=0)]
 
 
@@ -123,3 +162,16 @@ def test_plan_from_real_files(tmp_path: Path) -> None:
     batches = plan_batches_from_files([small, large], batch_count=2)
     assert batches[0].total_bytes == 10_000
     assert batches[0].items == (str(large),)
+
+
+def test_fractional_stagger_preserves_exact_delays() -> None:
+    batches = plan_batches(
+        {"a": 1, "b": 1, "c": 1},
+        batch_count=3,
+        stagger_interval_s=Fraction(1, 3),  # ty: ignore[invalid-argument-type]
+    )
+    assert [batch.start_delay_s for batch in batches] == [
+        Fraction(0),
+        Fraction(1, 3),
+        Fraction(2, 3),
+    ]

@@ -83,14 +83,14 @@ def test_catalog_ui_starts_empty_then_exposes_the_first_completed_append(
         server_started_event.set()
 
     refresh_local_catalog_connection = catalog_ui._refresh_local_catalog_connection
-    catalog_connection_contains_episodes = catalog_ui._catalog_connection_contains_episodes
+    catalog_connection_awaits_parquet = catalog_ui._catalog_connection_awaits_parquet
 
     def record_initial_catalog_read(
         catalog_connection: duckdb.DuckDBPyConnection,
     ) -> bool:
-        contains_episodes = catalog_connection_contains_episodes(catalog_connection)
+        awaits_parquet = catalog_connection_awaits_parquet(catalog_connection)
         empty_catalog_ready_event.set()
-        return contains_episodes
+        return awaits_parquet
 
     def record_catalog_refresh(
         catalog_connection: duckdb.DuckDBPyConnection,
@@ -102,7 +102,7 @@ def test_catalog_ui_starts_empty_then_exposes_the_first_completed_append(
     monkeypatch.setattr(catalog_ui, "_start_duckdb_ui_server", record_server_start)
     monkeypatch.setattr(
         catalog_ui,
-        "_catalog_connection_contains_episodes",
+        "_catalog_connection_awaits_parquet",
         record_initial_catalog_read,
     )
     monkeypatch.setattr(
@@ -150,6 +150,211 @@ def test_catalog_ui_starts_empty_then_exposes_the_first_completed_append(
         assert catalog_connection.execute(
             "SELECT count(*), min(task) FROM episodes"
         ).fetchone() == (1, "demo")
+    finally:
+        shutdown_event.set()
+        catalog_ui_thread.join(timeout=2)
+
+    assert not catalog_ui_thread.is_alive()
+    assert background_failures == []
+
+
+def test_catalog_ui_binds_ingest_failures_after_the_first_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mid-session ledger Parquet must replace the sticky empty BASE TABLE (#537)."""
+    from hflow.ingest_ledger import record_ingest_failure
+
+    catalog_root = tmp_path / "catalog"
+    shutdown_event = Event()
+    server_started_event = Event()
+    empty_catalog_ready_event = Event()
+    refresh_count = 0
+    first_refresh_event = Event()
+    second_refresh_event = Event()
+    catalog_connections: list[duckdb.DuckDBPyConnection] = []
+    background_failures: list[BaseException] = []
+
+    def record_server_start(catalog_connection: duckdb.DuckDBPyConnection, port: int) -> None:
+        catalog_connections.append(catalog_connection)
+        server_started_event.set()
+
+    refresh_local_catalog_connection = catalog_ui._refresh_local_catalog_connection
+    catalog_connection_awaits_parquet = catalog_ui._catalog_connection_awaits_parquet
+
+    def record_initial_catalog_read(
+        catalog_connection: duckdb.DuckDBPyConnection,
+    ) -> bool:
+        awaits_parquet = catalog_connection_awaits_parquet(catalog_connection)
+        empty_catalog_ready_event.set()
+        return awaits_parquet
+
+    def record_catalog_refresh(
+        catalog_connection: duckdb.DuckDBPyConnection,
+        refreshed_catalog_root: Path,
+    ) -> None:
+        nonlocal refresh_count
+        refresh_local_catalog_connection(catalog_connection, refreshed_catalog_root)
+        refresh_count += 1
+        if refresh_count == 1:
+            first_refresh_event.set()
+        elif refresh_count >= 2:
+            second_refresh_event.set()
+
+    monkeypatch.setattr(catalog_ui, "_start_duckdb_ui_server", record_server_start)
+    monkeypatch.setattr(
+        catalog_ui,
+        "_catalog_connection_awaits_parquet",
+        record_initial_catalog_read,
+    )
+    monkeypatch.setattr(
+        catalog_ui,
+        "_refresh_local_catalog_connection",
+        record_catalog_refresh,
+    )
+
+    def run_catalog_ui() -> None:
+        try:
+            catalog_ui.serve_catalog_ui(
+                catalog_ui.CatalogUiSettings(
+                    catalog_root=catalog_root,
+                    open_browser=False,
+                    catalog_poll_interval_seconds=0.01,
+                ),
+                shutdown_event=shutdown_event,
+            )
+        except BaseException as error:
+            background_failures.append(error)
+
+    catalog_ui_thread = Thread(target=run_catalog_ui)
+    catalog_ui_thread.start()
+    try:
+        assert server_started_event.wait(timeout=2)
+        assert empty_catalog_ready_event.wait(timeout=2)
+        (catalog_connection,) = catalog_connections
+
+        canonical_episode = tmp_path / "episode.canonical.mcap"
+        canonical_episode.write_bytes(b"canonical episode")
+        hflow.Catalog(catalog_root).append_episode(
+            canonical_path=canonical_episode,
+            stamps=hflow.EpisodeStamps(
+                schema_version="1",
+                pipeline_version="test-pipeline",
+                ffmpeg_version="test-ffmpeg",
+                robot_software_version="test-robot",
+            ),
+            episode_metadata={"task": "demo"},
+            check_rows=[],
+        )
+
+        assert first_refresh_event.wait(timeout=2)
+        assert catalog_connection.execute("SELECT count(*) FROM episodes").fetchone() == (1,)
+        assert catalog_connection.execute("SELECT count(*) FROM ingest_failures").fetchone() == (0,)
+
+        record_ingest_failure(
+            catalog_root,
+            source_uri="file:///missing.mcap",
+            stage="canonicalize",
+            pipeline_version="test-1",
+            error=FileNotFoundError("/missing.mcap"),
+        )
+
+        assert second_refresh_event.wait(timeout=2)
+        assert catalog_connection.execute("SELECT count(*) FROM ingest_failures").fetchone() == (1,)
+        relation_type = catalog_connection.execute(
+            """
+            SELECT table_type
+            FROM information_schema.tables
+            WHERE table_schema = 'main' AND table_name = 'ingest_failures'
+            """
+        ).fetchone()
+        assert relation_type == ("VIEW",)
+    finally:
+        shutdown_event.set()
+        catalog_ui_thread.join(timeout=2)
+
+    assert not catalog_ui_thread.is_alive()
+    assert background_failures == []
+
+
+def test_catalog_ui_binds_failure_only_catalog_without_episodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ledger Parquet alone must refresh the open UI without an episode append (#537)."""
+    from hflow.ingest_ledger import record_ingest_failure
+
+    catalog_root = tmp_path / "catalog"
+    shutdown_event = Event()
+    server_started_event = Event()
+    empty_catalog_ready_event = Event()
+    catalog_refreshed_event = Event()
+    catalog_connections: list[duckdb.DuckDBPyConnection] = []
+    background_failures: list[BaseException] = []
+
+    def record_server_start(catalog_connection: duckdb.DuckDBPyConnection, port: int) -> None:
+        catalog_connections.append(catalog_connection)
+        server_started_event.set()
+
+    refresh_local_catalog_connection = catalog_ui._refresh_local_catalog_connection
+    catalog_connection_awaits_parquet = catalog_ui._catalog_connection_awaits_parquet
+
+    def record_initial_catalog_read(
+        catalog_connection: duckdb.DuckDBPyConnection,
+    ) -> bool:
+        awaits_parquet = catalog_connection_awaits_parquet(catalog_connection)
+        empty_catalog_ready_event.set()
+        return awaits_parquet
+
+    def record_catalog_refresh(
+        catalog_connection: duckdb.DuckDBPyConnection,
+        refreshed_catalog_root: Path,
+    ) -> None:
+        refresh_local_catalog_connection(catalog_connection, refreshed_catalog_root)
+        catalog_refreshed_event.set()
+
+    monkeypatch.setattr(catalog_ui, "_start_duckdb_ui_server", record_server_start)
+    monkeypatch.setattr(
+        catalog_ui,
+        "_catalog_connection_awaits_parquet",
+        record_initial_catalog_read,
+    )
+    monkeypatch.setattr(
+        catalog_ui,
+        "_refresh_local_catalog_connection",
+        record_catalog_refresh,
+    )
+
+    def run_catalog_ui() -> None:
+        try:
+            catalog_ui.serve_catalog_ui(
+                catalog_ui.CatalogUiSettings(
+                    catalog_root=catalog_root,
+                    open_browser=False,
+                    catalog_poll_interval_seconds=0.01,
+                ),
+                shutdown_event=shutdown_event,
+            )
+        except BaseException as error:
+            background_failures.append(error)
+
+    catalog_ui_thread = Thread(target=run_catalog_ui)
+    catalog_ui_thread.start()
+    try:
+        assert server_started_event.wait(timeout=2)
+        assert empty_catalog_ready_event.wait(timeout=2)
+        (catalog_connection,) = catalog_connections
+        assert catalog_connection.execute("SELECT count(*) FROM ingest_failures").fetchone() == (0,)
+
+        record_ingest_failure(
+            catalog_root,
+            source_uri="file:///bad.mcap",
+            stage="canonicalize",
+            pipeline_version="test-1",
+            error=FileNotFoundError("/bad.mcap"),
+        )
+
+        assert catalog_refreshed_event.wait(timeout=2)
+        assert catalog_connection.execute("SELECT count(*) FROM ingest_failures").fetchone() == (1,)
+        assert catalog_connection.execute("SELECT count(*) FROM episodes").fetchone() == (0,)
     finally:
         shutdown_event.set()
         catalog_ui_thread.join(timeout=2)
@@ -370,15 +575,15 @@ def _run_bucket_catalog_ui_in_thread(
             server_started_event.set()
 
     refresh_local_catalog_connection = catalog_ui._refresh_local_catalog_connection
-    catalog_connection_contains_episodes = catalog_ui._catalog_connection_contains_episodes
+    catalog_connection_awaits_parquet = catalog_ui._catalog_connection_awaits_parquet
 
     def record_initial_catalog_read(
         catalog_connection: duckdb.DuckDBPyConnection,
     ) -> bool:
-        contains_episodes = catalog_connection_contains_episodes(catalog_connection)
+        awaits_parquet = catalog_connection_awaits_parquet(catalog_connection)
         if empty_catalog_ready_event is not None:
             empty_catalog_ready_event.set()
-        return contains_episodes
+        return awaits_parquet
 
     def record_catalog_refresh(
         catalog_connection: duckdb.DuckDBPyConnection,
@@ -391,7 +596,7 @@ def _run_bucket_catalog_ui_in_thread(
     monkeypatch.setattr(catalog_ui, "_start_duckdb_ui_server", record_server_start)
     monkeypatch.setattr(
         catalog_ui,
-        "_catalog_connection_contains_episodes",
+        "_catalog_connection_awaits_parquet",
         record_initial_catalog_read,
     )
     monkeypatch.setattr(

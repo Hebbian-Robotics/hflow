@@ -6,6 +6,7 @@ verify_dataset_snapshot must report exactly the damage -- nothing more,
 nothing less.
 """
 
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -89,6 +90,81 @@ def test_missing_file_reports_missing_alone(tmp_path: Path) -> None:
     assert marker["integrity"]["tables"]["samples"]["path"] in report.findings[0].uri
 
 
+def test_removed_receipt_entry_and_file_raise_inventory_mismatch(tmp_path: Path) -> None:
+    """#473's deleted-member case: when a receipt entry and its file are both
+    gone, the surviving entries agree with each other and every per-file
+    check passes; only the stored inventory content_id, computed over the
+    original set, can witness the loss. The marker is internally
+    inconsistent, so verify raises (CLI exit 2) instead of certifying."""
+
+    def strip_measurements(output_directory: Path) -> str:
+        marker_path = output_directory / "format.json"
+        marker = json.loads(marker_path.read_text())
+        entry = marker["integrity"]["tables"].pop("measurements")
+        marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+        (output_directory / entry["path"]).unlink()
+        return entry["path"]
+
+    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
+    removed = strip_measurements(output_directory)
+
+    with pytest.raises(ValueError, match="content_id"):
+        verify_dataset_snapshot(output_directory)
+
+    # A fresh export for the CLI path: the raise must map to exit 2, the
+    # unreadable-input code, not to a findings-based exit.
+    output_directory, _ = _export_two_episode_snapshot(tmp_path / "cli", "references")
+    strip_measurements(output_directory)
+    assert cli_main(["verify", "snapshot", str(output_directory)]) == 2
+    assert removed
+
+
+def test_deleted_file_with_intact_receipt_reports_missing(tmp_path: Path) -> None:
+    """Negative control for #473: delete the file but keep its receipt entry.
+    This is the ordinary ``missing`` path and must keep reporting DAMAGED
+    with or without the inventory gate; it exercises the per-file loop, not
+    the gate."""
+    output_directory, marker = _export_two_episode_snapshot(tmp_path, "references")
+    (output_directory / marker["integrity"]["tables"]["measurements"]["path"]).unlink()
+
+    report = verify_dataset_snapshot(output_directory)
+
+    assert not report.ok
+    assert [f.reason for f in report.findings] == ["missing"]
+
+
+@pytest.mark.parametrize(
+    ("replacement", "label"),
+    [(None, "absent"), ("", "empty"), (0, "not-a-string"), ([], "wrong-type")],
+    ids=["absent", "empty", "not-a-string", "wrong-type"],
+)
+def test_receipt_without_a_usable_content_id_is_refused(
+    tmp_path: Path, replacement: object, label: str
+) -> None:
+    """The other half of the #473 gate, which the mismatch test cannot reach.
+
+    A receipt whose ``content_id`` is missing or unusable cannot witness a
+    deleted member at all, so certifying it would be certifying that the
+    check ran. Deleting this branch left the whole suite green, so it needs
+    its own case. An ``integrity`` block with no ``content_id`` is not
+    something hflow writes (both arrived in #401), which is exactly why a
+    marker carrying one is unreadable input rather than damaged bytes.
+    """
+    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
+    marker_path = output_directory / "format.json"
+    marker = json.loads(marker_path.read_text())
+    if replacement is None:
+        marker["integrity"].pop("content_id")
+    else:
+        marker["integrity"]["content_id"] = replacement
+    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+
+    with pytest.raises(ValueError, match="no usable content_id"):
+        verify_dataset_snapshot(output_directory)
+
+    assert cli_main(["verify", "snapshot", str(output_directory)]) == 2, label
+
+
 def test_truncated_file_reports_size_mismatch_and_skips_the_hash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -146,6 +222,81 @@ def test_pre_401_format_json_is_unverifiable_not_corrupt(tmp_path: Path) -> None
 
     assert not report.ok
     assert [f.reason for f in report.findings] == ["no-receipt"]
+
+
+def test_foreign_marker_is_refused_at_the_boundary(tmp_path: Path) -> None:
+    """#472: a directory the exporter would refuse cannot be certified. A
+    marker with an integrity-shaped key but no format identity never reaches
+    the receipt logic; verify raises and the CLI maps to exit 2."""
+    foreign = tmp_path / "some-other-tools-output"
+    foreign.mkdir()
+    payload = b"not-a-hflow-snapshot-at-all"
+    (foreign / "data.parquet").write_bytes(payload)
+    (foreign / "format.json").write_text(
+        json.dumps(
+            {
+                "producer": "not-hflow",
+                "integrity": {
+                    "tables": {
+                        "data": {
+                            "path": "data.parquet",
+                            "size_bytes": len(payload),
+                            "sha256": hashlib.sha256(payload).hexdigest(),
+                        }
+                    }
+                },
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="not a 'hflow-dataset-snapshot'"):
+        verify_dataset_snapshot(foreign)
+
+    assert cli_main(["verify", "snapshot", str(foreign)]) == 2
+
+
+def test_unsupported_or_mistyped_version_is_refused(tmp_path: Path) -> None:
+    """#472: version 1 is the only version there has ever been, and the
+    comparison is deliberately identical to the writer, which records the
+    version as a string. A future version raises, and so does a JSON number
+    1: an easy honest mistake, so the error says exactly why."""
+    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
+    marker_path = output_directory / "format.json"
+
+    marker = json.loads(marker_path.read_text())
+    marker["format_version"] = "2"
+    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+    with pytest.raises(ValueError, match="format_version '2'"):
+        verify_dataset_snapshot(output_directory)
+
+    marker["format_version"] = 1
+    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+    with pytest.raises(ValueError, match="JSON number 1 is refused"):
+        verify_dataset_snapshot(output_directory)
+
+    marker["format_version"] = "1"
+    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+    assert cli_main(["verify", "snapshot", str(output_directory)]) == 0
+
+
+def test_a_right_version_with_a_foreign_format_name_is_refused(tmp_path: Path) -> None:
+    """The other half of the identity predicate.
+
+    `test_foreign_marker_is_refused_at_the_boundary` uses a marker carrying
+    neither field, so the version check alone refuses it and the format-name
+    check is never the thing that fires. Dropping the name comparison from
+    the predicate left the whole suite green. This pins it: a marker claiming
+    version 1 of somebody else's format is still not ours to certify.
+    """
+    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
+    marker_path = output_directory / "format.json"
+    marker = json.loads(marker_path.read_text())
+    marker["format"] = "someone-elses-dataset-snapshot"
+    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+
+    with pytest.raises(ValueError, match="someone-elses-dataset-snapshot"):
+        verify_dataset_snapshot(output_directory)
+    assert cli_main(["verify", "snapshot", str(output_directory)]) == 2
 
 
 def test_extra_files_under_assets_are_ignored(tmp_path: Path) -> None:
@@ -274,3 +425,183 @@ def test_damage_is_reported_from_the_verified_root_not_the_export_root(
     damaged_report = verify_dataset_snapshot(root_b)
     assert not damaged_report.ok
     assert [f.reason for f in damaged_report.findings] == ["content-id-mismatch"]
+
+
+_KNOWN_RECEIPT_ENTRIES: list[dict[str, str | int]] = [
+    {
+        "path": "samples.parquet",
+        "size_bytes": 164981,
+        "sha256": "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    },
+    {
+        "path": "measurements.parquet",
+        "size_bytes": 5223,
+        "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    },
+    {
+        "path": "assets/wrist_cam/frame_0000000001.jpg",
+        "size_bytes": 20481,
+        "sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+    },
+]
+
+# The digest over these exact entries, serialized the way the exporter has
+# always done it (sorted by path, keys sorted, compact separators). If this
+# value changes, every snapshot ever exported fails verification.
+_GOLDEN_INVENTORY_CONTENT_ID = "b4cd6b846051175bbf1c57e5f5fcd5edee479b5cf2afd8294335c071561217bf"
+
+
+def test_inventory_digest_is_byte_identical_through_the_record_bridge() -> None:
+    """#489's hard constraint: typing the receipt entries must not move the
+    content_id hash by one byte. The old path hashes raw dicts straight from
+    the marker; the new path hashes records converted back through
+    ``to_dict_for_hashing``. Both must produce the same string and the same
+    digest, and the digest must equal the golden value."""
+    old_payload = json.dumps(
+        sorted(_KNOWN_RECEIPT_ENTRIES, key=lambda entry: str(entry["path"])),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    records = [
+        hflow.snapshot._parse_file_integrity_record(entry) for entry in _KNOWN_RECEIPT_ENTRIES
+    ]
+    new_payload = json.dumps(
+        [record.to_dict_for_hashing() for record in sorted(records, key=lambda r: r.path)],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    assert new_payload == old_payload
+    assert hflow.snapshot._inventory_content_id(records) == hflow.snapshot._inventory_content_id(
+        [hflow.snapshot._parse_file_integrity_record(entry) for entry in _KNOWN_RECEIPT_ENTRIES]
+    )
+    assert hflow.snapshot._inventory_content_id(records) == _GOLDEN_INVENTORY_CONTENT_ID
+
+
+def test_the_digest_covers_the_three_delivery_fields_and_nothing_else() -> None:
+    """Typing the entries narrowed what the digest is computed over, and that
+    is a decision rather than an accident.
+
+    Hashing raw dicts meant the digest depended on every key an entry
+    happened to carry. Hashing records means it depends on exactly ``path``,
+    ``size_bytes`` and ``sha256``, which are the three facts that define a
+    delivery. An entry carrying an extra key therefore hashes the same now
+    and used to hash differently.
+
+    The consequence to keep: additive metadata in a later format revision
+    cannot silently invalidate the digest of every snapshot already
+    exported. The consequence to know: a marker whose entries were edited to
+    add a field is no longer caught here. That is not a loss, because the
+    receipt travels unsigned inside the file it describes and was never a
+    tamper defence, and the guarantee the docs make (a deleted member stays
+    visible) is unaffected. Restoring raw-dict hashing to "tighten" this
+    would trade a real compatibility property for an imaginary one.
+    """
+    entries_with_an_extra_field = [
+        {**entry, "injected_field": "not written by hflow"} for entry in _KNOWN_RECEIPT_ENTRIES
+    ]
+    records = [
+        hflow.snapshot._parse_file_integrity_record(entry) for entry in entries_with_an_extra_field
+    ]
+
+    assert hflow.snapshot._inventory_content_id(records) == _GOLDEN_INVENTORY_CONTENT_ID
+
+    # And the deleted-member guarantee still holds over the narrowed digest.
+    assert hflow.snapshot._inventory_content_id(records[:-1]) != _GOLDEN_INVENTORY_CONTENT_ID
+
+
+def test_receipt_entry_with_numeric_sha256_is_refused_at_the_boundary() -> None:
+    """#489's silent bug: a receipt whose sha256 arrived as a JSON number
+    used to reach a per-file comparison that can never succeed and was
+    reported as damaged bytes. The boundary refuses it instead, naming the
+    field, because a malformed receipt is unreadable input."""
+    from hflow.snapshot import _parse_file_integrity_record
+
+    with pytest.raises(ValueError, match="sha256"):
+        _parse_file_integrity_record({"path": "samples.parquet", "size_bytes": 10, "sha256": 123})
+
+
+def _hand_built_snapshot_with_receipt_path(
+    snap: Path, *, receipt_path: str, payload: bytes = b"secret-bytes"
+) -> None:
+    """Minimal identity+integrity marker whose single receipt uses ``receipt_path``.
+
+    ``content_id`` matches that one-entry inventory so the deleted-member gate
+    is not the thing that fires; the path containment check is.
+    """
+    from hflow.snapshot import (
+        DATASET_SNAPSHOT_FORMAT_NAME,
+        DATASET_SNAPSHOT_FORMAT_VERSION,
+        FileIntegrityRecord,
+        _inventory_content_id,
+    )
+
+    digest = hashlib.sha256(payload).hexdigest()
+    record = FileIntegrityRecord(path=receipt_path, size_bytes=len(payload), sha256=digest)
+    marker = {
+        "format": DATASET_SNAPSHOT_FORMAT_NAME,
+        "format_version": DATASET_SNAPSHOT_FORMAT_VERSION,
+        "media_mode": "references",
+        "media_uri_base": None,
+        "tables": ["samples.parquet"],
+        "integrity": {
+            "tables": {
+                "samples": {
+                    "path": record.path,
+                    "size_bytes": record.size_bytes,
+                    "sha256": record.sha256,
+                }
+            },
+            "assets": [],
+            "content_id": _inventory_content_id([record]),
+        },
+    }
+    snap.mkdir(parents=True, exist_ok=True)
+    (snap / "format.json").write_text(json.dumps(marker, indent=2) + "\n")
+
+
+def test_receipt_path_escaping_the_handed_directory_is_refused(tmp_path: Path) -> None:
+    """#469: relative ``..`` and absolute paths hash outside the root today;
+    both must raise before any read (exit 2), not report ok."""
+    snap = tmp_path / "snap"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.bin"
+    secret.write_bytes(b"secret-bytes")
+
+    for escape_path in (f"../outside/{secret.name}", str(secret.resolve())):
+        _hand_built_snapshot_with_receipt_path(snap, receipt_path=escape_path)
+        with pytest.raises(ValueError, match="must stay under the handed snapshot directory"):
+            verify_dataset_snapshot(snap)
+        assert cli_main(["verify", "snapshot", str(snap)]) == 2
+
+
+def test_normalized_parent_escape_through_an_existing_subdir_is_refused(
+    tmp_path: Path,
+) -> None:
+    """Kingston's third shape: ``tables/../../outside/...`` only looks like it
+    failed before because ``snap/tables/`` was missing. Create it and the bare
+    join escapes; containment must still refuse before the read."""
+    snap = tmp_path / "snap"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (snap / "tables").mkdir(parents=True)
+    secret = outside / "secret.bin"
+    secret.write_bytes(b"secret-bytes")
+
+    _hand_built_snapshot_with_receipt_path(snap, receipt_path=f"tables/../../outside/{secret.name}")
+    with pytest.raises(ValueError, match="must stay under the handed snapshot directory"):
+        verify_dataset_snapshot(snap)
+    assert cli_main(["verify", "snapshot", str(snap)]) == 2
+
+
+def test_honest_relative_receipt_path_still_verifies_after_containment_gate(
+    tmp_path: Path,
+) -> None:
+    """Containment must not break a clean export: relative keys under the root
+    still pass size and sha256 checks."""
+    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
+    report = verify_dataset_snapshot(output_directory)
+    assert report.ok
+    assert report.findings == []
+    assert cli_main(["verify", "snapshot", str(output_directory)]) == 0

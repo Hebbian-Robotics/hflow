@@ -1,5 +1,6 @@
 """Video import publishes complete, correctly sampled source episodes."""
 
+import asyncio
 import hashlib
 import subprocess
 from dataclasses import replace
@@ -14,6 +15,7 @@ from mcap_protobuf.decoder import DecoderFactory
 import hflow
 from hflow.ffmpeg import ffmpeg_path
 from hflow.importers.video import VideoImportConfig, import_video_episode
+from hflow.media import VideoLimits
 
 
 @pytest.fixture
@@ -98,13 +100,15 @@ def test_imported_excerpt_preserves_content_time_and_known_metadata(
     app = hflow.App("video-import", data_root=tmp_path / "worker", default_checks=())
 
     @app.check(version="1")
-    def sampled_images(episode: hflow.Episode) -> hflow.CheckResult:
+    async def sampled_images(episode: hflow.Episode) -> hflow.CheckResult:
         assert episode.metadata_records["episode/v1"] == dict(config.metadata)
         assert episode.metadata_records["video_import/v1"] == metadata["video_import/v1"]
         assert episode.cameras == ["/head/compressed"]
         return hflow.CheckResult(measurements={"frames": len(episode.frames(fps=4))})
 
-    report = app.process(output_path, record=False, stages={hflow.Stage.SYNC, hflow.Stage.META})
+    report = asyncio.run(
+        app.process(output_path, record=False, stages={hflow.Stage.SYNC, hflow.Stage.META})
+    )
     assert not report.has_errors, report.summary()
     result = report.check("sampled_images").result
     assert result is not None
@@ -214,12 +218,18 @@ def test_invalid_sources_and_incomplete_excerpts_publish_nothing(
     [
         {"duration_s": 0},
         {"duration_s": float("nan")},
+        {"duration_s": "fast"},
         {"source_start_s": -1},
+        {"source_start_s": False},
         {"image_hz": 0},
         {"image_hz": float("inf")},
+        {"image_width": 0},
         {"image_width": 3},
+        {"image_height": 3},
         {"image_height": True},
         {"start_time_ns": -1},
+        {"start_time_ns": True},
+        {"start_time_ns": (1 << 64)},
         {"start_time_ns": (1 << 64) - 1},
         {"camera_name": ""},
         {"metadata": (("task", "one"), ("task", "two"))},
@@ -228,3 +238,198 @@ def test_invalid_sources_and_incomplete_excerpts_publish_nothing(
 def test_invalid_import_configuration_is_rejected(config: dict[str, object]) -> None:
     with pytest.raises(ValueError):
         replace(VideoImportConfig(duration_s=1), **config)
+
+
+def test_preparation_distinguishes_rejected_media_from_tool_failures(
+    source_video: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hflow.media as media
+    from hflow.importers.video import ImportedVideoEpisode, prepare_video_episode
+
+    output = tmp_path / "episode.mcap"
+    unreadable = tmp_path / "invalid.mp4"
+    unreadable.write_bytes(b"not a recording")
+    assert isinstance(
+        prepare_video_episode(unreadable, output, VideoImportConfig(duration_s=1)),
+        media.UnreadableVideo,
+    )
+    assert isinstance(
+        prepare_video_episode(
+            source_video,
+            output,
+            VideoImportConfig(duration_s=1),
+            limits=media.VideoLimits(maximum_frame_pixels=10),
+        ),
+        media.UnsupportedVideo,
+    )
+    assert not output.exists()
+    assert isinstance(
+        prepare_video_episode(source_video, output, VideoImportConfig(duration_s=1)),
+        ImportedVideoEpisode,
+    )
+    missing_tool = tmp_path / "missing-ffprobe"
+    monkeypatch.setattr(media, "ffprobe_path", lambda: missing_tool)
+    with pytest.raises(media.MediaToolError):
+        prepare_video_episode(
+            source_video, tmp_path / "absent.mcap", VideoImportConfig(duration_s=1)
+        )
+    assert not (tmp_path / "absent.mcap").exists()
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [VideoLimits(maximum_frame_pixels=160 * 90), VideoLimits(maximum_frames_per_second=4)],
+)
+def test_both_import_entrypoints_reject_output_exceeding_limits(
+    source_video: Path, tmp_path: Path, limits: VideoLimits
+) -> None:
+    from hflow.importers.video import prepare_video_episode
+    from hflow.media import UnsupportedVideo
+
+    config = VideoImportConfig(duration_s=1)
+    output_path = tmp_path / "unsupported.mcap"
+    with pytest.raises(ValueError, match="output exceeds supported limits"):
+        import_video_episode(source_video, output_path, config, limits=limits)
+    assert isinstance(
+        prepare_video_episode(source_video, output_path, config, limits=limits), UnsupportedVideo
+    )
+    assert not output_path.exists()
+    assert not tuple(tmp_path.glob(".video-import-*"))
+
+
+def test_window_preparation_preserves_requested_sampling_and_first_video_stream(
+    source_video: Path, tmp_path: Path
+) -> None:
+    from hflow.media import PreparedVideoWindow, VideoWindow, prepare_video_window
+
+    multiple_streams = tmp_path / "multiple.mp4"
+    subprocess.run(
+        [
+            str(ffmpeg_path()),
+            "-v",
+            "error",
+            "-i",
+            str(source_video),
+            "-f",
+            "lavfi",
+            "-i",
+            "color=green:size=320x180:rate=4:duration=2",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:v:0",
+            "-c:v",
+            "libx264",
+            str(multiple_streams),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    output = tmp_path / "window.mp4"
+    prepared = prepare_video_window(multiple_streams, output, VideoWindow(0.5, 1.0, 4.0))
+    assert isinstance(prepared, PreparedVideoWindow)
+    assert prepared.properties.width == 160
+    assert prepared.properties.height == 90
+    assert prepared.properties.duration_seconds == 1
+    assert prepared.properties.frames_per_second == 4
+    assert prepared.source_window == VideoWindow(0.5, 1.0, 4.0)
+    with pytest.raises(FileExistsError):
+        prepare_video_window(multiple_streams, output, VideoWindow(0.5, 1, 4))
+    assert not tuple(tmp_path.glob(".video-window-*"))
+
+
+def test_prepared_window_preserves_source_duration_despite_frame_padding(
+    source_video: Path, tmp_path: Path
+) -> None:
+    from hflow.media import PreparedVideoWindow, VideoWindow, prepare_video_window
+
+    window = VideoWindow(0, 0.65, 4)
+    prepared = prepare_video_window(source_video, tmp_path / "fractional.mp4", window)
+    assert isinstance(prepared, PreparedVideoWindow)
+    assert prepared.source_window == window
+    assert float(prepared.properties.duration_seconds) > window.duration_seconds
+
+
+@pytest.mark.parametrize(
+    ("start_seconds", "requested_seconds", "covered_seconds"),
+    [(1.5, 1, 0.5), (1.75, 10, 0.25)],
+)
+def test_prepared_source_interval_stops_at_eof(
+    source_video: Path,
+    tmp_path: Path,
+    start_seconds: float,
+    requested_seconds: float,
+    covered_seconds: float,
+) -> None:
+    from hflow.media import PreparedVideoWindow, UnreadableVideo, VideoWindow, prepare_video_window
+
+    prepared = prepare_video_window(
+        source_video, tmp_path / "last-window.mp4", VideoWindow(start_seconds, requested_seconds, 4)
+    )
+    assert isinstance(prepared, PreparedVideoWindow)
+    assert prepared.source_window == VideoWindow(start_seconds, covered_seconds, 4)
+    beyond_source = tmp_path / "beyond-source.mp4"
+    assert isinstance(
+        prepare_video_window(source_video, beyond_source, VideoWindow(2, 1, 4)), UnreadableVideo
+    )
+    assert not beyond_source.exists()
+
+
+def test_tagged_video_duration_is_shared_by_probe_and_import(
+    source_video: Path, tmp_path: Path
+) -> None:
+    from hflow.importers.video import ImportedVideoEpisode, prepare_video_episode
+
+    matroska = tmp_path / "source.mkv"
+    subprocess.run(
+        [str(ffmpeg_path()), "-v", "error", "-i", str(source_video), "-c", "copy", str(matroska)],
+        check=True,
+        capture_output=True,
+    )
+    outcome = prepare_video_episode(
+        matroska, tmp_path / "tagged.mcap", VideoImportConfig(duration_s=1, image_hz=4)
+    )
+    assert isinstance(outcome, ImportedVideoEpisode)
+    assert len(hflow.Episode(outcome.path).channel("/camera/compressed")) == 4
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("image_width", 0, "image_width must be > 0, got 0"),
+        ("image_width", 3, "image_width must be an even integer, got 3"),
+        ("image_height", -4, "image_height must be > 0, got -4"),
+        ("image_height", 3, "image_height must be an even integer, got 3"),
+    ],
+)
+def test_image_dimensions_distinguish_non_positive_from_odd(
+    field: str, value: object, message: str
+) -> None:
+    """Positivity comes from the shared guard; evenness keeps its own message."""
+    with pytest.raises(ValueError, match=f"^{message}$"):
+        replace(VideoImportConfig(duration_s=1), **{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("duration_s", "fast", "duration_s must be an int or float, got str"),
+        ("duration_s", float("nan"), "duration_s must be finite, got nan"),
+        ("source_start_s", False, "source_start_s must be an int or float, got bool"),
+        ("image_hz", float("inf"), "image_hz must be finite, got inf"),
+    ],
+)
+def test_finite_fields_name_the_field_and_the_defect(
+    field: str, value: object, message: str
+) -> None:
+    """The shared guard splits the old blanket message into type vs finiteness."""
+    with pytest.raises(ValueError, match=f"^{message}$"):
+        replace(VideoImportConfig(duration_s=1), **{field: value})
+
+
+def test_start_time_upper_bound_uses_field_guard() -> None:
+    """The field guard owns the start_time_ns upper-bound refusal."""
+    value = 1 << 64
+    with pytest.raises(ValueError) as exc_info:
+        replace(VideoImportConfig(duration_s=1), start_time_ns=value)
+    assert str(exc_info.value) == (f"start_time_ns must be in [0, {value - 1}], got {value}")

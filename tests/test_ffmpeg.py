@@ -2,7 +2,8 @@
 
 The suite conftest pins ``HFLOW_FFMPEG`` to the system binary, so the
 resolution tests below must clear the ``lru_cache`` around any environment
-mutation. The one real-download test is opt-in via ``HFLOW_NETWORK_TESTS=1``.
+mutation. Remote availability and real-download tests are opt-in via
+``HFLOW_NETWORK_TESTS=1``.
 """
 
 import hashlib
@@ -15,6 +16,7 @@ import tarfile
 from collections.abc import Iterator
 from pathlib import Path
 
+import httpx2
 import numpy as np
 import pytest
 
@@ -43,7 +45,13 @@ from hflow._video_measurements._raw_frames import (
     rgb_frames,
 )
 from hflow.episode import ExtractedFrame
-from hflow.ffmpeg import _binary, _contact_sheet
+from hflow.ffmpeg import (
+    PINNED_LINUX_X86_64_FFMPEG,
+    PINNED_LINUX_X86_64_FFPROBE,
+    _binary,
+    _contact_sheet,
+    verify_media_binary,
+)
 from hflow.ffmpeg._binary import (
     FFMPEG_ENV_VAR,
     FFPROBE_ENV_VAR,
@@ -302,16 +310,36 @@ def test_cache_dir_with_only_ffmpeg_is_healed_by_reinstall(
     os.environ.get("HFLOW_NETWORK_TESTS") != "1",
     reason="network integration test; set HFLOW_NETWORK_TESTS=1 to run",
 )
+@pytest.mark.parametrize("machine", ["x86_64", "aarch64"])
+def test_pinned_release_assets_available(machine: str) -> None:
+    """Probe both remote pins without downloading either archive or using the cache."""
+    build = _binary.PINNED_BUILDS_BY_MACHINE[machine]
+    try:
+        # Preserve HEAD across GitHub's redirect, including on Python 3.11.
+        response = httpx2.head(build.url, follow_redirects=True, timeout=30)
+    except httpx2.HTTPError as error:
+        pytest.fail(f"pinned FFmpeg asset unavailable for {machine}: {build.url}: {error}")
+    assert response.status_code == 200, (
+        f"pinned FFmpeg asset unavailable for {machine}: {build.url} (HTTP {response.status_code})"
+    )
+
+
+@pytest.mark.skipif(
+    os.environ.get("HFLOW_NETWORK_TESTS") != "1",
+    reason="network integration test; set HFLOW_NETWORK_TESTS=1 to run",
+)
 @pytest.mark.skipif(
     platform.system() != "Linux" or platform.machine() not in ("x86_64", "aarch64"),
     reason="pinned builds exist for Linux x86_64/aarch64 only",
 )
 def test_real_pinned_download_and_version(
-    monkeypatch: pytest.MonkeyPatch, cleared_binary_caches: None
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cleared_binary_caches: None
 ) -> None:
     monkeypatch.delenv(FFMPEG_ENV_VAR, raising=False)
     monkeypatch.delenv(FFPROBE_ENV_VAR, raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     resolved = ffmpeg_path()
+    assert resolved == _pinned_install_dir(platform.machine()) / "ffmpeg"
     assert resolved.is_file()
     version_line = ffmpeg_version()
     assert PINNED_VERSION_LABEL in version_line
@@ -320,6 +348,10 @@ def test_real_pinned_download_and_version(
     assert resolved_ffprobe == resolved.with_name("ffprobe")
     ffprobe_version_line = ffprobe_version()
     assert PINNED_VERSION_LABEL in ffprobe_version_line
+    if platform.machine() == "x86_64":
+        verified_ffmpeg = verify_media_binary(resolved, PINNED_LINUX_X86_64_FFMPEG)
+        verified_ffprobe = verify_media_binary(resolved_ffprobe, PINNED_LINUX_X86_64_FFPROBE)
+        assert verified_ffmpeg.version == verified_ffprobe.version
 
 
 def _synthetic_frames(
@@ -633,6 +665,58 @@ def test_luma_frames_reaps_ffmpeg_when_the_caller_stops_early(
     assert first_frame.shape == (120, 160)
 
 
+def test_display_rotation_preserves_coded_frame_geometry_and_pixels(
+    black_tail_video: Path, tmp_path: Path
+) -> None:
+    rotated_video = tmp_path / "rotation-metadata.mp4"
+    subprocess.run(
+        [
+            str(ffmpeg_path()),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-display_rotation",
+            "90",
+            "-i",
+            str(black_tail_video),
+            "-c",
+            "copy",
+            str(rotated_video),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    rotation_probe = subprocess.run(
+        [
+            str(ffprobe_path()),
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream_side_data=rotation",
+            "-of",
+            "default=nw=1:nk=1",
+            str(rotated_video),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert abs(int(rotation_probe.stdout.strip())) == 90
+    toolchain = resolved_video_measurement_toolchain()
+    with (
+        luma_frames(black_tail_video, toolchain=toolchain) as source_frames,
+        luma_frames(rotated_video, toolchain=toolchain) as rotated_frames,
+    ):
+        frame_count = 0
+        for source_frame, rotated_frame in zip(source_frames, rotated_frames, strict=True):
+            assert source_frame.shape == rotated_frame.shape == (120, 160)
+            np.testing.assert_array_equal(source_frame, rotated_frame)
+            frame_count += 1
+    assert frame_count == 60
+
+
 def test_luma_frames_on_a_non_video_raises(tmp_path: Path) -> None:
     not_a_video = tmp_path / "garbage.mp4"
     not_a_video.write_bytes(b"\x00\x01\x02not a video")
@@ -641,6 +725,49 @@ def test_luma_frames_on_a_non_video_raises(tmp_path: Path) -> None:
         luma_frames(not_a_video, toolchain=resolved_video_measurement_toolchain()) as frames,
     ):
         list(frames)
+
+
+def test_frame_decoder_selects_the_same_video_stream_as_dimension_probing(
+    black_tail_video: Path, tmp_path: Path
+) -> None:
+    multi_stream_video = tmp_path / "two-video-streams.mkv"
+    subprocess.run(
+        [
+            str(ffmpeg_path()),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(black_tail_video),
+            "-f",
+            "lavfi",
+            "-i",
+            "color=white:size=320x240:rate=10:duration=6",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:v:0",
+            "-c:v:0",
+            "copy",
+            "-c:v:1",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            str(multi_stream_video),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    toolchain = resolved_video_measurement_toolchain()
+    with (
+        luma_frames(black_tail_video, toolchain=toolchain) as source_frames,
+        luma_frames(multi_stream_video, toolchain=toolchain) as decoded_frames,
+    ):
+        frame_count = 0
+        for source_frame, decoded_frame in zip(source_frames, decoded_frames, strict=True):
+            np.testing.assert_array_equal(source_frame, decoded_frame)
+            frame_count += 1
+    assert frame_count == 60
 
 
 def test_rgb_frames_streams_three_channels_at_the_coded_size(black_tail_video: Path) -> None:
@@ -975,37 +1102,30 @@ def _unreadable_frame(tmp_path: Path) -> ExtractedFrame:
     return ExtractedFrame(path=tmp_path / "must-not-be-read.jpg", log_time_ns=0)
 
 
-@pytest.mark.parametrize("tile_width", [0, -320])
-def test_contact_sheet_rejects_non_positive_tile_width_before_ffmpeg(
-    tile_width: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("parameter", ["columns", "tile_width", "max_tiles"])
+@pytest.mark.parametrize("value", [0, -320])
+def test_contact_sheet_rejects_non_positive_dimensions_before_ffmpeg(
+    parameter: str, value: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _refuse_ffmpeg_for_invalid_contact_sheet_arguments(monkeypatch)
-    with pytest.raises(ValueError, match=rf"tile_width must be >= 1, got {tile_width}"):
-        contact_sheet([_unreadable_frame(tmp_path)], tmp_path / "never.jpg", tile_width=tile_width)
+    with pytest.raises(ValueError, match=rf"^{parameter} must be > 0, got {value}$"):
+        contact_sheet([_unreadable_frame(tmp_path)], tmp_path / "never.jpg", **{parameter: value})
 
 
-def test_contact_sheet_rejects_boolean_columns_before_ffmpeg(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("parameter", ["columns", "tile_width", "max_tiles"])
+@pytest.mark.parametrize("value", [True, False, 1.0, "1", None])
+def test_contact_sheet_rejects_non_integer_dimensions_before_ffmpeg(
+    parameter: str, value: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _refuse_ffmpeg_for_invalid_contact_sheet_arguments(monkeypatch)
-    with pytest.raises(ValueError, match=r"columns must be an int, got True"):
-        contact_sheet([_unreadable_frame(tmp_path)], tmp_path / "never.jpg", columns=True)
-
-
-def test_contact_sheet_rejects_boolean_tile_width_before_ffmpeg(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _refuse_ffmpeg_for_invalid_contact_sheet_arguments(monkeypatch)
-    with pytest.raises(ValueError, match=r"tile_width must be an int, got True"):
-        contact_sheet([_unreadable_frame(tmp_path)], tmp_path / "never.jpg", tile_width=True)
-
-
-def test_contact_sheet_rejects_boolean_max_tiles_before_ffmpeg(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _refuse_ffmpeg_for_invalid_contact_sheet_arguments(monkeypatch)
-    with pytest.raises(ValueError, match=r"max_tiles must be an int, got True"):
-        contact_sheet([_unreadable_frame(tmp_path)], tmp_path / "never.jpg", max_tiles=True)
+    with pytest.raises(
+        ValueError, match=rf"^{parameter} must be an int, got {type(value).__name__}$"
+    ):
+        contact_sheet(
+            [_unreadable_frame(tmp_path)],
+            tmp_path / "never.jpg",
+            **{parameter: value},  # ty: ignore[invalid-argument-type]
+        )
 
 
 def test_coding_range_is_derived_from_luma_and_selects_the_exposure_gates() -> None:

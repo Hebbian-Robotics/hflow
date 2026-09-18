@@ -133,12 +133,11 @@ def _fake_corpus(tmp_path: Path, *, chunk1_eps: tuple[int, ...] = ()) -> dict:
         f"TO '{dquoted}' (FORMAT parquet)"
     )
 
-    # video chunks (fake bytes); exporter fetches them under the converter's
-    # local naming: cache/videos/<sanitized-cam>-chunk<N>-file<M>.mp4
+    # Source video chunks retain their repository paths in the SDK cache.
     for chunk in (0, 1) if chunk1_eps else (0,):
         for cam in ("observation.images.up", "observation.images.side"):
-            vname = cam.replace("/", "_").replace(".", "_") + f"-chunk{chunk}-file0.mp4"
-            vdir = tmp_path / "videos"
+            vname = "file-000.mp4"
+            vdir = tmp_path / "videos" / cam / f"chunk-{chunk:03d}"
             vdir.mkdir(parents=True, exist_ok=True)
             marker = "" if chunk == 0 else "CHUNK-ONE-"
             (vdir / vname).write_bytes(f"fake-mp4-{marker}{cam}".encode())
@@ -204,7 +203,6 @@ def _install_fake_import(corpus: dict, tmp_path: Path, monkeypatch: pytest.Monke
                 "camera_keys": camera_keys,
             }
         )
-        _make_data_local(corpus)
         cache = Path(output_dir) / "_lerobot_cache" / str(revision)
         if not cache.exists():
             shutil.copytree(tmp_path, cache)
@@ -251,18 +249,20 @@ def _provenance_meta(ep: int, task: str = "task-0") -> str:
     )
 
 
-def _make_data_local(corpus: dict) -> None:
-    """Place the data chunk where the exporter fetches it."""
-    src = Path(corpus["cache_dir"]) / "data" / "chunk-000" / "file-000.parquet"
-    dst = Path(corpus["cache_dir"]) / "data" / "chunk-000000-file-000000.parquet"
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if not dst.exists():
-        shutil.copy2(src, dst)
-
-
-def test_export_noncontiguous_selection(fake_corpus: dict, tmp_path: Path) -> None:
+@pytest.mark.parametrize("explicit_video_path", [True, False])
+def test_export_noncontiguous_selection(
+    fake_corpus: dict, tmp_path: Path, explicit_video_path: bool
+) -> None:
     """Outcome: exactly episodes 0 and 2, in selection order, loadable layout."""
-    _make_data_local(fake_corpus)
+    if not explicit_video_path:
+        source_root = Path(fake_corpus["cache_dir"])
+        for camera_key in CAMS:
+            video_directory = source_root / "videos" / camera_key
+            default_video_path = video_directory / "000000" / "000000.mp4"
+            default_video_path.parent.mkdir(parents=True)
+            (video_directory / "chunk-000" / "file-000.mp4").rename(default_video_path)
+        del fake_corpus["info"]["video_path"]
+        (source_root / "meta" / "info.json").write_text(json.dumps(fake_corpus["info"]))
     manifest = _fake_manifest(
         tmp_path,
         [
@@ -421,7 +421,6 @@ def test_export_missing_index_column_fails(fake_corpus: dict, tmp_path: Path) ->
 
 def test_export_sql_selection(fake_corpus: dict, tmp_path: Path) -> None:
     """SQL selection path: same outcome via a duckdb query string."""
-    _make_data_local(fake_corpus)
     dest = tmp_path / "out"
     catalog = tmp_path / "catalog.parquet"
     import pyarrow as pa
@@ -679,4 +678,81 @@ def test_validate_v3_rejects_missing_video(fake_corpus: dict, tmp_path: Path) ->
     video = dest / "videos" / "observation.images.side" / "chunk-000" / "file-000.mp4"
     video.unlink()
     with pytest.raises(ValueError, match="references missing video"):
+        export._validate_v3(dest)
+
+
+def test_export_refuses_frame_referencing_unpublished_task(
+    fake_corpus: dict, tmp_path: Path
+) -> None:
+    """#529: frame task_index referencing an unpublished task must be refused.
+
+    When an episode's data frames carry a task_index referencing a task that the
+    single-task output does not publish, export must fail loudly before writing
+    destination files, naming episode, frame, and index.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    # Add task_index column to source data: frame 0 has task_index=0, frame 1 has task_index=1
+    src_pq = Path(fake_corpus["cache_dir"]) / "data" / "chunk-000" / "file-000.parquet"
+    table = pq.read_table(str(src_pq))
+    task_indices = [0] * table.num_rows
+    task_indices[1] = 1  # frame 1 points to task 1 (unpublished in single-task episode)
+    table = table.append_column("task_index", pa.array(task_indices, pa.int64()))
+    pq.write_table(table, str(src_pq))
+
+    manifest = _fake_manifest(
+        tmp_path,
+        [{"metadata_json": _provenance_meta(0, task="pick cup")}],
+    )
+    dest = tmp_path / "out_refuse"
+    with pytest.raises(
+        ValueError,
+        match=r"source episode 0 frame 1: task_index 1 references an unpublished task",
+    ):
+        export.export(dest, manifest=manifest, camera_keys=CAMS)
+    assert not dest.exists()
+
+
+def test_export_preserves_valid_task_index(fake_corpus: dict, tmp_path: Path) -> None:
+    """A task_index matching the published task (index 0) exports cleanly."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    src_pq = Path(fake_corpus["cache_dir"]) / "data" / "chunk-000" / "file-000.parquet"
+    table = pq.read_table(str(src_pq))
+    task_indices = [0] * table.num_rows
+    table = table.append_column("task_index", pa.array(task_indices, pa.int64()))
+    pq.write_table(table, str(src_pq))
+
+    manifest = _fake_manifest(
+        tmp_path,
+        [{"metadata_json": _provenance_meta(0, task="pick cup")}],
+    )
+    dest = tmp_path / "out_valid_task"
+    export.export(dest, manifest=manifest, camera_keys=CAMS)
+
+    out_pq = dest / "data" / "chunk-000" / "file-000.parquet"
+    out_table = pq.read_table(str(out_pq))
+    assert "task_index" in out_table.column_names
+    assert out_table.column("task_index").to_pylist() == [0] * LENGTHS[0]
+
+
+def test_validate_v3_rejects_corrupted_task_index(fake_corpus: dict, tmp_path: Path) -> None:
+    """_validate_v3 refuses staged datasets where task_index resolves out-of-bounds."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    dest = _exported_dataset(fake_corpus, tmp_path)
+    data_pq = dest / "data" / "chunk-000" / "file-000.parquet"
+    table = pq.read_table(str(data_pq))
+    corrupted_indices = [0] * table.num_rows
+    corrupted_indices[3] = 99  # unpublished task index
+    table = table.append_column("task_index", pa.array(corrupted_indices, pa.int64()))
+    pq.write_table(table, str(data_pq))
+
+    with pytest.raises(
+        ValueError,
+        match=r"episode 0 frame 3: task_index 99 references an unpublished task",
+    ):
         export._validate_v3(dest)

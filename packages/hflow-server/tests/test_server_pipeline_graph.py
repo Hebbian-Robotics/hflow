@@ -25,17 +25,17 @@ app = hflow.App("tiered-demo", default_checks=())
 
 
 @app.check(version="1", name="needs_channel", requires=["/camera/wrist"], critical=True)
-def needs_channel(episode):
+async def needs_channel(episode):
     return hflow.CheckResult(measurements={"frames": 1.0})
 
 
 @app.check(version="1", name="needs_endpoint", requires=["vision-model"])
-def needs_endpoint(episode):
+async def needs_endpoint(episode):
     return hflow.CheckResult(measurements={"score": 1.0})
 
 
 @app.check(version="1", name="cheap_check", critical=True)
-def cheap_check(episode):
+async def cheap_check(episode):
     return hflow.CheckResult(verdict=True)
 
 
@@ -55,7 +55,7 @@ app = hflow.App("no-critical-demo", default_checks=())
 
 
 @app.check(version="1", name="just_evidence")
-def just_evidence(episode):
+async def just_evidence(episode):
     return hflow.CheckResult(measurements={"value": 1.0})
 """
 

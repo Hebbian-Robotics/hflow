@@ -40,13 +40,17 @@ macOS, install the Xcode Command Line Tools with `xcode-select --install`.
 Linux and macOS both work for native development. CI runs on Linux only, so
 run the quality checks yourself before opening a pull request on macOS.
 
-Native Windows does not work: HFlow imports `fcntl` for file locking
-(`src/hflow/storage.py`), and that module does not exist on Windows, so
-`import hflow` fails before any test can run. Work inside WSL2 with an Ubuntu
+Native Windows is not supported: pipeline and storage operations use `fcntl`
+for file locking (`src/hflow/storage.py`), which does not exist on Windows. Work inside WSL2 with an Ubuntu
 distribution instead, following the setup steps below from the WSL2 shell and
 keeping both the clone and your data root on the Linux filesystem. The
 [runtime prerequisites](./docs/RUNTIME.md#prerequisites) explain why the data
 root has to live there.
+
+Public package exports load their implementations on first access. Keep utility
+imports such as `hflow.statistics` and `hflow.batching` independent of pipeline,
+media, and model imports. This changes import cost, not installation dependencies;
+all modules ship in the single `hflow` distribution.
 
 Clone the repository and create the locked development environment:
 
@@ -122,6 +126,26 @@ HFLOW_DOCKER_TESTS=1 uv run pytest tests/test_runtime_integration.py -q
 HFLOW_TEST_BUCKET_URL=gs://your-bucket/tmp-prefix uv run pytest tests/test_storage.py -q
 HFLOW_MEDIAPIPE_TESTS=1 uv run --extra mediapipe pytest tests/test_mediapipe_hands.py -q
 ```
+
+Normal CI uses system FFmpeg and does not check the managed Linux download.
+For a cheap availability check of both pinned Linux archives, run:
+
+```bash
+HFLOW_NETWORK_TESTS=1 uv run pytest tests/test_ffmpeg.py::test_pinned_release_assets_available -q
+```
+
+This follows release-asset redirects with HTTP HEAD, without downloading the
+archives. The `pinned-assets` workflow runs it weekly on Mondays and supports
+manual dispatch. The publish workflow repeats it before building distributions.
+The separate
+`test_real_pinned_download_and_version` downloads into an isolated cache and
+executes both binaries for the host architecture. On Linux x86-64 it also
+checks both offline verification specifications against the downloaded binaries;
+the publish workflow runs this check before building distributions. Run it when changing the
+pin, and independently download, hash, and inspect the other architecture's
+archive. Select the last successful BtbN build of a completed month from its
+release list: these are retained for two years, while ordinary daily builds
+expire quickly. A tag's calendar date alone cannot establish retention.
 
 The MediaPipe one brings its own OpenCV, and the OpenCV wheels share one
 `cv2/` directory, so syncing back out can leave `import cv2` broken while

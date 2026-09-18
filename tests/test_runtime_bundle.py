@@ -804,6 +804,30 @@ def test_modules_beside_the_pipeline_are_copied(config: RuntimeConfig, tmp_path:
     assert (paths.user_dir / "rig_constants.py").is_file()
 
 
+def test_refresh_keeps_the_live_project_directory_and_removes_stale_modules(
+    config: RuntimeConfig, tmp_path: Path
+) -> None:
+    stale_module = tmp_path / "old_constants.py"
+    stale_module.write_text("OLD = True\n")
+    paths, _ = _render(config, tmp_path / "bundle")
+    directory_descriptor = os.open(paths.user_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        stale_module.unlink()
+        updated_source = PIPELINE_SOURCE + "\n# updated pipeline\n"
+        config.pipeline_file.write_text(updated_source)
+        _render(config, tmp_path / "bundle")
+        # A bind mount, like this open descriptor, continues to address the
+        # original directory even if its pathname is deleted and recreated.
+        with os.fdopen(
+            os.open(config.pipeline_file.name, os.O_RDONLY, dir_fd=directory_descriptor)
+        ) as pipeline_stream:
+            assert pipeline_stream.read() == updated_source
+        with pytest.raises(FileNotFoundError):
+            os.stat(stale_module.name, dir_fd=directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+
+
 def test_the_workspace_is_never_copied_whatever_it_is_called(
     config: RuntimeConfig, tmp_path: Path
 ) -> None:

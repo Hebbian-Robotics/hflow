@@ -55,7 +55,7 @@ jobs:
               '- 📖 Check [CONTRIBUTING.md](https://github.com/Hebbian-Robotics/hflow/blob/main/CONTRIBUTING.md) for the validation commands CI will run',
               '- 📣 Share the project with your network',
               '',
-              '💡 Tip: one open pull request per contributor at a time. Issues with an assignee are taken; everything else is fair game.',
+              '💡 Tip: one open pull request per contributor at a time. Before starting an issue, check its sidebar for an assignee or a linked pull request. Either one means somebody is already on it; everything else is fair game.',
               '',
               'We are excited to have you here and appreciate your help making the project better! 🙌',
             ].join('\n')

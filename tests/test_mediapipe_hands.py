@@ -13,6 +13,7 @@ manual probe -- and it leaves one honest gap, recorded at the bottom of this
 file.
 """
 
+import asyncio
 import functools
 import hashlib
 import os
@@ -235,7 +236,7 @@ class TestRegistrationWithoutTheModel:
         canonical = tmp_path / "episode.canonical.mcap"
         write_canonical_episode(source, canonical, TransformConfig())
         with hflow.Episode(canonical) as episode, pytest.raises(ValueError, match="sample_fps"):
-            mediapipe_hand_detection(episode, sample_fps=5000.0)
+            asyncio.run(mediapipe_hand_detection(episode, sample_fps=5000.0))
 
 
 @pytest.fixture(scope="module")
@@ -273,7 +274,7 @@ class TestEndToEnd:
         self, hands_episode_path: Path
     ) -> None:
         with hflow.Episode(hands_episode_path) as episode:
-            result = mediapipe_hand_detection(episode)
+            result = asyncio.run(mediapipe_hand_detection(episode))
 
         topic = "/wrist_cam/compressed"
         assert result.measurements[f"{topic}/hand_detection_frame_count"] == 3
@@ -292,7 +293,7 @@ class TestEndToEnd:
         to see which size produced the row.
         """
         with hflow.Episode(hands_episode_path) as episode:
-            result = mediapipe_hand_detection(episode, inference_long_edge_pixels=256)
+            result = asyncio.run(mediapipe_hand_detection(episode, inference_long_edge_pixels=256))
         assert result.measurements["/wrist_cam/compressed/hand_inference_long_edge_pixels"] == 256
 
     def test_no_key_collides_with_a_built_in_check(self, hands_episode_path: Path) -> None:
@@ -301,7 +302,7 @@ class TestEndToEnd:
         producer silently loses.
         """
         with hflow.Episode(hands_episode_path) as episode:
-            hand_keys = set(mediapipe_hand_detection(episode).measurements)
+            hand_keys = set(asyncio.run(mediapipe_hand_detection(episode)).measurements)
             builtin_keys = {
                 key
                 for check in (
@@ -315,6 +316,6 @@ class TestEndToEnd:
                     hflow.checks.episode_duration,
                     hflow.checks.timestamp_regularity,
                 )
-                for key in check(episode).measurements
+                for key in asyncio.run(check(episode)).measurements
             }
         assert hand_keys.isdisjoint(builtin_keys)

@@ -56,7 +56,9 @@ Use these when you already know the outcome you need.
 - [Write an input MCAP converter](./how-to/write-a-converter.md)
 - [Port existing processing and quality-check code](./PORTING.md)
 - [Run embedded workers and import video](./how-to/run-embedded-workers.md)
+- [Plan source windows and sample original frames](./how-to/sample-source-video.md)
 - [Summarize weighted measurements](./how-to/summarize-measurements.md)
+- [Stream continuous camera motion](./how-to/stream-camera-motion.md)
 - [Serve a workspace over HTTP](./SERVE.md)
 - [Call an OpenAI vision endpoint from a step](./how-to/call-openai-vision.md)
 - [Compare vision models on the Build AI evaluations](./how-to/run-build-ai-evaluation.md)
@@ -79,6 +81,7 @@ Use these when you already know the outcome you need.
 Reference pages define stable inputs, outputs, configuration, and stored-data
 contracts.
 
+- [Embedded integration boundaries](./EMBEDDED_BOUNDARIES.md)
 - [Canonical episode format](./FORMAT.md)
 - [Catalog tables and curation API](./CATALOG.md)
 - [Environment variables](./ENVIRONMENT.md)

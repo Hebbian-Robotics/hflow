@@ -11,6 +11,7 @@ Run from the repository root::
 from __future__ import annotations
 
 import argparse
+import asyncio
 from pathlib import Path
 
 import hflow
@@ -70,7 +71,7 @@ def main() -> None:
         camera=arguments.camera,
         frame_time_seconds=arguments.frame_time_seconds,
     )
-    report = application.test(arguments.episode)
+    report = asyncio.run(application.test(arguments.episode))
     if report.has_errors:
         raise SystemExit(1)
 

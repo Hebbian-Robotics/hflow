@@ -28,11 +28,13 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, TypedDict, cast
+from typing import BinaryIO, TypedDict
+
+from pydantic import TypeAdapter, ValidationError
 
 CYTHON_OVERLAY_MANIFEST_FILE_NAME = "hflow-native-overlay.json"
 INSTALLED_CYTHON_OVERLAY_MANIFEST_FILE_NAME = ".hflow-native-overlay.json"
@@ -168,6 +170,9 @@ class CythonOverlayManifest:
             "toolchain": self.toolchain.to_json_value(),
             "artifacts": [artifact.to_json_value() for artifact in self.artifacts],
         }
+
+
+_MANIFEST_ADAPTER = TypeAdapter(CythonOverlayManifest)
 
 
 @dataclass(frozen=True, slots=True)
@@ -627,123 +632,25 @@ def load_cython_overlay_manifest(manifest_path: Path) -> CythonOverlayManifest:
 
     serialized_manifest = _read_regular_file_bytes(manifest_path, "native overlay manifest")
     try:
-        raw_manifest = cast(
-            object,
-            json.loads(
-                serialized_manifest.decode("utf-8"),
-                object_pairs_hook=_reject_duplicate_json_fields,
-            ),
+        # The JSON decoder catches duplicate keys before Pydantic constructs the
+        # existing dataclasses. JSON validation accepts arrays for tuple fields
+        # while strict mode still refuses scalar coercion and extra fields.
+        json.loads(
+            serialized_manifest.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_fields,
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise CythonOverlayManifestError("native overlay manifest is not valid JSON") from error
-    manifest_mapping = _require_mapping(raw_manifest, "manifest")
-    _require_exact_fields(
-        manifest_mapping,
-        {
-            "schema_version",
-            "format",
-            "package_name",
-            "bundle_digest",
-            "target",
-            "toolchain",
-            "artifacts",
-        },
-        "manifest",
-    )
-    target_mapping = _require_mapping(manifest_mapping["target"], "target")
-    _require_exact_fields(
-        target_mapping,
-        {
-            "python_implementation",
-            "python_version",
-            "python_abi_tag",
-            "extension_suffix",
-            "platform_tag",
-            "operating_system",
-            "machine",
-        },
-        "target",
-    )
-    toolchain_mapping = _require_mapping(manifest_mapping["toolchain"], "toolchain")
-    _require_exact_fields(
-        toolchain_mapping,
-        {"cython_version", "setuptools_version"},
-        "toolchain",
-    )
-    raw_artifacts = manifest_mapping["artifacts"]
-    if not isinstance(raw_artifacts, list):
-        raise CythonOverlayManifestError("artifacts must be an array")
-    artifacts: list[CythonOverlayArtifact] = []
-    for raw_artifact in cast(Sequence[object], raw_artifacts):
-        artifact_mapping = _require_mapping(raw_artifact, "artifact")
-        _require_exact_fields(
-            artifact_mapping,
-            {
-                "module_name",
-                "source_path",
-                "source_sha256",
-                "source_size_bytes",
-                "artifact_path",
-                "artifact_sha256",
-                "artifact_size_bytes",
-            },
-            "artifact",
+    try:
+        manifest = _MANIFEST_ADAPTER.validate_json(serialized_manifest, strict=True, extra="forbid")
+    except ValidationError as error:
+        field_errors = "; ".join(
+            f"{'.'.join(str(part) for part in detail['loc']) or 'manifest'}: {detail['msg']}"
+            for detail in error.errors(include_input=False, include_url=False)
         )
-        artifacts.append(
-            CythonOverlayArtifact(
-                module_name=_require_nonempty_string(
-                    artifact_mapping["module_name"], "module_name"
-                ),
-                source_path=_require_relative_path(artifact_mapping["source_path"], "source_path"),
-                source_sha256=_require_sha256(artifact_mapping["source_sha256"], "source_sha256"),
-                source_size_bytes=_require_nonnegative_integer(
-                    artifact_mapping["source_size_bytes"], "source_size_bytes"
-                ),
-                artifact_path=_require_relative_path(
-                    artifact_mapping["artifact_path"], "artifact_path"
-                ),
-                artifact_sha256=_require_sha256(
-                    artifact_mapping["artifact_sha256"], "artifact_sha256"
-                ),
-                artifact_size_bytes=_require_positive_integer(
-                    artifact_mapping["artifact_size_bytes"], "artifact_size_bytes"
-                ),
-            )
-        )
-    manifest = CythonOverlayManifest(
-        schema_version=_require_integer(manifest_mapping["schema_version"], "schema_version"),
-        format=_require_nonempty_string(manifest_mapping["format"], "format"),
-        package_name=_require_nonempty_string(manifest_mapping["package_name"], "package_name"),
-        bundle_digest=_require_sha256(manifest_mapping["bundle_digest"], "bundle_digest"),
-        target=NativeBuildTarget(
-            python_implementation=_require_nonempty_string(
-                target_mapping["python_implementation"], "python_implementation"
-            ),
-            python_version=_require_nonempty_string(
-                target_mapping["python_version"], "python_version"
-            ),
-            python_abi_tag=_require_nonempty_string(
-                target_mapping["python_abi_tag"], "python_abi_tag"
-            ),
-            extension_suffix=_require_nonempty_string(
-                target_mapping["extension_suffix"], "extension_suffix"
-            ),
-            platform_tag=_require_nonempty_string(target_mapping["platform_tag"], "platform_tag"),
-            operating_system=_require_nonempty_string(
-                target_mapping["operating_system"], "operating_system"
-            ),
-            machine=_require_nonempty_string(target_mapping["machine"], "machine"),
-        ),
-        toolchain=CythonToolchain(
-            cython_version=_require_nonempty_string(
-                toolchain_mapping["cython_version"], "cython_version"
-            ),
-            setuptools_version=_require_nonempty_string(
-                toolchain_mapping["setuptools_version"], "setuptools_version"
-            ),
-        ),
-        artifacts=tuple(artifacts),
-    )
+        raise CythonOverlayManifestError(
+            f"invalid native overlay manifest: {field_errors}"
+        ) from error
     validated_manifest = _validate_manifest(manifest)
     if serialized_manifest != _serialize_manifest(validated_manifest):
         raise CythonOverlayManifestError("native overlay manifest is not canonical JSON")
@@ -1978,21 +1885,6 @@ def _paths_overlap(first_path: Path, second_path: Path) -> bool:
     except ValueError:
         return False
     return True
-
-
-def _require_mapping(value: object, label: str) -> Mapping[str, object]:
-    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
-        raise CythonOverlayManifestError(f"{label} must be an object")
-    return cast(Mapping[str, object], value)
-
-
-def _require_exact_fields(
-    mapping: Mapping[str, object],
-    expected_fields: set[str],
-    label: str,
-) -> None:
-    if set(mapping) != expected_fields:
-        raise CythonOverlayManifestError(f"{label} has unexpected fields")
 
 
 def _require_integer(value: object, label: str) -> int:

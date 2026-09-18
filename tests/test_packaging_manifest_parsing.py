@@ -80,13 +80,44 @@ def test_apply_refuses_invalid_manifest_json_before_mutation(tmp_path: Path) -> 
     )
 
 
-def test_apply_refuses_non_array_artifacts_before_mutation(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("field_path", "invalid_value", "expected_message"),
+    [
+        (("artifacts",), {}, "artifacts: Input should be a valid array"),
+        (("schema_version",), True, "schema_version: Input should be a valid integer"),
+        (
+            ("target", "python_version"),
+            314,
+            "target.python_version: Input should be a valid string",
+        ),
+        (("target", "unexpected"), "value", "target.unexpected: Unexpected keyword argument"),
+        (("toolchain",), {}, "toolchain.cython_version: Field required"),
+        (
+            ("artifacts", 0, "artifact_size_bytes"),
+            "12",
+            "artifact_size_bytes: Input should be a valid integer",
+        ),
+    ],
+)
+def test_apply_refuses_invalid_manifest_structure_before_mutation(
+    tmp_path: Path,
+    field_path: tuple[str | int, ...],
+    invalid_value: object,
+    expected_message: str,
+) -> None:
     package_root, overlay_directory, manifest, source_bytes, original_record = _build_overlay(
         tmp_path
     )
     manifest_path = overlay_directory / CYTHON_OVERLAY_MANIFEST_FILE_NAME
     payload = _manifest_payload(manifest_path)
-    payload["artifacts"] = {}
+    container: object = payload
+    for component in field_path[:-1]:
+        container = (
+            cast(list[object], container)[component]
+            if isinstance(component, int)
+            else cast(dict[str, object], container)[component]
+        )
+    cast(dict[str, object], container)[str(field_path[-1])] = invalid_value
     _write_manifest_bytes(
         manifest_path,
         (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"),
@@ -98,7 +129,7 @@ def test_apply_refuses_non_array_artifacts_before_mutation(tmp_path: Path) -> No
         manifest,
         source_bytes,
         original_record,
-        "artifacts must be an array",
+        expected_message,
     )
 
 

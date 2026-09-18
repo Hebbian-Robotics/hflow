@@ -212,9 +212,12 @@ from your_existing_qc import check_joint_smoothness  # untouched
 
 
 @app.check(version="1")
-def joint_smoothness(ep: hflow.Episode) -> hflow.CheckResult:
-    joints = ep.channel("/joint_states").to_numpy()  # extract
-    result = check_joint_smoothness(joints, rate_hz=100)  # unchanged
+async def joint_smoothness(ep: hflow.Episode) -> hflow.CheckResult:
+    from hflow.asyncio_utils import run_blocking
+
+    channel = await run_blocking(ep.channel, "/joint_states")
+    joints = await run_blocking(channel.to_numpy)  # extract
+    result = await run_blocking(check_joint_smoothness, joints, rate_hz=100)  # unchanged
     return hflow.CheckResult(measurements=result)  # record
 ```
 

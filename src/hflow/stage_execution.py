@@ -26,6 +26,7 @@ from pathlib import Path
 from posixpath import normpath
 from typing import TYPE_CHECKING, TypedDict
 
+from hflow.asyncio_utils import blocking_context, run_blocking
 from hflow.batching import plan_batches
 from hflow.catalog import QuarantineHistory
 from hflow.stage_planning import (
@@ -236,7 +237,7 @@ def plan_stage_batches(
     return [{"items": list(batch.items), "start_delay_s": batch.start_delay_s} for batch in planned]
 
 
-def process_stage_batch(
+async def process_stage_batch(
     application: "App",
     uris: Sequence[str],
     stage_name: str,
@@ -287,10 +288,14 @@ def process_stage_batch(
     # state; opening that reader once per batch rather than once per episode
     # is the difference between one mirror sync and one per episode. Stages
     # that decide quarantine themselves never read it.
-    with _batch_quarantine_history(
-        application,
-        stage,
-        preserve_existing_quarantine=isinstance(registered_step_selection, SelectedRegisteredSteps),
+    async with blocking_context(
+        _batch_quarantine_history(
+            application,
+            stage,
+            preserve_existing_quarantine=isinstance(
+                registered_step_selection, SelectedRegisteredSteps
+            ),
+        )
     ) as quarantine_history:
         for uri in uris:
             try:
@@ -298,7 +303,7 @@ def process_stage_batch(
                     data_root, parse_data_root_relative_uri(str(uri))
                 )
                 if isinstance(registered_step_selection, AllRegisteredSteps):
-                    report = application.process(
+                    report = await application.process(
                         episode_reference,
                         record=True,
                         stages={stage},
@@ -306,7 +311,7 @@ def process_stage_batch(
                         orchestrator_run_id=orchestrator_run_id,
                     )
                 else:
-                    report = application.process(
+                    report = await application.process(
                         episode_reference,
                         record=True,
                         stages={stage},
@@ -320,7 +325,8 @@ def process_stage_batch(
                 # so without this the only trace of it is this traceback in
                 # whatever log happened to be watching -- and the in-process
                 # executor has no Airflow task log behind it at all.
-                _record_failure_quietly(
+                await run_blocking(
+                    _record_failure_quietly,
                     application,
                     source_uri=str(uri),
                     stage=stage,
@@ -356,7 +362,7 @@ class StageOutcome:
     skipped_as_current: int = 0
 
 
-def run_stages_directly(
+async def run_stages_directly(
     application: "App",
     uris: Sequence[str],
     stages: Iterable[Stage],
@@ -429,7 +435,8 @@ def run_stages_directly(
             stage_uris = list(uris)
         else:
             if plans is None:
-                plans = _plan_after_sync(
+                plans = await run_blocking(
+                    _plan_after_sync,
                     application,
                     uris,
                     [later for later in ordered_stages if later is not Stage.SYNC],
@@ -453,16 +460,18 @@ def run_stages_directly(
         # gate, which on a bucket workspace means syncing the catalog mirror to
         # answer a question about no episodes.
         counts: StageBatchCounts = (
-            process_stage_batch(
-                application,
-                stage_uris,
-                stage.value,
-                orchestrator_run_id=orchestrator_run_id,
-                _registered_step_selection=(
-                    ALL_REGISTERED_STEPS
-                    if stage_step_names is None
-                    else SelectedRegisteredSteps(stage_step_names)
-                ),
+            (
+                await process_stage_batch(
+                    application,
+                    stage_uris,
+                    stage.value,
+                    orchestrator_run_id=orchestrator_run_id,
+                    _registered_step_selection=(
+                        ALL_REGISTERED_STEPS
+                        if stage_step_names is None
+                        else SelectedRegisteredSteps(stage_step_names)
+                    ),
+                )
             )
             if stage_uris
             else {"processed": 0, "quarantined": 0, "errors": 0}

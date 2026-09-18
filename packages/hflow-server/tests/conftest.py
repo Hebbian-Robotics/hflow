@@ -8,6 +8,8 @@ from hflow_server import ServerSettings, create_app
 from ui_test_fixtures import PopulatedWorkspace, build_populated_workspace
 
 from hflow.catalog import Catalog
+from hflow.storage import BucketStorageRoot, StorageRoot
+from hflow.storage import parse_storage_root as real_parse_storage_root
 
 
 @pytest.fixture(scope="session")
@@ -86,3 +88,32 @@ def empty_catalog_api(
     Catalog(data_root / "catalog")
     settings = ServerSettings(data_root=str(data_root), assets_dir=unbuilt_assets_dir)
     return TestClient(create_app(settings))
+
+
+@pytest.fixture()
+def bucket_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[str, BucketStorageRoot]:
+    """Real bucket I/O over file://; only URL resolution is redirected.
+
+    Public file:// settings resolve to LocalStorageRoot, so a sentinel URL
+    selects a BucketStorageRoot without credentials or cloud requests. All
+    catalog, sidecar and manifest operations run through the real backend.
+    """
+    pytest.importorskip("obstore", reason="bucket tests need the hflow[bucket] extra")
+    remote_directory = tmp_path / "remote"
+    remote_directory.mkdir()
+    root = BucketStorageRoot(remote_directory.as_uri(), mirror=tmp_path / "mirror")
+    sentinel = "gs://hflow-test-bucket/workspace"
+
+    def parse_as_test_bucket(value: str | Path | StorageRoot) -> StorageRoot:
+        return root if value == sentinel else real_parse_storage_root(value)
+
+    for module in (
+        "hflow.storage",
+        "hflow.workspace",
+        "hflow_server._settings",
+        "hflow_server._sidecar",
+    ):
+        monkeypatch.setattr(f"{module}.parse_storage_root", parse_as_test_bucket)
+    return sentinel, root

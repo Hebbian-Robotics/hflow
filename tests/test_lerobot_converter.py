@@ -2,18 +2,22 @@
 
 These tests exercise the metadata-driven discovery and fail-loud behavior
 with a synthetic v3-style corpus, without asserting third-party
-implementation details or touching the network.
+implementation details or contacting external services.
 """
 
-import io
+import hashlib
 import json
 import logging
 import shutil
 import subprocess
-import urllib.request
-from collections.abc import Sequence
+import threading
+from collections.abc import Callable, Sequence
 from dataclasses import replace
+from functools import partial
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import unquote, urlsplit
 
 import pytest
 
@@ -50,6 +54,20 @@ def _source_archive(
         cache_dir=cache_dir,
         dataset=dataset_source,
     )
+
+
+def _stub_download(
+    monkeypatch: pytest.MonkeyPatch, supply_file: Callable[[str, Path], None]
+) -> None:
+    """Supply fixture files at the SDK boundary, using its repository layout."""
+
+    def download(_repo_id: str, filename: str, *, local_dir: Path, **_kwargs: object) -> str:
+        destination = local_dir / filename
+        if not destination.exists():
+            supply_file(filename, destination)
+        return str(destination)
+
+    monkeypatch.setattr(prep, "hf_hub_download", download)
 
 
 _FFMPEG = shutil.which("ffmpeg")
@@ -163,6 +181,11 @@ def _build_fake_corpus(tmp_path: Path) -> dict:
         't(index, episode_index, frame_index, timestamp, "observation.state", action)) '
         f"TO '{data_quoted}' (FORMAT parquet)"
     )
+    conn.execute(
+        "COPY (SELECT index, episode_index, frame_index, CAST(timestamp AS DOUBLE) AS timestamp, "
+        f"\"observation.state\", action FROM read_parquet('{data_quoted}')) "
+        f"TO '{data_quoted}' (FORMAT parquet)"
+    )
     conn.close()
 
     return {
@@ -258,24 +281,19 @@ def test_index_discovery_multi_camera_metadata(
     monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: corpus["info"])
     monkeypatch.setattr(
         prep,
-        "_hf_tree",
-        lambda repo, rev, path: (
-            [{"path": "meta/episodes/chunk-000/file-000.parquet", "type": "file"}]
-            if "episodes" in path
-            else [{"path": "meta/info.json", "type": "file"}]
-        ),
+        "_hf_episode_metadata_files",
+        lambda repo, rev: ["meta/episodes/chunk-000/file-000.parquet"],
     )
-    monkeypatch.setattr(prep, "_download_file", lambda url, dest, **kw: None)
 
-    def fake_dl(url: str, dest: Path, **kw: object) -> None:
+    def fake_dl(filename: str, dest: Path, **kw: object) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
-        if "meta/episodes" in url:
+        if "meta/episodes" in filename:
             import shutil
 
             shutil.copy(
                 str(tmp_path / "meta" / "episodes" / "chunk-000" / "file-000.parquet"), dest
             )
-        elif url.endswith("info.json"):
+        elif filename.endswith("info.json"):
             import shutil
 
             shutil.copy(str(tmp_path / "meta" / "info.json"), dest)
@@ -284,7 +302,7 @@ def test_index_discovery_multi_camera_metadata(
 
             shutil.copy(str(tmp_path / "data" / "chunk-000" / "file-000.parquet"), dest)
 
-    monkeypatch.setattr(prep, "_download_file", fake_dl)
+    _stub_download(monkeypatch, fake_dl)
 
     ds = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
     found = prep._ensure_source_archive(ds, tmp_path)
@@ -344,33 +362,19 @@ def test_index_discovery_reads_every_metadata_shard(
     monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: corpus["info"])
     monkeypatch.setattr(
         prep,
-        "_hf_tree",
-        lambda repo, rev, path: (
-            [{"path": shard_path, "type": "file"} for shard_path in shard_paths]
-            if "episodes" in path
-            else [{"path": "meta/info.json", "type": "file"}]
-        ),
+        "_hf_episode_metadata_files",
+        lambda repo, rev: list(shard_paths),
     )
-    downloaded_destinations: dict[str, Path] = {}
 
-    def fake_download(url: str, dest: Path, **kw: object) -> None:
-        relative_path = url.split("/resolve/abc/", 1)[1]
-        assert relative_path not in downloaded_destinations, f"downloaded twice: {url}"
-        downloaded_destinations[relative_path] = dest
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy(tmp_path / relative_path, dest)
+    def supply_metadata_file(filename: str, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(tmp_path / filename, destination)
 
-    monkeypatch.setattr(prep, "_download_file", fake_download)
+    _stub_download(monkeypatch, supply_metadata_file)
 
     ds = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
     cache_dir = tmp_path / "cache"
     found = prep._ensure_source_archive(ds, cache_dir)
-    # A second discovery reuses each shard's own cache entry instead of
-    # re-downloading or colliding with the other shard.
-    prep._ensure_source_archive(ds, cache_dir)
-
-    assert set(downloaded_destinations) == set(shard_paths)
-    assert len(set(downloaded_destinations.values())) == len(shard_paths)
     assert [episode.episode_index for episode in found.episodes] == [0, 1, 2, 3]
     assert set(found.video_keys) == {"observation.images.up", "observation.images.side"}
     for episode in found.episodes:
@@ -382,23 +386,7 @@ def test_index_discovery_reads_every_metadata_shard(
             assert window.to_timestamp == pytest.approx(2.0 + episode_index * 0.2)
 
 
-@pytest.mark.parametrize(
-    "tree_entry_path",
-    [
-        "meta/episodes/../../data/chunk-000/file-000.parquet",
-        "/tmp/probe-293-absolute.parquet",
-        "meta/episodes",
-        "meta/other/file-000.parquet",
-    ],
-)
-def test_episode_metadata_cache_path_refuses_entries_outside_the_metadata_tree(
-    tmp_path: Path, tree_entry_path: str
-) -> None:
-    with pytest.raises(ValueError, match="not a file below meta/episodes/"):
-        prep._episode_metadata_cache_path(tmp_path, tree_entry_path, repo_id="fake/repo")
-
-
-def test_video_cache_distinguishes_file_indices_and_reuses_same_source(
+def test_conversion_selects_video_by_file_index(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     corpus = _build_fake_corpus(tmp_path)
@@ -435,18 +423,12 @@ def test_video_cache_distinguishes_file_indices_and_reuses_same_source(
         "observation.state": prep._NumericSchema(name="observation.state", dim=6),
         "action": prep._NumericSchema(name="action", dim=6),
     }
-    video_downloaded_urls: set[str] = set()
-    cache_path_by_url: dict[str, Path] = {}
     converted_sources: list[bytes] = []
 
-    def fake_download(url: str, destination_path: Path, **_kwargs: object) -> None:
+    def fake_download(filename: str, destination_path: Path, **_kwargs: object) -> None:
         destination_path.parent.mkdir(parents=True, exist_ok=True)
-        if "/videos/" in url:
-            if url in video_downloaded_urls:
-                raise AssertionError(f"source was downloaded twice: {url}")
-            video_downloaded_urls.add(url)
-            cache_path_by_url[url] = destination_path
-            destination_path.write_bytes(url.encode())
+        if filename.startswith("videos/"):
+            destination_path.write_bytes(filename.encode())
             return
         shutil.copy(tmp_path / "data" / "chunk-000" / "file-000.parquet", destination_path)
 
@@ -454,7 +436,7 @@ def test_video_cache_distinguishes_file_indices_and_reuses_same_source(
         converted_sources.append(mp4_path.read_bytes())
         return [b"access-unit"]
 
-    monkeypatch.setattr(prep, "_download_file", fake_download)
+    _stub_download(monkeypatch, fake_download)
     monkeypatch.setattr(prep, "_transcode_mp4_to_h264", fake_transcode)
     monkeypatch.setattr(prep, "_get_video_pts_times", lambda path: [0])
     monkeypatch.setattr(prep, "ffmpeg_version", lambda: "test-ffmpeg")
@@ -490,18 +472,15 @@ def test_video_cache_distinguishes_file_indices_and_reuses_same_source(
         assert receipt["content_id"] == prep.content_episode_id(landed_path)
         assert receipt["size_bytes"] == landed_path.stat().st_size
 
-    video_urls = [
-        "https://huggingface.co/datasets/fake/repo/resolve/abc/videos/"
-        "observation.images.up/chunk-000/file-000.mp4",
-        "https://huggingface.co/datasets/fake/repo/resolve/abc/videos/"
-        "observation.images.up/chunk-000/file-001.mp4",
+    video_filenames = [
+        "videos/observation.images.up/chunk-000/file-000.mp4",
+        "videos/observation.images.up/chunk-000/file-001.mp4",
     ]
     assert converted_sources == [
-        video_urls[0].encode(),
-        video_urls[1].encode(),
-        video_urls[0].encode(),
+        video_filenames[0].encode(),
+        video_filenames[1].encode(),
+        video_filenames[0].encode(),
     ]
-    assert cache_path_by_url[video_urls[0]] != cache_path_by_url[video_urls[1]]
 
 
 def test_camera_selection_validates_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -512,28 +491,24 @@ def test_camera_selection_validates_keys(tmp_path: Path, monkeypatch: pytest.Mon
     monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: corpus["info"])
     monkeypatch.setattr(
         prep,
-        "_hf_tree",
-        lambda repo, rev, path: (
-            [{"path": "meta/episodes/chunk-000/file-000.parquet", "type": "file"}]
-            if "episodes" in path
-            else [{"path": "meta/info.json", "type": "file"}]
-        ),
+        "_hf_episode_metadata_files",
+        lambda repo, rev: ["meta/episodes/chunk-000/file-000.parquet"],
     )
 
-    def fake_dl(url: str, dest: Path, **kw: object) -> None:
+    def fake_dl(filename: str, dest: Path, **kw: object) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
         import shutil
 
-        if "meta/episodes" in url:
+        if "meta/episodes" in filename:
             shutil.copy(
                 str(tmp_path / "meta" / "episodes" / "chunk-000" / "file-000.parquet"), dest
             )
-        elif url.endswith("info.json"):
+        elif filename.endswith("info.json"):
             shutil.copy(str(tmp_path / "meta" / "info.json"), dest)
         else:
             shutil.copy(str(tmp_path / "data" / "chunk-000" / "file-000.parquet"), dest)
 
-    monkeypatch.setattr(prep, "_download_file", fake_dl)
+    _stub_download(monkeypatch, fake_dl)
 
     with pytest.raises(ValueError, match="not found"):
         prep.import_lerobot_dataset(
@@ -612,11 +587,12 @@ def test_import_namespaces_source_cache_by_resolved_revision(
 def test_hf_repo_info_rejects_malformed_commit_sha(
     resolved_sha: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    response_body = json.dumps({"sha": resolved_sha, "cardData": {"license": "apache-2.0"}})
     monkeypatch.setattr(
-        prep.urllib.request,
-        "urlopen",
-        lambda request, timeout: io.BytesIO(response_body.encode()),
+        prep,
+        "HfApi",
+        lambda: SimpleNamespace(
+            dataset_info=lambda *_args, **_kwargs: SimpleNamespace(sha=resolved_sha)
+        ),
     )
 
     with pytest.raises(ValueError, match="malformed commit sha"):
@@ -725,268 +701,313 @@ def test_converter_output_remuxes_without_tail_loss(
     assert "nb_read_frames=90" in probe.stdout, probe.stdout
 
 
-# --- Hugging Face JSON boundary contextual errors (#301) ---------------------
-#
-# The LeRobot importer decodes response bytes at three HF boundaries (repo
-# info, tree listings, meta/info.json). Invalid UTF-8 or malformed JSON must
-# surface as a contextual ValueError naming the source, with the original
-# decoder exception chained as the cause. These tests stub urlopen with local
-# bytes; no network request is made.
-
-
-class _StubResponse:
-    """Minimal urlopen response double: a context manager with read()."""
-
-    def __init__(self, body: bytes, headers: dict[str, str] | None = None) -> None:
-        self._body = body
-        self.headers = headers or {}
-
-    def __enter__(self) -> "_StubResponse":
-        return self
-
-    def __exit__(self, *_args: object) -> None:
-        return None
-
-    def read(self) -> bytes:
-        return self._body
-
-
-class _StubUrlopen:
-    """Routes urlopen calls to fixed bytes by a marker in the request URL."""
-
-    def __init__(
-        self,
-        routes: dict[str, bytes],
-        response_headers: dict[str, dict[str, str]] | None = None,
-        max_requests: int | None = None,
-    ) -> None:
-        self._routes = routes
-        self._response_headers = response_headers or {}
-        self._max_requests = max_requests
-        self.requests: list[urllib.request.Request] = []
-
-    def __call__(self, request: urllib.request.Request, timeout: int = 60) -> _StubResponse:
-        url = request.full_url
-        self.requests.append(request)
-        if self._max_requests is not None and len(self.requests) > self._max_requests:
-            raise AssertionError(f"urlopen exceeded test request limit: {self._max_requests}")
-        for marker, body in self._routes.items():
-            if marker in url:
-                return _StubResponse(body, self._response_headers.get(marker))
-        raise AssertionError(f"unexpected urlopen URL: {url}")
-
-
-def _stub_urlopen(
-    monkeypatch: pytest.MonkeyPatch,
-    routes: dict[str, bytes],
-    response_headers: dict[str, dict[str, str]] | None = None,
-    max_requests: int | None = None,
-) -> _StubUrlopen:
-    stub = _StubUrlopen(routes, response_headers, max_requests)
-    monkeypatch.setattr(urllib.request, "urlopen", stub)
-    return stub
-
-
-_INVALID_UTF8 = b"\xff\xfe\x00"
-_MALFORMED_JSON = b"{not json"
-
-
-def test_hf_repo_info_invalid_utf8_raises_contextual_value_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _stub_urlopen(monkeypatch, {"/api/datasets/": _INVALID_UTF8})
-    with pytest.raises(ValueError) as excinfo:
-        prep._hf_repo_info("lerobot/pusht", "main")
-    assert "lerobot/pusht@main" in str(excinfo.value)
-    assert isinstance(excinfo.value.__cause__, UnicodeDecodeError)
-
-
-def test_hf_repo_info_malformed_json_raises_contextual_value_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _stub_urlopen(monkeypatch, {"/api/datasets/": _MALFORMED_JSON})
-    with pytest.raises(ValueError) as excinfo:
-        prep._hf_repo_info("lerobot/pusht", "main")
-    assert "lerobot/pusht@main" in str(excinfo.value)
-    assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
-
-
-def test_hf_tree_invalid_utf8_raises_contextual_value_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _stub_urlopen(monkeypatch, {"/tree/": _INVALID_UTF8})
-    with pytest.raises(ValueError) as excinfo:
-        prep._hf_tree("lerobot/pusht", "main", "meta")
-    message = str(excinfo.value)
-    assert "lerobot/pusht@main" in message
-    assert "'meta'" in message
-    assert isinstance(excinfo.value.__cause__, UnicodeDecodeError)
-
-
-def test_hf_tree_malformed_json_raises_contextual_value_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _stub_urlopen(monkeypatch, {"/tree/": b"[1, 2"})
-    with pytest.raises(ValueError) as excinfo:
-        prep._hf_tree("lerobot/pusht", "main", "meta")
-    message = str(excinfo.value)
-    assert "lerobot/pusht@main" in message
-    assert "'meta'" in message
-    assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
-
-
-def test_fetch_info_json_invalid_utf8_raises_contextual_value_error(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    tree_body = json.dumps([{"path": "meta/info.json", "type": "file"}]).encode()
-    _stub_urlopen(
-        monkeypatch,
-        {"recursive=true": tree_body, "meta/info.json": _INVALID_UTF8},
+def _decoded_gray_frame_stdin(access_units: "list[bytes]") -> bytes:
+    """Decode the first frame of an Annex B H.264 stream fed on stdin."""
+    completed = subprocess.run(
+        [
+            str(_FFMPEG),
+            "-v",
+            "error",
+            "-f",
+            "h264",
+            "-i",
+            "pipe:0",
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            "gray",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ],
+        input=b"".join(access_units),
+        capture_output=True,
+        check=True,
     )
-    with pytest.raises(ValueError) as excinfo:
-        prep._fetch_info_json("lerobot/pusht", "main", tmp_path)
-    message = str(excinfo.value)
-    assert "meta/info.json" in message
-    assert "lerobot/pusht@main" in message
-    assert isinstance(excinfo.value.__cause__, UnicodeDecodeError)
+    return completed.stdout
 
 
-def test_fetch_info_json_malformed_json_raises_contextual_value_error(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    tree_body = json.dumps([{"path": "meta/info.json", "type": "file"}]).encode()
-    _stub_urlopen(
-        monkeypatch,
-        {"recursive=true": tree_body, "meta/info.json": b"{oops"},
+def _source_gray_frame(video: Path, index: int) -> bytes:
+    """Decode one frame of the source video by its absolute frame index."""
+    completed = subprocess.run(
+        [
+            str(_FFMPEG),
+            "-v",
+            "error",
+            "-i",
+            str(video),
+            "-vf",
+            f"select=eq(n\\,{index})",
+            "-frames:v",
+            "1",
+            "-fps_mode",
+            "passthrough",
+            "-pix_fmt",
+            "gray",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ],
+        capture_output=True,
+        check=True,
     )
-    with pytest.raises(ValueError) as excinfo:
-        prep._fetch_info_json("lerobot/pusht", "main", tmp_path)
-    message = str(excinfo.value)
-    assert "meta/info.json" in message
-    assert "lerobot/pusht@main" in message
-    assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
+    return completed.stdout
 
 
-def test_hf_repo_info_valid_json_still_resolves(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A real resolved commit sha: at least the 7 hex characters the sha
-    # validation requires, since a cache directory is named after it.
-    body = json.dumps({"sha": "abc1234", "cardData": {"license": "apache-2.0"}}).encode()
-    _stub_urlopen(monkeypatch, {"/api/datasets/": body})
-    assert prep._hf_repo_info("lerobot/pusht", "main") == {
-        "sha": "abc1234",
-        "license": "apache-2.0",
+def _mean_absolute_difference(left: bytes, right: bytes) -> float:
+    assert left and len(left) == len(right)
+    return sum(abs(a - b) for a, b in zip(left, right, strict=True)) / len(left)
+
+
+def _episode_video_access_units(mcap: Path, camera_key: str) -> "list[bytes]":
+    """The episode's stored H.264 access units, in log order."""
+    from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
+
+    reader = open_reader(mcap)
+    units: list[bytes] = []
+    try:
+        for batch in reader.iter_batches(topics=[f"/{camera_key}"]):
+            for message in batch.data:
+                video_message = CompressedVideo()
+                video_message.ParseFromString(message)
+                units.append(video_message.data)
+    finally:
+        reader.close()
+    return units
+
+
+def test_converter_slices_exactly_the_declared_frame_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A window end landing exactly on a frame boundary must not pull the
+    next episode's first frame into the slice.
+
+    Source end timestamps are exclusive ([from, to) like the data rows), but
+    an end that lands exactly on the frame grid rounds UP to the next frame's
+    timestamp when ffmpeg receives it, so the -to cut includes one frame too
+    many and the converter refuses the episode. The slice is cut by the
+    declared frame count instead, so the parquet and the video cannot
+    disagree by one. The first episode of the pinned svla corpus reproduces
+    this on real recordings (length 226 vs 227 access units).
+    """
+    assert _FFMPEG is not None and _FFPROBE is not None
+    source = tmp_path / "source.mp4"
+    subprocess.run(
+        [
+            _FFMPEG,
+            "-hide_banner",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=30:duration=3,format=yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-bf",
+            "0",
+            "-g",
+            "30",
+            "-keyint_min",
+            "30",
+            "-sc_threshold",
+            "0",
+            str(source),
+        ],
+        capture_output=True,
+        check=True,
+    )
+    system_ffmpeg_path = Path(_FFMPEG)
+    system_ffprobe_path = Path(_FFPROBE)
+    monkeypatch.setattr(prep, "ffmpeg_path", lambda: system_ffmpeg_path)
+    monkeypatch.setattr(prep, "ffprobe_path", lambda: system_ffprobe_path)
+    monkeypatch.setattr(prep, "ffmpeg_version", lambda: "test-ffmpeg")
+
+    camera_key = "observation.images.up"
+    corpus = _build_fake_corpus(tmp_path)
+
+    # Two episodes sharing one 90-frame video. Episode 0 declares 62 frames
+    # and its window ends at 62/30 s -- exactly the boundary where a
+    # timestamp cut includes frame 62 (the first frame of episode 1).
+    boundary = 62 / 30.0
+
+    def episode_row(index: int, length: int, data_from: int) -> dict:
+        return {
+            "episode_index": index,
+            "task": f"task-{index}",
+            "length": length,
+            "data_chunk": "000",
+            "data_file": "000",
+            "data_from": data_from,
+            "data_to": data_from + length,
+            "video_windows": {
+                camera_key: {
+                    "chunk_index": "000",
+                    "file_index": "000",
+                    "from_timestamp": 0.0 if index == 0 else boundary,
+                    "to_timestamp": boundary if index == 0 else 3.0,
+                }
+            },
+        }
+
+    data_rows = []
+    for index in range(2):
+        length = 62 if index == 0 else 28
+        for frame in range(length):
+            state = "[" + ",".join(str(float(frame)) for _ in range(6)) + "]"
+            action = "[" + ",".join(str(float(frame + 0.5)) for _ in range(6)) + "]"
+            data_rows.append(
+                [index * 62 + frame, index, frame, round(frame / 30.0, 6), state, action]
+            )
+    data_path = tmp_path / "data" / "chunk-000" / "file-000.parquet"
+    data_path.parent.mkdir(parents=True, exist_ok=True)
+    data_quoted = str(data_path).replace("'", "''")
+    data_vals = ",".join("(" + ",".join(str(v) for v in row) + ")" for row in data_rows)
+    import duckdb
+
+    conn = duckdb.connect()
+    conn.execute(
+        f"COPY (SELECT * FROM (VALUES {data_vals}) AS "
+        't(index, episode_index, frame_index, timestamp, "observation.state", action)) '
+        f"TO '{data_quoted}' (FORMAT parquet)"
+    )
+    conn.execute(
+        "COPY (SELECT index, episode_index, frame_index, CAST(timestamp AS DOUBLE) AS timestamp, "
+        f"\"observation.state\", action FROM read_parquet('{data_quoted}')) "
+        f"TO '{data_quoted}' (FORMAT parquet)"
+    )
+    conn.close()
+
+    dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
+
+    def typed_episode_row(index: int, length: int, data_from: int) -> prep._EpisodeRow:
+        row = episode_row(index, length, data_from)
+        return prep._EpisodeRow(
+            episode_index=row["episode_index"],
+            task=row["task"],
+            length=row["length"],
+            data_chunk=row["data_chunk"],
+            data_file=row["data_file"],
+            data_from=row["data_from"],
+            data_to=row["data_to"],
+            video_windows={
+                camera_key: prep._VideoWindow(
+                    chunk_index=window["chunk_index"],
+                    file_index=window["file_index"],
+                    from_timestamp=window["from_timestamp"],
+                    to_timestamp=window["to_timestamp"],
+                )
+                for camera_key, window in row["video_windows"].items()
+            },
+        )
+
+    source_archive = prep._SourceArchive(
+        dataset_information=prep._parse_dataset_information(corpus["info"]),
+        episodes=(typed_episode_row(0, 62, 0), typed_episode_row(1, 28, 62)),
+        video_keys=(camera_key,),
+        cache_dir=corpus["cache_dir"],
+        dataset=dataset_source,
+    )
+    numeric_schemas = {
+        "observation.state": prep._NumericSchema(name="observation.state", dim=6),
+        "action": prep._NumericSchema(name="action", dim=6),
     }
 
+    def fake_download(filename: str, destination_path: Path, **_kwargs: object) -> None:
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        if filename.startswith("videos/"):
+            shutil.copy(source, destination_path)
+            return
+        shutil.copy(data_path, destination_path)
 
-def test_hf_tree_valid_json_still_returns_entries(monkeypatch: pytest.MonkeyPatch) -> None:
-    body = json.dumps([{"path": "meta/info.json", "type": "file"}]).encode()
-    stub = _stub_urlopen(monkeypatch, {"/tree/": body})
-    assert prep._hf_tree("lerobot/pusht", "main", "meta") == [
-        {"path": "meta/info.json", "type": "file"}
-    ]
-    assert len(stub.requests) == 1
+    _stub_download(monkeypatch, fake_download)
+
+    storage = LocalStorageRoot(tmp_path / "output")
+    landed_by_index: dict[int, Path] = {}
+    for index in (0, 1):
+        receipt = prep._convert_single_episode(
+            source_archive=source_archive,
+            dataset_source=dataset_source,
+            storage=storage,
+            episode_index=index,
+            camera_keys=(camera_key,),
+            numeric_schemas=numeric_schemas,
+            frames_per_second=30,
+        )
+        assert Path(receipt["uri"]).name == f"lerobot_episode_{index + 1:04d}.mcap"
+        landed_path = Path(receipt["uri"])
+        landed_by_index[index] = landed_path
+        assert receipt["content_id"] == prep.content_episode_id(landed_path)
+        assert receipt["size_bytes"] == landed_path.stat().st_size
+
+    # The canonical landing records the source episode it was converted from.
+    episode_metadata = open_reader(
+        storage.path / "landing" / "lerobot_episode_0001.mcap"
+    ).metadata()
+    assert episode_metadata["episode/v1"]["source_episode_index"] == "0"
+
+    # The two episodes share one source video, so counts and receipts alone
+    # cannot tell their windows apart: a dropped input seek gives episode 1
+    # episode 0's frames with a correct count (silent wrong footage). Pin each
+    # episode's first decoded frame to its own window's source frame instead.
+    episode_openers = {
+        index: _decoded_gray_frame_stdin(_episode_video_access_units(path, camera_key))
+        for index, path in landed_by_index.items()
+    }
+    source_frame_0 = _source_gray_frame(source, 0)
+    source_frame_62 = _source_gray_frame(source, 62)
+
+    for index, window_start_frame in ((0, 0), (1, 62)):
+        opener = episode_openers[index]
+        own = source_frame_0 if window_start_frame == 0 else source_frame_62
+        other = source_frame_62 if window_start_frame == 0 else source_frame_0
+        assert _mean_absolute_difference(opener, own) < _mean_absolute_difference(opener, other), (
+            f"episode {index} does not open on source frame {window_start_frame}"
+        )
+    assert _mean_absolute_difference(episode_openers[0], episode_openers[1]) > 5.0, (
+        "the two episodes' opening frames are not distinguishable"
+    )
 
 
-def test_hf_tree_follows_next_link_preserves_headers_and_deduplicates_entries(
+def test_window_times_are_count_anchored_not_boundary_filtered(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    first_page = json.dumps([{"path": "meta/info.json", "type": "file"}]).encode()
-    second_page = json.dumps(
-        [
-            {"path": "meta/info.json", "type": "file"},
-            {"path": "meta/episodes/file-000.parquet", "type": "file"},
-        ]
-    ).encode()
-    next_url = (
-        "https://huggingface.co/api/datasets/lerobot/pusht/tree/main/meta"
-        "?recursive=true&cursor=page-2"
+    """Quantized container timestamps at the window edges must not change the
+    frame count: the episode's extent is its data-row count, not a half-open
+    time filter that float32 rounding can tip by one frame in either
+    direction. The pinned svla corpus reproduces both directions (231
+    packets in a 230-row window; 214 in a 215-row window) on current main.
+    """
+    import struct
+
+    def f32(value: float) -> float:
+        return struct.unpack("f", struct.pack("f", value))[0]
+
+    fps = 30.0
+    start_seconds = 10.0
+    frame_count = 230
+    end_seconds = start_seconds + frame_count / fps
+    # Two hundred thirty data rows (indexes 300..529); the chunk carries
+    # frames 299..535, and the next episode's first frame (index 530, at
+    # exactly ``end_seconds``) quantizes to a hair BELOW the float64 end --
+    # inside a half-open [start, end) filter, outside a count-anchored one.
+    packets = [f32(index / fps) for index in range(299, 536)]
+
+    monkeypatch.setattr(prep, "_get_video_pts_times", lambda _path: packets)
+    rebased = prep._relative_video_pts_times(
+        Path("chunk.mp4"), start_seconds, end_seconds, frame_count, fps
     )
-    stub = _stub_urlopen(
-        monkeypatch,
-        {"cursor=page-2": second_page, "/tree/": first_page},
-        {"/tree/": {"Link": f'<{next_url}>; rel="next"'}},
-    )
-    monkeypatch.setenv("HF_TOKEN", "test-token")
+    assert len(rebased) == frame_count
+    assert rebased == [f32(index / fps) - start_seconds for index in range(300, 530)]
 
-    assert prep._hf_tree("lerobot/pusht", "main", "meta") == [
-        {"path": "meta/info.json", "type": "file"},
-        {"path": "meta/episodes/file-000.parquet", "type": "file"},
-    ]
-    assert [request.full_url for request in stub.requests] == [
-        "https://huggingface.co/api/datasets/lerobot/pusht/tree/main/meta?recursive=true",
-        next_url,
-    ]
-    for request in stub.requests:
-        assert request.get_header("User-agent") == "hflow-lerobot"
-        assert request.get_header("Authorization") == "Bearer test-token"
-
-
-def test_hf_tree_rejects_next_link_with_different_origin(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    first_page = json.dumps([{"path": "meta/info.json", "type": "file"}]).encode()
-    unsafe_next_url = "https://attacker.example/tree/secret?cursor=page-2"
-    stub = _stub_urlopen(
-        monkeypatch,
-        {"/tree/": first_page},
-        {"/tree/": {"Link": f'<{unsafe_next_url}>; rel="next"'}},
-        max_requests=1,
-    )
-    monkeypatch.setenv("HF_TOKEN", "secret-user-token")
-
-    with pytest.raises(ValueError, match="different scheme and host"):
-        prep._hf_tree("lerobot/pusht", "main", "meta")
-
-    assert len(stub.requests) == 1
-
-
-def test_hf_tree_rejects_a_repeated_next_url(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    first_page = json.dumps([{"path": "meta/info.json", "type": "file"}]).encode()
-    page_url = "https://huggingface.co/api/datasets/lerobot/pusht/tree/main/meta?recursive=true"
-    stub = _stub_urlopen(
-        monkeypatch,
-        {"/tree/": first_page},
-        {"/tree/": {"Link": f'<{page_url}>; rel="next"'}},
-        max_requests=1,
-    )
-
-    with pytest.raises(ValueError, match="already fetched"):
-        prep._hf_tree("lerobot/pusht", "main", "meta")
-
-    assert len(stub.requests) == 1
-
-
-def test_hf_tree_malformed_later_page_raises_contextual_value_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    first_page = json.dumps([{"path": "meta/info.json", "type": "file"}]).encode()
-    next_url = (
-        "https://huggingface.co/api/datasets/lerobot/pusht/tree/main/meta"
-        "?recursive=true&cursor=page-2"
-    )
-    _stub_urlopen(
-        monkeypatch,
-        {"cursor=page-2": _MALFORMED_JSON, "/tree/": first_page},
-        {"/tree/": {"Link": f'<{next_url}>; rel="next"'}},
-    )
-
-    with pytest.raises(ValueError) as excinfo:
-        prep._hf_tree("lerobot/pusht", "main", "meta")
-
-    message = str(excinfo.value)
-    assert "lerobot/pusht@main" in message
-    assert "'meta'" in message
-    assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
-
-
-def test_hf_repo_info_wrong_shape_refusal_unchanged(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _stub_urlopen(monkeypatch, {"/api/datasets/": b"[1, 2, 3]"})
-    with pytest.raises(ValueError, match="not a JSON object"):
-        prep._hf_repo_info("lerobot/pusht", "main")
+    # A video with too few packets after the window start is refused loudly
+    # rather than silently producing a short episode.
+    monkeypatch.setattr(prep, "_get_video_pts_times", lambda _path: packets[: frame_count - 1])
+    with pytest.raises(ValueError, match=r"video has \d+ packets"):
+        prep._relative_video_pts_times(
+            Path("chunk.mp4"), start_seconds, end_seconds, frame_count, fps
+        )
 
 
 @pytest.mark.parametrize(
@@ -1028,10 +1049,10 @@ def test_info_json_refuses_non_finite_or_non_positive_fps(
     )
     monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: info)
 
-    def fail_tree(repo: str, rev: str, path: str) -> list[dict]:
+    def fail_discovery(repo: str, rev: str) -> list[str]:
         raise AssertionError("episode metadata discovery must not run after invalid fps")
 
-    monkeypatch.setattr(prep, "_hf_tree", fail_tree)
+    monkeypatch.setattr(prep, "_hf_episode_metadata_files", fail_discovery)
 
     dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
     cache_dir = tmp_path / "cache"
@@ -1056,24 +1077,20 @@ def test_info_json_accepts_normal_positive_fps(
     monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: corpus["info"])
     monkeypatch.setattr(
         prep,
-        "_hf_tree",
-        lambda repo, rev, path: (
-            [{"path": "meta/episodes/chunk-000/file-000.parquet", "type": "file"}]
-            if "episodes" in path
-            else [{"path": "meta/info.json", "type": "file"}]
-        ),
+        "_hf_episode_metadata_files",
+        lambda repo, rev: ["meta/episodes/chunk-000/file-000.parquet"],
     )
 
-    def fake_dl(url: str, dest: Path, **kw: object) -> None:
+    def fake_dl(filename: str, dest: Path, **kw: object) -> None:
         import shutil
 
         dest.parent.mkdir(parents=True, exist_ok=True)
-        if "meta/episodes" in url:
+        if "meta/episodes" in filename:
             shutil.copy(
                 str(tmp_path / "meta" / "episodes" / "chunk-000" / "file-000.parquet"), dest
             )
 
-    monkeypatch.setattr(prep, "_download_file", fake_dl)
+    _stub_download(monkeypatch, fake_dl)
 
     dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
     source_archive = prep._ensure_source_archive(dataset_source, tmp_path / "cache")
@@ -1363,14 +1380,14 @@ def test_converter_version_reaches_the_canonical_episode_provenance(
         "action": prep._NumericSchema(name="action", dim=6),
     }
 
-    def fake_download(url: str, destination_path: Path, **_kwargs: object) -> None:
+    def fake_download(filename: str, destination_path: Path, **_kwargs: object) -> None:
         destination_path.parent.mkdir(parents=True, exist_ok=True)
-        if "/videos/" in url:
-            destination_path.write_bytes(url.encode())
+        if filename.startswith("videos/"):
+            destination_path.write_bytes(filename.encode())
             return
         shutil.copy(tmp_path / "data" / "chunk-000" / "file-000.parquet", destination_path)
 
-    monkeypatch.setattr(prep, "_download_file", fake_download)
+    _stub_download(monkeypatch, fake_download)
     monkeypatch.setattr(prep, "_transcode_mp4_to_h264", lambda *args, **kwargs: [b"access-unit"])
     monkeypatch.setattr(prep, "_get_video_pts_times", lambda path: [0])
     monkeypatch.setattr(prep, "ffmpeg_version", lambda: "test-ffmpeg")
@@ -2108,24 +2125,20 @@ def _import_success_label_corpus(
     monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: corpus["info"])
     monkeypatch.setattr(
         prep,
-        "_hf_tree",
-        lambda repo, rev, path: (
-            [{"path": "meta/episodes/chunk-000/file-000.parquet", "type": "file"}]
-            if "episodes" in path
-            else [{"path": "meta/info.json", "type": "file"}]
-        ),
+        "_hf_episode_metadata_files",
+        lambda repo, rev: ["meta/episodes/chunk-000/file-000.parquet"],
     )
 
-    def fake_download(url: str, dest: Path, **_kwargs: object) -> None:
+    def fake_download(filename: str, dest: Path, **_kwargs: object) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
-        if "meta/episodes" in url:
+        if "meta/episodes" in filename:
             shutil.copy(root / "meta" / "episodes" / "chunk-000" / "file-000.parquet", dest)
-        elif url.endswith("info.json"):
+        elif filename.endswith("info.json"):
             shutil.copy(root / "meta" / "info.json", dest)
         else:
             shutil.copy(root / "data" / "chunk-000" / "file-000.parquet", dest)
 
-    monkeypatch.setattr(prep, "_download_file", fake_download)
+    _stub_download(monkeypatch, fake_download)
 
     def fake_transcode(mp4_path: Path, gop: float, fps: float) -> list[bytes]:
         if transcode_calls is not None:
@@ -2237,11 +2250,12 @@ def test_converter_version_bumped_with_the_label_support() -> None:
     """The converter version moves with any change to the published bytes.
 
     The label changed episode/v1, which content_episode_id hashes. Reading a
-    fractional fps as declared moves every message log time. Reuse keys on
-    this stamp, so a version that lags a byte change makes stale output look
-    like completed work.
+    fractional fps as declared moves every message log time. The frame-exact
+    window extraction also changes canonical bytes for windowed corpora.
+    Reuse keys on this stamp, so a version that lags a byte change makes
+    stale output look like completed work.
     """
-    assert prep.CONVERTER_VERSION == "lerobot-converter-v8"
+    assert prep.CONVERTER_VERSION == "lerobot-converter-v9"
 
 
 def test_reuse_refuses_a_landing_episode_with_damaged_payload(
@@ -2416,3 +2430,142 @@ def test_reuse_refuses_an_episode_written_before_the_fps_fix(tmp_path: Path) -> 
         )
         is None
     )
+
+
+def test_hub_source_metadata_uses_pinned_files_and_reuses_downloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root = tmp_path / "repository"
+    _build_fake_corpus(source_root)
+    resolved_revision = "a" * 40
+    downloaded_filenames: list[str] = []
+
+    class HubHandler(BaseHTTPRequestHandler):
+        def do_HEAD(self) -> None:
+            self.respond(include_body=False)
+
+        def do_GET(self) -> None:
+            self.respond(include_body=True)
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+        def respond(self, *, include_body: bool) -> None:
+            request_path = unquote(urlsplit(self.path).path)
+            if request_path in {
+                "/api/datasets/fake/repo/revision/main",
+                f"/api/datasets/fake/repo/revision/{resolved_revision}",
+            }:
+                # The metadata shard appears after a large inventory of unrelated
+                # media files. Discovery must still include it without downloading
+                # those files or following the supplied pagination link.
+                siblings = [
+                    {"rfilename": f"videos/unselected/{index}.mp4"} for index in range(1501)
+                ]
+                siblings.extend(
+                    {"rfilename": filename}
+                    for filename in ("meta/info.json", "meta/episodes/chunk-000/file-000.parquet")
+                )
+                payload = json.dumps(
+                    {
+                        "id": "fake/repo",
+                        "sha": resolved_revision,
+                        "cardData": {"license": "apache-2.0"},
+                        "siblings": siblings,
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Link", '<http://127.0.0.1:1/untrusted-page>; rel="next"')
+                self.end_headers()
+                if include_body:
+                    self.wfile.write(payload)
+                return
+            pinned_prefix = f"/datasets/fake/repo/resolve/{resolved_revision}/"
+            if not request_path.startswith(pinned_prefix):
+                self.send_error(404)
+                return
+            filename = request_path.removeprefix(pinned_prefix)
+            source_file = source_root / filename
+            if not source_file.is_file():
+                self.send_error(404)
+                return
+            payload = source_file.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("X-Repo-Commit", resolved_revision)
+            self.send_header("ETag", hashlib.sha256(payload).hexdigest())
+            self.end_headers()
+            if include_body:
+                downloaded_filenames.append(filename)
+                self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), HubHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    endpoint = f"http://127.0.0.1:{server.server_port}"
+    monkeypatch.setattr(prep, "HfApi", partial(prep.HfApi, endpoint=endpoint, token=False))
+    monkeypatch.setattr(
+        prep, "hf_hub_download", partial(prep.hf_hub_download, endpoint=endpoint, token=False)
+    )
+    try:
+        repository_info = prep._hf_repo_info("fake/repo", "main")
+        source = prep.DatasetSource(
+            repo_id="fake/repo", revision=repository_info["sha"], license=repository_info["license"]
+        )
+        cache_directory = tmp_path / "output" / "_lerobot_cache" / source.revision
+        archive = prep._ensure_source_archive(source, cache_directory)
+        repeated_archive = prep._ensure_source_archive(source, cache_directory)
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join()
+
+    assert source.revision == resolved_revision
+    assert source.license == "apache-2.0"
+    assert [episode.length for episode in archive.episodes] == [60, 65, 70, 75]
+    assert repeated_archive == archive
+    assert downloaded_filenames == ["meta/info.json", "meta/episodes/chunk-000/file-000.parquet"]
+    assert not (cache_directory / "videos").exists()
+    assert json.loads((cache_directory / "meta/info.json").read_text())["fps"] == 30
+
+
+@pytest.mark.parametrize("invalid_payload", [b"\xff\xfe", b"{broken"])
+def test_import_refuses_invalid_downloaded_metadata_without_publishing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid_payload: bytes
+) -> None:
+    metadata_file = tmp_path / "downloaded-info.json"
+    metadata_file.write_bytes(invalid_payload)
+    monkeypatch.setattr(prep, "_hf_repo_info", lambda *_args: {"sha": "a" * 40, "license": "mit"})
+    monkeypatch.setattr(prep, "hf_hub_download", lambda *_args, **_kwargs: str(metadata_file))
+    output = tmp_path / "output"
+    with pytest.raises(ValueError, match=r"meta/info\.json"):
+        prep.import_lerobot_dataset(output_dir=output)
+    assert not (output / "landing").exists()
+    assert not (output / "prepared-manifest.json").exists()
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "../outside",
+        "/absolute",
+        "data/../../outside",
+        "meta/episodes/../../outside.parquet",
+        "data\\outside",
+    ],
+)
+def test_source_download_refuses_paths_outside_its_cache(tmp_path: Path, filename: str) -> None:
+    with pytest.raises(ValueError, match="inside the source cache"):
+        prep._download_file("fake/repo", "a" * 40, filename, tmp_path / "cache")
+
+
+def test_source_download_refuses_symlink_outside_its_cache(tmp_path: Path) -> None:
+    cache_directory = tmp_path / "cache"
+    cache_directory.mkdir()
+    outside_directory = tmp_path / "outside"
+    outside_directory.mkdir()
+    (cache_directory / "data").symlink_to(outside_directory, target_is_directory=True)
+    with pytest.raises(ValueError, match="inside the source cache"):
+        prep._download_file("fake/repo", "a" * 40, "data/file.parquet", cache_directory)
+    assert list(outside_directory.iterdir()) == []

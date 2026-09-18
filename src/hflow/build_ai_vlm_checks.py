@@ -7,8 +7,8 @@ sampled, intervals whichever way the answer was produced. Two executions
 implement the contract and are chosen per registered check:
 
 - :class:`OpenAICompatibleExecution` runs Build AI's published methodology:
-  their exact prompts and response schemas (copied below from the evaluation
-  release) through an OpenAI-compatible vision model you name. The module's
+  their published prompts and answer shapes, validated with strict response
+  schemas through an OpenAI-compatible vision model you name. The module's
   name and the ``build_ai_`` check names record that this is where the
   contract and the reference prompts come from.
 - :class:`HFlowHostedExecution` runs HFlow's hosted checks: fixed, versioned
@@ -28,15 +28,16 @@ https://huggingface.co/datasets/builddotai/Egocentric-100K-Evaluation
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import importlib
 import json
 import math
 import os
 import re
-import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -44,10 +45,36 @@ from typing import TYPE_CHECKING, Any, assert_never
 from urllib.parse import urlsplit
 
 import httpx2
+from pydantic import ValidationError
+from tenacity import (
+    AsyncRetrying,
+    RetryCallState,
+    retry_if_exception,
+    stop_after_attempt,
+    stop_before_delay,
+)
 
+from hflow._field_guards import (
+    require_finite_float,
+    require_non_negative_float,
+    require_non_negative_int,
+    require_positive_float,
+    require_positive_int,
+)
 from hflow._version import __version__
 from hflow._video_measurement_toolchain import measure_video_frame_statistics_for_hflow
 from hflow._video_measurements import FrameStatisticsSettings
+from hflow._vlm_boundary import (
+    ACTIVE_MANIPULATION_HOSTED_RESPONSE,
+    HAND_COUNT_HOSTED_RESPONSE,
+    ActiveManipulationAnswer,
+    CompletionResponse,
+    HandCountAnswer,
+    UnparsedResponse,
+    require_bounded_response,
+    strict_response_json,
+)
+from hflow.asyncio_utils import run_blocking
 from hflow.episode import Episode
 from hflow.fingerprints import step_version_from_contract
 from hflow.steps import (
@@ -118,7 +145,30 @@ def _hosted_retry_delay_seconds(retry_after_header: str | None, attempt: int) ->
             requested_delay = None
         if requested_delay is not None and math.isfinite(requested_delay) and requested_delay >= 0:
             return min(requested_delay, _MAX_HOSTED_RETRY_DELAY_SECONDS)
-    return min(float(2**attempt), _MAX_HOSTED_RETRY_DELAY_SECONDS)
+    return min(float(2 ** min(attempt, 7)), _MAX_HOSTED_RETRY_DELAY_SECONDS)
+
+
+def _retryable_hosted_failure(error: BaseException) -> bool:
+    if isinstance(error, httpx2.HTTPStatusError):
+        return error.response.status_code in _RETRYABLE_HOSTED_STATUS_CODES
+    return isinstance(error, httpx2.RequestError)
+
+
+def _hosted_retry_wait(retry_state: RetryCallState) -> float:
+    error = retry_state.outcome.exception() if retry_state.outcome is not None else None
+    retry_after = (
+        error.response.headers.get("Retry-After")
+        if isinstance(error, httpx2.HTTPStatusError)
+        else None
+    )
+    return _hosted_retry_delay_seconds(retry_after, retry_state.attempt_number - 1)
+
+
+def _remaining_hosted_seconds(deadline: float) -> float:
+    remaining_seconds = deadline - time.monotonic()
+    if remaining_seconds <= 0:
+        raise RuntimeError("HFlow hosted check exceeded its total timeout")
+    return remaining_seconds
 
 
 class EvaluationTask(StrEnum):
@@ -170,26 +220,19 @@ class SkippedBlackFrame:
 
 SampledFrameOutcome = VisionModelOutcome | SkippedBlackFrame
 
-HAND_COUNT_RESPONSE_SCHEMA: dict[str, object] = {
-    "type": "object",
-    "properties": {"hand_count": {"type": "integer"}},
-    "required": ["hand_count"],
-}
-ACTIVE_MANIPULATION_RESPONSE_SCHEMA: dict[str, object] = {
-    "type": "object",
-    "properties": {"answer": {"type": "string", "enum": ["yes", "no"]}},
-    "required": ["answer"],
-}
+HAND_COUNT_RESPONSE_SCHEMA: dict[str, object] = HandCountAnswer.model_json_schema()
+ACTIVE_MANIPULATION_RESPONSE_SCHEMA: dict[str, object] = (
+    ActiveManipulationAnswer.model_json_schema()
+)
 
 
 @dataclass(frozen=True)
 class OpenAICompatibleExecution:
     """Answer a check with Build AI's published prompts through a model you name.
 
-    This is the reference methodology: the prompt and response schema are the
-    ones Build AI released, and the model is whatever the OpenAI-compatible
-    endpoint serves. Changing the model changes the answers but not the
-    contract.
+    This uses Build AI's released prompts and answer shapes with stricter,
+    generated response schemas. The model is whatever the OpenAI-compatible
+    endpoint serves. Changing the model changes the answers but not the contract.
     """
 
     endpoint: str
@@ -215,16 +258,10 @@ class OpenAICompatibleExecution:
             raise ValueError(
                 "api_key_environment_variable must be a valid environment variable name"
             )
-        if not isinstance(self.max_tokens, int) or isinstance(self.max_tokens, bool):
-            raise ValueError("max_tokens must be an integer")
-        if self.max_tokens <= 0:
-            raise ValueError("max_tokens must be greater than zero")
-        if not isinstance(self.max_retries, int) or isinstance(self.max_retries, bool):
-            raise ValueError("max_retries must be an integer")
-        if self.max_retries < 0:
-            raise ValueError("max_retries must not be negative")
-        if self.temperature is not None and not math.isfinite(self.temperature):
-            raise ValueError("temperature must be finite")
+        require_positive_int(self.max_tokens, "max_tokens")
+        require_non_negative_int(self.max_retries, "max_retries")
+        if self.temperature is not None:
+            require_finite_float(self.temperature, "temperature")
 
 
 @dataclass(frozen=True)
@@ -242,6 +279,7 @@ class HFlowHostedExecution:
     base_url: str = DEFAULT_HFLOW_HOSTED_BASE_URL
     check_version: int = _DEFAULT_HFLOW_HOSTED_CHECK_VERSION
     request_timeout_seconds: float = 60.0
+    total_timeout_seconds: float = 360.0
     # Retries for transient failures only (429, 502, 503, 504, transport
     # errors), each after the server's Retry-After or an exponential delay. A
     # sampled check makes one request per frame, so one gateway timeout must
@@ -250,24 +288,13 @@ class HFlowHostedExecution:
 
     def __post_init__(self) -> None:
         _require_absolute_http_url(self.base_url, name="base_url")
-        if not isinstance(self.max_retries, int) or isinstance(self.max_retries, bool):
-            raise ValueError("max_retries must be an integer")
-        if self.max_retries < 0:
-            raise ValueError("max_retries must not be negative")
+        require_non_negative_int(self.max_retries, "max_retries")
         parsed_base_url = urlsplit(self.base_url)
         if parsed_base_url.query or parsed_base_url.fragment:
             raise ValueError("base_url must not contain a query string or fragment")
-        if not isinstance(self.check_version, int) or isinstance(self.check_version, bool):
-            raise ValueError("check_version must be an integer")
-        if self.check_version <= 0:
-            raise ValueError("check_version must be greater than zero")
-        if (
-            isinstance(self.request_timeout_seconds, bool)
-            or not isinstance(self.request_timeout_seconds, int | float)
-            or not math.isfinite(self.request_timeout_seconds)
-            or self.request_timeout_seconds <= 0
-        ):
-            raise ValueError("request_timeout_seconds must be finite and greater than zero")
+        require_positive_int(self.check_version, "check_version")
+        require_positive_float(self.request_timeout_seconds, "request_timeout_seconds")
+        require_positive_float(self.total_timeout_seconds, "total_timeout_seconds")
 
 
 BuildAIExecution = OpenAICompatibleExecution | HFlowHostedExecution
@@ -299,16 +326,12 @@ class FrameSampling:
     def __post_init__(self) -> None:
         if not isinstance(self.skip_black_frames, bool):
             raise ValueError("skip_black_frames must be a bool")
-        if isinstance(self.fps, bool) or not math.isfinite(self.fps) or self.fps <= 0:
-            raise ValueError("fps must be finite and greater than zero")
-        if isinstance(self.start_s, bool) or not math.isfinite(self.start_s) or self.start_s < 0:
-            raise ValueError("start_s must be finite and non-negative")
-        if self.end_s is not None and (
-            isinstance(self.end_s, bool)
-            or not math.isfinite(self.end_s)
-            or self.end_s <= self.start_s
-        ):
-            raise ValueError("end_s must be finite and greater than start_s")
+        require_positive_float(self.fps, "fps")
+        require_non_negative_float(self.start_s, "start_s")
+        if self.end_s is not None:
+            require_finite_float(self.end_s, "end_s")
+            if self.end_s <= self.start_s:
+                raise ValueError("end_s must be greater than start_s")
 
 
 @dataclass(frozen=True)
@@ -337,10 +360,7 @@ class _RegisteredBuildAICheckConfiguration:
                 "HFlowHostedExecution uses the hosted check's fixed prompt and does not support "
                 "prompt overrides"
             )
-        if isinstance(self.frame_time_seconds, bool) or not math.isfinite(self.frame_time_seconds):
-            raise ValueError("frame_time_seconds must be finite and non-negative")
-        if self.frame_time_seconds < 0:
-            raise ValueError("frame_time_seconds must be finite and non-negative")
+        require_non_negative_float(self.frame_time_seconds, "frame_time_seconds")
         if self.camera == "":
             raise ValueError("camera must be None or a non-empty topic name")
 
@@ -364,42 +384,38 @@ def _strip_markdown_code_fence(response_text: str) -> str:
 
 
 def _parse_json_or_scalar(response_text: str) -> object:
+    require_bounded_response(response_text)
     stripped_response = _strip_markdown_code_fence(response_text)
     try:
-        return json.loads(stripped_response)
+        return strict_response_json(stripped_response)
     except json.JSONDecodeError:
         return stripped_response
 
 
 def parse_hand_count_response(response_text: str) -> int:
     """Parse the published structured shape and compatible plain-text answers."""
-    parsed_response = _parse_json_or_scalar(response_text)
-    if isinstance(parsed_response, dict):
-        parsed_response = parsed_response.get("hand_count")
-    if isinstance(parsed_response, bool):
-        raise ValueError("hand count must be 0, 1, or 2")
-    if isinstance(parsed_response, int):
-        hand_count = parsed_response
-    elif isinstance(parsed_response, str) and re.fullmatch(r"[012]", parsed_response.strip()):
-        hand_count = int(parsed_response)
-    else:
-        raise ValueError("hand count must be 0, 1, or 2")
-    if hand_count not in {0, 1, 2}:
-        raise ValueError("hand count must be 0, 1, or 2")
-    return hand_count
+    try:
+        parsed_response = _parse_json_or_scalar(response_text)
+        if not isinstance(parsed_response, dict):
+            if isinstance(parsed_response, str) and re.fullmatch(r"[012]", parsed_response.strip()):
+                parsed_response = int(parsed_response)
+            parsed_response = {"hand_count": parsed_response}
+        return HandCountAnswer.model_validate(parsed_response).hand_count
+    except (ValueError, RecursionError):
+        raise ValueError("hand count must be 0, 1, or 2") from None
 
 
 def parse_active_manipulation_response(response_text: str) -> str:
-    """Parse the published structured shape and compatible plain-text answers."""
-    parsed_response = _parse_json_or_scalar(response_text)
-    if isinstance(parsed_response, dict):
-        parsed_response = parsed_response.get("answer")
-    if not isinstance(parsed_response, str):
-        raise ValueError('active manipulation must be "yes" or "no"')
-    normalized_answer = parsed_response.strip().lower().rstrip(".")
-    if normalized_answer not in {"yes", "no"}:
-        raise ValueError('active manipulation must be "yes" or "no"')
-    return normalized_answer
+    """Parse strict structured answers or the supported plain-text yes/no mode."""
+    try:
+        parsed_response = _parse_json_or_scalar(response_text)
+        if not isinstance(parsed_response, dict):
+            if isinstance(parsed_response, str):
+                parsed_response = parsed_response.strip().lower().rstrip(".")
+            parsed_response = {"answer": parsed_response}
+        return ActiveManipulationAnswer.model_validate(parsed_response).answer
+    except (ValueError, RecursionError):
+        raise ValueError('active manipulation must be "yes" or "no"') from None
 
 
 def parse_task_response(task: EvaluationTask, response_text: str) -> int | str:
@@ -480,23 +496,20 @@ def _response_format_payload(
 
 
 def _chat_completion_response_text(response: object) -> str:
-    choices = getattr(response, "choices", None)
-    if not choices:
-        raise ValueError("endpoint returned no completion choices")
-    message = getattr(choices[0], "message", None)
-    content = getattr(message, "content", None)
-    if isinstance(content, str):
-        return content
+    try:
+        parsed_response = CompletionResponse.model_validate(response)
+    except ValidationError:
+        raise ValueError("endpoint returned no unique completed answer") from None
+    message = parsed_response.choices[0].message
+    if message.refusal or message.tool_calls:
+        raise ValueError("endpoint refused the answer or requested a tool")
+    content = message.content
     if isinstance(content, list):
-        text_parts: list[str] = []
-        for content_part in content:
-            if isinstance(content_part, dict) and isinstance(content_part.get("text"), str):
-                text_parts.append(content_part["text"])
-            elif isinstance(getattr(content_part, "text", None), str):
-                text_parts.append(content_part.text)
-        if text_parts:
-            return "".join(text_parts)
-    raise ValueError("endpoint returned no text completion content")
+        content = "".join(part.text for part in content)
+    if not isinstance(content, str) or not content:
+        raise ValueError("endpoint returned no text completion content")
+    require_bounded_response(content)
+    return content
 
 
 def _response_metadata(response: object) -> ModelResponseMetadata:
@@ -536,8 +549,9 @@ def model_output_check_result(
             outcome.response_metadata.response_model
         )
     for usage_name, usage_value in outcome.response_metadata.usage.items():
-        if isinstance(usage_value, int | float) and not isinstance(usage_value, bool):
-            measurements[f"{measurement_prefix}/usage/{usage_name}"] = usage_value
+        if isinstance(usage_value, bool) or not isinstance(usage_value, int | float):
+            continue
+        measurements[f"{measurement_prefix}/usage/{usage_name}"] = usage_value
 
     observation_values: dict[str, MeasurementValue] = {
         "task": task.value,
@@ -706,7 +720,7 @@ def sampled_model_output_check_result(
     )
 
 
-def evaluate_image_with_model(
+async def evaluate_image_with_model(
     *,
     client: Any,
     model: str,
@@ -736,10 +750,11 @@ def evaluate_image_with_model(
     if temperature is not None:
         request_parameters["temperature"] = temperature
 
-    response = client.chat.completions.create(**request_parameters)
-    raw_response = _chat_completion_response_text(response)
+    response = await client.chat.completions.create(**request_parameters)
+    raw_response = ""
     response_metadata = _response_metadata(response)
     try:
+        raw_response = _chat_completion_response_text(response)
         predicted_value = parse_task_response(task_definition.task, raw_response)
     except ValueError as error:
         return UnparsedVisionModelOutcome(
@@ -787,124 +802,107 @@ def _hosted_observation_upload(image_bytes: bytes) -> tuple[str, bytes, str]:
     return filename, image_bytes, image_mime_type
 
 
-def _read_bounded_hosted_response(response: httpx2.Response) -> bytes:
+async def _read_bounded_hosted_response(response: httpx2.Response, *, deadline: float) -> bytes:
     response_body = bytearray()
-    for response_chunk in response.iter_bytes():
+    async for response_chunk in response.aiter_bytes():
+        _remaining_hosted_seconds(deadline)
         if len(response_body) + len(response_chunk) > _MAX_HFLOW_HOSTED_RESPONSE_BYTES:
             raise RuntimeError("HFlow hosted check response exceeds the 64 KiB limit")
         response_body.extend(response_chunk)
+    _remaining_hosted_seconds(deadline)
     return bytes(response_body)
-
-
-def _parse_hosted_prediction(task: EvaluationTask, value: object) -> int | str:
-    match task:
-        case EvaluationTask.HAND_COUNT:
-            if isinstance(value, bool) or not isinstance(value, int) or value not in {0, 1, 2}:
-                raise RuntimeError(
-                    "HFlow hosted hand-visibility check returned a parsed prediction "
-                    "outside 0, 1, or 2"
-                )
-            return value
-        case EvaluationTask.ACTIVE_MANIPULATION:
-            if not isinstance(value, str) or value not in {"yes", "no"}:
-                raise RuntimeError(
-                    "HFlow hosted active-manipulation check returned a parsed prediction other "
-                    'than "yes" or "no"'
-                )
-            return value
-        case EvaluationTask.BOTH:
-            raise AssertionError("BOTH is a CLI selection, not an executable task")
 
 
 def _parse_hosted_check_response(
     task: EvaluationTask,
     response_payload: object,
 ) -> VisionModelOutcome:
-    if not isinstance(response_payload, dict):
-        raise RuntimeError("HFlow hosted check returned JSON that is not an object")
-    raw_response = response_payload.get("raw_response")
-    if not isinstance(raw_response, str):
-        raise RuntimeError("HFlow hosted check response is missing string field 'raw_response'")
+    match task:
+        case EvaluationTask.HAND_COUNT:
+            response_adapter = HAND_COUNT_HOSTED_RESPONSE
+        case EvaluationTask.ACTIVE_MANIPULATION:
+            response_adapter = ACTIVE_MANIPULATION_HOSTED_RESPONSE
+        case EvaluationTask.BOTH:
+            raise AssertionError("BOTH is a CLI selection, not an executable task")
+    try:
+        parsed_response = response_adapter.validate_python(response_payload)
+    except ValidationError:
+        raise RuntimeError("HFlow hosted check returned an invalid response") from None
     response_metadata = ModelResponseMetadata(response_model=None, usage={})
-    outcome_kind = response_payload.get("outcome")
-    match outcome_kind:
-        case "parsed":
-            predicted_value = _parse_hosted_prediction(task, response_payload.get("prediction"))
-            return ParsedVisionModelOutcome(
-                raw_response=raw_response,
-                response_metadata=response_metadata,
-                predicted_value=predicted_value,
-            )
-        case "unparsed":
-            parse_error = response_payload.get("parse_error")
-            if not isinstance(parse_error, str) or not parse_error:
-                raise RuntimeError(
-                    "HFlow hosted unparsed outcome is missing non-empty string field 'parse_error'"
-                )
-            return UnparsedVisionModelOutcome(
-                raw_response=raw_response,
-                response_metadata=response_metadata,
-                parse_error=parse_error,
-            )
-        case _:
-            raise RuntimeError(
-                "HFlow hosted check response field 'outcome' must be 'parsed' or 'unparsed'"
-            )
+    if isinstance(parsed_response, UnparsedResponse):
+        return UnparsedVisionModelOutcome(
+            raw_response=parsed_response.raw_response,
+            response_metadata=response_metadata,
+            parse_error=parsed_response.parse_error,
+        )
+    return ParsedVisionModelOutcome(
+        raw_response=parsed_response.raw_response,
+        response_metadata=response_metadata,
+        predicted_value=parsed_response.prediction,
+    )
 
 
-def _evaluate_image_with_hflow_hosted_service(
+async def _evaluate_image_with_hflow_hosted_service(
     *,
     execution: HFlowHostedExecution,
     task: EvaluationTask,
     image_bytes: bytes,
+    client: httpx2.AsyncClient | None = None,
 ) -> VisionModelOutcome:
     if len(image_bytes) > _MAX_HFLOW_HOSTED_IMAGE_BYTES:
         raise ValueError("HFlow hosted check observation exceeds the 10 MiB image limit")
     endpoint = _hosted_check_endpoint(execution, task)
+    deadline = time.monotonic() + execution.total_timeout_seconds
     response_bytes: bytes | None = None
-    for attempt in range(execution.max_retries + 1):
-        is_last_attempt = attempt == execution.max_retries
-        try:
-            with httpx2.stream(
-                "POST",
-                endpoint,
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": _HFLOW_HOSTED_USER_AGENT,
-                },
-                files={"observation": _hosted_observation_upload(image_bytes)},
-                timeout=execution.request_timeout_seconds,
-                # An image-bearing API request must never follow a redirect to another origin.
-                follow_redirects=False,
-            ) as response:
-                response.raise_for_status()
-                response_bytes = _read_bounded_hosted_response(response)
-            break
-        except httpx2.HTTPStatusError as error:
-            retry_after = error.response.headers.get("Retry-After")
-            status_code = error.response.status_code
-            if status_code in _RETRYABLE_HOSTED_STATUS_CODES and not is_last_attempt:
-                time.sleep(_hosted_retry_delay_seconds(retry_after, attempt))
-                continue
-            retry_after_suffix = f"; retry after {retry_after}" if retry_after else ""
-            raise RuntimeError(
-                f"HFlow hosted check request failed with HTTP {status_code}{retry_after_suffix}"
-            ) from error
-        except httpx2.RequestError as error:
-            if not is_last_attempt:
-                time.sleep(_hosted_retry_delay_seconds(None, attempt))
-                continue
-            raise RuntimeError(f"HFlow hosted check endpoint is unreachable: {error}") from error
+    try:
+        async with asyncio.timeout(execution.total_timeout_seconds), AsyncExitStack() as resources:
+            if client is None:
+                client = await resources.enter_async_context(httpx2.AsyncClient())
+            async for attempt in AsyncRetrying(
+                retry=retry_if_exception(_retryable_hosted_failure),
+                wait=_hosted_retry_wait,
+                stop=(
+                    stop_after_attempt(execution.max_retries + 1)
+                    | stop_before_delay(execution.total_timeout_seconds)
+                ),
+                reraise=True,
+            ):
+                with attempt:
+                    remaining_seconds = _remaining_hosted_seconds(deadline)
+                    async with client.stream(
+                        "POST",
+                        endpoint,
+                        headers={
+                            "Accept": "application/json",
+                            "User-Agent": _HFLOW_HOSTED_USER_AGENT,
+                        },
+                        files={"observation": _hosted_observation_upload(image_bytes)},
+                        timeout=min(execution.request_timeout_seconds, remaining_seconds),
+                        # Image-bearing requests must never redirect to another origin.
+                        follow_redirects=False,
+                    ) as response:
+                        response.raise_for_status()
+                        response_bytes = await _read_bounded_hosted_response(
+                            response, deadline=deadline
+                        )
+    except TimeoutError:
+        raise RuntimeError("HFlow hosted check exceeded its total timeout") from None
+    except httpx2.HTTPStatusError as error:
+        raise RuntimeError(
+            f"HFlow hosted check request failed with HTTP {error.response.status_code}"
+        ) from None
+    except httpx2.RequestError:
+        raise RuntimeError("HFlow hosted check endpoint is unreachable") from None
     if response_bytes is None:
         raise AssertionError("the hosted request loop exits by returning or raising")
     try:
         response_text = response_bytes.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise RuntimeError("HFlow hosted check returned invalid UTF-8") from error
+    except UnicodeDecodeError:
+        raise RuntimeError("HFlow hosted check returned invalid UTF-8") from None
     try:
-        response_payload = json.loads(response_text)
-    except json.JSONDecodeError as error:
-        raise RuntimeError("HFlow hosted check returned malformed JSON") from error
+        response_payload = strict_response_json(response_text)
+    except (ValueError, RecursionError):
+        raise RuntimeError("HFlow hosted check returned malformed JSON") from None
     return _parse_hosted_check_response(task, response_payload)
 
 
@@ -916,11 +914,10 @@ def _check_version(configuration: _RegisteredBuildAICheckConfiguration) -> StepV
         "camera": configuration.camera,
         "frame_time_seconds": configuration.frame_time_seconds,
     }
-    # Sampling changes which frames produce results, so it is version-worthy;
-    # the single-frame contract keeps its shape so existing versions hold.
-    contract_name = "build-ai-single-frame-v1"
+    # Strict answer shapes and completion checks change accepted observations.
+    contract_name = "build-ai-single-frame-v2"
     if configuration.sampling is not None:
-        contract_name = "build-ai-sampled-frames-v1"
+        contract_name = "build-ai-sampled-frames-v2"
         version_contract["sampling"] = {
             "fps": configuration.sampling.fps,
             "start_s": configuration.sampling.start_s,
@@ -956,6 +953,7 @@ def _check_version(configuration: _RegisteredBuildAICheckConfiguration) -> StepV
                         execution, configuration.task_definition.task
                     ),
                     "request_timeout_seconds": execution.request_timeout_seconds,
+                    "total_timeout_seconds": execution.total_timeout_seconds,
                     "max_retries": execution.max_retries,
                 }
             )
@@ -991,8 +989,6 @@ def _register_build_ai_check(
     *,
     configuration: _RegisteredBuildAICheckConfiguration,
 ) -> CheckFunction:
-    client_for_thread = threading.local()
-
     def model_client(execution: OpenAICompatibleExecution) -> Any:
         api_key = None
         if execution.api_key_environment_variable is not None:
@@ -1002,61 +998,41 @@ def _register_build_ai_check(
                     f"{execution.api_key_environment_variable} is required by "
                     f"{_check_name_for_task(configuration.task_definition.task)}"
                 )
-        cache_key = (execution.endpoint, api_key, execution.max_retries)
-        if getattr(client_for_thread, "cache_key", None) != cache_key:
-            try:
-                openai_module = importlib.import_module("openai")
-            except ModuleNotFoundError as error:
-                raise RuntimeError(
-                    "the Build AI checks require the optional OpenAI-compatible client; "
-                    "install hflow with `uv add 'hflow[openai]'`"
-                ) from error
-            client_for_thread.client = openai_module.OpenAI(
-                api_key=api_key or "not-needed",
-                base_url=execution.endpoint,
-                max_retries=execution.max_retries,
-            )
-            client_for_thread.cache_key = cache_key
-        return client_for_thread.client
+        try:
+            openai_module = importlib.import_module("openai")
+        except ModuleNotFoundError as error:
+            raise RuntimeError(
+                "the Build AI checks require the optional OpenAI-compatible client; "
+                "install hflow with `uv add 'hflow[openai]'`"
+            ) from error
+        return openai_module.AsyncOpenAI(
+            api_key=api_key or "not-needed",
+            base_url=execution.endpoint,
+            max_retries=execution.max_retries,
+        )
 
-    def evaluate_frame(image_bytes: bytes) -> tuple[VisionModelOutcome, str]:
-        match configuration.execution:
-            case OpenAICompatibleExecution() as execution:
-                outcome = evaluate_image_with_model(
-                    client=model_client(execution),
-                    model=execution.model,
-                    task_definition=configuration.task_definition,
-                    image_data_url=image_bytes_data_url(image_bytes),
-                    response_format=execution.response_format,
-                    temperature=execution.temperature,
-                    max_tokens=execution.max_tokens,
-                )
-                return outcome, execution.model
-            case HFlowHostedExecution() as execution:
-                outcome = _evaluate_image_with_hflow_hosted_service(
-                    execution=execution,
-                    task=configuration.task_definition.task,
-                    image_bytes=image_bytes,
-                )
-                return outcome, _hosted_execution_label(
-                    execution, configuration.task_definition.task
-                )
-            case unexpected_execution:
-                assert_never(unexpected_execution)
-
-    def evaluate_build_ai_check(episode: Episode) -> CheckResult:
+    async def evaluate_episode(
+        episode: Episode,
+        evaluate_frame: Callable[[bytes], Awaitable[tuple[VisionModelOutcome, str]]],
+    ) -> CheckResult:
         sampling = configuration.sampling
         if sampling is not None:
             camera_topic = episode.resolve_camera(configuration.camera)
-            sampled_frames = episode.frames(
-                camera_topic, fps=sampling.fps, start_s=sampling.start_s, end_s=sampling.end_s
+            sampled_frames = await run_blocking(
+                episode.frames,
+                camera_topic,
+                fps=sampling.fps,
+                start_s=sampling.start_s,
+                end_s=sampling.end_s,
             )
             if not sampled_frames:
                 raise ValueError(
                     f"episode has no frames in the sampling window for camera {camera_topic!r}"
                 )
             black_spans_ns = (
-                _black_frame_spans_ns(episode, camera_topic) if sampling.skip_black_frames else ()
+                await run_blocking(_black_frame_spans_ns, episode, camera_topic)
+                if sampling.skip_black_frames
+                else ()
             )
             # One request at a time: the hosted quota admits a single request
             # per client, and a sequential loop keeps the observation order
@@ -1066,7 +1042,9 @@ def _register_build_ai_check(
                 if any(start <= frame.log_time_ns < end for start, end in black_spans_ns):
                     frame_outcomes.append((frame.log_time_ns, SkippedBlackFrame(), None))
                     continue
-                outcome, requested_model = evaluate_frame(frame.path.read_bytes())
+                outcome, requested_model = await evaluate_frame(
+                    await run_blocking(frame.path.read_bytes)
+                )
                 frame_outcomes.append((frame.log_time_ns, outcome, requested_model))
             return sampled_model_output_check_result(
                 task=configuration.task_definition.task,
@@ -1075,7 +1053,8 @@ def _register_build_ai_check(
                 frame_outcomes=frame_outcomes,
             )
 
-        extracted_frames = episode.frames(
+        extracted_frames = await run_blocking(
+            episode.frames,
             configuration.camera,
             fps=1.0,
             start_s=configuration.frame_time_seconds,
@@ -1087,7 +1066,9 @@ def _register_build_ai_check(
                 f"camera {configuration.camera!r}"
             )
         selected_frame = extracted_frames[0]
-        outcome, requested_model = evaluate_frame(selected_frame.path.read_bytes())
+        outcome, requested_model = await evaluate_frame(
+            await run_blocking(selected_frame.path.read_bytes)
+        )
         return model_output_check_result(
             task=configuration.task_definition.task,
             requested_model=requested_model,
@@ -1095,6 +1076,50 @@ def _register_build_ai_check(
             observation_id=f"frame:{selected_frame.log_time_ns}",
             timestamp_ns=selected_frame.log_time_ns,
         )
+
+    async def evaluate_build_ai_check(episode: Episode) -> CheckResult:
+        # Clients belong to this invocation's event loop. Lazy creation keeps
+        # all-black samples independent of credentials and model dependencies.
+        compatible_client: Any = None
+        hosted_client: httpx2.AsyncClient | None = None
+        async with AsyncExitStack() as resources:
+
+            async def evaluate_frame(image_bytes: bytes) -> tuple[VisionModelOutcome, str]:
+                nonlocal compatible_client, hosted_client
+                match configuration.execution:
+                    case OpenAICompatibleExecution() as execution:
+                        if compatible_client is None:
+                            compatible_client = await resources.enter_async_context(
+                                model_client(execution)
+                            )
+                        outcome = await evaluate_image_with_model(
+                            client=compatible_client,
+                            model=execution.model,
+                            task_definition=configuration.task_definition,
+                            image_data_url=image_bytes_data_url(image_bytes),
+                            response_format=execution.response_format,
+                            temperature=execution.temperature,
+                            max_tokens=execution.max_tokens,
+                        )
+                        return outcome, execution.model
+                    case HFlowHostedExecution() as execution:
+                        if hosted_client is None:
+                            hosted_client = await resources.enter_async_context(
+                                httpx2.AsyncClient()
+                            )
+                        outcome = await _evaluate_image_with_hflow_hosted_service(
+                            execution=execution,
+                            task=configuration.task_definition.task,
+                            image_bytes=image_bytes,
+                            client=hosted_client,
+                        )
+                        return outcome, _hosted_execution_label(
+                            execution, configuration.task_definition.task
+                        )
+                    case unexpected_execution:
+                        assert_never(unexpected_execution)
+
+            return await evaluate_episode(episode, evaluate_frame)
 
     return application.check(
         name=_check_name_for_task(configuration.task_definition.task),

@@ -3,7 +3,8 @@
 Use HFlow's built-in importer to turn selected LeRobot Dataset v3 episodes
 into canonical MCAP files that `hflow doctor`, `App.process`, Foxglove, and
 Rerun can consume. The importer is part of the normal `hflow` installation;
-it does not install or import LeRobot, PyTorch, or a Hugging Face SDK.
+it includes the Hugging Face Hub SDK and does not install or import LeRobot
+or PyTorch.
 
 ## Import one episode
 
@@ -29,7 +30,18 @@ data/lerobot_pusht/
 └── prepared-manifest.json          # source commit, import summary, per-episode receipts
 ```
 
-Re-running against the same output directory reuses downloaded source files.
+Source files retain their repository paths under `_lerobot_cache/<commit>/`.
+The Hub SDK tracks downloaded files in `.cache/huggingface/` within that
+revision directory and reuses them on subsequent imports. Older HFlow caches
+used different data/video filenames; those files may be downloaded again on
+the first import after upgrading. Existing landing episodes remain reusable.
+HFlow leaves the older source files in place.
+
+The SDK manages download retries, timeouts, and Xet transfers. Its auxiliary
+Xet cache follows `HF_XET_CACHE` (default: `$HF_HOME/xet`), independently of the
+workspace source cache. See the
+[Hub environment variables](https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables)
+for configuration.
 Matching landing episodes are also reused when their recorded identity matches
 this import: resolved Hugging Face commit, source episode index, selected
 camera keys, converter version, and the importer's canonical GOP setting.
@@ -79,9 +91,11 @@ local mirror under
 are never uploaded into the bucket. The success manifest is published only
 after every selected episode object has been written.
 
-For a gated or private repository, export a read token as `HF_TOKEN` (or
-`HUGGING_FACE_HUB_TOKEN`) before running the command. HFlow sends the token
-only to Hugging Face requests and never records it in an episode or manifest.
+For a gated or private repository, authenticate with `uv run hf auth login`
+or export a read token as `HF_TOKEN`. The SDK also recognizes the legacy
+`HUGGING_FACE_HUB_TOKEN` variable. Saved login credentials can be used even
+when no token environment variable is set; `HF_HUB_DISABLE_IMPLICIT_TOKEN=1`
+disables implicit token use. Tokens are never recorded in episodes or manifests.
 
 ## Import multiple cameras
 

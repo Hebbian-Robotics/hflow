@@ -33,7 +33,7 @@ from hflow import App, Stage
 
 with TemporaryDirectory(prefix="processing-") as workspace_directory:
     app = App("worker", data_root=Path(workspace_directory))
-    batch = app.process_many(
+    batch = await app.process_many(
         episode_paths,
         record=False,
         stages=(Stage.SYNC, Stage.META),
@@ -75,8 +75,7 @@ batches.
 - The input iterable is materialized and duplicate source identities are
   rejected before processing. Pass finite, reasonably sized batches: all
   reports are retained in memory and returned in input order.
-- `on_progress` receives `ProcessManyProgress` on the calling coordinator
-  thread as completed work is collected. Event input order is not guaranteed;
+- `on_progress` receives `ProcessManyProgress` on the caller's event loop as completed work is collected. Event input order is not guaranteed;
   each carries the original `input_index`. At most `max_workers` episodes are
   submitted at once.
 - A normal check/enrichment execution error is represented in its
@@ -85,8 +84,8 @@ batches.
   error. Quarantine can skip later stages according to the normal engine rules.
 - Configuration, source preparation, processing infrastructure, publication,
   and callback exceptions can propagate. On an exception, new submissions
-  stop, queued work is cancelled where possible, and already-running episodes
-  finish before the call raises. Completed work is not rolled back. There is
+  stop, active checks are cancelled, and started blocking work drains before
+  the call raises. Completed work is not rolled back. There is
   no automatic retry or failure-budget policy in this API.
 
 For durable stage accounting and error budgets, use
@@ -139,8 +138,9 @@ The importer reads a local video and emits an input-shaped MCAP for the normal
 canonical transform. It selects the first video stream, resamples the requested
 excerpt to a fixed image rate, and letterboxes to the configured dimensions;
 it is not a lossless video archival operation. The default image dimensions are
-640 × 360. The stream must declare its duration (as MP4 streams do); sources
-without a known duration are refused rather than silently truncating an excerpt.
+640 × 360. Duration comes from the selected video stream, its duration tag, or
+a single-stream container. Sources without a known video duration are refused
+rather than silently truncating an excerpt.
 Timestamp zero is the excerpt start unless `start_time_ns` is supplied;
 the importer does not infer an absolute recording time. It does not invent
 task, operator, or success labels. Caller metadata and importer provenance are
@@ -150,3 +150,7 @@ The output is published only after a successful import, existing destinations
 are refused, and temporary conversion files are removed on failure. Downloading
 objects, selecting shards, and retaining originals remain the caller's job.
 For generated fixtures and injected faults, keep using `hflow.testing`.
+
+For explicit unreadable/unsupported outcomes, resource limits, verified source
+downloads, typed evidence, and selected result exports, see the
+[embedded integration API reference](../EMBEDDED_BOUNDARIES.md).

@@ -19,6 +19,7 @@ Everything here shells out to the pinned ffmpeg (``hflow.ffmpeg``).
 import itertools
 import statistics
 import subprocess
+import tempfile
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -621,9 +622,14 @@ def write_access_units_to_mp4(
             "risk (measured 301 of 303 in #250). Canonical video requires "
             "bframes=0; re-encode upstream -- see docs/FORMAT.md item 4"
         )
-    # Write to a sibling temp path and replace atomically: callers cache on
-    # bare file existence, so the final path must never hold a partial MP4.
-    temporary_output = output.with_name(output.name + ".tmp")
+    # Write to a unique sibling temp path and replace atomically: callers cache
+    # on bare file existence, so the final path must never hold a partial MP4.
+    # A fixed ``<output>.tmp`` name lets concurrent remuxes truncate/unlink the
+    # same file; a per-call path keeps each ffmpeg process isolated.
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{output.name}.", suffix=".tmp", dir=output.parent, delete=False
+    ) as temp_file:
+        temporary_output = Path(temp_file.name)
     command: list[str] = [
         str(ffmpeg_path()),
         "-hide_banner",

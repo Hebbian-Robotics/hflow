@@ -57,6 +57,7 @@ import duckdb
 from hflow.catalog import (
     EPISODES_VIEW_STATUS_COLUMN,
     TABLE_COLUMN_DDL,
+    _raise_if_measurement_keys_case_collide,
     episode_status_case_sql,
 )
 from hflow.format import CATALOG_FORMAT_VERSION
@@ -302,12 +303,16 @@ def _open_connection_over_root(
     catalog's own files stay unreachable for reads and, crucially, writes.
     """
     connection = duckdb.connect()
-    _register_catalog_relations(
-        connection,
-        root,
-        constrained=constrained,
-        writable_directories=writable_directories,
-    )
+    try:
+        _register_catalog_relations(
+            connection,
+            root,
+            constrained=constrained,
+            writable_directories=writable_directories,
+        )
+    except Exception:
+        connection.close()
+        raise
     return connection
 
 
@@ -426,6 +431,7 @@ def _register_catalog_relations(
             "SELECT DISTINCT key FROM measurements_latest ORDER BY key"
         ).fetchall()
     ]
+    _raise_if_measurement_keys_case_collide(measurement_keys)
     if measurement_keys:
         # A PIVOT inside a view needs its values enumerated, so the wide view
         # is bound to the keys present when this connection was opened; a key
@@ -479,37 +485,57 @@ def _sync_catalog_mirror(catalog_root: "Path | str | StorageRoot") -> None:
         location.sync_into_mirror(tuple(_TABLE_DIRECTORIES.values()))
 
 
-def _completed_append_exists(catalog_root: "Path | str | StorageRoot") -> bool:
-    """Whether a completed catalog append is present.
+def _empty_table_relations_have_landed_parquet(
+    connection: duckdb.DuckDBPyConnection,
+    catalog_root: "Path | str | StorageRoot",
+) -> bool:
+    """Whether any in-memory empty catalog table now has Parquet on disk.
 
-    ``Catalog.append_episode`` writes the episodes file last, so any
-    ``episodes/*.parquet`` object proves the whole append finished.
+    Empty catalogs register ``CREATE TABLE`` shells because DuckDB refuses a
+    Parquet glob with no matches. Those shells stay sticky on a long-lived
+    connection until relations are re-registered. Episode appends are one
+    trigger; ``ingest_failures`` (and any other long table that gains files
+    later) is another. Syncs a bucket mirror first so remote files are visible
+    under the local query root.
     """
     location = parse_storage_root(catalog_root)
-    if isinstance(location, BucketStorageRoot):
-        _sync_catalog_mirror(location)
-        episodes_dir = location.mirror / "episodes"
-        return episodes_dir.is_dir() and any(episodes_dir.glob("*.parquet"))
-    return any(location.path.joinpath("episodes").glob("*.parquet"))
+    query_root = _local_query_root(location)
+    for relation_name in _LONG_TABLE_NAMES:
+        relation_type_row = connection.execute(
+            """
+            SELECT table_type
+            FROM information_schema.tables
+            WHERE table_schema = 'main' AND table_name = ?
+            """,
+            [relation_name],
+        ).fetchone()
+        if relation_type_row is None or str(relation_type_row[0]) != "BASE TABLE":
+            continue
+        table_directory = query_root / _TABLE_DIRECTORIES[relation_name]
+        if table_directory.is_dir() and any(table_directory.glob("*.parquet")):
+            return True
+    return False
 
 
 def _refresh_local_catalog_connection(
     connection: duckdb.DuckDBPyConnection, catalog_root: "Path | str | StorageRoot"
 ) -> None:
-    """Replace an empty catalog surface after its first append completes.
+    """Re-register catalog relations after empty in-memory shells gain Parquet.
 
     An empty catalog has real in-memory tables because DuckDB cannot define a
-    ``read_parquet`` view over a glob with no matches. Once the episodes file
-    from the first append exists, all dependent table files are complete too:
-    ``Catalog.append_episode`` deliberately writes the episodes file last.
-    Replacing the empty tables with the normal Parquet-backed views in one
-    transaction lets a long-running local explorer see that first run without
-    replacing its DuckDB connection.
+    ``read_parquet`` view over a glob with no matches. Replacing those tables
+    with the normal Parquet-backed views in one transaction lets a long-running
+    explorer see newly landed files without replacing its DuckDB connection.
+
+    ``Catalog.append_episode`` writes the episodes file last, so the first
+    episodes Parquet is enough to rebind every table that append wrote.
+    Tables outside that write set — notably ``ingest_failures`` — can land
+    Parquet later and need the same rebind when their directory gains files.
 
     For bucket catalogs the query root is the synced mirror directory; this
-    re-syncs before re-registering views so the first remote append is
-    visible. Constrained connections have locked their configuration and
-    materialized their data and must not call this.
+    re-syncs before re-registering views so remote files are visible.
+    Constrained connections have locked their configuration and materialized
+    their data and must not call this.
     """
     location = parse_storage_root(catalog_root)
     _verify_catalog_format(location)
@@ -659,33 +685,41 @@ def reject_non_single_select(sql: str) -> None:
         parser_connection.close()
 
 
-def _stage_manifest_and_count(
-    connection: duckdb.DuckDBPyConnection, sql: str, staged_manifest: Path
-) -> int:
-    """COPY the query's result to the staged manifest; return its row count.
+def _reject_tenant_sql(sql: str) -> None:
+    """Refuse non-single-SELECT tenant SQL before any connection execute.
 
-    ``sql`` is tenant-supplied on constrained connections.
-    ``reject_non_single_select`` parses the input **without executing it**
-    and refuses any payload that is not exactly one SELECT statement —
-    including multi-statement injections separated by semicolons (e.g.
-    ``SELECT ...; CREATE TABLE pwned AS SELECT ...``) and DDL-only input.
-    ``connection.sql()`` is **not** the guard: on duckdb 1.5.5 it silently
-    executes all statements and returns ``None`` for multi-statement input.
-    ``write_parquet`` then materialises the single confirmed-safe relation
-    to the staged path.
-
-    A parser ``duckdb.Error`` here is surfaced as the same ``ValueError``
-    this function has always raised for library callers; the
-    parse-failure/rule-rejection distinction the service relies on is intact
-    on ``reject_non_single_select`` itself.
-
-    The row-count query only ever receives an internally-generated path,
-    so it keeps the existing f-string form.
+    Shared by manifest materialization and the ``output=None`` / dry-run
+    count path so both surfaces share one gate. A parser ``duckdb.Error``
+    becomes ``ValueError`` for library callers; ``NonSingleSelectQueryError``
+    (already a ``ValueError``) propagates unchanged so the service can still
+    tell rule rejection from a raw parse failure on
+    :func:`reject_non_single_select` itself.
     """
     try:
         reject_non_single_select(sql)
     except duckdb.Error as exc:
         raise ValueError("sql must be exactly one SELECT statement") from exc
+
+
+def _stage_manifest_and_count(
+    connection: duckdb.DuckDBPyConnection, sql: str, staged_manifest: Path
+) -> int:
+    """Write the query's result to the staged manifest; return its row count.
+
+    ``sql`` is tenant-supplied on constrained connections.
+    ``_reject_tenant_sql`` / ``reject_non_single_select`` parses the input
+    **without executing it** and refuses any payload that is not exactly one
+    SELECT statement — including multi-statement injections separated by
+    semicolons (e.g. ``SELECT ...; CREATE TABLE pwned AS SELECT ...``) and
+    DDL-only input. ``connection.sql()`` is **not** the guard: on duckdb
+    1.5.5 it silently executes all statements and returns ``None`` for
+    multi-statement input. ``write_parquet`` then materialises the single
+    confirmed-safe relation to the staged path.
+
+    The row-count query only ever receives an internally-generated path,
+    so it keeps the existing f-string form.
+    """
+    _reject_tenant_sql(sql)
     connection.sql(sql).write_parquet(str(staged_manifest))
 
     (row_count,) = connection.execute(
@@ -798,12 +832,16 @@ def curate(
     is unreachable. ``catalog_root`` and ``output`` each accept a local path
     or a bucket URL (``gs://.../manifest.parquet`` uploads the manifest).
     With ``output=None`` the query still runs (row count + coverage
-    reporting) but nothing is written.
+    reporting) but nothing is written. Every path that executes ``sql`` —
+    including ``output=None`` — runs :func:`reject_non_single_select` first
+    so dry-run cannot accept DESCRIBE/SHOW/PIVOT (or other non-single-SELECT
+    shapes) that the manifest-write path already refuses.
 
     ``constrained=True`` runs the SQL on a locked-down connection (see
     :func:`open_catalog_connection`) whose only file access is the
     manifest's own private staging directory -- the posture a hosted service
-    uses for tenant-supplied SQL.
+    uses for tenant-supplied SQL. File locking alone does not replace the
+    statement gate.
     """
     # file:// output URLs mean a local file, matching parse_storage_root's
     # convention for roots -- without this, the Path() branch below would
@@ -877,6 +915,7 @@ def curate(
                 staged_manifest.replace(final_path)
                 manifest_path = final_path
             case None:
+                _reject_tenant_sql(sql)
                 (row_count,) = connection.execute(f"SELECT count(*) FROM ({sql})").fetchone() or (
                     0,
                 )

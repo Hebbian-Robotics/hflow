@@ -10,25 +10,25 @@ unsupported.
 The public :func:`import_lerobot_dataset` API and ``hflow import lerobot``
 command are the supported entry points. The importer does not install or
 import LeRobot itself: it reads Dataset v3 metadata and Parquet files through
-HFlow's existing dependencies, downloads selected source media from the
-Hugging Face Hub, and uses HFlow's managed FFmpeg build.
+HFlow's dependencies, downloads selected source media through the Hugging
+Face Hub SDK, and uses HFlow's managed FFmpeg build.
 """
 
 import json
 import logging
 import math
-import os
 import re
 import struct
 import subprocess
 import tempfile
-import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import TypedDict
-from urllib.parse import urlsplit
 
+from httpx import HTTPError
+from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.errors import RemoteEntryNotFoundError
 from mcap.reader import make_reader
 from mcap.writer import Writer as McapWriter
 
@@ -59,7 +59,11 @@ DEFAULT_CAMERA_KEY = "observation.image"
 # time on a corpus declaring one (29.97, say) moves. A v7 file of such a
 # corpus carries the stretched time axis, and resume would otherwise accept
 # it as completed work.
-CONVERTER_VERSION = "lerobot-converter-v8"
+# "v9": an episode cut from a shared chunk video is extracted frame-exactly
+# (accurate input seek, encoder frame cap, presentation timestamps rebased
+# to the window start) instead of a stream-copied slice, so windowed
+# outputs have different canonical bytes and must not share a v8 identity.
+CONVERTER_VERSION = "lerobot-converter-v9"
 # Canonical transform knobs that affect published bytes for this importer.
 IMPORT_GOP_SECONDS = 1.0
 # The v3 per-episode aggregate of the collector's frame-level next.success
@@ -67,12 +71,10 @@ IMPORT_GOP_SECONDS = 1.0
 _OUTCOME_AGGREGATE_COLUMN = "stats/next.success/max"
 _SUCCESS_DERIVATION = f"max({_OUTCOME_AGGREGATE_COLUMN.removesuffix('/max')})"
 PRESENTATION_TIMESTAMP_EPSILON_S = 0.050
-EPISODE_METADATA_TREE_PREFIX = PurePosixPath("meta/episodes")
 
 # Timestamp handling
 NANOSECONDS_PER_SECOND = 1_000_000_000
 EPISODE_START_TIME_NS = 1_755_000_000_000_000_000
-HUGGING_FACE_TOKEN_ENVIRONMENT_VARIABLES = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
 
 
 @dataclass(frozen=True)
@@ -325,13 +327,35 @@ def _encode_cdr_float32_array(values: list[float] | tuple[float, ...]) -> bytes:
 
 
 def _transcode_mp4_to_h264(
-    mp4_path: Path, gop_seconds: float, frames_per_second: float
+    mp4_path: Path,
+    gop_seconds: float,
+    frames_per_second: float,
+    frame_count: int | None = None,
+    seek_seconds: float | None = None,
 ) -> list[bytes]:
-    """Transcode an mp4 to H.264 access units split on AUD markers."""
+    """Transcode an mp4 to H.264 access units split on AUD markers.
+
+    With ``seek_seconds`` the source is cut from that timestamp with an
+    accurate input seek (decode from the preceding keyframe, output
+    starting at the seek point); with ``frame_count`` the encoder output is
+    capped at exactly that many frames. Together they extract an episode
+    window frame-exactly from a shared chunk video. A stream-copied slice
+    cannot: a cut at a non-keyframe boundary drops the pre-window frames
+    the seek decoded but the muxer cannot timestamp, and a window end that
+    lands exactly on a frame boundary drags the next episode's first frame
+    in (the source's end timestamps are exclusive). Callers transcoding a
+    whole file leave both unset: the frame-count guard downstream still
+    verifies the encoder output against the parquet, and an over-long video
+    must not be silently truncated here.
+    """
     keyframe_interval = max(1, round(gop_seconds * frames_per_second))
     ffmpeg_command = [
         str(ffmpeg_path()),
         "-y",
+    ]
+    if seek_seconds is not None:
+        ffmpeg_command += ["-ss", f"{seek_seconds:.6f}"]
+    ffmpeg_command += [
         "-i",
         str(mp4_path),
         "-c:v",
@@ -350,6 +374,10 @@ def _transcode_mp4_to_h264(
         # bframes=0: B-frame streams lose their reorder-buffer tail through
         # the raw Annex B -> MP4 remux, undercounting decoded_frame_count (#250).
         "aud=1:bframes=0",
+    ]
+    if frame_count is not None:
+        ffmpeg_command += ["-frames:v", str(frame_count)]
+    ffmpeg_command += [
         "-f",
         "h264",
         "pipe:1",
@@ -407,214 +435,175 @@ def _get_video_pts_times(mp4_path: Path) -> list[float]:
     return times
 
 
-def _slice_video(
-    video_path: Path,
+def _relative_video_pts_times(
+    mp4_path: Path,
     start_seconds: float,
     end_seconds: float,
-    output_path: Path | None = None,
-) -> Path:
-    """Slice a video to a time window with stream copy (no re-encode)."""
-    resolved_output_path = output_path or (
-        video_path.parent / f"{video_path.stem}_slice{video_path.suffix}"
-    )
-    ffmpeg_command = [
-        str(ffmpeg_path()),
-        "-y",
-        "-ss",
-        f"{start_seconds:.6f}",
-        "-to",
-        f"{end_seconds:.6f}",
-        "-i",
-        str(video_path),
-        "-c",
-        "copy",
-        "-an",
-        str(resolved_output_path),
-    ]
-    completed_process = subprocess.run(ffmpeg_command, capture_output=True, timeout=600)
-    if completed_process.returncode != 0:
-        raise RuntimeError(
-            "ffmpeg slice failed: " + completed_process.stderr.decode(errors="ignore")
+    frame_count: int,
+    frames_per_second: float,
+) -> list[float]:
+    """Packet times of an episode window, rebased to the window start.
+
+    The window anchors on the left: the first ``frame_count`` packets at or
+    within one frame period of ``start_seconds`` are the episode's frames.
+    Container timestamps are quantized while the metadata window is exact,
+    so a half-open ``[start, end)`` filter over the raw times drags the next
+    episode's first frame in or drops this episode's last frame by one; the
+    data row count is the window's true extent on both edges, and the
+    per-frame timestamp check downstream still validates the alignment.
+    """
+    frame_period = 1.0 / frames_per_second
+    times = _get_video_pts_times(mp4_path)
+    windowed = [time for time in times if time >= start_seconds - frame_period]
+    if len(windowed) < frame_count:
+        raise ValueError(
+            f"video has {len(windowed)} packets at or after the window start "
+            f"but the episode has {frame_count} data rows: {mp4_path}"
         )
-    return resolved_output_path
+    return [time - start_seconds for time in windowed[:frame_count]]
 
 
 def _hf_repo_info(repo_id: str, revision: str) -> _DatasetRepositoryInformation:
-    """Resolve the immutable commit sha and license for a HF dataset repo."""
-    url = f"https://huggingface.co/api/datasets/{repo_id}/revision/{revision}"
-    with urllib.request.urlopen(_hugging_face_request(url), timeout=60) as response:
-        try:
-            repository_information = json.loads(response.read().decode())
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError(
-                f"Hugging Face repository response for {repo_id}@{revision} is not valid "
-                f"JSON: {error}"
-            ) from error
-    if not isinstance(repository_information, dict):
-        raise ValueError("Hugging Face repository response is not a JSON object")
-    resolved_revision = repository_information.get("sha")
-    if not isinstance(resolved_revision, str) or not resolved_revision.strip():
-        raise ValueError(
-            f"Hugging Face did not resolve {repo_id}@{revision} to an immutable commit"
+    """Resolve the immutable source identity through the Hub SDK."""
+    try:
+        repository_information = HfApi().dataset_info(
+            repo_id, revision=revision, timeout=60, expand=["sha", "cardData"]
         )
-    if not re.fullmatch(r"[0-9a-f]{7,64}", resolved_revision):
+    except (HTTPError, ValueError, TypeError, KeyError) as error:
+        raise ValueError(f"Hugging Face repository {repo_id}@{revision}: {error}") from error
+    resolved_revision = repository_information.sha
+    if not isinstance(resolved_revision, str) or not re.fullmatch(
+        r"[0-9a-f]{7,64}", resolved_revision
+    ):
         raise ValueError(f"Hugging Face returned a malformed commit sha for {repo_id}@{revision}")
-    card_data = repository_information.get("cardData")
-    license_name = card_data.get("license") if isinstance(card_data, dict) else None
-    return {
-        "sha": resolved_revision,
-        "license": str(license_name or "unknown"),
-    }
+    card_data = repository_information.card_data
+    license_name = card_data.get("license") if card_data is not None else None
+    return {"sha": resolved_revision, "license": str(license_name or "unknown")}
 
 
-def _hf_tree(repo_id: str, revision: str, path: str) -> list[dict]:
-    """List files under a HF dataset tree path (recursive)."""
-    url = f"https://huggingface.co/api/datasets/{repo_id}/tree/{revision}/{path}?recursive=true"
-    initial_url_parts = urlsplit(url)
-    initial_origin = (initial_url_parts.scheme, initial_url_parts.netloc)
-    all_tree_entries: list[dict] = []
-    seen_paths: set[str] = set()
-    visited_urls: set[str] = set()
-    next_url: str | None = url
-    while next_url is not None:
-        if next_url in visited_urls:
-            raise ValueError(
-                f"Hugging Face tree response for {repo_id}@{revision} path {path!r} "
-                f"repeated an already fetched pagination URL: {next_url!r}"
-            )
-        try:
-            next_url_parts = urlsplit(next_url)
-        except ValueError as error:
-            raise ValueError(
-                f"Hugging Face tree response for {repo_id}@{revision} path {path!r} "
-                f"contains an invalid pagination URL: {next_url!r}"
-            ) from error
-        next_origin = (next_url_parts.scheme, next_url_parts.netloc)
-        if next_origin != initial_origin:
-            raise ValueError(
-                f"Hugging Face tree response for {repo_id}@{revision} path {path!r} "
-                f"contains a pagination URL with a different scheme and host: {next_url!r}"
-            )
-        visited_urls.add(next_url)
-        with urllib.request.urlopen(_hugging_face_request(next_url), timeout=60) as response:
-            try:
-                tree_entries = json.loads(response.read().decode())
-            except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                raise ValueError(
-                    f"Hugging Face tree response for {repo_id}@{revision} path {path!r} is not "
-                    f"valid JSON: {error}"
-                ) from error
-            link_header = response.headers.get("Link")
-        if not isinstance(tree_entries, list) or not all(
-            isinstance(tree_entry, dict) for tree_entry in tree_entries
-        ):
-            raise ValueError(f"Hugging Face tree response for {path!r} is not a list of objects")
-        for tree_entry in tree_entries:
-            tree_entry_path = tree_entry.get("path")
-            if isinstance(tree_entry_path, str):
-                if tree_entry_path in seen_paths:
-                    continue
-                seen_paths.add(tree_entry_path)
-            all_tree_entries.append(tree_entry)
+def _hf_episode_metadata_files(repo_id: str, revision: str) -> list[str]:
+    """Select metadata files from the SDK's complete repository file inventory.
 
-        next_url = None
-        for link_entry in (link_header or "").split(","):
-            link_match = re.fullmatch(r"\s*<([^>]+)>\s*;\s*(.*)", link_entry)
-            if link_match is None:
-                continue
-            relation_match = re.search(
-                r"(?:^|;)\s*rel\s*=\s*(?:\"([^\"]+)\"|([^;\s]+))",
-                link_match.group(2),
-                flags=re.IGNORECASE,
-            )
-            if relation_match is None:
-                continue
-            relations = (relation_match.group(1) or relation_match.group(2)).split()
-            if any(relation.lower() == "next" for relation in relations):
-                next_url = link_match.group(1)
-                break
-    return all_tree_entries
-
-
-def _hugging_face_request(url: str) -> urllib.request.Request:
-    headers = {"User-Agent": "hflow-lerobot"}
-    for environment_variable_name in HUGGING_FACE_TOKEN_ENVIRONMENT_VARIABLES:
-        token = os.environ.get(environment_variable_name, "").strip()
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-            break
-    return urllib.request.Request(url, headers=headers)
+    Repository info includes all file names in one response, so metadata
+    discovery does not follow server-provided pagination URLs with credentials.
+    """
+    try:
+        repository_information = HfApi().dataset_info(
+            repo_id, revision=revision, timeout=60, expand=["siblings"]
+        )
+    except (HTTPError, ValueError, TypeError, KeyError) as error:
+        raise ValueError(f"Hugging Face files for {repo_id}@{revision}: {error}") from error
+    if repository_information.siblings is None:
+        raise ValueError(f"Hugging Face did not list files for {repo_id}@{revision}")
+    filenames: set[str] = set()
+    for entry in repository_information.siblings:
+        if not isinstance(entry.rfilename, str) or not entry.rfilename:
+            raise ValueError(f"Hugging Face listed an invalid filename for {repo_id}@{revision}")
+        filenames.add(entry.rfilename)
+    return [
+        filename
+        for filename in sorted(filenames)
+        if filename.startswith("meta/episodes/") and filename.endswith(".parquet")
+    ]
 
 
 def _fetch_info_json(repo_id: str, revision: str, cache_dir: Path) -> dict:
-    meta_entries = _hf_tree(repo_id, revision, "meta")
-    info_path = None
-    for entry in meta_entries:
-        if entry.get("path") == "meta/info.json" and entry.get("type") == "file":
-            info_path = True
-            break
-    if not info_path:
-        raise RuntimeError("meta/info.json not found; not a LeRobot v3 repository")
-    load_url = f"https://huggingface.co/datasets/{repo_id}/resolve/{revision}/meta/info.json"
-    with urllib.request.urlopen(_hugging_face_request(load_url), timeout=120) as response:
-        try:
-            dataset_information = json.loads(response.read().decode())
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError(
-                f"LeRobot meta/info.json for {repo_id}@{revision} is not valid JSON: {error}"
-            ) from error
+    try:
+        metadata_path = _download_file(repo_id, revision, "meta/info.json", cache_dir)
+    except RemoteEntryNotFoundError as error:
+        raise RuntimeError("meta/info.json not found; not a LeRobot v3 repository") from error
+    try:
+        dataset_information = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"LeRobot meta/info.json for {repo_id}@{revision} is not valid JSON: {error}"
+        ) from error
     if not isinstance(dataset_information, dict):
         raise ValueError("LeRobot meta/info.json is not a JSON object")
-    (cache_dir / "meta").mkdir(parents=True, exist_ok=True)
-    (cache_dir / "meta" / "info.json").write_text(json.dumps(dataset_information, indent=2))
     return dataset_information
 
 
-def _download_file(url: str, destination_path: Path, chunk_size: int = 1 << 20) -> None:
-    destination_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        prefix=f".{destination_path.name}.",
-        suffix=".partial",
-        dir=destination_path.parent,
-        delete=False,
-    ) as temporary_file:
-        temporary_path = Path(temporary_file.name)
-        try:
-            with urllib.request.urlopen(_hugging_face_request(url), timeout=300) as response:
-                while chunk := response.read(chunk_size):
-                    temporary_file.write(chunk)
-            temporary_file.flush()
-            os.fsync(temporary_file.fileno())
-            temporary_path.replace(destination_path)
-        except BaseException:
-            temporary_path.unlink(missing_ok=True)
-            raise
-
-
-def _episode_metadata_cache_path(
-    episodes_metadata_directory: Path, tree_entry_path: str, *, repo_id: str
-) -> Path:
-    """Where one ``meta/episodes`` tree entry lands in the local cache.
-
-    The path below ``meta/episodes`` is kept rather than flattened to its
-    basename. Dataset v3 shards episode metadata as
-    ``chunk-XXX/file-YYY.parquet`` and reuses file names across chunk
-    directories, so two shards flattened to one cache file would make the
-    second look already downloaded and its episodes vanish (#293). The tree
-    listing is remote input, so an entry that would land outside the
-    metadata directory is refused rather than joined.
-    """
-    tree_path = PurePosixPath(tree_entry_path)
+def _download_file(repo_id: str, revision: str, filename: str, cache_dir: Path) -> Path:
+    relative_path = PurePosixPath(filename)
+    if (
+        relative_path.is_absolute()
+        or ".." in relative_path.parts
+        or "\\" in filename
+        or not relative_path.parts
+        or relative_path.as_posix() != filename
+        or not (cache_dir / filename).resolve().is_relative_to(cache_dir.resolve())
+    ):
+        raise ValueError(f"Hugging Face file {filename!r} must stay inside the source cache")
     try:
-        relative_path = tree_path.relative_to(EPISODE_METADATA_TREE_PREFIX)
-    except ValueError:
-        relative_path = None
-    if relative_path is None or not relative_path.parts or ".." in relative_path.parts:
-        raise ValueError(
-            f"Hugging Face tree response for {repo_id} lists {tree_entry_path!r}, which is "
-            f"not a file below {EPISODE_METADATA_TREE_PREFIX}/"
+        return Path(
+            hf_hub_download(
+                repo_id,
+                filename,
+                repo_type="dataset",
+                revision=revision,
+                local_dir=cache_dir,
+                library_name="hflow",
+            )
         )
-    return episodes_metadata_directory / relative_path
+    except RemoteEntryNotFoundError:
+        raise
+    except HTTPError as error:
+        raise RuntimeError(
+            f"Hugging Face download {repo_id}@{revision}/{filename}: {error}"
+        ) from error
+
+
+#: The fields ``_convert_single_episode`` supplies to each template's ``format`` call.
+#: They differ, and validating against the union would accept a ``data_path``
+#: naming ``camera_key`` that then fails at the data call site. The values are
+#: representative rather than real: the format spec is checked against the type
+#: the call site passes, so ``{chunk_index:03d}`` has to see an int.
+_DATA_PATH_FORMAT_FIELDS: dict[str, object] = {"chunk_index": 0, "file_index": 0}
+_VIDEO_PATH_FORMAT_FIELDS: dict[str, object] = {
+    "chunk_index": 0,
+    "file_index": 0,
+    "video_key": "camera",
+    "camera_key": "camera",
+}
+
+
+def _validate_path_template(
+    template: str, field_name: str, format_fields: dict[str, object]
+) -> None:
+    """Refuse a path template the converter could not format.
+
+    ``_parse_dataset_information`` is the one place the external document is
+    read, but these two templates used to reach ``str.format`` five hundred
+    lines later, after the episode metadata had already been downloaded. The
+    failure arrived as a bare ``KeyError`` naming neither the file nor the
+    field. Formatting once here moves it to the boundary and gives it the same
+    shape as every other refusal.
+
+    What this proves is that the template formats, not that it names a
+    sensible path. ``{chunk_index.bit_length}`` formats fine and yields a
+    directory named after a bound method; that becomes a 404 at download time
+    rather than something to catch here.
+    """
+    try:
+        template.format(**format_fields)
+    except KeyError as error:
+        raise ValueError(
+            f"LeRobot meta/info.json has an invalid {field_name} template "
+            f"{template!r}: unknown field {error.args[0]!r}"
+        ) from error
+    except IndexError as error:
+        raise ValueError(
+            f"LeRobot meta/info.json has an invalid {field_name} template "
+            f"{template!r}: positional fields are not supported, name the field instead"
+        ) from error
+    except (ValueError, TypeError) as error:
+        # TypeError belongs here for the same reason as the rest: subscripting
+        # a field, ``{chunk_index[0]}``, raises it from str.format and would
+        # otherwise leave the boundary as a bare "'int' object is not
+        # subscriptable" naming neither the file nor the field.
+        raise ValueError(
+            f"LeRobot meta/info.json has an invalid {field_name} template {template!r}: {error}"
+        ) from error
 
 
 def _parse_dataset_information(dataset_information: dict) -> _DatasetInformation:
@@ -624,6 +613,10 @@ def _parse_dataset_information(dataset_information: dict) -> _DatasetInformation
     boundary inspects the external document again. Unknown upstream fields are
     ignored: LeRobot adds them, and refusing one would fail imports that
     convert correctly.
+
+    The two path templates are checked by formatting them, each against the
+    fields its own call site supplies, so a template the converter could not
+    use is refused before any download.
     """
     frames_per_second = dataset_information.get("fps")
     if (
@@ -639,11 +632,13 @@ def _parse_dataset_information(dataset_information: dict) -> _DatasetInformation
     data_path_template = dataset_information.get("data_path")
     if not isinstance(data_path_template, str) or not data_path_template.strip():
         raise ValueError("LeRobot meta/info.json must define a non-empty data_path template")
+    _validate_path_template(data_path_template, "data_path", _DATA_PATH_FORMAT_FIELDS)
     video_path_template = dataset_information.get(
         "video_path", "videos/{camera_key}/{chunk_index:06d}/{file_index:06d}.mp4"
     )
     if not isinstance(video_path_template, str) or not video_path_template.strip():
         raise ValueError("LeRobot meta/info.json must define a non-empty video_path template")
+    _validate_path_template(video_path_template, "video_path", _VIDEO_PATH_FORMAT_FIELDS)
 
     dataset_features = dataset_information.get("features")
     if not isinstance(dataset_features, dict):
@@ -680,31 +675,17 @@ def _parse_dataset_information(dataset_information: dict) -> _DatasetInformation
 
 
 def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _SourceArchive:
-    """Download the corpus parquets and video chunks needed for the given episodes."""
+    """Download metadata and index episode data and video windows."""
     import duckdb
 
-    dataset_base_url = (
-        "https://huggingface.co/datasets/"
-        f"{dataset_source.repo_id}/resolve/{dataset_source.revision}"
-    )
-    metadata_directory = cache_dir / "meta"
     parsed_information = _parse_dataset_information(
         _fetch_info_json(dataset_source.repo_id, dataset_source.revision, cache_dir)
     )
 
-    # Determine the episodes parquet location (v3 uses meta/episodes/*.parquet)
-    episodes_metadata_directory = metadata_directory / "episodes"
-    episodes_metadata_directory.mkdir(parents=True, exist_ok=True)
-    episode_metadata_files: list[Path] = []
-    entries = _hf_tree(dataset_source.repo_id, dataset_source.revision, "meta/episodes")
-    for entry in entries:
-        if entry.get("type") == "file" and entry["path"].endswith(".parquet"):
-            destination_path = _episode_metadata_cache_path(
-                episodes_metadata_directory, entry["path"], repo_id=dataset_source.repo_id
-            )
-            if not destination_path.exists():
-                _download_file(f"{dataset_base_url}/{entry['path']}", destination_path)
-            episode_metadata_files.append(destination_path)
+    episode_metadata_files = [
+        _download_file(dataset_source.repo_id, dataset_source.revision, filename, cache_dir)
+        for filename in _hf_episode_metadata_files(dataset_source.repo_id, dataset_source.revision)
+    ]
 
     if not episode_metadata_files:
         raise RuntimeError("no meta/episodes parquet files found")
@@ -1106,10 +1087,6 @@ def _convert_single_episode(
     if episode_row.length is None or episode_row.length < 1:
         raise ValueError(f"episode {episode_index} has no frames")
 
-    dataset_base_url = (
-        "https://huggingface.co/datasets/"
-        f"{dataset_source.repo_id}/resolve/{dataset_source.revision}"
-    )
     cache_directory = source_archive.cache_dir
 
     # Locate the data parquet for this episode
@@ -1118,13 +1095,9 @@ def _convert_single_episode(
     data_relative_path = source_archive.data_path.format(
         chunk_index=int(data_chunk_index), file_index=int(data_file_index)
     )
-    local_data_path = (
-        cache_directory
-        / "data"
-        / f"chunk-{int(data_chunk_index):06d}-file-{int(data_file_index):06d}.parquet"
+    local_data_path = _download_file(
+        dataset_source.repo_id, dataset_source.revision, data_relative_path, cache_directory
     )
-    if not local_data_path.exists():
-        _download_file(f"{dataset_base_url}/{data_relative_path}", local_data_path)
 
     # Episode video windows per camera (v3 flat columns: videos/<cam>/from_timestamp etc.)
     video_time_window_by_camera: dict[str, tuple[float, float]] = {}
@@ -1212,33 +1185,25 @@ def _convert_single_episode(
             video_key=camera_key,
             camera_key=camera_key,
         )
-        local_video_path = (
-            cache_directory
-            / "videos"
-            / (
-                f"{camera_key.replace('/', '_').replace('.', '_')}"
-                f"-chunk{video_chunk_index}-file{video_file_index}.mp4"
-            )
+        local_video_path = _download_file(
+            dataset_source.repo_id, dataset_source.revision, video_relative_path, cache_directory
         )
-        if not local_video_path.exists():
-            _download_file(f"{dataset_base_url}/{video_relative_path}", local_video_path)
 
         if video_start_seconds > 0.0 or video_end_seconds > 0.0:
-            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temporary_video_file:
-                temporary_video_path = Path(temporary_video_file.name)
-            try:
-                sliced_video_path = _slice_video(
-                    local_video_path,
-                    video_start_seconds,
-                    video_end_seconds,
-                    temporary_video_path,
-                )
-                access_units = _transcode_mp4_to_h264(
-                    sliced_video_path, IMPORT_GOP_SECONDS, float(frames_per_second)
-                )
-                presentation_timestamps = _get_video_pts_times(sliced_video_path)
-            finally:
-                temporary_video_path.unlink(missing_ok=True)
+            access_units = _transcode_mp4_to_h264(
+                local_video_path,
+                IMPORT_GOP_SECONDS,
+                float(frames_per_second),
+                frame_count=frame_count,
+                seek_seconds=video_start_seconds,
+            )
+            presentation_timestamps = _relative_video_pts_times(
+                local_video_path,
+                video_start_seconds,
+                video_end_seconds,
+                frame_count,
+                float(frames_per_second),
+            )
         else:
             access_units = _transcode_mp4_to_h264(
                 local_video_path, IMPORT_GOP_SECONDS, float(frames_per_second)

@@ -13,10 +13,10 @@ script) reads the same file.
 
 Two rules hold at this boundary:
 
-- Every write is atomic: the payload lands in a temp file beside the target
-  and is moved into place with ``os.replace`` (via ``Path.replace``), so a
-  crash never leaves a torn file. Concurrent writers are last-writer-wins,
-  which a single-operator local tool accepts.
+- Every write replaces the whole state through ``StorageRoot``: a local
+  temp-file rename or a single bucket PUT, so readers never see a torn file.
+  Concurrent writers are last-writer-wins; the server serializes its own
+  read-modify-write operations.
 - Every read parses loudly: a payload that is not JSON, carries a
   ``state_version`` this build does not speak, or holds a malformed entry is
   refused with an error NAMING THE FILE -- never silently coerced, dropped,

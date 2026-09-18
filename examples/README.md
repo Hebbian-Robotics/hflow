@@ -57,6 +57,47 @@ Guide: [Run HFlow inside a worker](../docs/how-to/run-embedded-workers.md)
 
 Code: [`embedded_worker.py`](./embedded_worker.py)
 
+## Original source frame sampling
+
+**Use it for:** covering a local video with complete windows and extracting
+bounded previews with actual source timestamps.
+
+**Prerequisites:** the root uv environment, a local video, and FFmpeg/ffprobe.
+HFlow may download its managed binaries; no model service or credentials are used.
+
+```bash
+uv run python examples/sample_source_video.py recording.mp4 \
+    --output data/source-frames --mode keyframes_first
+```
+
+The example writes JPEGs into a new output directory and prints JSON for each
+window. It preserves the source and reports keyframe fallback explicitly.
+
+Guide: [Sample original video frames](../docs/how-to/sample-source-video.md)
+
+Code: [`sample_source_video.py`](./sample_source_video.py)
+
+## Continuous camera motion
+
+**Use it for:** streaming per-frame-pair motion and optional continuous shake
+measurements, including explicit tracking failures and unavailable filter context.
+
+**Prerequisites:** the root development environment (including OpenCV), a local
+fixed-frame-rate video, and its actual frame rate. HFlow may download its managed
+FFmpeg build. No model service or credentials are used.
+
+```bash
+uv run python examples/camera_motion.py recording.mp4 --fps 30 --shake
+```
+
+The example prints JSON Lines while decoding and measuring. It reads the video
+without modifying it and retains bounded decoder/filter state. Omit `--shake`
+for raw translation, rotation, scale, and fit evidence without filter lookahead.
+
+Guide: [Stream camera motion](../docs/how-to/stream-camera-motion.md)
+
+Code: [`camera_motion.py`](./camera_motion.py)
+
 ## Weighted measurement distributions
 
 **Use it for:** comparing measurement spread with an explicit observation
@@ -326,7 +367,8 @@ loud before any output is published.
 
 **Prerequisites:** network access to Hugging Face and enough local disk for the
 selected Parquet and video files. HFlow uses its managed FFmpeg build; no
-LeRobot, PyTorch, or Hugging Face SDK installation is required.
+LeRobot or PyTorch installation is required. The Hugging Face Hub SDK ships
+with HFlow.
 
 PushT (single camera, 2-dimensional vectors):
 
@@ -409,6 +451,56 @@ or (when `lerobot` is installed) official-API validation never replace a
 previously valid destination.
 
 Code: [`lerobot/export.py`](./lerobot/export.py)
+
+### Reproducible real-camera LeRobot workflow
+
+**Use it for:** the bounded end-to-end composition of the LeRobot adapter:
+import a pinned real SO-100 corpus subset (two 640 x 480 cameras,
+six-dimensional state and action), run the quality gates, curate from the
+recorded evidence, and export both an HFlow snapshot and a loadable
+LeRobot Dataset v3 selection -- twice from a clean checkout, with the same
+selection. The pinned repository, revision, cameras, and episode subset
+live in [`lerobot/source-manifest.json`](./lerobot/source-manifest.json);
+edit that file to change the run.
+
+**Prerequisites:** the normal development environment, network access to
+the Hugging Face Hub, and about 1 GB of free disk. The pinned corpus
+(`lerobot/svla_so101_pickplace` at commit `f641879`) is about 86 MB. The
+first run takes roughly 30-60 minutes: the export step materializes the
+full pinned source archive through the public importer (`hflow import
+lerobot` with no episode list converts every episode), while the import
+step itself converts only the listed subset. Later runs reuse downloads,
+skip already-converted episodes, and finish much faster. The Hugging Face Hub
+SDK ships with HFlow; no LeRobot or PyTorch installation is required.
+
+```bash
+uv run python examples/lerobot/workflow.py
+```
+
+The workflow imports the pinned subset with every declared camera, runs
+`hflow doctor` on the converted inputs (any non-conforming input aborts
+the run), processes the episodes through an `hflow.App` with the
+applicable default checks and the built-in contact-sheet enrichment, cuts
+the selection with the documented curation policy (regenerated from the
+camera list as [`lerobot/curation.sql`](./lerobot/curation.sql)), writes
+an HFlow dataset snapshot with copied media, exports the selection as a
+LeRobot Dataset v3 repository, verifies the export in a clean process, and
+prints a summary: source episode count, processed count, status counts,
+selected count, output paths, and the immutable source revision. All
+downloads and generated artifacts stay under the gitignored data
+directory. Re-running without source or configuration changes is safe and
+reproduces the same selection; if no episode is rejected under the
+documented policy, the run says so instead of manufacturing a failure.
+
+Observable outputs (under `./data/lerobot_workflow`):
+`prepared-manifest.json` (converter version, per-episode receipts, the
+resolved immutable source revision), `catalog/` (append-only quality
+evidence), `manifest.parquet` (the selection with coverage denominators),
+`snapshot/` (standard Parquet tables plus the copied media under
+`assets/`), and `v3/` (the exported LeRobot Dataset v3 repository).
+
+Code: [`lerobot/workflow.py`](./lerobot/workflow.py) and
+[`lerobot/verify.py`](./lerobot/verify.py)
 
 
 ## Example requirements

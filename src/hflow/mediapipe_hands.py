@@ -46,6 +46,7 @@ from hflow._pinned_asset import (
 )
 from hflow._video_measurement_toolchain import resolved_video_measurement_toolchain
 from hflow._video_measurements._raw_frames import rgb_frames
+from hflow.asyncio_utils import run_blocking
 from hflow.episode import Episode
 from hflow.steps import CheckResult, Interval, MeasurementValue
 from hflow.video import source_log_times_for_sampled_frames
@@ -391,7 +392,30 @@ def _frame_hand_counts(result: Any) -> FrameHandCounts:
     )
 
 
-def mediapipe_hand_detection(
+async def mediapipe_hand_detection(
+    episode: Episode,
+    *,
+    cameras: Sequence[str] | None = None,
+    sample_fps: float = DEFAULT_SAMPLE_FPS,
+    inference_long_edge_pixels: int | None = None,
+    minimum_hand_detection_confidence: float = DEFAULT_MINIMUM_CONFIDENCE,
+    minimum_hand_presence_confidence: float = DEFAULT_MINIMUM_CONFIDENCE,
+    minimum_tracking_confidence: float = DEFAULT_MINIMUM_CONFIDENCE,
+) -> CheckResult:
+    """Measure hands without blocking the pipeline event loop."""
+    return await run_blocking(
+        _measure_mediapipe_hands,
+        episode,
+        cameras=cameras,
+        sample_fps=sample_fps,
+        inference_long_edge_pixels=inference_long_edge_pixels,
+        minimum_hand_detection_confidence=minimum_hand_detection_confidence,
+        minimum_hand_presence_confidence=minimum_hand_presence_confidence,
+        minimum_tracking_confidence=minimum_tracking_confidence,
+    )
+
+
+def _measure_mediapipe_hands(
     episode: Episode,
     *,
     cameras: Sequence[str] | None = None,

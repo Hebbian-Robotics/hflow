@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import sys
@@ -231,20 +232,26 @@ def test_model_response_without_text_is_a_recoverable_invalid_judgment() -> None
         model="routed-model",
         usage=SimpleNamespace(model_dump=lambda **_arguments: {"total_tokens": 17}),
     )
+
+    async def complete(**_arguments: object) -> object:
+        return response
+
     client = SimpleNamespace(
         chat=SimpleNamespace(
-            completions=SimpleNamespace(create=lambda **_arguments: response),
+            completions=SimpleNamespace(create=complete),
         )
     )
 
-    judgment = evaluate_image_with_model(
-        client=client,
-        model="requested-model",
-        prompt="count hands",
-        image_data_url="data:image/jpeg;base64,unused",
-        response_format=ResponseFormat.JSON_SCHEMA,
-        temperature=None,
-        max_tokens=512,
+    judgment = asyncio.run(
+        evaluate_image_with_model(
+            client=client,
+            model="requested-model",
+            prompt="count hands",
+            image_data_url="data:image/jpeg;base64,unused",
+            response_format=ResponseFormat.JSON_SCHEMA,
+            temperature=None,
+            max_tokens=512,
+        )
     )
 
     assert judgment == UnparsedHandCountOutcome(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from collections.abc import Callable
@@ -68,9 +69,13 @@ class _FixtureCompletions:
     def __init__(self, response_text: str) -> None:
         self.response_text = response_text
 
-    def create(self, **_request_parameters: object) -> object:
+    async def create(self, **_request_parameters: object) -> object:
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=self.response_text))],
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop", message=SimpleNamespace(content=self.response_text)
+                )
+            ],
             model="routed-vision-model",
             usage=_FixtureUsage(),
         )
@@ -100,8 +105,8 @@ _TASK_VALUE_CONTRACTS: dict[
 }
 
 
-def test_task_schemas_and_parsers_match_the_published_contract() -> None:
-    """Preserve Build AI's schema shapes and enforce its prose vocabulary."""
+def test_task_schemas_and_parsers_enforce_the_answer_contract() -> None:
+    """Advertise the same answer vocabulary enforced at the model boundary."""
     executable_tasks = set(EvaluationTask) - {EvaluationTask.BOTH}
     assert set(_TASK_VALUE_CONTRACTS) == executable_tasks
 
@@ -114,9 +119,12 @@ def test_task_schemas_and_parsers_match_the_published_contract() -> None:
             else cast(list[object], property_schema["enum"])
         )
         if task is EvaluationTask.HAND_COUNT:
-            # The published schema says INTEGER without an enum. Keeping that
-            # exact shape also avoids Gemini/OpenRouter emitting an empty object.
-            assert property_schema == {"type": "integer"}
+            # Keep an integer schema; an integer enum caused empty answers on
+            # Gemini/OpenRouter. Bounds express the supported count vocabulary.
+            assert property_schema["type"] == "integer"
+            assert "enum" not in property_schema
+            assert property_schema["minimum"] == 0
+            assert property_schema["maximum"] == 2
         for value in permitted_values:
             assert parser(json.dumps({property_name: value})) == value, (
                 f"{task.value}: the schema permits {value!r} but the parser does not accept it"
@@ -163,18 +171,20 @@ def test_active_manipulation_parser_accepts_published_and_compatible_shapes(
 
 
 def test_model_judgment_returns_hflow_measurements_for_the_replay_and_pipeline() -> None:
-    outcome = evaluate_image_with_model(
-        client=_FixtureOpenAICompatibleClient('{"hand_count": 2}'),
-        model="requested-vision-model",
-        task_definition=TaskDefinition(
-            task=EvaluationTask.HAND_COUNT,
-            prompt="Count hands.",
-            response_schema={"type": "object"},
-        ),
-        image_data_url="data:image/png;base64,fixture",
-        response_format=ResponseFormat.JSON_SCHEMA,
-        temperature=None,
-        max_tokens=32,
+    outcome = asyncio.run(
+        evaluate_image_with_model(
+            client=_FixtureOpenAICompatibleClient('{"hand_count": 2}'),
+            model="requested-vision-model",
+            task_definition=TaskDefinition(
+                task=EvaluationTask.HAND_COUNT,
+                prompt="Count hands.",
+                response_schema={"type": "object"},
+            ),
+            image_data_url="data:image/png;base64,fixture",
+            response_format=ResponseFormat.JSON_SCHEMA,
+            temperature=None,
+            max_tokens=32,
+        )
     )
 
     assert isinstance(outcome, ParsedVisionModelOutcome)
@@ -214,18 +224,20 @@ def test_model_judgment_returns_hflow_measurements_for_the_replay_and_pipeline()
 
 
 def test_unparsed_model_judgment_is_an_explicit_recoverable_outcome() -> None:
-    outcome = evaluate_image_with_model(
-        client=_FixtureOpenAICompatibleClient("unclear"),
-        model="requested-vision-model",
-        task_definition=TaskDefinition(
-            task=EvaluationTask.HAND_COUNT,
-            prompt="Count hands.",
-            response_schema={"type": "object"},
-        ),
-        image_data_url="data:image/png;base64,fixture",
-        response_format=ResponseFormat.JSON_SCHEMA,
-        temperature=None,
-        max_tokens=32,
+    outcome = asyncio.run(
+        evaluate_image_with_model(
+            client=_FixtureOpenAICompatibleClient("unclear"),
+            model="requested-vision-model",
+            task_definition=TaskDefinition(
+                task=EvaluationTask.HAND_COUNT,
+                prompt="Count hands.",
+                response_schema={"type": "object"},
+            ),
+            image_data_url="data:image/png;base64,fixture",
+            response_format=ResponseFormat.JSON_SCHEMA,
+            temperature=None,
+            max_tokens=32,
+        )
     )
 
     assert isinstance(outcome, UnparsedVisionModelOutcome)
@@ -501,7 +513,7 @@ def test_run_fingerprint_for_unchanged_methodology_is_stable(tmp_path: Path) -> 
 
     assert (
         document["fingerprint"]
-        == "6e58a791b9fb05d793fbb10cfbb3f894d6f896691d8285e90fa5fc6e4685aa15"
+        == "90627b31fd9254366dc2fb9e5a6e2d193aa25855bb7d74a07c9473371253f156"
     )
 
 

@@ -26,6 +26,7 @@ def _append_snapshot_episode(
     name: str,
     score: float,
     with_media: bool,
+    score_key: str = "quality/score",
 ) -> tuple[str, Path | None]:
     canonical_episode = working_directory / f"{name}.canonical.mcap"
     canonical_episode.write_bytes(f"canonical bytes for {name}".encode())
@@ -47,7 +48,7 @@ def _append_snapshot_episode(
                 critical=False,
                 status=hflow.CheckStatus.MEASURED,
                 duration_s=0.1,
-                measurements={"quality/score": score, "caption": f"sample {name}"},
+                measurements={score_key: score, "caption": f"sample {name}"},
                 observations=[
                     hflow.Observation(
                         observation_id="frame:1",
@@ -69,6 +70,34 @@ def _append_snapshot_episode(
         ],
     )
     return append_result.episode_id, preview_file
+
+
+def test_case_collisions_refuse_snapshot_without_replacing_existing_output(tmp_path: Path) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    _append_snapshot_episode(
+        catalog, tmp_path, name="first", score=0.1, with_media=False, score_key="/Camera/score"
+    )
+    destination = tmp_path / "snapshot"
+    hflow.export_dataset_snapshot(catalog.root, destination)
+    original = {
+        path.relative_to(destination): path.read_bytes()
+        for path in destination.rglob("*")
+        if path.is_file()
+    }
+    _append_snapshot_episode(
+        catalog, tmp_path, name="second", score=0.9, with_media=False, score_key="/camera/score"
+    )
+
+    with pytest.raises(ValueError, match=r"'/Camera/score'.*'/camera/score'.*collide"):
+        hflow.export_dataset_snapshot(catalog.root, destination, overwrite=True)
+
+    assert {
+        path.relative_to(destination): path.read_bytes()
+        for path in destination.rglob("*")
+        if path.is_file()
+    } == original
+    assert not list(tmp_path.glob(".snapshot.staging-*"))
+    assert not list(tmp_path.glob(".snapshot.previous-*"))
 
 
 def _append_media_priority_episode(
@@ -193,8 +222,11 @@ def test_dataset_snapshot_is_tool_neutral_and_selected_by_manifest(tmp_path: Pat
         assert receipt["path"] == file_name
         assert receipt["size_bytes"] == (output_directory / file_name).stat().st_size
         assert receipt["sha256"] == snapshot_module._sha256_hex(output_directory / file_name)
-    inventory = [*integrity["tables"].values(), *integrity["assets"]]
-    assert integrity["content_id"] == snapshot_module._inventory_content_id(inventory)
+    inventory_records = [
+        snapshot_module._parse_file_integrity_record(entry)
+        for entry in [*integrity["tables"].values(), *integrity["assets"]]
+    ]
+    assert integrity["content_id"] == snapshot_module._inventory_content_id(inventory_records)
     assert len(integrity["content_id"]) == 64
 
     sample_row = duckdb.execute(
@@ -435,6 +467,45 @@ def test_dataset_snapshot_overwrite_refuses_a_symlinked_format_marker(tmp_path: 
         )
 
     assert format_marker.is_symlink()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("format", "someone-elses-dataset-snapshot"),
+        ("format_version", "2"),
+        ("format_version", 1),
+    ],
+    ids=["foreign-format-name", "future-version", "version-as-a-json-number"],
+)
+def test_dataset_snapshot_overwrite_refuses_a_marker_without_our_format_identity(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    """Overwrite is destructive, so identity is what makes it safe.
+
+    This guard shares its predicate with the verifier's #472 gate, and it had
+    no test of its own: disabling it left the whole suite green while the
+    verifier's tests kept passing. A shared predicate needs a case on both
+    sides or it can be loosened from one and noticed by neither.
+
+    The directory keeps its contents, which is the part that matters: a
+    refused overwrite must not have deleted anything first.
+    """
+    catalog = Catalog(tmp_path / "catalog")
+    output_directory = tmp_path / "dataset-snapshot"
+    hflow.export_dataset_snapshot(catalog.location, output_directory)
+    format_marker = output_directory / "format.json"
+    marker = json.loads(format_marker.read_text())
+    marker[field] = value
+    format_marker.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+    sentinel = output_directory / "samples.parquet"
+    sentinel_bytes = sentinel.read_bytes()
+
+    with pytest.raises(ValueError, match="does not identify supported"):
+        hflow.export_dataset_snapshot(catalog.location, output_directory, overwrite=True)
+
+    assert sentinel.read_bytes() == sentinel_bytes
+    assert json.loads(format_marker.read_text())[field] == value
 
 
 def test_dataset_snapshot_excludes_check_runs_without_a_committed_episode(tmp_path: Path) -> None:
@@ -700,8 +771,11 @@ def test_dataset_snapshot_copy_mode_records_asset_integrity(tmp_path: Path) -> N
     assert asset_receipt["path"].startswith("assets/")
     assert asset_receipt["size_bytes"] == asset_path.stat().st_size
     assert asset_receipt["sha256"] == snapshot_module._sha256_hex(asset_path)
-    inventory = [*integrity["tables"].values(), *integrity["assets"]]
-    assert integrity["content_id"] == snapshot_module._inventory_content_id(inventory)
+    inventory_records = [
+        snapshot_module._parse_file_integrity_record(entry)
+        for entry in [*integrity["tables"].values(), *integrity["assets"]]
+    ]
+    assert integrity["content_id"] == snapshot_module._inventory_content_id(inventory_records)
     assert len(integrity["content_id"]) == 64
 
 

@@ -50,6 +50,14 @@ class DatasetSource:
 
 
 @dataclass(frozen=True)
+class SourceIdentity:
+    """The factory and worker that produced one source video, from its sidecar."""
+
+    factory_id: str
+    worker_id: str
+
+
+@dataclass(frozen=True)
 class SourceArchive:
     path: str
     sha256: str
@@ -143,6 +151,7 @@ def _parse_fault_segment(value: object, context: str) -> tuple[float, float]:
 def _expand_episode_plan(
     sources: tuple[SourceVideo, ...],
     episode_plan: EpisodePlan,
+    archive_sha256: str,
 ) -> tuple[PlannedEpisode, ...]:
     planned_faults_by_episode_number = {
         planned_fault.episode_number: planned_fault for planned_fault in episode_plan.faults
@@ -163,9 +172,18 @@ def _expand_episode_plan(
             )
 
         planned_fault = planned_faults_by_episode_number.get(episode_number)
+        # Mirror App's _source_artifact_directory_name: source basenames are not
+        # identities, so the id carries a digest of the pinned archive, the member
+        # name, and this episode's window start (one member yields many excerpt
+        # windows). Two shards or two windows can never share a landing filename,
+        # and the episode number stays in the id for readability.
+        source_stem = Path(source_video.member).stem
+        source_identity_digest = hashlib.sha256(
+            f"{archive_sha256}:{source_video.member}:{source_start_s}".encode()
+        ).hexdigest()[:12]
         episodes.append(
             PlannedEpisode(
-                episode_id=f"factory_051_episode_{episode_number:04d}",
+                episode_id=f"{source_stem}-{episode_number:04d}-{source_identity_digest}",
                 source_member=source_video.member,
                 source_start_s=source_start_s,
                 duration_s=episode_plan.duration_s,
@@ -282,7 +300,7 @@ def _load_manifest(manifest_path: Path) -> CorpusManifest:
                 f"fault segment for episode {planned_fault.episode_number} ends after the episode"
             )
 
-    episodes = _expand_episode_plan(sources, episode_plan)
+    episodes = _expand_episode_plan(sources, episode_plan, archive.sha256)
 
     return CorpusManifest(
         schema_version=2,
@@ -348,13 +366,35 @@ def _extract_source_videos(
     manifest: CorpusManifest,
     archive_path: Path,
     data_root: Path,
-) -> dict[str, Path]:
+) -> tuple[dict[str, Path], dict[str, SourceIdentity]]:
     source_root = data_root / "source"
     source_root.mkdir(parents=True, exist_ok=True)
     source_paths: dict[str, Path] = {}
+    identities: dict[str, SourceIdentity] = {}
     with tarfile.open(archive_path, mode="r") as source_archive:
         for source_video in manifest.sources:
             destination_path = source_root / Path(source_video.member).name
+            sidecar_member = str(Path(source_video.member).with_suffix(".json").as_posix())
+            try:
+                sidecar_stream = source_archive.extractfile(sidecar_member)
+            except KeyError as error:
+                raise RuntimeError(
+                    f"missing sidecar {sidecar_member!r} for source video "
+                    f"{source_video.member!r} in the source archive"
+                ) from error
+            if sidecar_stream is None:
+                raise RuntimeError(
+                    f"missing sidecar {sidecar_member!r} for source video "
+                    f"{source_video.member!r} in the source archive"
+                )
+            with sidecar_stream:
+                sidecar = json.loads(sidecar_stream.read())
+            for field in ("factory_id", "worker_id"):
+                if not isinstance(sidecar.get(field), str) or not sidecar[field]:
+                    raise RuntimeError(f"sidecar {sidecar_member!r} is missing a usable {field!r}")
+            identities[source_video.member] = SourceIdentity(
+                factory_id=sidecar["factory_id"], worker_id=sidecar["worker_id"]
+            )
             if destination_path.is_file():
                 _verify_sha256(destination_path, source_video.sha256)
                 source_paths[source_video.member] = destination_path
@@ -373,7 +413,7 @@ def _extract_source_videos(
             temporary_path.replace(destination_path)
             _verify_sha256(destination_path, source_video.sha256)
             source_paths[source_video.member] = destination_path
-    return source_paths
+    return source_paths, identities
 
 
 def _fault_frame_range(episode: PlannedEpisode) -> tuple[int, int] | None:
@@ -488,10 +528,13 @@ def _transcode_episode_to_h264(
     return access_units
 
 
-def _episode_metadata(manifest: CorpusManifest, episode: PlannedEpisode) -> dict[str, str]:
+def _episode_metadata(
+    manifest: CorpusManifest, episode: PlannedEpisode, source_identity: SourceIdentity
+) -> dict[str, str]:
     return {
         "task": episode.task,
-        "operator": "factory_051_worker_001",
+        "factory": source_identity.factory_id,
+        "operator": f"{source_identity.factory_id}_{source_identity.worker_id}",
         EPISODE_KEY_ROBOT_SOFTWARE_VERSION: "build-ai-gen-1",
         "source_dataset": manifest.dataset.repo_id,
         "source_revision": manifest.dataset.revision,
@@ -509,6 +552,7 @@ def _write_video_episode(
     manifest: CorpusManifest,
     episode: PlannedEpisode,
     episode_index: int,
+    source_identity: SourceIdentity,
 ) -> None:
     access_units = _transcode_episode_to_h264(source_video_path, episode)
     episode_start_time_ns = EPISODE_START_TIME_NS + episode_index * 60_000_000_000
@@ -526,7 +570,10 @@ def _write_video_episode(
             message_encoding="protobuf",
             schema_id=schema_id,
         )
-        writer.add_metadata(name=METADATA_RECORD_EPISODE, data=_episode_metadata(manifest, episode))
+        writer.add_metadata(
+            name=METADATA_RECORD_EPISODE,
+            data=_episode_metadata(manifest, episode, source_identity),
+        )
         writer.add_metadata(
             name="source-provenance/v1",
             data={
@@ -599,7 +646,7 @@ def _write_prepared_manifest(
 def prepare_corpus(manifest_path: Path, source_root: Path, output_root: Path) -> list[Path]:
     manifest = _load_manifest(manifest_path)
     archive_path = _ensure_source_archive(manifest, source_root)
-    source_paths = _extract_source_videos(manifest, archive_path, source_root)
+    source_paths, identities = _extract_source_videos(manifest, archive_path, source_root)
     landing_root = output_root / "landing"
     landing_root.mkdir(parents=True, exist_ok=True)
 
@@ -612,6 +659,7 @@ def prepare_corpus(manifest_path: Path, source_root: Path, output_root: Path) ->
             manifest,
             episode,
             episode_index,
+            identities[episode.source_member],
         )
         prepared_episode_paths.append(output_path)
         prepared_count = episode_index + 1

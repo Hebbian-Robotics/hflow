@@ -14,7 +14,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           python-version: "3.11"
       - name: Verify the release tag matches the package version
@@ -24,6 +24,14 @@ jobs:
             echo "Release tag ${GITHUB_REF_NAME} must equal v${package_version}." >&2
             exit 1
           fi
+      - name: Check both pinned Linux FFmpeg assets are available
+        env:
+          HFLOW_NETWORK_TESTS: "1"
+        run: uv run --locked pytest tests/test_ffmpeg.py::test_pinned_release_assets_available -q
+      - name: Verify downloaded binaries match the offline specifications
+        env:
+          HFLOW_NETWORK_TESTS: "1"
+        run: uv run --locked pytest tests/test_ffmpeg.py::test_real_pinned_download_and_version -q
       - name: Build distributions
         run: uv build
       - name: Smoke-test the wheel in a clean environment
@@ -32,6 +40,7 @@ jobs:
           wheel_path="$(printf '%s\n' dist/*.whl)"
           uv pip install --python .release-venv/bin/python "${wheel_path}[native-build]"
           .release-venv/bin/hflow --help
+          .release-venv/bin/python scripts/smoke_test_lazy_imports.py
           .release-venv/bin/python scripts/smoke_test_installed_wheel.py
           package_root="$(.release-venv/bin/python -c \
             'from pathlib import Path; import hflow; print(Path(hflow.__file__).parent)')"

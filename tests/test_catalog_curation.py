@@ -1,6 +1,8 @@
 """Catalog appends and curation queries (issues #16/#17)."""
 
+import asyncio
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -99,6 +101,123 @@ def test_checks_without_observations_keep_the_pre_observation_fingerprint() -> N
     )
 
     assert _run_fingerprint("episode-id", "pipeline-v1", [check_row], []) == "b47ee98776b1"
+
+
+def test_selective_appends_do_not_replay_an_obsolete_full_outcome(tmp_path: Path) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    canonical = _fake_canonical(tmp_path)
+    measured = replace(_check_row(), critical=True)
+    other = replace(_check_row(), check_name="other", measurements={"other_score": 1.0})
+    errored = CheckRunRow(
+        check_name=measured.check_name,
+        check_version=measured.check_version,
+        critical=True,
+        status=hflow.CheckStatus.ERROR,
+        duration_s=0.1,
+        error="temporary service failure",
+    )
+    full_outcome = [measured, other]
+    for rows, expected_status in [
+        (full_outcome, "ok"),
+        ([errored], "unverified"),
+        ([other], "unverified"),
+        (full_outcome, "ok"),
+    ]:
+        result = catalog.append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=rows,
+        )
+        assert result.written
+        assert _status_of_only_episode(catalog.root) == expected_status
+
+    connection = open_catalog_connection(catalog.root)
+    try:
+        assert connection.execute("SELECT count(*) FROM episodes_raw").fetchone() == (4,)
+        assert connection.execute(
+            "SELECT DISTINCT run_fingerprint FROM check_runs_latest"
+        ).fetchall() == [(result.run_fingerprint,)]
+        assert connection.execute(
+            "SELECT DISTINCT run_fingerprint FROM observations_latest"
+        ).fetchall() == [(result.run_fingerprint,)]
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("execution_id", ["", "  ", "\t\n"])
+def test_append_rejects_blank_execution_id(tmp_path: Path, execution_id: str) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    canonical = _fake_canonical(tmp_path)
+
+    with pytest.raises(ValueError, match=r"^execution_id must be non-empty when supplied$"):
+        catalog.append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[_check_row()],
+            execution_id=execution_id,
+        )
+
+    assert not list((catalog.root / "episodes").glob("*.parquet"))
+
+
+@pytest.mark.parametrize("bucket", [False, True])
+def test_execution_identity_replays_history_without_reordering_it(
+    tmp_path: Path,
+    bucket_over_tmp: tuple[hflow.storage.BucketStorageRoot, Path],
+    bucket: bool,
+) -> None:
+    root = bucket_over_tmp[0].child("catalog") if bucket else tmp_path / "catalog"
+    canonical = _fake_canonical(tmp_path)
+
+    def append(execution_id: str, value: float = 1.0) -> hflow.catalog.AppendResult:
+        return Catalog(root).append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[_check_row(value=value)],
+            execution_id=execution_id,
+        )
+
+    first = append("first")
+    assert first.written
+    newer = append("second", value=2.0)
+    assert newer.written
+    location = Catalog(root).location
+    original_files = {
+        table: location.read_bytes(f"{table}/{first.episode_id}-{first.run_fingerprint}.parquet")
+        for table in TABLE_COLUMN_DDL
+    }
+    hflow.catalog._reconciled_append_stems.clear()
+    replay = append("first")
+    assert not replay.written
+    assert replay.run_fingerprint == first.run_fingerprint
+    connection = open_catalog_connection(root)
+    try:
+        assert connection.execute("SELECT example_metric FROM episodes").fetchone() == (2.0,)
+    finally:
+        connection.close()
+    returned = append("third")
+    assert returned.written
+    assert returned.run_fingerprint != first.run_fingerprint
+    assert not append("third").written
+    for table, content in original_files.items():
+        assert (
+            location.read_bytes(f"{table}/{first.episode_id}-{first.run_fingerprint}.parquet")
+            == content
+        )
+    connection = open_catalog_connection(root)
+    try:
+        assert connection.execute("SELECT example_metric FROM episodes").fetchone() == (1.0,)
+        assert connection.execute("SELECT count(*) FROM episodes_raw").fetchone() == (3,)
+        for table in TABLE_COLUMN_DDL:
+            relation = "episodes_raw" if table == "episodes" else table
+            assert connection.execute(
+                f"SELECT count(DISTINCT run_fingerprint) FROM {relation}"
+            ).fetchone() == (3,)
+    finally:
+        connection.close()
 
 
 def test_timestamped_observations_round_trip_as_typed_long_rows(tmp_path: Path) -> None:
@@ -619,13 +738,13 @@ def recorded_data_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
     app = hflow.App("catalog-pipeline", data_root=data_root)
 
     @app.check(version="1")
-    def joints(ep: hflow.Episode) -> hflow.CheckResult:
-        return hflow.checks.joint_discontinuity(ep)
+    async def joints(ep: hflow.Episode) -> hflow.CheckResult:
+        return await hflow.checks.joint_discontinuity(ep)
 
     @app.check(version="1", critical=True)
-    def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
+    async def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
         camera_topic = next(topic for topic in ep.cameras if "wrist_cam" in topic)
-        camera_evidence = camera_frame_stats(ep, cameras=[camera_topic])
+        camera_evidence = await camera_frame_stats(ep, cameras=[camera_topic])
         black_frame_percent = camera_evidence.measurements[f"{camera_topic}/black_frame_pct"]
         assert isinstance(black_frame_percent, float)
         return hflow.CheckResult(
@@ -634,17 +753,19 @@ def recorded_data_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
         )
 
     @app.check(version="1")
-    def late_check(ep: hflow.Episode) -> hflow.CheckResult:
+    async def late_check(ep: hflow.Episode) -> hflow.CheckResult:
         # Registered after the gate: skipped on quarantined episodes, so its
         # coverage must come out below 100%.
         return hflow.CheckResult(measurements={"late_metric": 1.0})
 
     for task_name, spec in episode_specs.items():
         source = synthesize_episode(sources_dir / f"{task_name}.mcap", spec)
-        report = app.test(source, verbose=False, record=True)
+        report = asyncio.run(app.test(source, verbose=False, record=True))
         assert report.catalog_entry is not None and report.catalog_entry.written
 
-    rerun_report = app.test(sources_dir / "fold_napkin.mcap", verbose=False, record=True)
+    rerun_report = asyncio.run(
+        app.test(sources_dir / "fold_napkin.mcap", verbose=False, record=True)
+    )
     assert rerun_report.catalog_entry is not None
     return data_root
 
@@ -1066,41 +1187,76 @@ def test_constrained_connection_confines_sql_to_the_catalog(tmp_path: Path) -> N
         connection.close()
 
 
-_MULTI_STATEMENT_PAYLOADS = [
-    # (id, sql_template, expected_refused)
-    # The sql_template may include {decoy} which is replaced at runtime with
-    # a path inside the constrained connection's known writable directory.
+# The SQL surface curate() accepts, written down (#279). Each row is
+# (sql_template, expected_refused, expected_rows). ``{decoy}`` is replaced at
+# runtime with a path inside the constrained connection's writable directory.
+#
+# This table is the one statement of the surface. When the gate changes, this
+# is the thing that has to change with it, deliberately and in one place.
+_SQL_SURFACE_PAYLOADS = [
+    # Injection shapes, from the #271 review. Refused.
     pytest.param(
         "SELECT 1) TO {decoy} ...; CREATE TABLE p(x TEXT); --",
         True,
+        0,
         id="copy-escape-old-pr-shape",
     ),
     pytest.param(
         "SELECT 1; CREATE TABLE pwned AS SELECT 1 AS x",
         True,
+        0,
         id="direct-multistatement-select-plus-create",
     ),
+    pytest.param("CREATE TABLE t(x INT)", True, 0, id="ddl-only-no-select"),
+    # PIVOT looks like a false positive and is not. DuckDB rewrites it, and
+    # extract_statements reports two statements, [CREATE, SELECT], so a
+    # user-written PIVOT really does run a CREATE first. The count check is
+    # what catches it. Do not "fix" this row by relaxing that check.
     pytest.param(
-        "CREATE TABLE t(x INT)",
+        "PIVOT episodes ON status USING count(*)",
         True,
-        id="ddl-only-no-select",
+        0,
+        id="pivot-expands-to-create-then-select",
     ),
+    # Table functions DuckDB labels SELECT. Refused since #453: they parse as
+    # SELECT but produce a description of columns, not a set of episodes, so a
+    # manifest from one has no episode_id and every consumer refuses it.
+    pytest.param("DESCRIBE SELECT episode_id FROM episodes", True, 0, id="describe"),
+    pytest.param("SUMMARIZE SELECT episode_id FROM episodes", True, 0, id="summarize"),
+    pytest.param("PRAGMA database_list", True, 0, id="pragma"),
+    pytest.param("SHOW TABLES", True, 0, id="show"),
+    # Accepted. The catalog holds exactly one episode, so a query selecting
+    # from it yields one row.
+    pytest.param("SELECT episode_id FROM episodes", False, 1, id="legitimate-single-select"),
+    pytest.param("TABLE episodes", False, 1, id="table-episodes"),
     pytest.param(
-        "SELECT episode_id FROM episodes",
+        "WITH picked AS (SELECT episode_id FROM episodes) SELECT * FROM picked",
         False,
-        id="legitimate-single-select",
+        1,
+        id="cte",
     ),
+    # Legal SELECTs that do not start with the word SELECT. #453 accepts these;
+    # its first attempt refused them on a text prefix, which is the regression
+    # these three rows exist to catch.
+    pytest.param("FROM episodes", False, 1, id="from-first"),
+    pytest.param("(SELECT episode_id FROM episodes)", False, 1, id="parenthesized-select"),
+    pytest.param("VALUES (1), (2)", False, 2, id="values"),
 ]
 
 
-@pytest.mark.parametrize("sql_template,expected_refused", _MULTI_STATEMENT_PAYLOADS)
-def test_stage_manifest_and_count_rejects_non_single_select(
+@pytest.mark.parametrize(
+    ("sql_template", "expected_refused", "expected_rows"), _SQL_SURFACE_PAYLOADS
+)
+def test_curate_sql_surface_is_pinned(
     tmp_path: Path,
     sql_template: str,
     expected_refused: bool,
+    expected_rows: int,
 ) -> None:
-    """_stage_manifest_and_count must refuse anything that is not exactly one
-    SELECT statement.
+    """The SQL `curate()` accepts and refuses, stated rather than discovered.
+
+    _stage_manifest_and_count must refuse anything that is not exactly one
+    read-only SELECT statement.
 
     ``connection.sql()`` and ``connection.execute()`` both silently execute
     every semicolon-separated statement in their input (verified on duckdb
@@ -1109,16 +1265,9 @@ def test_stage_manifest_and_count_rejects_non_single_select(
     ``connection.extract_statements`` to parse WITHOUT executing; it requires
     exactly one statement whose type is SELECT.
 
-    Payloads are drawn from the PR #271 reviewer's attack-shape table
-    (kstonekuan):
-      - COPY-escape (old PR shape) — refused
-      - Direct multi-statement SELECT + CREATE — refused
-      - DDL-only, no SELECT — refused
-      - Legitimate single SELECT — allowed
-
-    For refused cases: ValueError is raised BEFORE any table is created and
-    BEFORE any file is written.  For the allowed case: the manifest is
-    produced with the correct row count.
+    The payload table above is the surface. For refused cases, ValueError is
+    raised BEFORE any table is created and BEFORE any file is written. For
+    accepted cases, the manifest is produced with the expected row count.
     """
     from hflow.curation import _open_connection_over_root, _stage_manifest_and_count
 
@@ -1142,7 +1291,9 @@ def test_stage_manifest_and_count_rejects_non_single_select(
     )
     try:
         if expected_refused:
-            with pytest.raises(ValueError, match="exactly one SELECT"):
+            # #453 gave the table-function refusals their own wording, so the
+            # pattern has to admit both spellings of the same rule.
+            with pytest.raises(ValueError, match=r"exactly one (read-only )?SELECT"):
                 _stage_manifest_and_count(connection, sql, staged_manifest)
             # Guard fires before any file is written or any table is created.
             assert not staged_manifest.is_file()
@@ -1154,12 +1305,74 @@ def test_stage_manifest_and_count_rejects_non_single_select(
             with pytest.raises(duckdb.Error):
                 connection.execute("SELECT * FROM p")
         else:
-            # Legitimate query: manifest must be written with correct row count.
+            # Accepted query: manifest written, with the row count this shape
+            # yields over a one-episode catalog.
             row_count = _stage_manifest_and_count(connection, sql, staged_manifest)
-            assert row_count == 1
+            assert row_count == expected_rows
             assert staged_manifest.is_file()
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize(
+    ("sql_template", "expected_refused", "expected_rows"), _SQL_SURFACE_PAYLOADS
+)
+def test_curate_output_none_sql_surface_matches_manifest_gate(
+    tmp_path: Path,
+    sql_template: str,
+    expected_refused: bool,
+    expected_rows: int,
+) -> None:
+    """``curate(..., output=None)`` must refuse the same SQL surface as manifest write.
+
+    Dry-run wraps tenant SQL in ``SELECT count(*) FROM ({sql})``, which can
+    turn a multi-statement injection into a parser error — but DESCRIBE,
+    SHOW, SUMMARIZE, and PIVOT still execute cleanly inside that wrapper.
+    Without ``reject_non_single_select`` on the ``output=None`` branch those
+    shapes return a row count instead of ``NonSingleSelectQueryError``.
+    """
+    catalog_dir = tmp_path / "catalog"
+    catalog = Catalog(catalog_dir)
+    catalog.append_episode(
+        canonical_path=_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[_check_row()],
+    )
+    decoy_path = tmp_path / "decoy.parquet"
+    sql = sql_template.replace("{decoy}", str(decoy_path))
+
+    if expected_refused:
+        with pytest.raises(ValueError, match=r"exactly one (read-only )?SELECT"):
+            curate(catalog_dir, sql, output=None, constrained=True)
+        assert not decoy_path.exists()
+    else:
+        report = curate(catalog_dir, sql, output=None, constrained=True)
+        assert report.row_count == expected_rows
+        assert report.manifest_path is None
+
+
+def test_cli_curate_dry_run_refuses_non_single_select(
+    recorded_data_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    data_root = tmp_path / "data-root"
+    monkeypatch.setenv("HFLOW_DATA_ROOT", str(data_root))
+    exit_code = cli_main(
+        [
+            "curate",
+            "DESCRIBE SELECT episode_id FROM episodes",
+            "--catalog",
+            str(recorded_data_root / "catalog"),
+            "--dry-run",
+        ]
+    )
+    assert exit_code == 2
+    printed = capsys.readouterr()
+    assert "exactly one" in printed.err
+    assert not (data_root / "manifest.parquet").exists()
 
 
 def test_reject_non_single_select_refuses_a_single_non_select_statement() -> None:
@@ -1898,68 +2111,38 @@ def test_non_scalar_measurement_is_refused_naming_the_check_and_key(
         )
 
 
-def test_measurement_key_claiming_an_episode_column_is_refused(tmp_path: Path) -> None:
-    """A key named like an episodes column would pivot into <key>_1 beside it."""
-    canonical = tmp_path / "e.canonical.mcap"
-    canonical.write_bytes(b"episode-bytes")
-    row = CheckRunRow(
-        check_name="claims_task",
-        check_version="v1",
-        critical=False,
-        status=hflow.CheckStatus.MEASURED,
-        duration_s=0.1,
-        measurements={"task": 99.0},
-    )
-    with pytest.raises(ValueError, match=r"'claims_task'.*'task'"):
-        Catalog(tmp_path / "catalog").append_episode(
-            canonical_path=canonical,
-            stamps=FAKE_STAMPS,
-            episode_metadata={},
-            check_rows=[row],
-        )
-    assert list((tmp_path / "catalog" / "episodes").glob("*.parquet")) == []
+@pytest.mark.parametrize(
+    ("check_name", "measurement_key", "expected_message"),
+    [
+        pytest.param(
+            "claims_task", "task", r"'claims_task'.*'task'", id="claims-an-episodes-column"
+        ),
+        pytest.param("empty_key_check", "", r"'empty_key_check'.*''", id="empty"),
+        pytest.param("blank_key_check", "   ", r"'blank_key_check'", id="whitespace-only"),
+    ],
+)
+def test_a_measurement_key_that_cannot_become_a_column_is_refused(
+    check_name: str, measurement_key: str, expected_message: str, tmp_path: Path
+) -> None:
+    """Every measurement key has to survive the pivot into a wide-view column (#160).
 
-
-def test_empty_measurement_key_is_refused(tmp_path: Path) -> None:
-    """No empty measurement key may become a wide-view column (#160).
-
-    An empty key would pivot into a column whose name is the SQL expression
-    that produced it -- a queryable surface with no name a person would write
-    and no rename path (docs/CATALOG.md, "Naming measurement keys").
+    A key named like an episodes column pivots into ``<key>_1`` beside it. An
+    empty or whitespace-only key pivots into a column named for the SQL
+    expression that produced it, which is a queryable surface with no name a
+    person would write and no rename path (docs/CATALOG.md, "Naming
+    measurement keys").
     """
     canonical = tmp_path / "e.canonical.mcap"
     canonical.write_bytes(b"episode-bytes")
     row = CheckRunRow(
-        check_name="empty_key_check",
+        check_name=check_name,
         check_version="v1",
         critical=False,
         status=hflow.CheckStatus.MEASURED,
         duration_s=0.1,
-        measurements={"": 1.0},
+        measurements={measurement_key: 99.0},
     )
-    with pytest.raises(ValueError, match=r"'empty_key_check'.*''"):
-        Catalog(tmp_path / "catalog").append_episode(
-            canonical_path=canonical,
-            stamps=FAKE_STAMPS,
-            episode_metadata={},
-            check_rows=[row],
-        )
-    assert list((tmp_path / "catalog" / "episodes").glob("*.parquet")) == []
-
-
-def test_whitespace_only_measurement_key_is_refused(tmp_path: Path) -> None:
-    """Whitespace-only keys have the same "no name a person would write" problem (#160)."""
-    canonical = tmp_path / "e.canonical.mcap"
-    canonical.write_bytes(b"episode-bytes")
-    row = CheckRunRow(
-        check_name="blank_key_check",
-        check_version="v1",
-        critical=False,
-        status=hflow.CheckStatus.MEASURED,
-        duration_s=0.1,
-        measurements={"   ": 1.0},
-    )
-    with pytest.raises(ValueError, match=r"'blank_key_check'"):
+    with pytest.raises(ValueError, match=expected_message):
         Catalog(tmp_path / "catalog").append_episode(
             canonical_path=canonical,
             stamps=FAKE_STAMPS,
@@ -2033,7 +2216,135 @@ def test_measurement_key_shadowing_is_case_insensitive(tmp_path: Path) -> None:
         )
 
 
-def test_crash_repaired_append_keeps_one_recorded_at_across_tables(tmp_path: Path) -> None:
+def test_append_refuses_case_colliding_keys_before_writing(tmp_path: Path) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    row = replace(_check_row(), measurements={"/Camera/score": 0.1, "/camera/score": 0.9})
+    with pytest.raises(ValueError, match=r"'/Camera/score'.*'/camera/score'.*collide"):
+        catalog.append_episode(
+            canonical_path=_fake_canonical(tmp_path),
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[row],
+        )
+    assert list(catalog.root.rglob("*.parquet")) == []
+
+
+@pytest.mark.parametrize("same_episode", [False, True])
+@pytest.mark.parametrize("constrained", [False, True])
+def test_case_collisions_across_appends_refuse_curation_without_replacing_output(
+    tmp_path: Path, same_episode: bool, constrained: bool
+) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    manifest = tmp_path / "manifest.parquet"
+    for index, key in enumerate(("/Camera/score", "/camera/score")):
+        catalog.append_episode(
+            canonical_path=_fake_canonical(
+                tmp_path, b"same episode" if same_episode else f"episode {index}".encode()
+            ),
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[replace(_check_row(), measurements={key: 0.1 + index * 0.8})],
+        )
+        if index == 0:
+            curate(catalog.root, "SELECT episode_id FROM episodes", output=manifest)
+    previous_manifest = manifest.read_bytes()
+    previous_catalog = {path: path.read_bytes() for path in catalog.root.rglob("*.parquet")}
+
+    with pytest.raises(ValueError, match=r"'/Camera/score'.*'/camera/score'.*collide") as failure:
+        open_catalog_connection(catalog.root, constrained=constrained)
+    assert "Rename" in str(failure.value)
+    assert "measurements/*.parquet" in str(failure.value)
+    with pytest.raises(ValueError, match=r"measurement keys.*collide"):
+        curate(
+            catalog.root,
+            'SELECT episode_id FROM episodes WHERE "/camera/score" < 0.5',
+            output=manifest,
+            constrained=constrained,
+        )
+    assert manifest.read_bytes() == previous_manifest
+    assert not list(tmp_path.glob(".hflow-manifest-*"))
+    assert {path: path.read_bytes() for path in catalog.root.rglob("*.parquet")} == previous_catalog
+    with duckdb.connect() as connection:
+        assert connection.execute(
+            "SELECT key, value_double FROM read_parquet(?) ORDER BY key",
+            [str(catalog.root / "measurements" / "*.parquet")],
+        ).fetchall() == [("/Camera/score", 0.1), ("/camera/score", 0.9)]
+
+
+def test_existing_catalog_with_case_colliding_keys_is_refused(tmp_path: Path) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    catalog.append_episode(
+        canonical_path=_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[replace(_check_row(), measurements={"/Camera/score": 0.1, "other": 0.9})],
+    )
+    # Model evidence written before validation existed, without bypassing the
+    # reader under test or relying on today's append accepting invalid input.
+    (measurements,) = (catalog.root / "measurements").glob("*.parquet")
+    legacy = tmp_path / "legacy.parquet"
+    with duckdb.connect() as connection:
+        connection.execute(
+            "COPY (SELECT * REPLACE (CASE WHEN key = 'other' THEN '/camera/score' "
+            "ELSE key END AS key) FROM read_parquet($source)) TO $destination (FORMAT PARQUET)",
+            {"source": str(measurements), "destination": str(legacy)},
+        )
+    legacy.replace(measurements)
+    previous = measurements.read_bytes()
+    with pytest.raises(ValueError, match=r"'/Camera/score'.*'/camera/score'.*collide"):
+        open_catalog_connection(catalog.root)
+    assert measurements.read_bytes() == previous
+
+
+def test_distinct_unicode_keys_and_exact_key_reuse_remain_queryable(tmp_path: Path) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    # lower() would merge Ä/ä and Kelvin sign/k; casefold() also merges ß/ss.
+    keys = [
+        "/Ä/score",
+        "/ä/score",
+        "/\N{KELVIN SIGN}/score",
+        "/k/score",
+        "/ß/score",
+        "/ss/score",
+        "tas\N{KELVIN SIGN}",
+    ]
+    for index in range(2):
+        catalog.append_episode(
+            canonical_path=_fake_canonical(tmp_path, f"episode {index}".encode()),
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[
+                replace(
+                    _check_row(), measurements={key: index + n / 10 for n, key in enumerate(keys)}
+                )
+            ],
+        )
+    columns = ", ".join(f'"{key}"' for key in keys)
+    expected = [tuple(index + n / 10 for n in range(len(keys))) for index in range(2)]
+    with open_catalog_connection(catalog.root) as connection:
+        assert (
+            connection.execute(f'SELECT {columns} FROM episodes ORDER BY "{keys[0]}"').fetchall()
+            == expected
+        )
+        assert connection.execute(
+            "SELECT DISTINCT key FROM measurements ORDER BY key"
+        ).fetchall() == [(key,) for key in sorted(keys)]
+    snapshot = tmp_path / "snapshot"
+    hflow.export_dataset_snapshot(catalog.root, snapshot)
+    with duckdb.connect() as connection:
+        assert (
+            connection.execute(
+                f'SELECT {columns} FROM read_parquet(?) ORDER BY "{keys[0]}"',
+                [str(snapshot / "samples.parquet")],
+            ).fetchall()
+            == expected
+        )
+
+
+@pytest.mark.parametrize("recurring", [False, True])
+def test_crash_repaired_append_keeps_one_recorded_at_across_tables(
+    tmp_path: Path, recurring: bool
+) -> None:
     """A retry after a crashed append must not mix timestamps across tables.
 
     Mixed recorded_at would let the per-key 'latest' views attribute another
@@ -2064,6 +2375,14 @@ def test_crash_repaired_append_keeps_one_recorded_at_across_tables(tmp_path: Pat
             check_rows=[row],
         )
 
+    if recurring:
+        append_same_outcome()
+        catalog.append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[replace(row, measurements={"score": 2.0})],
+        )
     first = append_same_outcome()
     stem = f"{first.episode_id}-{first.run_fingerprint}"
     # Simulate the crash: the episodes file (written last) and one dependent
@@ -2100,8 +2419,10 @@ def test_crash_repaired_append_keeps_one_recorded_at_across_tables(tmp_path: Pat
         connection.close()
 
 
+@pytest.mark.parametrize("recurring", [False, True])
 def test_replaying_an_append_heals_dependents_left_stale_by_a_crashed_repair(
     tmp_path: Path,
+    recurring: bool,
 ) -> None:
     """#51's residual window: a winner that created the episodes file but
     crashed before force-aligning the dependents leaves them carrying a stale
@@ -2123,6 +2444,14 @@ def test_replaying_an_append_heals_dependents_left_stale_by_a_crashed_repair(
             check_rows=[row],
         )
 
+    if recurring:
+        append_same_outcome()
+        catalog.append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=[_check_row(value=2.0)],
+        )
     first = append_same_outcome()
     stem = f"{first.episode_id}-{first.run_fingerprint}"
 
@@ -2208,8 +2537,10 @@ def test_replaying_an_append_refuses_a_corrupt_empty_commit_marker(tmp_path: Pat
         append_same_outcome()
 
 
+@pytest.mark.parametrize("recurring", [False, True])
 def test_concurrent_append_of_the_identical_outcome_keeps_one_recorded_at(
     tmp_path: Path,
+    recurring: bool,
 ) -> None:
     """Two callers racing ``append_episode`` for the identical outcome (a
     retried or duplicate-dispatched batch task, not a crash) must not split
@@ -2229,6 +2560,15 @@ def test_concurrent_append_of_the_identical_outcome_keeps_one_recorded_at(
     canonical = _fake_canonical(tmp_path)
     catalog = Catalog(tmp_path / "catalog")
     row = _check_row()
+
+    if recurring:
+        for prior_row in [row, _check_row(value=2.0)]:
+            catalog.append_episode(
+                canonical_path=canonical,
+                stamps=FAKE_STAMPS,
+                episode_metadata={},
+                check_rows=[prior_row],
+            )
 
     # A storage-boundary test double: gate the first two dependent-table
     # writes on a barrier so both threads are guaranteed to reach

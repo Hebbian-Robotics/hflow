@@ -80,10 +80,11 @@ app.check(version="1")(action_integrity)
 ```
 
 To pass configuration, bind it -- either with `functools.partial` or a wrapper,
-whichever reads better to you. The version is explicit, so bump it when a
-retuned number makes the new measurements or verdicts incompatible with the
-old ones. These replace the bare registration of the same check rather than
-adding to it:
+whichever reads better to you. A `functools.partial` has no `__name__`, so it
+needs `name=`; a wrapper takes its name from the function. The version is
+explicit, so bump it when a retuned number makes the new measurements or
+verdicts incompatible with the old ones. These replace the bare registration of
+the same check rather than adding to it:
 
 ```python
 import functools
@@ -96,13 +97,13 @@ app.check(version="1", name="timestamps")(
 
 # Instead of `app.check(version="1")(camera_frame_stats)`:
 @app.check(version="1")
-def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
-    return camera_frame_stats(ep, expected_hz={"/wrist_cam/compressed": 30.0})
+async def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
+    return await camera_frame_stats(ep, expected_hz={"/wrist_cam/compressed": 30.0})
 
 
 @app.check(version="1")
-def topic_inventory(ep: hflow.Episode) -> hflow.CheckResult:
-    return required_topics(ep, topics=["/joint_states", "/imu"])
+async def topic_inventory(ep: hflow.Episode) -> hflow.CheckResult:
+    return await required_topics(ep, topics=["/joint_states", "/imu"])
 ```
 
 Registering two steps of your own under one name is refused, because both
@@ -175,6 +176,43 @@ optional `motion` extra (`pip install 'hflow[motion]'`). Everything else here
 runs on the core install. Enabling it without the extra raises at the first
 episode with the install command in the message, rather than failing obscurely.
 
+`camera_stability` reads hand-held footage as almost continuously unstable, and
+that is the report to expect on it rather than a sign the check is broken. Its
+rule is not a number anyone picked: a frame pair counts as unstable when its
+shake rate beats the deliberate camera movement in that same pair and clears
+the instrument's resolution floor of one pixel per frame. A camera in someone's
+hand crosses that floor constantly, by fractions of a degree. That is real
+motion, and it is not what a person means by a shaky camera.
+
+Two knobs raise the bar, both off by default so the instrument's own rule
+stands:
+
+```python
+import functools
+
+from hflow.checks import camera_stability
+
+# Instead of `app.check(version="1")(camera_stability)`:
+app.check(version="1", name="camera_stability")(
+    functools.partial(camera_stability, shake_threshold_dps=3.0, unstable_min_duration_s=0.25)
+)
+```
+
+`shake_threshold_dps` is a minimum shake rate a pair must clear on top of the
+resolution floor, so raising it moves every measurement: `unstable_share` and
+`unstable_s` count the same pairs the intervals do.
+
+`unstable_min_duration_s` drops unstable runs shorter than it **from the
+intervals only**. Raise it and the intervals get shorter and fewer while
+`unstable_share` and `unstable_s` do not move at all. That asymmetry is worth
+knowing before you tune, because someone who raises the duration and watches
+the share will conclude the knob does nothing.
+
+A few degrees per second and a quarter second of run is a reasonable starting
+point for hand-held work, and leaves the spans a viewer would point at. Read
+`unstable_share` next to `coverage_share` either way: footage no transform
+could be fitted to is reported as unclassified rather than as steady.
+
 The trajectory checks report in the stream's own units. If your dimensions share
 no unit -- a gripper width beside a shoulder angle -- pass `dimension_scales=`,
 one positive divisor per dimension, and `{topic}/scale_source` will record that
@@ -191,8 +229,8 @@ at registration rather than rewriting the check. HFlow ships a recommended one:
 
 ```python
 @app.check(version="1", critical=True, gate=hflow.checks.RECOMMENDED_CAMERA_INTEGRITY)
-def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
-    return camera_frame_stats(ep)
+async def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
+    return await camera_frame_stats(ep)
 ```
 
 `critical=True` is what makes a failing gate quarantine the episode and skip its
@@ -237,7 +275,7 @@ The dev loop prints every measurement per check, with `*` for evidence-only,
 facts land in the catalog for querying:
 
 ```python
-report = app.process(episode_path, record=True)
+report = await app.process(episode_path, record=True)
 ```
 
 Then query them, keeping in mind that measurement keys carry their topic and so

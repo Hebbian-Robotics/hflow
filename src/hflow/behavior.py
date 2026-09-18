@@ -80,4 +80,8 @@ across these changes.
 # source_uri as the data-root-prefixed and absolute spellings. The corrected
 # provenance changes canonical bytes for recordings previously processed under
 # the cwd-relative absolute identity, so they must not share a pipeline identity.
-TRANSFORM_BEHAVIOR_VERSION: str = "7"
+#
+# "8": the managed Linux FFmpeg pin now uses BtbN's retained August 2026
+# month-final build. Its version stamp changes canonical provenance whenever
+# video is transcoded, so those outputs must not share the old pipeline identity.
+TRANSFORM_BEHAVIOR_VERSION: str = "8"

@@ -10,6 +10,7 @@ Run: ``uv run python benchmarks/camera_frame_stats_benchmark.py``
 """
 
 import argparse
+import asyncio
 import os
 import statistics
 import subprocess
@@ -81,10 +82,12 @@ def _measure_cold_check(
 ) -> CheckRun:
     started = time.perf_counter()
     with hflow.Episode(canonical_path, workdir=workdir) as episode:
-        result = camera_frame_stats(
-            episode,
-            cameras=[camera_topic],
-            expected_hz={camera_topic: frames_per_second},
+        result = asyncio.run(
+            camera_frame_stats(
+                episode,
+                cameras=[camera_topic],
+                expected_hz={camera_topic: frames_per_second},
+            )
         )
     seconds = time.perf_counter() - started
     instrument_cache_paths = list(workdir.glob("*.instrument.*.txt"))

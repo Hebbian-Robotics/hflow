@@ -69,6 +69,10 @@ windows contributed, regardless of their durations.
 
 ## Preserve missing evidence and worker boundaries
 
+Importing `hflow.statistics` or its package-level exports does not initialize
+pipeline, media, or model code. These helpers use only the standard library and
+ship in the normal `hflow` package, whose installation dependencies are unchanged.
+
 Omit unassessed measurements. Do not replace them with zero: an assessed zero
 is valid evidence and belongs in the distribution. Zero-weight observations
 contribute to neither counts nor statistics. Empty or all-zero-weight input

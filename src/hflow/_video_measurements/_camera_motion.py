@@ -9,6 +9,7 @@ import numpy as np
 
 from hflow._field_guards import require_float
 
+from ._motion_fit import UnmeasuredCameraMotion, fit_frame_motion
 from ._raw_frames import LUMA_FRAME_FILTER_GRAPH, luma_frames
 from ._toolchain import VideoMeasurementToolchain
 
@@ -16,13 +17,6 @@ CAMERA_MOTION_DEFINITION_VERSION = "camera-motion/v1"
 DEFAULT_HORIZONTAL_FIELD_OF_VIEW_DEGREES = 90.0
 
 _SHAKE_HIGH_PASS_HZ = 1.0
-_TRACK_ROWS_TARGET = 20
-_MINIMUM_TRACK_SPACING_PIXELS = 8
-_TRACK_WINDOW_PIXELS = 21
-_TRACK_PYRAMID_LEVELS = 3
-_FORWARD_BACKWARD_TOLERANCE_PIXELS = 1.0
-_MINIMUM_TRACKS_FOR_A_FIT = 12
-_RANSAC_REPROJECTION_TOLERANCE_PIXELS = 3.0
 _MINIMUM_VIDEO_FRAME_COUNT = 2
 
 
@@ -124,73 +118,18 @@ class CameraMotionMeasurements:
 CameraMotionResult = CameraMotionMeasurements | InsufficientVideoFrames
 
 
-def _grid_points(frame_shape: tuple[int, int]) -> np.ndarray:
-    frame_height, frame_width = frame_shape
-    track_spacing_pixels = max(
-        _MINIMUM_TRACK_SPACING_PIXELS,
-        min(frame_height, frame_width) // _TRACK_ROWS_TARGET,
-    )
-    row_coordinates = np.arange(track_spacing_pixels // 2, frame_height, track_spacing_pixels)
-    column_coordinates = np.arange(track_spacing_pixels // 2, frame_width, track_spacing_pixels)
-    grid_points = np.stack(np.meshgrid(column_coordinates, row_coordinates), axis=-1).reshape(-1, 2)
-    return grid_points.astype(np.float32).reshape(-1, 1, 2)
-
-
 def _fit_frame_pair(
     cv2: ModuleType, earlier_frame: np.ndarray, later_frame: np.ndarray
 ) -> tuple[float, float, float, float]:
-    """Fit rotation, translation, and inlier coverage for one frame pair."""
-    source_points = _grid_points(earlier_frame.shape)
-    tracked_points, forward_status, _ = cv2.calcOpticalFlowPyrLK(
-        earlier_frame,
-        later_frame,
-        source_points,
-        None,
-        winSize=(_TRACK_WINDOW_PIXELS, _TRACK_WINDOW_PIXELS),
-        maxLevel=_TRACK_PYRAMID_LEVELS,
-    )
-    back_tracked_points, backward_status, _ = cv2.calcOpticalFlowPyrLK(
-        later_frame,
-        earlier_frame,
-        tracked_points,
-        None,
-        winSize=(_TRACK_WINDOW_PIXELS, _TRACK_WINDOW_PIXELS),
-        maxLevel=_TRACK_PYRAMID_LEVELS,
-    )
-    retained_track_mask = (
-        forward_status.reshape(-1).astype(bool)
-        & backward_status.reshape(-1).astype(bool)
-        & (
-            np.linalg.norm((back_tracked_points - source_points).reshape(-1, 2), axis=1)
-            <= _FORWARD_BACKWARD_TOLERANCE_PIXELS
-        )
-    )
-    if int(np.count_nonzero(retained_track_mask)) < _MINIMUM_TRACKS_FOR_A_FIT:
-        raise ValueError("too few surviving tracks to fit a transform")
-
-    retained_source_points = source_points.reshape(-1, 2)[retained_track_mask]
-    retained_destination_points = tracked_points.reshape(-1, 2)[retained_track_mask]
-    transformation_matrix, inliers = cv2.estimateAffinePartial2D(
-        retained_source_points,
-        retained_destination_points,
-        method=cv2.RANSAC,
-        ransacReprojThreshold=_RANSAC_REPROJECTION_TOLERANCE_PIXELS,
-    )
-    if transformation_matrix is None:
-        raise ValueError("no similarity transform fitted the surviving tracks")
-    rotation_degrees = float(
-        np.degrees(np.arctan2(transformation_matrix[1, 0], transformation_matrix[0, 0]))
-    )
-    inlier_ratio = (
-        float(np.count_nonzero(inliers) / len(retained_source_points))
-        if inliers is not None
-        else 1.0
-    )
+    """Keep the v1 aggregate adapter's acceptance policy and tuple contract."""
+    result = fit_frame_motion(cv2, earlier_frame, later_frame, minimum_track_count=12)
+    if isinstance(result, UnmeasuredCameraMotion):
+        raise ValueError(result.reason)
     return (
-        rotation_degrees,
-        float(transformation_matrix[0, 2]),
-        float(transformation_matrix[1, 2]),
-        inlier_ratio,
+        result.transform.rotation_degrees,
+        result.transform.horizontal_translation_pixels,
+        result.transform.vertical_translation_pixels,
+        result.evidence.inlier_ratio,
     )
 
 

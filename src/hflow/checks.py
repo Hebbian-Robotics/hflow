@@ -16,11 +16,16 @@ rather than a shared ``message_count``.
 """
 
 import hashlib
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
 
+from hflow._field_guards import (
+    require_finite_float,
+    require_int_in_range,
+    require_positive_float,
+)
 from hflow._video_measurement_toolchain import (
     measure_video_frame_statistics_for_hflow,
     resolved_video_measurement_toolchain,
@@ -37,6 +42,7 @@ from hflow._video_measurements import (
     VideoFrameStatistics,
     measure_camera_motion,
 )
+from hflow.asyncio_utils import run_blocking
 from hflow.episode import ChannelData, Episode
 from hflow.steps import (
     CheckFunction,
@@ -79,11 +85,19 @@ RECOMMENDED_CAMERA_INTEGRITY = Gate(
 @dataclass(frozen=True)
 class _JointMotionProfile:
     """Finite-difference motion facts of one state channel, computed once for
-    every check that reasons about joint speed."""
+    every check that reasons about joint speed.
+
+    ``per_step_max_speed`` is max over joints of |dq/dt|, one per step, and is
+    NaN exactly where the step is not measurable; ``measurable`` is that mask
+    spelled out -- strictly positive duration AND finite positions on every
+    joint (#546). A NaN step is not a clean step and not a moving step: it is
+    unmeasured, and every consumer must compute over ``measurable`` only.
+    """
 
     stamps_ns: np.ndarray
     deltas_s: np.ndarray
-    per_step_max_speed: np.ndarray  # max over joints of |dq/dt|, one per step
+    per_step_max_speed: np.ndarray  # max over joints of |dq/dt|, NaN if unmeasurable
+    measurable: np.ndarray  # bool, one per step: finite speed on a positive dt
     nonpositive_dt_count: int
 
 
@@ -100,12 +114,25 @@ def _joint_motion_profile(
     if len(stamps_ns) < 2:
         return None
     deltas_s = np.diff(stamps_ns) / 1e9
+    position_jumps = np.diff(positions, axis=0)
+    finite_jump = np.all(np.isfinite(position_jumps), axis=1)
+    measurable = (deltas_s > 0) & finite_jump
     safe_deltas_s = np.where(deltas_s > 0, deltas_s, np.nan)
-    velocities = np.abs(np.diff(positions, axis=0)) / safe_deltas_s[:, np.newaxis]
+    velocities = np.abs(position_jumps) / safe_deltas_s[:, np.newaxis]
+    # The mask picks the measurable rows, and every measurable row is finite,
+    # so the per-step maximum is an ordinary max over those rows; unmeasurable
+    # rows stay NaN because they are exactly the rows not filled. np.nanmax
+    # here computed the same values but warned "All-NaN slice encountered" on
+    # every duplicate-stamped or NaN stream -- numpy noise aimed at precisely
+    # the users this profile exists to serve (#549 review).
+    per_step_max_speed = np.full(len(deltas_s), np.nan)
+    if measurable.any():
+        per_step_max_speed[measurable] = np.max(velocities[measurable], axis=1)
     return _JointMotionProfile(
         stamps_ns=stamps_ns,
         deltas_s=deltas_s,
-        per_step_max_speed=np.nanmax(velocities, axis=1),
+        per_step_max_speed=per_step_max_speed,
+        measurable=measurable,
         nonpositive_dt_count=int(np.sum(deltas_s <= 0)),
     )
 
@@ -272,7 +299,7 @@ def _timestamp_regularity_value(
     raise ValueError(f"timestamp_regularity has no branch for the key {key!r}")
 
 
-def timestamp_regularity(
+async def timestamp_regularity(
     episode: Episode,
     *,
     topics: Sequence[str] | None = None,
@@ -294,6 +321,24 @@ def timestamp_regularity(
     ``_timestamp_regularity_value``, so a key the fact does not name cannot
     be emitted (#182).
     """
+    return await run_blocking(
+        _measure_timestamp_regularity,
+        episode,
+        topics=topics,
+        expected_hz=expected_hz,
+        tolerance_s=tolerance_s,
+        gap_factor=gap_factor,
+    )
+
+
+def _measure_timestamp_regularity(
+    episode: Episode,
+    *,
+    topics: Sequence[str] | None = None,
+    expected_hz: dict[str, float] | None = None,
+    tolerance_s: float = 0.010,
+    gap_factor: float = 3.0,
+) -> CheckResult:
     selected, state_topics = _timestamp_regularity_resolve_selected(episode, topics)
     infos = episode.topics
 
@@ -360,7 +405,7 @@ def timestamp_regularity(
     return CheckResult(measurements=measurements, intervals=intervals)
 
 
-def joint_discontinuity(
+async def joint_discontinuity(
     episode: Episode,
     *,
     topic: str = "/joint_states",
@@ -372,19 +417,55 @@ def joint_discontinuity(
     Ships as measurements and intervals only -- never a default reject rule:
     motion-smoothness heuristics are known to invert on real defects (the
     Voxel51 result), so the threshold and any verdict stay user-owned.
+
+    A duplicate-stamped or NaN-positioned step has no velocity at all, and a
+    NaN comparison is False: counting such steps as compliant (or letting
+    them dilute the percentage denominator) fails the gate open (#546).
+    Every percentage and maximum here covers measurable steps only, and a
+    stream with nothing measurable reports its counts and withholds the
+    verdict-shaped keys rather than emitting 0% or NaN.
     """
+    return await run_blocking(
+        _measure_joint_discontinuity,
+        episode,
+        topic=topic,
+        field=field,
+        velocity_limit=velocity_limit,
+    )
+
+
+def _measure_joint_discontinuity(
+    episode: Episode,
+    *,
+    topic: str = "/joint_states",
+    field: str = "position",
+    velocity_limit: float = 3.0,
+) -> CheckResult:
     profile = _joint_motion_profile(episode, topic, field)
     if profile is None:
         return CheckResult(
             measurements={f"{topic}/velocity_sample_count": len(episode.channel(topic).timestamps)}
         )
-    violation_mask = profile.per_step_max_speed > velocity_limit
+    measurable = profile.measurable
+    measurable_step_count = int(np.count_nonzero(measurable))
+    if measurable_step_count == 0:
+        return CheckResult(
+            measurements={
+                f"{topic}/velocity_sample_count": len(profile.stamps_ns),
+                f"{topic}/velocity_measurable_step_count": 0,
+                f"{topic}/nonpositive_dt_count": profile.nonpositive_dt_count,
+            }
+        )
+    speed = profile.per_step_max_speed
+    violation_mask = np.zeros(measurable.shape, dtype=bool)
+    violation_mask[measurable] = speed[measurable] > velocity_limit
     return CheckResult(
         measurements={
-            f"{topic}/max_abs_velocity": float(np.nanmax(profile.per_step_max_speed)),
+            f"{topic}/max_abs_velocity": float(np.max(speed[measurable])),
             f"{topic}/velocity_limit": velocity_limit,
-            f"{topic}/violation_count": int(np.sum(violation_mask)),
-            f"{topic}/violation_pct": float(np.mean(violation_mask) * 100.0),
+            f"{topic}/violation_count": int(np.count_nonzero(violation_mask)),
+            f"{topic}/violation_pct": float(np.mean(violation_mask[measurable]) * 100.0),
+            f"{topic}/velocity_measurable_step_count": measurable_step_count,
             f"{topic}/nonpositive_dt_count": profile.nonpositive_dt_count,
         },
         intervals=_mask_run_intervals(
@@ -414,7 +495,7 @@ def _camera_frame_stats_keys(episode: Episode, *, cameras: Sequence[str] | None 
     inside the per-topic selection, so an episode with no cameras emits
     nothing at all.
     """
-    selected = list(cameras) if cameras is not None else episode.cameras
+    selected = _resolve_selected_cameras(episode, cameras)
     keys: set[str] = set()
     for topic in selected:
         keys.add(f"{topic}/message_count")
@@ -564,7 +645,7 @@ def _camera_value(
     raise ValueError(f"camera_frame_stats has no branch for the key {key!r}")
 
 
-def camera_frame_stats(
+async def camera_frame_stats(
     episode: Episode,
     *,
     cameras: Sequence[str] | None = None,
@@ -603,7 +684,45 @@ def camera_frame_stats(
     The trade is one right-to-left key parse (``rpartition``) plus one dict
     lookup per key on top of the ffmpeg decode each topic already pays (#182).
     """
-    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    return await run_blocking(
+        _measure_camera_frame_stats,
+        episode,
+        cameras=cameras,
+        expected_hz=expected_hz,
+        black_frame_amount_pct=black_frame_amount_pct,
+        black_pixel_threshold=black_pixel_threshold,
+        freeze_noise_db=freeze_noise_db,
+        freeze_min_duration_s=freeze_min_duration_s,
+        bright_luma_threshold=bright_luma_threshold,
+    )
+
+
+def _measure_camera_frame_stats(
+    episode: Episode,
+    *,
+    cameras: Sequence[str] | None = None,
+    expected_hz: dict[str, float] | None = None,
+    black_frame_amount_pct: int = 98,
+    black_pixel_threshold: int = 17,
+    freeze_noise_db: float = -60.0,
+    freeze_min_duration_s: float = 2.0,
+    bright_luma_threshold: float = 235.0,
+) -> CheckResult:
+    # Above selected_cameras so a bad threshold is refused on a camera-less
+    # episode too: guards inside the per-camera loop never fire there, which
+    # is what #445 found and #447 is about. Each message names the parameter
+    # as the signature spells it, never the internal settings field.
+    require_int_in_range(black_frame_amount_pct, "black_frame_amount_pct", minimum=0, maximum=100)
+    require_int_in_range(black_pixel_threshold, "black_pixel_threshold", minimum=0, maximum=255)
+    require_finite_float(freeze_noise_db, "freeze_noise_db")
+    require_positive_float(freeze_min_duration_s, "freeze_min_duration_s")
+    # A float, so it composes rather than mapping onto require_int_in_range:
+    # the helper owns finiteness and the bound stays here.
+    require_finite_float(bright_luma_threshold, "bright_luma_threshold")
+    if not 0 <= bright_luma_threshold <= 255:
+        raise ValueError(f"bright_luma_threshold must be in [0, 255], got {bright_luma_threshold}")
+
+    selected_cameras = _resolve_selected_cameras(episode, cameras)
     intermediates_by_topic = {
         topic: _camera_intermediates(
             episode,
@@ -643,7 +762,7 @@ def camera_frame_stats(
     return CheckResult(measurements=measurements, intervals=intervals)
 
 
-def idle_fraction(
+async def idle_fraction(
     episode: Episode,
     *,
     topic: str = "/joint_states",
@@ -651,7 +770,7 @@ def idle_fraction(
     velocity_epsilon: float = 0.05,
     min_interval_s: float = 1.0,
 ) -> CheckResult:
-    """Time-weighted fraction of the episode spent with no joint moving.
+    """Time-weighted fraction of the MEASURED episode spent with no joint moving.
 
     A step is idle when every joint's finite-difference speed is below
     ``velocity_epsilon``; the fraction weights each step by its own duration,
@@ -659,21 +778,58 @@ def idle_fraction(
     ``min_interval_s`` long become labeled ``idle:<topic>`` intervals.
     Evidence for curation cuts over mostly-stationary demonstrations -- the
     keep/drop policy (and any verdict) stays user-owned.
+
+    Unmeasurable steps (duplicate stamps, NaN positions) belong in neither the
+    numerator nor the denominator: they had no velocity to be idle under, and
+    counting their time as "moving" understates the fraction (#546). A stream
+    with nothing measurable reports its counts and withholds
+    ``idle_fraction`` rather than storing 0.0 for a dead channel.
     """
+    return await run_blocking(
+        _measure_idle_fraction,
+        episode,
+        topic=topic,
+        field=field,
+        velocity_epsilon=velocity_epsilon,
+        min_interval_s=min_interval_s,
+    )
+
+
+def _measure_idle_fraction(
+    episode: Episode,
+    *,
+    topic: str = "/joint_states",
+    field: str | None = None,
+    velocity_epsilon: float = 0.05,
+    min_interval_s: float = 1.0,
+) -> CheckResult:
     profile = _joint_motion_profile(episode, topic, field)
     if profile is None:
         return CheckResult(
             measurements={f"{topic}/idle_sample_count": len(episode.channel(topic).timestamps)}
         )
-    idle_mask = profile.per_step_max_speed < velocity_epsilon
-    positive_deltas_s = np.where(profile.deltas_s > 0, profile.deltas_s, 0.0)
-    total_span_s = float(np.sum(positive_deltas_s))
-    idle_total_s = float(np.sum(positive_deltas_s[idle_mask]))
+    measurable = profile.measurable
+    measurable_step_count = int(np.count_nonzero(measurable))
+    if measurable_step_count == 0:
+        return CheckResult(
+            measurements={
+                f"{topic}/idle_sample_count": len(profile.stamps_ns),
+                f"{topic}/idle_measurable_step_count": 0,
+                f"{topic}/idle_nonpositive_dt_count": profile.nonpositive_dt_count,
+            }
+        )
+    speed = profile.per_step_max_speed
+    idle_mask = np.zeros(measurable.shape, dtype=bool)
+    idle_mask[measurable] = speed[measurable] < velocity_epsilon
+    total_span_s = float(np.sum(profile.deltas_s[measurable]))
+    idle_total_s = float(np.sum(profile.deltas_s[idle_mask]))
     return CheckResult(
         measurements={
-            f"{topic}/idle_fraction": idle_total_s / total_span_s if total_span_s else 0.0,
+            f"{topic}/idle_fraction": idle_total_s / total_span_s,
             f"{topic}/idle_total_s": idle_total_s,
             f"{topic}/velocity_epsilon": velocity_epsilon,
+            f"{topic}/idle_measurable_step_count": measurable_step_count,
+            f"{topic}/idle_nonpositive_dt_count": profile.nonpositive_dt_count,
         },
         intervals=_mask_run_intervals(
             profile.stamps_ns, idle_mask, f"idle:{topic}", min_duration_s=min_interval_s
@@ -705,6 +861,18 @@ def _timestamp_regularity_resolve_selected(
     return selected, state_topics
 
 
+def _resolve_selected_cameras(episode: Episode, cameras: Sequence[str] | None) -> list[str]:
+    """The cameras a check ran over: the caller's list, or every camera.
+
+    ``is not None`` rather than truthiness, and that is the whole reason this
+    is worth stating once. ``cameras=[]`` asks for no cameras and must select
+    none; ``cameras=None`` asks for the default and selects all of them.
+    Collapsing the two would silently turn nine checks into whole-episode
+    scans for a caller who passed an empty selection on purpose.
+    """
+    return list(cameras) if cameras is not None else episode.cameras
+
+
 @dataclass(frozen=True)
 class _EpisodeDurationIntermediates:
     """Everything one ``episode_duration`` key's value reads, computed once."""
@@ -718,14 +886,52 @@ def _episode_duration_intermediates(
     episode: Episode,
     topics: Sequence[str] | None,
 ) -> _EpisodeDurationIntermediates:
-    """Verbatim aggregation from the pre-fact body: explicit ``topics``
-    select as given, otherwise every topic carrying at least one message."""
+    """Explicit ``topics`` select as given; otherwise stream nonempty topics
+    without retaining their payloads in the episode's channel cache."""
     infos = episode.topics
     selected = (
         list(topics)
         if topics is not None
         else sorted(topic for topic, info in infos.items() if info.message_count >= 1)
     )
+    if topics is None:
+        # Statistics select topics, but need not agree with the messages.
+        # Keep measuring actual timestamps/counts rather than summary values.
+        #
+        # Reaching past Episode to its reader is the point rather than an
+        # oversight: episode.channel() caches every payload it decodes, and
+        # this check wants only the timestamps (#499). Going through the
+        # public accessor would populate the cache, which is the cost being
+        # removed. Batches arrive per channel in log-time order, so the first
+        # and last stamps of a batch are its bounds.
+        #
+        # The explicit-topics path below stays on episode.channel(), which
+        # refuses an unknown topic with a message naming it; indexing `infos`
+        # here would raise a bare KeyError instead. The two must agree on
+        # measurements for the same selection, which
+        # test_episode_duration_paths_agree_on_the_same_selection pins.
+        start_ns: int | None = None
+        end_ns: int | None = None
+        message_count_total = 0
+        if selected:
+            for batch in episode._reader.iter_batches(
+                topics=selected,
+                channel_ids=[infos[topic].channel_id for topic in selected],
+            ):
+                stamps_ns = batch.log_times
+                if len(stamps_ns) == 0:
+                    continue
+                message_count_total += len(stamps_ns)
+                first_ns, last_ns = int(stamps_ns[0]), int(stamps_ns[-1])
+                start_ns = first_ns if start_ns is None else min(start_ns, first_ns)
+                end_ns = last_ns if end_ns is None else max(end_ns, last_ns)
+        return _EpisodeDurationIntermediates(
+            duration_s=(end_ns - start_ns) / 1e9
+            if start_ns is not None and end_ns is not None
+            else 0.0,
+            message_count_total=message_count_total,
+            topic_count=len(selected),
+        )
     start_candidates_ns: list[int] = []
     end_candidates_ns: list[int] = []
     message_count_total = 0
@@ -778,7 +984,7 @@ def _episode_duration_keys(_episode: Episode) -> set[str]:
     return {"duration_s", "message_count_total", "topic_count"}
 
 
-def episode_duration(episode: Episode, *, topics: Sequence[str] | None = None) -> CheckResult:
+async def episode_duration(episode: Episode, *, topics: Sequence[str] | None = None) -> CheckResult:
     """Episode span and message volume, recorded for curation-side outlier cuts.
 
     An outlier is a corpus-relative judgment, so it cannot be decided inside
@@ -793,6 +999,12 @@ def episode_duration(episode: Episode, *, topics: Sequence[str] | None = None) -
     ``_episode_duration_value``, so a key the fact does not name cannot be
     emitted (#182).
     """
+    return await run_blocking(_measure_episode_duration, episode, topics=topics)
+
+
+def _measure_episode_duration(
+    episode: Episode, *, topics: Sequence[str] | None = None
+) -> CheckResult:
     intermediates = _episode_duration_intermediates(episode, topics)
     measurements: dict[str, MeasurementValue] = {
         key: _episode_duration_value(key, intermediates)
@@ -801,7 +1013,7 @@ def episode_duration(episode: Episode, *, topics: Sequence[str] | None = None) -
     return CheckResult(measurements=measurements)
 
 
-def required_topics(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
+async def required_topics(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
     """Presence and message volume for every topic a recording is expected to carry.
 
     A declared channel makes its topic present even when it contains no
@@ -813,6 +1025,10 @@ def required_topics(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
     Evidence only: whether a missing or empty topic rejects an episode remains
     a user-owned curation decision.
     """
+    return await run_blocking(_measure_required_topics, episode, topics=topics)
+
+
+def _measure_required_topics(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
     message_counts_by_topic: dict[str, int] = {}
     for info in episode.channels.values():
         message_counts_by_topic[info.topic] = (
@@ -831,7 +1047,7 @@ def required_topics(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
     return CheckResult(measurements=measurements)
 
 
-def action_rate(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
+async def action_rate(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
     """Message rate of each given action topic, in hertz, plus a pooled total.
 
     Per topic, over that topic's own span -- so three 100 Hz streams read
@@ -850,6 +1066,10 @@ def action_rate(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
     (the window function producing the ``_z`` column is documented in the
     Cohort statistics section of docs/CATALOG.md).
     """
+    return await run_blocking(_measure_action_rate, episode, topics=topics)
+
+
+def _measure_action_rate(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
     measurements: dict[str, MeasurementValue] = {}
     start_candidates_ns: list[int] = []
     end_candidates_ns: list[int] = []
@@ -915,7 +1135,7 @@ def _content_digest_value(key: str, inter: _ContentDigestIntermediates) -> Measu
     raise ValueError(f"content_digest has no branch for the key {key!r}")
 
 
-def content_digest(episode: Episode) -> CheckResult:
+async def content_digest(episode: Episode) -> CheckResult:
     """A stable digest of the episode's message content, for duplicate hunts.
 
     SHA-256 over every channel's log times and raw payloads (channels in
@@ -932,6 +1152,10 @@ def content_digest(episode: Episode) -> CheckResult:
     dedupes byte-identical re-ingests on its own; this digest additionally
     catches the same recording landed under different names or provenance.
     """
+    return await run_blocking(_measure_content_digest, episode)
+
+
+def _measure_content_digest(episode: Episode) -> CheckResult:
     inter = _content_digest_intermediates(episode)
     return CheckResult(
         measurements={
@@ -940,7 +1164,7 @@ def content_digest(episode: Episode) -> CheckResult:
     )
 
 
-def camera_stability(
+async def camera_stability(
     episode: Episode,
     *,
     cameras: Sequence[str] | None = None,
@@ -986,6 +1210,24 @@ def camera_stability(
     separate a shaking camera from a moving subject, which is the entire reason
     this check exists.
     """
+    return await run_blocking(
+        _measure_camera_stability,
+        episode,
+        cameras=cameras,
+        horizontal_field_of_view_degrees=horizontal_field_of_view_degrees,
+        shake_threshold_dps=shake_threshold_dps,
+        unstable_min_duration_s=unstable_min_duration_s,
+    )
+
+
+def _measure_camera_stability(
+    episode: Episode,
+    *,
+    cameras: Sequence[str] | None = None,
+    horizontal_field_of_view_degrees: float = DEFAULT_HORIZONTAL_FIELD_OF_VIEW_DEGREES,
+    shake_threshold_dps: float = 0.0,
+    unstable_min_duration_s: float = 0.0,
+) -> CheckResult:
 
     if (
         isinstance(shake_threshold_dps, bool)
@@ -1010,7 +1252,7 @@ def camera_stability(
             f"horizontal_field_of_view_degrees must be finite and in (0, 360], got {horizontal_field_of_view_degrees}"
         )
 
-    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    selected_cameras = _resolve_selected_cameras(episode, cameras)
     measurements: dict[str, MeasurementValue] = {}
     intervals: list[Interval] = []
     for topic in selected_cameras:
@@ -1077,7 +1319,7 @@ def camera_stability(
     return CheckResult(measurements=measurements, intervals=intervals)
 
 
-def trajectory_metrics(
+async def trajectory_metrics(
     episode: Episode,
     *,
     topic: str = "/joint_states",
@@ -1112,6 +1354,26 @@ def trajectory_metrics(
     (Voxel51's audit scored an early-gripper-release defect better than clean
     demos), so a threshold HFlow chose would reject the wrong episodes.
     """
+    return await run_blocking(
+        _measure_trajectory_metrics,
+        episode,
+        topic=topic,
+        field=field,
+        dimension_scales=dimension_scales,
+        motionless_speed_epsilon=motionless_speed_epsilon,
+        final_pose_window_s=final_pose_window_s,
+    )
+
+
+def _measure_trajectory_metrics(
+    episode: Episode,
+    *,
+    topic: str = "/joint_states",
+    field: str | None = None,
+    dimension_scales: Sequence[float] | None = None,
+    motionless_speed_epsilon: float = 1e-3,
+    final_pose_window_s: float = 0.5,
+) -> CheckResult:
     profile = _trajectory_profile(episode, topic, field, dimension_scales)
     if profile is None:
         return CheckResult(
@@ -1173,7 +1435,7 @@ def trajectory_metrics(
     return CheckResult(measurements=measurements)
 
 
-def trajectory_segments(
+async def trajectory_segments(
     episode: Episode,
     *,
     topic: str = "/joint_states",
@@ -1200,6 +1462,26 @@ def trajectory_segments(
 
     Evidence only, and no recommended gate: see :func:`trajectory_metrics`.
     """
+    return await run_blocking(
+        _measure_trajectory_segments,
+        episode,
+        topic=topic,
+        field=field,
+        dimension_scales=dimension_scales,
+        motionless_speed_epsilon=motionless_speed_epsilon,
+        min_motionless_span_s=min_motionless_span_s,
+    )
+
+
+def _measure_trajectory_segments(
+    episode: Episode,
+    *,
+    topic: str = "/joint_states",
+    field: str | None = None,
+    dimension_scales: Sequence[float] | None = None,
+    motionless_speed_epsilon: float = 1e-3,
+    min_motionless_span_s: float = 0.4,
+) -> CheckResult:
     profile = _trajectory_profile(episode, topic, field, dimension_scales)
     if profile is None:
         return CheckResult(
@@ -1312,7 +1594,7 @@ def _curvature_run_intervals(
     return intervals
 
 
-def camera_signal_quality(
+async def camera_signal_quality(
     episode: Episode,
     *,
     cameras: Sequence[str] | None = None,
@@ -1355,7 +1637,30 @@ def camera_signal_quality(
     ``camera_frame_stats`` records which one measured; compare across a pin bump
     only after re-measuring, not by reading old rows next to new ones.
     """
-    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    return await run_blocking(
+        _measure_camera_signal_quality,
+        episode,
+        cameras=cameras,
+        black_pixel_threshold=black_pixel_threshold,
+        freeze_noise_db=freeze_noise_db,
+        freeze_min_duration_s=freeze_min_duration_s,
+    )
+
+
+def _measure_camera_signal_quality(
+    episode: Episode,
+    *,
+    cameras: Sequence[str] | None = None,
+    black_pixel_threshold: int = 17,
+    freeze_noise_db: float = -60.0,
+    freeze_min_duration_s: float = 2.0,
+) -> CheckResult:
+    # Same placement and reason as camera_frame_stats above (#447).
+    require_int_in_range(black_pixel_threshold, "black_pixel_threshold", minimum=0, maximum=255)
+    require_finite_float(freeze_noise_db, "freeze_noise_db")
+    require_positive_float(freeze_min_duration_s, "freeze_min_duration_s")
+
+    selected_cameras = _resolve_selected_cameras(episode, cameras)
     measurements: dict[str, MeasurementValue] = {}
     for topic in selected_cameras:
         frame_statistics = measure_video_frame_statistics_for_hflow(
@@ -1405,7 +1710,7 @@ def camera_signal_quality(
     return CheckResult(measurements=measurements)
 
 
-def action_integrity(
+async def action_integrity(
     episode: Episode,
     *,
     topic: str = "/joint_states",
@@ -1436,6 +1741,24 @@ def action_integrity(
     a hold policy manufactures exactly-repeated samples, which is a fabricated
     frozen run rather than a recorded one.
     """
+    return await run_blocking(
+        _measure_action_integrity,
+        episode,
+        topic=topic,
+        field=field,
+        min_frozen_run_fraction=min_frozen_run_fraction,
+        min_unchanged_dimension_samples=min_unchanged_dimension_samples,
+    )
+
+
+def _measure_action_integrity(
+    episode: Episode,
+    *,
+    topic: str = "/joint_states",
+    field: str | None = None,
+    min_frozen_run_fraction: float = 0.05,
+    min_unchanged_dimension_samples: int = 11,
+) -> CheckResult:
     channel = episode.channel(topic)
     stamps_ns = channel.timestamps
     if len(stamps_ns) < 2:
@@ -1621,13 +1944,13 @@ def _mask_run_lengths(step_mask: np.ndarray) -> list[int]:
     return lengths
 
 
-def camera_fps_conformance(
+async def camera_fps_conformance(
     episode: Episode,
     *,
     nominal_fps: dict[str, int] | None = None,
     cameras: Sequence[str] | None = None,
-    max_plausible_fps: int = 240,
-    downsample_tolerance_fps: int = 1,
+    max_plausible_fps: float = 240,
+    downsample_tolerance_fps: float = 1,
 ) -> CheckResult:
     """Classify each camera's timestamp-derived rate against the rate declared.
 
@@ -1655,7 +1978,36 @@ def camera_fps_conformance(
     classifies; it never rewrites the stream -- decimating an episode is a
     transform concern that would move episode identity.
     """
-    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    return await run_blocking(
+        _measure_camera_fps_conformance,
+        episode,
+        nominal_fps=nominal_fps,
+        cameras=cameras,
+        max_plausible_fps=max_plausible_fps,
+        downsample_tolerance_fps=downsample_tolerance_fps,
+    )
+
+
+def _measure_camera_fps_conformance(
+    episode: Episode,
+    *,
+    nominal_fps: dict[str, int] | None = None,
+    cameras: Sequence[str] | None = None,
+    max_plausible_fps: float = 240,
+    downsample_tolerance_fps: float = 1,
+) -> CheckResult:
+
+    if isinstance(max_plausible_fps, bool):
+        raise ValueError("max_plausible_fps must be a float, got bool")
+    if not np.isfinite(max_plausible_fps) or max_plausible_fps <= 0:
+        raise ValueError("max_plausible_fps must be finite and positive")
+
+    if isinstance(downsample_tolerance_fps, bool):
+        raise ValueError("downsample_tolerance_fps must be a float, got bool")
+    if not np.isfinite(downsample_tolerance_fps) or downsample_tolerance_fps < 0:
+        raise ValueError("downsample_tolerance_fps must be finite and non-negative")
+
+    selected_cameras = _resolve_selected_cameras(episode, cameras)
     measurements: dict[str, MeasurementValue] = {}
     for topic in selected_cameras:
         stamps_ns = episode.channel(topic).timestamps
@@ -1693,8 +2045,8 @@ def _classify_derived_fps(
     *,
     derived_fps: int,
     declared_fps: int,
-    max_plausible_fps: int,
-    downsample_tolerance_fps: int,
+    max_plausible_fps: float,
+    downsample_tolerance_fps: float,
 ) -> str:
     """Branch order is the classification: equality first, then plausibility,
     then the 2x window. A declared rate at or above half the plausibility
@@ -1758,7 +2110,7 @@ def _media_digest_keys(episode: Episode, *, cameras: Sequence[str] | None = None
     both are produced in the same byte walk, so the fact's two-key claim
     holds for every camera the default runs over.
     """
-    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    selected_cameras = _resolve_selected_cameras(episode, cameras)
     keys: set[str] = set()
     for topic in selected_cameras:
         keys.add(f"{topic}/media_digest")
@@ -1775,7 +2127,7 @@ def _media_digest_value(topic: str, name: str, inter: _MediaDigestPerCamera) -> 
     raise ValueError(f"media_digest has no branch for the key {topic}/{name}")
 
 
-def media_digest(episode: Episode, *, cameras: Sequence[str] | None = None) -> CheckResult:
+async def media_digest(episode: Episode, *, cameras: Sequence[str] | None = None) -> CheckResult:
     """Per-camera digest of the encoded footage alone, for redundancy hunts.
 
     SHA-256 over one camera channel's length-framed payload bytes, deliberately
@@ -1797,7 +2149,11 @@ def media_digest(episode: Episode, *, cameras: Sequence[str] | None = None) -> C
     ``{topic}/media_bytes`` weights it by what the duplication costs to store.
     Reads no pixels and runs no decode, so it is exact and cheap.
     """
-    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    return await run_blocking(_measure_media_digest, episode, cameras=cameras)
+
+
+def _measure_media_digest(episode: Episode, *, cameras: Sequence[str] | None = None) -> CheckResult:
+    selected_cameras = _resolve_selected_cameras(episode, cameras)
     measurements: dict[str, MeasurementValue] = {}
     for topic in selected_cameras:
         inter = _media_digest_intermediates(episode, topic)
@@ -1828,21 +2184,34 @@ class _KeyframeIntervalPerCamera:
 
 def _keyframe_indices(channel: ChannelData) -> tuple[int, ...]:
     """Shared payload-scan helper for ``keyframe_interval``: which message
-    indices in ``channel.raw`` are keyframes. The fact and the body call
-    this; the cost is one Annex B scan per camera per call, which is the
-    irreducible price the default pays to know its own key set. Caching
-    the result on the channel would let the pre-decode supersession
-    consult the fact without a second scan, but no caller needs that
-    today -- the body is the only reader, and the fact is only consulted
-    when the default will run anyway. Revisit if a future change makes
-    the pre-decode check the hot path for this default.
+    indices in ``channel.raw`` are keyframes. The body shares the result
+    with the key-set fact so each camera's payloads are scanned once.
     """
     return tuple(
         index for index, payload in enumerate(channel.raw) if _payload_starts_a_keyframe(payload)
     )
 
 
-def _keyframe_interval_keys(episode: Episode, *, cameras: Sequence[str] | None = None) -> set[str]:
+def _keyframe_interval_intermediates(channel: ChannelData) -> _KeyframeIntervalPerCamera:
+    """One camera's keyframe scan, computed once and shared by the body and
+    the key-set fact (#480).
+
+    No empty-channel shortcut: ``_keyframe_indices`` on a channel with no
+    messages already returns ``()`` without inspecting a payload, so guarding
+    it would only add a branch that reads as if it saved something.
+    """
+    return _KeyframeIntervalPerCamera(
+        frame_count=channel.timestamps.size,
+        keyframe_indices=_keyframe_indices(channel),
+    )
+
+
+def _keyframe_interval_keys(
+    episode: Episode,
+    *,
+    cameras: Sequence[str] | None = None,
+    intermediates_by_camera: Mapping[str, _KeyframeIntervalPerCamera] | None = None,
+) -> set[str]:
     """The one statement of ``keyframe_interval``'s measurement key set.
 
     Per selected camera: ``scanned_frame_count`` and ``keyframe_count``
@@ -1851,23 +2220,26 @@ def _keyframe_interval_keys(episode: Episode, *, cameras: Sequence[str] | None =
     found; ``median_keyframe_interval_s`` only when at least two
     keyframes are found. ``App``'s pre-decode supersession reads this
     through the routing map, which only ever sees the automatic bare
-    registration.
+    registration. The body supplies its already-computed intermediates;
+    standalone callers compute them here.
     """
-    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    selected_cameras = _resolve_selected_cameras(episode, cameras)
     keys: set[str] = set()
     for topic in selected_cameras:
-        channel = episode.channel(topic)
-        frame_count = channel.timestamps.size
+        inter = (
+            _keyframe_interval_intermediates(episode.channel(topic))
+            if intermediates_by_camera is None
+            else intermediates_by_camera[topic]
+        )
         keys.add(f"{topic}/scanned_frame_count")
-        if frame_count == 0:
+        if inter.frame_count == 0:
             continue
-        keyframe_indices = _keyframe_indices(channel)
         keys.add(f"{topic}/keyframe_count")
         keys.add(f"{topic}/first_frame_is_keyframe")
-        if not keyframe_indices:
+        if not inter.keyframe_indices:
             continue
         keys.add(f"{topic}/max_keyframe_gap_s")
-        if len(keyframe_indices) >= 2:
+        if len(inter.keyframe_indices) >= 2:
             keys.add(f"{topic}/median_keyframe_interval_s")
     return keys
 
@@ -1904,7 +2276,9 @@ def _keyframe_interval_value(
     raise ValueError(f"keyframe_interval has no branch for the key {topic}/{name}")
 
 
-def keyframe_interval(episode: Episode, *, cameras: Sequence[str] | None = None) -> CheckResult:
+async def keyframe_interval(
+    episode: Episode, *, cameras: Sequence[str] | None = None
+) -> CheckResult:
     """Keyframe cadence per camera: how seekable and cuttable the footage is.
 
     A keyframe is where a decoder can start, so the longest gap between them
@@ -1927,19 +2301,36 @@ def keyframe_interval(episode: Episode, *, cameras: Sequence[str] | None = None)
     count as keyframes), so a ``<=`` filter excludes those rather than reading
     them as perfect.
     """
-    selected_cameras = list(cameras) if cameras is not None else episode.cameras
+    return await run_blocking(_measure_keyframe_interval, episode, cameras=cameras)
+
+
+def _measure_keyframe_interval(
+    episode: Episode, *, cameras: Sequence[str] | None = None
+) -> CheckResult:
+    selected_cameras = _resolve_selected_cameras(episode, cameras)
+    timestamps_by_camera: dict[str, np.ndarray] = {}
+    intermediates_by_camera: dict[str, _KeyframeIntervalPerCamera] = {}
+    # dict.fromkeys, not set: a repeated camera is loaded once but the
+    # measurement loop below still walks selected_cameras in the order the
+    # caller gave. Only the timestamps and the small keyframe struct are kept,
+    # so the channel's raw payloads are released as the loop moves on rather
+    # than all C being held at once.
+    for topic in dict.fromkeys(selected_cameras):
+        channel = episode.channel(topic)
+        timestamps_by_camera[topic] = channel.timestamps
+        intermediates_by_camera[topic] = _keyframe_interval_intermediates(channel)
+    keys = sorted(
+        _keyframe_interval_keys(
+            episode,
+            cameras=selected_cameras,
+            intermediates_by_camera=intermediates_by_camera,
+        )
+    )
     measurements: dict[str, MeasurementValue] = {}
     for topic in selected_cameras:
-        channel = episode.channel(topic)
-        stamps_ns = channel.timestamps
-        if stamps_ns.size == 0:
-            measurements[f"{topic}/scanned_frame_count"] = 0
-            continue
-        inter = _KeyframeIntervalPerCamera(
-            frame_count=stamps_ns.size,
-            keyframe_indices=_keyframe_indices(channel),
-        )
-        for key in sorted(_keyframe_interval_keys(episode, cameras=selected_cameras)):
+        stamps_ns = timestamps_by_camera[topic]
+        inter = intermediates_by_camera[topic]
+        for key in keys:
             if not key.startswith(f"{topic}/"):
                 continue
             name = key[len(topic) + 1 :]

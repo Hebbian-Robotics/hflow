@@ -9,11 +9,10 @@ records aggregate and per-frame evidence in HFlow's catalog boundary.
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
+import asyncio
 import hashlib
 import importlib
 import os
-import threading
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -38,6 +37,7 @@ from examples.egosuite_evaluation.judgment import (
     evaluate_image_with_model,
     image_file_data_url,
 )
+from hflow.asyncio_utils import run_blocking
 
 DEFAULT_OPENAI_COMPATIBLE_BASE_URL = "http://localhost:8000/v1"
 DEFAULT_MODEL_NAME = "model-not-configured"
@@ -171,10 +171,7 @@ def labels_for_pipeline_episode(
         ) from None
 
 
-_client_by_thread = threading.local()
-
-
-def _client_for_current_thread() -> Any:
+def _model_client() -> Any:
     if pipeline_configuration.model == DEFAULT_MODEL_NAME:
         raise ValueError("OPENAI_MODEL is required")
     api_key = os.environ.get(pipeline_configuration.api_key_environment_variable)
@@ -183,24 +180,20 @@ def _client_for_current_thread() -> Any:
             f"{pipeline_configuration.api_key_environment_variable} is not set; set "
             "EGOSUITE_ALLOW_MISSING_API_KEY=1 only for an unauthenticated endpoint"
         )
-    client_cache_key = (pipeline_configuration.endpoint, api_key)
-    if getattr(_client_by_thread, "cache_key", None) != client_cache_key:
-        openai_module = importlib.import_module("openai")
-        _client_by_thread.client = openai_module.OpenAI(
-            api_key=api_key or "not-needed",
-            base_url=pipeline_configuration.endpoint,
-            max_retries=pipeline_configuration.max_retries,
-        )
-        _client_by_thread.cache_key = client_cache_key
-    return _client_by_thread.client
+    openai_module = importlib.import_module("openai")
+    return openai_module.AsyncOpenAI(
+        api_key=api_key or "not-needed",
+        base_url=pipeline_configuration.endpoint,
+        max_retries=pipeline_configuration.max_retries,
+    )
 
 
-def _evaluate_frame(extracted_frame: hflow.ExtractedFrame) -> HandCountOutcome:
-    return evaluate_image_with_model(
-        client=_client_for_current_thread(),
+async def _evaluate_frame(extracted_frame: hflow.ExtractedFrame, client: Any) -> HandCountOutcome:
+    return await evaluate_image_with_model(
+        client=client,
         model=pipeline_configuration.model,
         prompt=pipeline_configuration.prompt,
-        image_data_url=image_file_data_url(extracted_frame.path),
+        image_data_url=await run_blocking(image_file_data_url, extracted_frame.path),
         response_format=pipeline_configuration.response_format,
         temperature=pipeline_configuration.temperature,
         max_tokens=pipeline_configuration.max_tokens,
@@ -340,7 +333,7 @@ def hand_visibility_check_result(
     requires=("vision-model",),
     version=_check_version(),
 )
-def egosuite_projected_hand_visibility(episode: hflow.Episode) -> hflow.CheckResult:
+async def egosuite_projected_hand_visibility(episode: hflow.Episode) -> hflow.CheckResult:
     """Compare image-only VLM hand counts with projected EgoSuite joints."""
 
     source_uri = episode.metadata.get("source_uri")
@@ -361,7 +354,8 @@ def egosuite_projected_hand_visibility(episode: hflow.Episode) -> hflow.CheckRes
                 f"camera {pipeline_configuration.camera_view.value!r}"
             )
     else:
-        labels = load_projected_hand_labels(
+        labels = await run_blocking(
+            load_projected_hand_labels,
             episode.path,
             source_uri=source_uri,
             camera_view=pipeline_configuration.camera_view,
@@ -369,14 +363,23 @@ def egosuite_projected_hand_visibility(episode: hflow.Episode) -> hflow.CheckRes
             limit_per_episode=pipeline_configuration.limit_per_episode,
             sample_seed=pipeline_configuration.sample_seed,
         )
-    extracted_frames = episode.frames_at_indices(
+    extracted_frames = await run_blocking(
+        episode.frames_at_indices,
         camera_topics(pipeline_configuration.camera_view).video,
         frame_indices=[label.frame_index for label in labels],
     )
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=pipeline_configuration.worker_count
-    ) as thread_pool:
-        judgments = list(thread_pool.map(_evaluate_frame, extracted_frames))
+    request_slots = asyncio.Semaphore(pipeline_configuration.worker_count)
+    async with _model_client() as client:
+
+        async def evaluate_when_admitted(frame: hflow.ExtractedFrame) -> HandCountOutcome:
+            async with request_slots:
+                return await _evaluate_frame(frame, client)
+
+        async with asyncio.TaskGroup() as requests:
+            frame_tasks = [
+                requests.create_task(evaluate_when_admitted(frame)) for frame in extracted_frames
+            ]
+        judgments = [frame_task.result() for frame_task in frame_tasks]
     return hand_visibility_check_result(
         labels,
         extracted_frames,
@@ -393,7 +396,7 @@ def _argument_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     arguments = _argument_parser().parse_args()
-    report = app.test(arguments.episode)
+    report = asyncio.run(app.test(arguments.episode))
     if report.has_errors:
         raise SystemExit(1)
 

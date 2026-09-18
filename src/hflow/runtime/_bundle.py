@@ -947,8 +947,16 @@ def copy_user_project(
         ignored.update(name for name in names if (current / name).resolve() in excluded_paths)
         return ignored
 
+    if user_dir.is_symlink():
+        raise ValueError("the copied project directory must not be a symbolic link")
     if user_dir.exists():
-        shutil.rmtree(user_dir)
+        # Running containers bind-mount this directory. Replacing its inode
+        # strands those mounts on an empty, deleted directory after refresh.
+        for copied_path in user_dir.iterdir():
+            if copied_path.is_dir() and not copied_path.is_symlink():
+                shutil.rmtree(copied_path)
+            else:
+                copied_path.unlink()
     shutil.copytree(project_directory, user_dir, ignore=ignored_names, dirs_exist_ok=True)
 
 

@@ -62,8 +62,8 @@ app = hflow.App("itest", data_root="/opt/airflow/data")
 
 
 @app.check(version="1")
-def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
-    return hflow.checks.timestamp_regularity(ep, tolerance_s=0.010)
+async def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
+    return await hflow.checks.timestamp_regularity(ep, tolerance_s=0.010)
 
 
 @app.enrich(version="1")
@@ -71,12 +71,11 @@ def caption(ep: hflow.Episode) -> hflow.EnrichmentResult:
     return hflow.EnrichmentResult(labels={"caption": "a robot arm moves"})
 """
 
-# The relabel scenario: an UPDATED labeler. An exact repeat is a deliberate
-# no-op, while changed source or a changed observable outcome appends a new
-# run fingerprint.
+# The relabel scenario: an UPDATED labeler with an explicit new step version.
+# Unchanged versions are deliberately current even if the source changes.
 PIPELINE_SOURCE_V2 = PIPELINE_SOURCE.replace(
-    '"caption": "a robot arm moves"', '"caption": "a robot arm moves (v2)"'
-)
+    '@app.enrich(version="1")', '@app.enrich(version="2")'
+).replace('"caption": "a robot arm moves"', '"caption": "a robot arm moves (v2)"')
 
 
 def _free_port() -> int:

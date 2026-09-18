@@ -5,6 +5,7 @@ these tests referee the hand-encoded CDR, the ros2msg schema texts, and the
 deterministic content formulas.
 """
 
+import asyncio
 import errno
 import hashlib
 import json
@@ -326,7 +327,7 @@ def test_video_episode_shake_segment_reads_as_unstable_footage(tmp_path: Path) -
     with hflow.Episode(canonical) as episode:
         time_bounds = episode.time_bounds
         assert time_bounds is not None
-        result = camera_stability(episode)
+        result = asyncio.run(camera_stability(episode))
 
     def overlap_seconds(interval: hflow.Interval, window: tuple[float, float]) -> float:
         start_s = (interval.start_ns - time_bounds.start_ns) / 1e9

@@ -7,7 +7,9 @@ from fastapi.testclient import TestClient
 from hflow_server import ServerSettings, create_app
 from ui_test_fixtures import PopulatedWorkspace
 
+from hflow.format import CATALOG_FORMAT_VERSION
 from hflow.runtime import RuntimeConfig, render_bundle
+from hflow.storage import BucketStorageRoot
 from hflow.workspace import Workspace
 
 
@@ -94,6 +96,7 @@ def test_config_reports_missing_catalog(empty_workspace_api: TestClient) -> None
     payload = empty_workspace_api.get("/api/v1/config").json()
     assert payload["capabilities"]["catalog"] is False
     assert payload["capabilities"]["media"] is True  # local root: serving is possible
+    assert payload["capabilities"]["curation"] is True  # studio writes still land locally
 
 
 def test_config_reports_a_minted_workspace_identity(tmp_path: Path) -> None:
@@ -102,6 +105,25 @@ def test_config_reports_a_minted_workspace_identity(tmp_path: Path) -> None:
     client = TestClient(create_app(ServerSettings(data_root=str(tmp_path))))
     payload = client.get("/api/v1/config").json()
     assert payload["workspace_id"] == minted_identity.workspace_id
+
+
+def test_config_enables_curation_not_media_for_bucket_backed_workspace(
+    bucket_workspace: tuple[str, BucketStorageRoot],
+    unbuilt_assets_dir: Path,
+    no_ambient_runtime: None,
+) -> None:
+    sentinel, bucket_root = bucket_workspace
+    bucket_root.child("catalog").write_bytes(
+        "format_version", (CATALOG_FORMAT_VERSION + "\n").encode()
+    )
+    settings = ServerSettings(data_root=sentinel, assets_dir=unbuilt_assets_dir)
+    response = TestClient(create_app(settings)).get("/api/v1/config")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["data_root"] == sentinel
+    assert payload["capabilities"]["catalog"] is True
+    assert payload["capabilities"]["curation"] is True
+    assert payload["capabilities"]["media"] is False
 
 
 def test_mutating_methods_are_rejected(api: TestClient) -> None:

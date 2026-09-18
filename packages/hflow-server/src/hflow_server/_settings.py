@@ -77,12 +77,12 @@ class ServerSettings:
 def local_data_root_or_none(data_root: str) -> Path | None:
     """The data root as a local directory, or ``None`` for a bucket URL.
 
-    The ONE derivation of "this workspace's files are reachable as paths" --
-    the precondition media serving, the sidecar, and pinned manifest files all
-    share. Each caller decides what to do without one (``_media`` and
-    ``_sidecar`` refuse 501 in their own error type; /api/v1/config turns it
-    into capability flags the frontend can hide affordances behind), but none
-    of them re-derives the predicate.
+    The ONE derivation of "this workspace's files are reachable as local paths"
+    -- the precondition media byte serving and HTTP manifest downloads still
+    need. Sidecar and pinned manifest writes go through StorageRoot instead,
+    so they do not share this gate. ``_media`` refuses 501 without a local root; /api/v1/config turns the
+    same predicate into the ``media`` capability flag. Callers must not
+    re-derive the predicate.
     """
     parsed_root = parse_storage_root(data_root)
     return parsed_root.path if isinstance(parsed_root, LocalStorageRoot) else None
