@@ -151,7 +151,10 @@ validation, repr-literal injection), and tenant SQL has a dedicated posture:
 `curate(..., constrained=True)` lock DuckDB's file access to the catalog and
 the manifest destination, disable extension auto-loading, and lock the
 configuration -- use it for any curation surface that executes SQL the
-operator did not write.
+operator did not write. The library also applies the single-SELECT statement
+gate on every `curate()` path that runs tenant SQL, including report-only
+`output=None` / CLI `--dry-run`; file locking alone does not refuse
+DESCRIBE/SHOW/PIVOT.
 
 Consequences for a hosted deployment:
 
