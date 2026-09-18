@@ -370,7 +370,8 @@ lowercases, merges, or renames stored evidence.
 
 Conflicting keys within a run are refused before recording. Separate appends
 can each be valid on their own, so HFlow also validates the complete key set
-when opening a catalog's wide view and before pivoting snapshot samples.
+when opening a catalog's wide view. Snapshot export opens the catalog through
+the same validation before writing its tables.
 Conflicts across episodes, appends, or older catalogs cause curation and
 snapshot export to refuse with both original names. Any existing manifest or
 snapshot destination stays intact. Rename one key at its producer so that the
