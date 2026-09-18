@@ -1311,6 +1311,67 @@ def test_curate_sql_surface_is_pinned(
         connection.close()
 
 
+@pytest.mark.parametrize(
+    ("sql_template", "expected_refused", "expected_rows"), _SQL_SURFACE_PAYLOADS
+)
+def test_curate_output_none_sql_surface_matches_manifest_gate(
+    tmp_path: Path,
+    sql_template: str,
+    expected_refused: bool,
+    expected_rows: int,
+) -> None:
+    """``curate(..., output=None)`` must refuse the same SQL surface as manifest write.
+
+    Dry-run wraps tenant SQL in ``SELECT count(*) FROM ({sql})``, which can
+    turn a multi-statement injection into a parser error — but DESCRIBE,
+    SHOW, SUMMARIZE, and PIVOT still execute cleanly inside that wrapper.
+    Without ``reject_non_single_select`` on the ``output=None`` branch those
+    shapes return a row count instead of ``NonSingleSelectQueryError``.
+    """
+    catalog_dir = tmp_path / "catalog"
+    catalog = Catalog(catalog_dir)
+    catalog.append_episode(
+        canonical_path=_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[_check_row()],
+    )
+    decoy_path = tmp_path / "decoy.parquet"
+    sql = sql_template.replace("{decoy}", str(decoy_path))
+
+    if expected_refused:
+        with pytest.raises(ValueError, match=r"exactly one (read-only )?SELECT"):
+            curate(catalog_dir, sql, output=None, constrained=True)
+        assert not decoy_path.exists()
+    else:
+        report = curate(catalog_dir, sql, output=None, constrained=True)
+        assert report.row_count == expected_rows
+        assert report.manifest_path is None
+
+
+def test_cli_curate_dry_run_refuses_non_single_select(
+    recorded_data_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    data_root = tmp_path / "data-root"
+    monkeypatch.setenv("HFLOW_DATA_ROOT", str(data_root))
+    exit_code = cli_main(
+        [
+            "curate",
+            "DESCRIBE SELECT episode_id FROM episodes",
+            "--catalog",
+            str(recorded_data_root / "catalog"),
+            "--dry-run",
+        ]
+    )
+    assert exit_code == 2
+    printed = capsys.readouterr()
+    assert "exactly one" in printed.err
+    assert not (data_root / "manifest.parquet").exists()
+
+
 def test_reject_non_single_select_refuses_a_single_non_select_statement() -> None:
     # A lone well-formed CREATE TABLE parses cleanly but is not a SELECT:
     # a rule rejection, never a parser error.
