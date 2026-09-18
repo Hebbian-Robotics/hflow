@@ -286,8 +286,10 @@ Running SQL you did not write? Pass `constrained=True` to `curate()` or
 to the catalog (plus the manifest's own destination), extension
 auto-install/auto-load is off, and the configuration is locked -- the
 posture a service uses for tenant-supplied SQL
-([docs/HOSTING.md](./HOSTING.md#trust-model)). The default stays
-unrestricted for your own exploration.
+([docs/HOSTING.md](./HOSTING.md#trust-model)). File locking is not the whole
+story: `curate()` also runs the single-SELECT statement gate before executing
+tenant SQL, including when `output` is omitted / `--dry-run` (report-only).
+The default stays unrestricted for your own exploration.
 
 ### The view surface
 

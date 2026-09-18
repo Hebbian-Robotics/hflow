@@ -679,33 +679,41 @@ def reject_non_single_select(sql: str) -> None:
         parser_connection.close()
 
 
+def _reject_tenant_sql(sql: str) -> None:
+    """Refuse non-single-SELECT tenant SQL before any connection execute.
+
+    Shared by manifest materialization and the ``output=None`` / dry-run
+    count path so both surfaces share one gate. A parser ``duckdb.Error``
+    becomes ``ValueError`` for library callers; ``NonSingleSelectQueryError``
+    (already a ``ValueError``) propagates unchanged so the service can still
+    tell rule rejection from a raw parse failure on
+    :func:`reject_non_single_select` itself.
+    """
+    try:
+        reject_non_single_select(sql)
+    except duckdb.Error as exc:
+        raise ValueError("sql must be exactly one SELECT statement") from exc
+
+
 def _stage_manifest_and_count(
     connection: duckdb.DuckDBPyConnection, sql: str, staged_manifest: Path
 ) -> int:
     """Write the query's result to the staged manifest; return its row count.
 
     ``sql`` is tenant-supplied on constrained connections.
-    ``reject_non_single_select`` parses the input **without executing it**
-    and refuses any payload that is not exactly one SELECT statement —
-    including multi-statement injections separated by semicolons (e.g.
-    ``SELECT ...; CREATE TABLE pwned AS SELECT ...``) and DDL-only input.
-    ``connection.sql()`` is **not** the guard: on duckdb 1.5.5 it silently
-    executes all statements and returns ``None`` for multi-statement input.
-    ``write_parquet`` then materialises the single confirmed-safe relation
-    to the staged path.
-
-    A parser ``duckdb.Error`` here is surfaced as the same ``ValueError``
-    this function has always raised for library callers; the
-    parse-failure/rule-rejection distinction the service relies on is intact
-    on ``reject_non_single_select`` itself.
+    ``_reject_tenant_sql`` / ``reject_non_single_select`` parses the input
+    **without executing it** and refuses any payload that is not exactly one
+    SELECT statement — including multi-statement injections separated by
+    semicolons (e.g. ``SELECT ...; CREATE TABLE pwned AS SELECT ...``) and
+    DDL-only input. ``connection.sql()`` is **not** the guard: on duckdb
+    1.5.5 it silently executes all statements and returns ``None`` for
+    multi-statement input. ``write_parquet`` then materialises the single
+    confirmed-safe relation to the staged path.
 
     The row-count query only ever receives an internally-generated path,
     so it keeps the existing f-string form.
     """
-    try:
-        reject_non_single_select(sql)
-    except duckdb.Error as exc:
-        raise ValueError("sql must be exactly one SELECT statement") from exc
+    _reject_tenant_sql(sql)
     connection.sql(sql).write_parquet(str(staged_manifest))
 
     (row_count,) = connection.execute(
@@ -818,12 +826,16 @@ def curate(
     is unreachable. ``catalog_root`` and ``output`` each accept a local path
     or a bucket URL (``gs://.../manifest.parquet`` uploads the manifest).
     With ``output=None`` the query still runs (row count + coverage
-    reporting) but nothing is written.
+    reporting) but nothing is written. Every path that executes ``sql`` —
+    including ``output=None`` — runs :func:`reject_non_single_select` first
+    so dry-run cannot accept DESCRIBE/SHOW/PIVOT (or other non-single-SELECT
+    shapes) that the manifest-write path already refuses.
 
     ``constrained=True`` runs the SQL on a locked-down connection (see
     :func:`open_catalog_connection`) whose only file access is the
     manifest's own private staging directory -- the posture a hosted service
-    uses for tenant-supplied SQL.
+    uses for tenant-supplied SQL. File locking alone does not replace the
+    statement gate.
     """
     # file:// output URLs mean a local file, matching parse_storage_root's
     # convention for roots -- without this, the Path() branch below would
@@ -897,6 +909,7 @@ def curate(
                 staged_manifest.replace(final_path)
                 manifest_path = final_path
             case None:
+                _reject_tenant_sql(sql)
                 (row_count,) = connection.execute(f"SELECT count(*) FROM ({sql})").fetchone() or (
                     0,
                 )
