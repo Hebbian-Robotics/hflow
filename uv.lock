@@ -999,7 +999,7 @@ wheels = [
 
 [[package]]
 name = "hflow"
-version = "0.3.0"
+version = "0.2.11"
 source = { editable = "." }
 dependencies = [
     { name = "duckdb" },
