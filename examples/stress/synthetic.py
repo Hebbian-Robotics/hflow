@@ -8,6 +8,7 @@ and the catalog under ``--data-root``, both of which are ignored trees.
 """
 
 import argparse
+import asyncio
 import random
 import shutil
 import subprocess
@@ -147,8 +148,8 @@ def run_ingest(corpus_dir: Path, data_root: Path) -> list[dict]:
     app.check(version="1")(episode_duration)
 
     @app.check(version="1", name="action_rate_check")
-    def action_rate_check(episode: hflow.Episode) -> hflow.CheckResult:
-        return action_rate(episode, topics=[JOINT_STATES_TOPIC])
+    async def action_rate_check(episode: hflow.Episode) -> hflow.CheckResult:
+        return await action_rate(episode, topics=[JOINT_STATES_TOPIC])
 
     mcap_files = sorted(corpus_dir.glob("episode_*.mcap"))
     print(f"Found {len(mcap_files)} episodes to ingest")
@@ -159,7 +160,7 @@ def run_ingest(corpus_dir: Path, data_root: Path) -> list[dict]:
         print(f"Processing {position}/{len(mcap_files)}: {mcap.name}")
         started = time.perf_counter()
         try:
-            report = app.process(str(mcap), record=True)
+            report = asyncio.run(app.process(str(mcap), record=True))
         except Exception as exc:
             elapsed_s = time.perf_counter() - started
             results.append(

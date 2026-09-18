@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -19,10 +20,10 @@ class _StubHostedResponse:
     def __init__(self, payload: object) -> None:
         self._body = json.dumps(payload).encode("utf-8")
 
-    def __enter__(self) -> _StubHostedResponse:
+    async def __aenter__(self) -> _StubHostedResponse:
         return self
 
-    def __exit__(
+    async def __aexit__(
         self,
         _exception_type: type[BaseException] | None,
         _exception: BaseException | None,
@@ -33,7 +34,7 @@ class _StubHostedResponse:
     def raise_for_status(self) -> None:
         return None
 
-    def iter_bytes(self) -> Iterator[bytes]:
+    async def aiter_bytes(self) -> AsyncIterator[bytes]:
         yield self._body
 
 
@@ -377,9 +378,9 @@ def test_hosted_execution_sends_the_selected_frame_and_returns_standard_evidence
             }
         )
 
-    monkeypatch.setattr(httpx2, "stream", hosted_response)
+    monkeypatch.setattr(httpx2.AsyncClient, "stream", staticmethod(hosted_response))
 
-    report = application.test(source_episode, verbose=False)
+    report = asyncio.run(application.test(source_episode, verbose=False))
     check_run = report.check("build_ai_hand_visibility")
     assert check_run.result is not None
     result = check_run.result
@@ -803,17 +804,21 @@ def test_only_one_complete_nonrefused_completion_produces_a_prediction(
         ]
         * choice_count
     )
-    client = SimpleNamespace(
-        chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_arguments: response))
-    )
-    outcome = checks.evaluate_image_with_model(
-        client=client,
-        model="model",
-        task_definition=checks.load_task_definitions()[checks.EvaluationTask.HAND_COUNT],
-        image_data_url="data:image/png;base64,fixture",
-        response_format=checks.ResponseFormat.JSON_SCHEMA,
-        temperature=None,
-        max_tokens=32,
+
+    async def complete(**_arguments: object) -> object:
+        return response
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=complete)))
+    outcome = asyncio.run(
+        checks.evaluate_image_with_model(
+            client=client,
+            model="model",
+            task_definition=checks.load_task_definitions()[checks.EvaluationTask.HAND_COUNT],
+            image_data_url="data:image/png;base64,fixture",
+            response_format=checks.ResponseFormat.JSON_SCHEMA,
+            temperature=None,
+            max_tokens=32,
+        )
     )
     assert isinstance(outcome, checks.ParsedVisionModelOutcome) is accepted
     if isinstance(outcome, checks.ParsedVisionModelOutcome):
@@ -825,12 +830,20 @@ def test_only_one_complete_nonrefused_completion_produces_a_prediction(
 @pytest.fixture
 def hosted_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     elapsed_seconds = [0.0]
-    monkeypatch.setattr(hflow.build_ai_vlm_checks.time, "monotonic", lambda: elapsed_seconds[0])
+    from types import SimpleNamespace
 
-    def advance_clock(seconds: float) -> None:
+    from tenacity import AsyncRetrying
+
+    monkeypatch.setattr(
+        hflow.build_ai_vlm_checks, "time", SimpleNamespace(monotonic=lambda: elapsed_seconds[0])
+    )
+
+    async def advance_clock(seconds: float) -> None:
         elapsed_seconds[0] += seconds
 
-    monkeypatch.setattr(hflow.build_ai_vlm_checks.time, "sleep", advance_clock)
+    monkeypatch.setattr(
+        hflow.build_ai_vlm_checks, "AsyncRetrying", partial(AsyncRetrying, sleep=advance_clock)
+    )
     return elapsed_seconds
 
 
@@ -846,10 +859,12 @@ def _evaluate_hosted_hand_count(
     **configuration: Any,
 ) -> hflow.build_ai_vlm_checks.VisionModelOutcome:
     checks = hflow.build_ai_vlm_checks
-    return checks._evaluate_image_with_hflow_hosted_service(
-        execution=checks.HFlowHostedExecution(**configuration),
-        task=checks.EvaluationTask.HAND_COUNT,
-        image_bytes=b"\xff\xd8\xffsynthetic-image",
+    return asyncio.run(
+        checks._evaluate_image_with_hflow_hosted_service(
+            execution=checks.HFlowHostedExecution(**configuration),
+            task=checks.EvaluationTask.HAND_COUNT,
+            image_bytes=b"\xff\xd8\xffsynthetic-image",
+        )
     )
 
 
@@ -859,12 +874,14 @@ def test_hosted_retry_recovers_transient_failures(
     hosted_clock: list[float],
     status_code: int | None,
 ) -> None:
-    from contextlib import contextmanager
+    from contextlib import asynccontextmanager
 
     responses = iter((status_code, 200))
 
-    @contextmanager
-    def respond(*_arguments: object, **_keyword_arguments: object) -> Iterator[httpx2.Response]:
+    @asynccontextmanager
+    async def respond(
+        *_arguments: object, **_keyword_arguments: object
+    ) -> AsyncIterator[httpx2.Response]:
         next_status = next(responses)
         if next_status is None:
             raise httpx2.ConnectError("connection interrupted")
@@ -880,9 +897,9 @@ def test_hosted_retry_recovers_transient_failures(
         try:
             yield response
         finally:
-            response.close()
+            await response.aclose()
 
-    monkeypatch.setattr(httpx2, "stream", respond)
+    monkeypatch.setattr(httpx2.AsyncClient, "stream", staticmethod(respond))
     outcome = _evaluate_hosted_hand_count()
     assert isinstance(outcome, hflow.build_ai_vlm_checks.ParsedVisionModelOutcome)
     assert outcome.predicted_value == 2
@@ -895,7 +912,7 @@ def test_hosted_request_does_not_turn_terminal_failures_into_success(
     hosted_clock: list[float],
     failure: str,
 ) -> None:
-    from contextlib import contextmanager
+    from contextlib import asynccontextmanager
 
     failure_responses = {
         "authorization": [httpx2.Response(401)],
@@ -910,16 +927,18 @@ def test_hosted_request_does_not_turn_terminal_failures_into_success(
     }
     responses = iter([*failure_responses[failure], _hosted_success_response()])
 
-    @contextmanager
-    def respond(*_arguments: object, **_keyword_arguments: object) -> Iterator[httpx2.Response]:
+    @asynccontextmanager
+    async def respond(
+        *_arguments: object, **_keyword_arguments: object
+    ) -> AsyncIterator[httpx2.Response]:
         response = next(responses)
         response.request = httpx2.Request("POST", "https://checks.example/private-input")
         try:
             yield response
         finally:
-            response.close()
+            await response.aclose()
 
-    monkeypatch.setattr(httpx2, "stream", respond)
+    monkeypatch.setattr(httpx2.AsyncClient, "stream", staticmethod(respond))
     with pytest.raises(RuntimeError) as captured_error:
         _evaluate_hosted_hand_count(max_retries=1, total_timeout_seconds=5)
     assert "private-input" not in str(captured_error.value)
@@ -932,13 +951,13 @@ def test_hosted_response_that_crosses_the_total_budget_is_not_accepted(
     hosted_clock: list[float],
 ) -> None:
     class SlowHostedResponse(_StubHostedResponse):
-        def iter_bytes(self) -> Iterator[bytes]:
+        async def aiter_bytes(self) -> AsyncIterator[bytes]:
             yield self._body[:1]
             hosted_clock[0] += 6
             yield self._body[1:]
 
     monkeypatch.setattr(
-        httpx2,
+        httpx2.AsyncClient,
         "stream",
         lambda *_arguments, **_keyword_arguments: SlowHostedResponse(
             {
@@ -950,3 +969,50 @@ def test_hosted_response_that_crosses_the_total_budget_is_not_accepted(
     )
     with pytest.raises(RuntimeError, match="total timeout"):
         _evaluate_hosted_hand_count(total_timeout_seconds=5)
+
+
+def test_hosted_total_deadline_interrupts_a_stalled_response_body() -> None:
+    """A responsive header cannot let an indefinitely stalled body hold an episode."""
+    checks = hflow.build_ai_vlm_checks
+
+    async def scenario() -> None:
+        connection_closed = asyncio.Event()
+        body_started = asyncio.Event()
+
+        async def stall_response(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            try:
+                headers = await reader.readuntil(b"\r\n\r\n")
+                content_length = next(
+                    int(line.partition(b":")[2])
+                    for line in headers.split(b"\r\n")
+                    if line.lower().startswith(b"content-length:")
+                )
+                await reader.readexactly(content_length)
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{")
+                await writer.drain()
+                body_started.set()
+                await reader.read()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+                connection_closed.set()
+
+        server = await asyncio.start_server(stall_response, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        async with server, asyncio.timeout(3):
+            with pytest.raises(RuntimeError, match="total timeout"):
+                await checks._evaluate_image_with_hflow_hosted_service(
+                    execution=checks.HFlowHostedExecution(
+                        base_url=f"http://127.0.0.1:{port}",
+                        total_timeout_seconds=0.3,
+                        request_timeout_seconds=2,
+                    ),
+                    task=checks.EvaluationTask.HAND_COUNT,
+                    image_bytes=b"\xff\xd8\xffsynthetic-image",
+                )
+            assert body_started.is_set()
+            await connection_closed.wait()
+
+    asyncio.run(scenario())

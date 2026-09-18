@@ -1,5 +1,6 @@
 """`hflow dataset create`: the pipeline's own policy as an immutable artifact."""
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -26,7 +27,7 @@ app = hflow.App("dataset-demo", default_checks=())
 
 
 @app.check(version="1")
-def duration(ep: hflow.Episode) -> hflow.CheckResult:
+async def duration(ep: hflow.Episode) -> hflow.CheckResult:
     return hflow.CheckResult(measurements={"seconds": 1.0})
 """
 
@@ -79,7 +80,7 @@ class TestDefaultPolicy:
         app = hflow.import_pipeline_application(str(ingested_project / "pipeline.py"))
 
         @app.check(version="1")
-        def added_later(ep: hflow.Episode) -> hflow.CheckResult:
+        async def added_later(ep: hflow.Episode) -> hflow.CheckResult:
             return hflow.CheckResult()
 
         assert create_dataset(app, "with-a-hole").row_count == 0
@@ -132,14 +133,14 @@ app = hflow.App("wrapper-demo")
 
 
 @app.check(version="1")
-def my_duration(ep: hflow.Episode) -> hflow.CheckResult:
-    return episode_duration(ep)
+async def my_duration(ep: hflow.Episode) -> hflow.CheckResult:
+    return await episode_duration(ep)
 """
         )
         _ingest(tmp_path, monkeypatch)
         app = hflow.import_pipeline_application(str(tmp_path / "pipeline.py"))
 
-        report = app.test(data_root / "episodes-in" / "episode_0001.mcap")
+        report = asyncio.run(app.test(data_root / "episodes-in" / "episode_0001.mcap"))
         superseded = report.check("episode_duration")
         assert superseded.status is hflow.CheckStatus.SUPERSEDED
 
@@ -287,7 +288,7 @@ def test_a_bucket_backed_workspace_can_write_a_manifest(tmp_path: Path) -> None:
     source = synthesize_episode(
         tmp_path / "episode_0001.mcap", SyntheticEpisodeSpec(duration_s=1.0, cameras=())
     )
-    app.process(source, record=True, verbose=False)
+    asyncio.run(app.process(source, record=True, verbose=False))
 
     written = write_dataset_manifest(workspace, name="clean", sql="SELECT episode_id FROM episodes")
 
@@ -307,7 +308,7 @@ def test_a_manifest_is_never_overwritten(tmp_path: Path, monkeypatch: pytest.Mon
     source = synthesize_episode(
         tmp_path / "episode_0001.mcap", SyntheticEpisodeSpec(duration_s=1.0, cameras=())
     )
-    app.process(source, record=True, verbose=False)
+    asyncio.run(app.process(source, record=True, verbose=False))
     workspace = Workspace.parse(data_root)
 
     write_dataset_manifest(
@@ -327,7 +328,7 @@ app = hflow.App("dataset-demo", default_checks=())
 
 
 @app.check(version="1", critical=True)
-def duration(ep: hflow.Episode) -> hflow.CheckResult:
+async def duration(ep: hflow.Episode) -> hflow.CheckResult:
     if os.environ.get("CRASH_DURATION"):
         raise RuntimeError("boom")
     return hflow.CheckResult(measurements={"seconds": 1.0})
@@ -356,7 +357,7 @@ class TestSettledThenCrashed:
         app = hflow.App("recurring-outcome", data_root=data_root, default_checks=())
 
         @app.check(critical=True, version="1")
-        def duration(_episode: hflow.Episode) -> hflow.CheckResult:
+        async def duration(_episode: hflow.Episode) -> hflow.CheckResult:
             if os.environ.get("CRASH_DURATION") == "1":
                 raise RuntimeError("temporary service failure")
             return hflow.CheckResult(measurements={"seconds": 1.0})
@@ -365,11 +366,13 @@ class TestSettledThenCrashed:
         for attempt, errors in enumerate([first_errors, not first_errors, first_errors]):
             monkeypatch.setenv("CRASH_DURATION", "1" if errors else "0")
             for retry in range(2):
-                report = app.process(
-                    source_episode,
-                    record=True,
-                    stages="full" if attempt == retry == 0 else stages,
-                    execution_id=f"attempt-{attempt}" if explicit_execution else None,
+                report = asyncio.run(
+                    app.process(
+                        source_episode,
+                        record=True,
+                        stages="full" if attempt == retry == 0 else stages,
+                        execution_id=f"attempt-{attempt}" if explicit_execution else None,
+                    )
                 )
                 expected_check_status = "error" if errors else "measured"
                 assert report.check("duration").status == expected_check_status

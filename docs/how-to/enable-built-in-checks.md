@@ -97,13 +97,13 @@ app.check(version="1", name="timestamps")(
 
 # Instead of `app.check(version="1")(camera_frame_stats)`:
 @app.check(version="1")
-def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
-    return camera_frame_stats(ep, expected_hz={"/wrist_cam/compressed": 30.0})
+async def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
+    return await camera_frame_stats(ep, expected_hz={"/wrist_cam/compressed": 30.0})
 
 
 @app.check(version="1")
-def topic_inventory(ep: hflow.Episode) -> hflow.CheckResult:
-    return required_topics(ep, topics=["/joint_states", "/imu"])
+async def topic_inventory(ep: hflow.Episode) -> hflow.CheckResult:
+    return await required_topics(ep, topics=["/joint_states", "/imu"])
 ```
 
 Registering two steps of your own under one name is refused, because both
@@ -229,8 +229,8 @@ at registration rather than rewriting the check. HFlow ships a recommended one:
 
 ```python
 @app.check(version="1", critical=True, gate=hflow.checks.RECOMMENDED_CAMERA_INTEGRITY)
-def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
-    return camera_frame_stats(ep)
+async def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
+    return await camera_frame_stats(ep)
 ```
 
 `critical=True` is what makes a failing gate quarantine the episode and skip its
@@ -275,7 +275,7 @@ The dev loop prints every measurement per check, with `*` for evidence-only,
 facts land in the catalog for querying:
 
 ```python
-report = app.process(episode_path, record=True)
+report = await app.process(episode_path, record=True)
 ```
 
 Then query them, keeping in mind that measurement keys carry their topic and so

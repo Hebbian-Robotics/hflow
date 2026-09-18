@@ -1,5 +1,6 @@
 """#506: undecompressable canonical bytes use #502's integrity refusal path."""
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -23,23 +24,23 @@ def test_undecompressable_canonical_is_refused_before_user_steps(tmp_path: Path)
     app, probe_runs, caption_runs = _app_with_probe_check(data_root)
     source_uri = "episodes-in/episode.mcap"
     source = synthesize_episode(data_root / source_uri, SPEC)
-    synced = app.process(source, stages={hflow.Stage.SYNC}, record=False)
+    synced = asyncio.run(app.process(source, stages={hflow.Stage.SYNC}, record=False))
     assert verify_canonical_integrity(synced.canonical_path) == (True, None)
     corrupt_zstd_chunk_payload(synced.canonical_path)
 
     reason = CANONICAL_DECOMPRESSION_FAILED_REASON
     assert reason == "canonical-decompression-failed"
     assert verify_canonical_integrity(synced.canonical_path) == (False, reason)
-    refused = app.process(source, stages="metadata_backfill")
+    refused = asyncio.run(app.process(source, stages="metadata_backfill"))
     assert refused.refusal_reason == reason
     assert refused.has_errors
     assert refused.checks == []
     assert f"REFUSED: {reason}" in refused.summary()
 
-    relabel_refused = app.process(source, stages="relabel")
+    relabel_refused = asyncio.run(app.process(source, stages="relabel"))
     assert relabel_refused.refusal_reason == reason
     assert relabel_refused.enrichments == []
-    assert process_stage_batch(app, [source_uri], "meta") == {
+    assert asyncio.run(process_stage_batch(app, [source_uri], "meta")) == {
         "processed": 0,
         "quarantined": 0,
         "errors": 1,
@@ -69,9 +70,9 @@ def test_one_error_filter_finds_both_canonical_corruption_species(tmp_path: Path
         ("zstd", corrupt_zstd_chunk_payload),
     ):
         source = synthesize_episode(data_root / "episodes-in" / f"{name}.mcap", SPEC)
-        synced = app.process(source, stages={hflow.Stage.SYNC}, record=False)
+        synced = asyncio.run(app.process(source, stages={hflow.Stage.SYNC}, record=False))
         corrupt(synced.canonical_path)
-        app.process(source, stages="metadata_backfill")
+        asyncio.run(app.process(source, stages="metadata_backfill"))
 
     connection = open_catalog_connection(data_root / "catalog")
     try:
@@ -93,14 +94,14 @@ def test_missing_canonical_remains_an_infrastructure_failure(tmp_path: Path) -> 
     app, probe_runs, _caption_runs = _app_with_probe_check(data_root)
     source_uri = "episodes-in/episode.mcap"
     source = synthesize_episode(data_root / source_uri, SPEC)
-    synced = app.process(source, stages={hflow.Stage.SYNC}, record=False)
+    synced = asyncio.run(app.process(source, stages={hflow.Stage.SYNC}, record=False))
     synced.canonical_path.unlink()
 
     with pytest.raises(FileNotFoundError):
         verify_canonical_integrity(synced.canonical_path)
     with pytest.raises(FileNotFoundError, match="no canonical episode exists"):
-        app.process(source, stages="metadata_backfill")
-    assert process_stage_batch(app, [source_uri], "meta") == {
+        asyncio.run(app.process(source, stages="metadata_backfill"))
+    assert asyncio.run(process_stage_batch(app, [source_uri], "meta")) == {
         "processed": 0,
         "quarantined": 0,
         "errors": 1,

@@ -108,7 +108,7 @@ forking those semantics:
 ```python
 from hflow.stage_execution import process_stage_batch
 
-counts = process_stage_batch(
+counts = await process_stage_batch(
     app,
     episode_uris,
     "meta",

@@ -1,5 +1,6 @@
 """Run profiles: the ingest stage graph's toggleable stages driven through App.process."""
 
+import asyncio
 import re
 from pathlib import Path
 
@@ -23,7 +24,7 @@ def _app_with_check_and_enrichment(data_root: Path) -> hflow.App:
     app = hflow.App("profiles", data_root=data_root, default_checks=())
 
     @app.check(version="1")
-    def joints(ep: hflow.Episode) -> hflow.CheckResult:
+    async def joints(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"joint_count": 7})
 
     @app.enrich(version="1")
@@ -45,7 +46,7 @@ def test_full_then_relabel_appends_labels_without_rewriting_canonical(
     data_root = tmp_path / "data"
     app = _app_with_check_and_enrichment(data_root)
 
-    full_report = app.process(source_episode, stages="full")
+    full_report = asyncio.run(app.process(source_episode, stages="full"))
     assert full_report.stages_run == frozenset(hflow.Stage)
     canonical_mtime_ns = full_report.canonical_path.stat().st_mtime_ns
 
@@ -58,7 +59,7 @@ def test_full_then_relabel_appends_labels_without_rewriting_canonical(
     finally:
         connection.close()
 
-    relabel_report = app.process(source_episode, stages="relabel")
+    relabel_report = asyncio.run(app.process(source_episode, stages="relabel"))
     assert relabel_report.stages_run == frozenset({hflow.Stage.LABELS})
     # The canonical file is untouched: relabel never re-runs the transform.
     assert full_report.canonical_path.stat().st_mtime_ns == canonical_mtime_ns
@@ -83,9 +84,9 @@ def test_full_then_relabel_appends_labels_without_rewriting_canonical(
 def test_metadata_backfill_runs_checks_only(source_episode: Path, tmp_path: Path) -> None:
     data_root = tmp_path / "data"
     app = _app_with_check_and_enrichment(data_root)
-    app.process(source_episode, stages="full")
+    asyncio.run(app.process(source_episode, stages="full"))
 
-    backfill_report = app.process(source_episode, stages="metadata_backfill")
+    backfill_report = asyncio.run(app.process(source_episode, stages="metadata_backfill"))
     assert backfill_report.stages_run == frozenset({hflow.Stage.META})
     assert [run.check.name for run in backfill_report.checks] == ["joints"]
     assert not backfill_report.enrichments
@@ -107,21 +108,23 @@ def test_step_selection_records_only_the_named_step(source_episode: Path, tmp_pa
     app = hflow.App("selected-steps", data_root=data_root, default_checks=())
 
     @app.check(version="1")
-    def selected_check(ep: hflow.Episode) -> hflow.CheckResult:
+    async def selected_check(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"selected": 1.0})
 
     @app.check(version="1")
-    def unselected_check(ep: hflow.Episode) -> hflow.CheckResult:
+    async def unselected_check(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"unselected": 1.0})
 
     @app.enrich(version="1")
     def unselected_enrichment(ep: hflow.Episode) -> hflow.EnrichmentResult:
         return hflow.EnrichmentResult(labels={"caption": "not requested"})
 
-    report = app.process(
-        source_episode,
-        stages={hflow.Stage.SYNC, hflow.Stage.META, hflow.Stage.LABELS},
-        step_names={"selected_check"},
+    report = asyncio.run(
+        app.process(
+            source_episode,
+            stages={hflow.Stage.SYNC, hflow.Stage.META, hflow.Stage.LABELS},
+            step_names={"selected_check"},
+        )
     )
 
     assert [run.check.name for run in report.checks] == ["selected_check"]
@@ -152,10 +155,12 @@ def test_step_selection_runs_only_the_named_enrichment(
     def unselected_embedding(ep: hflow.Episode) -> hflow.EnrichmentResult:
         return hflow.EnrichmentResult(labels={"embedding": "not requested"})
 
-    report = app.process(
-        source_episode,
-        stages={hflow.Stage.SYNC, hflow.Stage.LABELS},
-        step_names={"selected_caption"},
+    report = asyncio.run(
+        app.process(
+            source_episode,
+            stages={hflow.Stage.SYNC, hflow.Stage.LABELS},
+            step_names={"selected_caption"},
+        )
     )
 
     assert [run.enrichment.name for run in report.enrichments] == ["selected_caption"]
@@ -180,13 +185,15 @@ def test_step_selection_validates_names_and_enabled_stages_before_episode_io(
     app = _app_with_check_and_enrichment(tmp_path / "data")
 
     with pytest.raises(ValueError, match=r"unknown step names.*not_registered"):
-        app.process(missing_episode, step_names={"not_registered"})
+        asyncio.run(app.process(missing_episode, step_names={"not_registered"}))
 
     with pytest.raises(ValueError, match=r"caption \(labels\).+enabled stages: \['meta'\]"):
-        app.process(
-            missing_episode,
-            stages={hflow.Stage.META},
-            step_names={"caption"},
+        asyncio.run(
+            app.process(
+                missing_episode,
+                stages={hflow.Stage.META},
+                step_names={"caption"},
+            )
         )
 
 
@@ -194,18 +201,20 @@ def test_unselected_enrichment_does_not_run(source_episode: Path, tmp_path: Path
     app = hflow.App("selected-endpoint", data_root=tmp_path / "data", default_checks=())
 
     @app.check(version="1")
-    def local_check(ep: hflow.Episode) -> hflow.CheckResult:
+    async def local_check(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"local": 1.0})
 
     @app.enrich(version="1", requires=("vision-model",))
     def remote_enrichment(ep: hflow.Episode) -> hflow.EnrichmentResult:
         return hflow.EnrichmentResult(labels={"remote": "unused"})
 
-    report = app.process(
-        source_episode,
-        stages={hflow.Stage.SYNC, hflow.Stage.META},
-        step_names={"local_check"},
-        record=False,
+    report = asyncio.run(
+        app.process(
+            source_episode,
+            stages={hflow.Stage.SYNC, hflow.Stage.META},
+            step_names={"local_check"},
+            record=False,
+        )
     )
 
     assert [run.check.name for run in report.checks] == ["local_check"]
@@ -218,19 +227,21 @@ def test_partial_metadata_run_preserves_unselected_quarantine_and_rechecked_gate
     original_application = hflow.App("selected-quarantine", data_root=data_root, default_checks=())
 
     @original_application.check(version="1", name="safety_gate", critical=True)
-    def rejecting_safety_gate(ep: hflow.Episode) -> hflow.CheckResult:
+    async def rejecting_safety_gate(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(verdict=False)
 
     @original_application.check(version="1")
-    def refreshed_evidence(ep: hflow.Episode) -> hflow.CheckResult:
+    async def refreshed_evidence(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"refreshed": 1.0})
 
-    assert original_application.process(source_episode).quarantined
+    assert asyncio.run(original_application.process(source_episode)).quarantined
 
-    partial_report = original_application.process(
-        source_episode,
-        stages={hflow.Stage.META},
-        step_names={"refreshed_evidence"},
+    partial_report = asyncio.run(
+        original_application.process(
+            source_episode,
+            stages={hflow.Stage.META},
+            step_names={"refreshed_evidence"},
+        )
     )
     assert partial_report.quarantined
     assert partial_report.quarantine_tags == ["quarantined:safety_gate"]
@@ -238,13 +249,15 @@ def test_partial_metadata_run_preserves_unselected_quarantine_and_rechecked_gate
     revised_application = hflow.App("selected-quarantine", data_root=data_root, default_checks=())
 
     @revised_application.check(version="2", name="safety_gate", critical=True)
-    def accepting_safety_gate(ep: hflow.Episode) -> hflow.CheckResult:
+    async def accepting_safety_gate(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(verdict=True)
 
-    revised_report = revised_application.process(
-        source_episode,
-        stages={hflow.Stage.META},
-        step_names={"safety_gate"},
+    revised_report = asyncio.run(
+        revised_application.process(
+            source_episode,
+            stages={hflow.Stage.META},
+            step_names={"safety_gate"},
+        )
     )
     assert not revised_report.quarantined
     assert revised_report.quarantine_tags == []
@@ -253,7 +266,7 @@ def test_partial_metadata_run_preserves_unselected_quarantine_and_rechecked_gate
 def test_relabel_without_canonical_errors_helpfully(source_episode: Path, tmp_path: Path) -> None:
     app = _app_with_check_and_enrichment(tmp_path / "data")
     with pytest.raises(FileNotFoundError, match="run the full or sync profile first"):
-        app.process(source_episode, stages="relabel")
+        asyncio.run(app.process(source_episode, stages="relabel"))
 
 
 def test_quarantine_is_honored_across_invocations_via_the_catalog(
@@ -264,7 +277,7 @@ def test_quarantine_is_honored_across_invocations_via_the_catalog(
     enrichment_ran = False
 
     @app.check(version="1", critical=True)
-    def dead_camera(ep: hflow.Episode) -> hflow.CheckResult:
+    async def dead_camera(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(verdict=False)
 
     @app.enrich(version="1")
@@ -273,10 +286,10 @@ def test_quarantine_is_honored_across_invocations_via_the_catalog(
         enrichment_ran = True
         return hflow.EnrichmentResult()
 
-    full_report = app.process(source_episode, stages="full")
+    full_report = asyncio.run(app.process(source_episode, stages="full"))
     assert full_report.quarantined
 
-    relabel_report = app.process(source_episode, stages="relabel")
+    relabel_report = asyncio.run(app.process(source_episode, stages="relabel"))
     assert not enrichment_ran
     assert relabel_report.enrichments[0].status == hflow.CheckStatus.SKIPPED
     not_run = relabel_report.enrichments[0].not_run
@@ -287,9 +300,9 @@ def test_quarantine_is_honored_across_invocations_via_the_catalog(
 def test_no_catalog_means_no_known_quarantine(source_episode: Path, tmp_path: Path) -> None:
     app = _app_with_check_and_enrichment(tmp_path / "data")
     # sync writes the canonical without recording anything to consult ...
-    app.process(source_episode, stages={hflow.Stage.SYNC}, record=False)
+    asyncio.run(app.process(source_episode, stages={hflow.Stage.SYNC}, record=False))
     # ... so a relabel run proceeds: no catalog = no known quarantine.
-    relabel_report = app.process(source_episode, stages="relabel", record=False)
+    relabel_report = asyncio.run(app.process(source_episode, stages="relabel", record=False))
     assert relabel_report.enrichments[0].status == hflow.CheckStatus.MEASURED
 
 
@@ -298,7 +311,7 @@ def test_media_stage_records_a_contact_sheet_artifact(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
     app = hflow.App("profiles-media", data_root=data_root, default_checks=())
 
-    report = app.process(source_episode, stages={hflow.Stage.SYNC, hflow.Stage.MEDIA})
+    report = asyncio.run(app.process(source_episode, stages={hflow.Stage.SYNC, hflow.Stage.MEDIA}))
     media_runs = [run for run in report.enrichments if run.enrichment.name == "media/contact_sheet"]
     assert len(media_runs) == 1
     assert media_runs[0].status == hflow.CheckStatus.MEASURED
@@ -327,17 +340,21 @@ def test_media_step_selection_distinguishes_unselected_from_requested(tmp_path: 
     data_root = tmp_path / "data"
     app = hflow.App("selected-media", data_root=data_root, default_checks=())
 
-    unselected_report = app.process(
-        source_episode,
-        stages={hflow.Stage.SYNC, hflow.Stage.MEDIA},
-        step_names=set(),
+    unselected_report = asyncio.run(
+        app.process(
+            source_episode,
+            stages={hflow.Stage.SYNC, hflow.Stage.MEDIA},
+            step_names=set(),
+        )
     )
     assert not unselected_report.enrichments
 
-    selected_report = app.process(
-        source_episode,
-        stages={hflow.Stage.MEDIA},
-        step_names={"media/contact_sheet"},
+    selected_report = asyncio.run(
+        app.process(
+            source_episode,
+            stages={hflow.Stage.MEDIA},
+            step_names={"media/contact_sheet"},
+        )
     )
     assert [run.enrichment.name for run in selected_report.enrichments] == ["media/contact_sheet"]
     assert selected_report.enrichments[0].status == hflow.CheckStatus.MEASURED
@@ -347,7 +364,9 @@ def test_media_stage_is_silently_absent_without_cameras(
     source_episode: Path, tmp_path: Path
 ) -> None:
     app = hflow.App("profiles-no-media", data_root=tmp_path / "data")
-    report = app.process(source_episode, stages={hflow.Stage.SYNC, hflow.Stage.MEDIA}, record=False)
+    report = asyncio.run(
+        app.process(source_episode, stages={hflow.Stage.SYNC, hflow.Stage.MEDIA}, record=False)
+    )
     assert not report.enrichments  # no cameras: no media row claims otherwise
 
 
@@ -355,11 +374,13 @@ def test_stages_accepts_profile_string_and_explicit_set(
     source_episode: Path, tmp_path: Path
 ) -> None:
     app = _app_with_check_and_enrichment(tmp_path / "data")
-    app.process(source_episode, stages={hflow.Stage.SYNC}, record=False)
+    asyncio.run(app.process(source_episode, stages={hflow.Stage.SYNC}, record=False))
 
-    from_profile = app.process(source_episode, stages="metadata_backfill", record=False)
-    from_set = app.process(source_episode, stages={hflow.Stage.META}, record=False)
-    from_list = app.process(source_episode, stages=[hflow.Stage.META], record=False)
+    from_profile = asyncio.run(
+        app.process(source_episode, stages="metadata_backfill", record=False)
+    )
+    from_set = asyncio.run(app.process(source_episode, stages={hflow.Stage.META}, record=False))
+    from_list = asyncio.run(app.process(source_episode, stages=[hflow.Stage.META], record=False))
     assert (
         from_profile.stages_run
         == from_set.stages_run
@@ -372,7 +393,7 @@ def test_stages_accepts_profile_string_and_explicit_set(
 def test_unknown_profile_errors_with_valid_names(source_episode: Path, tmp_path: Path) -> None:
     app = _app_with_check_and_enrichment(tmp_path / "data")
     with pytest.raises(ValueError, match="metadata_backfill"):
-        app.process(source_episode, stages="everything")
+        asyncio.run(app.process(source_episode, stages="everything"))
 
 
 def test_run_profiles_vocabulary() -> None:

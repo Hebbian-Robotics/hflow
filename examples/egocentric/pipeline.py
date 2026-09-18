@@ -5,6 +5,7 @@ checks in-process for the dev loop, and ``hflow up --pipeline
 examples/egocentric/pipeline.py:pipeline`` runs the same pipeline under Airflow.
 """
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -26,14 +27,14 @@ pipeline = hflow.App("egocentric", data_root=DATA_ROOT)
 
 
 @pipeline.check(version="1")
-def timestamp_regularity(episode: hflow.Episode) -> hflow.CheckResult:
-    return measure_timestamp_regularity(episode, expected_hz={episode.cameras[0]: 10.0})
+async def timestamp_regularity(episode: hflow.Episode) -> hflow.CheckResult:
+    return await measure_timestamp_regularity(episode, expected_hz={episode.cameras[0]: 10.0})
 
 
 @pipeline.check(version="1", critical=True)
-def camera_health(episode: hflow.Episode) -> hflow.CheckResult:
+async def camera_health(episode: hflow.Episode) -> hflow.CheckResult:
     camera_topic = episode.cameras[0]
-    camera_evidence = measure_camera_frame_stats(episode, cameras=[camera_topic])
+    camera_evidence = await measure_camera_frame_stats(episode, cameras=[camera_topic])
     black_frame_percent = camera_evidence.measurements[f"{camera_topic}/black_frame_pct"]
     freeze_total_seconds = camera_evidence.measurements[f"{camera_topic}/freeze_total_s"]
     average_luma_mean = camera_evidence.measurements[f"{camera_topic}/luma_avg_mean"]
@@ -86,7 +87,7 @@ def main() -> None:
     if len(sys.argv) < 2:
         raise SystemExit(f"usage: {Path(sys.argv[0]).name} <episode.mcap> [episode.mcap ...]")
     for episode_path in map(Path, sys.argv[1:]):
-        pipeline.test(episode_path, record=True)
+        asyncio.run(pipeline.test(episode_path, record=True))
 
 
 if __name__ == "__main__":

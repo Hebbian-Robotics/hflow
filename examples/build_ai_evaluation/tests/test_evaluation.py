@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from collections.abc import Callable
@@ -68,7 +69,7 @@ class _FixtureCompletions:
     def __init__(self, response_text: str) -> None:
         self.response_text = response_text
 
-    def create(self, **_request_parameters: object) -> object:
+    async def create(self, **_request_parameters: object) -> object:
         return SimpleNamespace(
             choices=[
                 SimpleNamespace(
@@ -170,18 +171,20 @@ def test_active_manipulation_parser_accepts_published_and_compatible_shapes(
 
 
 def test_model_judgment_returns_hflow_measurements_for_the_replay_and_pipeline() -> None:
-    outcome = evaluate_image_with_model(
-        client=_FixtureOpenAICompatibleClient('{"hand_count": 2}'),
-        model="requested-vision-model",
-        task_definition=TaskDefinition(
-            task=EvaluationTask.HAND_COUNT,
-            prompt="Count hands.",
-            response_schema={"type": "object"},
-        ),
-        image_data_url="data:image/png;base64,fixture",
-        response_format=ResponseFormat.JSON_SCHEMA,
-        temperature=None,
-        max_tokens=32,
+    outcome = asyncio.run(
+        evaluate_image_with_model(
+            client=_FixtureOpenAICompatibleClient('{"hand_count": 2}'),
+            model="requested-vision-model",
+            task_definition=TaskDefinition(
+                task=EvaluationTask.HAND_COUNT,
+                prompt="Count hands.",
+                response_schema={"type": "object"},
+            ),
+            image_data_url="data:image/png;base64,fixture",
+            response_format=ResponseFormat.JSON_SCHEMA,
+            temperature=None,
+            max_tokens=32,
+        )
     )
 
     assert isinstance(outcome, ParsedVisionModelOutcome)
@@ -221,18 +224,20 @@ def test_model_judgment_returns_hflow_measurements_for_the_replay_and_pipeline()
 
 
 def test_unparsed_model_judgment_is_an_explicit_recoverable_outcome() -> None:
-    outcome = evaluate_image_with_model(
-        client=_FixtureOpenAICompatibleClient("unclear"),
-        model="requested-vision-model",
-        task_definition=TaskDefinition(
-            task=EvaluationTask.HAND_COUNT,
-            prompt="Count hands.",
-            response_schema={"type": "object"},
-        ),
-        image_data_url="data:image/png;base64,fixture",
-        response_format=ResponseFormat.JSON_SCHEMA,
-        temperature=None,
-        max_tokens=32,
+    outcome = asyncio.run(
+        evaluate_image_with_model(
+            client=_FixtureOpenAICompatibleClient("unclear"),
+            model="requested-vision-model",
+            task_definition=TaskDefinition(
+                task=EvaluationTask.HAND_COUNT,
+                prompt="Count hands.",
+                response_schema={"type": "object"},
+            ),
+            image_data_url="data:image/png;base64,fixture",
+            response_format=ResponseFormat.JSON_SCHEMA,
+            temperature=None,
+            max_tokens=32,
+        )
     )
 
     assert isinstance(outcome, UnparsedVisionModelOutcome)

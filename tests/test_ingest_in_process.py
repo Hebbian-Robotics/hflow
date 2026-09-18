@@ -5,6 +5,7 @@ than which branch the resolver took, so the executor can be restructured
 without rewriting these.
 """
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -81,7 +82,7 @@ def test_cli_and_app_process_share_one_bare_key_identity(
     capsys.readouterr()
 
     app = hflow.App("in-process", data_root=Path("data"), default_checks=())
-    direct_report = app.process(source_key, record=True, verbose=False)
+    direct_report = asyncio.run(app.process(source_key, record=True, verbose=False))
 
     connection = open_catalog_connection(project / "data" / "catalog")
     try:
@@ -161,10 +162,12 @@ def test_stages_run_in_graph_order_whatever_order_they_are_asked_for(project: Pa
     from hflow.stage_execution import run_stages_directly
 
     app = hflow.App("in-process", data_root=project / "data")
-    outcomes = run_stages_directly(
-        app,
-        ["episodes-in/episode_0001.mcap"],
-        {hflow.Stage.LABELS, hflow.Stage.META, hflow.Stage.SYNC},
+    outcomes = asyncio.run(
+        run_stages_directly(
+            app,
+            ["episodes-in/episode_0001.mcap"],
+            {hflow.Stage.LABELS, hflow.Stage.META, hflow.Stage.SYNC},
+        )
     )
 
     assert [outcome.stage for outcome in outcomes] == [

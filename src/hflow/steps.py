@@ -9,7 +9,7 @@ episode (a tag, never a deletion) and skips its downstream steps.
 """
 
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from fnmatch import fnmatchcase
@@ -206,7 +206,7 @@ class CheckResult:
     verdict: bool | None = None
 
 
-CheckFunction = Callable[["Episode"], CheckResult]
+CheckFunction = Callable[["Episode"], Awaitable[CheckResult]]
 
 
 class Comparison(StrEnum):

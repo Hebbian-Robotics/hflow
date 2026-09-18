@@ -1,6 +1,7 @@
 """The vertical slice, end to end: one episode in, measurements out, zero
 infrastructure. Mirrors the README design-target example."""
 
+import asyncio
 import logging
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -51,23 +52,23 @@ def report_and_app(
     app = hflow.App("kitchen-pipeline", data_root=tmp_path_factory.mktemp("e2e-data"))
 
     @app.check(version="1")
-    def joint_smoothness(ep: hflow.Episode) -> hflow.CheckResult:
+    async def joint_smoothness(ep: hflow.Episode) -> hflow.CheckResult:
         joints = ep.channel("/joint_states").to_numpy()
         result = check_joint_smoothness(joints, rate_hz=100)
         return hflow.CheckResult(measurements=dict(result))
 
     @app.check(version="1")
-    def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
-        return hflow.checks.timestamp_regularity(ep, tolerance_s=0.001)
+    async def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
+        return await hflow.checks.timestamp_regularity(ep, tolerance_s=0.001)
 
     @app.check(version="1")
-    def joint_jumps(ep: hflow.Episode) -> hflow.CheckResult:
-        return hflow.checks.joint_discontinuity(ep, velocity_limit=3.0)
+    async def joint_jumps(ep: hflow.Episode) -> hflow.CheckResult:
+        return await hflow.checks.joint_discontinuity(ep, velocity_limit=3.0)
 
     @app.check(version="1", critical=True)
-    def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
+    async def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
         camera_topic = next(topic for topic in ep.cameras if "wrist_cam" in topic)
-        camera_evidence = camera_frame_stats(ep, cameras=[camera_topic])
+        camera_evidence = await camera_frame_stats(ep, cameras=[camera_topic])
         black_frame_percent = camera_evidence.measurements[f"{camera_topic}/black_frame_pct"]
         assert isinstance(black_frame_percent, float)
         return hflow.CheckResult(
@@ -75,7 +76,7 @@ def report_and_app(
             verdict=black_frame_percent < 50.0,
         )
 
-    report = app.test(source_episode, verbose=False)
+    report = asyncio.run(app.test(source_episode, verbose=False))
     return report, app
 
 
@@ -141,17 +142,19 @@ def test_batch_runs_distinct_episodes_and_preserves_input_order(
     )
 
     @application.check(version="1")
-    def episode_task(episode: hflow.Episode) -> hflow.CheckResult:
+    async def episode_task(episode: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"episode/task": str(episode.metadata["task"])})
 
     requested_source_paths = (source_paths[2], source_paths[0], source_paths[1])
     progress_events: list[hflow.TestManyProgress] = []
     process_batch = application.process_many if worker_api else application.test_many
-    batch_report = process_batch(
-        requested_source_paths,
-        max_workers=2,
-        stages=(hflow.Stage.SYNC, hflow.Stage.META),
-        on_progress=progress_events.append,
+    batch_report = asyncio.run(
+        process_batch(
+            requested_source_paths,
+            max_workers=2,
+            stages=(hflow.Stage.SYNC, hflow.Stage.META),
+            on_progress=progress_events.append,
+        )
     )
     reports = batch_report.reports
 
@@ -187,7 +190,7 @@ def test_batch_refuses_duplicate_source_identities(tmp_path: Path, worker_api: b
     process_batch = application.process_many if worker_api else application.test_many
 
     with pytest.raises(ValueError, match="duplicate episode source identity"):
-        process_batch((source_path, source_path), max_workers=2)
+        asyncio.run(process_batch((source_path, source_path), max_workers=2))
 
 
 @pytest.mark.parametrize("invalid_max_workers", (0, -1, True))
@@ -201,7 +204,7 @@ def test_batch_refuses_invalid_concurrency_limits(
     process_batch = application.process_many if worker_api else application.test_many
 
     with pytest.raises(ValueError, match="max_workers must be a positive integer"):
-        process_batch((), max_workers=invalid_max_workers)
+        asyncio.run(process_batch((), max_workers=invalid_max_workers))
 
 
 @pytest.mark.parametrize("worker_api", (False, True), ids=("test_many", "process_many"))
@@ -222,10 +225,12 @@ def test_batch_stops_scheduling_new_episodes_after_preparation_failure(
     process_batch = application.process_many if worker_api else application.test_many
 
     with pytest.raises(FileNotFoundError):
-        process_batch(
-            (missing_source, first_valid_source, source_that_must_not_start),
-            max_workers=2,
-            stages=(hflow.Stage.SYNC,),
+        asyncio.run(
+            process_batch(
+                (missing_source, first_valid_source, source_that_must_not_start),
+                max_workers=2,
+                stages=(hflow.Stage.SYNC,),
+            )
         )
 
     output_root = (
@@ -254,11 +259,13 @@ def test_batch_stops_scheduling_new_episodes_after_progress_failure(
         raise RuntimeError("progress consumer failed")
 
     with pytest.raises(RuntimeError, match="progress consumer failed"):
-        process_batch(
-            source_paths,
-            max_workers=2,
-            stages=(hflow.Stage.SYNC,),
-            on_progress=reject_first_progress,
+        asyncio.run(
+            process_batch(
+                source_paths,
+                max_workers=2,
+                stages=(hflow.Stage.SYNC,),
+                on_progress=reject_first_progress,
+            )
         )
 
     output_root = (
@@ -287,23 +294,25 @@ def test_stateless_batch_retains_error_reports_and_uses_caller_owned_workspace(
         application = hflow.App("stateless-worker", data_root=workspace, default_checks=())
 
         @application.check(version="1")
-        def episode_task(episode: hflow.Episode) -> hflow.CheckResult:
+        async def episode_task(episode: hflow.Episode) -> hflow.CheckResult:
             task_name = str(episode.metadata["task"])
             if task_name == "unavailable":
                 raise RuntimeError("measurement unavailable")
             return hflow.CheckResult(measurements={"episode/task": task_name})
 
         @application.check(version="1")
-        def unrelated_measurement(episode: hflow.Episode) -> hflow.CheckResult:
+        async def unrelated_measurement(episode: hflow.Episode) -> hflow.CheckResult:
             return hflow.CheckResult(measurements={"unrelated": True})
 
-        batch_report = application.process_many(
-            source_paths,
-            output_dir=output_root,
-            max_workers=2,
-            record=False,
-            stages=(stage for stage in (hflow.Stage.SYNC, hflow.Stage.META)),
-            step_names=(step_name for step_name in ("episode_task",)),
+        batch_report = asyncio.run(
+            application.process_many(
+                source_paths,
+                output_dir=output_root,
+                max_workers=2,
+                record=False,
+                stages=(stage for stage in (hflow.Stage.SYNC, hflow.Stage.META)),
+                step_names=(step_name for step_name in ("episode_task",)),
+            )
         )
 
         assert batch_report.has_errors
@@ -331,10 +340,12 @@ def test_process_many_records_orchestrator_provenance_by_default(
     state_only_source_episode: Path, tmp_path: Path
 ) -> None:
     application = hflow.App("batch-worker", data_root=tmp_path / "data", default_checks=())
-    batch_report = application.process_many(
-        (state_only_source_episode,),
-        stages=(hflow.Stage.SYNC, hflow.Stage.META),
-        orchestrator_run_id="worker-run-17",
+    batch_report = asyncio.run(
+        application.process_many(
+            (state_only_source_episode,),
+            stages=(hflow.Stage.SYNC, hflow.Stage.META),
+            orchestrator_run_id="worker-run-17",
+        )
     )
 
     assert batch_report.reports[0].catalog_entry is not None
@@ -351,10 +362,12 @@ def test_process_many_rejects_unknown_steps_before_source_io(tmp_path: Path) -> 
     application = hflow.App("batch-worker", data_root=tmp_path / "data", default_checks=())
 
     with pytest.raises(ValueError, match=r"unknown step names.*not_registered"):
-        application.process_many(
-            (tmp_path / "missing.mcap",),
-            output_dir=tmp_path / "batch",
-            step_names=("not_registered",),
+        asyncio.run(
+            application.process_many(
+                (tmp_path / "missing.mcap",),
+                output_dir=tmp_path / "batch",
+                step_names=("not_registered",),
+            )
         )
 
     assert not (tmp_path / "batch").exists()
@@ -564,9 +577,9 @@ def test_failed_critical_verdict_quarantines_and_skips_downstream(
     app = hflow.App("strict-pipeline", data_root=tmp_path)
 
     @app.check(version="1", critical=True)
-    def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
+    async def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
         camera_topic = next(topic for topic in ep.cameras if "wrist_cam" in topic)
-        camera_evidence = camera_frame_stats(ep, cameras=[camera_topic])
+        camera_evidence = await camera_frame_stats(ep, cameras=[camera_topic])
         black_frame_percent = camera_evidence.measurements[f"{camera_topic}/black_frame_pct"]
         assert isinstance(black_frame_percent, float)
         return hflow.CheckResult(
@@ -575,10 +588,10 @@ def test_failed_critical_verdict_quarantines_and_skips_downstream(
         )
 
     @app.check(version="1")
-    def never_reached(ep: hflow.Episode) -> hflow.CheckResult:
+    async def never_reached(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"ran": True})
 
-    report = app.test(source_episode, verbose=False)
+    report = asyncio.run(app.test(source_episode, verbose=False))
     assert report.quarantined
     assert report.quarantine_tags == ["quarantined:camera_blackout"]
     by_name = {run.check.name: run for run in report.checks}
@@ -597,15 +610,17 @@ def test_crashing_check_is_infrastructure_not_data(
     app = hflow.App("crashy-pipeline", data_root=tmp_path)
 
     @app.check(version="1", critical=True)
-    def exploding(ep: hflow.Episode) -> hflow.CheckResult:
+    async def exploding(ep: hflow.Episode) -> hflow.CheckResult:
         raise RuntimeError("boom")
 
     @app.check(version="1")
-    def still_runs(ep: hflow.Episode) -> hflow.CheckResult:
+    async def still_runs(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"ran": True})
 
     report = (
-        app.test(state_only_source_episode) if dev_loop else app.process(state_only_source_episode)
+        asyncio.run(app.test(state_only_source_episode))
+        if dev_loop
+        else asyncio.run(app.process(state_only_source_episode))
     )
     assert report.has_errors
     assert not report.quarantined
@@ -630,16 +645,16 @@ def test_resource_declaring_checks_run_after_plain_ones(
     execution_order: list[str] = []
 
     @app.check(version="1", requires=("vision-model",))
-    def expensive(ep: hflow.Episode) -> hflow.CheckResult:
+    async def expensive(ep: hflow.Episode) -> hflow.CheckResult:
         execution_order.append("expensive")
         return hflow.CheckResult()
 
     @app.check(version="1")
-    def cheap(ep: hflow.Episode) -> hflow.CheckResult:
+    async def cheap(ep: hflow.Episode) -> hflow.CheckResult:
         execution_order.append("cheap")
         return hflow.CheckResult()
 
-    app.test(state_only_source_episode, verbose=False)
+    asyncio.run(app.test(state_only_source_episode, verbose=False))
     assert execution_order == ["cheap", "expensive"]
 
 
@@ -652,8 +667,8 @@ def test_check_claiming_an_episode_column_refuses_the_append(
     app = hflow.App("reserved-key", data_root=tmp_path / "data")
 
     @app.check(version="1")
-    def claims_task(ep: hflow.Episode) -> hflow.CheckResult:
+    async def claims_task(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"task": 99.0})
 
     with pytest.raises(ValueError, match=r"'claims_task'.*shadows 'task'"):
-        app.test(state_only_source_episode, verbose=False, record=True)
+        asyncio.run(app.test(state_only_source_episode, verbose=False, record=True))

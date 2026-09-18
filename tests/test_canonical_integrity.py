@@ -7,6 +7,7 @@ refuses. The guard refuses the episode once, with a named reason, before any
 check runs, and memoizes the verdict so one run pays for one strict read.
 """
 
+import asyncio
 import io
 from pathlib import Path
 
@@ -33,7 +34,7 @@ def _app_with_probe_check(
     caption_runs: list[int] = []
 
     @app.check(version="1")
-    def probe(ep: hflow.Episode) -> hflow.CheckResult:
+    async def probe(ep: hflow.Episode) -> hflow.CheckResult:
         probe_runs.append(1)
         return hflow.CheckResult(measurements={"probe": 1})
 
@@ -61,14 +62,14 @@ def test_a_decayed_canonical_is_refused_once_with_a_named_reason(tmp_path: Path)
     app, probe_runs, caption_runs = _app_with_probe_check(data_root)
     source = synthesize_episode(tmp_path / "episode.mcap", SPEC)
 
-    healthy = app.process(source, stages="full")
+    healthy = asyncio.run(app.process(source, stages="full"))
     assert healthy.refusal_reason is None
     probe_runs_after_healthy = len(probe_runs)
     caption_runs_after_healthy = len(caption_runs)
 
     _corrupt_first_chunk_crc(healthy.canonical_path)
 
-    refused = app.process(source, stages="metadata_backfill")
+    refused = asyncio.run(app.process(source, stages="metadata_backfill"))
     assert refused.refusal_reason == CANONICAL_CRC_MISMATCH_REASON
     # ONE diagnosis: the refusal lives on the report field and on one
     # framework-owned catalog row; report.checks is empty because no check
@@ -80,14 +81,14 @@ def test_a_decayed_canonical_is_refused_once_with_a_named_reason(tmp_path: Path)
 
     # The refusal covers every consuming lane. The relabel lane declines to
     # spend enrichments on the damaged bytes ...
-    relabel_refused = app.process(source, stages="relabel")
+    relabel_refused = asyncio.run(app.process(source, stages="relabel"))
     assert relabel_refused.refusal_reason == CANONICAL_CRC_MISMATCH_REASON
     assert relabel_refused.enrichments == []
     assert len(caption_runs) == caption_runs_after_healthy
 
     # ... and the production meta task (the generated DAG's own batch entry,
     # the lane an online re-check flows through) refuses with it.
-    recheck_counts = process_stage_batch(app, [str(source)], "meta")
+    recheck_counts = asyncio.run(process_stage_batch(app, [str(source)], "meta"))
     assert recheck_counts == {"processed": 0, "quarantined": 0, "errors": 1}
 
     # The reason is a queryable value, not just a log string: one refusal row
@@ -111,7 +112,7 @@ def test_a_healthy_canonical_runs_clean(tmp_path: Path) -> None:
     app, probe_runs, _caption_runs = _app_with_probe_check(data_root)
     source = synthesize_episode(tmp_path / "episode.mcap", SPEC)
 
-    report = app.process(source, stages="full")
+    report = asyncio.run(app.process(source, stages="full"))
     assert report.refusal_reason is None
     assert [run.status for run in report.checks] == [hflow.CheckStatus.MEASURED]
     assert not report.has_errors
@@ -142,7 +143,7 @@ def test_one_corrupt_episode_is_strict_read_once_per_run(
     app, _probe_runs, _caption_runs = _app_with_probe_check(data_root)
     source = synthesize_episode(tmp_path / "episode.mcap", SPEC)
 
-    synced = app.process(source, stages={hflow.Stage.SYNC}, record=False)
+    synced = asyncio.run(app.process(source, stages={hflow.Stage.SYNC}, record=False))
     _corrupt_first_chunk_crc(synced.canonical_path)
 
     strict_reads: list[Path] = []
@@ -154,8 +155,8 @@ def test_one_corrupt_episode_is_strict_read_once_per_run(
 
     monkeypatch.setattr(hflow.app, "verify_canonical_integrity", counting_verify)
 
-    first = app.process(source, stages="metadata_backfill")
-    second = app.process(source, stages="metadata_backfill")
+    first = asyncio.run(app.process(source, stages="metadata_backfill"))
+    second = asyncio.run(app.process(source, stages="metadata_backfill"))
 
     assert len(strict_reads) == 1
     assert first.refusal_reason == second.refusal_reason == CANONICAL_CRC_MISMATCH_REASON
@@ -194,8 +195,8 @@ def test_a_run_with_no_step_work_pays_no_strict_read(
     # Sync owns the canonical and just wrote it; a relabel with no
     # enrichments registered and a meta with no checks registered have no
     # step work to protect.
-    app.process(source, stages={hflow.Stage.SYNC}, record=False)
-    app.process(source, stages="relabel", record=False)
-    app.process(source, stages="metadata_backfill", record=False)
+    asyncio.run(app.process(source, stages={hflow.Stage.SYNC}, record=False))
+    asyncio.run(app.process(source, stages="relabel", record=False))
+    asyncio.run(app.process(source, stages="metadata_backfill", record=False))
 
     assert strict_reads == []

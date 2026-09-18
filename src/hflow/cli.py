@@ -22,6 +22,7 @@ environment credentials) -- the same commands drive a hosted workspace.
 """
 
 import argparse
+import asyncio
 import errno
 import logging
 import os
@@ -1298,12 +1299,14 @@ def _ingest_in_process(arguments: argparse.Namespace) -> int:
         file=sys.stderr,
     )
     try:
-        outcomes = run_stages_directly(
-            app,
-            list(arguments.uris),
-            stages,
-            selection=selection,
-            step_names=arguments.step_names,
+        outcomes = asyncio.run(
+            run_stages_directly(
+                app,
+                list(arguments.uris),
+                stages,
+                selection=selection,
+                step_names=arguments.step_names,
+            )
         )
     except RuntimeError as error:
         # The mass-failure gates, verbatim: the same budgets a scheduled run

@@ -116,7 +116,7 @@ class TestPipelineManifest:
         )
 
         @app.check(version="1", critical=True)
-        def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
+        async def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
             return hflow.CheckResult()
 
         @app.enrich(version="1", requires=("gpu",))
@@ -159,11 +159,11 @@ class TestPipelineManifest:
         app = hflow.App("kitchen", data_root=tmp_path, default_checks=())
 
         @app.check(version="1", critical=True, gate=hflow.checks.RECOMMENDED_CAMERA_INTEGRITY)
-        def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
+        async def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
             return hflow.CheckResult()
 
         @app.check(version="1")
-        def ungated(ep: hflow.Episode) -> hflow.CheckResult:
+        async def ungated(ep: hflow.Episode) -> hflow.CheckResult:
             return hflow.CheckResult()
 
         payload = json.loads(app.manifest().to_json())

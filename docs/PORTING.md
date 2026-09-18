@@ -4,6 +4,35 @@ You already have a script that checks joint limits, or flags dark frames, or ask
 
 The accessor surface exists because robotics QC scripts consume a small set of input dialects: numpy arrays, an MP4 path, JPEG frames, a metadata dict. Each section below is one dialect: your original function first, then the wrapper.
 
+## Migrating synchronous pipelines
+
+Check callbacks and the built-in checks are async-only. Define checks with
+`async def` and await any check you call. `App.process`, `process_many`, `test`,
+`test_many`, `process_stage_batch`, and `run_stages_directly` must also be awaited.
+The `CheckResult` and report data models stay the same.
+
+Use `asyncio.run(app.test("episode.mcap"))` at a synchronous script entry point.
+Inside an existing event loop, use `await app.test("episode.mcap")` instead.
+Transforms, enrichments, derived-channel hooks, and progress callbacks retain
+synchronous signatures; HFlow runs blocking pipeline phases off the event loop.
+Progress callbacks run on the caller's loop and should be brief.
+
+For an existing blocking check, keep its implementation and adapt it explicitly:
+
+```python
+from hflow.asyncio_utils import run_blocking
+
+
+@app.check(version="1")
+async def measure_episode(episode: hflow.Episode) -> hflow.CheckResult:
+    return await run_blocking(existing_blocking_check, episode)
+```
+
+`run_blocking` waits for started thread work before propagating cancellation,
+so episode files remain alive while that work uses them. Use it for blocking
+media decoding and file work. Use native async clients for HTTP/model requests
+so cancellation and `asyncio.timeout(...)` can interrupt waiting for I/O.
+
 ## The model: evidence, not verdicts
 
 A check returns `hflow.CheckResult`: **measurements** (episode summaries), **observations** (timestamped repeated evidence), **intervals** (labeled time spans), and **tags**. Every field is recorded regardless of pass or fail. Thresholds are not baked into the corpus, because quality heuristics are known to *invert* on real defects (smoothness metrics have scored an early-gripper-release defect *better* than clean demos); stored evidence lets you re-decide with a query, while a stored verdict bakes in the wrong call.
@@ -20,15 +49,15 @@ app = hflow.App("my-pipeline")
 
 
 @app.check(version="1")
-def my_check(ep: hflow.Episode) -> hflow.CheckResult:
-    inputs = ep.<accessor>(...)          # our line: extract the dialect
-    result = your_function(inputs, ...)  # your line: unchanged
+async def my_check(ep: hflow.Episode) -> hflow.CheckResult:
+    inputs = await run_blocking(ep.<accessor>, ...)          # our line: extract the dialect
+    result = await run_blocking(your_function, inputs, ...)  # your line: unchanged
     return hflow.CheckResult(measurements=result)  # our line: record
 ```
 
 `@app.check(version="1")` takes a required `version=` plus `name=` (defaults to the function name), `critical=`, `requires={...}` (capability set, e.g. `{"gpu"}`), and `gate=` (a declarative accept policy the runner evaluates over what the check returned). The version is your compatibility promise: keep it when a refactor preserves the meaning of the results, and bump it when code, configuration, a gate, or a dependency changes that meaning. HFlow stores the value exactly as declared and never inspects the function to derive another identity. Checks that declare no resources run before checks that do, so cheap integrity checks gate expensive model calls. Today `requires` records intent and orders steps; it does **not** route the step to a particular worker or GPU pool (per-step compute routing is [deferred](./ARCHITECTURE.md#implementation-status)); a bring-your-own Airflow deployment arranges those resources itself.
 
-Every step is called with exactly one argument, an `Episode`, so `@app.check(version="1")`, `@app.enrich(version="1")`, and `@app.derive("/topic", version="1")` refuse a function the runtime could never call: one with a required parameter beyond the episode, or with no positional slot to receive it. That refusal happens at registration, not once per episode, and the error shows the wrapper form to use instead. To pass configuration, bind it in a wrapper (`return action_rate(ep, topics=[...])`) rather than adding a parameter.
+Every step is called with exactly one argument, an `Episode`, so `@app.check(version="1")`, `@app.enrich(version="1")`, and `@app.derive("/topic", version="1")` refuse a function the runtime could never call: one with a required parameter beyond the episode, or with no positional slot to receive it. That refusal happens at registration, not once per episode, and the error shows the wrapper form to use instead. To pass configuration, bind it in a wrapper (`return await action_rate(ep, topics=[...])`) rather than adding a parameter.
 
 ## Dialect 1: numpy arrays
 
@@ -45,9 +74,10 @@ The wrapper:
 
 ```python
 @app.check(version="1")
-def joint_smoothness(ep: hflow.Episode) -> hflow.CheckResult:
-    joints = ep.channel("/joint_states").to_numpy()
-    result = check_joint_smoothness(joints, rate_hz=100)
+async def joint_smoothness(ep: hflow.Episode) -> hflow.CheckResult:
+    channel = await run_blocking(ep.channel, "/joint_states")
+    joints = await run_blocking(channel.to_numpy)
+    result = await run_blocking(check_joint_smoothness, joints, rate_hz=100)
     return hflow.CheckResult(measurements=result)
 ```
 
@@ -77,9 +107,9 @@ The wrapper:
 
 ```python
 @app.check(version="1")
-def sharpness(ep: hflow.Episode) -> hflow.CheckResult:
-    mp4 = ep.video("wrist_cam")  # lossless remux of the in-band H.264, cached
-    return hflow.CheckResult(measurements=measure_sharpness(str(mp4)))
+async def sharpness(ep: hflow.Episode) -> hflow.CheckResult:
+    mp4 = await run_blocking(ep.video, "wrist_cam")  # lossless remux of the in-band H.264, cached
+    return hflow.CheckResult(measurements=await run_blocking(measure_sharpness, str(mp4)))
 ```
 
 `ep.video()` remuxes the camera's in-band H.264 into a plain MP4 with **no re-encode**: the pixels your check measures are the pixels in the episode. Camera names resolve by full topic or unique substring: `"wrist_cam"` finds `/wrist_cam/compressed`; with a single camera you can omit the argument.
@@ -145,29 +175,30 @@ model_base_url = os.environ.get("MODEL_BASE_URL", "http://localhost:8000/v1")
 
 
 @app.check(version="1", requires=("vision-model",))
-def gripper_reached_target(ep: hflow.Episode) -> hflow.CheckResult:
-    from openai import OpenAI  # your client, your dependency
+async def gripper_reached_target(ep: hflow.Episode) -> hflow.CheckResult:
+    from openai import AsyncOpenAI  # your client, your dependency
 
-    client = OpenAI(base_url=model_base_url, api_key="not-needed-locally")
     answers: list[bool] = []
-    for frame in ep.frames("wrist_cam", fps=0.5):  # you declare the rate
-        image_b64 = base64.b64encode(frame.path.read_bytes()).decode()
-        response = client.chat.completions.create(
-            model="Qwen/Qwen2.5-VL-7B-Instruct",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Is the gripper touching the towel? yes/no"},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
-                        },
-                    ],
-                }
-            ],
-        )
-        answers.append("yes" in response.choices[0].message.content.lower())
+    sampled_frames = await run_blocking(ep.frames, "wrist_cam", fps=0.5)
+    async with AsyncOpenAI(base_url=model_base_url, api_key="not-needed-locally") as client:
+        for frame in sampled_frames:  # you declare the rate
+            image_b64 = base64.b64encode(await run_blocking(frame.path.read_bytes)).decode()
+            response = await client.chat.completions.create(
+                model="Qwen/Qwen2.5-VL-7B-Instruct",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Is the gripper touching the towel? yes/no"},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+                            },
+                        ],
+                    }
+                ],
+            )
+            answers.append("yes" in response.choices[0].message.content.lower())
 
     reached_fraction = sum(answers) / len(answers)  # aggregation is yours
     return hflow.CheckResult(measurements={"gripper_reached_fraction": reached_fraction})
@@ -219,7 +250,7 @@ The wrapper:
 
 ```python
 @app.check(version="1")
-def labels(ep: hflow.Episode) -> hflow.CheckResult:
+async def labels(ep: hflow.Episode) -> hflow.CheckResult:
     return hflow.CheckResult(measurements=validate_labels(ep.metadata))
 ```
 
@@ -235,7 +266,7 @@ from mcap.reader import make_reader
 
 
 @app.check(version="1")
-def my_raw_check(ep: hflow.Episode) -> hflow.CheckResult:
+async def my_raw_check(ep: hflow.Episode) -> hflow.CheckResult:
     with ep.path.open("rb") as stream:
         reader = make_reader(stream)
         ...  # your existing reader code, untouched
@@ -279,7 +310,7 @@ model_contract = {
     version=hflow.step_version_from_contract("scene-judge-v1", model_contract),
     requires=("vision-model",),
 )
-def scene_judge(episode: hflow.Episode) -> hflow.CheckResult: ...
+async def scene_judge(episode: hflow.Episode) -> hflow.CheckResult: ...
 ```
 
 `hflow.fingerprint_contract()` exposes the corresponding full canonical
@@ -291,7 +322,7 @@ objects.
 ## The dev loop
 
 ```python
-report = app.test("episode_0001.mcap")
+report = await app.test("episode_0001.mcap")
 ```
 
 `app.test()` runs the whole registered pipeline on one episode **in-process**, with no Docker and no scheduler. It transforms the input into a canonical episode under `<data_root>/test-runs/`, runs every check with the ordering and gate semantics described above, prints a summary, and returns the full `TestReport` (per-check status, measurements, durations, quarantine tags). Iterate on a check in seconds; the canonical file it writes opens directly in Foxglove or Rerun for eyeballing.
@@ -301,14 +332,14 @@ HFlow guarantees registered step names are unique; requesting a name that is
 not present raises `KeyError` and lists the available checks.
 
 For a bounded local corpus experiment, use the same loop without rebuilding
-thread-pool plumbing in every pipeline:
+concurrency plumbing in every pipeline:
 
 ```python
 def print_progress(progress: hflow.TestManyProgress) -> None:
     print(f"[{progress.completed_count}/{progress.total_count}] {progress.report.source_path.name}")
 
 
-batch_report = app.test_many(
+batch_report = await app.test_many(
     ["episode_0001.mcap", "episode_0002.mcap"],
     max_workers=4,
     stages=(hflow.Stage.SYNC, hflow.Stage.META),
@@ -319,12 +350,12 @@ reports = batch_report.reports
 
 `app.test_many()` returns a `TestManyReport` whose `reports` tuple preserves
 input order and keeps at most `max_workers` episodes submitted at once. The
-optional progress callback runs on the coordinator thread as episodes finish;
+optional progress callback runs on the caller's event loop as episodes finish;
 each event carries its original input index because completion order may differ
 from report order. Sources must be distinct because each source owns one
 test-run directory. A source-preparation or progress-callback failure stops new
-submissions and is raised after already-running episodes finish, so no worker
-keeps writing after control returns to the caller. This remains an in-process
+submissions, cancels active checks, and drains started blocking work before
+raising. No worker keeps writing after control returns to the caller. This remains an in-process
 development convenience. Use [`app.process_many()`](./how-to/run-embedded-workers.md)
 for an embedded production worker, or `app.run()` / a deployed runtime when the
 corpus needs durable scheduling and retries.
@@ -340,7 +371,7 @@ import hflow
 from my_pipeline import camera_blackout
 
 with hflow.Episode("episode_0001.canonical.mcap") as episode:
-    result = camera_blackout(episode)
+    result = await camera_blackout(episode)
 
 print(result.measurements)
 print(result.intervals)

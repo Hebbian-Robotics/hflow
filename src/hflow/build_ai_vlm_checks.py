@@ -28,15 +28,16 @@ https://huggingface.co/datasets/builddotai/Egocentric-100K-Evaluation
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import importlib
 import json
 import math
 import os
 import re
-import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -46,8 +47,8 @@ from urllib.parse import urlsplit
 import httpx2
 from pydantic import ValidationError
 from tenacity import (
+    AsyncRetrying,
     RetryCallState,
-    Retrying,
     retry_if_exception,
     stop_after_attempt,
     stop_before_delay,
@@ -73,6 +74,7 @@ from hflow._vlm_boundary import (
     require_bounded_response,
     strict_response_json,
 )
+from hflow.asyncio_utils import run_blocking
 from hflow.episode import Episode
 from hflow.fingerprints import step_version_from_contract
 from hflow.steps import (
@@ -718,7 +720,7 @@ def sampled_model_output_check_result(
     )
 
 
-def evaluate_image_with_model(
+async def evaluate_image_with_model(
     *,
     client: Any,
     model: str,
@@ -748,7 +750,7 @@ def evaluate_image_with_model(
     if temperature is not None:
         request_parameters["temperature"] = temperature
 
-    response = client.chat.completions.create(**request_parameters)
+    response = await client.chat.completions.create(**request_parameters)
     raw_response = ""
     response_metadata = _response_metadata(response)
     try:
@@ -800,9 +802,9 @@ def _hosted_observation_upload(image_bytes: bytes) -> tuple[str, bytes, str]:
     return filename, image_bytes, image_mime_type
 
 
-def _read_bounded_hosted_response(response: httpx2.Response, *, deadline: float) -> bytes:
+async def _read_bounded_hosted_response(response: httpx2.Response, *, deadline: float) -> bytes:
     response_body = bytearray()
-    for response_chunk in response.iter_bytes():
+    async for response_chunk in response.aiter_bytes():
         _remaining_hosted_seconds(deadline)
         if len(response_body) + len(response_chunk) > _MAX_HFLOW_HOSTED_RESPONSE_BYTES:
             raise RuntimeError("HFlow hosted check response exceeds the 64 KiB limit")
@@ -840,11 +842,12 @@ def _parse_hosted_check_response(
     )
 
 
-def _evaluate_image_with_hflow_hosted_service(
+async def _evaluate_image_with_hflow_hosted_service(
     *,
     execution: HFlowHostedExecution,
     task: EvaluationTask,
     image_bytes: bytes,
+    client: httpx2.AsyncClient | None = None,
 ) -> VisionModelOutcome:
     if len(image_bytes) > _MAX_HFLOW_HOSTED_IMAGE_BYTES:
         raise ValueError("HFlow hosted check observation exceeds the 10 MiB image limit")
@@ -852,32 +855,38 @@ def _evaluate_image_with_hflow_hosted_service(
     deadline = time.monotonic() + execution.total_timeout_seconds
     response_bytes: bytes | None = None
     try:
-        for attempt in Retrying(
-            retry=retry_if_exception(_retryable_hosted_failure),
-            wait=_hosted_retry_wait,
-            stop=(
-                stop_after_attempt(execution.max_retries + 1)
-                | stop_before_delay(execution.total_timeout_seconds)
-            ),
-            sleep=time.sleep,
-            reraise=True,
-        ):
-            with attempt:
-                remaining_seconds = _remaining_hosted_seconds(deadline)
-                with httpx2.stream(
-                    "POST",
-                    endpoint,
-                    headers={
-                        "Accept": "application/json",
-                        "User-Agent": _HFLOW_HOSTED_USER_AGENT,
-                    },
-                    files={"observation": _hosted_observation_upload(image_bytes)},
-                    timeout=min(execution.request_timeout_seconds, remaining_seconds),
-                    # Image-bearing requests must never redirect to another origin.
-                    follow_redirects=False,
-                ) as response:
-                    response.raise_for_status()
-                    response_bytes = _read_bounded_hosted_response(response, deadline=deadline)
+        async with asyncio.timeout(execution.total_timeout_seconds), AsyncExitStack() as resources:
+            if client is None:
+                client = await resources.enter_async_context(httpx2.AsyncClient())
+            async for attempt in AsyncRetrying(
+                retry=retry_if_exception(_retryable_hosted_failure),
+                wait=_hosted_retry_wait,
+                stop=(
+                    stop_after_attempt(execution.max_retries + 1)
+                    | stop_before_delay(execution.total_timeout_seconds)
+                ),
+                reraise=True,
+            ):
+                with attempt:
+                    remaining_seconds = _remaining_hosted_seconds(deadline)
+                    async with client.stream(
+                        "POST",
+                        endpoint,
+                        headers={
+                            "Accept": "application/json",
+                            "User-Agent": _HFLOW_HOSTED_USER_AGENT,
+                        },
+                        files={"observation": _hosted_observation_upload(image_bytes)},
+                        timeout=min(execution.request_timeout_seconds, remaining_seconds),
+                        # Image-bearing requests must never redirect to another origin.
+                        follow_redirects=False,
+                    ) as response:
+                        response.raise_for_status()
+                        response_bytes = await _read_bounded_hosted_response(
+                            response, deadline=deadline
+                        )
+    except TimeoutError:
+        raise RuntimeError("HFlow hosted check exceeded its total timeout") from None
     except httpx2.HTTPStatusError as error:
         raise RuntimeError(
             f"HFlow hosted check request failed with HTTP {error.response.status_code}"
@@ -980,8 +989,6 @@ def _register_build_ai_check(
     *,
     configuration: _RegisteredBuildAICheckConfiguration,
 ) -> CheckFunction:
-    client_for_thread = threading.local()
-
     def model_client(execution: OpenAICompatibleExecution) -> Any:
         api_key = None
         if execution.api_key_environment_variable is not None:
@@ -991,61 +998,41 @@ def _register_build_ai_check(
                     f"{execution.api_key_environment_variable} is required by "
                     f"{_check_name_for_task(configuration.task_definition.task)}"
                 )
-        cache_key = (execution.endpoint, api_key, execution.max_retries)
-        if getattr(client_for_thread, "cache_key", None) != cache_key:
-            try:
-                openai_module = importlib.import_module("openai")
-            except ModuleNotFoundError as error:
-                raise RuntimeError(
-                    "the Build AI checks require the optional OpenAI-compatible client; "
-                    "install hflow with `uv add 'hflow[openai]'`"
-                ) from error
-            client_for_thread.client = openai_module.OpenAI(
-                api_key=api_key or "not-needed",
-                base_url=execution.endpoint,
-                max_retries=execution.max_retries,
-            )
-            client_for_thread.cache_key = cache_key
-        return client_for_thread.client
+        try:
+            openai_module = importlib.import_module("openai")
+        except ModuleNotFoundError as error:
+            raise RuntimeError(
+                "the Build AI checks require the optional OpenAI-compatible client; "
+                "install hflow with `uv add 'hflow[openai]'`"
+            ) from error
+        return openai_module.AsyncOpenAI(
+            api_key=api_key or "not-needed",
+            base_url=execution.endpoint,
+            max_retries=execution.max_retries,
+        )
 
-    def evaluate_frame(image_bytes: bytes) -> tuple[VisionModelOutcome, str]:
-        match configuration.execution:
-            case OpenAICompatibleExecution() as execution:
-                outcome = evaluate_image_with_model(
-                    client=model_client(execution),
-                    model=execution.model,
-                    task_definition=configuration.task_definition,
-                    image_data_url=image_bytes_data_url(image_bytes),
-                    response_format=execution.response_format,
-                    temperature=execution.temperature,
-                    max_tokens=execution.max_tokens,
-                )
-                return outcome, execution.model
-            case HFlowHostedExecution() as execution:
-                outcome = _evaluate_image_with_hflow_hosted_service(
-                    execution=execution,
-                    task=configuration.task_definition.task,
-                    image_bytes=image_bytes,
-                )
-                return outcome, _hosted_execution_label(
-                    execution, configuration.task_definition.task
-                )
-            case unexpected_execution:
-                assert_never(unexpected_execution)
-
-    def evaluate_build_ai_check(episode: Episode) -> CheckResult:
+    async def evaluate_episode(
+        episode: Episode,
+        evaluate_frame: Callable[[bytes], Awaitable[tuple[VisionModelOutcome, str]]],
+    ) -> CheckResult:
         sampling = configuration.sampling
         if sampling is not None:
             camera_topic = episode.resolve_camera(configuration.camera)
-            sampled_frames = episode.frames(
-                camera_topic, fps=sampling.fps, start_s=sampling.start_s, end_s=sampling.end_s
+            sampled_frames = await run_blocking(
+                episode.frames,
+                camera_topic,
+                fps=sampling.fps,
+                start_s=sampling.start_s,
+                end_s=sampling.end_s,
             )
             if not sampled_frames:
                 raise ValueError(
                     f"episode has no frames in the sampling window for camera {camera_topic!r}"
                 )
             black_spans_ns = (
-                _black_frame_spans_ns(episode, camera_topic) if sampling.skip_black_frames else ()
+                await run_blocking(_black_frame_spans_ns, episode, camera_topic)
+                if sampling.skip_black_frames
+                else ()
             )
             # One request at a time: the hosted quota admits a single request
             # per client, and a sequential loop keeps the observation order
@@ -1055,7 +1042,9 @@ def _register_build_ai_check(
                 if any(start <= frame.log_time_ns < end for start, end in black_spans_ns):
                     frame_outcomes.append((frame.log_time_ns, SkippedBlackFrame(), None))
                     continue
-                outcome, requested_model = evaluate_frame(frame.path.read_bytes())
+                outcome, requested_model = await evaluate_frame(
+                    await run_blocking(frame.path.read_bytes)
+                )
                 frame_outcomes.append((frame.log_time_ns, outcome, requested_model))
             return sampled_model_output_check_result(
                 task=configuration.task_definition.task,
@@ -1064,7 +1053,8 @@ def _register_build_ai_check(
                 frame_outcomes=frame_outcomes,
             )
 
-        extracted_frames = episode.frames(
+        extracted_frames = await run_blocking(
+            episode.frames,
             configuration.camera,
             fps=1.0,
             start_s=configuration.frame_time_seconds,
@@ -1076,7 +1066,9 @@ def _register_build_ai_check(
                 f"camera {configuration.camera!r}"
             )
         selected_frame = extracted_frames[0]
-        outcome, requested_model = evaluate_frame(selected_frame.path.read_bytes())
+        outcome, requested_model = await evaluate_frame(
+            await run_blocking(selected_frame.path.read_bytes)
+        )
         return model_output_check_result(
             task=configuration.task_definition.task,
             requested_model=requested_model,
@@ -1084,6 +1076,50 @@ def _register_build_ai_check(
             observation_id=f"frame:{selected_frame.log_time_ns}",
             timestamp_ns=selected_frame.log_time_ns,
         )
+
+    async def evaluate_build_ai_check(episode: Episode) -> CheckResult:
+        # Clients belong to this invocation's event loop. Lazy creation keeps
+        # all-black samples independent of credentials and model dependencies.
+        compatible_client: Any = None
+        hosted_client: httpx2.AsyncClient | None = None
+        async with AsyncExitStack() as resources:
+
+            async def evaluate_frame(image_bytes: bytes) -> tuple[VisionModelOutcome, str]:
+                nonlocal compatible_client, hosted_client
+                match configuration.execution:
+                    case OpenAICompatibleExecution() as execution:
+                        if compatible_client is None:
+                            compatible_client = await resources.enter_async_context(
+                                model_client(execution)
+                            )
+                        outcome = await evaluate_image_with_model(
+                            client=compatible_client,
+                            model=execution.model,
+                            task_definition=configuration.task_definition,
+                            image_data_url=image_bytes_data_url(image_bytes),
+                            response_format=execution.response_format,
+                            temperature=execution.temperature,
+                            max_tokens=execution.max_tokens,
+                        )
+                        return outcome, execution.model
+                    case HFlowHostedExecution() as execution:
+                        if hosted_client is None:
+                            hosted_client = await resources.enter_async_context(
+                                httpx2.AsyncClient()
+                            )
+                        outcome = await _evaluate_image_with_hflow_hosted_service(
+                            execution=execution,
+                            task=configuration.task_definition.task,
+                            image_bytes=image_bytes,
+                            client=hosted_client,
+                        )
+                        return outcome, _hosted_execution_label(
+                            execution, configuration.task_definition.task
+                        )
+                    case unexpected_execution:
+                        assert_never(unexpected_execution)
+
+            return await evaluate_episode(episode, evaluate_frame)
 
     return application.check(
         name=_check_name_for_task(configuration.task_definition.task),

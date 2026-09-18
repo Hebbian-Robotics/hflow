@@ -11,6 +11,7 @@ stem plus a digest of the full topic, so the name is injective.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 import subprocess
@@ -169,7 +170,7 @@ def test_three_cameras_produce_three_distinct_contact_sheets(tmp_path: Path) -> 
         data_root=tmp_path / "data",
         default_checks=(),
     )
-    report = app.process(canonical, stages={hflow.Stage.SYNC, hflow.Stage.MEDIA})
+    report = asyncio.run(app.process(canonical, stages={hflow.Stage.SYNC, hflow.Stage.MEDIA}))
     (media_run,) = [
         run for run in report.enrichments if run.enrichment.name == "media/contact_sheet"
     ]

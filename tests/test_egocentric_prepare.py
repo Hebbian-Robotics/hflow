@@ -1,5 +1,6 @@
 """The egocentric converter lands H.264 directly and preserves its planted faults."""
 
+import asyncio
 import hashlib
 import importlib.util
 import io
@@ -143,7 +144,7 @@ def test_egocentric_h264_lands_once_and_faults_survive_transform(
     assert canonical_payloads == landing_payloads
 
     with Episode(canonical_path) as canonical_episode:
-        evidence = camera_frame_stats(canonical_episode)
+        evidence = asyncio.run(camera_frame_stats(canonical_episode))
     camera_topic = "/head_camera/compressed"
     assert evidence.measurements[f"{camera_topic}/black_frame_pct"] == pytest.approx(
         expected_black_frame_pct, abs=0.6

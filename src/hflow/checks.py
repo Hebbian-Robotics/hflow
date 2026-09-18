@@ -42,6 +42,7 @@ from hflow._video_measurements import (
     VideoFrameStatistics,
     measure_camera_motion,
 )
+from hflow.asyncio_utils import run_blocking
 from hflow.episode import ChannelData, Episode
 from hflow.steps import (
     CheckFunction,
@@ -298,7 +299,7 @@ def _timestamp_regularity_value(
     raise ValueError(f"timestamp_regularity has no branch for the key {key!r}")
 
 
-def timestamp_regularity(
+async def timestamp_regularity(
     episode: Episode,
     *,
     topics: Sequence[str] | None = None,
@@ -320,6 +321,24 @@ def timestamp_regularity(
     ``_timestamp_regularity_value``, so a key the fact does not name cannot
     be emitted (#182).
     """
+    return await run_blocking(
+        _measure_timestamp_regularity,
+        episode,
+        topics=topics,
+        expected_hz=expected_hz,
+        tolerance_s=tolerance_s,
+        gap_factor=gap_factor,
+    )
+
+
+def _measure_timestamp_regularity(
+    episode: Episode,
+    *,
+    topics: Sequence[str] | None = None,
+    expected_hz: dict[str, float] | None = None,
+    tolerance_s: float = 0.010,
+    gap_factor: float = 3.0,
+) -> CheckResult:
     selected, state_topics = _timestamp_regularity_resolve_selected(episode, topics)
     infos = episode.topics
 
@@ -386,7 +405,7 @@ def timestamp_regularity(
     return CheckResult(measurements=measurements, intervals=intervals)
 
 
-def joint_discontinuity(
+async def joint_discontinuity(
     episode: Episode,
     *,
     topic: str = "/joint_states",
@@ -406,6 +425,22 @@ def joint_discontinuity(
     stream with nothing measurable reports its counts and withholds the
     verdict-shaped keys rather than emitting 0% or NaN.
     """
+    return await run_blocking(
+        _measure_joint_discontinuity,
+        episode,
+        topic=topic,
+        field=field,
+        velocity_limit=velocity_limit,
+    )
+
+
+def _measure_joint_discontinuity(
+    episode: Episode,
+    *,
+    topic: str = "/joint_states",
+    field: str = "position",
+    velocity_limit: float = 3.0,
+) -> CheckResult:
     profile = _joint_motion_profile(episode, topic, field)
     if profile is None:
         return CheckResult(
@@ -610,7 +645,7 @@ def _camera_value(
     raise ValueError(f"camera_frame_stats has no branch for the key {key!r}")
 
 
-def camera_frame_stats(
+async def camera_frame_stats(
     episode: Episode,
     *,
     cameras: Sequence[str] | None = None,
@@ -649,6 +684,30 @@ def camera_frame_stats(
     The trade is one right-to-left key parse (``rpartition``) plus one dict
     lookup per key on top of the ffmpeg decode each topic already pays (#182).
     """
+    return await run_blocking(
+        _measure_camera_frame_stats,
+        episode,
+        cameras=cameras,
+        expected_hz=expected_hz,
+        black_frame_amount_pct=black_frame_amount_pct,
+        black_pixel_threshold=black_pixel_threshold,
+        freeze_noise_db=freeze_noise_db,
+        freeze_min_duration_s=freeze_min_duration_s,
+        bright_luma_threshold=bright_luma_threshold,
+    )
+
+
+def _measure_camera_frame_stats(
+    episode: Episode,
+    *,
+    cameras: Sequence[str] | None = None,
+    expected_hz: dict[str, float] | None = None,
+    black_frame_amount_pct: int = 98,
+    black_pixel_threshold: int = 17,
+    freeze_noise_db: float = -60.0,
+    freeze_min_duration_s: float = 2.0,
+    bright_luma_threshold: float = 235.0,
+) -> CheckResult:
     # Above selected_cameras so a bad threshold is refused on a camera-less
     # episode too: guards inside the per-camera loop never fire there, which
     # is what #445 found and #447 is about. Each message names the parameter
@@ -703,7 +762,7 @@ def camera_frame_stats(
     return CheckResult(measurements=measurements, intervals=intervals)
 
 
-def idle_fraction(
+async def idle_fraction(
     episode: Episode,
     *,
     topic: str = "/joint_states",
@@ -726,6 +785,24 @@ def idle_fraction(
     with nothing measurable reports its counts and withholds
     ``idle_fraction`` rather than storing 0.0 for a dead channel.
     """
+    return await run_blocking(
+        _measure_idle_fraction,
+        episode,
+        topic=topic,
+        field=field,
+        velocity_epsilon=velocity_epsilon,
+        min_interval_s=min_interval_s,
+    )
+
+
+def _measure_idle_fraction(
+    episode: Episode,
+    *,
+    topic: str = "/joint_states",
+    field: str | None = None,
+    velocity_epsilon: float = 0.05,
+    min_interval_s: float = 1.0,
+) -> CheckResult:
     profile = _joint_motion_profile(episode, topic, field)
     if profile is None:
         return CheckResult(
@@ -907,7 +984,7 @@ def _episode_duration_keys(_episode: Episode) -> set[str]:
     return {"duration_s", "message_count_total", "topic_count"}
 
 
-def episode_duration(episode: Episode, *, topics: Sequence[str] | None = None) -> CheckResult:
+async def episode_duration(episode: Episode, *, topics: Sequence[str] | None = None) -> CheckResult:
     """Episode span and message volume, recorded for curation-side outlier cuts.
 
     An outlier is a corpus-relative judgment, so it cannot be decided inside
@@ -922,6 +999,12 @@ def episode_duration(episode: Episode, *, topics: Sequence[str] | None = None) -
     ``_episode_duration_value``, so a key the fact does not name cannot be
     emitted (#182).
     """
+    return await run_blocking(_measure_episode_duration, episode, topics=topics)
+
+
+def _measure_episode_duration(
+    episode: Episode, *, topics: Sequence[str] | None = None
+) -> CheckResult:
     intermediates = _episode_duration_intermediates(episode, topics)
     measurements: dict[str, MeasurementValue] = {
         key: _episode_duration_value(key, intermediates)
@@ -930,7 +1013,7 @@ def episode_duration(episode: Episode, *, topics: Sequence[str] | None = None) -
     return CheckResult(measurements=measurements)
 
 
-def required_topics(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
+async def required_topics(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
     """Presence and message volume for every topic a recording is expected to carry.
 
     A declared channel makes its topic present even when it contains no
@@ -942,6 +1025,10 @@ def required_topics(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
     Evidence only: whether a missing or empty topic rejects an episode remains
     a user-owned curation decision.
     """
+    return await run_blocking(_measure_required_topics, episode, topics=topics)
+
+
+def _measure_required_topics(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
     message_counts_by_topic: dict[str, int] = {}
     for info in episode.channels.values():
         message_counts_by_topic[info.topic] = (
@@ -960,7 +1047,7 @@ def required_topics(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
     return CheckResult(measurements=measurements)
 
 
-def action_rate(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
+async def action_rate(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
     """Message rate of each given action topic, in hertz, plus a pooled total.
 
     Per topic, over that topic's own span -- so three 100 Hz streams read
@@ -979,6 +1066,10 @@ def action_rate(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
     (the window function producing the ``_z`` column is documented in the
     Cohort statistics section of docs/CATALOG.md).
     """
+    return await run_blocking(_measure_action_rate, episode, topics=topics)
+
+
+def _measure_action_rate(episode: Episode, *, topics: Sequence[str]) -> CheckResult:
     measurements: dict[str, MeasurementValue] = {}
     start_candidates_ns: list[int] = []
     end_candidates_ns: list[int] = []
@@ -1044,7 +1135,7 @@ def _content_digest_value(key: str, inter: _ContentDigestIntermediates) -> Measu
     raise ValueError(f"content_digest has no branch for the key {key!r}")
 
 
-def content_digest(episode: Episode) -> CheckResult:
+async def content_digest(episode: Episode) -> CheckResult:
     """A stable digest of the episode's message content, for duplicate hunts.
 
     SHA-256 over every channel's log times and raw payloads (channels in
@@ -1061,6 +1152,10 @@ def content_digest(episode: Episode) -> CheckResult:
     dedupes byte-identical re-ingests on its own; this digest additionally
     catches the same recording landed under different names or provenance.
     """
+    return await run_blocking(_measure_content_digest, episode)
+
+
+def _measure_content_digest(episode: Episode) -> CheckResult:
     inter = _content_digest_intermediates(episode)
     return CheckResult(
         measurements={
@@ -1069,7 +1164,7 @@ def content_digest(episode: Episode) -> CheckResult:
     )
 
 
-def camera_stability(
+async def camera_stability(
     episode: Episode,
     *,
     cameras: Sequence[str] | None = None,
@@ -1115,6 +1210,24 @@ def camera_stability(
     separate a shaking camera from a moving subject, which is the entire reason
     this check exists.
     """
+    return await run_blocking(
+        _measure_camera_stability,
+        episode,
+        cameras=cameras,
+        horizontal_field_of_view_degrees=horizontal_field_of_view_degrees,
+        shake_threshold_dps=shake_threshold_dps,
+        unstable_min_duration_s=unstable_min_duration_s,
+    )
+
+
+def _measure_camera_stability(
+    episode: Episode,
+    *,
+    cameras: Sequence[str] | None = None,
+    horizontal_field_of_view_degrees: float = DEFAULT_HORIZONTAL_FIELD_OF_VIEW_DEGREES,
+    shake_threshold_dps: float = 0.0,
+    unstable_min_duration_s: float = 0.0,
+) -> CheckResult:
 
     if (
         isinstance(shake_threshold_dps, bool)
@@ -1206,7 +1319,7 @@ def camera_stability(
     return CheckResult(measurements=measurements, intervals=intervals)
 
 
-def trajectory_metrics(
+async def trajectory_metrics(
     episode: Episode,
     *,
     topic: str = "/joint_states",
@@ -1241,6 +1354,26 @@ def trajectory_metrics(
     (Voxel51's audit scored an early-gripper-release defect better than clean
     demos), so a threshold HFlow chose would reject the wrong episodes.
     """
+    return await run_blocking(
+        _measure_trajectory_metrics,
+        episode,
+        topic=topic,
+        field=field,
+        dimension_scales=dimension_scales,
+        motionless_speed_epsilon=motionless_speed_epsilon,
+        final_pose_window_s=final_pose_window_s,
+    )
+
+
+def _measure_trajectory_metrics(
+    episode: Episode,
+    *,
+    topic: str = "/joint_states",
+    field: str | None = None,
+    dimension_scales: Sequence[float] | None = None,
+    motionless_speed_epsilon: float = 1e-3,
+    final_pose_window_s: float = 0.5,
+) -> CheckResult:
     profile = _trajectory_profile(episode, topic, field, dimension_scales)
     if profile is None:
         return CheckResult(
@@ -1302,7 +1435,7 @@ def trajectory_metrics(
     return CheckResult(measurements=measurements)
 
 
-def trajectory_segments(
+async def trajectory_segments(
     episode: Episode,
     *,
     topic: str = "/joint_states",
@@ -1329,6 +1462,26 @@ def trajectory_segments(
 
     Evidence only, and no recommended gate: see :func:`trajectory_metrics`.
     """
+    return await run_blocking(
+        _measure_trajectory_segments,
+        episode,
+        topic=topic,
+        field=field,
+        dimension_scales=dimension_scales,
+        motionless_speed_epsilon=motionless_speed_epsilon,
+        min_motionless_span_s=min_motionless_span_s,
+    )
+
+
+def _measure_trajectory_segments(
+    episode: Episode,
+    *,
+    topic: str = "/joint_states",
+    field: str | None = None,
+    dimension_scales: Sequence[float] | None = None,
+    motionless_speed_epsilon: float = 1e-3,
+    min_motionless_span_s: float = 0.4,
+) -> CheckResult:
     profile = _trajectory_profile(episode, topic, field, dimension_scales)
     if profile is None:
         return CheckResult(
@@ -1441,7 +1594,7 @@ def _curvature_run_intervals(
     return intervals
 
 
-def camera_signal_quality(
+async def camera_signal_quality(
     episode: Episode,
     *,
     cameras: Sequence[str] | None = None,
@@ -1484,6 +1637,24 @@ def camera_signal_quality(
     ``camera_frame_stats`` records which one measured; compare across a pin bump
     only after re-measuring, not by reading old rows next to new ones.
     """
+    return await run_blocking(
+        _measure_camera_signal_quality,
+        episode,
+        cameras=cameras,
+        black_pixel_threshold=black_pixel_threshold,
+        freeze_noise_db=freeze_noise_db,
+        freeze_min_duration_s=freeze_min_duration_s,
+    )
+
+
+def _measure_camera_signal_quality(
+    episode: Episode,
+    *,
+    cameras: Sequence[str] | None = None,
+    black_pixel_threshold: int = 17,
+    freeze_noise_db: float = -60.0,
+    freeze_min_duration_s: float = 2.0,
+) -> CheckResult:
     # Same placement and reason as camera_frame_stats above (#447).
     require_int_in_range(black_pixel_threshold, "black_pixel_threshold", minimum=0, maximum=255)
     require_finite_float(freeze_noise_db, "freeze_noise_db")
@@ -1539,7 +1710,7 @@ def camera_signal_quality(
     return CheckResult(measurements=measurements)
 
 
-def action_integrity(
+async def action_integrity(
     episode: Episode,
     *,
     topic: str = "/joint_states",
@@ -1570,6 +1741,24 @@ def action_integrity(
     a hold policy manufactures exactly-repeated samples, which is a fabricated
     frozen run rather than a recorded one.
     """
+    return await run_blocking(
+        _measure_action_integrity,
+        episode,
+        topic=topic,
+        field=field,
+        min_frozen_run_fraction=min_frozen_run_fraction,
+        min_unchanged_dimension_samples=min_unchanged_dimension_samples,
+    )
+
+
+def _measure_action_integrity(
+    episode: Episode,
+    *,
+    topic: str = "/joint_states",
+    field: str | None = None,
+    min_frozen_run_fraction: float = 0.05,
+    min_unchanged_dimension_samples: int = 11,
+) -> CheckResult:
     channel = episode.channel(topic)
     stamps_ns = channel.timestamps
     if len(stamps_ns) < 2:
@@ -1755,7 +1944,7 @@ def _mask_run_lengths(step_mask: np.ndarray) -> list[int]:
     return lengths
 
 
-def camera_fps_conformance(
+async def camera_fps_conformance(
     episode: Episode,
     *,
     nominal_fps: dict[str, int] | None = None,
@@ -1789,6 +1978,24 @@ def camera_fps_conformance(
     classifies; it never rewrites the stream -- decimating an episode is a
     transform concern that would move episode identity.
     """
+    return await run_blocking(
+        _measure_camera_fps_conformance,
+        episode,
+        nominal_fps=nominal_fps,
+        cameras=cameras,
+        max_plausible_fps=max_plausible_fps,
+        downsample_tolerance_fps=downsample_tolerance_fps,
+    )
+
+
+def _measure_camera_fps_conformance(
+    episode: Episode,
+    *,
+    nominal_fps: dict[str, int] | None = None,
+    cameras: Sequence[str] | None = None,
+    max_plausible_fps: float = 240,
+    downsample_tolerance_fps: float = 1,
+) -> CheckResult:
 
     if isinstance(max_plausible_fps, bool):
         raise ValueError("max_plausible_fps must be a float, got bool")
@@ -1920,7 +2127,7 @@ def _media_digest_value(topic: str, name: str, inter: _MediaDigestPerCamera) -> 
     raise ValueError(f"media_digest has no branch for the key {topic}/{name}")
 
 
-def media_digest(episode: Episode, *, cameras: Sequence[str] | None = None) -> CheckResult:
+async def media_digest(episode: Episode, *, cameras: Sequence[str] | None = None) -> CheckResult:
     """Per-camera digest of the encoded footage alone, for redundancy hunts.
 
     SHA-256 over one camera channel's length-framed payload bytes, deliberately
@@ -1942,6 +2149,10 @@ def media_digest(episode: Episode, *, cameras: Sequence[str] | None = None) -> C
     ``{topic}/media_bytes`` weights it by what the duplication costs to store.
     Reads no pixels and runs no decode, so it is exact and cheap.
     """
+    return await run_blocking(_measure_media_digest, episode, cameras=cameras)
+
+
+def _measure_media_digest(episode: Episode, *, cameras: Sequence[str] | None = None) -> CheckResult:
     selected_cameras = _resolve_selected_cameras(episode, cameras)
     measurements: dict[str, MeasurementValue] = {}
     for topic in selected_cameras:
@@ -2065,7 +2276,9 @@ def _keyframe_interval_value(
     raise ValueError(f"keyframe_interval has no branch for the key {topic}/{name}")
 
 
-def keyframe_interval(episode: Episode, *, cameras: Sequence[str] | None = None) -> CheckResult:
+async def keyframe_interval(
+    episode: Episode, *, cameras: Sequence[str] | None = None
+) -> CheckResult:
     """Keyframe cadence per camera: how seekable and cuttable the footage is.
 
     A keyframe is where a decoder can start, so the longest gap between them
@@ -2088,6 +2301,12 @@ def keyframe_interval(episode: Episode, *, cameras: Sequence[str] | None = None)
     count as keyframes), so a ``<=`` filter excludes those rather than reading
     them as perfect.
     """
+    return await run_blocking(_measure_keyframe_interval, episode, cameras=cameras)
+
+
+def _measure_keyframe_interval(
+    episode: Episode, *, cameras: Sequence[str] | None = None
+) -> CheckResult:
     selected_cameras = _resolve_selected_cameras(episode, cameras)
     timestamps_by_camera: dict[str, np.ndarray] = {}
     intermediates_by_camera: dict[str, _KeyframeIntervalPerCamera] = {}

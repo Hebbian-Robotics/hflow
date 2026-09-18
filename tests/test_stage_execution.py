@@ -2,6 +2,7 @@
 the generated DAGs are thin callers of -- lane planning, pipeline loading,
 per-episode accounting, and the error/quarantine budgets."""
 
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar, cast
@@ -213,7 +214,7 @@ class _StubApp:
     received_histories: list[object] = field(default_factory=list)
     received_run_ids: list[str | None] = field(default_factory=list)
 
-    def process(
+    async def process(
         self,
         episode_reference: object,
         *,
@@ -244,10 +245,12 @@ def test_process_stage_batch_counts_every_outcome_kind(tmp_path: Path) -> None:
             "crash.mcap": "crash",
         },
     )
-    counts = process_stage_batch(
-        cast("hflow.App", stub_app),  # a double at the App boundary
-        ["good.mcap", "quarantined.mcap", "steperror.mcap", "crash.mcap"],
-        "meta",
+    counts = asyncio.run(
+        process_stage_batch(
+            cast("hflow.App", stub_app),  # a double at the App boundary
+            ["good.mcap", "quarantined.mcap", "steperror.mcap", "crash.mcap"],
+            "meta",
+        )
     )
     # Per-episode crashes are counted, never batch-fatal: all four were tried.
     assert len(stub_app.processed_references) == 4
@@ -269,11 +272,13 @@ def test_the_orchestrator_run_id_reaches_every_episode_in_the_batch(tmp_path: Pa
         outcomes={"crash.mcap": "crash"},
     )
 
-    process_stage_batch(
-        cast("hflow.App", stub_app),  # a double at the App boundary
-        ["good.mcap", "crash.mcap", "also_good.mcap"],
-        "meta",
-        "scheduled__2026-08-23T00:00:00+00:00",
+    asyncio.run(
+        process_stage_batch(
+            cast("hflow.App", stub_app),  # a double at the App boundary
+            ["good.mcap", "crash.mcap", "also_good.mcap"],
+            "meta",
+            "scheduled__2026-08-23T00:00:00+00:00",
+        )
     )
 
     # Including the episode that crashed: it was still attempted under this
@@ -323,10 +328,12 @@ def test_a_gated_stage_opens_one_quarantine_reader_for_the_whole_batch(
         workspace=_StubWorkspace(catalog_root=catalog_root),
         expected_stage=stage_name,
     )
-    counts = process_stage_batch(
-        cast("hflow.App", stub_app),
-        [f"episode_{index}.mcap" for index in range(5)],
-        stage_name,
+    counts = asyncio.run(
+        process_stage_batch(
+            cast("hflow.App", stub_app),
+            [f"episode_{index}.mcap" for index in range(5)],
+            stage_name,
+        )
     )
 
     assert counts == {"processed": 5, "quarantined": 0, "errors": 0}
@@ -346,7 +353,7 @@ def test_the_meta_stage_never_opens_the_quarantine_reader(
         workspace=_StubWorkspace(catalog_root=tmp_path / "catalog"),
         expected_stage="meta",
     )
-    process_stage_batch(cast("hflow.App", stub_app), ["a.mcap", "b.mcap"], "meta")
+    asyncio.run(process_stage_batch(cast("hflow.App", stub_app), ["a.mcap", "b.mcap"], "meta"))
 
     assert counting_quarantine_history == []
     assert stub_app.received_histories == [None, None]
@@ -357,5 +364,5 @@ def test_an_unknown_stage_is_refused_before_any_episode_is_touched(tmp_path: Pat
         data_root=str(tmp_path), workspace=_StubWorkspace(catalog_root=tmp_path / "catalog")
     )
     with pytest.raises(ValueError, match="not a valid Stage"):
-        process_stage_batch(cast("hflow.App", stub_app), ["a.mcap"], "nonsense")
+        asyncio.run(process_stage_batch(cast("hflow.App", stub_app), ["a.mcap"], "nonsense"))
     assert stub_app.processed_references == []

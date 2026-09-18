@@ -1,5 +1,6 @@
 """Enrichment step registration, execution, and catalog outcomes."""
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -31,11 +32,11 @@ def test_enrichments_run_after_all_checks(source_episode: Path, tmp_path: Path) 
         return hflow.EnrichmentResult(labels={"caption": "a robot arm moves"})
 
     @app.check(version="1")
-    def joints(ep: hflow.Episode) -> hflow.CheckResult:
+    async def joints(ep: hflow.Episode) -> hflow.CheckResult:
         execution_order.append("joints")
         return hflow.CheckResult()
 
-    report = app.test(source_episode, verbose=False)
+    report = asyncio.run(app.test(source_episode, verbose=False))
     assert execution_order == ["joints", "caption"]
     assert [run.status for run in report.enrichments] == [hflow.CheckStatus.MEASURED]
     assert "caption = a robot arm moves" in report.summary()
@@ -46,7 +47,7 @@ def test_quarantine_skips_enrichments(source_episode: Path, tmp_path: Path) -> N
     enrichment_ran = False
 
     @app.check(version="1", critical=True)
-    def always_fails(ep: hflow.Episode) -> hflow.CheckResult:
+    async def always_fails(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(verdict=False)
 
     @app.enrich(version="1")
@@ -55,7 +56,7 @@ def test_quarantine_skips_enrichments(source_episode: Path, tmp_path: Path) -> N
         enrichment_ran = True
         return hflow.EnrichmentResult()
 
-    report = app.test(source_episode, verbose=False)
+    report = asyncio.run(app.test(source_episode, verbose=False))
     assert report.quarantined
     assert not enrichment_ran
     assert report.enrichments[0].status == hflow.CheckStatus.SKIPPED
@@ -70,7 +71,7 @@ def test_enrichment_wrong_return_type_is_an_error(
     def returns_a_string(ep: hflow.Episode) -> hflow.EnrichmentResult:
         return cast(hflow.EnrichmentResult, "a caption")  # deliberate misuse
 
-    report = app.test(source_episode, verbose=False)
+    report = asyncio.run(app.test(source_episode, verbose=False))
     assert report.enrichments[0].status == hflow.CheckStatus.ERROR
     assert report.enrichments[0].error is not None
     assert "expected hflow.EnrichmentResult" in report.enrichments[0].error
@@ -97,7 +98,7 @@ def test_enrichment_crash_is_logged_and_later_steps_continue(
     def still_runs(ep: hflow.Episode) -> hflow.EnrichmentResult:
         return hflow.EnrichmentResult(labels={"caption": "robot arm"})
 
-    report = app.process(source_episode)
+    report = asyncio.run(app.process(source_episode))
     assert report.has_errors
     assert not report.quarantined
     failed, measured = report.enrichments
@@ -143,7 +144,7 @@ def test_enrichment_labels_and_artifacts_land_in_the_catalog(
             tags=["labeled"],
         )
 
-    app.test(source_episode, verbose=False, record=True)
+    asyncio.run(app.test(source_episode, verbose=False, record=True))
     connection = open_catalog_connection(data_root / "catalog")
     try:
         caption_row = connection.execute(
@@ -175,7 +176,7 @@ def test_step_names_are_unique_across_checks_and_enrichments(tmp_path: Path) -> 
     app = hflow.App("enrich-names", data_root=tmp_path)
 
     @app.check(version="1")
-    def labeling(ep: hflow.Episode) -> hflow.CheckResult:
+    async def labeling(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult()
 
     with pytest.raises(ValueError, match="already registered"):
@@ -188,7 +189,7 @@ def test_step_names_are_unique_across_checks_and_enrichments(tmp_path: Path) -> 
 def test_built_in_media_step_name_is_reserved_for_user_steps(tmp_path: Path) -> None:
     app = hflow.App("reserved-media-name", data_root=tmp_path)
 
-    def check(ep: hflow.Episode) -> hflow.CheckResult:
+    async def check(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult()
 
     def enrichment(ep: hflow.Episode) -> hflow.EnrichmentResult:
@@ -219,7 +220,7 @@ def test_enrichment_label_claiming_the_artifact_namespace_is_refused(
         )
 
     with pytest.raises(ValueError, match=r"'artifact/notes'.*'labeling'"):
-        app.test(source_episode, verbose=False, record=True)
+        asyncio.run(app.test(source_episode, verbose=False, record=True))
     assert list((data_root / "catalog" / "episodes").glob("*.parquet")) == []
 
 
@@ -231,11 +232,11 @@ def test_check_measurement_claiming_the_artifact_namespace_is_refused(
     app = hflow.App("artifact-claim-check", data_root=data_root)
 
     @app.check(version="1")
-    def labeled(ep: hflow.Episode) -> hflow.CheckResult:
+    async def labeled(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"artifact/frames": 1.0})
 
     with pytest.raises(ValueError, match=r"'artifact/frames'.*'labeled'"):
-        app.test(source_episode, verbose=False, record=True)
+        asyncio.run(app.test(source_episode, verbose=False, record=True))
     assert list((data_root / "catalog" / "episodes").glob("*.parquet")) == []
 
 
@@ -257,7 +258,7 @@ def test_labels_near_the_artifact_namespace_still_land_with_real_artifacts(
             artifacts={"segments": artifact_path},
         )
 
-    app.test(source_episode, verbose=False, record=True)
+    asyncio.run(app.test(source_episode, verbose=False, record=True))
     connection = open_catalog_connection(data_root / "catalog")
     try:
         label_row = connection.execute(
@@ -300,7 +301,7 @@ def test_the_egocentric_example_renders_a_sheet_on_a_multi_camera_episode(
     write_canonical_episode(raw, canonical)
 
     pipeline_application = hflow.import_pipeline_application(f"{_EGOCENTRIC_PIPELINE}:pipeline")
-    report = pipeline_application.test(canonical, verbose=False)
+    report = asyncio.run(pipeline_application.test(canonical, verbose=False))
 
     sheet_run = next(run for run in report.enrichments if run.enrichment.name == "contact_sheet")
     assert sheet_run.status is hflow.CheckStatus.MEASURED, sheet_run.error

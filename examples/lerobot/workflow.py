@@ -28,6 +28,7 @@ takes roughly 30-60 minutes of video conversion on a laptop.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import subprocess
 import sys
@@ -140,7 +141,7 @@ def run_process(data_dir: Path, landing_uris: Sequence[Path | str]) -> None:
     """Process every episode with the default checks and contact sheets."""
     app = hflow.App("lerobot-workflow", data_root=str(data_dir))
     for uri in landing_uris:
-        app.process(uri)
+        asyncio.run(app.process(uri))
 
 
 def run_curation(data_dir: Path, cameras: Sequence[str]) -> Path:

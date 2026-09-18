@@ -14,8 +14,8 @@ DuckDB, pandas, or polars at the files and ignore our helpers entirely.
 Two entry points write the catalog, one operation underneath:
 
 ```python
-report = app.test("episode_0001.mcap", record=True)  # dev loop: OFF by default
-report = app.process("episode_0001.mcap")  # ingest path: ON by default
+report = await app.test("episode_0001.mcap", record=True)  # dev loop: OFF by default
+report = await app.process("episode_0001.mcap")  # ingest path: ON by default
 ```
 
 `app.test()` never records unless you ask; iterating on a check should not
@@ -35,7 +35,7 @@ For a targeted backfill, `step_names=` records only the selected registered
 steps:
 
 ```python
-report = app.process(
+report = await app.process(
     "episode_0001.mcap",
     stages={hflow.Stage.META},
     step_names={"camera_integrity"},
@@ -133,7 +133,7 @@ retries to remain idempotent across intervening executions must persist an
 `execution_id` **before the first attempt** and reuse it:
 
 ```python
-report = app.process("episode_0001.mcap", execution_id="durable-task-attempt-42")
+report = await app.process("episode_0001.mcap", execution_id="durable-task-attempt-42")
 ```
 
 `Catalog.append_episode()` accepts the same argument. With an explicit id, the
@@ -559,7 +559,7 @@ cataloged run against the versions you pass:
 ```python
 stale = hflow.stale_episodes("data/catalog", pipeline_version=app.pipeline_version)
 for episode in stale:
-    app.process(episode.source_uri)
+    await app.process(episode.source_uri)
 ```
 
 or on the command line, where stdout is exactly the pipeable source-URI list:

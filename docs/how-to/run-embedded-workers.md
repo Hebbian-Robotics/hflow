@@ -33,7 +33,7 @@ from hflow import App, Stage
 
 with TemporaryDirectory(prefix="processing-") as workspace_directory:
     app = App("worker", data_root=Path(workspace_directory))
-    batch = app.process_many(
+    batch = await app.process_many(
         episode_paths,
         record=False,
         stages=(Stage.SYNC, Stage.META),
@@ -75,8 +75,7 @@ batches.
 - The input iterable is materialized and duplicate source identities are
   rejected before processing. Pass finite, reasonably sized batches: all
   reports are retained in memory and returned in input order.
-- `on_progress` receives `ProcessManyProgress` on the calling coordinator
-  thread as completed work is collected. Event input order is not guaranteed;
+- `on_progress` receives `ProcessManyProgress` on the caller's event loop as completed work is collected. Event input order is not guaranteed;
   each carries the original `input_index`. At most `max_workers` episodes are
   submitted at once.
 - A normal check/enrichment execution error is represented in its
@@ -85,8 +84,8 @@ batches.
   error. Quarantine can skip later stages according to the normal engine rules.
 - Configuration, source preparation, processing infrastructure, publication,
   and callback exceptions can propagate. On an exception, new submissions
-  stop, queued work is cancelled where possible, and already-running episodes
-  finish before the call raises. Completed work is not rolled back. There is
+  stop, active checks are cancelled, and started blocking work drains before
+  the call raises. Completed work is not rolled back. There is
   no automatic retry or failure-budget policy in this API.
 
 For durable stage accounting and error budgets, use

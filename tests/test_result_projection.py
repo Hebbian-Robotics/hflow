@@ -1,5 +1,6 @@
 """External consumers receive selected evidence and explicit execution outcomes."""
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -22,7 +23,7 @@ def test_result_projection_preserves_verdicts_without_disclosing_internal_detail
     )
 
     @application.check(version="private-version")
-    def private_measurement(_episode: hflow.Episode) -> hflow.CheckResult:
+    async def private_measurement(_episode: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(
             measurements={"internal_score": 25.0, "private_prompt": "secret"},
             tags=["private_tag"],
@@ -30,10 +31,10 @@ def test_result_projection_preserves_verdicts_without_disclosing_internal_detail
         )
 
     @application.check(version="private-version")
-    def private_failure(_episode: hflow.Episode) -> hflow.CheckResult:
+    async def private_failure(_episode: hflow.Episode) -> hflow.CheckResult:
         raise RuntimeError("private diagnostic")
 
-    report = application.process(source, record=False)
+    report = asyncio.run(application.process(source, record=False))
     projection = project_results(
         report,
         (

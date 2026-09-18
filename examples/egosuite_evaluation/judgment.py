@@ -153,7 +153,7 @@ def _response_metadata(response: object) -> ModelResponseMetadata:
     )
 
 
-def evaluate_image_with_model(
+async def evaluate_image_with_model(
     *,
     client: Any,
     model: str,
@@ -184,7 +184,7 @@ def evaluate_image_with_model(
     if temperature is not None:
         request_parameters["temperature"] = temperature
 
-    response = client.chat.completions.create(**request_parameters)
+    response = await client.chat.completions.create(**request_parameters)
     response_metadata = _response_metadata(response)
     try:
         raw_response = _chat_completion_response_text(response)

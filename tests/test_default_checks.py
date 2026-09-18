@@ -1,5 +1,6 @@
 """The baseline every episode gets without anyone registering it."""
 
+import asyncio
 import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -48,7 +49,7 @@ def test_a_pipeline_that_registers_nothing_still_records_evidence(
 ) -> None:
     app = hflow.App("baseline", data_root=tmp_path / "data")
 
-    report = app.test(source_episode, verbose=False)
+    report = asyncio.run(app.test(source_episode, verbose=False))
 
     # Pinned by name rather than derived from DEFAULT_CHECKS: which checks
     # every corpus pays for is a product decision, and a test that recomputes
@@ -79,7 +80,7 @@ def test_a_pipeline_that_registers_nothing_still_records_evidence(
 def test_the_baseline_can_be_turned_off_entirely(source_episode: Path, tmp_path: Path) -> None:
     app = hflow.App("bare", data_root=tmp_path / "data", default_checks=())
 
-    assert app.test(source_episode, verbose=False).checks == []
+    assert asyncio.run(app.test(source_episode, verbose=False)).checks == []
 
 
 def test_a_subset_is_expressible_because_that_is_the_real_need(
@@ -99,7 +100,7 @@ def test_a_subset_is_expressible_because_that_is_the_real_need(
 
 
 def test_pipeline_authored_checks_require_explicit_registration_versions() -> None:
-    def pipeline_authored_check(episode: hflow.Episode) -> hflow.CheckResult:
+    async def pipeline_authored_check(episode: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"episode_path": str(episode.path)})
 
     with pytest.raises(
@@ -129,13 +130,13 @@ def test_two_pipeline_steps_sharing_a_name_are_still_refused(tmp_path: Path) -> 
     app = hflow.App("clash", data_root=tmp_path / "data")
 
     @app.check(version="1", name="mine")
-    def first(ep: hflow.Episode) -> hflow.CheckResult:
+    async def first(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult()
 
     with pytest.raises(ValueError, match="already registered"):
 
         @app.check(version="1", name="mine")
-        def second(ep: hflow.Episode) -> hflow.CheckResult:
+        async def second(ep: hflow.Episode) -> hflow.CheckResult:
             return hflow.CheckResult()
 
 
@@ -147,10 +148,10 @@ def test_a_default_yields_to_a_pipeline_step_measuring_the_same_thing(
     app = hflow.App("wrapping", data_root=tmp_path / "data")
 
     @app.check(version="1")
-    def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
-        return hflow.checks.timestamp_regularity(ep, tolerance_s=0.001)
+    async def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
+        return await hflow.checks.timestamp_regularity(ep, tolerance_s=0.001)
 
-    report = app.test(source_episode, verbose=False)
+    report = asyncio.run(app.test(source_episode, verbose=False))
 
     by_name = {run.check.name: run for run in report.checks}
     assert by_name["timestamps"].result is not None
@@ -174,10 +175,10 @@ def test_a_default_that_does_not_overlap_keeps_running(
     app = hflow.App("partial-overlap", data_root=tmp_path / "data")
 
     @app.check(version="1")
-    def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
-        return hflow.checks.timestamp_regularity(ep)
+    async def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
+        return await hflow.checks.timestamp_regularity(ep)
 
-    report = app.test(source_episode, verbose=False)
+    report = asyncio.run(app.test(source_episode, verbose=False))
 
     by_name = {run.check.name: run for run in report.checks}
     assert by_name["timestamp_regularity"].status is hflow.CheckStatus.SUPERSEDED
@@ -235,10 +236,10 @@ def test_a_wrapper_with_non_default_parameters_supersedes_the_default_without_ru
     app = hflow.App("non-default-wrap", data_root=tmp_path / "data")
 
     @app.check(version="1")
-    def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
+    async def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
         # Non-default parameter: a different freeze_min_duration_s builds a
         # different filter graph inside frame_stats.
-        return hflow.checks.camera_frame_stats(ep, freeze_min_duration_s=5.0)
+        return await hflow.checks.camera_frame_stats(ep, freeze_min_duration_s=5.0)
 
     decode_calls: list[int] = []
     real_popen = _frame_statistics.subprocess.Popen
@@ -258,7 +259,7 @@ def test_a_wrapper_with_non_default_parameters_supersedes_the_default_without_ru
         return real_popen(*arguments, **keywords)
 
     monkeypatch.setattr(_frame_statistics.subprocess, "Popen", fake_popen)
-    report = app.process(camera_source, stages="full", record=False)
+    report = asyncio.run(app.process(camera_source, stages="full", record=False))
     by_name = {run.check.name: run for run in report.checks}
 
     # The wrapper ran, the default did not, and exactly one ffmpeg decode
@@ -298,10 +299,10 @@ def test_a_wrapper_with_default_parameters_uses_the_post_execution_backstop(
     app = hflow.App("default-params", data_root=tmp_path / "data")
 
     @app.check(version="1")
-    def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
-        return hflow.checks.camera_frame_stats(ep)
+    async def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
+        return await hflow.checks.camera_frame_stats(ep)
 
-    report = app.test(camera_source, verbose=False)
+    report = asyncio.run(app.test(camera_source, verbose=False))
     by_name = {run.check.name: run for run in report.checks}
     assert by_name["camera_health"].result is not None
     default = by_name["camera_frame_stats"]
@@ -324,10 +325,10 @@ def test_a_non_overlapping_user_step_does_not_supersede(
     app = hflow.App("non-overlap", data_root=tmp_path / "data")
 
     @app.check(version="1")
-    def unrelated(ep: hflow.Episode) -> hflow.CheckResult:
+    async def unrelated(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"my/custom/key": 1.0})
 
-    report = app.test(camera_source, verbose=False)
+    report = asyncio.run(app.test(camera_source, verbose=False))
     by_name = {run.check.name: run for run in report.checks}
     assert by_name["camera_frame_stats"].result is not None
     assert by_name["unrelated"].result is not None
@@ -343,10 +344,10 @@ def test_superseded_default_reports_the_overlapping_keys(
     app = hflow.App("keys-listed", data_root=tmp_path / "data")
 
     @app.check(version="1")
-    def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
-        return hflow.checks.camera_frame_stats(ep, freeze_min_duration_s=2.0)
+    async def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
+        return await hflow.checks.camera_frame_stats(ep, freeze_min_duration_s=2.0)
 
-    report = app.test(camera_source, verbose=False)
+    report = asyncio.run(app.test(camera_source, verbose=False))
     by_name = {run.check.name: run for run in report.checks}
     superseded = by_name["camera_frame_stats"].not_run
     assert isinstance(superseded, hflow.SupersededByPipeline)
@@ -383,10 +384,10 @@ def test_partial_camera_coverage_drops_the_uncovered_camera_too(tmp_path: Path) 
     app = hflow.App("partial", data_root=tmp_path / "data")
 
     @app.check(version="1")
-    def only_wrist(ep: hflow.Episode) -> hflow.CheckResult:
-        return hflow.checks.camera_frame_stats(ep)
+    async def only_wrist(ep: hflow.Episode) -> hflow.CheckResult:
+        return await hflow.checks.camera_frame_stats(ep)
 
-    report = app.test(two_camera_source, verbose=False)
+    report = asyncio.run(app.test(two_camera_source, verbose=False))
     by_name = {run.check.name: run for run in report.checks}
     default = by_name["camera_frame_stats"]
     assert default.status is hflow.CheckStatus.SUPERSEDED
@@ -421,7 +422,7 @@ def test_every_default_iterates_its_fact_for_measurements(
         SyntheticEpisodeSpec(duration_s=1.0, cameras=cameras),
     )
     app = hflow.App("fact-guard", data_root=tmp_path / "data")
-    report = app.test(source_episode, verbose=False)
+    report = asyncio.run(app.test(source_episode, verbose=False))
     actual = {
         run.check.name: (set(run.result.measurements) if run.result is not None else set())
         for run in report.checks
@@ -478,10 +479,10 @@ def test_quarantined_episode_still_carries_default_measurements(
         critical=True,
         gate=hflow.checks.RECOMMENDED_CAMERA_INTEGRITY,
     )
-    def blackout(ep: hflow.Episode) -> hflow.CheckResult:
+    async def blackout(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"*black_frame_pct": 99.0})
 
-    report = app.test(camera_source, verbose=False)
+    report = asyncio.run(app.test(camera_source, verbose=False))
     by_name = {run.check.name: run for run in report.checks}
     # The user's check did its job: the episode is quarantined.
     assert report.quarantined is not None
@@ -642,7 +643,9 @@ def test_camera_frame_stats_emits_exactly_the_documented_measurements(
     dispatcher branch (luma_avg_min reading average_luma_maximum) fails in
     CI instead of recording a plausible wrong number."""
     source = synthesize_episode(tmp_path / "value_source.mcap", spec)
-    report = hflow.App("value-fixture", data_root=tmp_path / "data").test(source, verbose=False)
+    report = asyncio.run(
+        hflow.App("value-fixture", data_root=tmp_path / "data").test(source, verbose=False)
+    )
     run = report.check("camera_frame_stats")
     assert run.result is not None
 
@@ -716,7 +719,9 @@ def test_a_single_stamp_camera_topic_errors_before_any_measurement(
         tmp_path / "sparse_source.mcap",
         SyntheticEpisodeSpec(duration_s=1.0, image_hz=1.0, cameras=("wrist_cam",)),
     )
-    report = hflow.App("single-stamp", data_root=tmp_path / "data").test(source, verbose=False)
+    report = asyncio.run(
+        hflow.App("single-stamp", data_root=tmp_path / "data").test(source, verbose=False)
+    )
     run = report.check("camera_frame_stats")
     assert run.result is None
     assert "at least 2" in (run.error or "")
@@ -750,8 +755,8 @@ def test_declared_expected_hz_wins_and_median_delta_fills_in(tmp_path: Path) -> 
 
     from hflow.episode import Episode
 
-    baseline_report = hflow.App("hz-fallback", data_root=tmp_path / "data-a").test(
-        source, verbose=False
+    baseline_report = asyncio.run(
+        hflow.App("hz-fallback", data_root=tmp_path / "data-a").test(source, verbose=False)
     )
 
     # Parameters ride a wrapper -- the documented way to configure a built-in.
@@ -760,10 +765,12 @@ def test_declared_expected_hz_wins_and_median_delta_fills_in(tmp_path: Path) -> 
     declared_app = hflow.App("hz-declared", data_root=tmp_path / "data-b")
 
     @declared_app.check(version="1")
-    def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
-        return hflow.checks.camera_frame_stats(ep, expected_hz=dict.fromkeys(ep.cameras, 30.0))
+    async def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
+        return await hflow.checks.camera_frame_stats(
+            ep, expected_hz=dict.fromkeys(ep.cameras, 30.0)
+        )
 
-    declared_report = declared_app.test(source, verbose=False)
+    declared_report = asyncio.run(declared_app.test(source, verbose=False))
 
     baseline_run = baseline_report.check("camera_frame_stats")
     declared_run = declared_report.check("camera_health")
@@ -929,7 +936,7 @@ def test_camera_frame_stats_reports_frames_present_but_not_decoded(tmp_path: Pat
         writer.finish()
 
     with hflow.Episode(source) as episode:
-        result = camera_frame_stats(episode)
+        result = asyncio.run(camera_frame_stats(episode))
 
     message_count = result.measurements[f"{topic}/message_count"]
     decoded_frame_count = result.measurements[f"{topic}/decoded_frame_count"]
@@ -976,7 +983,9 @@ def test_episode_duration_emits_exactly_the_documented_measurements(
     we pin it by the spec the test parameterises over rather than
     restating the synthetic topology."""
     source = synthesize_episode(tmp_path / "duration_source.mcap", spec)
-    report = hflow.App("duration-fixture", data_root=tmp_path / "data").test(source, verbose=False)
+    report = asyncio.run(
+        hflow.App("duration-fixture", data_root=tmp_path / "data").test(source, verbose=False)
+    )
     run = report.check("episode_duration")
     assert run.result is not None
 
@@ -1035,7 +1044,9 @@ def test_timestamp_regularity_emits_exactly_the_documented_measurements(
     here we keep the per-topic keys tight.
     """
     source = synthesize_episode(tmp_path / "ts_source.mcap", spec)
-    report = hflow.App("ts-fixture", data_root=tmp_path / "data").test(source, verbose=False)
+    report = asyncio.run(
+        hflow.App("ts-fixture", data_root=tmp_path / "data").test(source, verbose=False)
+    )
     run = report.check("timestamp_regularity")
     assert run.result is not None
 
@@ -1112,7 +1123,9 @@ def test_keyframe_interval_emits_exactly_the_documented_measurements(
     tight.
     """
     source = synthesize_episode(tmp_path / "kf_source.mcap", spec)
-    report = hflow.App("kf-fixture", data_root=tmp_path / "data").test(source, verbose=False)
+    report = asyncio.run(
+        hflow.App("kf-fixture", data_root=tmp_path / "data").test(source, verbose=False)
+    )
     run = report.check("keyframe_interval")
     assert run.result is not None
     _assert_measurements_match_pinned(dict(run.result.measurements), expected_subset)
@@ -1134,10 +1147,10 @@ def test_keyframe_supersession_uses_only_keys_the_camera_would_emit(
     key = f"/wrist_cam/compressed/{measurement_name}"
 
     @app.check(version="1")
-    def pipeline_cadence(episode: hflow.Episode) -> hflow.CheckResult:
+    async def pipeline_cadence(episode: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={key: 42.0})
 
-    report = app.test(camera_source, verbose=False)
+    report = asyncio.run(app.test(camera_source, verbose=False))
     pipeline_result = report.check("pipeline_cadence").result
     assert pipeline_result is not None
     assert pipeline_result.measurements == {key: 42.0}
@@ -1162,8 +1175,8 @@ def test_keyframe_supersession_uses_only_keys_the_camera_would_emit(
 def test_content_digest_emits_exactly_the_documented_measurements(
     source_episode: Path, tmp_path: Path
 ) -> None:
-    report = hflow.App("cd-fixture", data_root=tmp_path / "data").test(
-        source_episode, verbose=False
+    report = asyncio.run(
+        hflow.App("cd-fixture", data_root=tmp_path / "data").test(source_episode, verbose=False)
     )
     run = report.check("content_digest")
     assert run.result is not None
@@ -1242,7 +1255,7 @@ class TestContentDigestIsAPropertyOfTheContent:
     def _digest(path: Path) -> str:
         from hflow.episode import Episode
 
-        result = hflow.checks.content_digest(Episode(path))
+        result = asyncio.run(hflow.checks.content_digest(Episode(path)))
         return str(result.measurements["content_digest"])
 
     def test_the_emitted_value_is_the_digest_and_not_a_transform_of_it(
@@ -1310,7 +1323,9 @@ def test_media_digest_emits_exactly_the_documented_measurements(
     spec: SyntheticEpisodeSpec, expected_subset: dict[str, object], tmp_path: Path
 ) -> None:
     source = synthesize_episode(tmp_path / "md_source.mcap", spec)
-    report = hflow.App("md-fixture", data_root=tmp_path / "data").test(source, verbose=False)
+    report = asyncio.run(
+        hflow.App("md-fixture", data_root=tmp_path / "data").test(source, verbose=False)
+    )
     run = report.check("media_digest")
     assert run.result is not None
     measurements = dict(run.result.measurements)
@@ -1324,7 +1339,7 @@ def test_media_digest_emits_exactly_the_documented_measurements(
     # a different field) will not match.
     expected = dict(expected_subset)
     app = hflow.App("md-pin", data_root=tmp_path / "data2")
-    pin_report = app.test(source, verbose=False)
+    pin_report = asyncio.run(app.test(source, verbose=False))
     pin_run = pin_report.check("media_digest")
     assert pin_run.result is not None
     expected["/wrist_cam/compressed/media_digest"] = pin_run.result.measurements[

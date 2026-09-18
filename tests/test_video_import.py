@@ -1,5 +1,6 @@
 """Video import publishes complete, correctly sampled source episodes."""
 
+import asyncio
 import hashlib
 import subprocess
 from dataclasses import replace
@@ -99,13 +100,15 @@ def test_imported_excerpt_preserves_content_time_and_known_metadata(
     app = hflow.App("video-import", data_root=tmp_path / "worker", default_checks=())
 
     @app.check(version="1")
-    def sampled_images(episode: hflow.Episode) -> hflow.CheckResult:
+    async def sampled_images(episode: hflow.Episode) -> hflow.CheckResult:
         assert episode.metadata_records["episode/v1"] == dict(config.metadata)
         assert episode.metadata_records["video_import/v1"] == metadata["video_import/v1"]
         assert episode.cameras == ["/head/compressed"]
         return hflow.CheckResult(measurements={"frames": len(episode.frames(fps=4))})
 
-    report = app.process(output_path, record=False, stages={hflow.Stage.SYNC, hflow.Stage.META})
+    report = asyncio.run(
+        app.process(output_path, record=False, stages={hflow.Stage.SYNC, hflow.Stage.META})
+    )
     assert not report.has_errors, report.summary()
     result = report.check("sampled_images").result
     assert result is not None

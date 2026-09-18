@@ -10,6 +10,7 @@ A live object-store integration test runs only when
 ``HFLOW_TEST_BUCKET_URL`` is set (e.g. ``gs://bucket/tmp-prefix``).
 """
 
+import asyncio
 import errno
 import os
 import re
@@ -443,7 +444,7 @@ class TestBucketPipeline:
         app = hflow.App("bucket-pipeline", data_root=data_root)
 
         @app.check(version="1", name="always-good")
-        def always_good(_episode: hflow.Episode) -> hflow.CheckResult:
+        async def always_good(_episode: hflow.Episode) -> hflow.CheckResult:
             return hflow.CheckResult(verdict=True, measurements={"score": 1.0})
 
         @app.enrich(version="1", name="write-mask")
@@ -452,7 +453,7 @@ class TestBucketPipeline:
             artifact_path.write_bytes(b"mask")
             return hflow.EnrichmentResult(artifacts={"left/mask": artifact_path})
 
-        first_report = app.process(source_path)
+        first_report = asyncio.run(app.process(source_path))
         episode_directories = list((remote_directory / "episodes").iterdir())
         assert len(episode_directories) == 1
         episode_directory = episode_directories[0]
@@ -479,7 +480,9 @@ class TestBucketPipeline:
         assert artifact_row is not None
         assert artifact_row[0].startswith(f"{data_root.url}/episodes/")
 
-        repeated_report = app.process(source_path, stages={hflow.Stage.META, hflow.Stage.LABELS})
+        repeated_report = asyncio.run(
+            app.process(source_path, stages={hflow.Stage.META, hflow.Stage.LABELS})
+        )
         assert repeated_report.catalog_entry is not None
         assert repeated_report.catalog_entry.written is False
 
@@ -492,19 +495,19 @@ class TestBucketPipeline:
             SyntheticEpisodeSpec(duration_s=1.0, cameras=()),
         )
         app = hflow.App("bucket-sync-proof", data_root=data_root)
-        app.process(source_path, record=False, stages={hflow.Stage.SYNC})
+        asyncio.run(app.process(source_path, record=False, stages={hflow.Stage.SYNC}))
         episode_directory = next((remote_directory / "episodes").iterdir())
         published_canonical = episode_directory / "source.canonical.mcap"
         previous_bytes = published_canonical.read_bytes()
 
         source_path.write_bytes(b"not an mcap")
         with pytest.raises(InvalidMagic):
-            app.process(source_path, record=False, stages={hflow.Stage.SYNC})
+            asyncio.run(app.process(source_path, record=False, stages={hflow.Stage.SYNC}))
 
         assert published_canonical.read_bytes() == previous_bytes
         assert not (episode_directory / ".sync-complete.json").exists()
         with pytest.raises(FileNotFoundError, match="sync completion marker"):
-            app.process(source_path, record=False, stages={hflow.Stage.META})
+            asyncio.run(app.process(source_path, record=False, stages={hflow.Stage.META}))
 
 
 @pytest.mark.skipif(

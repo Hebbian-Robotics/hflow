@@ -75,22 +75,27 @@ The entry point may reference a provider **class** (discovery instantiates it wi
 Discovery is one call; the HTTP request stays yours:
 
 ```python
-import httpx  # your client, your dependency
+import asyncio
+import httpx2
 import os
 
 import hflow
+from hflow.asyncio_utils import run_blocking
 from hflow.providers import discover_providers
 
 
 @app.check(version="1", requires=("vision-model",))
-def grasp_succeeded(ep: hflow.Episode) -> hflow.CheckResult:
-    provider = discover_providers()["vllm"]
-    payload = provider.prepare_video_request(
-        ep.video("wrist_cam"),  # lossless remux, cached
+async def grasp_succeeded(ep: hflow.Episode) -> hflow.CheckResult:
+    provider = (await run_blocking(discover_providers))["vllm"]
+    payload = await run_blocking(
+        provider.prepare_video_request,
+        await run_blocking(ep.video, "wrist_cam"),  # lossless remux, cached
         "Did the gripper grasp the towel? yes/no",
     )
     endpoint = os.environ.get("MODEL_BASE_URL", "http://localhost:8000/v1")
-    response = httpx.post(f"{endpoint}/chat/completions", json=payload)
+    async with asyncio.timeout(60), httpx2.AsyncClient() as client:
+        response = await client.post(f"{endpoint}/chat/completions", json=payload)
+        response.raise_for_status()
     answer = response.json()["choices"][0]["message"]["content"]
     return hflow.CheckResult(measurements={"grasp_succeeded": "yes" in answer.lower()})
 ```

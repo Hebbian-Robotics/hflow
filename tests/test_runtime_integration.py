@@ -62,8 +62,8 @@ app = hflow.App("itest", data_root="/opt/airflow/data")
 
 
 @app.check(version="1")
-def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
-    return hflow.checks.timestamp_regularity(ep, tolerance_s=0.010)
+async def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
+    return await hflow.checks.timestamp_regularity(ep, tolerance_s=0.010)
 
 
 @app.enrich(version="1")

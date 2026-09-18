@@ -1,5 +1,6 @@
 """Grid resampling, derived signals, @app.transform, and camera-less ffmpeg provenance."""
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -313,7 +314,7 @@ def test_app_derive_end_to_end(cameraless_source: Path, tmp_path: Path) -> None:
     def joints_5hz(ep: Episode) -> DerivedSeries:
         return to_grid(ep.channel("/joint_states"), 5.0, policy="nearest", field="position")
 
-    report = app.test(cameraless_source, verbose=False)
+    report = asyncio.run(app.test(cameraless_source, verbose=False))
     assert report.stamps.ffmpeg_version == FFMPEG_VERSION_NOT_USED
     with Episode(report.canonical_path) as canonical_episode:
         derived_channel = canonical_episode.channel("/joints_5hz")
@@ -363,7 +364,7 @@ def test_transform_override_invoked_and_stamps_propagate(
         # The override contract: still end by calling write_canonical_episode.
         return write_canonical_episode(source, output, config, source_uri="custom://override")
 
-    report = app.test(cameraless_source, verbose=False)
+    report = asyncio.run(app.test(cameraless_source, verbose=False))
     assert override_calls == [(cameraless_source, report.canonical_path)]
     with Episode(report.canonical_path) as canonical_episode:
         assert canonical_episode.metadata["source_uri"] == "custom://override"

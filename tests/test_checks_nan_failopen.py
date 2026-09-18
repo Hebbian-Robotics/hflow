@@ -12,6 +12,7 @@ measurable, and no NaN ever leaving a check.
 
 from __future__ import annotations
 
+import asyncio
 import math
 from pathlib import Path
 
@@ -90,8 +91,8 @@ def test_duplicate_stamp_stream_refuses_instead_of_reporting_zero_violations(
             positions,
         ) as stream_b,
     ):
-        refused = joint_discontinuity(stream_a, velocity_limit=3.0)
-        measured = joint_discontinuity(stream_b, velocity_limit=3.0)
+        refused = asyncio.run(joint_discontinuity(stream_a, velocity_limit=3.0))
+        measured = asyncio.run(joint_discontinuity(stream_b, velocity_limit=3.0))
         _assert_all_measurements_finite(refused, measured)
         assert f"{TOPIC}/violation_pct" not in refused.measurements
         assert refused.measurements[f"{TOPIC}/velocity_measurable_step_count"] == 0
@@ -108,8 +109,8 @@ def test_all_nan_channel_withholds_every_percentage(tmp_path: Path) -> None:
     positions were unmeasurable."""
     stamps = [i * NS_PER_S for i in range(4)]
     with _joint_states_episode(tmp_path / "nan.mcap", stamps, [float("nan")] * 4) as episode:
-        velocity = joint_discontinuity(episode, velocity_limit=3.0)
-        idle = idle_fraction(episode, velocity_epsilon=0.05)
+        velocity = asyncio.run(joint_discontinuity(episode, velocity_limit=3.0))
+        idle = asyncio.run(idle_fraction(episode, velocity_epsilon=0.05))
         _assert_all_measurements_finite(velocity, idle)
         for key in ("violation_pct", "violation_count", "max_abs_velocity"):
             assert f"{TOPIC}/{key}" not in velocity.measurements
@@ -139,11 +140,11 @@ def test_unmeasurable_steps_do_not_dilate_percentage_denominators(
             [5.0, 5.0, float("nan")],
         ) as idle_episode,
     ):
-        velocity = joint_discontinuity(velocity_episode, velocity_limit=3.0)
+        velocity = asyncio.run(joint_discontinuity(velocity_episode, velocity_limit=3.0))
         assert velocity.measurements[f"{TOPIC}/violation_pct"] == pytest.approx(100.0 / 3.0)
         assert velocity.measurements[f"{TOPIC}/velocity_measurable_step_count"] == 3
         assert velocity.measurements[f"{TOPIC}/nonpositive_dt_count"] == 2
-        idle = idle_fraction(idle_episode, velocity_epsilon=0.05)
+        idle = asyncio.run(idle_fraction(idle_episode, velocity_epsilon=0.05))
         assert idle.measurements[f"{TOPIC}/idle_fraction"] == pytest.approx(1.0)
         assert idle.measurements[f"{TOPIC}/idle_measurable_step_count"] == 1
         _assert_all_measurements_finite(velocity, idle)
@@ -159,8 +160,8 @@ def test_every_percentage_names_the_time_it_could_not_measure(
         [0, 0, NS_PER_S],
         [0.0, 5.0, 5.0],
     ) as episode:
-        velocity = joint_discontinuity(episode, velocity_limit=3.0)
-        idle = idle_fraction(episode, velocity_epsilon=0.05)
+        velocity = asyncio.run(joint_discontinuity(episode, velocity_limit=3.0))
+        idle = asyncio.run(idle_fraction(episode, velocity_epsilon=0.05))
         assert velocity.measurements[f"{TOPIC}/nonpositive_dt_count"] == 1
         assert f"{TOPIC}/violation_pct" in velocity.measurements
         assert idle.measurements[f"{TOPIC}/idle_nonpositive_dt_count"] == 1

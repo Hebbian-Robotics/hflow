@@ -18,7 +18,7 @@ app = hflow.App("ui-demo", default_checks=())
 
 
 @app.check(version="1", name="joint_check", critical=True)
-def joint_check(episode):
+async def joint_check(episode):
     return hflow.CheckResult(measurements={"max_velocity": 1.0}, verdict=True)
 
 

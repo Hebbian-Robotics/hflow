@@ -7,6 +7,7 @@ which is about ordering: it exists because a planner that ran before `sync`
 instead of after it would pass every other test in this file.
 """
 
+import asyncio
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -41,8 +42,8 @@ app = hflow.App("planning-demo")
 
 
 @app.check(version="1")
-def my_duration(ep: hflow.Episode) -> hflow.CheckResult:
-    return episode_duration(ep)
+async def my_duration(ep: hflow.Episode) -> hflow.CheckResult:
+    return await episode_duration(ep)
 """
 
 PIPELINE_WITHOUT_DEFAULT_CHECKS = """
@@ -62,8 +63,8 @@ app = hflow.App("planning-demo")
 
 
 @app.check(version="1")
-def my_camera_frame_stats(ep: hflow.Episode) -> hflow.CheckResult:
-    return camera_frame_stats(ep)
+async def my_camera_frame_stats(ep: hflow.Episode) -> hflow.CheckResult:
+    return await camera_frame_stats(ep)
 """
 
 
@@ -94,11 +95,13 @@ def _ingest(
 ) -> list[StageOutcome]:
     """One in-process ingest of the project's own pipeline."""
     app = hflow.import_pipeline_application(str(project / "pipeline.py"))
-    return run_stages_directly(
-        app,
-        list(uris) or [EPISODE_URI],
-        hflow.RUN_PROFILES["full"],
-        **({"selection": selection} if selection is not None else {}),
+    return asyncio.run(
+        run_stages_directly(
+            app,
+            list(uris) or [EPISODE_URI],
+            hflow.RUN_PROFILES["full"],
+            **({"selection": selection} if selection is not None else {}),
+        )
     )
 
 
@@ -158,32 +161,38 @@ def test_selected_steps_are_planned_and_replayed_independently(
     invocation_counts = {"first_check": 0, "second_check": 0}
 
     @application.check(version="1")
-    def first_check(ep: hflow.Episode) -> hflow.CheckResult:
+    async def first_check(ep: hflow.Episode) -> hflow.CheckResult:
         invocation_counts["first_check"] += 1
         return hflow.CheckResult(measurements={"first": 1.0})
 
     @application.check(version="1")
-    def second_check(ep: hflow.Episode) -> hflow.CheckResult:
+    async def second_check(ep: hflow.Episode) -> hflow.CheckResult:
         invocation_counts["second_check"] += 1
         return hflow.CheckResult(measurements={"second": 1.0})
 
-    first_run = run_stages_directly(
-        application,
-        [EPISODE_URI],
-        hflow.RUN_PROFILES["full"],
-        step_names={"first_check"},
+    first_run = asyncio.run(
+        run_stages_directly(
+            application,
+            [EPISODE_URI],
+            hflow.RUN_PROFILES["full"],
+            step_names={"first_check"},
+        )
     )
-    repeated_first_run = run_stages_directly(
-        application,
-        [EPISODE_URI],
-        hflow.RUN_PROFILES["full"],
-        step_names={"first_check"},
+    repeated_first_run = asyncio.run(
+        run_stages_directly(
+            application,
+            [EPISODE_URI],
+            hflow.RUN_PROFILES["full"],
+            step_names={"first_check"},
+        )
     )
-    second_run = run_stages_directly(
-        application,
-        [EPISODE_URI],
-        hflow.RUN_PROFILES["full"],
-        step_names={"second_check"},
+    second_run = asyncio.run(
+        run_stages_directly(
+            application,
+            [EPISODE_URI],
+            hflow.RUN_PROFILES["full"],
+            step_names={"second_check"},
+        )
     )
 
     assert invocation_counts == {"first_check": 1, "second_check": 1}
@@ -202,7 +211,7 @@ class TestWhatSchedulesWorkAgain:
             + """
 
 @app.check(version="1")
-def added_later(ep: hflow.Episode) -> hflow.CheckResult:
+async def added_later(ep: hflow.Episode) -> hflow.CheckResult:
     return hflow.CheckResult(measurements={"added": 1.0})
 """
         )
@@ -294,7 +303,9 @@ class TestTheEscapeHatches:
         _ingest(project)
         app = hflow.import_pipeline_application(str(project / "pipeline.py"))
 
-        backfill = run_stages_directly(app, [EPISODE_URI], hflow.RUN_PROFILES["metadata_backfill"])
+        backfill = asyncio.run(
+            run_stages_directly(app, [EPISODE_URI], hflow.RUN_PROFILES["metadata_backfill"])
+        )
 
         assert _stage(backfill, hflow.Stage.META).counts["processed"] == 1
         assert _stage(backfill, hflow.Stage.META).skipped_as_current == 0
@@ -323,8 +334,8 @@ app = hflow.App("planning-demo", default_checks=())
 
 
 @app.check(version={version!r}, critical=True)
-def long_enough(ep: hflow.Episode) -> hflow.CheckResult:
-    seconds = float(episode_duration(ep).measurements["duration_s"])
+async def long_enough(ep: hflow.Episode) -> hflow.CheckResult:
+    seconds = float((await episode_duration(ep)).measurements["duration_s"])
     return hflow.CheckResult(
         measurements={{"seconds": seconds}}, verdict=seconds >= {minimum_duration_s}
     )
@@ -373,7 +384,7 @@ class TestUnQuarantiningAnEpisode:
         _ingest(project)
         (project / "pipeline.py").write_text(_pipeline_with_a_gate_at(0.1, version="2"))
         app = hflow.import_pipeline_application(str(project / "pipeline.py"))
-        run_stages_directly(app, [EPISODE_URI], {hflow.Stage.SYNC, hflow.Stage.META})
+        asyncio.run(run_stages_directly(app, [EPISODE_URI], {hflow.Stage.SYNC, hflow.Stage.META}))
 
         # meta cleared the quarantine; labels has not run yet.
         assert create_dataset(app, "too-early").row_count == 0
@@ -439,7 +450,7 @@ class TestARecordingSyncCouldNotCanonicalize:
             + """
 
 @app.check(version="1")
-def explodes(ep: hflow.Episode) -> hflow.CheckResult:
+async def explodes(ep: hflow.Episode) -> hflow.CheckResult:
     raise RuntimeError("boom")
 """
         )
@@ -485,10 +496,12 @@ class TestMediaPlanning:
     ) -> None:
         (project / "data" / EPISODE_URI).write_bytes(camera_source.read_bytes())
         application = hflow.import_pipeline_application(str(project / "pipeline.py"))
-        run_stages_directly(
-            application,
-            [EPISODE_URI],
-            {hflow.Stage.SYNC, hflow.Stage.META},
+        asyncio.run(
+            run_stages_directly(
+                application,
+                [EPISODE_URI],
+                {hflow.Stage.SYNC, hflow.Stage.META},
+            )
         )
 
         second = _ingest(project)
@@ -523,10 +536,12 @@ class TestMediaPlanning:
         (project / "data" / EPISODE_URI).write_bytes(camera_source.read_bytes())
         (project / "pipeline.py").write_text(PIPELINE_THAT_SUPERSEDES_CAMERA_FRAME_STATS)
         application = hflow.import_pipeline_application(str(project / "pipeline.py"))
-        run_stages_directly(
-            application,
-            [EPISODE_URI],
-            {hflow.Stage.SYNC, hflow.Stage.META},
+        asyncio.run(
+            run_stages_directly(
+                application,
+                [EPISODE_URI],
+                {hflow.Stage.SYNC, hflow.Stage.META},
+            )
         )
 
         second = _ingest(project)
@@ -582,7 +597,7 @@ class TestFilteringAScheduledStagesUris:
         """Sync alone leaves meta outstanding, which is the case the filter has
         to keep: dropping it would silently never run the checks."""
         application = self._application(project)
-        run_stages_directly(application, [EPISODE_URI], frozenset({hflow.Stage.SYNC}))
+        asyncio.run(run_stages_directly(application, [EPISODE_URI], frozenset({hflow.Stage.SYNC})))
 
         assert self._filter(project, hflow.Stage.META) == [EPISODE_URI]
 
@@ -596,7 +611,7 @@ class TestFilteringAScheduledStagesUris:
             + """
 
 @app.check(version="1")
-def added_later(ep: hflow.Episode) -> hflow.CheckResult:
+async def added_later(ep: hflow.Episode) -> hflow.CheckResult:
     return hflow.CheckResult(evidence={})
 """
         )

@@ -6,14 +6,16 @@ Run from the repository root with:
       uv run --extra openai python examples/openai_vision/pipeline.py [episode.mcap]
 """
 
+import asyncio
 import base64
 import os
 import sys
 from pathlib import Path
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 import hflow
+from hflow.asyncio_utils import run_blocking
 
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 ACTIVITY_PROMPT = (
@@ -38,33 +40,34 @@ def _image_data_url(image_path: Path) -> str:
 
 
 @app.check(requires=("vision-model",), version="responses-contact-sheet-v1")
-def describe_activity(episode: hflow.Episode) -> hflow.CheckResult:
-    contact_sheet = hflow.ffmpeg.contact_sheet(
-        episode.frames(fps=0.5),
+async def describe_activity(episode: hflow.Episode) -> hflow.CheckResult:
+    contact_sheet = await run_blocking(
+        hflow.ffmpeg.contact_sheet,
+        await run_blocking(episode.frames, fps=0.5),
         episode.workdir / "openai-vision-contact-sheet.jpg",
         columns=4,
         max_tiles=12,
     )
-    client = OpenAI(
+    model_name = os.environ["OPENAI_MODEL"]
+    async with AsyncOpenAI(
         api_key=os.environ["OPENAI_API_KEY"],
         base_url=OPENAI_BASE_URL,
-    )
-    model_name = os.environ["OPENAI_MODEL"]
-    response = client.responses.create(
-        model=model_name,
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": ACTIVITY_PROMPT},
-                    {
-                        "type": "input_image",
-                        "image_url": _image_data_url(contact_sheet.path),
-                    },
-                ],
-            }
-        ],
-    )
+    ) as client:
+        response = await client.responses.create(
+            model=model_name,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": ACTIVITY_PROMPT},
+                        {
+                            "type": "input_image",
+                            "image_url": await run_blocking(_image_data_url, contact_sheet.path),
+                        },
+                    ],
+                }
+            ],
+        )
     return hflow.CheckResult(
         measurements={
             "activity_description": response.output_text,
@@ -75,41 +78,43 @@ def describe_activity(episode: hflow.Episode) -> hflow.CheckResult:
 
 
 @app.check(requires=("vision-model",), version="hand-visibility-contact-sheet-v1")
-def hand_visibility(episode: hflow.Episode) -> hflow.CheckResult:
+async def hand_visibility(episode: hflow.Episode) -> hflow.CheckResult:
     """Measure hand visibility as a model judgment rather than a signal statistic.
 
     The check samples frames, asks the model, and records the visible fraction
     as evidence. The keep/drop threshold stays a curation query.
     """
-    contact_sheet = hflow.ffmpeg.contact_sheet(
-        episode.frames(fps=0.5),
+    contact_sheet = await run_blocking(
+        hflow.ffmpeg.contact_sheet,
+        await run_blocking(episode.frames, fps=0.5),
         episode.workdir / "hand-visibility-contact-sheet.jpg",
         columns=4,
         max_tiles=12,
     )
     tile_count = len(contact_sheet.tile_log_times_ns)
-    client = OpenAI(
+    model_name = os.environ["OPENAI_MODEL"]
+    async with AsyncOpenAI(
         api_key=os.environ["OPENAI_API_KEY"],
         base_url=OPENAI_BASE_URL,
-    )
-    response = client.responses.create(
-        model=os.environ["OPENAI_MODEL"],
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": HAND_VISIBILITY_PROMPT.format(tile_count=tile_count),
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": _image_data_url(contact_sheet.path),
-                    },
-                ],
-            }
-        ],
-    )
+    ) as client:
+        response = await client.responses.create(
+            model=model_name,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": HAND_VISIBILITY_PROMPT.format(tile_count=tile_count),
+                        },
+                        {
+                            "type": "input_image",
+                            "image_url": await run_blocking(_image_data_url, contact_sheet.path),
+                        },
+                    ],
+                }
+            ],
+        )
     answer_text = response.output_text.strip()
     measurements: dict[str, hflow.MeasurementValue] = {
         "hands_visible_raw_answer": answer_text,
@@ -132,7 +137,7 @@ def main() -> None:
             print(f"synthesizing a sample episode at {episode_path} ...")
             hflow.testing.synthesize_episode(episode_path)
 
-    app.test(episode_path)
+    asyncio.run(app.test(episode_path))
 
 
 if __name__ == "__main__":

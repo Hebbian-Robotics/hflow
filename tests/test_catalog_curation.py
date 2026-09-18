@@ -1,5 +1,6 @@
 """Catalog appends and curation queries (issues #16/#17)."""
 
+import asyncio
 import tempfile
 from dataclasses import replace
 from pathlib import Path
@@ -737,13 +738,13 @@ def recorded_data_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
     app = hflow.App("catalog-pipeline", data_root=data_root)
 
     @app.check(version="1")
-    def joints(ep: hflow.Episode) -> hflow.CheckResult:
-        return hflow.checks.joint_discontinuity(ep)
+    async def joints(ep: hflow.Episode) -> hflow.CheckResult:
+        return await hflow.checks.joint_discontinuity(ep)
 
     @app.check(version="1", critical=True)
-    def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
+    async def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
         camera_topic = next(topic for topic in ep.cameras if "wrist_cam" in topic)
-        camera_evidence = camera_frame_stats(ep, cameras=[camera_topic])
+        camera_evidence = await camera_frame_stats(ep, cameras=[camera_topic])
         black_frame_percent = camera_evidence.measurements[f"{camera_topic}/black_frame_pct"]
         assert isinstance(black_frame_percent, float)
         return hflow.CheckResult(
@@ -752,17 +753,19 @@ def recorded_data_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
         )
 
     @app.check(version="1")
-    def late_check(ep: hflow.Episode) -> hflow.CheckResult:
+    async def late_check(ep: hflow.Episode) -> hflow.CheckResult:
         # Registered after the gate: skipped on quarantined episodes, so its
         # coverage must come out below 100%.
         return hflow.CheckResult(measurements={"late_metric": 1.0})
 
     for task_name, spec in episode_specs.items():
         source = synthesize_episode(sources_dir / f"{task_name}.mcap", spec)
-        report = app.test(source, verbose=False, record=True)
+        report = asyncio.run(app.test(source, verbose=False, record=True))
         assert report.catalog_entry is not None and report.catalog_entry.written
 
-    rerun_report = app.test(sources_dir / "fold_napkin.mcap", verbose=False, record=True)
+    rerun_report = asyncio.run(
+        app.test(sources_dir / "fold_napkin.mcap", verbose=False, record=True)
+    )
     assert rerun_report.catalog_entry is not None
     return data_root
 

@@ -10,12 +10,14 @@ The canonical episode it writes under ./data/test-runs/ opens directly in
 Foxglove and Rerun.
 """
 
+import asyncio
 import sys
 from pathlib import Path
 
 import numpy as np
 
 import hflow
+from hflow.asyncio_utils import run_blocking
 
 # Imported as functions because the pipeline calls them directly. The versions
 # below are explicit compatibility promises; bump them when an implementation
@@ -35,21 +37,24 @@ app = hflow.App("kitchen-pipeline")
 
 
 @app.check(version="1")
-def joint_smoothness(ep: hflow.Episode) -> hflow.CheckResult:
-    joints = ep.channel("/joint_states").to_numpy()
-    measurements = check_joint_smoothness(joints, rate_hz=100)
+async def joint_smoothness(ep: hflow.Episode) -> hflow.CheckResult:
+    def measure_joint_smoothness() -> dict[str, float]:
+        joints = ep.channel("/joint_states").to_numpy()
+        return check_joint_smoothness(joints, rate_hz=100)
+
+    measurements = await run_blocking(measure_joint_smoothness)
     return hflow.CheckResult(measurements=dict(measurements))
 
 
 @app.check(version="1")
-def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
-    return timestamp_regularity(ep, tolerance_s=0.005)
+async def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
+    return await timestamp_regularity(ep, tolerance_s=0.005)
 
 
 @app.check(version="1", critical=True)
-def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
+async def camera_blackout(ep: hflow.Episode) -> hflow.CheckResult:
     camera_topic = next(topic for topic in ep.cameras if "wrist_cam" in topic)
-    evidence = camera_frame_stats(ep, cameras=[camera_topic])
+    evidence = await camera_frame_stats(ep, cameras=[camera_topic])
     black_frame_percent = evidence.measurements[f"{camera_topic}/black_frame_pct"]
     assert isinstance(black_frame_percent, float)
     return hflow.CheckResult(
@@ -67,7 +72,7 @@ def main() -> None:
             print(f"synthesizing a sample episode at {episode_path} ...")
             hflow.testing.synthesize_episode(episode_path)
 
-    app.test(episode_path)
+    asyncio.run(app.test(episode_path))
 
 
 if __name__ == "__main__":

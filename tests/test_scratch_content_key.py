@@ -7,6 +7,7 @@ catalog then stores old measurements under the new content ``episode_id``.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -85,7 +86,7 @@ def test_sync_omitted_meta_remeasures_after_canonical_mutation(
     if with_media:
         stages.add(hflow.Stage.MEDIA)
 
-    first = app.process(source, stages=stages | {hflow.Stage.SYNC}, verbose=False)
+    first = asyncio.run(app.process(source, stages=stages | {hflow.Stage.SYNC}, verbose=False))
     assert not first.has_errors
     first_black = _black_frame_pct(first)
     assert first_black == pytest.approx(0.0, abs=0.6)
@@ -102,12 +103,14 @@ def test_sync_omitted_meta_remeasures_after_canonical_mutation(
     black_source = synthesize_episode(tmp_path / "black.mcap", _BLACK_SPEC)
     # Replacement canonical keeps the same pipeline stamps (marker still
     # validates) but different camera bytes -- content hash changes.
-    replacement = app.process(
-        black_source,
-        record=False,
-        stages={hflow.Stage.SYNC},
-        output_dir=tmp_path / "replacement-run",
-        verbose=False,
+    replacement = asyncio.run(
+        app.process(
+            black_source,
+            record=False,
+            stages={hflow.Stage.SYNC},
+            output_dir=tmp_path / "replacement-run",
+            verbose=False,
+        )
     )
     assert content_episode_id(replacement.canonical_path) != first_episode_id
     first.canonical_path.write_bytes(replacement.canonical_path.read_bytes())
@@ -115,7 +118,7 @@ def test_sync_omitted_meta_remeasures_after_canonical_mutation(
         assert path.read_bytes() == payload
         assert path.stat().st_mtime_ns == mtime_ns
 
-    second = app.process(source, stages=stages, verbose=False)
+    second = asyncio.run(app.process(source, stages=stages, verbose=False))
     assert not second.has_errors
     second_black = _black_frame_pct(second)
     assert content_episode_id(second.canonical_path) == content_episode_id(
@@ -166,10 +169,12 @@ def test_file_bucket_sync_omitted_worker_does_not_reuse_peer_stale_scratch(
     worker1 = _app("worker1", worker1_root)
     worker2 = _app("worker2", worker2_root)
 
-    v1 = worker1.process(
-        "landing/episode.mcap",
-        stages={hflow.Stage.SYNC, hflow.Stage.META},
-        verbose=False,
+    v1 = asyncio.run(
+        worker1.process(
+            "landing/episode.mcap",
+            stages={hflow.Stage.SYNC, hflow.Stage.META},
+            verbose=False,
+        )
     )
     v1_black = _black_frame_pct(v1)
     assert v1_black == pytest.approx(0.0, abs=0.6)
@@ -178,10 +183,12 @@ def test_file_bucket_sync_omitted_worker_does_not_reuse_peer_stale_scratch(
 
     black_local = synthesize_episode(tmp_path / "black.mcap", _BLACK_SPEC)
     worker2_root.publish(black_local, "landing/episode.mcap")
-    v2 = worker2.process(
-        "landing/episode.mcap",
-        stages={hflow.Stage.SYNC, hflow.Stage.META},
-        verbose=False,
+    v2 = asyncio.run(
+        worker2.process(
+            "landing/episode.mcap",
+            stages={hflow.Stage.SYNC, hflow.Stage.META},
+            verbose=False,
+        )
     )
     v2_black = _black_frame_pct(v2)
     assert v2_black == pytest.approx(100.0 * 5 / 15, abs=5.0)
@@ -190,10 +197,12 @@ def test_file_bucket_sync_omitted_worker_does_not_reuse_peer_stale_scratch(
 
     # Worker 1 still has the v1 remux under its mirror; sync-omitted META must
     # fetch the v2 canonical and measure v2 pixels, not the cached remux.
-    measured = worker1.process(
-        "landing/episode.mcap",
-        stages={hflow.Stage.META},
-        verbose=False,
+    measured = asyncio.run(
+        worker1.process(
+            "landing/episode.mcap",
+            stages={hflow.Stage.META},
+            verbose=False,
+        )
     )
     measured_black = _black_frame_pct(measured)
     assert content_episode_id(measured.canonical_path) == v2_id
@@ -218,7 +227,7 @@ def test_unchanged_content_reuses_scratch_and_sync_rewrite_clears_it(tmp_path: P
     source = synthesize_episode(tmp_path / "clean.mcap", _CLEAN_SPEC)
     app = _app("scratch-lifecycle", tmp_path / "data")
     stages = {hflow.Stage.SYNC, hflow.Stage.META, hflow.Stage.MEDIA}
-    first = app.process(source, stages=stages)
+    first = asyncio.run(app.process(source, stages=stages))
     assert not first.has_errors
     scratch_root = first.canonical_path.parent / "scratch"
     artifacts = list(scratch_root.rglob("*.mp4")) + list(scratch_root.rglob("*.jpg"))
@@ -226,7 +235,7 @@ def test_unchanged_content_reuses_scratch_and_sync_rewrite_clears_it(tmp_path: P
     assert any(path.suffix == ".jpg" for path in artifacts)
     before = {path: (path.stat().st_mtime_ns, path.read_bytes()) for path in artifacts}
     for replay_stages in (stages, stages - {hflow.Stage.SYNC}):
-        replay = app.process(source, stages=replay_stages)
+        replay = asyncio.run(app.process(source, stages=replay_stages))
         assert not replay.has_errors
         assert replay.sync_reused == (hflow.Stage.SYNC in replay_stages)
         assert _black_frame_pct(replay) == pytest.approx(_black_frame_pct(first))
@@ -241,7 +250,7 @@ def test_unchanged_content_reuses_scratch_and_sync_rewrite_clears_it(tmp_path: P
     old_content.mkdir()
     (old_content / "stale.mp4").write_bytes(b"obsolete keyed cache")
     (first.canonical_path.parent / ".sync-complete.json").unlink()
-    rewritten = app.process(source, stages=stages)
+    rewritten = asyncio.run(app.process(source, stages=stages))
     assert not rewritten.has_errors
     assert not rewritten.sync_reused
     assert not legacy_file.exists()

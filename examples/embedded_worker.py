@@ -12,6 +12,7 @@ Run from the repository root::
 """
 
 import argparse
+import asyncio
 import json
 from collections.abc import Sequence
 from pathlib import Path
@@ -42,8 +43,8 @@ def process_videos(
         application = App("video-worker", data_root=workspace_path, default_checks=())
 
         @application.check(version="1")
-        def camera_quality(episode: Episode) -> CheckResult:
-            return checks.camera_frame_stats(episode)
+        async def camera_quality(episode: Episode) -> CheckResult:
+            return await checks.camera_frame_stats(episode)
 
         episode_paths = [
             import_video_episode(
@@ -53,11 +54,13 @@ def process_videos(
             )
             for source_index, source_path in enumerate(source_paths)
         ]
-        batch_report = application.process_many(
-            episode_paths,
-            record=False,
-            stages=(Stage.SYNC, Stage.META),
-            max_workers=max_workers,
+        batch_report = asyncio.run(
+            application.process_many(
+                episode_paths,
+                record=False,
+                stages=(Stage.SYNC, Stage.META),
+                max_workers=max_workers,
+            )
         )
         measurements: list[dict[str, MeasurementValue]] = []
         for report in batch_report.reports:

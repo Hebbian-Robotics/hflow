@@ -61,23 +61,25 @@ credentials, retry policy, and other client settings under one owner:
 
 ```python
 @app.check(requires=("vision-model",), version="responses-contact-sheet-v1")
-def describe_activity(episode: hflow.Episode) -> hflow.CheckResult:
-    client = OpenAI(
+async def describe_activity(episode: hflow.Episode) -> hflow.CheckResult:
+    from openai import AsyncOpenAI
+
+    async with AsyncOpenAI(
         api_key=os.environ["OPENAI_API_KEY"],
         base_url=OPENAI_BASE_URL,
-    )
-    response = client.responses.create(
-        model=os.environ["OPENAI_MODEL"],
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": ACTIVITY_PROMPT},
-                    {"type": "input_image", "image_url": contact_sheet_data_url},
-                ],
-            }
-        ],
-    )
+    ) as client:
+        response = await client.responses.create(
+            model=os.environ["OPENAI_MODEL"],
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": ACTIVITY_PROMPT},
+                        {"type": "input_image", "image_url": contact_sheet_data_url},
+                    ],
+                }
+            ],
+        )
     return hflow.CheckResult(measurements={"activity_description": response.output_text})
 ```
 
