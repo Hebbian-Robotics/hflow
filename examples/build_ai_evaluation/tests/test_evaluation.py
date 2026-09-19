@@ -27,15 +27,16 @@ from examples.build_ai_evaluation.evaluate import (
     SampleResponseMetadata,
     SourceSelection,
     SuccessfulSampleOutcome,
-    _argument_parser,
     _prepare_output_directory,
-    _run_configuration_from_arguments,
     _run_metadata_document,
     _sample_result,
     _sanitize_base_url,
     iter_evaluation_frames,
     main,
     summarize_results,
+)
+from examples.build_ai_evaluation.evaluate import (
+    app as evaluate_app,
 )
 from examples.build_ai_evaluation.pipeline import (
     _argument_parser as pipeline_argument_parser,
@@ -57,6 +58,7 @@ from hflow.build_ai_vlm_checks import (
     parse_active_manipulation_response,
     parse_hand_count_response,
 )
+from typer.testing import CliRunner
 
 
 class _FixtureUsage:
@@ -714,8 +716,22 @@ def test_base_url_metadata_drops_embedded_credentials_and_query_values() -> None
     )
 
 
-def test_cli_preserves_typed_source_and_task_selections() -> None:
-    arguments = _argument_parser().parse_args(
+def test_cli_preserves_typed_source_and_task_selections(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured_configurations: list[EvaluationConfiguration] = []
+
+    def fake_run_evaluation(
+        configuration: EvaluationConfiguration, *, download: bool = False
+    ) -> None:
+        captured_configurations.append(configuration)
+
+    monkeypatch.setattr(
+        "examples.build_ai_evaluation.evaluate.run_evaluation",
+        fake_run_evaluation,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        evaluate_app,
         [
             "run",
             "--dataset",
@@ -728,11 +744,12 @@ def test_cli_preserves_typed_source_and_task_selections() -> None:
             "vision-model",
             "--base-url",
             "http://localhost:8000/v1",
-        ]
+        ],
     )
 
-    configuration = _run_configuration_from_arguments(arguments)
-
+    assert result.exit_code == 0
+    assert len(captured_configurations) == 1
+    configuration = captured_configurations[0]
     assert configuration.selected_sources == (SourceSelection.BUILD_AI,)
     assert configuration.selected_tasks == (EvaluationTask.HAND_COUNT,)
 
@@ -870,3 +887,102 @@ def test_run_missing_file_exits_2(
     assert "No such file or directory" in captured.err
     assert missing_file in captured.err
     assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize(
+    ("flag", "invalid_value"),
+    [
+        ("--max-tokens", "0"),
+        ("--max-tokens", "-5"),
+        ("--max-retries", "0"),
+        ("--workers", "0"),
+        ("--limit", "0"),
+        ("--limit", "-1"),
+    ],
+)
+def test_cli_positive_integer_bounds_rejected(flag: str, invalid_value: str) -> None:
+    runner = CliRunner()
+    result = runner.invoke(
+        evaluate_app,
+        [
+            "run",
+            "--dataset",
+            "10k",
+            "--model",
+            "model-name",
+            "--base-url",
+            "http://localhost:8000/v1",
+            flag,
+            invalid_value,
+        ],
+    )
+    assert result.exit_code == 2
+    assert "not in the range x>=1" in result.output
+
+
+def test_cli_help_displays_subcommands_and_options() -> None:
+    runner = CliRunner()
+
+    top_help = runner.invoke(evaluate_app, ["--help"])
+    assert top_help.exit_code == 0
+    assert "run" in top_help.output
+    assert "compare" in top_help.output
+
+    run_help = runner.invoke(evaluate_app, ["run", "--help"])
+    assert run_help.exit_code == 0
+    assert "--dataset" in run_help.output
+    assert "--source" in run_help.output
+    assert "--task" in run_help.output
+    assert "--model" in run_help.output
+    assert "--base-url" in run_help.output
+    assert "--max-tokens" in run_help.output
+    assert "--limit" in run_help.output
+
+    compare_help = runner.invoke(evaluate_app, ["compare", "--help"])
+    assert compare_help.exit_code == 0
+    assert "summaries" in compare_help.output
+
+
+def test_cli_repeated_source_and_task_preserved(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured_configurations: list[EvaluationConfiguration] = []
+
+    def fake_run_evaluation(
+        configuration: EvaluationConfiguration, *, download: bool = False
+    ) -> None:
+        captured_configurations.append(configuration)
+
+    monkeypatch.setattr(
+        "examples.build_ai_evaluation.evaluate.run_evaluation",
+        fake_run_evaluation,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        evaluate_app,
+        [
+            "run",
+            "--dataset",
+            "10k",
+            "--source",
+            "build",
+            "--source",
+            "ego4d",
+            "--task",
+            "hand-count",
+            "--task",
+            "active-manipulation",
+            "--model",
+            "test-model",
+            "--base-url",
+            "http://localhost:8000/v1",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert len(captured_configurations) == 1
+    config = captured_configurations[0]
+    assert config.selected_sources == (SourceSelection.BUILD_AI, SourceSelection.EGO4D)
+    assert config.selected_tasks == (
+        EvaluationTask.HAND_COUNT,
+        EvaluationTask.ACTIVE_MANIPULATION,
+    )

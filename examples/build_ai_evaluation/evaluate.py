@@ -11,7 +11,6 @@ for prerequisites, commands, costs, outputs, and methodology notes.
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import importlib.metadata
 import json
@@ -30,6 +29,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import duckdb
 import hflow
+import typer
 from inspect_ai import SampleSource, Task, eval_set
 from inspect_ai.dataset import Sample
 from inspect_ai.log import EvalLog, EvalSample, read_eval_log
@@ -43,6 +43,7 @@ from inspect_ai.model import (
 from inspect_ai.scorer import Score, Scorer, Target, categorical, mean, scorer
 from inspect_ai.solver import TaskState
 from inspect_ai.util import JSONSchema
+from typer._click import exceptions as click_exceptions
 
 REPOSITORY_ROOT = str(Path(__file__).resolve().parents[2])
 if REPOSITORY_ROOT not in sys.path:
@@ -974,129 +975,219 @@ def compare_summaries(summary_paths: Sequence[Path]) -> None:
             )
 
 
-def _positive_integer(raw_value: str) -> int:
-    parsed_value = int(raw_value)
-    if parsed_value <= 0:
-        raise argparse.ArgumentTypeError("must be a positive integer")
-    return parsed_value
-
-
 def _default_output_directory(dataset_variant: DatasetVariant, model: str) -> Path:
     sanitized_model_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", model).strip("-") or "model"
     return DEFAULT_RUNS_DIRECTORY / f"{dataset_variant.value}-{sanitized_model_name}"
 
 
-def _run_configuration_from_arguments(arguments: argparse.Namespace) -> EvaluationConfiguration:
-    if not arguments.model:
+def build_evaluation_configuration(
+    *,
+    dataset: DatasetVariant,
+    source: Sequence[SourceSelection] | None = None,
+    task: Sequence[EvaluationTask] | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+    api_key_env: str = "OPENAI_API_KEY",
+    allow_missing_api_key: bool = False,
+    response_format: ResponseFormat = ResponseFormat.JSON_SCHEMA,
+    temperature: float | None = None,
+    max_tokens: int = 32,
+    max_retries: int = 5,
+    workers: int = 8,
+    limit: int | None = None,
+    data_directory: Path = DEFAULT_DATA_DIRECTORY,
+    output: Path | None = None,
+    label: str | None = None,
+    hand_count_prompt: Path | None = None,
+    active_manipulation_prompt: Path | None = None,
+) -> EvaluationConfiguration:
+    if not model:
         raise ValueError("--model or OPENAI_MODEL is required")
-    if not arguments.base_url:
+    if not base_url:
         raise ValueError("--base-url or OPENAI_BASE_URL is required")
-    dataset_variant = DatasetVariant(arguments.dataset)
-    output_directory = arguments.output or _default_output_directory(
-        dataset_variant, arguments.model
-    )
-    task_definitions = load_task_definitions(
-        arguments.hand_count_prompt, arguments.active_manipulation_prompt
-    )
+    output_directory = output or _default_output_directory(dataset, model)
+    task_definitions = load_task_definitions(hand_count_prompt, active_manipulation_prompt)
     return EvaluationConfiguration(
-        dataset_variant=dataset_variant,
-        selected_sources=_selected_sources(arguments.source),
-        selected_tasks=_selected_tasks(arguments.task),
-        data_directory=arguments.data_directory,
+        dataset_variant=dataset,
+        selected_sources=_selected_sources(source),
+        selected_tasks=_selected_tasks(task),
+        data_directory=data_directory,
         output_directory=output_directory,
-        model=arguments.model,
-        base_url=arguments.base_url,
-        api_key_environment_variable=arguments.api_key_env,
-        allow_missing_api_key=arguments.allow_missing_api_key,
-        response_format=ResponseFormat(arguments.response_format),
-        temperature=arguments.temperature,
-        max_tokens=arguments.max_tokens,
-        max_retries=arguments.max_retries,
-        worker_count=arguments.workers,
-        row_limit_per_source=arguments.limit,
-        label=arguments.label or arguments.model,
+        model=model,
+        base_url=base_url,
+        api_key_environment_variable=api_key_env,
+        allow_missing_api_key=allow_missing_api_key,
+        response_format=response_format,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        max_retries=max_retries,
+        worker_count=workers,
+        row_limit_per_source=limit,
+        label=label or model,
         task_definitions=task_definitions,
     )
 
 
-def _argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    run_parser = subparsers.add_parser("run", help="run an Inspect evaluation")
-    run_parser.add_argument("--dataset", type=DatasetVariant, choices=DatasetVariant, required=True)
-    run_parser.add_argument(
+app = typer.Typer(
+    help=__doc__,
+    no_args_is_help=True,
+    add_completion=False,
+)
+
+
+@app.command("run", help="run an Inspect evaluation")
+def run_command(
+    dataset: DatasetVariant = typer.Option(
+        ...,
+        "--dataset",
+        help="Dataset variant to evaluate.",
+        case_sensitive=False,
+    ),
+    source: list[SourceSelection] | None = typer.Option(
+        None,
         "--source",
-        action="append",
-        type=SourceSelection,
-        choices=SourceSelection,
         help="repeat to select corpora; default: all three published corpora",
-    )
-    run_parser.add_argument(
+        case_sensitive=False,
+    ),
+    task: list[EvaluationTask] | None = typer.Option(
+        None,
         "--task",
-        action="append",
-        type=EvaluationTask,
-        choices=EvaluationTask,
         help="repeat to select tasks; default: both published tasks",
-    )
-    run_parser.add_argument("--model", default=os.environ.get("OPENAI_MODEL"))
-    run_parser.add_argument("--base-url", default=os.environ.get("OPENAI_BASE_URL"))
-    run_parser.add_argument("--api-key-env", default="OPENAI_API_KEY")
-    run_parser.add_argument("--allow-missing-api-key", action="store_true")
-    run_parser.add_argument(
+        case_sensitive=False,
+    ),
+    model: str | None = typer.Option(
+        None,
+        "--model",
+        envvar="OPENAI_MODEL",
+        help="Model name to evaluate (default: OPENAI_MODEL environment variable).",
+    ),
+    base_url: str | None = typer.Option(
+        None,
+        "--base-url",
+        envvar="OPENAI_BASE_URL",
+        help="Base URL for OpenAI-compatible endpoint (default: OPENAI_BASE_URL environment variable).",
+    ),
+    api_key_env: str = typer.Option(
+        "OPENAI_API_KEY",
+        "--api-key-env",
+        help="Environment variable name containing the API key.",
+    ),
+    allow_missing_api_key: bool = typer.Option(
+        False,
+        "--allow-missing-api-key",
+        help="Allow running without an API key.",
+    ),
+    response_format: ResponseFormat = typer.Option(
+        ResponseFormat.JSON_SCHEMA,
         "--response-format",
-        type=ResponseFormat,
-        choices=ResponseFormat,
-        default=ResponseFormat.JSON_SCHEMA,
-    )
-    run_parser.add_argument("--temperature", type=float, default=None)
-    run_parser.add_argument("--max-tokens", type=_positive_integer, default=32)
-    run_parser.add_argument("--max-retries", type=_positive_integer, default=5)
-    run_parser.add_argument("--workers", type=_positive_integer, default=8)
-    run_parser.add_argument(
+        help="Response format for model generation.",
+        case_sensitive=False,
+    ),
+    temperature: float | None = typer.Option(
+        None,
+        "--temperature",
+        help="Sampling temperature.",
+    ),
+    max_tokens: int = typer.Option(
+        32,
+        "--max-tokens",
+        min=1,
+        help="Maximum tokens per generation.",
+    ),
+    max_retries: int = typer.Option(
+        5,
+        "--max-retries",
+        min=1,
+        help="Maximum retry attempts on failure.",
+    ),
+    workers: int = typer.Option(
+        8,
+        "--workers",
+        min=1,
+        help="Worker concurrency.",
+    ),
+    limit: int | None = typer.Option(
+        None,
         "--limit",
-        type=_positive_integer,
-        default=None,
+        min=1,
         help="evaluate only the first N pinned rows per source",
-    )
-    run_parser.add_argument("--data-directory", type=Path, default=DEFAULT_DATA_DIRECTORY)
-    run_parser.add_argument("--download", action="store_true")
-    run_parser.add_argument("--output", type=Path, default=None)
-    run_parser.add_argument("--label", default=None, help="display label used by compare")
-    run_parser.add_argument(
+    ),
+    data_directory: Path = typer.Option(
+        DEFAULT_DATA_DIRECTORY,
+        "--data-directory",
+        help="Directory where dataset files are stored.",
+    ),
+    download: bool = typer.Option(
+        False,
+        "--download",
+        help="Download dataset files if missing.",
+    ),
+    output: Path | None = typer.Option(
+        None,
+        "--output",
+        help="Directory to store evaluation run output.",
+    ),
+    label: str | None = typer.Option(
+        None,
+        "--label",
+        help="display label used by compare",
+    ),
+    hand_count_prompt: Path | None = typer.Option(
+        None,
         "--hand-count-prompt",
-        type=Path,
-        default=None,
-    )
-    run_parser.add_argument(
+        help="Path to hand count prompt template.",
+    ),
+    active_manipulation_prompt: Path | None = typer.Option(
+        None,
         "--active-manipulation-prompt",
-        type=Path,
-        default=None,
+        help="Path to active manipulation prompt template.",
+    ),
+) -> None:
+    configuration = build_evaluation_configuration(
+        dataset=dataset,
+        source=source,
+        task=task,
+        model=model,
+        base_url=base_url,
+        api_key_env=api_key_env,
+        allow_missing_api_key=allow_missing_api_key,
+        response_format=response_format,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        max_retries=max_retries,
+        workers=workers,
+        limit=limit,
+        data_directory=data_directory,
+        output=output,
+        label=label,
+        hand_count_prompt=hand_count_prompt,
+        active_manipulation_prompt=active_manipulation_prompt,
     )
+    run_evaluation(configuration, download=download)
 
-    compare_parser = subparsers.add_parser("compare", help="compare completed run summaries")
-    compare_parser.add_argument(
-        "summaries",
-        nargs="+",
-        type=Path,
+
+@app.command("compare", help="compare completed run summaries")
+def compare_command(
+    summaries: list[Path] = typer.Argument(
+        ...,
         help="paths to evaluation run summary JSON files to compare",
-    )
-    return parser
+    ),
+) -> None:
+    compare_summaries(summaries)
 
 
-def main() -> None:
-    parser = _argument_parser()
-    arguments = parser.parse_args()
+def main(argv: Sequence[str] | None = None) -> None:
+    args = list(argv) if argv is not None else sys.argv[1:]
     try:
-        match arguments.command:
-            case "run":
-                configuration = _run_configuration_from_arguments(arguments)
-                run_evaluation(configuration, download=arguments.download)
-            case "compare":
-                compare_summaries(arguments.summaries)
-            case unknown_command:
-                raise AssertionError(f"unhandled command: {unknown_command}")
+        app(args=args, standalone_mode=False)
+    except typer.Exit as error:
+        sys.exit(error.exit_code)
+    except click_exceptions.ClickException as error:
+        error.show()
+        sys.exit(error.exit_code)
     except (FileNotFoundError, ValueError, RuntimeError) as error:
-        parser.error(str(error))
+        print(f"error: {error}", file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":
