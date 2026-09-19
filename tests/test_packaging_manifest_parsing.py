@@ -10,6 +10,7 @@ from packaging_test_helpers import example_record_path, write_example_distributi
 from hflow.packaging import (
     CYTHON_OVERLAY_MANIFEST_FILE_NAME,
     INSTALLED_CYTHON_OVERLAY_MANIFEST_FILE_NAME,
+    MAX_NATIVE_OVERLAY_MANIFEST_BYTES,
     CythonOverlayBuildConfig,
     CythonOverlayManifest,
     CythonOverlayManifestError,
@@ -63,12 +64,18 @@ def _assert_apply_refused_without_mutation(
     assert example_record_path(package_root).read_bytes() == original_record
 
 
-def test_apply_refuses_invalid_manifest_json_before_mutation(tmp_path: Path) -> None:
+@pytest.mark.parametrize("oversized", [False, True], ids=["invalid-json", "oversized"])
+def test_apply_refuses_invalid_manifest_json_before_mutation(
+    tmp_path: Path, oversized: bool
+) -> None:
     package_root, overlay_directory, manifest, source_bytes, original_record = _build_overlay(
         tmp_path
     )
     manifest_path = overlay_directory / CYTHON_OVERLAY_MANIFEST_FILE_NAME
-    _write_manifest_bytes(manifest_path, b'{"schema_version":')
+    _write_manifest_bytes(
+        manifest_path,
+        b" " * (MAX_NATIVE_OVERLAY_MANIFEST_BYTES + 1) if oversized else b'{"schema_version":',
+    )
 
     _assert_apply_refused_without_mutation(
         package_root,
@@ -76,7 +83,9 @@ def test_apply_refuses_invalid_manifest_json_before_mutation(tmp_path: Path) -> 
         manifest,
         source_bytes,
         original_record,
-        "native overlay manifest is not valid JSON",
+        "native overlay manifest exceeds its byte limit"
+        if oversized
+        else "native overlay manifest is not valid JSON",
     )
 
 

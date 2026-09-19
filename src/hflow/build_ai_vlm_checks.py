@@ -501,7 +501,7 @@ def _chat_completion_response_text(response: object) -> str:
     except ValidationError:
         raise ValueError("endpoint returned no unique completed answer") from None
     message = parsed_response.choices[0].message
-    if message.refusal or message.tool_calls:
+    if message.refusal or message.tool_calls or message.function_call:
         raise ValueError("endpoint refused the answer or requested a tool")
     content = message.content
     if isinstance(content, list):
@@ -803,8 +803,10 @@ def _hosted_observation_upload(image_bytes: bytes) -> tuple[str, bytes, str]:
 
 
 async def _read_bounded_hosted_response(response: httpx2.Response, *, deadline: float) -> bytes:
+    if response.headers.get("Content-Encoding", "identity").strip().lower() != "identity":
+        raise RuntimeError("HFlow hosted check returned an unsupported content encoding")
     response_body = bytearray()
-    async for response_chunk in response.aiter_bytes():
+    async for response_chunk in response.aiter_raw():
         _remaining_hosted_seconds(deadline)
         if len(response_body) + len(response_chunk) > _MAX_HFLOW_HOSTED_RESPONSE_BYTES:
             raise RuntimeError("HFlow hosted check response exceeds the 64 KiB limit")
@@ -874,6 +876,7 @@ async def _evaluate_image_with_hflow_hosted_service(
                         endpoint,
                         headers={
                             "Accept": "application/json",
+                            "Accept-Encoding": "identity",
                             "User-Agent": _HFLOW_HOSTED_USER_AGENT,
                         },
                         files={"observation": _hosted_observation_upload(image_bytes)},
@@ -914,10 +917,10 @@ def _check_version(configuration: _RegisteredBuildAICheckConfiguration) -> StepV
         "camera": configuration.camera,
         "frame_time_seconds": configuration.frame_time_seconds,
     }
-    # Strict answer shapes and completion checks change accepted observations.
-    contract_name = "build-ai-single-frame-v2"
+    # Tool-call rejection and bounded identity-encoded responses change accepted observations.
+    contract_name = "build-ai-single-frame-v3"
     if configuration.sampling is not None:
-        contract_name = "build-ai-sampled-frames-v2"
+        contract_name = "build-ai-sampled-frames-v3"
         version_contract["sampling"] = {
             "fps": configuration.sampling.fps,
             "start_s": configuration.sampling.start_s,

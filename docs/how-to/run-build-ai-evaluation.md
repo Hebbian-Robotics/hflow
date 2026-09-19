@@ -132,7 +132,9 @@ delay would exhaust the budget is refused. An enclosing `asyncio.timeout`
 interrupts requests, streamed reads, and retry waits when the budget expires.
 Socket timeouts are also capped by the remaining budget at the start of each
 attempt. Cancellation closes the active response and stops further frame
-requests. A 64 KiB response limit also applies. Both timeout settings and the
+requests. Responses are limited to 64 KiB before JSON decoding. Hosted requests
+ask for identity encoding and reject compressed replies so decompression cannot
+bypass the byte limit. Both timeout settings and the
 retry count enter the check version.
 
 The two checks are contracts, not a particular model: one egocentric frame in,

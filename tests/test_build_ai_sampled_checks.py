@@ -28,6 +28,7 @@ CAMERA_TOPIC = "/head_camera/compressed"
 
 class _StubHostedResponse:
     def __init__(self, payload: object) -> None:
+        self.headers: dict[str, str] = {}
         self._body = json.dumps(payload).encode("utf-8")
 
     async def __aenter__(self) -> _StubHostedResponse:
@@ -44,7 +45,7 @@ class _StubHostedResponse:
     def raise_for_status(self) -> None:
         return None
 
-    async def aiter_bytes(self) -> AsyncIterator[bytes]:
+    async def aiter_raw(self) -> AsyncIterator[bytes]:
         yield self._body
 
 

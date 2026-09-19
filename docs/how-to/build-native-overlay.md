@@ -138,7 +138,8 @@ uv pip install --python ./dist/runtime-venv/bin/python \
 Use the builder environment's `hflow package` command against the runtime
 environment's `site-packages/hflow` directory. Keep the wheel SHA-256, overlay
 `bundle_digest`, and final OCI image digest together as the deployment receipt.
-The manifest is canonical JSON and records source and artifact hashes plus the
+The manifest is canonical JSON, limited to 16 MiB on read and write, and records
+source and artifact hashes plus the
 CPython ABI and platform. Builds from identical inputs on the same pinned
 toolchain and target are tested to reproduce the same manifest and extension
 bytes; portability across compilers or operating-system images is neither

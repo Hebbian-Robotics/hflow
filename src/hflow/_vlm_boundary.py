@@ -40,6 +40,7 @@ class CompletionMessage(ProviderResponse):
     content: str | list[TextPart] | None
     refusal: str | None = None
     tool_calls: list[object] | None = None
+    function_call: object = None
 
 
 class CompletionChoice(ProviderResponse):

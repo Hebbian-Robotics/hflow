@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
@@ -18,6 +19,7 @@ from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
 class _StubHostedResponse:
     def __init__(self, payload: object) -> None:
+        self.headers: dict[str, str] = {}
         self._body = json.dumps(payload).encode("utf-8")
 
     async def __aenter__(self) -> _StubHostedResponse:
@@ -34,7 +36,7 @@ class _StubHostedResponse:
     def raise_for_status(self) -> None:
         return None
 
-    async def aiter_bytes(self) -> AsyncIterator[bytes]:
+    async def aiter_raw(self) -> AsyncIterator[bytes]:
         yield self._body
 
 
@@ -393,6 +395,7 @@ def test_hosted_execution_sends_the_selected_frame_and_returns_standard_evidence
     assert follow_redirects is False
     assert headers == {
         "Accept": "application/json",
+        "Accept-Encoding": "identity",
         "User-Agent": f"hflow/{hflow.__version__} (+https://hflow.dev)",
     }
     filename, uploaded_image_bytes, uploaded_image_mime_type = files["observation"]
@@ -627,10 +630,10 @@ def test_check_version_stable_when_every_covered_field_is_identical(tmp_path: Pa
 # Editing these strings is the signal, not the chore. Change them only
 # together with a deliberate contract change, and say in the PR why every
 # existing Build AI result is being invalidated.
-_GOLDEN_OPENAI_CHECK_VERSION = "build-ai-single-frame-v2-d9a739c8f3f88364"
+_GOLDEN_OPENAI_CHECK_VERSION = "build-ai-single-frame-v3-d9a739c8f3f88364"
 # Re-minted when HFlowHostedExecution gained max_retries: like the OpenAI
 # branch's max_retries (#404), it decides which frames produce a result at all.
-_GOLDEN_HOSTED_CHECK_VERSION = "build-ai-single-frame-v2-5c2e7b10be83c45a"
+_GOLDEN_HOSTED_CHECK_VERSION = "build-ai-single-frame-v3-5c2e7b10be83c45a"
 
 
 def test_check_version_is_pinned_for_a_fixed_openai_configuration(tmp_path: Path) -> None:
@@ -771,22 +774,24 @@ def test_plain_text_response_mode_remains_explicitly_supported(
 
 
 @pytest.mark.parametrize(
-    ("finish_reason", "refusal", "tool_calls", "choice_count", "accepted"),
+    ("finish_reason", "refusal", "tool_calls", "function_call", "choice_count", "accepted"),
     [
-        ("stop", None, None, 1, True),
-        ("length", None, None, 1, False),
-        ("content_filter", None, None, 1, False),
-        (None, None, None, 1, False),
-        ("stop", "cannot answer", None, 1, False),
-        ("stop", None, [{"id": "tool"}], 1, False),
-        ("stop", None, None, 2, False),
-        ("stop", None, None, 0, False),
+        ("stop", None, None, None, 1, True),
+        ("length", None, None, None, 1, False),
+        ("content_filter", None, None, None, 1, False),
+        (None, None, None, None, 1, False),
+        ("stop", "cannot answer", None, None, 1, False),
+        ("stop", None, [{"id": "tool"}], None, 1, False),
+        ("stop", None, None, None, 2, False),
+        ("stop", None, None, None, 0, False),
+        ("stop", None, None, {"name": "external_tool"}, 1, False),
     ],
 )
 def test_only_one_complete_nonrefused_completion_produces_a_prediction(
     finish_reason: str | None,
     refusal: str | None,
     tool_calls: list[object] | None,
+    function_call: object,
     choice_count: int,
     accepted: bool,
 ) -> None:
@@ -798,7 +803,10 @@ def test_only_one_complete_nonrefused_completion_produces_a_prediction(
             SimpleNamespace(
                 finish_reason=finish_reason,
                 message=SimpleNamespace(
-                    content='{"hand_count":2}', refusal=refusal, tool_calls=tool_calls
+                    content='{"hand_count":2}',
+                    refusal=refusal,
+                    tool_calls=tool_calls,
+                    function_call=function_call,
                 ),
             )
         ]
@@ -850,7 +858,7 @@ def hosted_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 def _hosted_success_response() -> httpx2.Response:
     return httpx2.Response(
         200,
-        json={"outcome": "parsed", "prediction": 2, "raw_response": "2"},
+        stream=httpx2.ByteStream(b'{"outcome":"parsed","prediction":2,"raw_response":"2"}'),
         request=httpx2.Request("POST", "https://checks.example/evaluate"),
     )
 
@@ -951,7 +959,7 @@ def test_hosted_response_that_crosses_the_total_budget_is_not_accepted(
     hosted_clock: list[float],
 ) -> None:
     class SlowHostedResponse(_StubHostedResponse):
-        async def aiter_bytes(self) -> AsyncIterator[bytes]:
+        async def aiter_raw(self) -> AsyncIterator[bytes]:
             yield self._body[:1]
             hosted_clock[0] += 6
             yield self._body[1:]
@@ -971,8 +979,9 @@ def test_hosted_response_that_crosses_the_total_budget_is_not_accepted(
         _evaluate_hosted_hand_count(total_timeout_seconds=5)
 
 
-def test_hosted_total_deadline_interrupts_a_stalled_response_body() -> None:
-    """A responsive header cannot let an indefinitely stalled body hold an episode."""
+@pytest.mark.parametrize("response_case", ["stalled", "oversized", "compressed", "at-limit"])
+def test_hosted_response_enforces_read_deadline_encoding_and_byte_limit(response_case: str) -> None:
+    """A real response must stay bounded before decoding or releasing an episode."""
     checks = hflow.build_ai_vlm_checks
 
     async def scenario() -> None:
@@ -990,7 +999,24 @@ def test_hosted_total_deadline_interrupts_a_stalled_response_body() -> None:
                     if line.lower().startswith(b"content-length:")
                 )
                 await reader.readexactly(content_length)
-                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{")
+                prediction_body = b'{"outcome":"parsed","prediction":2,"raw_response":"2"}'
+                encoding_header = b""
+                if response_case == "stalled":
+                    response_body = b"{"
+                    declared_length = 100
+                elif response_case == "compressed":
+                    response_body = gzip.compress(prediction_body)
+                    declared_length = len(response_body)
+                    encoding_header = b"Content-Encoding: gzip\r\n"
+                else:
+                    declared_length = 64 * 1024 + (response_case == "oversized")
+                    response_body = prediction_body.ljust(declared_length, b" ")
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\n"
+                    + encoding_header
+                    + f"Content-Length: {declared_length}\r\n\r\n".encode()
+                    + response_body
+                )
                 await writer.drain()
                 body_started.set()
                 await reader.read()
@@ -1002,16 +1028,27 @@ def test_hosted_total_deadline_interrupts_a_stalled_response_body() -> None:
         server = await asyncio.start_server(stall_response, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
         async with server, asyncio.timeout(3):
-            with pytest.raises(RuntimeError, match="total timeout"):
-                await checks._evaluate_image_with_hflow_hosted_service(
-                    execution=checks.HFlowHostedExecution(
-                        base_url=f"http://127.0.0.1:{port}",
-                        total_timeout_seconds=0.3,
-                        request_timeout_seconds=2,
-                    ),
-                    task=checks.EvaluationTask.HAND_COUNT,
-                    image_bytes=b"\xff\xd8\xffsynthetic-image",
-                )
+            request = checks._evaluate_image_with_hflow_hosted_service(
+                execution=checks.HFlowHostedExecution(
+                    base_url=f"http://127.0.0.1:{port}",
+                    total_timeout_seconds=0.3 if response_case == "stalled" else 2,
+                    request_timeout_seconds=2,
+                ),
+                task=checks.EvaluationTask.HAND_COUNT,
+                image_bytes=b"\xff\xd8\xffsynthetic-image",
+            )
+            if response_case == "at-limit":
+                outcome = await request
+                assert isinstance(outcome, checks.ParsedVisionModelOutcome)
+                assert outcome.predicted_value == 2
+            else:
+                expected_message = {
+                    "stalled": "total timeout",
+                    "oversized": "64 KiB limit",
+                    "compressed": "unsupported content encoding",
+                }[response_case]
+                with pytest.raises(RuntimeError, match=expected_message):
+                    await request
             assert body_started.is_set()
             await connection_closed.wait()
 

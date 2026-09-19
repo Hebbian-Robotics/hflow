@@ -38,6 +38,7 @@ from pydantic import TypeAdapter, ValidationError
 
 CYTHON_OVERLAY_MANIFEST_FILE_NAME = "hflow-native-overlay.json"
 INSTALLED_CYTHON_OVERLAY_MANIFEST_FILE_NAME = ".hflow-native-overlay.json"
+MAX_NATIVE_OVERLAY_MANIFEST_BYTES = 16 * 1024 * 1024
 CYTHON_OVERLAY_SCHEMA_VERSION = 1
 CYTHON_OVERLAY_FORMAT = "cython-extension-overlay"
 _ARTIFACT_DIRECTORY_NAME = "artifacts"
@@ -630,7 +631,7 @@ def write_cython_overlay_manifest(
 def load_cython_overlay_manifest(manifest_path: Path) -> CythonOverlayManifest:
     """Parse untrusted manifest bytes into the strict overlay domain model."""
 
-    serialized_manifest = _read_regular_file_bytes(manifest_path, "native overlay manifest")
+    serialized_manifest = _read_overlay_manifest_bytes(manifest_path, "native overlay manifest")
     try:
         # The JSON decoder catches duplicate keys before Pydantic constructs the
         # existing dataclasses. JSON validation accepts arrays for tuple fields
@@ -929,7 +930,11 @@ def _calculate_bundle_digest(
 
 
 def _serialize_manifest(manifest: CythonOverlayManifest) -> bytes:
-    return (json.dumps(manifest.to_json_value(), indent=2, sort_keys=True) + "\n").encode("utf-8")
+    serialized_manifest = (
+        json.dumps(manifest.to_json_value(), indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    _require_bounded_manifest(serialized_manifest)
+    return serialized_manifest
 
 
 def _append_target_issues(
@@ -1042,11 +1047,11 @@ def _append_applied_overlay_issues(
             )
         )
     else:
-        expected_manifest_bytes = _read_regular_file_bytes(
+        expected_manifest_bytes = _read_overlay_manifest_bytes(
             overlay_path / CYTHON_OVERLAY_MANIFEST_FILE_NAME,
             "native overlay manifest",
         )
-        installed_manifest_bytes = _read_regular_file_bytes(
+        installed_manifest_bytes = _read_overlay_manifest_bytes(
             installed_manifest_path,
             "installed native overlay manifest",
         )
@@ -1114,12 +1119,12 @@ def _preflight_installed_manifest(overlay_path: Path, target_root: Path) -> bool
         raise CythonOverlayApplyError(
             f"installed native overlay manifest is not a regular file: {installed_manifest_path}"
         )
-    expected_manifest_bytes = _read_regular_file_bytes(
+    expected_manifest_bytes = _read_overlay_manifest_bytes(
         overlay_path / CYTHON_OVERLAY_MANIFEST_FILE_NAME,
         "native overlay manifest",
     )
     if (
-        _read_regular_file_bytes(
+        _read_overlay_manifest_bytes(
             installed_manifest_path,
             "installed native overlay manifest",
         )
@@ -1797,6 +1802,20 @@ def _regular_file_size(file_path: Path) -> int:
         return os.fstat(file_descriptor).st_size
     finally:
         os.close(file_descriptor)
+
+
+def _require_bounded_manifest(serialized_manifest: bytes) -> None:
+    if len(serialized_manifest) > MAX_NATIVE_OVERLAY_MANIFEST_BYTES:
+        raise CythonOverlayManifestError("native overlay manifest exceeds its byte limit")
+
+
+def _read_overlay_manifest_bytes(manifest_path: Path, label: str) -> bytes:
+    # Read the limit plus one from the verified descriptor. A stat-only size
+    # check would not bound a file that grows between inspection and reading.
+    with os.fdopen(_open_regular_file(manifest_path, label), "rb") as manifest_file:
+        serialized_manifest = manifest_file.read(MAX_NATIVE_OVERLAY_MANIFEST_BYTES + 1)
+    _require_bounded_manifest(serialized_manifest)
+    return serialized_manifest
 
 
 def _read_regular_file_bytes(file_path: Path, label: str) -> bytes:
