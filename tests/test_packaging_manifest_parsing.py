@@ -7,15 +7,19 @@ from typing import cast
 import pytest
 from packaging_test_helpers import example_record_path, write_example_distribution
 
+import hflow.packaging as packaging
 from hflow.packaging import (
     CYTHON_OVERLAY_MANIFEST_FILE_NAME,
     INSTALLED_CYTHON_OVERLAY_MANIFEST_FILE_NAME,
     MAX_NATIVE_OVERLAY_MANIFEST_BYTES,
+    CythonOverlayApplyError,
     CythonOverlayBuildConfig,
     CythonOverlayManifest,
     CythonOverlayManifestError,
+    CythonOverlayVerificationCode,
     apply_cython_overlay,
     build_cython_overlay,
+    verify_cython_overlay,
 )
 
 
@@ -187,3 +191,48 @@ def test_apply_refuses_duplicate_manifest_fields_before_mutation(tmp_path: Path)
         original_record,
         "native overlay manifest contains duplicate fields",
     )
+
+
+@pytest.mark.parametrize("oversized", [False, True], ids=["mismatch", "oversized"])
+def test_invalid_installed_manifest_reports_mismatch_without_mutating_package(
+    tmp_path: Path, oversized: bool
+) -> None:
+    package_root, overlay_directory, manifest, _, _ = _build_overlay(tmp_path)
+    apply_cython_overlay(overlay_directory, package_root)
+    installed_manifest_path = package_root / INSTALLED_CYTHON_OVERLAY_MANIFEST_FILE_NAME
+    invalid_manifest = b" " * (MAX_NATIVE_OVERLAY_MANIFEST_BYTES + 1) if oversized else b"{}"
+    _write_manifest_bytes(installed_manifest_path, invalid_manifest)
+    preserved_files = {
+        path: path.read_bytes()
+        for path in (
+            installed_manifest_path,
+            example_record_path(package_root),
+            *(package_root / artifact.installed_artifact_path for artifact in manifest.artifacts),
+        )
+    }
+
+    verification = verify_cython_overlay(overlay_directory, target_package_root=package_root)
+    assert CythonOverlayVerificationCode.INSTALLED_MANIFEST_MISMATCH in {
+        issue.code for issue in verification.issues
+    }
+    with pytest.raises(CythonOverlayApplyError, match="different native overlay manifest"):
+        apply_cython_overlay(overlay_directory, package_root)
+    for path, expected_bytes in preserved_files.items():
+        assert path.read_bytes() == expected_bytes
+
+
+def test_manifest_byte_limit_includes_the_boundary_and_preserves_existing_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, overlay_directory, manifest, _, _ = _build_overlay(tmp_path)
+    manifest_path = overlay_directory / CYTHON_OVERLAY_MANIFEST_FILE_NAME
+    original_bytes = manifest_path.read_bytes()
+    manifest_path.chmod(0o644)
+    monkeypatch.setattr(packaging, "MAX_NATIVE_OVERLAY_MANIFEST_BYTES", len(original_bytes))
+    packaging.write_cython_overlay_manifest(manifest, manifest_path)
+    assert packaging.load_cython_overlay_manifest(manifest_path) == manifest
+
+    monkeypatch.setattr(packaging, "MAX_NATIVE_OVERLAY_MANIFEST_BYTES", len(original_bytes) - 1)
+    with pytest.raises(CythonOverlayManifestError, match="exceeds its byte limit"):
+        packaging.write_cython_overlay_manifest(manifest, manifest_path)
+    assert manifest_path.read_bytes() == original_bytes

@@ -1047,15 +1047,7 @@ def _append_applied_overlay_issues(
             )
         )
     else:
-        expected_manifest_bytes = _read_overlay_manifest_bytes(
-            overlay_path / CYTHON_OVERLAY_MANIFEST_FILE_NAME,
-            "native overlay manifest",
-        )
-        installed_manifest_bytes = _read_overlay_manifest_bytes(
-            installed_manifest_path,
-            "installed native overlay manifest",
-        )
-        if installed_manifest_bytes != expected_manifest_bytes:
+        if not _installed_manifest_matches_overlay(overlay_path, installed_manifest_path):
             issues.append(
                 CythonOverlayVerificationIssue(
                     CythonOverlayVerificationCode.INSTALLED_MANIFEST_MISMATCH,
@@ -1119,21 +1111,24 @@ def _preflight_installed_manifest(overlay_path: Path, target_root: Path) -> bool
         raise CythonOverlayApplyError(
             f"installed native overlay manifest is not a regular file: {installed_manifest_path}"
         )
-    expected_manifest_bytes = _read_overlay_manifest_bytes(
-        overlay_path / CYTHON_OVERLAY_MANIFEST_FILE_NAME,
-        "native overlay manifest",
-    )
-    if (
-        _read_overlay_manifest_bytes(
-            installed_manifest_path,
-            "installed native overlay manifest",
-        )
-        != expected_manifest_bytes
-    ):
+    if not _installed_manifest_matches_overlay(overlay_path, installed_manifest_path):
         raise CythonOverlayApplyError(
             "target package already contains a different native overlay manifest"
         )
     return True
+
+
+def _installed_manifest_matches_overlay(overlay_path: Path, installed_manifest_path: Path) -> bool:
+    expected_manifest_bytes = _read_overlay_manifest_bytes(
+        overlay_path / CYTHON_OVERLAY_MANIFEST_FILE_NAME, "native overlay manifest"
+    )
+    try:
+        installed_manifest_bytes = _read_overlay_manifest_bytes(
+            installed_manifest_path, "installed native overlay manifest"
+        )
+    except CythonOverlayManifestError:
+        return False
+    return installed_manifest_bytes == expected_manifest_bytes
 
 
 def _resolve_wheel_record_update(
