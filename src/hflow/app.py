@@ -2803,23 +2803,50 @@ class App:
             if enrichment_result is None:
                 continue
             for artifact_name, artifact_path in enrichment_result.artifacts.items():
-                resolved_artifact_path = artifact_path.resolve()
                 try:
-                    artifact_relative_path = resolved_artifact_path.relative_to(run_dir.resolve())
-                    artifact_key = artifact_relative_path.as_posix()
-                except ValueError:
-                    step_directory = (
-                        f"{_sanitize_topic(enrichment_run.enrichment.name)}-"
-                        f"{enrichment_run.enrichment.version}"
-                    )
-                    artifact_name_digest = hashlib.sha256(artifact_name.encode()).hexdigest()[:8]
-                    artifact_key = (
-                        f"artifacts/{step_directory}/{_sanitize_topic(artifact_name)}-"
-                        f"{artifact_name_digest}/{artifact_path.name}"
-                    )
-                try:
+                    resolved_artifact_path = artifact_path.resolve()
+                    try:
+                        resolved_artifact_path.relative_to(scratch_dir.resolve())
+                        artifact_is_scratch_bound = True
+                    except ValueError:
+                        artifact_is_scratch_bound = False
+
+                    if artifact_is_scratch_bound:
+                        step_directory = (
+                            f"{_sanitize_topic(enrichment_run.enrichment.name)}-"
+                            f"{enrichment_run.enrichment.version}"
+                        )
+                        artifact_name_digest = hashlib.sha256(artifact_name.encode()).hexdigest()[:8]
+                        with resolved_artifact_path.open("rb") as artifact_stream:
+                            artifact_content_digest = hashlib.file_digest(
+                                artifact_stream, "sha256"
+                            ).hexdigest()
+                        artifact_key = (
+                            f"artifacts/{step_directory}/{_sanitize_topic(artifact_name)}-"
+                            f"{artifact_name_digest}/{artifact_content_digest}/"
+                            f"{artifact_path.name}"
+                        )
+                    else:
+                        try:
+                            artifact_relative_path = resolved_artifact_path.relative_to(
+                                run_dir.resolve()
+                            )
+                            artifact_key = artifact_relative_path.as_posix()
+                        except ValueError:
+                            step_directory = (
+                                f"{_sanitize_topic(enrichment_run.enrichment.name)}-"
+                                f"{enrichment_run.enrichment.version}"
+                            )
+                            artifact_name_digest = hashlib.sha256(
+                                artifact_name.encode()
+                            ).hexdigest()[:8]
+                            artifact_key = (
+                                f"artifacts/{step_directory}/{_sanitize_topic(artifact_name)}-"
+                                f"{artifact_name_digest}/{artifact_path.name}"
+                            )
+
                     enrichment_run.artifact_uris[artifact_name] = run_storage_root.publish(
-                        artifact_path, artifact_key
+                        resolved_artifact_path, artifact_key
                     )
                 except Exception as error:
                     # A missing or unreadable artifact file is the STEP's
