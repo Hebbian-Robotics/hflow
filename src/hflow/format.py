@@ -73,6 +73,19 @@ PROVENANCE_KEY_TOPIC_GROUP_PREFIX = "group/"
 # exists nowhere else.
 PROVENANCE_KEY_CHUNK_TARGET_PREFIX = "chunk-target/"
 
+# The keyframe interval MEASURED off each pass-through video channel, in
+# seconds. ``gop_seconds`` is what the encoder was told to use, which is a
+# fact only about channels the transform actually encoded: pass-through video
+# is copied byte for byte, so its cadence is whatever the upstream recorder
+# produced and the configured value describes nothing. Stamping the measured
+# interval keeps FORMAT.md's "keyframe interval actually used" true for both
+# paths, and gives `hflow doctor` a cadence to check against that the episode
+# really has. Per topic because channels are independent and one episode can
+# mix encoded and pass-through video. Irregular cadence is NOT smoothed away
+# here: the stamp is the median interval, and the spread is a doctor finding
+# (see #376), because a single number cannot state a distribution honestly.
+PROVENANCE_KEY_OBSERVED_KEYFRAME_INTERVAL_PREFIX = "keyframe-interval/"
+
 # Schema record name for derived channels (JSON messages on a grid). Neutral
 # and format-versioned like every stored identifier in this module.
 DERIVED_SCHEMA_NAME = "derived/v1"

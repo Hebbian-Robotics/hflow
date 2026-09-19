@@ -25,7 +25,7 @@ import hflow
 from hflow import transform
 from hflow._grouped_mcap_writer import NO_SCHEMA_ID, GroupedMcapWriter
 from hflow.doctor import diagnose
-from hflow.format import METADATA_RECORD_EPISODE
+from hflow.format import METADATA_RECORD_EPISODE, METADATA_RECORD_PROVENANCE
 from hflow.reader import TopicInfo
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import SourceNotConforming, write_canonical_episode
@@ -255,6 +255,14 @@ def test_transform_losslessly_inserts_missing_passthrough_video_auds(tmp_path: P
     assert report.conforming, report.summary()
 
 
+def _provenance_of(episode: Path) -> dict[str, str]:
+    with episode.open("rb") as stream:
+        for record in make_reader(stream).iter_metadata():
+            if record.name == METADATA_RECORD_PROVENANCE:
+                return dict(record.metadata)
+    raise AssertionError(f"{episode} carries no {METADATA_RECORD_PROVENANCE} record")
+
+
 def test_transform_repairs_auds_without_refusing_irregular_passthrough_gop(
     tmp_path: Path,
 ) -> None:
@@ -281,13 +289,48 @@ def test_transform_repairs_auds_without_refusing_irregular_passthrough_gop(
         assert bytes(repaired.data).endswith(bytes(original.data))
         assert len(repaired.data) == len(original.data) + 6
 
+    # A keyframe every two frames IS a regular cadence. Before the transform
+    # measured it, the doctor compared this stream against the encoder's
+    # configured gop_seconds, which no pass-through copy ever applied, and
+    # reported the disagreement as the stream's fault (#376).
+    report = diagnose(output)
+    assert [
+        finding for finding in report.findings if finding.code == "video-keyframe-cadence"
+    ] == []
+
+
+def test_doctor_still_reports_a_genuinely_irregular_passthrough_cadence(tmp_path: Path) -> None:
+    """Measuring the cadence must not turn the check into a rubber stamp.
+
+    Keyframes at message 0, 2, 4 and then 5: the median interval is still two
+    frames, so the stamp is 0.2 s, and the frame that breaks step is reported
+    against the stream's own cadence rather than against a configured value.
+    """
+    source = tmp_path / "irregular-gop.mcap"
+    _write_passthrough_video_source(
+        source,
+        [
+            (
+                "/cam",
+                index * 100_000_000,
+                KEYFRAME_ACCESS_UNIT if keyframe else NON_KEYFRAME_ACCESS_UNIT,
+            )
+            for index, keyframe in enumerate([True, False, True, False, True, True])
+        ],
+    )
+    output = tmp_path / "out.mcap"
+
+    write_canonical_episode(source, output)
+
+    provenance = _provenance_of(output)
+    assert provenance["keyframe-interval//cam"] == "0.2"
     report = diagnose(output)
     cadence_findings = [
         finding for finding in report.findings if finding.code == "video-keyframe-cadence"
     ]
     assert cadence_findings
     assert any(
-        "message 2: is_keyframe=True, expected False" in finding.message
+        "message 5: is_keyframe=True, expected False" in finding.message
         for finding in cadence_findings
     )
 

@@ -30,6 +30,7 @@ from hflow.format import (
     METADATA_RECORD_EPISODE,
     METADATA_RECORD_PROVENANCE,
     PASSTHROUGH_VIDEO_SCHEMA_NAMES,
+    PROVENANCE_KEY_OBSERVED_KEYFRAME_INTERVAL_PREFIX,
     PROVENANCE_KEY_PIPELINE_VERSION,
     PROVENANCE_KEY_SCHEMA_VERSION,
 )
@@ -251,15 +252,30 @@ def diagnose(path: Path | str) -> DoctorReport:
 
         metadata_records = {record.name: dict(record.metadata) for record in reader.iter_metadata()}
         provenance = metadata_records.get(METADATA_RECORD_PROVENANCE)
+
+        def _positive_finite_seconds(raw_value: str) -> float | None:
+            try:
+                parsed = float(raw_value)
+            except ValueError:
+                return None
+            return parsed if math.isfinite(parsed) and parsed > 0 else None
+
         stamped_gop_seconds: float | None = None
         if provenance is not None and "gop_seconds" in provenance:
-            try:
-                parsed_gop_seconds = float(provenance["gop_seconds"])
-            except ValueError:
-                pass
-            else:
-                if math.isfinite(parsed_gop_seconds) and parsed_gop_seconds > 0:
-                    stamped_gop_seconds = parsed_gop_seconds
+            stamped_gop_seconds = _positive_finite_seconds(provenance["gop_seconds"])
+        # A pass-through channel's cadence is whatever the upstream recorder
+        # produced, so the transform measures it and stamps it per topic
+        # (#376). Prefer it over ``gop_seconds``, which describes the encoder
+        # and therefore describes nothing on a channel that was copied.
+        measured_interval_seconds_by_topic: dict[str, float] = {}
+        for key, raw_value in (provenance or {}).items():
+            if not key.startswith(PROVENANCE_KEY_OBSERVED_KEYFRAME_INTERVAL_PREFIX):
+                continue
+            measured = _positive_finite_seconds(raw_value)
+            if measured is not None:
+                measured_interval_seconds_by_topic[
+                    key[len(PROVENANCE_KEY_OBSERVED_KEYFRAME_INTERVAL_PREFIX) :]
+                ] = measured
 
         # Schema pre-pass (#460): a channel naming a schema id the file does
         # not carry makes the reader raise KeyError mid-iteration, and the
@@ -461,33 +477,41 @@ def diagnose(path: Path | str) -> DoctorReport:
                 f"reading messages failed (corrupt chunk or bad CRC?): {error}",
             )
         else:
-            if stamped_gop_seconds is not None:
-                for channel_id in sorted(video_channel_ids):
+            for channel_id in sorted(video_channel_ids):
+                topic = topics_by_channel_id[channel_id]
+                # The measured stamp wins: on a pass-through channel it is the
+                # only one describing these bytes. Neither present means the
+                # episode states no cadence to check against.
+                cadence_seconds = measured_interval_seconds_by_topic.get(topic)
+                if cadence_seconds is None:
+                    cadence_seconds = stamped_gop_seconds
+                if cadence_seconds is not None:
                     keyframes = video_keyframes.get(channel_id, [])
                     if not keyframes or any(is_keyframe is None for is_keyframe in keyframes):
                         continue
-                    topic = topics_by_channel_id[channel_id]
                     log_times = video_log_times[channel_id]
-                    if len(log_times) >= 2:
-                        try:
-                            fps = video_module.estimate_fps_from_log_times(log_times, topic=topic)
-                        except ValueError as error:
-                            collector.add(
-                                DiagnosticLevel.ERROR,
-                                "video-keyframe-cadence",
-                                f"{topic} channel {channel_id}: cannot validate fixed GOP cadence: "
-                                f"{error}",
-                            )
-                            continue
-                    else:
-                        fps = 1.0
-                    gop_frames_value = stamped_gop_seconds * fps
+                    if len(log_times) < 2:
+                        # One message states no frame rate, so there is no grid
+                        # to compare against. Inventing fps=1.0 made the check
+                        # assert a cadence the episode never claimed.
+                        continue
+                    try:
+                        fps = video_module.estimate_fps_from_log_times(log_times, topic=topic)
+                    except ValueError as error:
+                        collector.add(
+                            DiagnosticLevel.ERROR,
+                            "video-keyframe-cadence",
+                            f"{topic} channel {channel_id}: cannot validate fixed GOP cadence: "
+                            f"{error}",
+                        )
+                        continue
+                    gop_frames_value = cadence_seconds * fps
                     if not math.isfinite(gop_frames_value):
                         collector.add(
                             DiagnosticLevel.ERROR,
                             "video-keyframe-cadence",
                             f"{topic} channel {channel_id}: cannot validate fixed GOP cadence: "
-                            f"gop_seconds={stamped_gop_seconds:g} and fps={fps:g} produce a "
+                            f"keyframe interval={cadence_seconds:g} and fps={fps:g} produce a "
                             "non-finite GOP frame count",
                         )
                         continue

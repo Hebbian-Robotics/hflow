@@ -84,4 +84,11 @@ across these changes.
 # "8": the managed Linux FFmpeg pin now uses BtbN's retained August 2026
 # month-final build. Its version stamp changes canonical provenance whenever
 # video is transcoded, so those outputs must not share the old pipeline identity.
-TRANSFORM_BEHAVIOR_VERSION: str = "8"
+#
+# "9": pass-through video channels now stamp the keyframe interval measured
+# off the copied bytes (``keyframe-interval/<topic>``). ``gop_seconds`` alone
+# reported what the encoder was told to do, which describes nothing on a path
+# that never encodes, so FORMAT.md's "keyframe interval actually used" was
+# false for pass-through episodes. The added provenance changes canonical
+# bytes for any episode carrying pre-encoded video (#376).
+TRANSFORM_BEHAVIOR_VERSION: str = "9"

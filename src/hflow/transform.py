@@ -59,7 +59,9 @@ import logging
 from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 from dataclasses import dataclass, field
+from itertools import pairwise
 from pathlib import Path
+from statistics import median
 from typing import Any, Literal
 
 from hflow import video as video_module
@@ -91,9 +93,11 @@ from hflow.format import (
     METADATA_RECORD_EPISODE,
     METADATA_RECORD_PROVENANCE,
     MINIMUM_DERIVED_CHUNK_SIZE_BYTES,
+    NANOSECONDS_PER_SECOND,
     PASSTHROUGH_VIDEO_SCHEMA_NAMES,
     PROVENANCE_KEY_CHUNK_TARGET_PREFIX,
     PROVENANCE_KEY_DERIVED_PREFIX,
+    PROVENANCE_KEY_OBSERVED_KEYFRAME_INTERVAL_PREFIX,
     PROVENANCE_KEY_PIPELINE_VERSION,
     PROVENANCE_KEY_RESAMPLE_POLICY_VERSION,
     PROVENANCE_KEY_SCHEMA_VERSION,
@@ -465,12 +469,19 @@ def _insert_missing_passthrough_video_aud(
 
 def _validate_passthrough_video_payload(
     topic: str, message: _PassthroughVideoMessage, *, is_first_message: bool
-) -> None:
-    """Enforce the canonical video constraints on a pass-through message.
+) -> "video_module.AccessUnit":
+    """Parse a pass-through message into its single access unit, refusing any
+    that violates the canonical video constraints.
 
     The provenance stamp asserts the whole file conforms (FORMAT.md), so a
     pre-encoded video channel from another recorder must be proven
     conforming, not trusted.
+
+    Returns what it parsed rather than a validity flag: the caller needs
+    ``is_keyframe`` to measure the channel's cadence, and re-splitting the
+    stream to recover it would parse every message twice. A bool return would
+    be the second job, because "was it valid" is already carried by whether
+    this raised.
     """
     try:
         access_units = video_module.split_annex_b_stream(message.data)
@@ -504,6 +515,26 @@ def _validate_passthrough_video_payload(
             "bframes=0 because a -c:v copy MP4 remux drops the reorder tail "
             "(measured 301 of 303 in #250) -- re-encode upstream with bframes=0"
         )
+    return access_unit
+
+
+def _observed_keyframe_interval_seconds(keyframe_log_times: list[int]) -> float | None:
+    """Median interval between consecutive keyframes, in seconds.
+
+    ``None`` when fewer than two keyframes were seen, because one keyframe
+    states no interval at all and inventing one would put a number in
+    provenance that nothing measured. The median rather than the mean so a
+    single long gap (a dropped segment, a scene cut the recorder honoured)
+    does not move the stamp away from the cadence the channel actually runs
+    at; how far the stream strays from it is a doctor finding, not something
+    this scalar can carry.
+    """
+    if len(keyframe_log_times) < 2:
+        return None
+    intervals = [later - earlier for earlier, later in pairwise(keyframe_log_times)]
+    if any(interval <= 0 for interval in intervals):
+        return None
+    return median(intervals) / NANOSECONDS_PER_SECOND
 
 
 def _decode_compressed_images(
@@ -616,6 +647,10 @@ def write_canonical_episode(
         passthrough_video_decoders: dict[int, Callable[[bytes], Any]] = {}
         passthrough_video_encoders: dict[int, Callable[[Any, bytes], bytes]] = {}
         passthrough_video_channels_with_messages: set[int] = set()
+        # Log time of every keyframe on each pass-through channel, so the
+        # cadence stamped into provenance is measured off the bytes being
+        # copied rather than read off a config the copy never applied.
+        passthrough_keyframe_log_times: dict[int, list[int]] = {}
         for batch in reader.iter_batches():
             if batch.channel_id in camera_payloads:
                 camera_log_times[batch.channel_id].extend(int(t) for t in batch.log_times)
@@ -629,7 +664,7 @@ def write_canonical_episode(
                         )
                     decode = passthrough_video_decoders[batch.channel_id]
                     canonical_payloads: list[bytes] = []
-                    for payload in batch.data:
+                    for message_index, payload in enumerate(batch.data):
                         is_first_message = (
                             batch.channel_id not in passthrough_video_channels_with_messages
                         )
@@ -640,11 +675,15 @@ def write_canonical_episode(
                         repaired_video_message = _insert_missing_passthrough_video_aud(
                             batch.topic, video_message
                         )
-                        _validate_passthrough_video_payload(
+                        access_unit = _validate_passthrough_video_payload(
                             batch.topic,
                             repaired_video_message,
                             is_first_message=is_first_message,
                         )
+                        if access_unit.is_keyframe:
+                            passthrough_keyframe_log_times.setdefault(batch.channel_id, []).append(
+                                int(batch.log_times[message_index])
+                            )
                         if repaired_video_message.data != video_message.data:
                             if batch.channel_id not in passthrough_video_encoders:
                                 passthrough_video_encoders[batch.channel_id] = _resolve_encoder(
@@ -899,6 +938,20 @@ def write_canonical_episode(
             # configured value it cannot be read back off the config.
             for group_name, chunk_target in sorted(resolved_chunk_sizes.items()):
                 provenance[f"{PROVENANCE_KEY_CHUNK_TARGET_PREFIX}{group_name}"] = str(chunk_target)
+            # Measured off the copied bytes, per pass-through video channel.
+            # ``gop_seconds`` above describes the encoder, which never ran for
+            # these, so without this the record would state a cadence nothing
+            # applied (#376). Absent for a channel with fewer than two
+            # keyframes: no interval was observed, and a default would be the
+            # same invention in a new place.
+            for channel_id, keyframe_log_times in sorted(passthrough_keyframe_log_times.items()):
+                observed_interval_seconds = _observed_keyframe_interval_seconds(keyframe_log_times)
+                if observed_interval_seconds is None:
+                    continue
+                topic = infos[channel_id].topic
+                provenance[f"{PROVENANCE_KEY_OBSERVED_KEYFRAME_INTERVAL_PREFIX}{topic}"] = (
+                    f"{observed_interval_seconds:g}"
+                )
             if derived_channels:
                 # The alignment policy is part of every derived channel's
                 # identity: this is where format converters silently diverge.
