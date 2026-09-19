@@ -178,6 +178,28 @@ class FileIntegrityRecord:
         }
 
 
+def _raw_integrity_receipt_entries(integrity: dict[str, object]) -> list[object]:
+    """Flatten ``integrity.tables`` / ``integrity.assets`` after shape checks.
+
+    Missing keys keep the exporter defaults (empty object / empty array).
+    A present JSON ``null`` or wrong container type is unreadable input
+    (exit 2), not a traceback: ``dict.get`` defaults do not apply when the
+    key exists with value ``null``, so ``.values()`` / iteration used to
+    raise ``AttributeError`` / ``TypeError`` through the CLI (#575).
+    """
+    tables = integrity.get("tables", {})
+    if not isinstance(tables, dict):
+        raise ValueError(
+            f"format.json integrity.tables must be a JSON object, got {type(tables).__name__}"
+        )
+    assets = integrity.get("assets", [])
+    if not isinstance(assets, list):
+        raise ValueError(
+            f"format.json integrity.assets must be a JSON array, got {type(assets).__name__}"
+        )
+    return [*tables.values(), *assets]
+
+
 def _parse_file_integrity_record(entry: object) -> FileIntegrityRecord:
     """Check one raw marker entry at the boundary and type it.
 
@@ -988,18 +1010,15 @@ def verify_dataset_snapshot(
             ],
         )
 
-    # Boundary parse (#489): receipt entries arrive from external JSON with
-    # unknown types; they become typed records here or the verify refuses,
-    # naming the field. Refusal is exit 2 unreadable input, not a finding:
-    # a receipt whose sha256 arrived as a number used to fall through to a
-    # per-file comparison that can never succeed and was reported as damaged
-    # bytes.
+    # Boundary parse (#489 / #575): receipt containers and entries arrive from
+    # external JSON with unknown types; they become typed records here or the
+    # verify refuses, naming the field. Refusal is exit 2 unreadable input,
+    # not a finding or a traceback: a receipt whose sha256 arrived as a
+    # number used to fall through to a per-file comparison that can never
+    # succeed and was reported as damaged bytes, and a null tables/assets
+    # container used to raise AttributeError/TypeError through the CLI.
     receipt_records = [
-        _parse_file_integrity_record(entry)
-        for entry in [
-            *integrity.get("tables", {}).values(),
-            *integrity.get("assets", []),
-        ]
+        _parse_file_integrity_record(entry) for entry in _raw_integrity_receipt_entries(integrity)
     ]
 
     # The deleted-member gate (#473): when a receipt entry and its file are
