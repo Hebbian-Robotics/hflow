@@ -165,6 +165,37 @@ def test_receipt_without_a_usable_content_id_is_refused(
     assert cli_main(["verify", "snapshot", str(output_directory)]) == 2, label
 
 
+@pytest.mark.parametrize(
+    ("field", "replacement", "match"),
+    [
+        ("tables", None, r"integrity\.tables must be a JSON object"),
+        ("tables", [], r"integrity\.tables must be a JSON object"),
+        ("assets", None, r"integrity\.assets must be a JSON array"),
+        ("assets", {}, r"integrity\.assets must be a JSON array"),
+    ],
+    ids=["tables-null", "tables-array", "assets-null", "assets-object"],
+)
+def test_null_or_wrong_type_integrity_containers_are_refused_at_the_boundary(
+    tmp_path: Path, field: str, replacement: object, match: str
+) -> None:
+    """#575: present-but-null (or wrong-type) tables/assets used to crash.
+
+    ``integrity.get("tables", {})`` does not apply when the key exists with
+    JSON ``null``, so verify raised AttributeError/TypeError through the CLI
+    instead of exit 2. Same family as #489's typed entry boundary.
+    """
+    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
+    marker_path = output_directory / "format.json"
+    marker = json.loads(marker_path.read_text())
+    marker["integrity"][field] = replacement
+    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+
+    with pytest.raises(ValueError, match=match):
+        verify_dataset_snapshot(output_directory)
+
+    assert cli_main(["verify", "snapshot", str(output_directory)]) == 2
+
+
 def test_truncated_file_reports_size_mismatch_and_skips_the_hash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
