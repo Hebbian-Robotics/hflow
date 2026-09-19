@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.requires_system_ffmpeg
+
 from hflow.ffmpeg import ffmpeg_path, ffprobe_path
 from hflow.video import (
     AccessUnit,

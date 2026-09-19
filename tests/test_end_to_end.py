@@ -437,6 +437,7 @@ def test_canonical_episode_accessors(
         assert abs(frames[1].log_time_ns - frames[0].log_time_ns - 466_666_667) <= 1
 
 
+@pytest.mark.requires_system_ffmpeg
 def test_canonical_episode_extracts_exact_source_frame_indices(
     report_and_app: tuple[hflow.TestReport, hflow.App],
 ) -> None:
