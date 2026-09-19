@@ -47,13 +47,14 @@ jobs:
           .release-venv/bin/hflow package build \
             --package-root "${package_root}" \
             --module hflow.uri \
+            --module hflow.packaging \
             --output-dir .release-native-overlay
           .release-venv/bin/hflow package apply .release-native-overlay \
             --target-package-root "${package_root}"
           .release-venv/bin/hflow package verify .release-native-overlay \
             --target-package-root "${package_root}"
           .release-venv/bin/python -c \
-            'import hflow.uri; assert hflow.uri.__file__.endswith(".so")'
+            'import hflow.uri, hflow.packaging; assert all(module.__file__.endswith(".so") for module in (hflow.uri, hflow.packaging))'
       - name: Upload distributions for publishing
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
