@@ -14,7 +14,6 @@ prerequisites, and exact commands.
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import importlib.metadata
 import json
@@ -27,10 +26,11 @@ from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from itertools import islice
 from pathlib import Path
-from typing import Any, cast
+from typing import Annotated, Any, NoReturn, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import hflow
+import typer
 from inspect_ai import SampleSource, Task, eval_set
 from inspect_ai.dataset import Sample
 from inspect_ai.log import EvalLog, EvalSample, read_eval_log
@@ -1514,18 +1514,36 @@ def compare_summaries(summary_paths: Sequence[Path]) -> None:
         )
 
 
-def _positive_integer(raw_value: str) -> int:
-    parsed_value = int(raw_value)
-    if parsed_value <= 0:
-        raise argparse.ArgumentTypeError("must be a positive integer")
-    return parsed_value
+def _positive_integer(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if value <= 0:
+        raise typer.BadParameter("must be a positive integer")
+    return value
 
 
-def _nonnegative_integer(raw_value: str) -> int:
-    parsed_value = int(raw_value)
-    if parsed_value < 0:
-        raise argparse.ArgumentTypeError("must be a nonnegative integer")
-    return parsed_value
+def _nonnegative_integer(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if value < 0:
+        raise typer.BadParameter("must be a nonnegative integer")
+    return value
+
+
+def _refuse_conflicting_frame_selection(
+    limit_per_episode: int | None,
+    samples_per_episode: int | None,
+) -> None:
+    if limit_per_episode is not None and samples_per_episode is not None:
+        raise typer.BadParameter(
+            "--limit-per-episode and --samples-per-episode are mutually exclusive",
+            param_hint="--samples-per-episode",
+        )
+
+
+def _exit_with_usage_error(message: str) -> NoReturn:
+    typer.echo(f"Error: {message}", err=True)
+    raise typer.Exit(2)
 
 
 def _default_output_directory(model: str, camera_view: CameraView) -> Path:
@@ -1533,190 +1551,254 @@ def _default_output_directory(model: str, camera_view: CameraView) -> Path:
     return DEFAULT_RUNS_DIRECTORY / f"{camera_view.value}-{sanitized_model_name}"
 
 
-def _labels_by_source_from_arguments(
-    arguments: argparse.Namespace,
+def _labels_by_source(
+    inputs: Sequence[Path],
+    *,
+    camera: CameraView,
+    frame_stride: int,
+    limit_per_episode: int | None,
+    episode_count: int | None,
+    samples_per_episode: int | None,
+    samples_per_hand_count: int | None,
+    sample_seed: int,
 ) -> dict[Path, list[ProjectedHandFrameLabel]]:
-    resolved_source_paths = _resolved_mcap_paths(arguments.inputs)
+    resolved_source_paths = _resolved_mcap_paths(inputs)
     source_uri_by_path = _source_uri_by_path(resolved_source_paths)
     source_paths = select_episode_paths(
         resolved_source_paths,
         source_uri_by_path=source_uri_by_path,
-        episode_count=arguments.episode_count,
-        sample_seed=arguments.sample_seed,
+        episode_count=episode_count,
+        sample_seed=sample_seed,
     )
-    camera_view = CameraView(arguments.camera)
     candidate_labels_by_source = {
         source_path: load_projected_hand_labels(
             source_path,
             source_uri=source_uri_by_path[source_path],
-            camera_view=camera_view,
-            frame_stride=arguments.frame_stride,
-            limit_per_episode=arguments.limit_per_episode,
-            samples_per_episode=arguments.samples_per_episode,
-            sample_seed=arguments.sample_seed,
+            camera_view=camera,
+            frame_stride=frame_stride,
+            limit_per_episode=limit_per_episode,
+            samples_per_episode=samples_per_episode,
+            sample_seed=sample_seed,
         )
         for source_path in source_paths
     }
     return select_stratified_labels(
         candidate_labels_by_source,
         source_uri_by_path=source_uri_by_path,
-        samples_per_hand_count=arguments.samples_per_hand_count,
-        sample_seed=arguments.sample_seed,
+        samples_per_hand_count=samples_per_hand_count,
+        sample_seed=sample_seed,
     )
 
 
-def _run_configuration_from_arguments(arguments: argparse.Namespace) -> EvaluationConfiguration:
-    if not arguments.model:
+def _run_configuration(
+    inputs: Sequence[Path],
+    *,
+    camera: CameraView,
+    frame_stride: int,
+    limit_per_episode: int | None,
+    episode_count: int | None,
+    samples_per_episode: int | None,
+    samples_per_hand_count: int | None,
+    sample_seed: int,
+    output: Path | None,
+    model: str | None,
+    base_url: str | None,
+    api_key_environment_variable: str,
+    allow_missing_api_key: bool,
+    response_format: ResponseFormat,
+    temperature: float | None,
+    max_tokens: int,
+    max_retries: int,
+    worker_count: int,
+    prompt_path: Path,
+    label: str | None,
+) -> EvaluationConfiguration:
+    if not model:
         raise ValueError("--model or OPENAI_MODEL is required")
-    if not arguments.base_url:
+    if not base_url:
         raise ValueError("--base-url or OPENAI_BASE_URL is required")
-    camera_view = CameraView(arguments.camera)
-    output_directory = arguments.output or _default_output_directory(arguments.model, camera_view)
-    resolved_source_paths = _resolved_mcap_paths(arguments.inputs)
+    output_directory = output or _default_output_directory(model, camera)
+    resolved_source_paths = _resolved_mcap_paths(inputs)
     source_paths = select_episode_paths(
         resolved_source_paths,
         source_uri_by_path=_source_uri_by_path(resolved_source_paths),
-        episode_count=arguments.episode_count,
-        sample_seed=arguments.sample_seed,
+        episode_count=episode_count,
+        sample_seed=sample_seed,
     )
     return EvaluationConfiguration(
         source_paths=source_paths,
-        camera_view=camera_view,
-        frame_stride=arguments.frame_stride,
-        limit_per_episode=arguments.limit_per_episode,
-        episode_count=arguments.episode_count,
-        samples_per_episode=arguments.samples_per_episode,
-        samples_per_hand_count=arguments.samples_per_hand_count,
-        sample_seed=arguments.sample_seed,
+        camera_view=camera,
+        frame_stride=frame_stride,
+        limit_per_episode=limit_per_episode,
+        episode_count=episode_count,
+        samples_per_episode=samples_per_episode,
+        samples_per_hand_count=samples_per_hand_count,
+        sample_seed=sample_seed,
         output_directory=output_directory,
-        model=arguments.model,
-        base_url=arguments.base_url,
-        api_key_environment_variable=arguments.api_key_env,
-        allow_missing_api_key=arguments.allow_missing_api_key,
-        response_format=ResponseFormat(arguments.response_format),
-        temperature=arguments.temperature,
-        max_tokens=arguments.max_tokens,
-        max_retries=arguments.max_retries,
-        worker_count=arguments.workers,
-        prompt=arguments.prompt.read_text(),
-        prompt_path=arguments.prompt,
-        label=arguments.label or arguments.model,
+        model=model,
+        base_url=base_url,
+        api_key_environment_variable=api_key_environment_variable,
+        allow_missing_api_key=allow_missing_api_key,
+        response_format=response_format,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        max_retries=max_retries,
+        worker_count=worker_count,
+        prompt=prompt_path.read_text(),
+        prompt_path=prompt_path,
+        label=label or model,
     )
 
 
-def _add_input_and_projection_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("inputs", nargs="+", type=Path, help="MCAP files or directories")
-    parser.add_argument(
-        "--camera",
-        type=CameraView,
-        choices=CameraView,
-        default=CameraView.HEAD_LEFT,
-    )
-    parser.add_argument(
-        "--frame-stride",
-        type=_positive_integer,
-        default=30,
-        help="evaluate every Nth source frame; default 30 (about 1 fps)",
-    )
-    per_episode_selection = parser.add_mutually_exclusive_group()
-    per_episode_selection.add_argument(
-        "--limit-per-episode",
-        type=_positive_integer,
-        default=None,
-        help="stop after this many selected frames in each episode",
-    )
-    parser.add_argument(
-        "--episode-count",
-        type=_positive_integer,
-        default=None,
-        help="select up to N input episodes deterministically",
-    )
-    per_episode_selection.add_argument(
-        "--samples-per-episode",
-        type=_positive_integer,
-        default=None,
-        help="randomly select up to N eligible frames in each episode deterministically",
-    )
-    parser.add_argument(
-        "--samples-per-hand-count",
-        type=_positive_integer,
-        default=None,
+InputPathsArgument = Annotated[list[Path], typer.Argument(help="MCAP files or directories")]
+FrameStrideOption = Annotated[
+    int,
+    typer.Option(callback=_positive_integer, help="evaluate every Nth source frame; default 30"),
+]
+LimitPerEpisodeOption = Annotated[
+    int | None,
+    typer.Option(
+        callback=_positive_integer, help="stop after this many selected frames per episode"
+    ),
+]
+EpisodeCountOption = Annotated[
+    int | None,
+    typer.Option(
+        callback=_positive_integer, help="select up to N input episodes deterministically"
+    ),
+]
+SamplesPerEpisodeOption = Annotated[
+    int | None,
+    typer.Option(
+        callback=_positive_integer,
+        help="randomly select up to N eligible frames per episode deterministically",
+    ),
+]
+SamplesPerHandCountOption = Annotated[
+    int | None,
+    typer.Option(
+        callback=_positive_integer,
         help="select up to N deterministic samples for each projected count (0, 1, and 2)",
-    )
-    parser.add_argument(
-        "--sample-seed",
-        type=_nonnegative_integer,
-        default=42,
+    ),
+]
+SampleSeedOption = Annotated[
+    int,
+    typer.Option(
+        callback=_nonnegative_integer,
         help="seed for deterministic episode, frame, and class selection; default 42",
-    )
+    ),
+]
+MaxTokensOption = Annotated[int, typer.Option(callback=_positive_integer)]
+MaxRetriesOption = Annotated[int, typer.Option(callback=_positive_integer)]
+WorkersOption = Annotated[int, typer.Option(callback=_positive_integer)]
+
+app = typer.Typer(add_completion=False, help=__doc__)
 
 
-def _argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    labels_parser = subparsers.add_parser(
-        "labels", help="calculate projected hand-count labels without calling a model"
-    )
-    _add_input_and_projection_arguments(labels_parser)
-    labels_parser.add_argument(
-        "--output",
-        type=Path,
-        default=DEFAULT_LABELS_DIRECTORY / "projected-hand-labels.json",
-    )
+@app.command("labels", help="calculate projected hand-count labels without calling a model")
+def labels_command(
+    inputs: InputPathsArgument,
+    camera: CameraView = CameraView.HEAD_LEFT,
+    frame_stride: FrameStrideOption = 30,
+    limit_per_episode: LimitPerEpisodeOption = None,
+    episode_count: EpisodeCountOption = None,
+    samples_per_episode: SamplesPerEpisodeOption = None,
+    samples_per_hand_count: SamplesPerHandCountOption = None,
+    sample_seed: SampleSeedOption = 42,
+    output: Path = DEFAULT_LABELS_DIRECTORY / "projected-hand-labels.json",
+) -> None:
+    _refuse_conflicting_frame_selection(limit_per_episode, samples_per_episode)
+    try:
+        labels_by_source = _labels_by_source(
+            inputs,
+            camera=camera,
+            frame_stride=frame_stride,
+            limit_per_episode=limit_per_episode,
+            episode_count=episode_count,
+            samples_per_episode=samples_per_episode,
+            samples_per_hand_count=samples_per_hand_count,
+            sample_seed=sample_seed,
+        )
+        _print_reference_summary(labels_by_source)
+        write_label_report(
+            labels_by_source,
+            camera_view=camera,
+            frame_stride=frame_stride,
+            limit_per_episode=limit_per_episode,
+            episode_count=episode_count,
+            samples_per_episode=samples_per_episode,
+            samples_per_hand_count=samples_per_hand_count,
+            sample_seed=sample_seed,
+            output_path=output,
+        )
+        print(f"\nlabels: {output}")
+    except (FileNotFoundError, RuntimeError, ValueError) as error:
+        _exit_with_usage_error(str(error))
 
-    run_parser = subparsers.add_parser("run", help="run the image-only VLM evaluation")
-    _add_input_and_projection_arguments(run_parser)
-    run_parser.add_argument("--model", default=os.environ.get("OPENAI_MODEL"))
-    run_parser.add_argument("--base-url", default=os.environ.get("OPENAI_BASE_URL"))
-    run_parser.add_argument("--api-key-env", default="OPENAI_API_KEY")
-    run_parser.add_argument("--allow-missing-api-key", action="store_true")
-    run_parser.add_argument(
-        "--response-format",
-        type=ResponseFormat,
-        choices=ResponseFormat,
-        default=ResponseFormat.JSON_SCHEMA,
-    )
-    run_parser.add_argument("--temperature", type=float, default=None)
-    run_parser.add_argument("--max-tokens", type=_positive_integer, default=512)
-    run_parser.add_argument("--max-retries", type=_positive_integer, default=5)
-    run_parser.add_argument("--workers", type=_positive_integer, default=8)
-    run_parser.add_argument("--output", type=Path, default=None)
-    run_parser.add_argument("--label", default=None, help="display label used by compare")
-    run_parser.add_argument("--prompt", type=Path, default=DEFAULT_PROMPT_PATH)
 
-    compare_parser = subparsers.add_parser("compare", help="compare completed run summaries")
-    compare_parser.add_argument("summaries", nargs="+", type=Path)
-    return parser
+@app.command("run", help="run the image-only VLM evaluation")
+def run_command(
+    inputs: InputPathsArgument,
+    camera: CameraView = CameraView.HEAD_LEFT,
+    frame_stride: FrameStrideOption = 30,
+    limit_per_episode: LimitPerEpisodeOption = None,
+    episode_count: EpisodeCountOption = None,
+    samples_per_episode: SamplesPerEpisodeOption = None,
+    samples_per_hand_count: SamplesPerHandCountOption = None,
+    sample_seed: SampleSeedOption = 42,
+    model: str | None = os.environ.get("OPENAI_MODEL"),
+    base_url: str | None = os.environ.get("OPENAI_BASE_URL"),
+    api_key_env: str = "OPENAI_API_KEY",
+    allow_missing_api_key: Annotated[bool, typer.Option("--allow-missing-api-key")] = False,
+    response_format: ResponseFormat = ResponseFormat.JSON_SCHEMA,
+    temperature: float | None = None,
+    max_tokens: MaxTokensOption = 512,
+    max_retries: MaxRetriesOption = 5,
+    workers: WorkersOption = 8,
+    output: Path | None = None,
+    label: str | None = None,
+    prompt: Path = DEFAULT_PROMPT_PATH,
+) -> None:
+    _refuse_conflicting_frame_selection(limit_per_episode, samples_per_episode)
+    try:
+        run_evaluation(
+            _run_configuration(
+                inputs,
+                camera=camera,
+                frame_stride=frame_stride,
+                limit_per_episode=limit_per_episode,
+                episode_count=episode_count,
+                samples_per_episode=samples_per_episode,
+                samples_per_hand_count=samples_per_hand_count,
+                sample_seed=sample_seed,
+                output=output,
+                model=model,
+                base_url=base_url,
+                api_key_environment_variable=api_key_env,
+                allow_missing_api_key=allow_missing_api_key,
+                response_format=response_format,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                max_retries=max_retries,
+                worker_count=workers,
+                prompt_path=prompt,
+                label=label,
+            )
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as error:
+        _exit_with_usage_error(str(error))
+
+
+@app.command("compare", help="compare completed run summaries")
+def compare_command(summaries: list[Path]) -> None:
+    try:
+        compare_summaries(summaries)
+    except (FileNotFoundError, RuntimeError, ValueError) as error:
+        _exit_with_usage_error(str(error))
 
 
 def main() -> None:
-    parser = _argument_parser()
-    arguments = parser.parse_args()
-    try:
-        match arguments.command:
-            case "labels":
-                labels_by_source = _labels_by_source_from_arguments(arguments)
-                _print_reference_summary(labels_by_source)
-                write_label_report(
-                    labels_by_source,
-                    camera_view=CameraView(arguments.camera),
-                    frame_stride=arguments.frame_stride,
-                    limit_per_episode=arguments.limit_per_episode,
-                    episode_count=arguments.episode_count,
-                    samples_per_episode=arguments.samples_per_episode,
-                    samples_per_hand_count=arguments.samples_per_hand_count,
-                    sample_seed=arguments.sample_seed,
-                    output_path=arguments.output,
-                )
-                print(f"\nlabels: {arguments.output}")
-            case "run":
-                run_evaluation(_run_configuration_from_arguments(arguments))
-            case "compare":
-                compare_summaries(arguments.summaries)
-            case unknown_command:
-                raise AssertionError(f"unhandled command: {unknown_command}")
-    except (FileNotFoundError, RuntimeError, ValueError) as error:
-        parser.error(str(error))
+    app()
 
 
 if __name__ == "__main__":
