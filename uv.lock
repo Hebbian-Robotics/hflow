@@ -1198,6 +1198,7 @@ dependencies = [
     { name = "hflow" },
     { name = "inspect-ai" },
     { name = "openai" },
+    { name = "typer" },
 ]
 
 [package.dev-dependencies]
@@ -1212,6 +1213,7 @@ requires-dist = [
     { name = "hflow", editable = "." },
     { name = "inspect-ai", specifier = ">=0.3.260" },
     { name = "openai", specifier = ">=3.3.1" },
+    { name = "typer", specifier = ">=0.21.0" },
 ]
 
 [package.metadata.requires-dev]

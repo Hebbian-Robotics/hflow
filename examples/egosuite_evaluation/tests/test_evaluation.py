@@ -10,8 +10,10 @@ from types import SimpleNamespace
 
 import hflow
 import pytest
+import typer
 from inspect_ai.log import EvalConfig, EvalDataset, EvalLog, EvalSample, EvalSpec
 from inspect_ai.model import ModelOutput, ModelUsage
+from typer.testing import CliRunner, Result
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
@@ -31,12 +33,14 @@ from examples.egosuite_evaluation.evaluate import (
     _sample_result,
     _selected_frame_indices,
     load_projected_hand_label_report,
-    main,
     parse_hand_count_response,
     select_episode_paths,
     select_stratified_labels,
     summarize_evaluation_results,
     write_label_report,
+)
+from examples.egosuite_evaluation.evaluate import (
+    app as cli_app,
 )
 from examples.egosuite_evaluation.geometry import (
     CameraPoseInWorld,
@@ -1323,46 +1327,58 @@ def test_frame_sampling_ranks_same_named_sources_by_source_uri() -> None:
     assert second_selection == [0, 150, 180, 240]
 
 
-def test_compare_refuses_a_missing_summary_without_a_traceback(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
+def _invoke_cli(*arguments: str) -> Result:
+    return CliRunner().invoke(cli_app, list(arguments))
+
+
+def _captured_text(result: Result) -> str:
+    return result.output + getattr(result, "stderr", "")
+
+
+def _parameter_spec(parameter: object) -> tuple[object, object, object, object]:
+    parameter_type = getattr(parameter, "type", None)
+    callback = getattr(parameter, "callback", None)
+    return (
+        getattr(parameter, "default", None),
+        getattr(callback, "__name__", None),
+        getattr(parameter_type, "name", None),
+        getattr(parameter_type, "choices", None),
+    )
+
+
+def _command_parameters(name: str) -> dict[str, tuple[object, object, object, object]]:
+    commands = getattr(typer.main.get_command(cli_app), "commands", None)
+    assert isinstance(commands, dict)
+    specs: dict[str, tuple[object, object, object, object]] = {}
+    for parameter in getattr(commands[name], "params", ()):
+        parameter_name = getattr(parameter, "name", None)
+        assert isinstance(parameter_name, str)
+        specs[parameter_name] = _parameter_spec(parameter)
+    return specs
+
+
+def test_compare_refuses_a_missing_summary_without_a_traceback(tmp_path: Path) -> None:
     missing_summary_path = tmp_path / "missing-summary.json"
-    monkeypatch.setattr(sys, "argv", ["evaluate.py", "compare", str(missing_summary_path)])
+    result = _invoke_cli("compare", str(missing_summary_path))
 
-    with pytest.raises(SystemExit) as exit_info:
-        main()
-
-    streams = capsys.readouterr()
-    assert exit_info.value.code == 2
-    assert str(missing_summary_path) in streams.err
-    assert "Traceback" not in streams.err
+    assert result.exit_code == 2
+    captured = _captured_text(result)
+    assert str(missing_summary_path) in captured
+    assert "Traceback" not in captured
 
 
-def test_compare_refuses_malformed_json_without_a_traceback(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
+def test_compare_refuses_malformed_json_without_a_traceback(tmp_path: Path) -> None:
     malformed_summary_path = tmp_path / "malformed-summary.json"
     malformed_summary_path.write_text("not json")
-    monkeypatch.setattr(sys, "argv", ["evaluate.py", "compare", str(malformed_summary_path)])
+    result = _invoke_cli("compare", str(malformed_summary_path))
 
-    with pytest.raises(SystemExit) as exit_info:
-        main()
-
-    streams = capsys.readouterr()
-    assert exit_info.value.code == 2
-    assert "Expecting value" in streams.err
-    assert "Traceback" not in streams.err
+    assert result.exit_code == 2
+    captured = _captured_text(result)
+    assert "Expecting value" in captured
+    assert "Traceback" not in captured
 
 
-def test_compare_preserves_successful_output(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
+def test_compare_preserves_successful_output(tmp_path: Path) -> None:
     summary_path = tmp_path / "summary.json"
     summary_path.write_text(
         json.dumps(
@@ -1382,13 +1398,66 @@ def test_compare_preserves_successful_output(
             }
         )
     )
-    monkeypatch.setattr(sys, "argv", ["evaluate.py", "compare", str(summary_path)])
+    result = _invoke_cli("compare", str(summary_path))
 
-    main()
-
-    assert capsys.readouterr().out.splitlines() == [
+    assert result.exit_code == 0
+    assert result.output.splitlines() == [
         "| run | model | camera | valid / attempted | valid accuracy | end-to-end accuracy "
         "| macro end-to-end accuracy | predicted 0 | predicted 1 | predicted 2 |",
         "|---|---|---|---:|---:|---:|---:|---:|---:|---:|",
         "| candidate | vision-model | head-left | 5 / 6 | 80.00% | 66.67% | 50.00% | 1 | 2 | 3 |",
     ]
+
+
+def test_labels_and_run_keep_the_shared_input_and_projection_options() -> None:
+    labels = _command_parameters("labels")
+    run = _command_parameters("run")
+
+    for name in (
+        "inputs",
+        "camera",
+        "frame_stride",
+        "limit_per_episode",
+        "episode_count",
+        "samples_per_episode",
+        "samples_per_hand_count",
+        "sample_seed",
+    ):
+        assert name in labels, name
+        assert name in run, name
+        assert labels[name] == run[name], name
+
+
+def test_conflicting_frame_selection_flags_are_refused(tmp_path: Path) -> None:
+    result = _invoke_cli(
+        "labels",
+        str(tmp_path / "episode.mcap"),
+        "--limit-per-episode",
+        "5",
+        "--samples-per-episode",
+        "5",
+    )
+
+    assert result.exit_code == 2
+    assert "mutually exclusive" in _captured_text(result)
+
+
+def test_projection_bounds_are_refused_before_any_input_is_read(tmp_path: Path) -> None:
+    missing_input = str(tmp_path / "missing.mcap")
+
+    stride = _invoke_cli("labels", missing_input, "--frame-stride", "0")
+    seed = _invoke_cli("labels", missing_input, "--sample-seed", "-1")
+
+    assert stride.exit_code == 2
+    assert "positive integer" in _captured_text(stride)
+    assert seed.exit_code == 2
+    assert "nonnegative integer" in _captured_text(seed)
+
+
+def test_help_lists_every_command() -> None:
+    top_level = _invoke_cli("--help")
+
+    assert top_level.exit_code == 0
+    for name in ("labels", "run", "compare"):
+        assert name in top_level.output
+        assert _invoke_cli(name, "--help").exit_code == 0
