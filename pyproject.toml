@@ -54,6 +54,7 @@ mediapipe = ["mediapipe>=1.0.1"]
 # dependency is real, and confined to the one check that needs it. Headless
 # because a data pipeline runs where there is no display.
 motion = ["opencv-python-headless>=5.0.0.93"]
+video = ["av>=18.1.0"]
 native-build = ["Cython>=3.3.0", "setuptools>=84.0.0"]
 openai = ["openai>=3.3.1"]
 
@@ -67,6 +68,7 @@ hflow = "hflow.cli:main"
 
 [dependency-groups]
 dev = [
+    "av>=18.1.0", # the video extra, exercised by timestamp-preserving camera export tests
     "Cython>=3.3.0", # the native-build extra, present so its real build path is tested
     "hflow-server", # the workspace API package, present in dev so the suite tests it
     "obstore>=0.11.1", # the bucket extra, present in dev so the suite tests it

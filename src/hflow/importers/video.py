@@ -20,8 +20,10 @@ from hflow._field_guards import (
 from hflow._pinned_asset import sha256_hex_of_file
 from hflow.ffmpeg import ffmpeg_path, ffmpeg_version
 from hflow.ffmpeg._process import media_input_was_rejected, run_media_command
-from hflow.format import METADATA_RECORD_EPISODE, NANOSECONDS_PER_SECOND
+from hflow.format import GOP_SECONDS, METADATA_RECORD_EPISODE, NANOSECONDS_PER_SECOND
 from hflow.media import UnreadableVideo, UnsupportedVideo, VideoLimits, VideoProperties, probe_video
+from hflow.transform import TransformConfig
+from hflow.video import encode_images_to_h264, write_access_units_to_mp4
 
 _IMPORT_METADATA_RECORD = "video_import/v1"
 _MAXIMUM_TIMESTAMP_NS = (1 << 64) - 1
@@ -335,3 +337,62 @@ def prepare_video_episode(
         return UnreadableVideo()
     except _UnsupportedExcerpt:
         return UnsupportedVideo()
+
+
+def prepare_model_video(
+    source_video: Path,
+    output: Path,
+    config: VideoImportConfig,
+    *,
+    limits: VideoLimits = VideoLimits(),
+    transform_config: TransformConfig = TransformConfig(),
+) -> Path | UnreadableVideo | UnsupportedVideo:
+    """Prepare canonical model-input pixels directly, without an intermediate MCAP.
+
+    Shares the importer's fixed-rate JPEG recipe, then the canonical H.264 encoder.
+    This preserves the intentional JPEG compression and single-frame cadence.
+    No catalog, episode or persistent workspace is created. Output is published
+    atomically without replacing any existing path; the caller owns its lifetime.
+    """
+    source_video = source_video.resolve(strict=True)
+    if output.exists() or output.is_symlink():
+        raise FileExistsError(output)
+    inspection = probe_video(source_video, limits=limits)
+    if not isinstance(inspection, VideoProperties):
+        return inspection
+    if (
+        config.image_width * config.image_height > limits.maximum_frame_pixels
+        or config.image_hz > limits.maximum_frames_per_second
+        or config.duration_s > limits.maximum_duration_seconds
+    ):
+        return UnsupportedVideo()
+    try:
+        _require_excerpt_duration(inspection, config)
+    except _UnsupportedExcerpt:
+        return UnsupportedVideo()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=output.parent, prefix=".model-video-") as directory:
+        frame_directory = Path(directory)
+        try:
+            _render_frames(source_video, config, frame_directory, limits)
+        except _UnreadableImport:
+            return UnreadableVideo()
+        frame_paths = tuple(
+            frame_directory / f"frame_{index + 1:010d}.jpg" for index in range(config.frame_count)
+        )
+        if not all(frame_path.is_file() for frame_path in frame_paths):
+            return UnreadableVideo()
+        frames_per_second = config.image_hz if len(frame_paths) >= 2 else 1.0
+        access_units = encode_images_to_h264(
+            [frame_path.read_bytes() for frame_path in frame_paths],
+            fps=frames_per_second,
+            gop_frames=max(1, round(GOP_SECONDS[transform_config.gop_preset] * frames_per_second)),
+            crf=transform_config.crf,
+        )
+        staged_video = write_access_units_to_mp4(
+            (access_unit.data for access_unit in access_units),
+            fps=frames_per_second,
+            output=frame_directory / "video.mp4",
+        )
+        os.link(staged_video, output)
+    return output

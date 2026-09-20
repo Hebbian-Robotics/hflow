@@ -82,6 +82,7 @@ Reference pages define stable inputs, outputs, configuration, and stored-data
 contracts.
 
 - [Embedded integration boundaries](./EMBEDDED_BOUNDARIES.md)
+- [Local video preparation and measurements](./VIDEO_PRIMITIVES.md)
 - [Canonical episode format](./FORMAT.md)
 - [Catalog tables and curation API](./CATALOG.md)
 - [Environment variables](./ENVIRONMENT.md)

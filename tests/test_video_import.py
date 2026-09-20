@@ -433,3 +433,56 @@ def test_start_time_upper_bound_uses_field_guard() -> None:
     with pytest.raises(ValueError) as exc_info:
         replace(VideoImportConfig(duration_s=1), start_time_ns=value)
     assert str(exc_info.value) == (f"start_time_ns must be in [0, {value - 1}], got {value}")
+
+
+@pytest.mark.parametrize("duration_s,image_hz", [(1.0, 4.0), (0.1, 1.0)])
+def test_direct_model_video_matches_canonical_decoded_pixels(
+    source_video: Path, tmp_path: Path, duration_s: float, image_hz: float
+) -> None:
+    from hflow.importers.video import prepare_model_video
+
+    configuration = VideoImportConfig(
+        duration_s=duration_s, image_hz=image_hz, image_width=80, image_height=80
+    )
+    imported = import_video_episode(source_video, tmp_path / "import.mcap", configuration)
+    application = hflow.App("model-parity", data_root=tmp_path / "workspace", default_checks=())
+    report = asyncio.run(application.process(imported, record=False, stages={hflow.Stage.SYNC}))
+    assert not report.has_errors, report.summary()
+    output = tmp_path / "direct.mp4"
+    assert prepare_model_video(source_video, output, configuration) == output
+    from hflow.video import write_access_units_to_mp4
+
+    with report.canonical_path.open("rb") as canonical_stream:
+        canonical_messages = list(
+            make_reader(
+                canonical_stream, decoder_factories=[DecoderFactory()]
+            ).iter_decoded_messages()
+        )
+        reference_video = write_access_units_to_mp4(
+            (decoded.data for _schema, _channel, _message, decoded in canonical_messages),
+            fps=image_hz if configuration.frame_count > 1 else 1.0,
+            output=tmp_path / "reference.mp4",
+        )
+        fingerprints = [
+            subprocess.check_output(
+                [
+                    str(ffmpeg_path()),
+                    "-v",
+                    "error",
+                    "-i",
+                    str(video),
+                    "-map",
+                    "0:v:0",
+                    "-f",
+                    "framemd5",
+                    "-",
+                ],
+                timeout=30,
+            )
+            for video in (reference_video, output)
+        ]
+    assert fingerprints[0] == fingerprints[1]
+    original_output = output.read_bytes()
+    with pytest.raises(FileExistsError):
+        prepare_model_video(source_video, output, configuration)
+    assert output.read_bytes() == original_output

@@ -96,3 +96,22 @@ and selected FFmpeg build in their version or input contract. Changing selection
 can change measured results. This is a new original-source API; existing
 `Episode.frames()` and Build AI `FrameSampling` keep their declared frame-rate
 behavior. No canonical transform version changes are needed to use these helpers.
+
+## Nearest keyframes and unpadded evidence
+
+`SourceSamplingMode.NEAREST_KEYFRAMES` selects unique codec keyframes nearest
+caller-supplied `keyframe_positions`, expressed as fractions of the requested
+window. Ties choose the earlier frame; results are chronological. Empty windows
+remain empty and this mode has no uniform fallback. Position count must fit
+`maximum_frames`.
+
+Import `SourceFrameResize` from `hflow.source_sampling`. Set `resize=SourceFrameResize.FIT`
+to fit within `width` and `height` without adding padding; the default `PAD` retains
+the existing padded canvas. `scaling_algorithm` accepts `lanczos` (default) or
+`bicubic`, and `jpeg_quality` accepts FFmpeg quality values 1 through 31 (default 5).
+For example, a caller can choose positions `(0.15, 0.5, 0.85)`, a 960×960 fit box,
+and JPEG quality 2. These are evidence settings, not a classification policy.
+
+Nearest-keyframe probing shares the extraction deadline and is bounded by
+`maximum_probe_bytes`. Returned timestamps retain the source's playback clock and
+rational time base; subtract the window start explicitly for relative timestamps.

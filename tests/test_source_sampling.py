@@ -481,3 +481,73 @@ def test_example_emits_complete_windows_with_readable_frame_paths(
     frames = [frame for record in records for frame in record["frames"]]
     assert [frame["timestamp_seconds"] for frame in frames] == list(range(6))
     assert all(cv2.imread(frame["path"]) is not None for frame in frames)
+
+
+@pytest.mark.parametrize("timestamp_offset", [0, 5, -1])
+def test_nearest_keyframes_preserve_ties_pixels_and_playback_origin(
+    color_video: Path, tmp_path: Path, timestamp_offset: int
+) -> None:
+    from hflow.source_sampling import SourceFrameResize
+
+    shifted_source = tmp_path / ("shifted.ts" if timestamp_offset < 0 else "shifted.mp4")
+    subprocess.run(
+        [
+            str(ffmpeg_path()),
+            "-v",
+            "error",
+            "-i",
+            str(color_video),
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "copy",
+            "-output_ts_offset",
+            str(timestamp_offset),
+            "-avoid_negative_ts",
+            "disabled",
+            str(shifted_source),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    samples = sample_source_frames(
+        shifted_source,
+        tmp_path / "nearest",
+        window=SourceWindow(0, 6000),
+        settings=SourceFrameSampling(
+            mode=SourceSamplingMode.NEAREST_KEYFRAMES,
+            keyframe_positions=(0.15, 0.5, 0.85),
+            resize=SourceFrameResize.FIT,
+            width=960,
+            height=960,
+            jpeg_quality=2,
+            scaling_algorithm="bicubic",
+        ),
+    )
+    assert [frame.timestamp_seconds for frame in samples.frames] == [0, 2, 4]
+    assert samples.actual_mode is SourceSamplingMode.NEAREST_KEYFRAMES
+    assert samples.fallback_reason is None
+    for frame, dominant_channel in zip(samples.frames, (2, 1, 0), strict=True):
+        pixels = cv2.imread(str(frame.path))
+        assert pixels is not None
+        assert pixels.shape == (640, 960, 3)
+        assert int(pixels[320, 480, dominant_channel]) > 100
+        assert np.all(pixels.max(axis=2) > 30)
+
+
+def test_nearest_keyframes_deduplicate_and_leave_empty_windows_empty(
+    color_video: Path, tmp_path: Path
+) -> None:
+    settings = SourceFrameSampling(
+        mode=SourceSamplingMode.NEAREST_KEYFRAMES,
+        keyframe_positions=(0.2, 0.5, 0.8),
+    )
+    sparse = sample_source_frames(
+        color_video, tmp_path / "sparse", window=SourceWindow(0, 1900), settings=settings
+    )
+    empty = sample_source_frames(
+        color_video, tmp_path / "empty-nearest", window=SourceWindow(250, 1250), settings=settings
+    )
+    assert [frame.timestamp_seconds for frame in sparse.frames] == [0]
+    assert empty.frames == ()
+    assert empty.fallback_reason is None
