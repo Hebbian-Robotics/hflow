@@ -556,6 +556,9 @@ class Episode:
                 "Transform it first (hflow.write_canonical_episode) or read the "
                 "raw messages yourself via ep.channel()/the mcap package."
             )
+        output = self.workdir / f"{_sanitize_topic(topic)}.mp4"
+        if topic in self._video_fps and output.exists():
+            return output
         fps = video_module.estimate_fps_from_streaming_log_times(
             (
                 int(timestamp)
@@ -567,7 +570,6 @@ class Episode:
             topic=topic,
         )
         self._video_fps[topic] = fps
-        output = self.workdir / f"{_sanitize_topic(topic)}.mp4"
         if output.exists():
             # Sound because write_access_units_to_mp4 replaces atomically: a
             # file at the final path is always a completed remux.

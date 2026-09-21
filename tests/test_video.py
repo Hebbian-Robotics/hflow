@@ -160,7 +160,8 @@ def test_episode_video_remuxes_batches_without_materializing_a_channel(
         pytest.fail("video must not materialize the camera channel")
 
     monkeypatch.setattr(Episode, "channel", refuse_materialization)
-    with Episode(source) as episode:
+    workdir = tmp_path / "video-cache"
+    with Episode(source, workdir=workdir) as episode:
         original_batches = episode._reader.iter_batches
 
         def small_batches(*args: Any, **kwargs: Any) -> Iterator[Any]:
@@ -179,7 +180,25 @@ def test_episode_video_remuxes_batches_without_materializing_a_channel(
         assert int(_ffprobe_video_stream_fields(output)["nb_read_frames"]) == FRAME_COUNT
         assert episode._video_fps["/camera"] == pytest.approx(FPS)
         assert not episode._channel_data_by_id
+
+        def refuse_cached_read(*args: Any, **kwargs: Any) -> None:
+            pytest.fail("a completed video with cached FPS must not reread the channel")
+
+        with monkeypatch.context() as cached_patch:
+            cached_patch.setattr(episode._reader, "iter_batches", refuse_cached_read)
+            assert episode.video() == output
+
+        # FPS alone is insufficient: a removed MP4 must be recreated.
+        output.unlink()
         assert episode.video() == output
+        assert int(_ffprobe_video_stream_fields(output)["nb_read_frames"]) == FRAME_COUNT
+
+    with Episode(source, workdir=workdir) as reopened:
+        # A fresh handle must recover FPS, but can reuse the completed MP4.
+        monkeypatch.setattr(reopened, "iter_decoded_batches", refuse_cached_read)
+        assert not reopened._video_fps
+        assert reopened.video() == output
+        assert reopened._video_fps["/camera"] == pytest.approx(FPS)
 
 
 @pytest.fixture(scope="module")
