@@ -17,10 +17,12 @@ Everything here shells out to the pinned ffmpeg (``hflow.ffmpeg``).
 """
 
 import itertools
+import sqlite3
 import statistics
 import subprocess
 import tempfile
 from collections.abc import Iterable, Iterator, Sequence
+from contextlib import closing, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
@@ -90,6 +92,46 @@ def estimate_fps_from_log_times(log_times_ns: Sequence[int], *, topic: str) -> f
             "(duplicate or non-increasing log times); cannot infer a frame rate"
         )
     return 1e9 / median_delta_ns
+
+
+def estimate_fps_from_streaming_log_times(log_times_ns: Iterable[int], *, topic: str) -> float:
+    """Infer the same exact median rate without retaining all timestamps in RAM.
+
+    Keep intervals in a temporary disk index with a bounded SQLite page cache.
+    Selecting its middle one or two entries needs no in-memory sort. Only
+    timestamps are consumed; callers can release each raw video batch in turn.
+    """
+    with (
+        tempfile.TemporaryDirectory(prefix="hflow-video-fps-") as directory,
+        closing(sqlite3.connect(Path(directory) / "intervals.sqlite")) as connection,
+    ):
+        connection.execute("PRAGMA cache_size = -1024")
+        connection.execute("CREATE TABLE intervals (delta INTEGER NOT NULL)")
+        connection.execute("CREATE INDEX ordered_intervals ON intervals (delta)")
+        timestamp_count = 0
+
+        def intervals() -> Iterator[tuple[int]]:
+            nonlocal timestamp_count
+            previous: int | None = None
+            for timestamp in log_times_ns:
+                timestamp_count += 1
+                if previous is not None:
+                    yield (timestamp - previous,)
+                previous = timestamp
+
+        connection.executemany("INSERT INTO intervals VALUES (?)", intervals())
+        if timestamp_count < 2:
+            # Reuse the existing error contract for empty/single-frame streams.
+            return estimate_fps_from_log_times([0] * timestamp_count, topic=topic)
+        interval_count = timestamp_count - 1
+        middle = connection.execute(
+            "SELECT delta FROM intervals ORDER BY delta LIMIT ? OFFSET ?",
+            (2 - interval_count % 2, (interval_count - 1) // 2),
+        ).fetchall()
+        median_delta_ns = statistics.median(row[0] for row in middle)
+        if median_delta_ns <= 0:
+            return estimate_fps_from_log_times([0, 0], topic=topic)
+        return 1e9 / median_delta_ns
 
 
 def source_log_times_for_sampled_frames(
@@ -466,39 +508,52 @@ def scan_picture_coding_types(stream: bytes) -> PictureCodingScan:
     fail-closed as an error: an uncountable slice means the stream's B-frame
     freedom cannot be proven.
     """
-    picture_is_b: list[bool] = []
-    for slice_header in _iter_slice_headers(stream):
-        if slice_header.first_mb_in_slice is None or slice_header.slice_type is None:
-            raise ValueError(
-                "a slice header is incomplete or truncated; picture coding types "
-                "cannot be classified"
-            )
-        slice_is_b = slice_header.slice_type % 5 == 1
-        if slice_header.first_mb_in_slice == 0:
-            picture_is_b.append(slice_is_b)
-        elif picture_is_b:
-            picture_is_b[-1] = picture_is_b[-1] or slice_is_b
-        else:
-            raise ValueError(
-                "a slice header claims first_mb_in_slice > 0 before any picture starts; "
-                "picture coding types cannot be classified"
-            )
-    reorder_depth = 0
-    current_run = 0
-    for picture_is_b_flag in picture_is_b:
-        current_run = current_run + 1 if picture_is_b_flag else 0
-        reorder_depth = max(reorder_depth, current_run)
-    trailing_b_pictures = 0
-    for picture_is_b_flag in reversed(picture_is_b):
-        if not picture_is_b_flag:
-            break
-        trailing_b_pictures += 1
-    return PictureCodingScan(
-        picture_count=len(picture_is_b),
-        b_picture_count=sum(picture_is_b),
-        reorder_depth=reorder_depth,
-        trailing_b_pictures=trailing_b_pictures,
-    )
+    scanner = _PictureCodingScanner()
+    scanner.update(stream)
+    return scanner.result()
+
+
+@dataclass
+class _PictureCodingScanner:
+    """Accumulate the existing slice-header evidence across access units."""
+
+    picture_count: int = 0
+    b_picture_count: int = 0
+    reorder_depth: int = 0
+    trailing_b_pictures: int = 0
+    _picture_is_b: bool | None = None
+    _preceding_b_run: int = 0
+
+    def update(self, access_unit: bytes) -> None:
+        for slice_header in _iter_slice_headers(access_unit):
+            if slice_header.first_mb_in_slice is None or slice_header.slice_type is None:
+                raise ValueError(
+                    "a slice header is incomplete or truncated; picture coding types "
+                    "cannot be classified"
+                )
+            if slice_header.first_mb_in_slice == 0:
+                self.picture_count += 1
+                self._preceding_b_run = self.trailing_b_pictures
+                self.trailing_b_pictures = 0
+                self._picture_is_b = False
+            elif self._picture_is_b is None:
+                raise ValueError(
+                    "a slice header claims first_mb_in_slice > 0 before any picture starts; "
+                    "picture coding types cannot be classified"
+                )
+            if slice_header.slice_type % 5 == 1 and not self._picture_is_b:
+                self._picture_is_b = True
+                self.b_picture_count += 1
+                self.trailing_b_pictures = self._preceding_b_run + 1
+                self.reorder_depth = max(self.reorder_depth, self.trailing_b_pictures)
+
+    def result(self) -> PictureCodingScan:
+        return PictureCodingScan(
+            picture_count=self.picture_count,
+            b_picture_count=self.b_picture_count,
+            reorder_depth=self.reorder_depth,
+            trailing_b_pictures=self.trailing_b_pictures,
+        )
 
 
 def ensure_access_unit_delimiter(access_unit: bytes) -> bytes:
@@ -599,7 +654,7 @@ def write_access_units_to_mp4(
 ) -> Path:
     """Losslessly remux H.264 access units into an MP4 file (no re-encode).
 
-    Concatenates the access units to a raw Annex B stream and remuxes with
+    Streams complete access units to ffmpeg stdin and remuxes with
     ``ffmpeg -r {fps} -f h264 -i - -c:v copy -movflags +faststart``. The
     resulting file plays in anything; frame timing is constant-rate ``fps``
     (callers needing exact per-frame log times use the message timestamps).
@@ -610,18 +665,7 @@ def write_access_units_to_mp4(
     decoded). Canonical video requires ``bframes=0`` (docs/FORMAT.md, "The
     H.264 bitstream constraints").
     """
-    annex_b_stream = b"".join(units)
-    coding_types = scan_picture_coding_types(annex_b_stream)
-    if coding_types.b_picture_count:
-        raise ValueError(
-            f"cannot remux to MP4 without dropping frames: the stream carries "
-            f"{coding_types.b_picture_count} B picture(s) across "
-            f"{coding_types.picture_count} (reorder depth "
-            f"{coding_types.reorder_depth}); a -c:v copy remux drops the reorder "
-            f"tail, putting the last {coding_types.trailing_b_pictures} frame(s) at "
-            "risk (measured 301 of 303 in #250). Canonical video requires "
-            "bframes=0; re-encode upstream -- see docs/FORMAT.md item 4"
-        )
+    executable = ffmpeg_path()
     # Write to a unique sibling temp path and replace atomically: callers cache
     # on bare file existence, so the final path must never hold a partial MP4.
     # A fixed ``<output>.tmp`` name lets concurrent remuxes truncate/unlink the
@@ -631,7 +675,7 @@ def write_access_units_to_mp4(
     ) as temp_file:
         temporary_output = Path(temp_file.name)
     command: list[str] = [
-        str(ffmpeg_path()),
+        str(executable),
         "-hide_banner",
         "-loglevel",
         "error",
@@ -654,18 +698,59 @@ def write_access_units_to_mp4(
         str(temporary_output),
     ]
     try:
-        completed = subprocess.run(command, input=annex_b_stream, capture_output=True)
-        if completed.returncode != 0:
-            raise VideoEncodeError(
-                f"ffmpeg remux failed (exit {completed.returncode}): "
-                f"{_stderr_tail(completed.stderr)}"
+        # File-backed stderr cannot fill a pipe while stdin is being written,
+        # and diagnostics never accumulate in Python memory.
+        with tempfile.TemporaryFile() as stderr:
+            process = subprocess.Popen(
+                command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=stderr
             )
+            assert process.stdin is not None
+            try:
+                scanner = _PictureCodingScanner()
+                pipe_broken = False
+                for unit in units:
+                    scanner.update(unit)
+                    if not pipe_broken:
+                        try:
+                            process.stdin.write(unit)
+                            process.stdin.flush()
+                        except BrokenPipeError:
+                            # Complete validation even if ffmpeg exits early:
+                            # malformed input/B-frame errors retain precedence.
+                            pipe_broken = True
+                try:
+                    process.stdin.close()
+                except BrokenPipeError:
+                    pipe_broken = True
+                coding_types = scanner.result()
+                if coding_types.b_picture_count:
+                    raise ValueError(
+                        f"cannot remux to MP4 without dropping frames: the stream carries "
+                        f"{coding_types.b_picture_count} B picture(s) across "
+                        f"{coding_types.picture_count} (reorder depth "
+                        f"{coding_types.reorder_depth}); a -c:v copy remux drops the reorder "
+                        f"tail, putting the last {coding_types.trailing_b_pictures} frame(s) at "
+                        "risk (measured 301 of 303 in #250). Canonical video requires "
+                        "bframes=0; re-encode upstream -- see docs/FORMAT.md item 4"
+                    )
+                returncode = process.wait()
+                if returncode != 0 or pipe_broken:
+                    stderr.seek(0, 2)
+                    stderr.seek(max(0, stderr.tell() - 4 * _STDERR_TAIL_CHARACTER_LIMIT))
+                    raise VideoEncodeError(
+                        f"ffmpeg remux failed (exit {returncode}): {_stderr_tail(stderr.read())}"
+                    )
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+                with suppress(BrokenPipeError):
+                    process.stdin.close()
         if not temporary_output.is_file() or temporary_output.stat().st_size == 0:
             raise VideoEncodeError(f"ffmpeg remux exited 0 but produced no output at {output}")
-    except BaseException:
+        temporary_output.replace(output)
+    finally:
         temporary_output.unlink(missing_ok=True)
-        raise
-    temporary_output.replace(output)
     return output
 
 
