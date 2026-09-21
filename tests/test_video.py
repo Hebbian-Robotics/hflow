@@ -2,10 +2,15 @@
 
 import subprocess
 import time
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
+from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
+from mcap_protobuf.writer import Writer
 
+from hflow.episode import Episode
 from hflow.ffmpeg import ffmpeg_path, ffprobe_path
 from hflow.video import (
     AccessUnit,
@@ -132,6 +137,70 @@ def test_remux_to_mp4_preserves_every_frame(
     assert remux_elapsed_seconds < 5.0
 
 
+@pytest.mark.parametrize("invalid_format", [False, True])
+def test_episode_video_remuxes_batches_without_materializing_a_channel(
+    encoded_units: list[AccessUnit],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_format: bool,
+) -> None:
+    source = tmp_path / "camera.mcap"
+    with Writer(str(source)) as writer:
+        for index, unit in enumerate(encoded_units):
+            writer.write_message(
+                "/camera",
+                CompressedVideo(
+                    format="h265" if invalid_format and index == FRAME_COUNT - 1 else "h264",
+                    data=unit.data,
+                ),
+                log_time=round(index * 1e9 / FPS),
+            )
+
+    def refuse_materialization(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("video must not materialize the camera channel")
+
+    monkeypatch.setattr(Episode, "channel", refuse_materialization)
+    workdir = tmp_path / "video-cache"
+    with Episode(source, workdir=workdir) as episode:
+        original_batches = episode._reader.iter_batches
+
+        def small_batches(*args: Any, **kwargs: Any) -> Iterator[Any]:
+            kwargs["batch_max_messages"] = 3
+            yield from original_batches(*args, **kwargs)
+
+        monkeypatch.setattr(episode._reader, "iter_batches", small_batches)
+        if invalid_format:
+            with pytest.raises(ValueError, match="carries 'h265', expected 'h264'"):
+                episode.video()
+            assert not list(episode.workdir.glob("*.mp4"))
+            assert not list(episode.workdir.glob(".*.tmp"))
+            assert not episode._channel_data_by_id
+            return
+        output = episode.video()
+        assert int(_ffprobe_video_stream_fields(output)["nb_read_frames"]) == FRAME_COUNT
+        assert episode._video_fps["/camera"] == pytest.approx(FPS)
+        assert not episode._channel_data_by_id
+
+        def refuse_cached_read(*args: Any, **kwargs: Any) -> None:
+            pytest.fail("a completed video with cached FPS must not reread the channel")
+
+        with monkeypatch.context() as cached_patch:
+            cached_patch.setattr(episode._reader, "iter_batches", refuse_cached_read)
+            assert episode.video() == output
+
+        # FPS alone is insufficient: a removed MP4 must be recreated.
+        output.unlink()
+        assert episode.video() == output
+        assert int(_ffprobe_video_stream_fields(output)["nb_read_frames"]) == FRAME_COUNT
+
+    with Episode(source, workdir=workdir) as reopened:
+        # A fresh handle must recover FPS, but can reuse the completed MP4.
+        monkeypatch.setattr(reopened, "iter_decoded_batches", refuse_cached_read)
+        assert not reopened._video_fps
+        assert reopened.video() == output
+        assert reopened._video_fps["/camera"] == pytest.approx(FPS)
+
+
 @pytest.fixture(scope="module")
 def b_frame_stream(jpeg_frames: list[bytes]) -> bytes:
     """The same frames re-encoded with libx264 defaults (B-frames enabled)."""
@@ -155,7 +224,7 @@ def b_frame_stream(jpeg_frames: list[bytes]) -> bytes:
         "-pix_fmt",
         "yuv420p",
         "-x264-params",
-        "bframes=3:b_adapt=0",
+        "bframes=3:b_adapt=0:aud=1",
         "-f",
         "h264",
         "-",
@@ -219,21 +288,29 @@ def test_scan_refuses_an_unparseable_slice_header() -> None:
         scan_picture_coding_types(unparseable_slice)
 
 
+@pytest.mark.parametrize("split_units", [False, True])
 def test_remux_refuses_a_b_frame_stream_naming_the_tail(
-    b_frame_stream: bytes, tmp_path: Path
+    b_frame_stream: bytes, tmp_path: Path, split_units: bool
 ) -> None:
     output_path = tmp_path / "bframe.mp4"
+    units = (
+        (unit.data for unit in split_annex_b_stream(b_frame_stream))
+        if split_units
+        else iter((b_frame_stream,))
+    )
 
     with pytest.raises(ValueError, match="reorder depth") as error:
-        write_access_units_to_mp4((b_frame_stream,), fps=FPS, output=output_path)
+        write_access_units_to_mp4(units, fps=FPS, output=output_path)
 
     message = str(error.value)
-    assert "B picture" in message
-    assert "at risk" in message
+    scan = scan_picture_coding_types(b_frame_stream)
+    assert f"{scan.b_picture_count} B picture(s) across {scan.picture_count}" in message
+    assert f"reorder depth {scan.reorder_depth}" in message
+    assert f"last {scan.trailing_b_pictures} frame(s) at risk" in message
     assert "docs/FORMAT.md" in message
-    # The refusal fires before ffmpeg runs, so no partial MP4 is left behind.
+    # Even a refusal after streaming must remove the partial MP4.
     assert not output_path.exists()
-    assert not output_path.with_name(output_path.name + ".tmp").exists()
+    assert not list(tmp_path.glob(f".{output_path.name}.*.tmp"))
 
 
 def test_encode_guarantees_accept_a_conforming_stream(

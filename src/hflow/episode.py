@@ -556,24 +556,33 @@ class Episode:
                 "Transform it first (hflow.write_canonical_episode) or read the "
                 "raw messages yourself via ep.channel()/the mcap package."
             )
-        channel = self.channel(topic)
-        fps = video_module.estimate_fps_from_log_times(channel.timestamps.tolist(), topic=topic)
-        self._video_fps[topic] = fps
         output = self.workdir / f"{_sanitize_topic(topic)}.mp4"
+        if topic in self._video_fps and output.exists():
+            return output
+        fps = video_module.estimate_fps_from_streaming_log_times(
+            (
+                int(timestamp)
+                for batch in self._reader.iter_batches(
+                    topics=[topic], channel_ids=[info.channel_id]
+                )
+                for timestamp in batch.log_times
+            ),
+            topic=topic,
+        )
+        self._video_fps[topic] = fps
         if output.exists():
             # Sound because write_access_units_to_mp4 replaces atomically: a
             # file at the final path is always a completed remux.
             return output
 
         def validated_access_units() -> "Iterator[bytes]":
-            # Stream-decode instead of channel.messages: caching a decoded
-            # copy of every video payload would double the episode's memory.
-            for message in channel.iter_decoded():
-                if message.format != "h264":
-                    raise ValueError(
-                        f"camera {topic!r} carries {message.format!r}, expected 'h264'"
-                    )
-                yield message.data
+            for batch in self.iter_decoded_batches(topics=[topic], channel_ids=[info.channel_id]):
+                for message in batch.messages:
+                    if message.format != "h264":
+                        raise ValueError(
+                            f"camera {topic!r} carries {message.format!r}, expected 'h264'"
+                        )
+                    yield message.data
 
         return video_module.write_access_units_to_mp4(
             validated_access_units(),
