@@ -12,6 +12,7 @@ A live object-store integration test runs only when
 
 import asyncio
 import errno
+import logging
 import os
 import re
 import sys
@@ -326,6 +327,61 @@ class TestBucketStorageRoot:
         (mirror / "catalog" / "tags" / "t.parquet").write_bytes(b"local-final")
         root.sync_into_mirror(("catalog/tags",))
         assert (mirror / "catalog" / "tags" / "t.parquet").read_bytes() == b"local-final"
+
+    def test_fetch_logging_emits_debug_on_miss_and_silent_on_etag_hit(
+        self,
+        bucket_over_tmp: tuple[BucketStorageRoot, Path],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        root, _ = bucket_over_tmp
+        root.write_bytes("landing/e.mcap", b"version-one")
+
+        with caplog.at_level(logging.DEBUG, logger="hflow.storage"):
+            # A fresh fetch emits one DEBUG refresh record; no INFO records.
+            file_path = root.fetch("landing/e.mcap")
+            assert file_path.read_bytes() == b"version-one"
+            debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
+            assert len(debug_records) == 1
+            assert "refreshing" in debug_records[0].getMessage()
+            assert "landing/e.mcap" in debug_records[0].getMessage()
+            assert not [r for r in caplog.records if r.levelno == logging.INFO]
+
+            # An ETag cache hit emits no refresh records.
+            caplog.clear()
+            assert root.fetch("landing/e.mcap").read_bytes() == b"version-one"
+            assert not caplog.records
+
+            # A stale fetch (remote content/etag changed) emits one DEBUG refresh record.
+            root.write_bytes("landing/e.mcap", b"version-two!")
+            caplog.clear()
+            assert root.fetch("landing/e.mcap").read_bytes() == b"version-two!"
+            debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
+            assert len(debug_records) == 1
+            assert "refreshing" in debug_records[0].getMessage()
+            assert "landing/e.mcap" in debug_records[0].getMessage()
+            assert not [r for r in caplog.records if r.levelno == logging.INFO]
+
+    def test_sync_into_mirror_logging_emits_one_info_with_count_and_silent_when_warm(
+        self,
+        bucket_over_tmp: tuple[BucketStorageRoot, Path],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        root, _ = bucket_over_tmp
+        root.write_bytes("catalog/episodes/a.parquet", b"aa")
+        root.write_bytes("catalog/tags/t.parquet", b"tt")
+
+        with caplog.at_level(logging.INFO, logger="hflow.storage"):
+            # Synchronizing 2 missing objects emits exactly one INFO summary record containing the count.
+            root.sync_into_mirror(("catalog/episodes", "catalog/tags"))
+            info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+            assert len(info_records) == 1
+            assert "2" in info_records[0].getMessage()
+
+            # Synchronizing an already warm mirror emits no INFO records.
+            caplog.clear()
+            root.sync_into_mirror(("catalog/episodes", "catalog/tags"))
+            info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+            assert not info_records
 
     def test_child_shares_the_mirror_subtree(
         self, bucket_over_tmp: tuple[BucketStorageRoot, Path]
