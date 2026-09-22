@@ -117,7 +117,9 @@ class SourceFrameSampling:
 class SampledSourceFrame:
     """A JPEG and its actual presentation time from the source playback origin.
 
-    The origin is the container start time, not the requested window start.
+    The origin is the container start time, not the requested window start,
+    taken as FFmpeg rescales it onto the video time base: the nearest tick,
+    ties away from zero. Every sampling mode shares that origin.
     ``timestamp_seconds`` retains FFmpeg's rational time base without rounding.
     It is neither an MCAP log time nor an invented uniform sampling tick.
     """

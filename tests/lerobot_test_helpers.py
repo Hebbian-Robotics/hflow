@@ -73,9 +73,9 @@ class CorpusEpisodeRow:
 
 def _sql_literal(value: object) -> str:
     if isinstance(value, list | tuple):
-        return "[" + ",".join(f"'{item}'" for item in value) + "]"
+        return "[" + ",".join(_sql_literal(item) for item in value) + "]"
     if isinstance(value, str):
-        return f"'{value!s}'"
+        return "'" + value.replace("'", "''") + "'"
     return str(value)
 
 
