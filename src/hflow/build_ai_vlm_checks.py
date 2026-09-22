@@ -32,6 +32,7 @@ import asyncio
 import base64
 import importlib
 import json
+import logging
 import math
 import os
 import re
@@ -88,6 +89,8 @@ from hflow.steps import (
 
 if TYPE_CHECKING:
     from hflow.app import App
+
+logger = logging.getLogger(__name__)
 
 # Copied from Build AI's prompt file at the immutable revision used by the
 # reproduction runner:
@@ -162,6 +165,28 @@ def _hosted_retry_wait(retry_state: RetryCallState) -> float:
         else None
     )
     return _hosted_retry_delay_seconds(retry_after, retry_state.attempt_number - 1)
+
+
+def _hosted_retry_failure_category(error: BaseException) -> str:
+    if isinstance(error, httpx2.HTTPStatusError):
+        return f"http_{error.response.status_code}"
+    if isinstance(error, httpx2.RequestError):
+        return "transport"
+    return "unknown"
+
+
+def _log_hosted_retry(retry_state: RetryCallState) -> None:
+    error = retry_state.outcome.exception() if retry_state.outcome is not None else None
+    next_action = retry_state.next_action
+    if error is None or next_action is None:
+        return
+
+    logger.info(
+        "HFlow hosted check retry scheduled: next_attempt=%d delay_seconds=%.1f failure=%s",
+        retry_state.attempt_number + 1,
+        next_action.sleep,
+        _hosted_retry_failure_category(error),
+    )
 
 
 def _remaining_hosted_seconds(deadline: float) -> float:
@@ -867,6 +892,7 @@ async def _evaluate_image_with_hflow_hosted_service(
                     stop_after_attempt(execution.max_retries + 1)
                     | stop_before_delay(execution.total_timeout_seconds)
                 ),
+                before_sleep=_log_hosted_retry,
                 reraise=True,
             ):
                 with attempt:
