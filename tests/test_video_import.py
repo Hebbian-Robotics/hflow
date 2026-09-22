@@ -2,20 +2,24 @@
 
 import asyncio
 import hashlib
+import json
 import subprocess
+import tracemalloc
 from dataclasses import replace
 from pathlib import Path
 
-import cv2
+import av
 import numpy as np
 import pytest
 from mcap.reader import make_reader
 from mcap_protobuf.decoder import DecoderFactory
 
 import hflow
-from hflow.ffmpeg import ffmpeg_path
+from hflow.ffmpeg import ffmpeg_path, ffprobe_path
+from hflow.format import GopPreset
 from hflow.importers.video import VideoImportConfig, import_video_episode
 from hflow.media import VideoLimits
+from hflow.transform import TransformConfig, write_canonical_episode
 
 
 @pytest.fixture
@@ -50,6 +54,13 @@ def source_video(tmp_path: Path) -> Path:
     return source_path
 
 
+def _bgr_frame_from_h264(access_unit: bytes, decoder: av.CodecContext) -> np.ndarray:
+    assert isinstance(decoder, av.VideoCodecContext)
+    frames = list(decoder.decode(av.Packet(access_unit)))
+    assert len(frames) == 1, "expected exactly one decoded H.264 picture per access unit"
+    return frames[0].to_ndarray(format="bgr24")
+
+
 def test_imported_excerpt_preserves_content_time_and_known_metadata(
     source_video: Path, tmp_path: Path
 ) -> None:
@@ -71,9 +82,10 @@ def test_imported_excerpt_preserves_content_time_and_known_metadata(
         metadata = {record.name: record.metadata for record in reader.iter_metadata()}
 
     assert len(messages) == 4
+    decoder = av.CodecContext.create("h264", "r")
     for sample_index, (schema, channel, message, decoded) in enumerate(messages):
         assert schema is not None
-        assert schema.name == "foxglove.CompressedImage"
+        assert schema.name == "foxglove.CompressedVideo"
         assert channel.topic == "/head/compressed"
         expected_timestamp = config.start_time_ns + sample_index * 250_000_000
         assert message.log_time == message.publish_time == expected_timestamp
@@ -82,8 +94,8 @@ def test_imported_excerpt_preserves_content_time_and_known_metadata(
             == expected_timestamp
         )
         assert decoded.frame_id == "head"
-        pixels = cv2.imdecode(np.frombuffer(decoded.data, dtype=np.uint8), cv2.IMREAD_COLOR)
-        assert pixels is not None
+        assert decoded.format == "h264"
+        pixels = _bgr_frame_from_h264(decoded.data, decoder)
         assert pixels.shape == (80, 80, 3)
         assert pixels[0].max() < 20  # Letterboxing, not stretched source content.
         expected_channel = 2 if sample_index < 2 else 0  # OpenCV uses BGR.
@@ -189,8 +201,10 @@ def test_subframe_excerpts_sample_the_frame_covering_their_start(
     assert len(messages) == 1
     _schema, _channel, message, decoded = messages[0]
     assert message.log_time == 0
-    pixels = cv2.imdecode(np.frombuffer(decoded.data, dtype=np.uint8), cv2.IMREAD_COLOR)
-    assert pixels is not None
+    assert _schema is not None and _schema.name == "foxglove.CompressedVideo"
+    assert decoded.format == "h264"
+    decoder = av.CodecContext.create("h264", "r")
+    pixels = _bgr_frame_from_h264(decoded.data, decoder)
     assert pixels[45, 80, expected_color_channel] > 230
     assert np.delete(pixels[45, 80], expected_color_channel).max() < 20
 
@@ -233,6 +247,9 @@ def test_invalid_sources_and_incomplete_excerpts_publish_nothing(
         {"start_time_ns": (1 << 64) - 1},
         {"camera_name": ""},
         {"metadata": (("task", "one"), ("task", "two"))},
+        {"maximum_encoded_bytes": 0},
+        {"maximum_encoded_bytes": True},
+        {"maximum_encoded_bytes": 1.5},
     ],
 )
 def test_invalid_import_configuration_is_rejected(config: dict[str, object]) -> None:
@@ -486,3 +503,311 @@ def test_direct_model_video_matches_canonical_decoded_pixels(
     with pytest.raises(FileExistsError):
         prepare_model_video(source_video, output, configuration)
     assert output.read_bytes() == original_output
+
+
+def test_import_lands_h264_without_jpeg_and_canonical_passthrough_shrinks_ratio(
+    moving_video: Path, tmp_path: Path
+) -> None:
+    """Landing stores in-band H.264; canonical pass-through no longer grows from JPEG."""
+    from hflow.transform import write_canonical_episode
+    from hflow.video import split_annex_b_stream
+
+    config = VideoImportConfig(
+        duration_s=3,
+        image_hz=10,
+        image_width=320,
+        image_height=240,
+        camera_name="cam",
+    )
+    landing_path = tmp_path / "landing.mcap"
+    import_video_episode(moving_video, landing_path, config)
+    with landing_path.open("rb") as input_stream:
+        reader = make_reader(input_stream, decoder_factories=[DecoderFactory()])
+        messages = list(reader.iter_decoded_messages())
+        metadata = {record.name: record.metadata for record in reader.iter_metadata()}
+    assert metadata["video_import/v1"]["landing_format"] == "h264"
+    assert metadata["video_import/v1"]["importer_version"] == "2"
+    assert len(messages) == 30
+    for schema, _channel, _message, decoded in messages:
+        assert schema is not None
+        assert schema.name == "foxglove.CompressedVideo"
+        assert decoded.format == "h264"
+
+        units = split_annex_b_stream(decoded.data)
+        assert len(units) == 1
+
+    canonical_path = tmp_path / "canonical.mcap"
+    write_canonical_episode(landing_path, canonical_path)
+    payloads = _video_payloads(landing_path)
+    assert payloads == _video_payloads(canonical_path)
+    media_bytes = sum(map(len, payloads))
+    assert landing_path.stat().st_size <= media_bytes * 1.15
+    landing_bytes = landing_path.stat().st_size
+    canonical_bytes = canonical_path.stat().st_size
+    # H.264 landing should stay close to the lossless canonical copy's size.
+    assert landing_bytes <= canonical_bytes * 1.5
+
+
+@pytest.fixture
+def moving_video(tmp_path: Path) -> Path:
+    source = tmp_path / "moving.mkv"
+    subprocess.run(
+        [
+            str(ffmpeg_path()),
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=10:duration=3",
+            "-c:v",
+            "ffv1",
+            str(source),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return source
+
+
+def _video_payloads(path: Path) -> list[bytes]:
+    with path.open("rb") as stream:
+        return [
+            bytes(decoded.data)
+            for _schema, _channel, _message, decoded in make_reader(
+                stream, decoder_factories=[DecoderFactory()]
+            ).iter_decoded_messages()
+        ]
+
+
+def _decoded_yuv(path: Path) -> np.ndarray:
+    with av.open(str(path)) as container:
+        return np.stack([frame.to_ndarray(format="yuv420p") for frame in container.decode(video=0)])
+
+
+@pytest.mark.parametrize(
+    "settings,gop_frames",
+    [
+        (TransformConfig(), 10),
+        (TransformConfig(crf=0), 10),
+        (TransformConfig(crf=40), 10),
+        (TransformConfig(gop_preset=GopPreset.WORLD_MODEL), 60),
+        (TransformConfig(crf=18, gop_preset=GopPreset.WORLD_MODEL, gop_seconds=0.5), 5),
+    ],
+)
+def test_custom_encoding_matches_independent_moving_video_reference(
+    moving_video: Path, tmp_path: Path, settings: TransformConfig, gop_frames: int
+) -> None:
+    from hflow.importers.video import (
+        ImportedVideoEpisode,
+        prepare_model_video,
+        prepare_video_episode,
+    )
+    from hflow.video import (
+        scan_picture_coding_types,
+        split_annex_b_stream,
+        write_access_units_to_mp4,
+    )
+
+    config = VideoImportConfig(duration_s=3, image_hz=10, image_width=320, image_height=240)
+    landing = import_video_episode(
+        moving_video, tmp_path / "landing.mcap", config, transform_config=settings
+    )
+    prepared = prepare_video_episode(
+        moving_video, tmp_path / "prepared.mcap", config, transform_config=settings
+    )
+    assert isinstance(prepared, ImportedVideoEpisode)
+    canonical = tmp_path / "canonical.mcap"
+    # Grouping is independent of the committed encoding settings.
+    stamps = write_canonical_episode(
+        landing,
+        canonical,
+        replace(settings, compression="none", topic_groups={"/camera/compressed": "custom"}),
+    )
+    assert stamps.ffmpeg_version == "not-used"
+    payloads = _video_payloads(landing)
+    assert payloads == _video_payloads(canonical) == _video_payloads(prepared.path)
+    with landing.open("rb") as stream:
+        metadata = {record.name: record.metadata for record in make_reader(stream).iter_metadata()}
+    assert "provenance/v1" not in metadata
+    assert metadata["episode/v1"] == {}
+    assert int(metadata["video_import/v1"]["crf"]) == settings.crf
+    assert float(metadata["video_import/v1"]["gop_seconds"]) == gop_frames / 10
+    units = split_annex_b_stream(b"".join(payloads))
+    assert len(units) == 30
+    assert [i for i, unit in enumerate(units) if unit.is_keyframe] == list(range(0, 30, gop_frames))
+    assert all(unit.has_parameter_sets for unit in units if unit.is_keyframe)
+    decoder = av.CodecContext.create("h264", "r")
+    for payload in payloads:
+        _bgr_frame_from_h264(payload, decoder)
+    assert isinstance(decoder, av.VideoCodecContext)
+    assert decoder.decode(None) == []  # No delayed picture/reorder tail.
+    scan = scan_picture_coding_types(b"".join(payloads))
+    assert scan.picture_count == 30 and scan.b_picture_count == 0
+    exported = write_access_units_to_mp4(payloads, fps=10, output=tmp_path / "canonical.mp4")
+    direct = tmp_path / "direct.mp4"
+    assert prepare_model_video(moving_video, direct, config, transform_config=settings) == direct
+
+    # Independent FFmpeg oracle: the fixture already has the requested rate,
+    # dimensions and pixel format, so no importer filter/helper is involved.
+    reference = tmp_path / "oracle.mp4"
+    subprocess.run(
+        [
+            str(ffmpeg_path()),
+            "-v",
+            "error",
+            "-i",
+            str(moving_video),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            str(settings.crf),
+            "-pix_fmt",
+            "yuv420p",
+            "-x264-params",
+            f"keyint={gop_frames}:min-keyint={gop_frames}:scenecut=0:bframes=0:repeat-headers=1:aud=1",
+            str(reference),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    expected = _decoded_yuv(reference)
+    assert np.array_equal(_decoded_yuv(exported), expected)
+    assert np.array_equal(_decoded_yuv(direct), expected)
+    if settings.crf == 0:
+        assert np.array_equal(expected, _decoded_yuv(moving_video))
+    else:
+        assert not np.array_equal(expected, _decoded_yuv(moving_video))
+
+
+@pytest.mark.parametrize(
+    "requested",
+    [
+        TransformConfig(crf=0),
+        TransformConfig(crf=40),
+        TransformConfig(gop_preset=GopPreset.WORLD_MODEL),
+        TransformConfig(gop_seconds=0.5),
+    ],
+)
+def test_incompatible_import_encoding_requires_explicit_reimport(
+    source_video: Path, tmp_path: Path, requested: TransformConfig
+) -> None:
+    from hflow.transform import SourceNotConforming
+
+    config = VideoImportConfig(duration_s=2, image_hz=4, image_width=160, image_height=90)
+    landing = import_video_episode(source_video, tmp_path / "landing.mcap", config)
+    output = tmp_path / "canonical.mcap"
+    with pytest.raises(SourceNotConforming, match=r"re-import.*transform_config"):
+        write_canonical_episode(landing, output, requested)
+    assert not output.exists()
+    reimported = import_video_episode(
+        source_video, tmp_path / "reimported.mcap", config, transform_config=requested
+    )
+    write_canonical_episode(reimported, output, requested)
+    assert _video_payloads(output) == _video_payloads(reimported)
+
+
+@pytest.mark.parametrize("image_hz", [0.1, 1.0, 10.0, 30.0])
+def test_single_frame_packet_and_container_duration_is_one_second(
+    source_video: Path, tmp_path: Path, image_hz: float
+) -> None:
+    from hflow.importers.video import prepare_model_video
+    from hflow.video import write_access_units_to_mp4
+
+    config = VideoImportConfig(duration_s=0.01, image_hz=image_hz, image_width=160, image_height=90)
+    landing = import_video_episode(source_video, tmp_path / "landing.mcap", config)
+    canonical = tmp_path / "canonical.mcap"
+    write_canonical_episode(landing, canonical)
+    payloads = _video_payloads(canonical)
+    assert len(payloads) == 1
+    exported = write_access_units_to_mp4(payloads, fps=1, output=tmp_path / "canonical.mp4")
+    direct = tmp_path / "direct.mp4"
+    assert prepare_model_video(source_video, direct, config) == direct
+    for path in (exported, direct):
+        probe = json.loads(
+            subprocess.check_output(
+                [
+                    str(ffprobe_path()),
+                    "-v",
+                    "error",
+                    "-show_packets",
+                    "-show_streams",
+                    "-show_format",
+                    "-of",
+                    "json",
+                    str(path),
+                ],
+                timeout=30,
+            )
+        )
+        assert len(probe["packets"]) == 1
+        assert float(probe["packets"][0]["duration_time"]) == pytest.approx(1, abs=1e-6)
+        assert float(probe["streams"][0]["duration"]) == pytest.approx(1, abs=1e-6)
+        assert float(probe["format"]["duration"]) == pytest.approx(1, abs=1e-6)
+        assert _decoded_yuv(path).shape[0] == 1
+
+
+def test_encoded_byte_budget_is_exclusive_and_all_entrypoints_clean_up(
+    moving_video: Path, tmp_path: Path
+) -> None:
+    from hflow.importers.video import prepare_model_video, prepare_video_episode
+    from hflow.media import UnsupportedVideo
+
+    config = VideoImportConfig(duration_s=3, image_hz=10, image_width=320, image_height=240)
+    landing = import_video_episode(moving_video, tmp_path / "sized.mcap", config)
+    encoded_size = sum(map(len, _video_payloads(landing)))
+    accepted = import_video_episode(
+        moving_video,
+        tmp_path / "accepted.mcap",
+        replace(config, maximum_encoded_bytes=encoded_size + 1),
+    )
+    assert _video_payloads(accepted) == _video_payloads(landing)
+    for limit in (encoded_size, 1024):
+        bounded = replace(config, maximum_encoded_bytes=limit)
+        output = tmp_path / "rejected"
+        with pytest.raises(ValueError, match="maximum_encoded_bytes"):
+            import_video_episode(moving_video, output, bounded)
+        assert isinstance(prepare_video_episode(moving_video, output, bounded), UnsupportedVideo)
+        assert isinstance(prepare_model_video(moving_video, output, bounded), UnsupportedVideo)
+        assert not output.exists()
+        assert not tuple(tmp_path.glob(".video-import-*"))
+        assert not tuple(tmp_path.glob(".model-video-*"))
+
+
+def test_oversized_encoded_output_is_rejected_before_memory_scales_with_file(
+    source_video: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hflow.importers.video as importer
+    from hflow.media import UnsupportedVideo
+
+    # A process-boundary double simulates a tool ignoring -fs. Sparse files
+    # exercise large size rejection without an expensive encode or allocation.
+    encoded_size = 8 * 1024 * 1024
+
+    def oversized_encode(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        with Path(command[-1]).open("wb") as stream:
+            stream.truncate(encoded_size)
+        return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(importer, "run_media_command", oversized_encode)
+    config = VideoImportConfig(duration_s=1, maximum_encoded_bytes=1024 * 1024)
+    peaks = []
+    for encoded_size in (8 * 1024 * 1024, 256 * 1024 * 1024):
+        tracemalloc.start()
+        try:
+            outcome = importer.prepare_video_episode(
+                source_video, tmp_path / "rejected.mcap", config
+            )
+            _, peak = tracemalloc.get_traced_memory()
+            peaks.append(peak)
+        finally:
+            tracemalloc.stop()
+        assert isinstance(outcome, UnsupportedVideo), f"accepted {encoded_size} encoded bytes"
+        assert not (tmp_path / "rejected.mcap").exists()
+        assert not tuple(tmp_path.glob(".video-import-*"))
+    assert max(peaks) < 4 * 1024 * 1024

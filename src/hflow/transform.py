@@ -597,6 +597,23 @@ def write_canonical_episode(
     # check on a pass that was already happening rather than adding one.
     reader = open_reader(source_path, validate_crcs=True)
     try:
+        # First-party direct-H.264 imports commit quality/GOP at import time.
+        # Never silently accept incompatible transform requests or introduce
+        # another lossy generation. Ordinary recorded H.264 remains pass-through.
+        import_settings = reader.metadata().get("video_import/v1", {})
+        if import_settings.get("landing_format") == "h264":
+            try:
+                settings_match = (
+                    int(import_settings["crf"]) == transform_config.crf
+                    and float(import_settings["gop_seconds"]) == gop_seconds
+                )
+            except (KeyError, ValueError):
+                settings_match = False
+            if not settings_match:
+                raise SourceNotConforming(
+                    "imported H.264 encoding settings do not match TransformConfig; "
+                    "re-import the source video with the requested transform_config"
+                )
         # Keyed by CHANNEL id: several channels may legally share a topic and
         # each must survive the transform as its own output channel.
         infos = reader.channels()
