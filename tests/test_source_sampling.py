@@ -23,6 +23,8 @@ from hflow import (
 )
 from hflow.ffmpeg import ffmpeg_path, ffprobe_path
 
+pytestmark = pytest.mark.requires_system_ffmpeg
+
 
 @pytest.fixture
 def color_video(tmp_path: Path) -> Path:

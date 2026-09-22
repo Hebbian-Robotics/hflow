@@ -632,6 +632,7 @@ def test_cli_routes_lerobot_import_refusals_without_a_traceback(
 
 
 @_requires_system_ffmpeg
+@pytest.mark.requires_system_ffmpeg
 def test_converter_output_remuxes_without_tail_loss(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -776,6 +777,7 @@ def _episode_video_access_units(mcap: Path, camera_key: str) -> "list[bytes]":
     return units
 
 
+@pytest.mark.requires_system_ffmpeg
 def test_converter_slices_exactly_the_declared_frame_count(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

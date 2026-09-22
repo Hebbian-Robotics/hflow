@@ -107,6 +107,9 @@ hflow-server = { workspace = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "packages/hflow-server/tests"]
+markers = [
+    "requires_system_ffmpeg: needs a system ffmpeg that supports -fps_mode (5.1+)",
+]
 
 [tool.ruff]
 line-length = 100

@@ -28,6 +28,8 @@ from hflow.video import (
     write_access_units_to_mp4,
 )
 
+pytestmark = pytest.mark.requires_system_ffmpeg
+
 FRAME_COUNT = 48
 FPS = 12.0
 GOP_FRAMES = 12
