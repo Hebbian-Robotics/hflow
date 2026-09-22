@@ -21,6 +21,7 @@ from hflow.media import UnreadableVideo, VideoProperties, VideoWindow, probe_vid
 from hflow.video_statistics import (
     FrameStatisticsSettings,
     LumaRangePolicy,
+    VideoMeasurementToolchain,
     measure_video_frame_statistics,
 )
 from hflow.window_measurements import (
@@ -174,3 +175,25 @@ def test_windows_without_decodable_frames_are_unreadable(tmp_path: Path) -> None
 
     assert isinstance(after_source_end, UnreadableVideo)
     assert isinstance(damaged_source, UnreadableVideo)
+
+
+def test_caller_toolchain_probes_the_source(tmp_path: Path) -> None:
+    source = write_moving_colour_source(tmp_path / "source.mp4", display_rotation_degrees=None)
+    rejecting_ffprobe = tmp_path / "ffprobe"
+    rejecting_ffprobe.write_text(
+        "#!/bin/sh\necho 'Invalid data found when processing input' >&2\nexit 1\n"
+    )
+    rejecting_ffprobe.chmod(0o755)
+    toolchain = VideoMeasurementToolchain(
+        ffmpeg_executable=ffmpeg_path(),
+        ffprobe_executable=rejecting_ffprobe,
+        ffmpeg_version="caller ffmpeg",
+        ffprobe_version="caller ffprobe",
+    )
+
+    # The default toolchain reads this source; only the caller's probe rejects it.
+    measurements = measure_video_window(
+        source, MEASURED_WINDOW, WindowMeasurementSelection(blur=True), toolchain=toolchain
+    )
+
+    assert isinstance(measurements, UnreadableVideo)

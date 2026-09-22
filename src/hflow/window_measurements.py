@@ -121,7 +121,12 @@ def measure_video_window(
     less than half its duration (at most 0.5 seconds), as ``prepare_video_window`` does.
     FFmpeg's default display-rotation handling applies, so frames are measured upright.
     """
-    inspection = probe_video(source, limits=limits)
+    resolved_toolchain = (
+        toolchain if toolchain is not None else resolved_video_measurement_toolchain()
+    )
+    inspection = probe_video(
+        source, limits=limits, executable=resolved_toolchain.ffprobe_executable
+    )
     if not isinstance(inspection, VideoProperties):
         return inspection
     if (
@@ -136,9 +141,6 @@ def measure_video_window(
         start_seconds=window.start_seconds,
         duration_seconds=min(window.duration_seconds, float(remaining_source_seconds)),
         frames_per_second=window.frames_per_second,
-    )
-    resolved_toolchain = (
-        toolchain if toolchain is not None else resolved_video_measurement_toolchain()
     )
     if selection.frame_statistics is not None:
         _validate_frame_statistics_filters(resolved_toolchain)
