@@ -548,42 +548,77 @@ def test_check_returning_wrong_type_is_an_error_not_a_crash(
     assert "expected hflow.CheckResult" in record.getMessage()
 
 
-def test_direct_process_loop_logs_errors_without_logging_configuration(tmp_path: Path) -> None:
-    source = _state_only_episode(tmp_path)
-    script = textwrap.dedent(
-        """\
-        import asyncio
-        import sys
-        from pathlib import Path
-        import hflow
+_ERROR_LOOP_SCRIPT = """\
+import asyncio
+import sys
+from pathlib import Path
+{configure_logging}
+import hflow
 
-        source = Path(sys.argv[1])
-        app = hflow.App("error-loop", data_root=source.parent / "data", default_checks=())
+source = Path(sys.argv[1])
+app = hflow.App("error-loop", data_root=source.parent / "data", default_checks=())
 
-        @app.check(version="1", critical=True)
-        async def exploding(ep: hflow.Episode) -> hflow.CheckResult:
-            raise RuntimeError("intentional probe failure")
+@app.check(version="1", critical=True)
+async def exploding(ep: hflow.Episode) -> hflow.CheckResult:
+    raise RuntimeError("intentional probe failure")
 
-        completed = 0
-        for index in range(3):
-            episode = source.with_name(f"episode_{index}.mcap")
-            episode.write_bytes(source.read_bytes())
-            report = asyncio.run(app.process(episode))
-            assert report.has_errors
-            assert not report.quarantined
-            completed += 1
-        assert completed == 3
-        """
-    )
-    result = subprocess.run(
+completed = 0
+for index in range(3):
+    episode = source.with_name(f"episode_{{index}}.mcap")
+    episode.write_bytes(source.read_bytes())
+    report = asyncio.run(app.process(episode))
+    assert report.has_errors
+    assert not report.quarantined
+    completed += 1
+assert completed == 3
+"""
+
+
+def _run_error_loop(source: Path, *, configure_logging: str) -> subprocess.CompletedProcess[str]:
+    script = textwrap.dedent(_ERROR_LOOP_SCRIPT).format(configure_logging=configure_logging)
+    return subprocess.run(
         [sys.executable, "-c", script, str(source)], capture_output=True, text=True, check=False
     )
+
+
+def test_direct_process_loop_stays_silent_without_logging_configuration(tmp_path: Path) -> None:
+    """An unconfigured host gets nothing on its streams (#586).
+
+    Before the package-level NullHandler this leaked three check failures to
+    stderr through Python's lastResort handler, which is the library printing
+    behind its host's back. The errors did not go missing: the loop below
+    asserts ``report.has_errors`` on every episode, so the programmatic signal
+    is what carries them, and the next test proves a host that asks for the
+    records still receives them.
+    """
+    result = _run_error_loop(_state_only_episode(tmp_path), configure_logging="")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
+def test_direct_process_loop_logs_errors_once_the_host_configures_a_handler(
+    tmp_path: Path,
+) -> None:
+    """Silence is the default, not a gag: propagation still reaches a handler."""
+    result = _run_error_loop(
+        _state_only_episode(tmp_path),
+        configure_logging=(
+            "import logging\n"
+            "logging.basicConfig(level=logging.WARNING, format='%(name)s %(message)s')"
+        ),
+    )
+
     assert result.returncode == 0, result.stderr
     assert result.stdout == ""
     assert result.stderr.count("RuntimeError: intentional probe failure") == 3
     assert result.stderr.count("exploding") == 3
     for index in range(3):
         assert f"episode_{index}" in result.stderr
+    # The host's own format string carries the logger name, so the records
+    # arrive under hflow.* rather than as anonymous text.
+    assert "hflow." in result.stderr
     assert "Traceback" not in result.stderr
 
 
