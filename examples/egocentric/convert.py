@@ -36,7 +36,7 @@ from mcap_protobuf.schema import build_file_descriptor_set
 from hflow.ffmpeg import ffmpeg_path, ffmpeg_version
 from hflow.format import EPISODE_KEY_ROBOT_SOFTWARE_VERSION, METADATA_RECORD_EPISODE
 from hflow.transform import TransformConfig, write_canonical_episode
-from hflow.video import AccessUnit, split_annex_b_stream
+from hflow.video import AccessUnit, canonical_x264_parameters, split_annex_b_stream
 
 logger = logging.getLogger(__name__)
 
@@ -129,10 +129,7 @@ def transcode_video_to_annex_b_h264(
 ) -> list[AccessUnit]:
     """Transcode source video to Annex B H.264 access units with AUD and SPS/PPS on keyframes."""
     keyframe_interval = max(1, round(target_fps))
-    x264_parameters = (
-        f"keyint={keyframe_interval}:min-keyint={keyframe_interval}:"
-        "scenecut=0:bframes=0:repeat-headers=1:aud=1"
-    )
+    x264_parameters = canonical_x264_parameters(keyframe_interval)
     filter_string = (
         f"fps={target_fps:g},"
         f"scale={target_width}:{target_height}:"

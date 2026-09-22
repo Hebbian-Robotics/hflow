@@ -6,10 +6,9 @@ convention (docs/ARCHITECTURE.md, "The episode container"):
 - ``foxglove.CompressedVideo`` requires an Annex B byte stream, SPS/PPS
   attached to every keyframe, no B-frames, and one decodable access unit per
   message.
-- x264 delivers exactly that with ``repeat-headers=1`` (parameter sets before
-  every IDR), ``aud=1`` (access-unit delimiters, giving an unambiguous split
-  point), ``bframes=0`` and ``scenecut=0`` (frame i in equals access unit i
-  out, keyframes exactly every ``gop_frames``).
+- x264 delivers exactly that with :func:`canonical_x264_parameters`, which
+  repeats parameter sets, emits access-unit delimiters, disables B-frames and
+  scene-cut keyframes, and fixes the GOP cadence.
 - A raw ``.h264`` stream carries no timestamps; remuxing to MP4 requires
   declaring the frame rate to the demuxer (``-r`` before ``-i``).
 
@@ -68,6 +67,18 @@ class AccessUnit:
     data: bytes
     is_keyframe: bool  # contains an IDR NAL (type 5)
     has_parameter_sets: bool  # contains SPS (type 7) and PPS (type 8) NALs
+
+
+def canonical_x264_parameters(gop_frames: int) -> str:
+    """Return canonical x264 parameters for a fixed ``gop_frames`` GOP.
+
+    The settings enforce ``keyint=min-keyint``, ``scenecut=0``, ``bframes=0``,
+    ``repeat-headers=1``, and ``aud=1`` as required by the canonical video
+    convention.
+    """
+    return (
+        f"keyint={gop_frames}:min-keyint={gop_frames}:scenecut=0:bframes=0:repeat-headers=1:aud=1"
+    )
 
 
 def estimate_fps_from_log_times(log_times_ns: Sequence[int], *, topic: str) -> float:
@@ -183,10 +194,9 @@ def encode_images_to_h264(
     """Encode a sequence of compressed images into H.264 access units.
 
     Pipes ``images`` (all the same codec, e.g. JPEG) into a single ffmpeg
-    process (``-f image2pipe``) encoding with libx264 at ``crf``,
-    ``yuv420p``, ``keyint=min-keyint=gop_frames``, ``scenecut=0``,
-    ``bframes=0``, ``repeat-headers=1``, ``aud=1``, raw Annex B out
-    (``-f h264``), then splits the stream with :func:`split_annex_b_stream`.
+    process (``-f image2pipe``) encoding with libx264 at ``crf``, ``yuv420p``,
+    and :func:`canonical_x264_parameters`, raw Annex B out (``-f h264``), then
+    splits the stream with :func:`split_annex_b_stream`.
 
     Guarantees (enforced, raising ``VideoEncodeError`` otherwise):
     - ``len(result) == len(images)`` -- one access unit per input frame, in
@@ -196,9 +206,7 @@ def encode_images_to_h264(
     - No access unit contains a B picture (checked from the slice headers).
     """
     concatenated_image_bytes = b"".join(images)
-    x264_params = (
-        f"keyint={gop_frames}:min-keyint={gop_frames}:scenecut=0:bframes=0:repeat-headers=1:aud=1"
-    )
+    x264_params = canonical_x264_parameters(gop_frames)
 
     def run_encode(extra_output_flags: list[str]) -> bytes:
         command: list[str] = [

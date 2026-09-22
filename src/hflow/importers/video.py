@@ -32,6 +32,7 @@ from hflow.video import (
     AccessUnit,
     VideoEncodeError,
     _enforce_encode_guarantees,
+    canonical_x264_parameters,
     split_annex_b_stream,
     write_access_units_to_mp4,
 )
@@ -213,9 +214,7 @@ def _render_h264_access_units(
         else GOP_SECONDS[transform_config.gop_preset]
     )
     gop_frames = max(1, round(gop_seconds * fps))
-    x264_params = (
-        f"keyint={gop_frames}:min-keyint={gop_frames}:scenecut=0:bframes=0:repeat-headers=1:aud=1"
-    )
+    x264_params = canonical_x264_parameters(gop_frames)
     annex_b_path = working_directory / "excerpt.h264"
     output_flags = [
         # Set encoder/VUI timing too: remux -r alone cannot change the

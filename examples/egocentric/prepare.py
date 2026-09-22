@@ -25,7 +25,7 @@ from mcap_protobuf.schema import build_file_descriptor_set
 
 from hflow.ffmpeg import ffmpeg_path, ffmpeg_version
 from hflow.format import EPISODE_KEY_ROBOT_SOFTWARE_VERSION, METADATA_RECORD_EPISODE
-from hflow.video import AccessUnit, split_annex_b_stream
+from hflow.video import AccessUnit, canonical_x264_parameters, split_annex_b_stream
 
 DEFAULT_MANIFEST_PATH = Path(__file__).with_name("manifest.json")
 DEFAULT_SOURCE_ROOT = Path("data/egocentric")
@@ -500,10 +500,7 @@ def _transcode_episode_to_h264(
 ) -> list[AccessUnit]:
     frame_count = round(episode.duration_s * EPISODE_IMAGE_HZ)
     keyframe_interval = max(1, round(EPISODE_IMAGE_HZ))
-    x264_parameters = (
-        f"keyint={keyframe_interval}:min-keyint={keyframe_interval}:"
-        "scenecut=0:bframes=0:repeat-headers=1:aud=1"
-    )
+    x264_parameters = canonical_x264_parameters(keyframe_interval)
     command = [
         str(ffmpeg_path()),
         "-hide_banner",
