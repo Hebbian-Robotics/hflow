@@ -106,3 +106,22 @@ These measurements do not classify footage as blurry or unstable and are not
 accuracy estimates. See [streaming camera motion](how-to/stream-camera-motion.md)
 for extraction and filtering contracts, and [source sampling](how-to/sample-source-video.md)
 for original-frame evidence selection.
+
+## Shared window measurements
+
+`hflow.window_measurements.measure_video_window(source, window, selection,
+limits=VideoLimits(), toolchain=None)` measures one `VideoWindow` of the original
+source with a single decode. FFmpeg seeks the source, applies the window's `fps`
+filter and its default display-rotation handling, then splits the frames between
+the measurements chosen by `WindowMeasurementSelection`: `frame_statistics`
+settings, `blur`, and `camera_shake` settings. No intermediate video is written.
+
+Each branch applies exactly the filters of its file-level measurement, so results
+equal measuring an uncompressed copy of the same window with
+`measure_video_frame_statistics`, `measure_video_blur`, and `stream_camera_motion`.
+They differ from measuring `prepare_video_window` output, whose lossy H.264 encode
+changes pixel values. Unselected results are `None`. The window is clamped to the
+source end. A start at or beyond the source end, a damaged source, or a window that
+decodes to less than half its duration (at most 0.5 seconds) returns
+`UnreadableVideo`; unsupported sources return `UnsupportedVideo`, as
+`prepare_video_window` does. Timeouts and other process failures raise.

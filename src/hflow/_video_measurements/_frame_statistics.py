@@ -605,6 +605,17 @@ def _temporary_instrument_cache_output(
 
 def frame_statistics_filter_graph(settings: FrameStatisticsSettings) -> str:
     """Return the effective single-pass FFmpeg measurement graph."""
+    return frame_statistics_filter_chain(settings, metadata_destination="-")
+
+
+def frame_statistics_filter_chain(
+    settings: FrameStatisticsSettings, *, metadata_destination: str
+) -> str:
+    """Build the measurement chain, printing per-frame metadata to the destination.
+
+    Provenance always records the ``-`` (standard output) form; a shared decode
+    prints to a private file so one FFmpeg process can emit several measurements.
+    """
     normalization = (
         "scale=in_range=auto:out_range=full," if settings.luma_range is LumaRangePolicy.FULL else ""
     )
@@ -614,7 +625,7 @@ def frame_statistics_filter_graph(settings: FrameStatisticsSettings) -> str:
         "freezedetect="
         f"n={settings.freeze_noise_tolerance_decibels}dB:"
         f"d={settings.freeze_minimum_duration_seconds},"
-        "signalstats=stat=tout+brng,metadata=mode=print:file=-"
+        f"signalstats=stat=tout+brng,metadata=mode=print:file={metadata_destination}"
     )
 
 
