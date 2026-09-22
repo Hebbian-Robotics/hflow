@@ -22,6 +22,7 @@ The single overriding rule: **a canonical episode is spec-conforming MCAP.** Eve
 - `Header.library` is informational only (currently `hflow._grouped_mcap_writer`). Its exact value is not part of the format contract, and no reader may key behavior off it (see [Identifier rules](#identifier-rules)).
 - Chunks are compressed with **zstd** by default (`"none"` is permitted). Each `Chunk` record carries `uncompressed_crc`; the `Footer` carries a summary CRC.
 - The summary section repeats all `Schema` and `Channel` records and contains `Statistics`, all `ChunkIndex` records, `AttachmentIndex`/`MetadataIndex` records, and `SummaryOffset` records. A canonical episode always has a complete summary; unindexed files are not canonical.
+- Each topic names exactly one channel. MCAP allows several channels to share a topic; a canonical episode does not, because topic-keyed reads would be ambiguous.
 
 ## Topic-group chunking
 
@@ -242,6 +243,7 @@ automation. An `error` breaks the canonical convention (or the MCAP spec); a
 | `missing-provenance` | error | The `provenance/v1` metadata record is absent. |
 | `provenance-missing-key` | error | `provenance/v1` lacks `schema_version` or `pipeline_version`. |
 | `missing-episode-record` | warning | The optional `episode/v1` semantics record is absent. |
+| `multiple-channels-for-topic` | error | One topic names more than one channel. Topic-keyed reads cannot represent that. |
 | `topic-time-order` | error | A channel's `log_time` decreases between messages. |
 | `video-format` | error | A supported video message does not declare `format="h264"`. |
 | `video-invalid-slice-header` | error | The H.264 payload's picture count cannot be determined from its slice headers. |

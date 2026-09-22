@@ -3,10 +3,11 @@
 ``hflow doctor <file>`` / :func:`diagnose` check a file against the
 canonical-episode convention, in the spirit of ``mcap doctor``: container
 integrity (CRC-validated read, summary section, chunk indexes, statistics),
-the metadata records and their required stamps, chunk-group layout, per-topic
-time ordering, and every in-band video constraint (h264, one AUD-delimited
-access unit per message, SPS/PPS on keyframes, no B-frames, streams start on a
-keyframe, fixed GOP against the stamped interval).
+the metadata records and their required stamps, one channel per topic,
+chunk-group layout, per-topic time ordering, and every in-band video
+constraint (h264, one AUD-delimited access unit per message, SPS/PPS on
+keyframes, no B-frames, streams start on a keyframe, fixed GOP against the
+stamped interval).
 
 Findings, not exceptions: the doctor accumulates everything it can observe
 and reports levels. ``error`` breaks the convention; ``warning`` is legal but
@@ -244,6 +245,19 @@ def diagnose(path: Path | str) -> DoctorReport:
             for channel in summary.channels.values()
         }
         topics_by_channel_id = {channel.id: channel.topic for channel in summary.channels.values()}
+        channel_ids_by_topic: dict[str, list[int]] = {}
+        for channel in summary.channels.values():
+            channel_ids_by_topic.setdefault(channel.topic, []).append(channel.id)
+        for topic, channel_ids in sorted(channel_ids_by_topic.items()):
+            if len(channel_ids) < 2:
+                continue
+            ids = ", ".join(str(channel_id) for channel_id in sorted(channel_ids))
+            collector.add(
+                DiagnosticLevel.ERROR,
+                "multiple-channels-for-topic",
+                f"{topic}: {len(channel_ids)} channels (ids {ids}); "
+                "topic-keyed reads cannot represent them",
+            )
         video_channel_ids = {
             channel_id
             for channel_id, schema_name in schema_names_by_channel_id.items()

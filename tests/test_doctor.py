@@ -141,6 +141,63 @@ def test_video_channel_with_missing_schema_is_reported_not_corrupt(tmp_path: Pat
     assert "/good-cam" in b_finding.message
 
 
+def test_duplicate_topic_channels_are_an_error(tmp_path: Path) -> None:
+    """A file that already has two channels on one topic is not canonical,
+    even when the transform was never asked to rewrite it (#597)."""
+    path = tmp_path / "duplicate_topic.mcap"
+    with path.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        gripper_ids = [
+            writer.register_channel(topic="/gripper", message_encoding="json", schema_id=0)
+            for _ in range(2)
+        ]
+        joint_ids = [
+            writer.register_channel(topic="/joint_states", message_encoding="json", schema_id=0)
+            for _ in range(2)
+        ]
+        unique_id = writer.register_channel(topic="/wrench", message_encoding="json", schema_id=0)
+        for index, channel_id in enumerate([*gripper_ids, *joint_ids, unique_id]):
+            writer.add_message(channel_id, log_time=index + 1, data=b"{}", publish_time=index + 1)
+        writer.finish()
+
+    report = diagnose(path)
+
+    findings = [
+        finding for finding in report.findings if finding.code == "multiple-channels-for-topic"
+    ]
+    assert [finding.level for finding in findings] == [
+        DiagnosticLevel.ERROR,
+        DiagnosticLevel.ERROR,
+    ]
+
+    def described(topic: str, channel_ids: list[int]) -> str:
+        ids = ", ".join(str(channel_id) for channel_id in sorted(channel_ids))
+        return f"{topic}: 2 channels (ids {ids}); topic-keyed reads cannot represent them"
+
+    assert [finding.message for finding in findings] == [
+        described("/gripper", gripper_ids),
+        described("/joint_states", joint_ids),
+    ]
+    assert not any("/wrench" in finding.message for finding in findings)
+    assert not report.conforming
+
+
+def test_unique_topics_do_not_report_multiple_channels(tmp_path: Path) -> None:
+    path = tmp_path / "unique_topics.mcap"
+    with path.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        channel_id = writer.register_channel(
+            topic="/joint_states", message_encoding="json", schema_id=0
+        )
+        writer.add_message(channel_id, log_time=1, data=b"{}", publish_time=1)
+        writer.finish()
+
+    report = diagnose(path)
+    assert not any(finding.code == "multiple-channels-for-topic" for finding in report.findings)
+
+
 def test_nonconforming_video_is_reported(tmp_path: Path) -> None:
     path = tmp_path / "bad_video.mcap"
     with path.open("wb") as stream:
