@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import tarfile
+from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType
 
@@ -182,9 +183,9 @@ def _write_shard_tar(
     factory_id: str,
     worker_id: str,
     *,
-    sidecar_fields: dict[str, object] | None = None,
+    sidecar_fields: Mapping[str, object] | None = None,
     include_sidecar: bool = True,
-    intrinsics_fields: dict[str, object] | None = None,
+    intrinsics_fields: Mapping[str, object] | None = None,
 ) -> tuple[str, str, str]:
     """One pinned shard tar: a single video plus its sidecar.
 
@@ -583,5 +584,104 @@ def test_convert_webdataset_tar_missing_sidecar_fails(
 
     with pytest.raises(
         RuntimeError, match=_exactly("missing sidecar for source video 'clip.mp4' in broken.tar")
+    ):
+        CONVERT.convert_webdataset_tar(tar_path, output_dir)
+
+
+def test_convert_webdataset_tar_preserves_distinct_operator(
+    tmp_path: Path, moving_hevc_video: Path
+) -> None:
+    """When sidecar specifies an operator, it is preserved instead of generated."""
+    tar_path = tmp_path / "operator_test.tar"
+    output_dir = tmp_path / "converted"
+    video_bytes = moving_hevc_video.read_bytes()
+
+    sidecar_dict = {
+        "factory_id": "factory_010",
+        "worker_id": "worker_002",
+        "operator": "lead_operator_99",
+        "duration_sec": 24.0,
+        "fps": 10.0,
+        "codec": "h265",
+    }
+
+    with tarfile.open(tar_path, "w") as tar:
+        video_info = tarfile.TarInfo("clip.mp4")
+        video_info.size = len(video_bytes)
+        tar.addfile(video_info, io.BytesIO(video_bytes))
+
+        sidecar_bytes = json.dumps(sidecar_dict).encode("utf-8")
+        sidecar_info = tarfile.TarInfo("clip.json")
+        sidecar_info.size = len(sidecar_bytes)
+        tar.addfile(sidecar_info, io.BytesIO(sidecar_bytes))
+
+    results = CONVERT.convert_webdataset_tar(
+        tar_path=tar_path,
+        output_dir=output_dir,
+        canonical=False,
+        max_duration_s=1.0,
+    )
+    assert len(results) == 1
+    with Episode(results[0]) as episode:
+        metadata = episode.metadata_records["episode/v1"]
+        assert metadata["operator"] == "lead_operator_99"
+
+
+def test_convert_webdataset_tar_staged_validation_leaves_no_partial_mcap(
+    tmp_path: Path, moving_hevc_video: Path
+) -> None:
+    """If a subsequent clip is missing its sidecar, pre-validation fails before any MCAP is written."""
+    tar_path = tmp_path / "partial_test.tar"
+    output_dir = tmp_path / "converted"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    video_bytes = moving_hevc_video.read_bytes()
+
+    with tarfile.open(tar_path, "w") as tar:
+        # First clip has valid sidecar
+        v1 = tarfile.TarInfo("clip1.mp4")
+        v1.size = len(video_bytes)
+        tar.addfile(v1, io.BytesIO(video_bytes))
+
+        s1_bytes = json.dumps({"factory_id": "f1", "worker_id": "w1"}).encode("utf-8")
+        s1 = tarfile.TarInfo("clip1.json")
+        s1.size = len(s1_bytes)
+        tar.addfile(s1, io.BytesIO(s1_bytes))
+
+        # Second clip is missing sidecar
+        v2 = tarfile.TarInfo("clip2.mp4")
+        v2.size = len(video_bytes)
+        tar.addfile(v2, io.BytesIO(video_bytes))
+
+    with pytest.raises(
+        RuntimeError,
+        match=_exactly(f"missing sidecar for source video 'clip2.mp4' in {tar_path.name}"),
+    ):
+        CONVERT.convert_webdataset_tar(tar_path, output_dir)
+
+    # Assert no partial MCAPs were written to output_dir
+    assert list(output_dir.glob("*.mcap")) == []
+
+
+def test_convert_webdataset_tar_invalid_identity_fails(
+    tmp_path: Path, moving_hevc_video: Path
+) -> None:
+    """Non-string or null factory_id or worker_id fails loudly."""
+    tar_path = tmp_path / "invalid_id.tar"
+    output_dir = tmp_path / "converted"
+    video_bytes = moving_hevc_video.read_bytes()
+
+    with tarfile.open(tar_path, "w") as tar:
+        v1 = tarfile.TarInfo("clip1.mp4")
+        v1.size = len(video_bytes)
+        tar.addfile(v1, io.BytesIO(video_bytes))
+
+        s1_bytes = json.dumps({"factory_id": "f1", "worker_id": None}).encode("utf-8")
+        s1 = tarfile.TarInfo("clip1.json")
+        s1.size = len(s1_bytes)
+        tar.addfile(s1, io.BytesIO(s1_bytes))
+
+    with pytest.raises(
+        RuntimeError,
+        match=_exactly("sidecar 'clip1.json' is missing a usable 'factory_id' or 'worker_id'"),
     ):
         CONVERT.convert_webdataset_tar(tar_path, output_dir)

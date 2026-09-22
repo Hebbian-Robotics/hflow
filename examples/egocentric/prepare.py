@@ -58,6 +58,7 @@ class SourceIdentity:
     duration_s: float | None = None
     fps: float | None = None
     codec: str | None = None
+    operator_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -403,12 +404,19 @@ def _extract_source_videos(
             fps = float(raw_fps) if isinstance(raw_fps, (int, float)) else None
             raw_codec = sidecar.get("codec")
             codec = str(raw_codec) if isinstance(raw_codec, str) and raw_codec else None
+            raw_operator = sidecar.get("operator", sidecar.get("operator_id"))
+            operator_id = (
+                str(raw_operator).strip()
+                if isinstance(raw_operator, str) and raw_operator.strip()
+                else None
+            )
             identities[source_video.member] = SourceIdentity(
                 factory_id=sidecar["factory_id"],
                 worker_id=sidecar["worker_id"],
                 duration_s=duration_s,
                 fps=fps,
                 codec=codec,
+                operator_id=operator_id,
             )
             if destination_path.is_file():
                 _verify_sha256(destination_path, source_video.sha256)
@@ -560,7 +568,8 @@ def _episode_metadata(
         "task": episode.task,
         "factory": source_identity.factory_id,
         "worker": source_identity.worker_id,
-        "operator": f"{source_identity.factory_id}_{source_identity.worker_id}",
+        "operator": source_identity.operator_id
+        or f"{source_identity.factory_id}_{source_identity.worker_id}",
         EPISODE_KEY_ROBOT_SOFTWARE_VERSION: "build-ai-gen-1",
         "source_dataset": manifest.dataset.repo_id,
         "source_revision": manifest.dataset.revision,

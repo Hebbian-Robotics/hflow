@@ -55,6 +55,7 @@ class ClipSidecar:
     fps: float | None = None
     codec: str | None = None
     task: str = "unlabeled"
+    operator_id: str | None = None
     raw_data: dict[str, object] | None = None
 
 
@@ -68,13 +69,32 @@ def parse_sidecar(sidecar_json_bytes: bytes, member_name: str) -> ClipSidecar:
     if not isinstance(data, dict):
         raise RuntimeError(f"sidecar {member_name!r} must be a JSON object")
 
-    factory_id = str(data.get("factory_id", data.get("factory", ""))).strip()
-    worker_id = str(data.get("worker_id", data.get("worker", ""))).strip()
+    raw_factory = (
+        data.get("factory_id") if isinstance(data.get("factory_id"), str) else data.get("factory")
+    )
+    raw_worker = (
+        data.get("worker_id") if isinstance(data.get("worker_id"), str) else data.get("worker")
+    )
 
-    if not factory_id or not worker_id:
+    if (
+        not isinstance(raw_factory, str)
+        or not raw_factory.strip()
+        or not isinstance(raw_worker, str)
+        or not raw_worker.strip()
+    ):
         raise RuntimeError(
             f"sidecar {member_name!r} is missing a usable 'factory_id' or 'worker_id'"
         )
+
+    factory_id = raw_factory.strip()
+    worker_id = raw_worker.strip()
+
+    raw_operator = data.get("operator", data.get("operator_id"))
+    operator_id = (
+        str(raw_operator).strip()
+        if isinstance(raw_operator, str) and raw_operator.strip()
+        else None
+    )
 
     raw_duration = data.get("duration_sec", data.get("duration_s", data.get("duration")))
     duration_s = float(raw_duration) if isinstance(raw_duration, (int, float)) else None
@@ -95,6 +115,7 @@ def parse_sidecar(sidecar_json_bytes: bytes, member_name: str) -> ClipSidecar:
         fps=fps,
         codec=codec,
         task=task,
+        operator_id=operator_id,
         raw_data=data,
     )
 
@@ -214,7 +235,7 @@ def write_webdataset_episode(
             "task": sidecar.task,
             "factory": sidecar.factory_id,
             "worker": sidecar.worker_id,
-            "operator": f"{sidecar.factory_id}_{sidecar.worker_id}",
+            "operator": sidecar.operator_id or f"{sidecar.factory_id}_{sidecar.worker_id}",
             EPISODE_KEY_ROBOT_SOFTWARE_VERSION: "build-ai-gen-1",
             "source_archive": tar_path.name,
             "source_member": source_member,
@@ -319,8 +340,18 @@ def convert_webdataset_tar(
             if not video_members:
                 raise RuntimeError(f"archive {tar_path.name!r} contains no video members")
 
-            for episode_index, video_member in enumerate(video_members):
+            # Phase 1: Pre-validate all video members and their sidecars ahead of writes
+            planned_clips: list[tuple[tarfile.TarInfo, ClipSidecar]] = []
+            seen_stems: set[str] = set()
+
+            for video_member in video_members:
                 video_stem = Path(video_member.name).stem
+                if video_stem in seen_stems:
+                    raise RuntimeError(
+                        f"duplicate video stem {video_stem!r} in archive {tar_path.name!r}"
+                    )
+                seen_stems.add(video_stem)
+
                 sidecar_candidates = [
                     str(Path(video_member.name).with_suffix(".json").as_posix()),
                     f"{video_stem}.json",
@@ -342,6 +373,12 @@ def convert_webdataset_tar(
                     raise RuntimeError(f"could not read sidecar {sidecar_info.name!r}")
                 with sidecar_stream:
                     sidecar = parse_sidecar(sidecar_stream.read(), sidecar_info.name)
+
+                planned_clips.append((video_member, sidecar))
+
+            # Phase 2: Transcode and write episodes
+            for episode_index, (video_member, sidecar) in enumerate(planned_clips):
+                video_stem = Path(video_member.name).stem
 
                 # Extract video to temporary file
                 video_stream = tar.extractfile(video_member)
