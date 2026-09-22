@@ -51,10 +51,14 @@ class DatasetSource:
 
 @dataclass(frozen=True)
 class SourceIdentity:
-    """The factory and worker that produced one source video, from its sidecar."""
+    """The factory, worker, and video attributes from the sidecar."""
 
     factory_id: str
     worker_id: str
+    duration_s: float | None = None
+    fps: float | None = None
+    codec: str | None = None
+    operator_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -366,7 +370,7 @@ def _extract_source_videos(
     manifest: CorpusManifest,
     archive_path: Path,
     data_root: Path,
-) -> tuple[dict[str, Path], dict[str, SourceIdentity]]:
+) -> tuple[dict[str, Path], dict[str, SourceIdentity], bytes | None]:
     source_root = data_root / "source"
     source_root.mkdir(parents=True, exist_ok=True)
     source_paths: dict[str, Path] = {}
@@ -392,8 +396,27 @@ def _extract_source_videos(
             for field in ("factory_id", "worker_id"):
                 if not isinstance(sidecar.get(field), str) or not sidecar[field]:
                     raise RuntimeError(f"sidecar {sidecar_member!r} is missing a usable {field!r}")
+            raw_duration = sidecar.get(
+                "duration_sec", sidecar.get("duration_s", sidecar.get("duration"))
+            )
+            duration_s = float(raw_duration) if isinstance(raw_duration, (int, float)) else None
+            raw_fps = sidecar.get("fps")
+            fps = float(raw_fps) if isinstance(raw_fps, (int, float)) else None
+            raw_codec = sidecar.get("codec")
+            codec = str(raw_codec) if isinstance(raw_codec, str) and raw_codec else None
+            raw_operator = sidecar.get("operator", sidecar.get("operator_id"))
+            operator_id = (
+                str(raw_operator).strip()
+                if isinstance(raw_operator, str) and raw_operator.strip()
+                else None
+            )
             identities[source_video.member] = SourceIdentity(
-                factory_id=sidecar["factory_id"], worker_id=sidecar["worker_id"]
+                factory_id=sidecar["factory_id"],
+                worker_id=sidecar["worker_id"],
+                duration_s=duration_s,
+                fps=fps,
+                codec=codec,
+                operator_id=operator_id,
             )
             if destination_path.is_file():
                 _verify_sha256(destination_path, source_video.sha256)
@@ -413,7 +436,17 @@ def _extract_source_videos(
             temporary_path.replace(destination_path)
             _verify_sha256(destination_path, source_video.sha256)
             source_paths[source_video.member] = destination_path
-    return source_paths, identities
+
+        intrinsics_data: bytes | None = None
+        for member_name in source_archive.getnames():
+            if Path(member_name).name == "intrinsics.json":
+                extracted = source_archive.extractfile(member_name)
+                if extracted is not None:
+                    with extracted:
+                        intrinsics_data = extracted.read()
+                break
+
+    return source_paths, identities, intrinsics_data
 
 
 def _fault_frame_range(episode: PlannedEpisode) -> tuple[int, int] | None:
@@ -531,10 +564,12 @@ def _transcode_episode_to_h264(
 def _episode_metadata(
     manifest: CorpusManifest, episode: PlannedEpisode, source_identity: SourceIdentity
 ) -> dict[str, str]:
-    return {
+    metadata = {
         "task": episode.task,
         "factory": source_identity.factory_id,
-        "operator": f"{source_identity.factory_id}_{source_identity.worker_id}",
+        "worker": source_identity.worker_id,
+        "operator": source_identity.operator_id
+        or f"{source_identity.factory_id}_{source_identity.worker_id}",
         EPISODE_KEY_ROBOT_SOFTWARE_VERSION: "build-ai-gen-1",
         "source_dataset": manifest.dataset.repo_id,
         "source_revision": manifest.dataset.revision,
@@ -544,6 +579,13 @@ def _episode_metadata(
         "injected_fault": episode.fault.value,
         "task_completion": "unlabeled",
     }
+    if source_identity.duration_s is not None:
+        metadata["duration"] = f"{source_identity.duration_s:g}"
+    if source_identity.fps is not None:
+        metadata["fps"] = f"{source_identity.fps:g}"
+    if source_identity.codec is not None:
+        metadata["codec"] = source_identity.codec
+    return metadata
 
 
 def _write_video_episode(
@@ -553,6 +595,7 @@ def _write_video_episode(
     episode: PlannedEpisode,
     episode_index: int,
     source_identity: SourceIdentity,
+    intrinsics_data: bytes | None = None,
 ) -> None:
     access_units = _transcode_episode_to_h264(source_video_path, episode)
     episode_start_time_ns = EPISODE_START_TIME_NS + episode_index * 60_000_000_000
@@ -585,6 +628,14 @@ def _write_video_episode(
                 ),
             },
         )
+        if intrinsics_data is not None:
+            writer.add_attachment(
+                name="intrinsics.json",
+                media_type="application/json",
+                data=intrinsics_data,
+                log_time=episode_start_time_ns,
+                create_time=episode_start_time_ns,
+            )
         for frame_index, access_unit in enumerate(access_units):
             log_time_ns = episode_start_time_ns + round(
                 frame_index * 1_000_000_000 / EPISODE_IMAGE_HZ
@@ -646,7 +697,9 @@ def _write_prepared_manifest(
 def prepare_corpus(manifest_path: Path, source_root: Path, output_root: Path) -> list[Path]:
     manifest = _load_manifest(manifest_path)
     archive_path = _ensure_source_archive(manifest, source_root)
-    source_paths, identities = _extract_source_videos(manifest, archive_path, source_root)
+    source_paths, identities, intrinsics_data = _extract_source_videos(
+        manifest, archive_path, source_root
+    )
     landing_root = output_root / "landing"
     landing_root.mkdir(parents=True, exist_ok=True)
 
@@ -660,6 +713,7 @@ def prepare_corpus(manifest_path: Path, source_root: Path, output_root: Path) ->
             episode,
             episode_index,
             identities[episode.source_member],
+            intrinsics_data=intrinsics_data,
         )
         prepared_episode_paths.append(output_path)
         prepared_count = episode_index + 1

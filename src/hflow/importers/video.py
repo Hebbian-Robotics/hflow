@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-from foxglove_schemas_protobuf.CompressedImage_pb2 import CompressedImage
+from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
 from mcap.writer import Writer
 from mcap_protobuf.schema import build_file_descriptor_set
 
@@ -20,10 +20,21 @@ from hflow._field_guards import (
 from hflow._pinned_asset import sha256_hex_of_file
 from hflow.ffmpeg import ffmpeg_path, ffmpeg_version
 from hflow.ffmpeg._process import media_input_was_rejected, run_media_command
-from hflow.format import GOP_SECONDS, METADATA_RECORD_EPISODE, NANOSECONDS_PER_SECOND
+from hflow.format import (
+    CANONICAL_VIDEO_SCHEMA_NAME,
+    GOP_SECONDS,
+    METADATA_RECORD_EPISODE,
+    NANOSECONDS_PER_SECOND,
+)
 from hflow.media import UnreadableVideo, UnsupportedVideo, VideoLimits, VideoProperties, probe_video
 from hflow.transform import TransformConfig
-from hflow.video import encode_images_to_h264, write_access_units_to_mp4
+from hflow.video import (
+    AccessUnit,
+    VideoEncodeError,
+    _enforce_encode_guarantees,
+    split_annex_b_stream,
+    write_access_units_to_mp4,
+)
 
 _IMPORT_METADATA_RECORD = "video_import/v1"
 _MAXIMUM_TIMESTAMP_NS = (1 << 64) - 1
@@ -42,6 +53,9 @@ class VideoImportConfig:
     offset, and are rounded to the nearest nanosecond. No recording date,
     task, operator, or success label is inferred; ``metadata`` supplies only
     the episode fields the caller actually knows.
+    ``maximum_encoded_bytes`` bounds the buffered Annex-B excerpt (default
+    64 MiB, exclusive). Larger excerpts must be split or given an explicit
+    higher budget. This is an encoded-byte limit, not a process RSS limit.
     """
 
     duration_s: float
@@ -52,8 +66,10 @@ class VideoImportConfig:
     camera_name: str = "camera"
     start_time_ns: int = 0
     metadata: tuple[tuple[str, str], ...] = ()
+    maximum_encoded_bytes: int = 64 * 1024 * 1024
 
     def __post_init__(self) -> None:
+        require_positive_int(self.maximum_encoded_bytes, "maximum_encoded_bytes")
         for name, value in (
             ("duration_s", self.duration_s),
             ("source_start_s", self.source_start_s),
@@ -129,57 +145,148 @@ def _require_excerpt_duration(properties: VideoProperties, config: VideoImportCo
         raise _UnsupportedExcerpt("the requested excerpt extends past the source video")
 
 
-def _render_frames(
-    source_video: Path, config: VideoImportConfig, working_directory: Path, limits: VideoLimits
-) -> None:
+def _excerpt_video_filter(config: VideoImportConfig) -> str:
     # Keep the preceding keyframe's negative, excerpt-relative timestamps.
     # Accurate seeking would discard the frame covering a non-frame-aligned
     # start, letting fps pad the excerpt with a later (potentially different)
     # frame. Resample before trimming so that preceding frame stays available.
-    video_filter = (
+    return (
         f"fps={config.image_hz}:start_time=0:round=up:eof_action=pass,"
         f"trim=duration={config.duration_s},"
         f"scale={config.image_width}:{config.image_height}:"
         "force_original_aspect_ratio=decrease:flags=lanczos,"
         f"pad={config.image_width}:{config.image_height}:(ow-iw)/2:(oh-ih)/2:black"
     )
-    completed = run_media_command(
-        [
-            str(ffmpeg_path()),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-xerror",
-            "-protocol_whitelist",
-            "file",
-            "-noaccurate_seek",
-            "-ss",
-            str(config.source_start_s),
-            "-i",
-            str(source_video),
-            "-map",
-            "0:v:0",
-            "-an",
-            "-vf",
-            video_filter,
-            "-frames:v",
-            str(config.frame_count),
-            "-pix_fmt",
-            "yuvj420p",
-            "-c:v",
-            "mjpeg",
-            "-q:v",
-            "5",
-            "-f",
-            "image2",
-            str(working_directory / "frame_%010d.jpg"),
-        ],
-        timeout_seconds=limits.timeout_seconds,
-        maximum_output_bytes=limits.maximum_probe_bytes,
+
+
+def _ffmpeg_excerpt_command(
+    source_video: Path,
+    config: VideoImportConfig,
+    *,
+    output_flags: list[str],
+) -> list[str]:
+    return [
+        str(ffmpeg_path()),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-xerror",
+        "-protocol_whitelist",
+        "file",
+        "-noaccurate_seek",
+        "-ss",
+        str(config.source_start_s),
+        "-i",
+        str(source_video),
+        "-map",
+        "0:v:0",
+        "-an",
+        "-vf",
+        _excerpt_video_filter(config),
+        "-frames:v",
+        str(config.frame_count),
+        *output_flags,
+    ]
+
+
+def _render_h264_access_units(
+    source_video: Path,
+    config: VideoImportConfig,
+    working_directory: Path,
+    limits: VideoLimits,
+    *,
+    transform_config: TransformConfig = TransformConfig(),
+) -> list[AccessUnit]:
+    """Transcode the excerpt to canonical in-band H.264 access units.
+
+    One FFmpeg pass resample+scales the source and encodes libx264 with the
+    same AUD / keyframe / no-B-frame contract as
+    :func:`hflow.video.encode_images_to_h264`, so
+    :func:`hflow.transform.write_canonical_episode` can pass the messages
+    through without a JPEG intermediate.
+    """
+    fps = config.image_hz if config.frame_count > 1 else 1.0
+    gop_seconds = (
+        transform_config.gop_seconds
+        if transform_config.gop_seconds is not None
+        else GOP_SECONDS[transform_config.gop_preset]
     )
-    if media_input_was_rejected(completed):
-        raise _UnreadableImport("could not decode source video")
+    gop_frames = max(1, round(gop_seconds * fps))
+    x264_params = (
+        f"keyint={gop_frames}:min-keyint={gop_frames}:scenecut=0:bframes=0:repeat-headers=1:aud=1"
+    )
+    annex_b_path = working_directory / "excerpt.h264"
+    output_flags = [
+        # Set encoder/VUI timing too: remux -r alone cannot change the
+        # duration embedded in a single-picture H.264 stream.
+        "-r",
+        str(fps),
+        "-pix_fmt",
+        "yuv420p",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        str(transform_config.crf),
+        "-x264-params",
+        x264_params,
+        "-f",
+        "h264",
+        # FFmpeg may overshoot by one packet; reject before reading it into
+        # Python. The input/output dimension and timeout limits still apply.
+        "-fs",
+        str(config.maximum_encoded_bytes),
+        str(annex_b_path),
+    ]
+
+    def run_encode(extra_output_flags: list[str]) -> None:
+        if annex_b_path.exists():
+            annex_b_path.unlink()
+        completed = run_media_command(
+            _ffmpeg_excerpt_command(
+                source_video, config, output_flags=[*extra_output_flags, *output_flags]
+            ),
+            timeout_seconds=limits.timeout_seconds,
+            maximum_output_bytes=limits.maximum_probe_bytes,
+        )
+        if media_input_was_rejected(completed):
+            raise _UnreadableImport("could not decode source video")
+
+    def read_units() -> list[AccessUnit]:
+        if not annex_b_path.is_file():
+            raise _UnreadableImport("could not decode source video")
+        encoded_size = annex_b_path.stat().st_size
+        if encoded_size >= config.maximum_encoded_bytes:
+            raise _UnsupportedExcerpt("encoded video reaches maximum_encoded_bytes")
+        with annex_b_path.open("rb") as stream:
+            encoded = stream.read(encoded_size + 1)
+        if len(encoded) >= config.maximum_encoded_bytes:
+            raise _UnsupportedExcerpt("encoded video reaches maximum_encoded_bytes")
+        try:
+            return split_annex_b_stream(encoded)
+        except ValueError as error:
+            raise _UnreadableImport("could not decode source video") from error
+
+    run_encode([])
+    access_units = read_units()
+    if len(access_units) != config.frame_count:
+        # Some frame-rate conversions duplicate or drop frames to hit CFR;
+        # passthrough forces one output frame per filtered sample.
+        run_encode(["-fps_mode", "passthrough"])
+        access_units = read_units()
+    if len(access_units) != config.frame_count:
+        raise _UnreadableImport(
+            f"expected {config.frame_count} video samples, decoded only {len(access_units)}"
+        )
+    try:
+        _enforce_encode_guarantees(
+            access_units, expected_frame_count=config.frame_count, gop_frames=gop_frames
+        )
+    except VideoEncodeError as error:
+        raise _UnreadableImport("could not decode source video") from error
+    return access_units
 
 
 def import_video_episode(
@@ -188,6 +295,7 @@ def import_video_episode(
     config: VideoImportConfig,
     *,
     limits: VideoLimits = VideoLimits(),
+    transform_config: TransformConfig = TransformConfig(),
 ) -> Path:
     """Import a local excerpt into an MCAP for :meth:`hflow.App.process`.
 
@@ -197,16 +305,29 @@ def import_video_episode(
     publishing an output. URL inputs and network references are not read.
     FFmpeg uses HFlow's usual managed-binary policy.
 
-    JPEG ``foxglove.CompressedImage`` messages are source data, not canonical
-    output; the normal processing engine still owns transformation and QC.
-    Only caller-supplied fields enter ``episode/v1``. ``video_import/v1``
-    records source SHA-256, import settings, and the FFmpeg version.
+    Landing messages are in-band H.264 ``foxglove.CompressedVideo`` on
+    ``/{camera_name}/compressed``, encoded to the same Annex-B access-unit
+    contract the canonical transform validates for pass-through (AUD, SPS/PPS
+    on keyframes, no B-frames, first message is a keyframe). Container and
+    codec variety stop at this importer: ``write_canonical_episode`` does not
+    need a JPEG intermediate. The processing engine still owns provenance,
+    grouping, and QC. Only caller-supplied fields enter ``episode/v1``.
+    ``video_import/v1`` records source SHA-256, import settings, and the
+    FFmpeg version.
 
-    Conversion uses temporary disk beside ``output`` and reads one JPEG at
-    a time into the MCAP writer. The complete output is published atomically
-    without overwriting an existing path, including a concurrent publisher.
-    Temporary files are cleaned on success and exception; the caller owns
-    the published output and any later processing workspace.
+    Pass the same ``transform_config`` to import and canonical processing:
+    CRF and effective GOP seconds are committed here, recorded in import
+    metadata, and checked before canonical pass-through. Incompatible settings
+    require re-import from the source, not a second lossy transcode. Grouping
+    and other non-encoding transform settings are still applied at SYNC.
+    A single-picture stream is encoded at 1 Hz regardless of sampling rate.
+    Encoded excerpts reaching ``config.maximum_encoded_bytes`` are unsupported.
+
+    Conversion uses temporary disk beside ``output``. The complete output is
+    published atomically without overwriting an existing path, including a
+    concurrent publisher. Temporary files are cleaned on success and
+    exception; the caller owns the published output and any later processing
+    workspace.
     """
     source_video_path = Path(source_video).resolve()
     if not source_video_path.is_file():
@@ -222,7 +343,7 @@ def import_video_episode(
             raise _UnsupportedExcerpt("source video exceeds supported limits")
         case VideoProperties():
             return _import_inspected_video(
-                source_video_path, output_path, config, limits, inspection
+                source_video_path, output_path, config, limits, inspection, transform_config
             )
 
 
@@ -232,6 +353,7 @@ def _import_inspected_video(
     config: VideoImportConfig,
     limits: VideoLimits,
     properties: VideoProperties,
+    transform_config: TransformConfig,
 ) -> Path:
     if (
         config.image_width * config.image_height > limits.maximum_frame_pixels
@@ -244,15 +366,17 @@ def _import_inspected_video(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=output_path.parent, prefix=".video-import-") as directory:
         working_directory = Path(directory)
-        _render_frames(source_video_path, config, working_directory, limits)
+        access_units = _render_h264_access_units(
+            source_video_path, config, working_directory, limits, transform_config=transform_config
+        )
         staged_episode = working_directory / "episode.mcap"
         with staged_episode.open("wb") as output_stream:
             writer = Writer(output_stream)
             writer.start(library="hflow video importer")
             schema_id = writer.register_schema(
-                name="foxglove.CompressedImage",
+                name=CANONICAL_VIDEO_SCHEMA_NAME,
                 encoding="protobuf",
-                data=build_file_descriptor_set(CompressedImage).SerializeToString(),
+                data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
             )
             channel_id = writer.register_channel(
                 topic=f"/{config.camera_name}/compressed",
@@ -263,7 +387,7 @@ def _import_inspected_video(
             writer.add_metadata(
                 name=_IMPORT_METADATA_RECORD,
                 data={
-                    "importer_version": "1",
+                    "importer_version": "2",
                     "source_sha256": source_sha256,
                     "source_start_s": str(config.source_start_s),
                     "duration_s": str(config.duration_s),
@@ -274,22 +398,25 @@ def _import_inspected_video(
                     "start_time_ns": str(config.start_time_ns),
                     "frame_count": str(config.frame_count),
                     "ffmpeg_version": ffmpeg_version(),
+                    "landing_format": "h264",
+                    "crf": str(transform_config.crf),
+                    "gop_seconds": str(
+                        transform_config.gop_seconds
+                        if transform_config.gop_seconds is not None
+                        else GOP_SECONDS[transform_config.gop_preset]
+                    ),
+                    "maximum_encoded_bytes": str(config.maximum_encoded_bytes),
                 },
             )
-            for frame_index in range(config.frame_count):
-                frame_path = working_directory / f"frame_{frame_index + 1:010d}.jpg"
-                if not frame_path.is_file():
-                    raise _UnreadableImport(
-                        f"expected {config.frame_count} video samples, decoded only {frame_index}"
-                    )
+            for frame_index, access_unit in enumerate(access_units):
                 timestamp_ns = _sample_timestamp_ns(config, frame_index)
-                message = CompressedImage()
+                message = CompressedVideo()
                 message.timestamp.seconds, message.timestamp.nanos = divmod(
                     timestamp_ns, NANOSECONDS_PER_SECOND
                 )
                 message.frame_id = config.camera_name
-                message.format = "jpeg"
-                message.data = frame_path.read_bytes()
+                message.format = "h264"
+                message.data = access_unit.data
                 writer.add_message(
                     channel_id=channel_id,
                     log_time=timestamp_ns,
@@ -297,7 +424,6 @@ def _import_inspected_video(
                     sequence=frame_index,
                     data=message.SerializeToString(),
                 )
-                frame_path.unlink()
             writer.finish()
         # A hard link is an atomic create-if-absent on the same filesystem;
         # rename/replace would overwrite a concurrent caller's finished file.
@@ -316,6 +442,7 @@ def prepare_video_episode(
     config: VideoImportConfig,
     *,
     limits: VideoLimits = VideoLimits(),
+    transform_config: TransformConfig = TransformConfig(),
 ) -> ImportedVideoEpisode | UnreadableVideo | UnsupportedVideo:
     """Import supported media with explicit rejection outcomes.
 
@@ -330,7 +457,12 @@ def prepare_video_episode(
             raise FileExistsError("episode output already exists")
         return ImportedVideoEpisode(
             _import_inspected_video(
-                source_video.resolve(strict=True), output, config, limits, inspection
+                source_video.resolve(strict=True),
+                output,
+                config,
+                limits,
+                inspection,
+                transform_config,
             )
         )
     except _UnreadableImport:
@@ -349,10 +481,11 @@ def prepare_model_video(
 ) -> Path | UnreadableVideo | UnsupportedVideo:
     """Prepare canonical model-input pixels directly, without an intermediate MCAP.
 
-    Shares the importer's fixed-rate JPEG recipe, then the canonical H.264 encoder.
-    This preserves the intentional JPEG compression and single-frame cadence.
-    No catalog, episode or persistent workspace is created. Output is published
-    atomically without replacing any existing path; the caller owns its lifetime.
+    Shares the importer's direct source-to-H.264 recipe (same filters, GOP, and
+    CRF as :func:`import_video_episode` with the same transform settings), so
+    decoded pixels match a SYNC of the imported landing episode. No catalog,
+    episode or persistent workspace is created. Output is published atomically
+    without replacing any existing path; the caller owns its lifetime.
     """
     source_video = source_video.resolve(strict=True)
     if output.exists() or output.is_symlink():
@@ -372,27 +505,24 @@ def prepare_model_video(
         return UnsupportedVideo()
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=output.parent, prefix=".model-video-") as directory:
-        frame_directory = Path(directory)
+        work_directory = Path(directory)
         try:
-            _render_frames(source_video, config, frame_directory, limits)
+            access_units = _render_h264_access_units(
+                source_video,
+                config,
+                work_directory,
+                limits,
+                transform_config=transform_config,
+            )
         except _UnreadableImport:
             return UnreadableVideo()
-        frame_paths = tuple(
-            frame_directory / f"frame_{index + 1:010d}.jpg" for index in range(config.frame_count)
-        )
-        if not all(frame_path.is_file() for frame_path in frame_paths):
-            return UnreadableVideo()
-        frames_per_second = config.image_hz if len(frame_paths) >= 2 else 1.0
-        access_units = encode_images_to_h264(
-            [frame_path.read_bytes() for frame_path in frame_paths],
-            fps=frames_per_second,
-            gop_frames=max(1, round(GOP_SECONDS[transform_config.gop_preset] * frames_per_second)),
-            crf=transform_config.crf,
-        )
+        except _UnsupportedExcerpt:
+            return UnsupportedVideo()
+        frames_per_second = config.image_hz if len(access_units) >= 2 else 1.0
         staged_video = write_access_units_to_mp4(
             (access_unit.data for access_unit in access_units),
             fps=frames_per_second,
-            output=frame_directory / "video.mp4",
+            output=work_directory / "video.mp4",
         )
         os.link(staged_video, output)
     return output

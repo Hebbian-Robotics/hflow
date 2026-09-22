@@ -30,13 +30,49 @@ The existing canonical `camera_video` enrichment keeps its constant-rate contrac
 `hflow.importers.video.prepare_model_video(source, output, config, limits=...,
 transform_config=...)` uses `VideoImportConfig` and `TransformConfig` to produce
 canonical model-input pixels without first writing an MCAP. It shares the video
-importer's fixed-rate JPEG rendering and canonical H.264 encoding, including the
-single-frame cadence. Output is an atomically published caller-owned MP4.
+importer's direct source-to-H.264 encoding: fixed-rate sampling, aspect-preserving
+resize and letterboxing, then libx264, with no JPEG intermediate. Output is an
+atomically published caller-owned MP4. Removing the former lossy JPEG step
+intentionally changes pixels compared with older imports.
+
+`import_video_episode` and `prepare_video_episode` also accept `transform_config`.
+Use the same `TransformConfig` for import, canonical SYNC, and direct preparation
+to obtain identical decoded pixels. Custom `crf`, `gop_preset`, and explicit
+`gop_seconds` are applied at import/direct preparation; explicit seconds override
+the preset. Canonical SYNC validates and copies the encoded access units without
+a second lossy encode. If requested CRF or effective GOP seconds differ from the
+import metadata (or those settings are missing), SYNC raises `SourceNotConforming`
+with instructions to re-import the original video with the requested settings.
+Changing only grouping/compression settings does not require re-import. Ordinary
+recorded H.264 without the first-party import record retains its existing
+pass-through behavior; legacy JPEG landing episodes still transcode at SYNC.
+
+For example, pass `TransformConfig(crf=18, gop_seconds=2.0)` as `transform_config`
+to either import function and to `prepare_model_video`, and as `config` to
+`write_canonical_episode`. Encoding choices live in `video_import/v1`, along with
+source identity, sampling settings, and the actual FFmpeg version. Landing remains
+a source episode: only caller metadata enters `episode/v1`; the canonical
+transform still owns grouping, QC boundaries, and `provenance/v1`.
+
+Samples retain the half-open excerpt grid and MCAP timestamps. When there is only
+one sample, its H.264 encoder timing and exported MP4 packet/container duration
+are one second, even for sampling rates below or above 1 Hz. Multi-frame output
+uses the requested sampling rate.
+
+`VideoImportConfig.maximum_encoded_bytes` defaults to 64 MiB (exclusive) for all
+three entrypoints. FFmpeg is asked to stop at that size (it may overshoot by one
+encoded packet); size is checked before Python reads/splits/validates the stream.
+Reaching the limit rejects the excerpt without publishing output. Split larger
+excerpts or explicitly raise the budget. Buffering is bounded by the selected
+encoded-byte budget but includes copied access units, parser objects and validation
+buffers: this is not a 64 MiB total-memory/RSS guarantee. Existing source/output
+dimension limits, timeouts, bounded diagnostics, and temporary-file cleanup remain.
 
 Expected media failures return `UnreadableVideo` or `UnsupportedVideo`; operational
-failures raise. Existing destinations raise `FileExistsError`. The JPEG intermediate
-is intentional: bypassing it would change model-input pixels. This helper does not
-change canonical transformation defaults or identities.
+failures raise. The exception-style `import_video_episode` raises `ValueError` for
+unsupported excerpts, including the encoded-byte limit. Existing destinations raise
+`FileExistsError`. New import identities reflect the new encoded bytes and importer
+metadata; canonical encoding defaults and generic H.264 pass-through are unchanged.
 
 ## Frame statistics
 
