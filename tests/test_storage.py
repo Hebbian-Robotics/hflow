@@ -328,60 +328,73 @@ class TestBucketStorageRoot:
         root.sync_into_mirror(("catalog/tags",))
         assert (mirror / "catalog" / "tags" / "t.parquet").read_bytes() == b"local-final"
 
-    def test_fetch_logging_emits_debug_on_miss_and_silent_on_etag_hit(
-        self,
-        bucket_over_tmp: tuple[BucketStorageRoot, Path],
-        caplog: pytest.LogCaptureFixture,
+    def test_fetch_download_emits_one_debug_record_and_cache_hit_none(
+        self, bucket_over_tmp: tuple[BucketStorageRoot, Path], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        root, _ = bucket_over_tmp
+        root.write_bytes("landing/e.mcap", b"episode-bytes")
+        with caplog.at_level(logging.DEBUG, logger="hflow.storage"):
+            fetched = root.fetch("landing/e.mcap")
+        assert fetched.read_bytes() == b"episode-bytes"
+        (record,) = caplog.records
+        assert record.levelno == logging.DEBUG
+        assert "landing/e.mcap" in record.getMessage()
+        # The mirror had no payload for the key at all.
+        assert "(missing)" in record.getMessage()
+        caplog.clear()
+        # The etag hit is the quiet steady state: a second fetch logs nothing.
+        with caplog.at_level(logging.DEBUG, logger="hflow.storage"):
+            assert root.fetch("landing/e.mcap").read_bytes() == b"episode-bytes"
+        assert caplog.records == []
+
+    def test_fetch_stale_payload_emits_one_debug_record(
+        self, bucket_over_tmp: tuple[BucketStorageRoot, Path], caplog: pytest.LogCaptureFixture
     ) -> None:
         root, _ = bucket_over_tmp
         root.write_bytes("landing/e.mcap", b"version-one")
-
+        root.fetch("landing/e.mcap")
+        root.write_bytes("landing/e.mcap", b"version-two!")  # changed size => changed etag
+        caplog.clear()
         with caplog.at_level(logging.DEBUG, logger="hflow.storage"):
-            # A fresh fetch emits one DEBUG refresh record; no INFO records.
-            file_path = root.fetch("landing/e.mcap")
-            assert file_path.read_bytes() == b"version-one"
-            debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
-            assert len(debug_records) == 1
-            assert "refreshing" in debug_records[0].getMessage()
-            assert "landing/e.mcap" in debug_records[0].getMessage()
-            assert not [r for r in caplog.records if r.levelno == logging.INFO]
-
-            # An ETag cache hit emits no refresh records.
-            caplog.clear()
-            assert root.fetch("landing/e.mcap").read_bytes() == b"version-one"
-            assert not caplog.records
-
-            # A stale fetch (remote content/etag changed) emits one DEBUG refresh record.
-            root.write_bytes("landing/e.mcap", b"version-two!")
-            caplog.clear()
             assert root.fetch("landing/e.mcap").read_bytes() == b"version-two!"
-            debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
-            assert len(debug_records) == 1
-            assert "refreshing" in debug_records[0].getMessage()
-            assert "landing/e.mcap" in debug_records[0].getMessage()
-            assert not [r for r in caplog.records if r.levelno == logging.INFO]
+        (record,) = caplog.records
+        assert record.levelno == logging.DEBUG
+        assert "(stale)" in record.getMessage()
 
-    def test_sync_into_mirror_logging_emits_one_info_with_count_and_silent_when_warm(
-        self,
-        bucket_over_tmp: tuple[BucketStorageRoot, Path],
-        caplog: pytest.LogCaptureFixture,
+    def test_sync_into_mirror_emits_one_info_summary_per_transfer(
+        self, bucket_over_tmp: tuple[BucketStorageRoot, Path], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        root, _ = bucket_over_tmp
+        root.write_bytes("catalog/episodes/a.parquet", b"aa")
+        root.write_bytes("catalog/episodes/b.parquet", b"bbb")
+        root.write_bytes("catalog/tags/t.parquet", b"t")
+        with caplog.at_level(logging.INFO, logger="hflow.storage"):
+            mirror = root.sync_into_mirror(("catalog/episodes", "catalog/tags"))
+        assert (mirror / "catalog" / "episodes" / "b.parquet").read_bytes() == b"bbb"
+        (record,) = caplog.records
+        assert record.levelno == logging.INFO
+        # Three objects, ONE record: the summary is per call, not per object.
+        assert record.getMessage().startswith("synced 3 object(s) (6 bytes) into the mirror in ")
+        assert re.search(r" in \d+\.\d+s$", record.getMessage())
+        caplog.clear()
+        # An already warm mirror transfers nothing and says nothing.
+        with caplog.at_level(logging.INFO, logger="hflow.storage"):
+            root.sync_into_mirror(("catalog/episodes", "catalog/tags"))
+        assert caplog.records == []
+
+    def test_sync_into_mirror_counts_only_what_it_transferred(
+        self, bucket_over_tmp: tuple[BucketStorageRoot, Path], caplog: pytest.LogCaptureFixture
     ) -> None:
         root, _ = bucket_over_tmp
         root.write_bytes("catalog/episodes/a.parquet", b"aa")
         root.write_bytes("catalog/tags/t.parquet", b"tt")
-
+        root.sync_into_mirror(("catalog/episodes",))
+        caplog.clear()
         with caplog.at_level(logging.INFO, logger="hflow.storage"):
-            # Synchronizing 2 missing objects emits exactly one INFO summary record containing the count.
             root.sync_into_mirror(("catalog/episodes", "catalog/tags"))
-            info_records = [r for r in caplog.records if r.levelno == logging.INFO]
-            assert len(info_records) == 1
-            assert "2" in info_records[0].getMessage()
-
-            # Synchronizing an already warm mirror emits no INFO records.
-            caplog.clear()
-            root.sync_into_mirror(("catalog/episodes", "catalog/tags"))
-            info_records = [r for r in caplog.records if r.levelno == logging.INFO]
-            assert not info_records
+        (record,) = caplog.records
+        # Only the object the mirror lacked is counted, not the warm one.
+        assert record.getMessage().startswith("synced 1 object(s) (2 bytes) into the mirror in ")
 
     def test_child_shares_the_mirror_subtree(
         self, bucket_over_tmp: tuple[BucketStorageRoot, Path]

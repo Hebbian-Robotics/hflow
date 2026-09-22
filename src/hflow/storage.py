@@ -39,6 +39,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -575,7 +576,13 @@ class BucketStorageRoot:
                 and sidecar.read_text() == remote_etag
             ):
                 return local_file
-            logger.debug("refreshing %s to %s", f"{self.url}/{key}", local_file)
+            if not local_file.is_file():
+                refresh_reason = "missing"
+            elif remote_etag is None:
+                refresh_reason = "no remote etag"
+            else:
+                refresh_reason = "stale"
+            logger.debug("downloading %s into the mirror (%s)", key, refresh_reason)
             get_result = obstore.get(store, key)
             # The GET's own metadata etag (not the earlier HEAD's) goes into
             # the sidecar, so the recorded etag always matches the downloaded
@@ -623,6 +630,8 @@ class BucketStorageRoot:
         store = self._get_store()
         self.workspace  # noqa: B018  -- ensures the mirror directory exists
         downloaded = 0
+        transferred_bytes = 0
+        started = time.monotonic()
         for prefix in prefixes:
             for name in self.list_names(prefix):
                 local_file = self.mirror / name
@@ -631,10 +640,17 @@ class BucketStorageRoot:
                 # No lock or sidecar: immutable-file convention -- concurrent
                 # syncers can only write identical bytes, and the replace is
                 # atomic either way.
-                _download_to_file_atomically(obstore.get(store, name), local_file)
+                get_result = obstore.get(store, name)
+                transferred_bytes += get_result.meta["size"]
+                _download_to_file_atomically(get_result, local_file)
                 downloaded += 1
         if downloaded:
-            logger.info("synchronized %d missing object(s) to %s", downloaded, self.mirror)
+            logger.info(
+                "synced %d object(s) (%d bytes) into the mirror in %.2fs",
+                downloaded,
+                transferred_bytes,
+                time.monotonic() - started,
+            )
         return self.mirror
 
     def _warm_mirror(self, local_file: Path, key: str, etag: str | None) -> None:
