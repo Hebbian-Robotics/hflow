@@ -23,11 +23,12 @@ import subprocess
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from itertools import chain
 from pathlib import Path, PurePosixPath
 from typing import TypedDict
 
 from httpx import HTTPError
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi, RepoFile, hf_hub_download
 from huggingface_hub.errors import RemoteEntryNotFoundError
 from mcap.reader import make_reader
 from mcap.writer import Writer as McapWriter
@@ -482,29 +483,36 @@ def _hf_repo_info(repo_id: str, revision: str) -> _DatasetRepositoryInformation:
 
 
 def _hf_episode_metadata_files(repo_id: str, revision: str) -> list[str]:
-    """Select metadata files from the SDK's complete repository file inventory.
-
-    Repository info includes all file names in one response, so metadata
-    discovery does not follow server-provided pagination URLs with credentials.
-    """
+    """Enumerate episode metadata shards through the Hub's paginated tree API."""
+    filenames: set[str] = set()
     try:
-        repository_information = HfApi().dataset_info(
-            repo_id, revision=revision, timeout=60, expand=["siblings"]
-        )
+        try:
+            repository_tree = iter(
+                HfApi().list_repo_tree(
+                    repo_id,
+                    path_in_repo="meta/episodes",
+                    recursive=True,
+                    revision=revision,
+                    repo_type="dataset",
+                )
+            )
+            first_entry = next(repository_tree)
+        except StopIteration:
+            return []
+        except RemoteEntryNotFoundError:
+            return []
+        for entry in chain((first_entry,), repository_tree):
+            if not isinstance(entry, RepoFile):
+                continue
+            if not isinstance(entry.path, str) or not entry.path:
+                raise ValueError(
+                    f"Hugging Face listed an invalid filename for {repo_id}@{revision}"
+                )
+            if entry.path.endswith(".parquet"):
+                filenames.add(entry.path)
     except (HTTPError, ValueError, TypeError, KeyError) as error:
         raise ValueError(f"Hugging Face files for {repo_id}@{revision}: {error}") from error
-    if repository_information.siblings is None:
-        raise ValueError(f"Hugging Face did not list files for {repo_id}@{revision}")
-    filenames: set[str] = set()
-    for entry in repository_information.siblings:
-        if not isinstance(entry.rfilename, str) or not entry.rfilename:
-            raise ValueError(f"Hugging Face listed an invalid filename for {repo_id}@{revision}")
-        filenames.add(entry.rfilename)
-    return [
-        filename
-        for filename in sorted(filenames)
-        if filename.startswith("meta/episodes/") and filename.endswith(".parquet")
-    ]
+    return sorted(filenames)
 
 
 def _fetch_info_json(repo_id: str, revision: str, cache_dir: Path) -> dict:

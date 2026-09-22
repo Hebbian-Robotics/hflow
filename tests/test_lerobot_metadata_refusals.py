@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -252,10 +253,57 @@ def test_import_refuses_repository_without_episode_parquets(
             "features": {},
         },
     )
-    monkeypatch.setattr(prep, "_hf_episode_metadata_files", lambda _repo, _revision: [])
+
+    def missing_episode_tree(*_args: object, **_kwargs: object) -> list[object]:
+        raise RemoteEntryNotFoundError(
+            "missing meta/episodes",
+            response=Response(404, request=Request("GET", "https://huggingface.co/missing")),
+        )
+
+    monkeypatch.setattr(
+        prep,
+        "HfApi",
+        lambda: SimpleNamespace(list_repo_tree=missing_episode_tree),
+    )
     output_dir = tmp_path / "out"
 
     with pytest.raises(RuntimeError, match=_exactly("no meta/episodes parquet files found")):
+        _import(output_dir)
+
+    _assert_no_dataset_output(output_dir)
+
+
+def test_import_wraps_error_from_later_episode_tree_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_repo_info(monkeypatch)
+    monkeypatch.setattr(prep, "_fetch_info_json", lambda *_args: _info())
+
+    def failing_episode_tree(*_args: object, **_kwargs: object) -> Iterator[object]:
+        yield prep.RepoFile(
+            path="meta/episodes/chunk-000/file-000.parquet",
+            size=0,
+            oid="deadbeef",
+        )
+        raise RemoteEntryNotFoundError(
+            "missing later page",
+            response=Response(
+                404,
+                request=Request("GET", "https://huggingface.co/missing-later-page"),
+            ),
+        )
+
+    monkeypatch.setattr(
+        prep,
+        "HfApi",
+        lambda: SimpleNamespace(list_repo_tree=failing_episode_tree),
+    )
+    output_dir = tmp_path / "out"
+
+    with pytest.raises(
+        ValueError,
+        match=rf"^Hugging Face files for {re.escape(_REPO)}@{_SHA}:",
+    ):
         _import(output_dir)
 
     _assert_no_dataset_output(output_dir)
@@ -271,9 +319,9 @@ def test_import_refuses_inventory_with_invalid_filename(
         prep,
         "HfApi",
         lambda: SimpleNamespace(
-            dataset_info=lambda *_args, **_kwargs: SimpleNamespace(
-                siblings=[SimpleNamespace(rfilename=filename)]
-            )
+            list_repo_tree=lambda *_args, **_kwargs: [
+                prep.RepoFile(path=filename, size=0, oid="deadbeef")
+            ]
         ),
     )
     output_dir = tmp_path / "out"

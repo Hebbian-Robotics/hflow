@@ -2432,13 +2432,35 @@ def test_reuse_refuses_an_episode_written_before_the_fps_fix(tmp_path: Path) -> 
     )
 
 
-def test_hub_source_metadata_uses_pinned_files_and_reuses_downloads(
+def test_hub_source_metadata_paginates_pinned_tree_and_reuses_downloads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source_root = tmp_path / "repository"
     _build_fake_corpus(source_root)
+    first_shard = source_root / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    second_shard = source_root / "meta" / "episodes" / "chunk-001" / "file-000.parquet"
+    second_shard.parent.mkdir(parents=True)
+    import duckdb
+
+    connection = duckdb.connect()
+    connection.execute(
+        "CREATE TABLE all_episodes AS SELECT * FROM read_parquet('"
+        + str(first_shard).replace("'", "''")
+        + "')"
+    )
+    for shard_path, episode_indexes in (
+        (first_shard, (0, 1)),
+        (second_shard, (2, 3)),
+    ):
+        connection.execute(
+            f"COPY (SELECT * FROM all_episodes WHERE episode_index IN {episode_indexes}) "
+            f"TO '{str(shard_path).replace(chr(39), chr(39) * 2)}' (FORMAT parquet)"
+        )
+    connection.close()
+
     resolved_revision = "a" * 40
     downloaded_filenames: list[str] = []
+    metadata_tree_requests: list[str] = []
 
     class HubHandler(BaseHTTPRequestHandler):
         def do_HEAD(self) -> None:
@@ -2451,32 +2473,73 @@ def test_hub_source_metadata_uses_pinned_files_and_reuses_downloads(
             pass
 
         def respond(self, *, include_body: bool) -> None:
-            request_path = unquote(urlsplit(self.path).path)
+            request_url = urlsplit(self.path)
+            request_path = unquote(request_url.path)
+            metadata_tree_path = f"/api/datasets/fake/repo/tree/{resolved_revision}/meta/episodes"
+            if request_path == metadata_tree_path:
+                metadata_tree_requests.append(self.path)
+                second_page = "cursor=second" in request_url.query
+                if second_page:
+                    entries = [
+                        {
+                            "type": "file",
+                            "path": "meta/episodes/chunk-000/file-000.parquet",
+                            "size": first_shard.stat().st_size,
+                            "oid": "1" * 40,
+                        },
+                        {
+                            "type": "file",
+                            "path": "meta/episodes/chunk-001/file-000.parquet",
+                            "size": second_shard.stat().st_size,
+                            "oid": "2" * 40,
+                        },
+                    ]
+                else:
+                    entries = [
+                        {
+                            "type": "file",
+                            "path": "meta/episodes/chunk-001/file-000.parquet",
+                            "size": second_shard.stat().st_size,
+                            "oid": "2" * 40,
+                        },
+                        {
+                            "type": "directory",
+                            "path": "meta/episodes/chunk-001",
+                            "oid": "3" * 40,
+                        },
+                        {
+                            "type": "file",
+                            "path": "meta/episodes/README.txt",
+                            "size": 0,
+                            "oid": "4" * 40,
+                        },
+                    ]
+                payload = json.dumps(entries).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                if not second_page:
+                    self.send_header(
+                        "Link",
+                        f'<http://{self.headers["Host"]}{metadata_tree_path}?cursor=second>; rel="next"',
+                    )
+                self.end_headers()
+                if include_body:
+                    self.wfile.write(payload)
+                return
             if request_path in {
                 "/api/datasets/fake/repo/revision/main",
                 f"/api/datasets/fake/repo/revision/{resolved_revision}",
             }:
-                # The metadata shard appears after a large inventory of unrelated
-                # media files. Discovery must still include it without downloading
-                # those files or following the supplied pagination link.
-                siblings = [
-                    {"rfilename": f"videos/unselected/{index}.mp4"} for index in range(1501)
-                ]
-                siblings.extend(
-                    {"rfilename": filename}
-                    for filename in ("meta/info.json", "meta/episodes/chunk-000/file-000.parquet")
-                )
                 payload = json.dumps(
                     {
                         "id": "fake/repo",
                         "sha": resolved_revision,
                         "cardData": {"license": "apache-2.0"},
-                        "siblings": siblings,
+                        "siblings": [],
                     }
                 ).encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(payload)))
-                self.send_header("Link", '<http://127.0.0.1:1/untrusted-page>; rel="next"')
                 self.end_headers()
                 if include_body:
                     self.wfile.write(payload)
@@ -2525,7 +2588,17 @@ def test_hub_source_metadata_uses_pinned_files_and_reuses_downloads(
     assert source.license == "apache-2.0"
     assert [episode.length for episode in archive.episodes] == [60, 65, 70, 75]
     assert repeated_archive == archive
-    assert downloaded_filenames == ["meta/info.json", "meta/episodes/chunk-000/file-000.parquet"]
+    assert downloaded_filenames == [
+        "meta/info.json",
+        "meta/episodes/chunk-000/file-000.parquet",
+        "meta/episodes/chunk-001/file-000.parquet",
+    ]
+    assert len(metadata_tree_requests) == 4
+    assert all(
+        f"/tree/{resolved_revision}/meta/episodes" in unquote(request)
+        for request in metadata_tree_requests
+    )
+    assert sum("cursor=second" in request for request in metadata_tree_requests) == 2
     assert not (cache_directory / "videos").exists()
     assert json.loads((cache_directory / "meta/info.json").read_text())["fps"] == 30
 
