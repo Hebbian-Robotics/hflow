@@ -638,7 +638,7 @@ def test_frame_stats_freeze_interval(frozen_tail_video: Path) -> None:
 def test_frame_stats_truncated_video_file_raises(tmp_path: Path) -> None:
     not_a_video = tmp_path / "garbage.mp4"
     not_a_video.write_bytes(b"\x00\x01\x02not a video")
-    with pytest.raises(RuntimeError):
+    with pytest.raises(FrameStatisticsExecutionError):
         _measure_frame_statistics(not_a_video)
 
 

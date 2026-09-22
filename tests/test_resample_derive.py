@@ -24,6 +24,7 @@ from hflow.resample import DerivedSeries, to_grid
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import (
     EpisodeStamps,
+    SourceNotConforming,
     TransformConfig,
     compute_pipeline_version,
     write_canonical_episode,
@@ -273,7 +274,7 @@ def test_derived_topic_colliding_with_source_topic_errors(
         timestamps_ns=np.asarray([1_755_000_000_500_000_000], dtype=np.int64),
         values={"value": np.asarray([1.0])},
     )
-    with pytest.raises(ValueError, match="collides with a source"):
+    with pytest.raises(SourceNotConforming, match="collides with a source"):
         write_canonical_episode(
             cameraless_source, tmp_path / "out.mcap", derived=[("/joint_states", series, "v1")]
         )

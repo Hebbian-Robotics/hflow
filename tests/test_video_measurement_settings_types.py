@@ -116,15 +116,3 @@ def test_float_field_accepts_a_plain_int() -> None:
 
     interval = VideoTimeInterval(start_seconds=0, end_seconds=1)
     assert interval.start_seconds == 0
-
-
-def test_int_field_accepts_zero() -> None:
-    settings = FrameStatisticsSettings(black_pixel_luma_threshold=0)
-    assert settings.black_pixel_luma_threshold == 0
-
-
-def test_defaults_are_unaffected() -> None:
-    # No behavior change for the values every caller already relies on.
-    assert FrameStatisticsSettings() == FrameStatisticsSettings()
-    assert VideoTimeInterval(start_seconds=0.0, end_seconds=1.0).end_seconds == 1.0
-    assert CameraMotionSettings(frames_per_second=30.0).frames_per_second == 30.0

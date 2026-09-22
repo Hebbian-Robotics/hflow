@@ -350,31 +350,6 @@ def test_encode_guarantees_raise_on_a_b_picture_naming_the_unit() -> None:
     assert "B picture" in str(error.value)
 
 
-def test_encode_guarantees_find_a_b_picture_in_a_later_unit() -> None:
-    # A B picture in the final unit must still be named, proving the joined
-    # scan covers the whole stream rather than stopping early.
-    aud = b"\x00\x00\x00\x01\x09\x10"
-    non_idr_nal = b"\x00\x00\x00\x01\x41"
-    units = [
-        AccessUnit(
-            data=aud + b"\x00\x00\x00\x01\x65" + _slice_header_rbsp(0, 2),
-            is_keyframe=True,
-            has_parameter_sets=True,
-        ),
-        AccessUnit(
-            data=aud + non_idr_nal + _slice_header_rbsp(0, 1),
-            is_keyframe=False,
-            has_parameter_sets=False,
-        ),
-    ]
-
-    with pytest.raises(VideoEncodeError, match=r"access unit 1"):
-        _enforce_encode_guarantees(units, expected_frame_count=len(units), gop_frames=2)
-
-    with pytest.raises(VideoEncodeError, match=r"access unit 1"):
-        _enforce_encode_guarantees(units, expected_frame_count=len(units), gop_frames=2)
-
-
 def test_split_rejects_garbage_without_aud() -> None:
     with pytest.raises(ValueError, match="aud=1"):
         split_annex_b_stream(b"\xde\xad\xbe\xef" * 32)

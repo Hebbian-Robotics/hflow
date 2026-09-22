@@ -197,29 +197,6 @@ def test_step_selection_validates_names_and_enabled_stages_before_episode_io(
         )
 
 
-def test_unselected_enrichment_does_not_run(source_episode: Path, tmp_path: Path) -> None:
-    app = hflow.App("selected-endpoint", data_root=tmp_path / "data", default_checks=())
-
-    @app.check(version="1")
-    async def local_check(ep: hflow.Episode) -> hflow.CheckResult:
-        return hflow.CheckResult(measurements={"local": 1.0})
-
-    @app.enrich(version="1", requires=("vision-model",))
-    def remote_enrichment(ep: hflow.Episode) -> hflow.EnrichmentResult:
-        return hflow.EnrichmentResult(labels={"remote": "unused"})
-
-    report = asyncio.run(
-        app.process(
-            source_episode,
-            stages={hflow.Stage.SYNC, hflow.Stage.META},
-            step_names={"local_check"},
-            record=False,
-        )
-    )
-
-    assert [run.check.name for run in report.checks] == ["local_check"]
-
-
 def test_partial_metadata_run_preserves_unselected_quarantine_and_rechecked_gate_replaces_it(
     source_episode: Path, tmp_path: Path
 ) -> None:

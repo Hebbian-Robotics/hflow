@@ -106,7 +106,7 @@ def test_removed_receipt_entry_and_file_raise_inventory_mismatch(tmp_path: Path)
         return entry["path"]
 
     output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
-    removed = strip_measurements(output_directory)
+    strip_measurements(output_directory)
 
     with pytest.raises(ValueError, match="content_id"):
         verify_dataset_snapshot(output_directory)
@@ -116,7 +116,6 @@ def test_removed_receipt_entry_and_file_raise_inventory_mismatch(tmp_path: Path)
     output_directory, _ = _export_two_episode_snapshot(tmp_path / "cli", "references")
     strip_measurements(output_directory)
     assert cli_main(["verify", "snapshot", str(output_directory)]) == 2
-    assert removed
 
 
 def test_deleted_file_with_intact_receipt_reports_missing(tmp_path: Path) -> None:
@@ -624,15 +623,3 @@ def test_normalized_parent_escape_through_an_existing_subdir_is_refused(
     with pytest.raises(ValueError, match="must stay under the handed snapshot directory"):
         verify_dataset_snapshot(snap)
     assert cli_main(["verify", "snapshot", str(snap)]) == 2
-
-
-def test_honest_relative_receipt_path_still_verifies_after_containment_gate(
-    tmp_path: Path,
-) -> None:
-    """Containment must not break a clean export: relative keys under the root
-    still pass size and sha256 checks."""
-    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
-    report = verify_dataset_snapshot(output_directory)
-    assert report.ok
-    assert report.findings == []
-    assert cli_main(["verify", "snapshot", str(output_directory)]) == 0

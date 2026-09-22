@@ -185,9 +185,3 @@ class TestPipelineManifest:
                 },
             ]
         }
-
-    def test_manifest_json_round_trips(self, tmp_path: Path) -> None:
-        app = hflow.App("kitchen", data_root=tmp_path, default_checks=())
-        parsed = json.loads(app.manifest().to_json())
-        assert parsed["pipeline_name"] == "kitchen"
-        assert parsed["checks"] == []

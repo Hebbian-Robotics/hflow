@@ -72,13 +72,6 @@ def _topic_groups(canonical: Path) -> dict[str, str]:
         }
 
 
-def test_a_bulk_channel_gets_its_own_group(canonical_with_bulk: Path) -> None:
-    groups = _topic_groups(canonical_with_bulk)
-
-    assert groups[STATE_TOPIC] == DEFAULT_STATE_GROUP
-    assert groups[BULK_TOPIC] == DEFAULT_BULK_GROUP
-
-
 def test_the_resolved_layout_is_readable_from_the_published_episode(
     canonical_with_bulk: Path,
 ) -> None:

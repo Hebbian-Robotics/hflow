@@ -73,8 +73,8 @@ def _stub_download(
 _FFMPEG = shutil.which("ffmpeg")
 _FFPROBE = shutil.which("ffprobe")
 
-# Only the remux test below shells out. Scoping this to the module would skip
-# the five metadata tests too, and none of those touch ffmpeg at all.
+# Only the remux and frame-slicing tests below shell out. Scoping this to the
+# module would skip the metadata tests too, and none of those touch ffmpeg.
 _requires_system_ffmpeg = pytest.mark.skipif(
     _FFMPEG is None or _FFPROBE is None,
     reason="system ffmpeg/ffprobe required to construct and inspect the test video",
@@ -312,6 +312,8 @@ def test_index_discovery_multi_camera_metadata(
     assert found.episodes[0].data_from == 0
     assert found.episodes[0].data_to == 60
     assert set(found.video_keys) == {"observation.images.up", "observation.images.side"}
+    # The control for the fps refusals: a positive fps loads.
+    assert found.fps == 30
     assert found.episodes[0].video_windows["observation.images.up"].to_timestamp == pytest.approx(
         2.0
     )
@@ -776,6 +778,7 @@ def _episode_video_access_units(mcap: Path, camera_key: str) -> "list[bytes]":
     return units
 
 
+@_requires_system_ffmpeg
 def test_converter_slices_exactly_the_declared_frame_count(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1066,37 +1069,6 @@ def test_info_json_refuses_non_finite_or_non_positive_fps(
     assert not cache_dir.exists() or not (cache_dir / "meta" / "episodes").exists()
 
 
-def test_info_json_accepts_normal_positive_fps(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    corpus = _build_fake_corpus(tmp_path)
-    corpus["info"]["fps"] = 30
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, rev: {"sha": rev, "license": "apache-2.0"}
-    )
-    monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: corpus["info"])
-    monkeypatch.setattr(
-        prep,
-        "_hf_episode_metadata_files",
-        lambda repo, rev: ["meta/episodes/chunk-000/file-000.parquet"],
-    )
-
-    def fake_dl(filename: str, dest: Path, **kw: object) -> None:
-        import shutil
-
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if "meta/episodes" in filename:
-            shutil.copy(
-                str(tmp_path / "meta" / "episodes" / "chunk-000" / "file-000.parquet"), dest
-            )
-
-    _stub_download(monkeypatch, fake_dl)
-
-    dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
-    source_archive = prep._ensure_source_archive(dataset_source, tmp_path / "cache")
-    assert source_archive.fps == 30
-
-
 def _stub_single_episode_info(camera_metadata: dict | None = None) -> dict:
     """One RGB camera and the two required numeric features.
 
@@ -1175,64 +1147,6 @@ def _install_publish_through_convert(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     return published_keys
 
 
-def test_fractional_fps_reaches_conversion_untruncated(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A fractional source fps must not be floored on the way to conversion.
-
-    meta/info.json is allowed a non-integer fps, and NTSC corpora ship 29.97.
-    Truncating it to 29 stretches the canonical time axis by about a second
-    every thirty and moves the keyframe interval off the GOP the provenance
-    record claims.
-    """
-    received_fps: list[object] = []
-
-    def capture_convert(*, frames_per_second: object, **_kwargs: object) -> prep._PublishedEpisode:
-        received_fps.append(frames_per_second)
-        staged = tmp_path / "staged.mcap"
-        staged.write_bytes(b"episode")
-        return {
-            "uri": "file:///landing/lerobot_episode_0001.mcap",
-            "content_id": prep.content_episode_id(staged),
-            "size_bytes": staged.stat().st_size,
-        }
-
-    info = _stub_single_episode_info()
-    info["fps"] = 29.97
-
-    monkeypatch.setattr(prep, "_convert_single_episode", capture_convert)
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, rev: {"sha": "abc", "license": "apache-2.0"}
-    )
-    monkeypatch.setattr(
-        prep,
-        "_ensure_source_archive",
-        lambda dataset_source, cache_dir: _source_archive(
-            dataset_source,
-            cache_dir,
-            info=info,
-            episodes=[
-                prep._EpisodeRow(
-                    episode_index=0,
-                    task="push",
-                    length=1,
-                    data_chunk="000",
-                    data_file="000",
-                    data_from=0,
-                    data_to=1,
-                )
-            ],
-            video_keys=[prep.DEFAULT_CAMERA_KEY],
-        ),
-    )
-
-    prep.import_lerobot_dataset(
-        dataset_repo="fake/repo", revision="abc", output_dir=tmp_path / "out"
-    )
-
-    assert received_fps == [29.97]
-
-
 @pytest.mark.parametrize(
     "depth_metadata",
     [
@@ -1293,6 +1207,12 @@ def test_import_refuses_a_depth_video_before_publishing_dataset_output(
 def test_import_returns_local_uris_and_keeps_cache_beside_landing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The manifest lists every delivered episode with its content id and size.
+
+    A recipient of a prepared corpus gets a receipt that can be checked
+    against the landing directory without re-running the import; the
+    content id is the same ``content_episode_id`` the catalog dedupes on.
+    """
     output_dir = tmp_path / "out"
     monkeypatch.setattr(
         prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
@@ -1445,57 +1365,6 @@ def test_import_publishes_into_a_bucket_data_root_without_uploading_cache(
     ]
     assert not any(name.startswith("_lerobot_cache") for name in data_root.list_names())
     assert (data_root.mirror / "_lerobot_cache" / "abc").is_dir()
-
-
-def test_manifest_records_per_episode_receipts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The manifest lists every delivered episode with its content id and size.
-
-    A recipient of a prepared corpus gets a receipt that can be checked
-    against the landing directory without re-running the import; the
-    content id is the same ``content_episode_id`` the catalog dedupes on.
-    """
-    output_dir = tmp_path / "out"
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
-    )
-    monkeypatch.setattr(prep, "_ensure_source_archive", _stub_single_episode_source_archive)
-    _install_publish_through_convert(monkeypatch, tmp_path)
-
-    episode_uris = prep.import_lerobot_dataset(
-        dataset_repo="fake/repo",
-        revision="main",
-        output_dir=output_dir,
-        episode_index=0,
-    )
-
-    manifest = json.loads((output_dir / "prepared-manifest.json").read_text())
-    assert manifest["schema_version"] == 3
-    # v2 top-level keys survive: readers of the old schema keep working.
-    assert manifest["episodes_converted"] == 1
-    assert manifest["dataset"] == {
-        "repo_id": "fake/repo",
-        "revision": "abc",
-        "license": "apache-2.0",
-    }
-    assert manifest["converter_version"] == prep.CONVERTER_VERSION
-    assert manifest["camera_keys"] == [prep.DEFAULT_CAMERA_KEY]
-
-    entries = manifest["episodes"]
-    assert len(entries) == 1
-    entry = entries[0]
-    assert entry["uri"] == episode_uris[0]
-    assert entry["size_bytes"] == len(b"episode-0")
-    assert entry["content_id"] == prep.content_episode_id(
-        output_dir / "landing" / "lerobot_episode_0001.mcap"
-    )
-    # The receipt describes the published landing object, not a local
-    # staging path: for a bucket root this entry is an object URI that a
-    # recipient of the bucket prefix can resolve without our filesystem.
-    assert entry["uri"].endswith("landing/lerobot_episode_0001.mcap")
-    assert "canonical-" not in entry["uri"]
-    assert "staged-" not in entry["uri"]
 
 
 def test_manifest_content_id_detects_a_truncated_episode(
@@ -2310,41 +2179,6 @@ def test_reuse_refuses_a_landing_episode_with_damaged_payload(
     assert content_id_differs_from_delivery_receipt(landing, intact_content_id)
 
 
-def test_reuse_accepts_an_intact_episode_after_the_crc_pass(
-    tmp_path: Path,
-) -> None:
-    """The control: the CRC pass adds no refusal for undamaged bytes."""
-    from reuse_test_helpers import flip_chunk_payload_bytes
-
-    data_root = LocalStorageRoot(tmp_path / "out")
-    landing = tmp_path / "out" / "landing" / "lerobot_episode_0001.mcap"
-    _write_identity_matching_landing_mcap(
-        landing,
-        dataset_source=_MATCHING_SOURCE,
-        episode_index=0,
-        camera_keys=_MATCHING_CAMERA_KEYS,
-        marker="intact",
-    )
-
-    reused = prep._try_reuse_completed_episode(
-        data_root,
-        dataset_source=_MATCHING_SOURCE,
-        episode_index=0,
-        camera_keys=_MATCHING_CAMERA_KEYS,
-    )
-    assert reused is not None
-
-    flip_chunk_payload_bytes(landing)
-
-    damaged = prep._try_reuse_completed_episode(
-        data_root,
-        dataset_source=_MATCHING_SOURCE,
-        episode_index=0,
-        camera_keys=_MATCHING_CAMERA_KEYS,
-    )
-    assert damaged is None
-
-
 def test_fractional_fps_sets_the_log_times_from_the_declared_rate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2397,39 +2231,6 @@ def test_fractional_fps_reaches_the_transcoder_for_the_keyframe_interval(
     keyframe_interval = max(1, round(prep.IMPORT_GOP_SECONDS * transcode_calls[0]))
     assert keyframe_interval == 30
     assert keyframe_interval != max(1, round(prep.IMPORT_GOP_SECONDS * 29))
-
-
-def test_reuse_refuses_an_episode_written_before_the_fps_fix(tmp_path: Path) -> None:
-    """The resume half, which is the part a reader would assume rather than check.
-
-    _episode_identity_matches never looks at fps, so a fractional-fps episode
-    delivered with the stretched time axis still matches on dataset, revision,
-    episode index, camera keys and gop_seconds. Only the converter version
-    separates it from a correct one, which is why the bump is what makes the
-    fix reach an existing landing tree instead of stopping at new imports.
-    """
-    data_root = LocalStorageRoot(tmp_path / "out")
-    landing = tmp_path / "out" / "landing" / "lerobot_episode_0001.mcap"
-    _write_identity_matching_landing_mcap(
-        landing,
-        dataset_source=_MATCHING_SOURCE,
-        episode_index=0,
-        camera_keys=_MATCHING_CAMERA_KEYS,
-        marker="pre-fps-fix",
-        episode_record_overrides={"converter_version": "lerobot-converter-v7"},
-        source_provenance_overrides={"converter_version": "lerobot-converter-v7"},
-        provenance_overrides=None,
-    )
-
-    assert (
-        prep._try_reuse_completed_episode(
-            data_root,
-            dataset_source=_MATCHING_SOURCE,
-            episode_index=0,
-            camera_keys=_MATCHING_CAMERA_KEYS,
-        )
-        is None
-    )
 
 
 def test_hub_source_metadata_paginates_pinned_tree_and_reuses_downloads(

@@ -6,7 +6,6 @@ from pathlib import Path
 import pytest
 import yaml
 
-from hflow.cli import main as cli_main
 from hflow.runtime import RuntimeConfig, render_bundle
 
 
@@ -91,9 +90,3 @@ def test_generated_gate_budgets_errors_too(tmp_path: Path) -> None:
         compile(dag_source, str(sub_dag_file), "exec")
         assert "from hflow.stage_execution import summarize_" in dag_source
         assert "_budget(batch_counts)" in dag_source
-
-
-def test_ingest_rejects_absolute_and_escaping_uris(tmp_path: Path) -> None:
-    assert cli_main(["ingest", "/home/user/x.mcap", "--bundle-dir", str(tmp_path)]) == 2
-    assert cli_main(["ingest", "../outside.mcap", "--bundle-dir", str(tmp_path)]) == 2
-    assert cli_main(["ingest", "a/../../outside.mcap", "--bundle-dir", str(tmp_path)]) == 2

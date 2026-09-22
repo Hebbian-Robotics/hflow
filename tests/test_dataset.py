@@ -103,10 +103,31 @@ class TestDefaultPolicy:
     def test_a_quarantined_episode_is_left_out(
         self, ingested_project: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        (ingested_project / "pipeline.py").write_text(
+            """
+import hflow
+
+app = hflow.App("dataset-demo", default_checks=())
+
+
+@app.check(
+    version="1",
+    critical=True,
+    gate=hflow.Gate(
+        accept_when=(hflow.Threshold("seconds", hflow.Comparison.AT_MOST, 0.5),)
+    ),
+)
+async def duration(ep: hflow.Episode) -> hflow.CheckResult:
+    return hflow.CheckResult(measurements={"seconds": 1.0})
+"""
+        )
         _ingest(ingested_project, monkeypatch)
         app = hflow.import_pipeline_application(str(ingested_project / "pipeline.py"))
-        sql = default_dataset_sql(app)
-        assert "status = 'ok'" in sql
+
+        dataset = create_dataset(app, "quarantine-excluded")
+
+        assert dataset.total_episodes == 1
+        assert dataset.row_count == 0
 
     def test_a_default_check_the_pipeline_supersedes_is_not_a_hole(
         self, tmp_path: Path, source_episode: Path, monkeypatch: pytest.MonkeyPatch

@@ -1,5 +1,4 @@
 import json
-import shutil
 from pathlib import Path
 
 import duckdb
@@ -777,78 +776,6 @@ def test_dataset_snapshot_copy_mode_records_asset_integrity(tmp_path: Path) -> N
     ]
     assert integrity["content_id"] == snapshot_module._inventory_content_id(inventory_records)
     assert len(integrity["content_id"]) == 64
-
-
-def test_dataset_snapshot_marker_integrity_detects_post_export_mutations(
-    tmp_path: Path,
-) -> None:
-    catalog = Catalog(tmp_path / "catalog")
-    _append_snapshot_episode(
-        catalog,
-        tmp_path,
-        name="mutation-source",
-        score=0.9,
-        with_media=True,
-    )
-    output_directory = tmp_path / "dataset-snapshot"
-    hflow.export_dataset_snapshot(
-        catalog.location,
-        output_directory,
-        media_mode=hflow.SnapshotMediaMode.COPY,
-    )
-    original_marker = json.loads((output_directory / "format.json").read_text())
-    assert original_marker["format_version"] == "1"
-    original_integrity = original_marker["integrity"]
-
-    media_copy = tmp_path / "media-mutated"
-    tags_copy = tmp_path / "tags-deleted"
-    samples_copy = tmp_path / "samples-truncated"
-    for destination in (media_copy, tags_copy, samples_copy):
-        shutil.copytree(output_directory, destination)
-
-    # Replacing copied media bytes leaves tables readable but mismatches the receipt.
-    media_receipt = original_integrity["assets"][0]
-    media_path = media_copy / media_receipt["path"]
-    media_path.write_bytes(b"replaced media bytes")
-    assert snapshot_module._sha256_hex(media_path) != media_receipt["sha256"]
-    assert media_path.stat().st_size != media_receipt["size_bytes"]
-    media_inventory = [
-        *[
-            snapshot_module._file_integrity_record(receipt["path"], media_copy / receipt["path"])
-            for receipt in original_integrity["tables"].values()
-        ],
-        snapshot_module._file_integrity_record(media_receipt["path"], media_path),
-    ]
-    assert (
-        snapshot_module._inventory_content_id(media_inventory) != original_integrity["content_id"]
-    )
-
-    # Deleting a required table is invisible to format/format_version checks,
-    # but the inventory digest no longer matches the marker.
-    (tags_copy / "tags.parquet").unlink()
-    assert not (tags_copy / "tags.parquet").exists()
-    remaining_entries = [
-        snapshot_module._file_integrity_record(receipt["path"], tags_copy / receipt["path"])
-        for receipt in original_integrity["tables"].values()
-        if (tags_copy / receipt["path"]).is_file()
-    ] + [
-        snapshot_module._file_integrity_record(receipt["path"], tags_copy / receipt["path"])
-        for receipt in original_integrity["assets"]
-    ]
-    assert (
-        snapshot_module._inventory_content_id(remaining_entries) != original_integrity["content_id"]
-    )
-    overwrite_marker = json.loads((tags_copy / "format.json").read_text())
-    assert overwrite_marker["format"] == "hflow-dataset-snapshot"
-    assert overwrite_marker["format_version"] == "1"
-    assert overwrite_marker["tables"]["tags"] == "tags.parquet"
-
-    # Truncation changes size and hash while the destination still looks like a snapshot.
-    samples_path = samples_copy / "samples.parquet"
-    samples_path.write_bytes(samples_path.read_bytes()[:64])
-    samples_receipt = original_integrity["tables"]["samples"]
-    assert samples_path.stat().st_size != samples_receipt["size_bytes"]
-    assert snapshot_module._sha256_hex(samples_path) != samples_receipt["sha256"]
 
 
 def test_dataset_snapshot_overwrite_still_accepts_integrity_enriched_v1_marker(

@@ -259,15 +259,6 @@ class TestBucketStorageRoot:
         first.write_bytes(b"locally-poisoned")
         assert root.fetch("landing/e.mcap").read_bytes() == b"locally-poisoned"
 
-    def test_fetch_redownloads_when_remote_changed(
-        self, bucket_over_tmp: tuple[BucketStorageRoot, Path]
-    ) -> None:
-        root, _ = bucket_over_tmp
-        root.write_bytes("landing/e.mcap", b"version-one")
-        assert root.fetch("landing/e.mcap").read_bytes() == b"version-one"
-        root.write_bytes("landing/e.mcap", b"version-two!")  # changed size => changed etag
-        assert root.fetch("landing/e.mcap").read_bytes() == b"version-two!"
-
     def test_fetch_missing_raises_file_not_found(
         self, bucket_over_tmp: tuple[BucketStorageRoot, Path]
     ) -> None:

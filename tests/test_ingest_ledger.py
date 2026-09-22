@@ -2,7 +2,6 @@
 
 from pathlib import Path
 
-import numpy as np
 import pytest
 from mcap.exceptions import InvalidMagic
 from mcap.stream_reader import CRCValidationError
@@ -13,8 +12,6 @@ from hflow import transform
 from hflow.app import SourceNotFound
 from hflow.format import METADATA_RECORD_EPISODE
 from hflow.ingest_ledger import IngestFailureKind, classify_ingest_failure
-from hflow.resample import DerivedSeries
-from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import SourceNotConforming, write_canonical_episode
 
 
@@ -128,37 +125,6 @@ def test_mixed_compressed_image_formats_classify_as_source_unsupported(tmp_path:
     assert classify_ingest_failure(raised.value) == IngestFailureKind.SOURCE_UNSUPPORTED
 
 
-def test_nonconforming_passthrough_video_classifies_as_source_unsupported(tmp_path: Path) -> None:
-    from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
-    from mcap_protobuf.schema import build_file_descriptor_set
-
-    source = tmp_path / "h265.mcap"
-    with source.open("wb") as stream:
-        writer = StockWriter(stream)
-        writer.start(profile="", library="test")
-        schema_id = writer.register_schema(
-            name="foxglove.CompressedVideo",
-            encoding="protobuf",
-            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
-        )
-        channel_id = writer.register_channel(
-            topic="/cam", message_encoding="protobuf", schema_id=schema_id
-        )
-        message = CompressedVideo()
-        message.timestamp.FromNanoseconds(10**9)
-        message.frame_id = "cam"
-        message.data = b"\x00\x00\x00\x01\x40junk"
-        message.format = "h265"
-        writer.add_message(
-            channel_id, log_time=10**9, data=message.SerializeToString(), publish_time=10**9
-        )
-        writer.finish()
-
-    with pytest.raises(SourceNotConforming) as raised:
-        write_canonical_episode(source, tmp_path / "out.mcap")
-    assert classify_ingest_failure(raised.value) == IngestFailureKind.SOURCE_UNSUPPORTED
-
-
 def test_raw_image_schema_classifies_as_source_unsupported(tmp_path: Path) -> None:
     source = tmp_path / "raw_image.mcap"
     with source.open("wb") as stream:
@@ -176,26 +142,4 @@ def test_raw_image_schema_classifies_as_source_unsupported(tmp_path: Path) -> No
 
     with pytest.raises(SourceNotConforming) as raised:
         write_canonical_episode(source, tmp_path / "out.mcap")
-    assert classify_ingest_failure(raised.value) == IngestFailureKind.SOURCE_UNSUPPORTED
-
-
-def test_derived_topic_collision_classifies_as_source_unsupported(tmp_path: Path) -> None:
-    cameraless_spec = SyntheticEpisodeSpec(
-        duration_s=2.0,
-        cameras=(),
-        joint_hz=50.0,
-        black_segment=None,
-        joint_jump_at_s=None,
-        timestamp_offset_segment=None,
-    )
-    source = synthesize_episode(tmp_path / "episode.mcap", cameraless_spec)
-    series = DerivedSeries(
-        timestamps_ns=np.asarray([1_755_000_000_500_000_000], dtype=np.int64),
-        values={"value": np.asarray([1.0])},
-    )
-
-    with pytest.raises(SourceNotConforming) as raised:
-        write_canonical_episode(
-            source, tmp_path / "out.mcap", derived=[("/joint_states", series, "v1")]
-        )
     assert classify_ingest_failure(raised.value) == IngestFailureKind.SOURCE_UNSUPPORTED

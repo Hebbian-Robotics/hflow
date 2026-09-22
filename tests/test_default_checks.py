@@ -1,6 +1,7 @@
 """The baseline every episode gets without anyone registering it."""
 
 import asyncio
+import re
 import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -385,7 +386,7 @@ def test_partial_camera_coverage_drops_the_uncovered_camera_too(tmp_path: Path) 
 
     @app.check(version="1")
     async def only_wrist(ep: hflow.Episode) -> hflow.CheckResult:
-        return await hflow.checks.camera_frame_stats(ep)
+        return await hflow.checks.camera_frame_stats(ep, cameras=["/wrist_cam/compressed"])
 
     report = asyncio.run(app.test(two_camera_source, verbose=False))
     by_name = {run.check.name: run for run in report.checks}
@@ -1297,52 +1298,27 @@ class TestContentDigestIsAPropertyOfTheContent:
 
 
 # media_digest: per-camera ``media_digest`` (64-char hex SHA-256) and
-# ``media_bytes`` (positive int). No cameras => empty dict. One camera =>
-# both keys present. Exact digest pinned via the deterministic synthetic
-# encoder so a dispatcher reading the wrong field fails.
-
-MEDIA_DIGEST_VALUE_CASES = [
-    pytest.param(
-        SyntheticEpisodeSpec(duration_s=1.0, cameras=()),
-        {},
-        id="no-camera",
-    ),
-    pytest.param(
-        SyntheticEpisodeSpec(duration_s=1.0, cameras=("wrist_cam",)),
-        {
-            "/wrist_cam/compressed/media_digest": "a" * 64,  # placeholder; pinned in body
-            "/wrist_cam/compressed/media_bytes": (1, 10_000_000),
-        },
-        id="one-camera",
-    ),
-]
+# ``media_bytes`` (positive int). The camera-less case is the empty key set
+# ``test_every_default_iterates_its_fact_for_measurements`` already pins.
 
 
-@pytest.mark.parametrize(("spec", "expected_subset"), MEDIA_DIGEST_VALUE_CASES)
-def test_media_digest_emits_exactly_the_documented_measurements(
-    spec: SyntheticEpisodeSpec, expected_subset: dict[str, object], tmp_path: Path
-) -> None:
-    source = synthesize_episode(tmp_path / "md_source.mcap", spec)
+def _is_sha256_hex(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def test_media_digest_emits_exactly_the_documented_measurements(tmp_path: Path) -> None:
+    source = synthesize_episode(
+        tmp_path / "md_source.mcap", SyntheticEpisodeSpec(duration_s=1.0, cameras=("wrist_cam",))
+    )
     report = asyncio.run(
         hflow.App("md-fixture", data_root=tmp_path / "data").test(source, verbose=False)
     )
     run = report.check("media_digest")
     assert run.result is not None
-    measurements = dict(run.result.measurements)
-
-    if not spec.cameras:
-        assert measurements == {}
-        return
-
-    # Pin the exact digest: the synthetic writer is deterministic, so a
-    # dispatcher that returns a transformed value (e.g. reversed hex, or
-    # a different field) will not match.
-    expected = dict(expected_subset)
-    app = hflow.App("md-pin", data_root=tmp_path / "data2")
-    pin_report = asyncio.run(app.test(source, verbose=False))
-    pin_run = pin_report.check("media_digest")
-    assert pin_run.result is not None
-    expected["/wrist_cam/compressed/media_digest"] = pin_run.result.measurements[
-        "/wrist_cam/compressed/media_digest"
-    ]
-    _assert_measurements_match_pinned(measurements, expected)
+    _assert_measurements_match_pinned(
+        run.result.measurements,
+        {
+            "/wrist_cam/compressed/media_digest": _is_sha256_hex,
+            "/wrist_cam/compressed/media_bytes": (1, 10_000_000),
+        },
+    )

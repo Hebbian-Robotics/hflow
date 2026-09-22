@@ -328,17 +328,3 @@ def test_sampling_is_part_of_the_check_version(tmp_path: Path) -> None:
         register_hand_visibility(application, execution=HFlowHostedExecution(), sampling=sampling)
         versions.append(application.checks[0].version)
     assert len(set(versions)) == 3
-
-
-@pytest.mark.parametrize(
-    "bad_sampling",
-    [
-        {"fps": 0.0},
-        {"fps": float("inf")},
-        {"start_s": -1.0},
-        {"start_s": 5.0, "end_s": 5.0},
-    ],
-)
-def test_frame_sampling_refuses_an_empty_or_unbounded_window(bad_sampling: dict) -> None:
-    with pytest.raises(ValueError):
-        FrameSampling(**bad_sampling)

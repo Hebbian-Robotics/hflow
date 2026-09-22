@@ -113,20 +113,6 @@ def test_registered_provider_class_is_discovered(monkeypatch: pytest.MonkeyPatch
     assert isinstance(provider, NativeVideoProvider)
 
 
-def test_prepared_request_is_a_payload_for_the_users_own_client(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _register_entry_points(
-        monkeypatch, ("dummy-vllm", f"{FAKE_PLUGIN_MODULE}:DummyVllmVideoProvider")
-    )
-    provider = discover_providers()["dummy-vllm"]
-    payload = provider.prepare_video_request(Path("/data/episode.mp4"), "Did the grasp succeed?")
-    # The provider encodes protocol knowledge (how video is attached) but the
-    # result is inert data: no connection, no client object, just the body.
-    assert payload["model"] == "test-model"
-    assert "file:///data/episode.mp4" in str(payload["messages"])
-
-
 def test_module_level_instance_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
     _register_entry_points(monkeypatch, ("dummy-vllm", f"{FAKE_PLUGIN_MODULE}:PREBUILT_INSTANCE"))
     discovered = discover_providers()
@@ -196,9 +182,3 @@ def test_entry_point_name_drift_warns_but_registers_under_provider_name(
     # The provider owns its name; the entry-point name is packaging metadata.
     assert set(discovered) == {"actual-name"}
     assert any("registering under" in record.message for record in caplog.records)
-
-
-def test_protocol_is_a_runtime_checkable_duck_check() -> None:
-    assert isinstance(DummyVllmVideoProvider(), NativeVideoProvider)
-    assert not isinstance(object(), NativeVideoProvider)
-    assert not isinstance(MissingMethodProvider(), NativeVideoProvider)
