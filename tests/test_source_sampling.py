@@ -487,13 +487,13 @@ def test_example_emits_complete_windows_with_readable_frame_paths(
     assert all(cv2.imread(frame["path"]) is not None for frame in frames)
 
 
-@pytest.mark.parametrize("timestamp_offset", [0, 5, -1])
+@pytest.mark.parametrize("timestamp_offset", ["0", "5", "-1", "5.033333", "-3.033333"])
 def test_nearest_keyframes_preserve_ties_pixels_and_playback_origin(
-    color_video: Path, tmp_path: Path, timestamp_offset: int
+    color_video: Path, tmp_path: Path, timestamp_offset: str
 ) -> None:
     from hflow.source_sampling import SourceFrameResize
 
-    shifted_source = tmp_path / ("shifted.ts" if timestamp_offset < 0 else "shifted.mp4")
+    shifted_source = tmp_path / ("shifted.ts" if Fraction(timestamp_offset) < 0 else "shifted.mp4")
     subprocess.run(
         [
             str(ffmpeg_path()),
@@ -506,7 +506,7 @@ def test_nearest_keyframes_preserve_ties_pixels_and_playback_origin(
             "-c:v",
             "copy",
             "-output_ts_offset",
-            str(timestamp_offset),
+            timestamp_offset,
             "-avoid_negative_ts",
             "disabled",
             str(shifted_source),
@@ -537,6 +537,100 @@ def test_nearest_keyframes_preserve_ties_pixels_and_playback_origin(
         assert pixels.shape == (640, 960, 3)
         assert int(pixels[320, 480, dominant_channel]) > 100
         assert np.all(pixels.max(axis=2) > 30)
+
+
+@pytest.mark.parametrize("half_tick_origin", [False, True])
+def test_nearest_keyframes_preserve_the_container_origin_when_audio_starts_first(
+    color_video: Path, tmp_path: Path, half_tick_origin: bool
+) -> None:
+    source_path = tmp_path / ("audio-first.mov" if half_tick_origin else "audio-first.mp4")
+    arguments = [
+        str(ffmpeg_path()),
+        "-nostdin",
+        "-v",
+        "error",
+        "-itsoffset",
+        "0.1",
+        "-i",
+        str(color_video),
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000:duration=7",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "libx264",
+        "-threads",
+        "1",
+        "-g",
+        "4" if half_tick_origin else "20",
+        "-keyint_min",
+        "4" if half_tick_origin else "20",
+        "-sc_threshold",
+        "0",
+        "-c:a",
+        "pcm_s16le" if half_tick_origin else "aac",
+        "-output_ts_offset",
+        "0.25" if half_tick_origin else "5.033333",
+        "-avoid_negative_ts",
+        "disabled",
+    ]
+    if half_tick_origin:
+        arguments.extend(("-r", "2", "-video_track_timescale", "2"))
+    arguments.append(str(source_path))
+    subprocess.run(arguments, check=True, capture_output=True, timeout=30)
+    probe = subprocess.run(
+        [
+            str(ffprobe_path()),
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,time_base,start_pts:format=start_time",
+            "-of",
+            "json",
+            str(source_path),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    metadata = json.loads(probe.stdout)
+    video = next(stream for stream in metadata["streams"] if stream["codec_type"] == "video")
+    time_base = Fraction(video["time_base"])
+    origin = Fraction(metadata["format"]["start_time"])
+    assert origin < video["start_pts"] * time_base
+    assert (origin / time_base).denominator != 1
+    if half_tick_origin:
+        assert origin / time_base == Fraction(1, 2)
+
+    window = SourceWindow(0, 6000)
+    decoded_keyframes = sample_source_frames(
+        source_path,
+        tmp_path / "decoded-keyframes",
+        window=window,
+        settings=SourceFrameSampling(mode=SourceSamplingMode.KEYFRAMES),
+    )
+    nearest = sample_source_frames(
+        source_path,
+        tmp_path / "nearest-keyframes",
+        window=window,
+        settings=SourceFrameSampling(
+            mode=SourceSamplingMode.NEAREST_KEYFRAMES, keyframe_positions=(0.15, 0.5, 0.85)
+        ),
+    )
+    assert [frame.timestamp_seconds for frame in nearest.frames] == [
+        frame.timestamp_seconds for frame in decoded_keyframes.frames
+    ]
+    assert len(nearest.frames) == 3
+    if half_tick_origin:
+        assert nearest.frames[0].timestamp_seconds == 0
+    else:
+        assert nearest.frames[0].timestamp_seconds > 0
+    for frame, decoded_frame in zip(nearest.frames, decoded_keyframes.frames, strict=True):
+        assert frame.path.read_bytes() == decoded_frame.path.read_bytes()
 
 
 def test_nearest_keyframes_deduplicate_and_leave_empty_windows_empty(

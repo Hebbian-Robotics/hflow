@@ -231,6 +231,15 @@ def _nearest_keyframe_times(
         origin = Fraction(origin_result.stdout.decode("ascii").strip())
     except (ValueError, ZeroDivisionError) as error:
         raise SourceSamplingError("source video has no valid playback origin") from error
+    # Container start times use microseconds and need not align to video ticks.
+    # Match FFmpeg's timestamp offset rescaling: nearest, with ties away from zero.
+    origin_ticks = origin / time_base
+    rounded_origin_ticks = (
+        math.floor(origin_ticks + Fraction(1, 2))
+        if origin_ticks >= 0
+        else math.ceil(origin_ticks - Fraction(1, 2))
+    )
+    aligned_origin = rounded_origin_ticks * time_base
     start = Fraction(window.start_millis, 1000)
     end = Fraction(window.end_millis, 1000)
     packet_result = _run_sampling_command(
@@ -243,7 +252,7 @@ def _nearest_keyframe_times(
             "-select_streams",
             "v:0",
             "-read_intervals",
-            f"%{float(origin + end):.9f}",
+            f"%{float(aligned_origin + end):.9f}",
             "-show_packets",
             "-show_entries",
             "packet=pts,flags",
@@ -266,10 +275,8 @@ def _nearest_keyframe_times(
                 continue
             if type(packet.get("pts")) is not int:
                 raise ValueError("keyframe has no presentation timestamp")
-            timestamp = packet["pts"] * time_base - origin
+            timestamp = packet["pts"] * time_base - aligned_origin
             if start <= timestamp < end:
-                if (timestamp / time_base).denominator != 1:
-                    raise ValueError("playback origin is not aligned to the source time base")
                 available_times.add(timestamp)
     except (ValueError, TypeError, KeyError) as error:
         raise SourceSamplingError("source keyframes have invalid presentation times") from error
