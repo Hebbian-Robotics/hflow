@@ -4,10 +4,13 @@ Ingest, quality-check, enrich, and curate robot episode data. See README.md
 for orientation and docs/ARCHITECTURE.md for the design and its references.
 """
 
+import logging
 from importlib import import_module
 from typing import TYPE_CHECKING
 
 from hflow._version import __version__
+
+logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 if TYPE_CHECKING:
     from hflow import build_ai_vlm_checks, checks, ffmpeg, providers, testing

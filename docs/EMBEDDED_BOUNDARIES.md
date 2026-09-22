@@ -42,6 +42,32 @@ imports and their package-level equivalents do not initialize pipeline, media,
 or model code. All modules ship in the single `hflow` distribution; its normal
 installation dependencies are unchanged.
 
+## Logging ownership
+
+HFlow library modules emit standard-library logging records under the `hflow.*`
+namespace but do not configure application logging. Importing `hflow` leaves the
+root logger and its handlers unchanged, and an embedding application that has not
+configured logging receives no fallback output. Records continue to propagate,
+so a host can enable HFlow logs through its own handler and formatting policy:
+
+```python
+import logging
+
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+
+hflow_logger = logging.getLogger("hflow")
+hflow_logger.setLevel(logging.INFO)
+hflow_logger.addHandler(handler)
+```
+
+The installed `hflow` CLI is an application and therefore owns its presentation:
+it shows `WARNING` and above by default, while `--verbose` enables `INFO`. The
+workspace server is also an application boundary; its launcher delegates server
+and access-log configuration to Uvicorn. Embedding applications and external
+servers should configure handlers themselves instead of relying on either
+command-line entry point's policy.
+
 `plan_batches(..., maximum_items_per_batch=N)` optionally caps complete inputs
 per batch while retaining byte balancing. In fixed-count mode, an impossible
 combination of batch count and item cap raises before returning a plan. Capacity
