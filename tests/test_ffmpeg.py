@@ -19,6 +19,13 @@ from pathlib import Path
 import httpx2
 import numpy as np
 import pytest
+from media_test_helpers import (
+    make_extracted_frames,
+    render_lavfi,
+    run_ffmpeg,
+    run_ffprobe,
+    video_stream_dimensions,
+)
 
 from hflow._video_measurement_toolchain import (
     _frame_statistics_cache_path,
@@ -71,10 +78,6 @@ from hflow.ffmpeg._contact_sheet import (
     _find_usable_font_file,
     contact_sheet,
 )
-
-
-def _system_ffmpeg() -> str:
-    return os.environ[FFMPEG_ENV_VAR]
 
 
 def _measure_frame_statistics(
@@ -492,97 +495,49 @@ def test_invalid_freeze_interval_is_a_parse_error() -> None:
         _aggregate_frame_statistics_output(output_text)
 
 
-@pytest.fixture(scope="module")
-def black_tail_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """4s of testsrc2 followed by 2s of black, 10 fps, h264: 60 frames total."""
-    output = tmp_path_factory.mktemp("videos") / "black_tail.mp4"
-    subprocess.run(
-        [
-            _system_ffmpeg(),
-            "-hide_banner",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=160x120:rate=10:duration=4,format=yuv420p",
-            "-f",
-            "lavfi",
-            "-i",
-            "color=black:size=160x120:rate=10:duration=2,format=yuv420p",
+_ULTRAFAST_H264 = ("-c:v", "libx264", "-preset", "ultrafast")
+
+
+def _testsrc2_with_color_tail(output: Path, tail_color: str) -> Path:
+    """4s of testsrc2 followed by 2s of ``tail_color``, 10 fps, h264: 60 frames."""
+    return render_lavfi(
+        output,
+        "testsrc2=size=160x120:rate=10:duration=4,format=yuv420p",
+        f"color={tail_color}:size=160x120:rate=10:duration=2,format=yuv420p",
+        output_arguments=(
             "-filter_complex",
             "[0:v][1:v]concat=n=2:v=1:a=0[out]",
             "-map",
             "[out]",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            str(output),
-        ],
-        capture_output=True,
-        check=True,
+            *_ULTRAFAST_H264,
+        ),
     )
-    return output
+
+
+@pytest.fixture(scope="module")
+def black_tail_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """4s of testsrc2 followed by 2s of black, 10 fps, h264: 60 frames total."""
+    return _testsrc2_with_color_tail(
+        tmp_path_factory.mktemp("videos") / "black_tail.mp4", tail_color="black"
+    )
 
 
 @pytest.fixture(scope="module")
 def bright_tail_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """4s of testsrc2 followed by 2s of white, 10 fps, h264: 60 frames total."""
-    output = tmp_path_factory.mktemp("videos") / "bright_tail.mp4"
-    subprocess.run(
-        [
-            _system_ffmpeg(),
-            "-hide_banner",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=160x120:rate=10:duration=4,format=yuv420p",
-            "-f",
-            "lavfi",
-            "-i",
-            "color=white:size=160x120:rate=10:duration=2,format=yuv420p",
-            "-filter_complex",
-            "[0:v][1:v]concat=n=2:v=1:a=0[out]",
-            "-map",
-            "[out]",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            str(output),
-        ],
-        capture_output=True,
-        check=True,
+    return _testsrc2_with_color_tail(
+        tmp_path_factory.mktemp("videos") / "bright_tail.mp4", tail_color="white"
     )
-    return output
 
 
 @pytest.fixture(scope="module")
 def frozen_tail_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """2s of testsrc2 then the last frame held (cloned) for 3s, 10 fps."""
-    output = tmp_path_factory.mktemp("videos") / "frozen_tail.mp4"
-    subprocess.run(
-        [
-            _system_ffmpeg(),
-            "-hide_banner",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=160x120:rate=10:duration=2,format=yuv420p",
-            "-vf",
-            "tpad=stop_mode=clone:stop_duration=3",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            str(output),
-        ],
-        capture_output=True,
-        check=True,
+    return render_lavfi(
+        tmp_path_factory.mktemp("videos") / "frozen_tail.mp4",
+        "testsrc2=size=160x120:rate=10:duration=2,format=yuv420p",
+        output_arguments=("-vf", "tpad=stop_mode=clone:stop_duration=3", *_ULTRAFAST_H264),
     )
-    return output
 
 
 def test_frame_stats_black_segment(black_tail_video: Path) -> None:
@@ -665,56 +620,55 @@ def test_luma_frames_reaps_ffmpeg_when_the_caller_stops_early(
     assert first_frame.shape == (120, 160)
 
 
+def _assert_same_luma_frames(
+    reference_video: Path, candidate_video: Path, *, expected_shape: tuple[int, int] | None
+) -> None:
+    """Both videos decode to the same 60 luma frames, pixel for pixel."""
+    toolchain = resolved_video_measurement_toolchain()
+    with (
+        luma_frames(reference_video, toolchain=toolchain) as reference_frames,
+        luma_frames(candidate_video, toolchain=toolchain) as candidate_frames,
+    ):
+        frame_count = 0
+        for reference_frame, candidate_frame in zip(
+            reference_frames, candidate_frames, strict=True
+        ):
+            if expected_shape is not None:
+                assert reference_frame.shape == candidate_frame.shape == expected_shape
+            np.testing.assert_array_equal(reference_frame, candidate_frame)
+            frame_count += 1
+    assert frame_count == 60
+
+
 def test_display_rotation_preserves_coded_frame_geometry_and_pixels(
     black_tail_video: Path, tmp_path: Path
 ) -> None:
     rotated_video = tmp_path / "rotation-metadata.mp4"
-    subprocess.run(
-        [
-            str(ffmpeg_path()),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-display_rotation",
-            "90",
-            "-i",
-            str(black_tail_video),
-            "-c",
-            "copy",
-            str(rotated_video),
-        ],
-        check=True,
-        capture_output=True,
+    run_ffmpeg(
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-display_rotation",
+        "90",
+        "-i",
+        str(black_tail_video),
+        "-c",
+        "copy",
+        str(rotated_video),
     )
-    rotation_probe = subprocess.run(
-        [
-            str(ffprobe_path()),
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream_side_data=rotation",
-            "-of",
-            "default=nw=1:nk=1",
-            str(rotated_video),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
+    rotation_probe = run_ffprobe(
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream_side_data=rotation",
+        "-of",
+        "default=nw=1:nk=1",
+        str(rotated_video),
     )
-    assert abs(int(rotation_probe.stdout.strip())) == 90
-    toolchain = resolved_video_measurement_toolchain()
-    with (
-        luma_frames(black_tail_video, toolchain=toolchain) as source_frames,
-        luma_frames(rotated_video, toolchain=toolchain) as rotated_frames,
-    ):
-        frame_count = 0
-        for source_frame, rotated_frame in zip(source_frames, rotated_frames, strict=True):
-            assert source_frame.shape == rotated_frame.shape == (120, 160)
-            np.testing.assert_array_equal(source_frame, rotated_frame)
-            frame_count += 1
-    assert frame_count == 60
+    assert abs(int(rotation_probe.strip())) == 90
+    _assert_same_luma_frames(black_tail_video, rotated_video, expected_shape=(120, 160))
 
 
 def test_luma_frames_on_a_non_video_raises(tmp_path: Path) -> None:
@@ -731,43 +685,29 @@ def test_frame_decoder_selects_the_same_video_stream_as_dimension_probing(
     black_tail_video: Path, tmp_path: Path
 ) -> None:
     multi_stream_video = tmp_path / "two-video-streams.mkv"
-    subprocess.run(
-        [
-            str(ffmpeg_path()),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(black_tail_video),
-            "-f",
-            "lavfi",
-            "-i",
-            "color=white:size=320x240:rate=10:duration=6",
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:v:0",
-            "-c:v:0",
-            "copy",
-            "-c:v:1",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            str(multi_stream_video),
-        ],
-        check=True,
-        capture_output=True,
+    run_ffmpeg(
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(black_tail_video),
+        "-f",
+        "lavfi",
+        "-i",
+        "color=white:size=320x240:rate=10:duration=6",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:v:0",
+        "-c:v:0",
+        "copy",
+        "-c:v:1",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        str(multi_stream_video),
     )
-    toolchain = resolved_video_measurement_toolchain()
-    with (
-        luma_frames(black_tail_video, toolchain=toolchain) as source_frames,
-        luma_frames(multi_stream_video, toolchain=toolchain) as decoded_frames,
-    ):
-        frame_count = 0
-        for source_frame, decoded_frame in zip(source_frames, decoded_frames, strict=True):
-            np.testing.assert_array_equal(source_frame, decoded_frame)
-            frame_count += 1
-    assert frame_count == 60
+    _assert_same_luma_frames(black_tail_video, multi_stream_video, expected_shape=None)
 
 
 def test_rgb_frames_streams_three_channels_at_the_coded_size(black_tail_video: Path) -> None:
@@ -863,57 +803,10 @@ def test_missing_motion_extra_names_the_install_command(
         _import_cv2()
 
 
-def _probe_dimensions(image: Path) -> tuple[int, int]:
-    ffprobe_binary = shutil.which("ffprobe")
-    assert ffprobe_binary is not None, "ffprobe required on PATH for tests"
-    completed = subprocess.run(
-        [
-            ffprobe_binary,
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=width,height",
-            "-of",
-            "csv=p=0",
-            str(image),
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    width_text, height_text = completed.stdout.strip().split(",")
-    return int(width_text), int(height_text)
-
-
 @pytest.fixture(scope="module")
 def ten_extracted_frames(tmp_path_factory: pytest.TempPathFactory) -> list[ExtractedFrame]:
     """Ten 320x240 jpegs extracted from a testsrc2 clip, 1s apart."""
-    directory = tmp_path_factory.mktemp("frames")
-    subprocess.run(
-        [
-            _system_ffmpeg(),
-            "-hide_banner",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=320x240:rate=1:duration=10",
-            "-q:v",
-            "2",
-            str(directory / "frame_%02d.jpg"),
-        ],
-        capture_output=True,
-        check=True,
-    )
-    frame_paths = sorted(directory.glob("frame_*.jpg"))
-    assert len(frame_paths) == 10
-    stream_start_ns = 1_755_000_000_000_000_000
-    return [
-        ExtractedFrame(path=frame_path, log_time_ns=stream_start_ns + index * 1_000_000_000)
-        for index, frame_path in enumerate(frame_paths)
-    ]
+    return make_extracted_frames(tmp_path_factory.mktemp("frames"), count=10, size="320x240")
 
 
 def test_contact_sheet_grid_geometry(
@@ -927,7 +820,7 @@ def test_contact_sheet_grid_geometry(
     assert sheet.rows == 3  # ceil(10 / 4)
     assert sheet.frames_sampled_from == 10
     assert sheet.tile_log_times_ns == [frame.log_time_ns for frame in ten_extracted_frames]
-    width, height = _probe_dimensions(output)
+    width, height = video_stream_dimensions(output)
     assert width == 4 * 320
     assert height == 3 * 240  # 320x240 sources scaled to width 320 keep height 240
     assert sheet.timestamps_burned == (
@@ -948,7 +841,7 @@ def test_contact_sheet_max_tiles_sampling(
     assert sheet.tile_log_times_ns[-1] == ten_extracted_frames[-1].log_time_ns
     assert sheet.tile_log_times_ns == sorted(set(sheet.tile_log_times_ns))
     assert sheet.rows == 2  # ceil(6 / 4); tile pads the two empty cells
-    width, _height = _probe_dimensions(output)
+    width, _height = video_stream_dimensions(output)
     assert width == 4 * 160
 
 
@@ -972,7 +865,7 @@ def test_contact_sheet_without_drawtext_still_produces_sheet(
     sheet = contact_sheet(ten_extracted_frames[:2], output, columns=2)
 
     assert output.is_file()
-    assert _probe_dimensions(output) == (640, 240)
+    assert video_stream_dimensions(output) == (640, 240)
     assert sheet.timestamps_burned is False
 
 
@@ -1007,7 +900,7 @@ def test_contact_sheet_accepts_apostrophes_in_external_paths(
     sheet = contact_sheet(copied_frames, output, columns=2)
 
     assert output.is_file()
-    assert _probe_dimensions(output) == (640, 240)
+    assert video_stream_dimensions(output) == (640, 240)
     assert sheet.timestamps_burned is True
 
 

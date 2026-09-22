@@ -1,12 +1,11 @@
 """Public full-range measurements match explicit lossless normalization."""
 
 import hashlib
-import subprocess
 from pathlib import Path
 
 import pytest
+from media_test_helpers import render_lavfi, run_ffmpeg
 
-from hflow.ffmpeg import ffmpeg_path
 from hflow.video_statistics import (
     FrameStatisticsSettings,
     LumaRangePolicy,
@@ -20,50 +19,30 @@ def test_full_range_statistics_match_explicit_normalization_without_persistent_o
 ) -> None:
     source = tmp_path / "source.mp4"
     normalized = tmp_path / "normalized.mp4"
-    subprocess.run(
-        [
-            str(ffmpeg_path()),
-            "-v",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            f"color={color}:s=96x64:r=8:d=3",
-            "-c:v",
-            "libx264",
-            "-threads",
-            "1",
-            "-pix_fmt",
-            "yuv420p",
-            str(source),
-        ],
-        check=True,
-        capture_output=True,
+    render_lavfi(
+        source,
+        f"color={color}:s=96x64:r=8:d=3",
+        output_arguments=("-c:v", "libx264", "-threads", "1", "-pix_fmt", "yuv420p"),
     )
     source_digest = hashlib.sha256(source.read_bytes()).digest()
-    subprocess.run(
-        [
-            str(ffmpeg_path()),
-            "-v",
-            "error",
-            "-i",
-            str(source),
-            "-vf",
-            "scale=in_range=auto:out_range=full",
-            "-c:v",
-            "libx264",
-            "-crf",
-            "0",
-            "-threads",
-            "1",
-            "-pix_fmt",
-            "yuv420p",
-            "-color_range",
-            "pc",
-            str(normalized),
-        ],
-        check=True,
-        capture_output=True,
+    run_ffmpeg(
+        "-v",
+        "error",
+        "-i",
+        str(source),
+        "-vf",
+        "scale=in_range=auto:out_range=full",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "0",
+        "-threads",
+        "1",
+        "-pix_fmt",
+        "yuv420p",
+        "-color_range",
+        "pc",
+        str(normalized),
     )
     reference = measure_video_frame_statistics(
         normalized, settings=FrameStatisticsSettings(luma_range=LumaRangePolicy.FULL)

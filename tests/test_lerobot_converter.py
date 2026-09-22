@@ -11,7 +11,7 @@ import logging
 import shutil
 import subprocess
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import replace
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,6 +20,17 @@ from types import SimpleNamespace
 from urllib.parse import unquote, urlsplit
 
 import pytest
+from lerobot_test_helpers import (
+    CorpusEpisodeRow,
+    publish_staged_episode,
+    split_episode_metadata_into_shards,
+    stub_hub_download,
+    stub_hub_repo_info,
+    stub_single_shard_hub_corpus,
+    two_camera_v3_info,
+    write_v3_corpus,
+    write_v3_data_parquet,
+)
 
 import hflow.importers.lerobot as prep
 from hflow.cli import main as cli_main
@@ -28,6 +39,10 @@ from hflow.storage import LocalStorageRoot, StorageRoot
 
 _DERIVE = prep._derive_numeric_schema
 _ENCODE = prep._encode_cdr_float32_array
+_SIX_DIMENSION_NUMERIC_SCHEMAS = {
+    "observation.state": prep._NumericSchema(name="observation.state", dim=6),
+    "action": prep._NumericSchema(name="action", dim=6),
+}
 
 
 def _numeric_feature(name: str, dtype: str, shape: list) -> prep._NumericFeature:
@@ -56,18 +71,35 @@ def _source_archive(
     )
 
 
-def _stub_download(
-    monkeypatch: pytest.MonkeyPatch, supply_file: Callable[[str, Path], None]
-) -> None:
-    """Supply fixture files at the SDK boundary, using its repository layout."""
-
-    def download(_repo_id: str, filename: str, *, local_dir: Path, **_kwargs: object) -> str:
-        destination = local_dir / filename
-        if not destination.exists():
-            supply_file(filename, destination)
-        return str(destination)
-
-    monkeypatch.setattr(prep, "hf_hub_download", download)
+def _single_camera_episode_row(
+    episode_index: int,
+    *,
+    camera_key: str,
+    task: str | None = None,
+    length: int = 1,
+    data_from: int = 0,
+    video_file_index: str = "000",
+    from_timestamp: float = 0.0,
+    to_timestamp: float = 0.0,
+) -> prep._EpisodeRow:
+    """An episode in data chunk and file ``000`` with one camera's video window."""
+    return prep._EpisodeRow(
+        episode_index=episode_index,
+        task=f"task-{episode_index}" if task is None else task,
+        length=length,
+        data_chunk="000",
+        data_file="000",
+        data_from=data_from,
+        data_to=data_from + length,
+        video_windows={
+            camera_key: prep._VideoWindow(
+                chunk_index="000",
+                file_index=video_file_index,
+                from_timestamp=from_timestamp,
+                to_timestamp=to_timestamp,
+            )
+        },
+    )
 
 
 _FFMPEG = shutil.which("ffmpeg")
@@ -81,122 +113,29 @@ _requires_system_ffmpeg = pytest.mark.skipif(
 )
 
 
-def _build_fake_corpus(tmp_path: Path) -> dict:
+def _build_fake_corpus(corpus_root: Path) -> dict:
     """Synthetic v3 metadata: 4 episodes, 2 cameras, 6-dim state/action."""
-    info = {
-        "fps": 30,
-        "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
-        "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
-        "features": {
-            "action": {"dtype": "float32", "shape": [6]},
-            "observation.state": {"dtype": "float32", "shape": [6]},
-            "observation.images.up": {"dtype": "video", "shape": [480, 640, 3]},
-            "observation.images.side": {"dtype": "video", "shape": [480, 640, 3]},
-            "timestamp": {"dtype": "float32", "shape": [1]},
-        },
-        "robot_type": "so101",
-    }
-    (tmp_path / "meta").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "meta" / "info.json").write_text(json.dumps(info))
-
-    import duckdb
-
-    conn = duckdb.connect()
-    rows = []
-    for i in range(4):
-        rows.append(
-            [
-                i,
-                60 + i * 5,
-                "chunk-000",
-                "file-000",
-                i * 200,
-                i * 200 + 60 + i * 5,
-                "chunk-000",
-                "file-000",
-                0.0,
-                2.0 + i * 0.2,
-                "chunk-000",
-                "file-000",
-                0.0,
-                2.0 + i * 0.2,
-                [f"task-{i}"],
-            ]
-        )
-    ep_cols = [
-        "episode_index",
-        "length",
-        "data/chunk_index",
-        "data/file_index",
-        "dataset_from_index",
-        "dataset_to_index",
-        "videos/observation.images.up/chunk_index",
-        "videos/observation.images.up/file_index",
-        "videos/observation.images.up/from_timestamp",
-        "videos/observation.images.up/to_timestamp",
-        "videos/observation.images.side/chunk_index",
-        "videos/observation.images.side/file_index",
-        "videos/observation.images.side/from_timestamp",
-        "videos/observation.images.side/to_timestamp",
-        "tasks",
-    ]
-    ep_path = tmp_path / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
-    ep_path.parent.mkdir(parents=True, exist_ok=True)
-    ep_quoted = str(ep_path).replace("'", "''")
-    vals_sql = ",".join(
-        "("
-        + ",".join(
-            "[" + ",".join(f"'{x}'" for x in v) + "]"
-            if isinstance(v, list)
-            else f"'{v!s}'"
-            if isinstance(v, str)
-            else str(v)
-            for v in row
-        )
-        + ")"
-        for row in rows
+    info = two_camera_v3_info()
+    write_v3_corpus(
+        corpus_root,
+        info=info,
+        episode_rows=[
+            CorpusEpisodeRow(
+                episode_index=episode_index,
+                length=60 + episode_index * 5,
+                dataset_from_index=episode_index * 200,
+                video_to_timestamp=2.0 + episode_index * 0.2,
+                tasks=(f"task-{episode_index}",),
+                data_chunk_index="chunk-000",
+                data_file_index="file-000",
+                video_chunk_index="chunk-000",
+                video_file_index="file-000",
+            )
+            for episode_index in range(4)
+        ],
+        timestamps_as_double=True,
     )
-    ep_cols_q = ",".join(f'"{c}"' for c in ep_cols)
-    conn.execute(
-        f"COPY (SELECT * FROM (VALUES {vals_sql}) AS t({ep_cols_q})) "
-        f"TO '{ep_quoted}' (FORMAT parquet)"
-    )
-
-    # data parquet with contiguous `index` column matching episode windows
-    data_rows = []
-    idx = 0
-    for i in range(4):
-        length = 60 + i * 5
-        for f in range(length):
-            state = "[" + ",".join(str(float(f)) for _ in range(6)) + "]"
-            action = "[" + ",".join(str(float(f + 0.5)) for _ in range(6)) + "]"
-            data_rows.append([idx, i, f, round(f / 30.0, 6), state, action])
-            idx += 1
-    data_path = tmp_path / "data" / "chunk-000" / "file-000.parquet"
-    data_path.parent.mkdir(parents=True, exist_ok=True)
-    data_quoted = str(data_path).replace("'", "''")
-    data_vals = ",".join("(" + ",".join(str(v) for v in row) + ")" for row in data_rows)
-    conn.execute(
-        f"COPY (SELECT * FROM (VALUES {data_vals}) AS "
-        't(index, episode_index, frame_index, timestamp, "observation.state", action)) '
-        f"TO '{data_quoted}' (FORMAT parquet)"
-    )
-    conn.execute(
-        "COPY (SELECT index, episode_index, frame_index, CAST(timestamp AS DOUBLE) AS timestamp, "
-        f"\"observation.state\", action FROM read_parquet('{data_quoted}')) "
-        f"TO '{data_quoted}' (FORMAT parquet)"
-    )
-    conn.close()
-
-    return {
-        "info": info,
-        "fps": 30,
-        "data_path": info["data_path"],
-        "video_path": info["video_path"],
-        "cache_dir": tmp_path,
-        "data_chunk": "chunk-000",
-        "data_file": "file-000",
-    }
+    return {"info": info, "cache_dir": corpus_root}
 
 
 def test_derive_numeric_schema_float32_vector() -> None:
@@ -225,11 +164,7 @@ def test_import_rejects_required_boolean_dimension_without_dataset_output(
 ) -> None:
     output_dir = tmp_path / "out"
     dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
-    monkeypatch.setattr(
-        prep,
-        "_hf_repo_info",
-        lambda repo, revision: {"sha": "abc", "license": "apache-2.0"},
-    )
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc")
     monkeypatch.setattr(
         prep,
         "_ensure_source_archive",
@@ -275,34 +210,8 @@ def test_index_discovery_multi_camera_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     corpus = _build_fake_corpus(tmp_path)
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, rev: {"sha": rev, "license": "apache-2.0"}
-    )
-    monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: corpus["info"])
-    monkeypatch.setattr(
-        prep,
-        "_hf_episode_metadata_files",
-        lambda repo, rev: ["meta/episodes/chunk-000/file-000.parquet"],
-    )
-
-    def fake_dl(filename: str, dest: Path, **kw: object) -> None:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if "meta/episodes" in filename:
-            import shutil
-
-            shutil.copy(
-                str(tmp_path / "meta" / "episodes" / "chunk-000" / "file-000.parquet"), dest
-            )
-        elif filename.endswith("info.json"):
-            import shutil
-
-            shutil.copy(str(tmp_path / "meta" / "info.json"), dest)
-        else:
-            import shutil
-
-            shutil.copy(str(tmp_path / "data" / "chunk-000" / "file-000.parquet"), dest)
-
-    _stub_download(monkeypatch, fake_dl)
+    stub_hub_repo_info(monkeypatch)
+    stub_single_shard_hub_corpus(monkeypatch, tmp_path, corpus["info"])
 
     ds = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
     found = prep._ensure_source_archive(ds, tmp_path)
@@ -339,28 +248,12 @@ def test_index_discovery_reads_every_metadata_shard(
     episodes in each file and a distinct video window per episode.
     """
     corpus = _build_fake_corpus(tmp_path)
-    single_shard = tmp_path / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
     shard_paths = ("meta/episodes/chunk-000/file-000.parquet", second_shard_path)
-    import duckdb
-
-    conn = duckdb.connect()
-    conn.execute(
-        "CREATE TABLE all_episodes AS SELECT * FROM read_parquet('"
-        + str(single_shard).replace("'", "''")
-        + "')"
+    split_episode_metadata_into_shards(
+        tmp_path, dict(zip(shard_paths, ((0, 1), (2, 3)), strict=True))
     )
-    for shard_path, episode_indexes in zip(shard_paths, ((0, 1), (2, 3)), strict=True):
-        shard_file = tmp_path / shard_path
-        shard_file.parent.mkdir(parents=True, exist_ok=True)
-        conn.execute(
-            f"COPY (SELECT * FROM all_episodes WHERE episode_index IN {episode_indexes}) "
-            f"TO '{str(shard_file).replace(chr(39), chr(39) * 2)}' (FORMAT parquet)"
-        )
-    conn.close()
 
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, rev: {"sha": rev, "license": "apache-2.0"}
-    )
+    stub_hub_repo_info(monkeypatch)
     monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: corpus["info"])
     monkeypatch.setattr(
         prep,
@@ -372,7 +265,7 @@ def test_index_discovery_reads_every_metadata_shard(
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(tmp_path / filename, destination)
 
-    _stub_download(monkeypatch, supply_metadata_file)
+    stub_hub_download(monkeypatch, supply_metadata_file)
 
     ds = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
     cache_dir = tmp_path / "cache"
@@ -395,36 +288,16 @@ def test_conversion_selects_video_by_file_index(
     camera_key = "observation.images.up"
     dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
 
-    def episode_row(episode_index: int, video_file_index: int) -> prep._EpisodeRow:
-        return prep._EpisodeRow(
-            episode_index=episode_index,
-            task=f"task-{episode_index}",
-            length=1,
-            data_chunk="000",
-            data_file="000",
-            data_from=0,
-            data_to=1,
-            video_windows={
-                camera_key: prep._VideoWindow(
-                    chunk_index="000",
-                    file_index=f"{video_file_index:03d}",
-                    from_timestamp=0.0,
-                    to_timestamp=0.0,
-                )
-            },
-        )
-
     source_archive = _source_archive(
         dataset_source,
         corpus["cache_dir"],
         info=corpus["info"],
-        episodes=[episode_row(0, 0), episode_row(1, 1)],
+        episodes=[
+            _single_camera_episode_row(0, camera_key=camera_key, video_file_index="000"),
+            _single_camera_episode_row(1, camera_key=camera_key, video_file_index="001"),
+        ],
         video_keys=[camera_key],
     )
-    numeric_schemas = {
-        "observation.state": prep._NumericSchema(name="observation.state", dim=6),
-        "action": prep._NumericSchema(name="action", dim=6),
-    }
     converted_sources: list[bytes] = []
 
     def fake_download(filename: str, destination_path: Path, **_kwargs: object) -> None:
@@ -438,7 +311,7 @@ def test_conversion_selects_video_by_file_index(
         converted_sources.append(mp4_path.read_bytes())
         return [b"access-unit"]
 
-    _stub_download(monkeypatch, fake_download)
+    stub_hub_download(monkeypatch, fake_download)
     monkeypatch.setattr(prep, "_transcode_mp4_to_h264", fake_transcode)
     monkeypatch.setattr(prep, "_get_video_pts_times", lambda path: [0])
     monkeypatch.setattr(prep, "ffmpeg_version", lambda: "test-ffmpeg")
@@ -457,7 +330,7 @@ def test_conversion_selects_video_by_file_index(
             storage=LocalStorageRoot(tmp_path / "output"),
             episode_index=episode_index,
             camera_keys=(camera_key,),
-            numeric_schemas=numeric_schemas,
+            numeric_schemas=_SIX_DIMENSION_NUMERIC_SCHEMAS,
             frames_per_second=30,
         )
         published_uris.append(receipt["uri"])
@@ -487,30 +360,8 @@ def test_conversion_selects_video_by_file_index(
 
 def test_camera_selection_validates_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     corpus = _build_fake_corpus(tmp_path)
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, rev: {"sha": rev, "license": "apache-2.0"}
-    )
-    monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: corpus["info"])
-    monkeypatch.setattr(
-        prep,
-        "_hf_episode_metadata_files",
-        lambda repo, rev: ["meta/episodes/chunk-000/file-000.parquet"],
-    )
-
-    def fake_dl(filename: str, dest: Path, **kw: object) -> None:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        import shutil
-
-        if "meta/episodes" in filename:
-            shutil.copy(
-                str(tmp_path / "meta" / "episodes" / "chunk-000" / "file-000.parquet"), dest
-            )
-        elif filename.endswith("info.json"):
-            shutil.copy(str(tmp_path / "meta" / "info.json"), dest)
-        else:
-            shutil.copy(str(tmp_path / "data" / "chunk-000" / "file-000.parquet"), dest)
-
-    _stub_download(monkeypatch, fake_dl)
+    stub_hub_repo_info(monkeypatch)
+    stub_single_shard_hub_corpus(monkeypatch, tmp_path, corpus["info"])
 
     with pytest.raises(ValueError, match="not found"):
         prep.import_lerobot_dataset(
@@ -835,87 +686,31 @@ def test_converter_slices_exactly_the_declared_frame_count(
     # timestamp cut includes frame 62 (the first frame of episode 1).
     boundary = 62 / 30.0
 
-    def episode_row(index: int, length: int, data_from: int) -> dict:
-        return {
-            "episode_index": index,
-            "task": f"task-{index}",
-            "length": length,
-            "data_chunk": "000",
-            "data_file": "000",
-            "data_from": data_from,
-            "data_to": data_from + length,
-            "video_windows": {
-                camera_key: {
-                    "chunk_index": "000",
-                    "file_index": "000",
-                    "from_timestamp": 0.0 if index == 0 else boundary,
-                    "to_timestamp": boundary if index == 0 else 3.0,
-                }
-            },
-        }
-
-    data_rows = []
-    for index in range(2):
-        length = 62 if index == 0 else 28
-        for frame in range(length):
-            state = "[" + ",".join(str(float(frame)) for _ in range(6)) + "]"
-            action = "[" + ",".join(str(float(frame + 0.5)) for _ in range(6)) + "]"
-            data_rows.append(
-                [index * 62 + frame, index, frame, round(frame / 30.0, 6), state, action]
-            )
     data_path = tmp_path / "data" / "chunk-000" / "file-000.parquet"
-    data_path.parent.mkdir(parents=True, exist_ok=True)
-    data_quoted = str(data_path).replace("'", "''")
-    data_vals = ",".join("(" + ",".join(str(v) for v in row) + ")" for row in data_rows)
-    import duckdb
-
-    conn = duckdb.connect()
-    conn.execute(
-        f"COPY (SELECT * FROM (VALUES {data_vals}) AS "
-        't(index, episode_index, frame_index, timestamp, "observation.state", action)) '
-        f"TO '{data_quoted}' (FORMAT parquet)"
+    write_v3_data_parquet(
+        data_path, episode_lengths=[62, 28], frames_per_second=30, timestamps_as_double=True
     )
-    conn.execute(
-        "COPY (SELECT index, episode_index, frame_index, CAST(timestamp AS DOUBLE) AS timestamp, "
-        f"\"observation.state\", action FROM read_parquet('{data_quoted}')) "
-        f"TO '{data_quoted}' (FORMAT parquet)"
-    )
-    conn.close()
 
     dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
-
-    def typed_episode_row(index: int, length: int, data_from: int) -> prep._EpisodeRow:
-        row = episode_row(index, length, data_from)
-        return prep._EpisodeRow(
-            episode_index=row["episode_index"],
-            task=row["task"],
-            length=row["length"],
-            data_chunk=row["data_chunk"],
-            data_file=row["data_file"],
-            data_from=row["data_from"],
-            data_to=row["data_to"],
-            video_windows={
-                camera_key: prep._VideoWindow(
-                    chunk_index=window["chunk_index"],
-                    file_index=window["file_index"],
-                    from_timestamp=window["from_timestamp"],
-                    to_timestamp=window["to_timestamp"],
-                )
-                for camera_key, window in row["video_windows"].items()
-            },
-        )
-
     source_archive = prep._SourceArchive(
         dataset_information=prep._parse_dataset_information(corpus["info"]),
-        episodes=(typed_episode_row(0, 62, 0), typed_episode_row(1, 28, 62)),
+        episodes=(
+            _single_camera_episode_row(
+                0, camera_key=camera_key, length=62, data_from=0, to_timestamp=boundary
+            ),
+            _single_camera_episode_row(
+                1,
+                camera_key=camera_key,
+                length=28,
+                data_from=62,
+                from_timestamp=boundary,
+                to_timestamp=3.0,
+            ),
+        ),
         video_keys=(camera_key,),
         cache_dir=corpus["cache_dir"],
         dataset=dataset_source,
     )
-    numeric_schemas = {
-        "observation.state": prep._NumericSchema(name="observation.state", dim=6),
-        "action": prep._NumericSchema(name="action", dim=6),
-    }
 
     def fake_download(filename: str, destination_path: Path, **_kwargs: object) -> None:
         destination_path.parent.mkdir(parents=True, exist_ok=True)
@@ -924,7 +719,7 @@ def test_converter_slices_exactly_the_declared_frame_count(
             return
         shutil.copy(data_path, destination_path)
 
-    _stub_download(monkeypatch, fake_download)
+    stub_hub_download(monkeypatch, fake_download)
 
     storage = LocalStorageRoot(tmp_path / "output")
     landed_by_index: dict[int, Path] = {}
@@ -935,7 +730,7 @@ def test_converter_slices_exactly_the_declared_frame_count(
             storage=storage,
             episode_index=index,
             camera_keys=(camera_key,),
-            numeric_schemas=numeric_schemas,
+            numeric_schemas=_SIX_DIMENSION_NUMERIC_SCHEMAS,
             frames_per_second=30,
         )
         assert Path(receipt["uri"]).name == f"lerobot_episode_{index + 1:04d}.mcap"
@@ -1047,9 +842,7 @@ def test_info_json_refuses_non_finite_or_non_positive_fps(
     else:
         info["fps"] = bad_fps
     expected_value = info.get("fps")
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, rev: {"sha": rev, "license": "apache-2.0"}
-    )
+    stub_hub_repo_info(monkeypatch)
     monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: info)
 
     def fail_discovery(repo: str, rev: str) -> list[str]:
@@ -1132,16 +925,10 @@ def _install_publish_through_convert(monkeypatch: pytest.MonkeyPatch, tmp_path: 
         frames_per_second: object,
     ) -> prep._PublishedEpisode:
         del source_archive, dataset_source, camera_keys, numeric_schemas, frames_per_second
-        relative_key = f"landing/lerobot_episode_{episode_index + 1:04d}.mcap"
         staged = tmp_path / f"staged-{episode_index}.mcap"
         staged.write_bytes(f"episode-{episode_index}".encode())
-        published_keys.append(relative_key)
-        published_uri = storage.publish(staged, relative_key)
-        return {
-            "uri": published_uri,
-            "content_id": prep.content_episode_id(staged),
-            "size_bytes": staged.stat().st_size,
-        }
+        published_keys.append(prep._landing_relative_key(episode_index))
+        return publish_staged_episode(storage, staged, episode_index)
 
     monkeypatch.setattr(prep, "_convert_single_episode", fake_convert)
     return published_keys
@@ -1183,9 +970,7 @@ def test_import_refuses_a_depth_video_before_publishing_dataset_output(
             ),
         )
 
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
-    )
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc")
     monkeypatch.setattr(prep, "_ensure_source_archive", ensure_depth_archive)
     _install_publish_through_convert(monkeypatch, tmp_path)
 
@@ -1214,9 +999,7 @@ def test_import_returns_local_uris_and_keeps_cache_beside_landing(
     content id is the same ``content_episode_id`` the catalog dedupes on.
     """
     output_dir = tmp_path / "out"
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
-    )
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc")
     monkeypatch.setattr(prep, "_ensure_source_archive", _stub_single_episode_source_archive)
     _install_publish_through_convert(monkeypatch, tmp_path)
 
@@ -1274,31 +1057,9 @@ def test_converter_version_reaches_the_canonical_episode_provenance(
         dataset_source,
         corpus["cache_dir"],
         info=corpus["info"],
-        episodes=[
-            prep._EpisodeRow(
-                episode_index=0,
-                task="pick-and-place",
-                length=1,
-                data_chunk="000",
-                data_file="000",
-                data_from=0,
-                data_to=1,
-                video_windows={
-                    camera_key: prep._VideoWindow(
-                        chunk_index="000",
-                        file_index="000",
-                        from_timestamp=0.0,
-                        to_timestamp=0.0,
-                    )
-                },
-            )
-        ],
+        episodes=[_single_camera_episode_row(0, camera_key=camera_key, task="pick-and-place")],
         video_keys=[camera_key],
     )
-    numeric_schemas = {
-        "observation.state": prep._NumericSchema(name="observation.state", dim=6),
-        "action": prep._NumericSchema(name="action", dim=6),
-    }
 
     def fake_download(filename: str, destination_path: Path, **_kwargs: object) -> None:
         destination_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1307,7 +1068,7 @@ def test_converter_version_reaches_the_canonical_episode_provenance(
             return
         shutil.copy(tmp_path / "data" / "chunk-000" / "file-000.parquet", destination_path)
 
-    _stub_download(monkeypatch, fake_download)
+    stub_hub_download(monkeypatch, fake_download)
     monkeypatch.setattr(prep, "_transcode_mp4_to_h264", lambda *args, **kwargs: [b"access-unit"])
     monkeypatch.setattr(prep, "_get_video_pts_times", lambda path: [0])
     monkeypatch.setattr(prep, "ffmpeg_version", lambda: "test-ffmpeg")
@@ -1323,7 +1084,7 @@ def test_converter_version_reaches_the_canonical_episode_provenance(
         storage=LocalStorageRoot(tmp_path / "output"),
         episode_index=0,
         camera_keys=(camera_key,),
-        numeric_schemas=numeric_schemas,
+        numeric_schemas=_SIX_DIMENSION_NUMERIC_SCHEMAS,
         frames_per_second=30,
     )
 
@@ -1341,9 +1102,7 @@ def test_import_publishes_into_a_bucket_data_root_without_uploading_cache(
 
     data_root, remote_dir = bucket_over_tmp
     assert isinstance(data_root, BucketStorageRoot)
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
-    )
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc")
     monkeypatch.setattr(prep, "_ensure_source_archive", _stub_single_episode_source_archive)
     _install_publish_through_convert(monkeypatch, tmp_path)
 
@@ -1380,9 +1139,7 @@ def test_manifest_content_id_detects_a_truncated_episode(
     )
 
     output_dir = tmp_path / "out"
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
-    )
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc")
     monkeypatch.setattr(prep, "_ensure_source_archive", _stub_single_episode_source_archive)
     _install_publish_through_convert(monkeypatch, tmp_path)
 
@@ -1422,18 +1179,6 @@ def test_import_skips_bucket_manifest_when_an_episode_publish_fails(
     data_root, remote_dir = bucket_over_tmp
     assert isinstance(data_root, BucketStorageRoot)
 
-    def ensure_two_episodes(
-        dataset_source: prep.DatasetSource, cache_dir: Path
-    ) -> prep._SourceArchive:
-        archive = _stub_single_episode_source_archive(dataset_source, cache_dir)
-        return replace(
-            archive,
-            episodes=(
-                archive.episodes[0],
-                replace(archive.episodes[0], episode_index=1, task="second"),
-            ),
-        )
-
     convert_calls = 0
 
     def fail_on_second_episode(
@@ -1451,20 +1196,12 @@ def test_import_skips_bucket_manifest_when_an_episode_publish_fails(
         convert_calls += 1
         if episode_index == 1:
             raise RuntimeError("forced publish failure")
-        relative_key = f"landing/lerobot_episode_{episode_index + 1:04d}.mcap"
         staged = tmp_path / f"staged-{episode_index}.mcap"
         staged.write_bytes(b"first")
-        published_uri = storage.publish(staged, relative_key)
-        return {
-            "uri": published_uri,
-            "content_id": prep.content_episode_id(staged),
-            "size_bytes": staged.stat().st_size,
-        }
+        return publish_staged_episode(storage, staged, episode_index)
 
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
-    )
-    monkeypatch.setattr(prep, "_ensure_source_archive", ensure_two_episodes)
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc")
+    monkeypatch.setattr(prep, "_ensure_source_archive", _ensure_two_episode_archive)
     monkeypatch.setattr(prep, "_convert_single_episode", fail_on_second_episode)
 
     with pytest.raises(RuntimeError, match="forced publish failure"):
@@ -1711,7 +1448,6 @@ def test_import_resumes_after_mid_batch_failure_without_rewriting_completed_epis
         convert_calls.append(episode_index)
         if episode_index == 1 and convert_calls.count(1) == 1:
             raise RuntimeError("forced mid-batch failure")
-        relative_key = prep._landing_relative_key(episode_index)
         staged = tmp_path / f"staged-{episode_index}-{len(convert_calls)}.mcap"
         _write_identity_matching_landing_mcap(
             staged,
@@ -1720,16 +1456,9 @@ def test_import_resumes_after_mid_batch_failure_without_rewriting_completed_epis
             camera_keys=camera_keys,
             marker=f"episode-{episode_index}-bytes",
         )
-        published_uri = storage.publish(staged, relative_key)
-        return {
-            "uri": published_uri,
-            "content_id": prep.content_episode_id(staged),
-            "size_bytes": staged.stat().st_size,
-        }
+        return publish_staged_episode(storage, staged, episode_index)
 
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
-    )
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc")
     monkeypatch.setattr(prep, "_ensure_source_archive", _ensure_two_episode_archive)
     monkeypatch.setattr(prep, "_convert_single_episode", convert_or_fail)
 
@@ -1798,7 +1527,6 @@ def test_import_does_not_reuse_identity_mismatched_landing_episode(
         nonlocal convert_calls
         del source_archive, numeric_schemas, frames_per_second
         convert_calls += 1
-        relative_key = prep._landing_relative_key(episode_index)
         staged = tmp_path / f"replacement-{episode_index}.mcap"
         _write_identity_matching_landing_mcap(
             staged,
@@ -1807,16 +1535,9 @@ def test_import_does_not_reuse_identity_mismatched_landing_episode(
             camera_keys=camera_keys,
             marker="replacement",
         )
-        published_uri = storage.publish(staged, relative_key)
-        return {
-            "uri": published_uri,
-            "content_id": prep.content_episode_id(staged),
-            "size_bytes": staged.stat().st_size,
-        }
+        return publish_staged_episode(storage, staged, episode_index)
 
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
-    )
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc")
     monkeypatch.setattr(prep, "_ensure_source_archive", _stub_single_episode_source_archive)
     monkeypatch.setattr(prep, "_convert_single_episode", convert_replacement)
 
@@ -1856,9 +1577,7 @@ def test_import_full_reuse_reports_zero_episodes_converted(
         convert_calls += 1
         raise AssertionError("matching landing episodes must be reused")
 
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
-    )
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc")
     monkeypatch.setattr(prep, "_ensure_source_archive", _ensure_two_episode_archive)
     monkeypatch.setattr(prep, "_convert_single_episode", should_not_convert)
 
@@ -1988,26 +1707,8 @@ def _import_success_label_corpus(
     corpus = _build_success_label_corpus(root, outcome_mode, frames_per_second)
     output_dir = tmp_path / "out"
 
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc1234", "license": "apache-2.0"}
-    )
-    monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: corpus["info"])
-    monkeypatch.setattr(
-        prep,
-        "_hf_episode_metadata_files",
-        lambda repo, rev: ["meta/episodes/chunk-000/file-000.parquet"],
-    )
-
-    def fake_download(filename: str, dest: Path, **_kwargs: object) -> None:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if "meta/episodes" in filename:
-            shutil.copy(root / "meta" / "episodes" / "chunk-000" / "file-000.parquet", dest)
-        elif filename.endswith("info.json"):
-            shutil.copy(root / "meta" / "info.json", dest)
-        else:
-            shutil.copy(root / "data" / "chunk-000" / "file-000.parquet", dest)
-
-    _stub_download(monkeypatch, fake_download)
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc1234")
+    stub_single_shard_hub_corpus(monkeypatch, root, corpus["info"])
 
     def fake_transcode(mp4_path: Path, gop: float, fps: float) -> list[bytes]:
         if transcode_calls is not None:
@@ -2240,24 +1941,13 @@ def test_hub_source_metadata_paginates_pinned_tree_and_reuses_downloads(
     _build_fake_corpus(source_root)
     first_shard = source_root / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
     second_shard = source_root / "meta" / "episodes" / "chunk-001" / "file-000.parquet"
-    second_shard.parent.mkdir(parents=True)
-    import duckdb
-
-    connection = duckdb.connect()
-    connection.execute(
-        "CREATE TABLE all_episodes AS SELECT * FROM read_parquet('"
-        + str(first_shard).replace("'", "''")
-        + "')"
+    split_episode_metadata_into_shards(
+        source_root,
+        {
+            "meta/episodes/chunk-000/file-000.parquet": (0, 1),
+            "meta/episodes/chunk-001/file-000.parquet": (2, 3),
+        },
     )
-    for shard_path, episode_indexes in (
-        (first_shard, (0, 1)),
-        (second_shard, (2, 3)),
-    ):
-        connection.execute(
-            f"COPY (SELECT * FROM all_episodes WHERE episode_index IN {episode_indexes}) "
-            f"TO '{str(shard_path).replace(chr(39), chr(39) * 2)}' (FORMAT parquet)"
-        )
-    connection.close()
 
     resolved_revision = "a" * 40
     downloaded_filenames: list[str] = []

@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import shutil
-import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from media_test_helpers import decoded_frame_count, run_ffmpeg
 
 import hflow.video as video
 
@@ -18,29 +18,6 @@ _requires_system_ffmpeg = pytest.mark.skipif(
 )
 
 
-def _frame_count(path: Path) -> int:
-    assert _FFPROBE is not None
-    result = subprocess.run(
-        [
-            _FFPROBE,
-            "-v",
-            "error",
-            "-count_frames",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=nb_read_frames",
-            "-of",
-            "csv=p=0",
-            str(path),
-        ],
-        capture_output=True,
-        check=True,
-        text=True,
-    )
-    return int(result.stdout.strip())
-
-
 @_requires_system_ffmpeg
 def test_concurrent_remuxes_match_single_process_reference(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -49,31 +26,26 @@ def test_concurrent_remuxes_match_single_process_reference(
     system_ffmpeg = Path(_FFMPEG)
     monkeypatch.setattr(video, "ffmpeg_path", lambda: system_ffmpeg)
 
-    encoded = subprocess.run(
-        [
-            _FFMPEG,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=160x120:rate=30:duration=2,format=yuv420p",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-bf",
-            "0",
-            "-g",
-            "30",
-            "-f",
-            "h264",
-            "-",
-        ],
-        capture_output=True,
-        check=True,
-    ).stdout
+    encoded = run_ffmpeg(
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=160x120:rate=30:duration=2,format=yuv420p",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-bf",
+        "0",
+        "-g",
+        "30",
+        "-f",
+        "h264",
+        "-",
+    )
 
     reference = video.write_access_units_to_mp4(
         [encoded], fps=30.0, output=tmp_path / "reference.mp4"
@@ -91,5 +63,5 @@ def test_concurrent_remuxes_match_single_process_reference(
         hashlib.sha256(output.read_bytes()).digest()
         == hashlib.sha256(reference.read_bytes()).digest()
     )
-    assert _frame_count(output) == 60
+    assert decoded_frame_count(output) == 60
     assert not list(tmp_path.glob(f".{output.name}.*.tmp"))

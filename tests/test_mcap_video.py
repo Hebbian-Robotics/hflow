@@ -10,9 +10,8 @@ from pathlib import Path
 import av
 import numpy as np
 import pytest
-from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
 from mcap.writer import Writer
-from mcap_protobuf.schema import build_file_descriptor_set
+from mcap_test_helpers import write_compressed_video_mcap
 
 from hflow.mcap_video import McapMediaError, export_mcap_camera
 from hflow.media import VideoLimits
@@ -60,26 +59,15 @@ def _write_h264_mcap(
     frame_times_ns: tuple[int, ...] = FRAME_TIMES_NS,
 ) -> list[bytes]:
     packets = _h264_packets() if packets is None else packets
-    with path.open("wb") as output:
-        writer = Writer(output)
-        writer.start()
-        schema_id = writer.register_schema(
-            name="foxglove.CompressedVideo",
-            encoding="protobuf",
-            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
-        )
-        for topic in topics:
-            channel_id = writer.register_channel(topic, "protobuf", schema_id)
-            for timestamp, packet in zip(frame_times_ns, packets, strict=True):
-                message = CompressedVideo(format="h264", data=packet)
-                message.timestamp.FromNanoseconds(CAMERA_START_NS + timestamp)
-                writer.add_message(
-                    channel_id,
-                    CAMERA_START_NS + timestamp,
-                    message.SerializeToString(),
-                    CAMERA_START_NS + timestamp,
-                )
-        writer.finish()
+    write_compressed_video_mcap(
+        path,
+        [
+            (topic, CAMERA_START_NS + timestamp, packet)
+            for topic in topics
+            for timestamp, packet in zip(frame_times_ns, packets, strict=True)
+        ],
+        frame_id_by_topic=dict.fromkeys(topics, ""),
+    )
     return packets
 
 

@@ -10,6 +10,12 @@ from types import SimpleNamespace
 import pytest
 from httpx import Request, Response
 from huggingface_hub.errors import RemoteEntryNotFoundError
+from lerobot_test_helpers import (
+    V3_DATA_PATH_TEMPLATE,
+    V3_VIDEO_PATH_TEMPLATE,
+    exactly,
+    stub_hub_repo_info,
+)
 
 import hflow.importers.lerobot as prep
 
@@ -17,21 +23,15 @@ _REPO = "fake/repo"
 _SHA = "abcdef1234567890"
 
 
-def _exactly(message: str) -> str:
-    """A ``match=`` pattern pinning the whole message, metacharacters and all.
-
-    #405 asks for these to be byte-identical, and several contain a ``.``
-    (``meta/info.json``), which unescaped would also match ``meta/infoXjson``.
-    """
-    return rf"^{re.escape(message)}$"
-
-
-def _stub_repo_info(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        prep,
-        "_hf_repo_info",
-        lambda _repo, _revision: {"sha": _SHA, "license": "apache-2.0"},
-    )
+def _info(**overrides: object) -> dict[str, object]:
+    info: dict[str, object] = {
+        "fps": 30,
+        "data_path": V3_DATA_PATH_TEMPLATE,
+        "video_path": V3_VIDEO_PATH_TEMPLATE,
+        "features": {},
+    }
+    info.update(overrides)
+    return info
 
 
 def _assert_no_dataset_output(output_dir: Path) -> None:
@@ -46,7 +46,7 @@ def _import(output_dir: Path) -> None:
 def test_import_refuses_repository_without_lerobot_v3_info(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _stub_repo_info(monkeypatch)
+    stub_hub_repo_info(monkeypatch, resolved_sha=_SHA)
 
     def missing_info(*_args: object, **_kwargs: object) -> str:
         raise RemoteEntryNotFoundError(
@@ -58,7 +58,7 @@ def test_import_refuses_repository_without_lerobot_v3_info(
     output_dir = tmp_path / "out"
 
     with pytest.raises(
-        RuntimeError, match=_exactly("meta/info.json not found; not a LeRobot v3 repository")
+        RuntimeError, match=exactly("meta/info.json not found; not a LeRobot v3 repository")
     ):
         _import(output_dir)
 
@@ -68,13 +68,13 @@ def test_import_refuses_repository_without_lerobot_v3_info(
 def test_import_refuses_info_json_that_is_not_an_object(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _stub_repo_info(monkeypatch)
+    stub_hub_repo_info(monkeypatch, resolved_sha=_SHA)
     metadata_file = tmp_path / "info.json"
     metadata_file.write_text("[]")
     monkeypatch.setattr(prep, "hf_hub_download", lambda *_args, **_kwargs: str(metadata_file))
     output_dir = tmp_path / "out"
 
-    with pytest.raises(ValueError, match=_exactly("LeRobot meta/info.json is not a JSON object")):
+    with pytest.raises(ValueError, match=exactly("LeRobot meta/info.json is not a JSON object")):
         _import(output_dir)
 
     _assert_no_dataset_output(output_dir)
@@ -94,36 +94,15 @@ def test_import_refuses_empty_path_templates(
     value: str,
     message: str,
 ) -> None:
-    _stub_repo_info(monkeypatch)
-    info = {
-        "fps": 30,
-        "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
-        "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
-        "features": {},
-    }
-    info[field] = value
+    stub_hub_repo_info(monkeypatch, resolved_sha=_SHA)
+    info = _info(**{field: value})
     monkeypatch.setattr(prep, "_fetch_info_json", lambda _repo, _revision, _cache: info)
     output_dir = tmp_path / "out"
 
-    with pytest.raises(ValueError, match=_exactly(message)):
+    with pytest.raises(ValueError, match=exactly(message)):
         _import(output_dir)
 
     _assert_no_dataset_output(output_dir)
-
-
-_VALID_DATA_PATH = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
-_VALID_VIDEO_PATH = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
-
-
-def _info(**overrides: object) -> dict[str, object]:
-    info: dict[str, object] = {
-        "fps": 30,
-        "data_path": _VALID_DATA_PATH,
-        "video_path": _VALID_VIDEO_PATH,
-        "features": {},
-    }
-    info.update(overrides)
-    return info
 
 
 @pytest.mark.parametrize(
@@ -166,7 +145,7 @@ def test_import_refuses_a_template_the_converter_could_not_format(
     ``meta/episodes`` had been listed and every episode metadata parquet
     downloaded; asserting only the message would pass either way.
     """
-    _stub_repo_info(monkeypatch)
+    stub_hub_repo_info(monkeypatch, resolved_sha=_SHA)
     monkeypatch.setattr(
         prep, "_fetch_info_json", lambda _repo, _revision, _cache: _info(**{field: template})
     )
@@ -180,7 +159,7 @@ def test_import_refuses_a_template_the_converter_could_not_format(
     output_dir = tmp_path / "out"
 
     message = f"LeRobot meta/info.json has an invalid {field} template {template!r}: {detail}"
-    with pytest.raises(ValueError, match=_exactly(message)):
+    with pytest.raises(ValueError, match=exactly(message)):
         _import(output_dir)
 
     assert listed_repositories == []
@@ -211,14 +190,12 @@ def test_import_refuses_info_json_without_features_before_listing_episodes(
     would pass either way, so the point of the test is the second assertion:
     a corpus with no ``features`` must not cost a listing of ``meta/episodes``.
     """
-    _stub_repo_info(monkeypatch)
+    stub_hub_repo_info(monkeypatch, resolved_sha=_SHA)
     monkeypatch.setattr(
         prep,
         "_fetch_info_json",
         lambda _repo, _revision, _cache: {
-            "fps": 30,
-            "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
-            "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+            key: value for key, value in _info().items() if key != "features"
         },
     )
     listed_repositories: list[str] = []
@@ -231,7 +208,7 @@ def test_import_refuses_info_json_without_features_before_listing_episodes(
     output_dir = tmp_path / "out"
 
     with pytest.raises(
-        ValueError, match=_exactly("LeRobot meta/info.json must define a features object")
+        ValueError, match=exactly("LeRobot meta/info.json must define a features object")
     ):
         _import(output_dir)
 
@@ -242,17 +219,8 @@ def test_import_refuses_info_json_without_features_before_listing_episodes(
 def test_import_refuses_repository_without_episode_parquets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _stub_repo_info(monkeypatch)
-    monkeypatch.setattr(
-        prep,
-        "_fetch_info_json",
-        lambda _repo, _revision, _cache: {
-            "fps": 30,
-            "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
-            "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
-            "features": {},
-        },
-    )
+    stub_hub_repo_info(monkeypatch, resolved_sha=_SHA)
+    monkeypatch.setattr(prep, "_fetch_info_json", lambda _repo, _revision, _cache: _info())
 
     def missing_episode_tree(*_args: object, **_kwargs: object) -> list[object]:
         raise RemoteEntryNotFoundError(
@@ -267,7 +235,7 @@ def test_import_refuses_repository_without_episode_parquets(
     )
     output_dir = tmp_path / "out"
 
-    with pytest.raises(RuntimeError, match=_exactly("no meta/episodes parquet files found")):
+    with pytest.raises(RuntimeError, match=exactly("no meta/episodes parquet files found")):
         _import(output_dir)
 
     _assert_no_dataset_output(output_dir)
@@ -276,7 +244,7 @@ def test_import_refuses_repository_without_episode_parquets(
 def test_import_wraps_error_from_later_episode_tree_page(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _stub_repo_info(monkeypatch)
+    stub_hub_repo_info(monkeypatch, resolved_sha=_SHA)
     monkeypatch.setattr(prep, "_fetch_info_json", lambda *_args: _info())
 
     def failing_episode_tree(*_args: object, **_kwargs: object) -> Iterator[object]:
@@ -313,7 +281,7 @@ def test_import_wraps_error_from_later_episode_tree_page(
 def test_import_refuses_inventory_with_invalid_filename(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, filename: object
 ) -> None:
-    _stub_repo_info(monkeypatch)
+    stub_hub_repo_info(monkeypatch, resolved_sha=_SHA)
     monkeypatch.setattr(prep, "_fetch_info_json", lambda *_args: _info())
     monkeypatch.setattr(
         prep,

@@ -9,7 +9,6 @@ import sys
 import textwrap
 from collections.abc import Callable
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -17,9 +16,15 @@ from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
 from mcap.exceptions import InvalidMagic
 from mcap.reader import make_reader
 from mcap.writer import Writer as StockWriter
-from mcap_protobuf.schema import build_file_descriptor_set
 from mcap_ros2.decoder import DecoderFactory as Ros2DecoderFactory
-from mcap_ros2.writer import Writer as Ros2Writer
+from mcap_test_helpers import (
+    ANNEX_B_START_CODE,
+    KEYFRAME_ACCESS_UNIT,
+    NON_KEYFRAME_ACCESS_UNIT,
+    ROS2_COMPRESSED_VIDEO_SCHEMA,
+    write_compressed_video_mcap,
+    write_ros2_compressed_video_mcap,
+)
 
 import hflow
 from hflow import transform
@@ -31,15 +36,6 @@ from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import SourceNotConforming, write_canonical_episode
 from hflow.video import estimate_fps_from_log_times
 
-ANNEX_B_START_CODE = b"\x00\x00\x00\x01"
-KEYFRAME_ACCESS_UNIT = b"".join(
-    ANNEX_B_START_CODE + bytes([nal_type]) + (b"\x80payload" if nal_type == 0x65 else b"payload")
-    for nal_type in (0x09, 0x67, 0x68, 0x65)
-)
-NON_KEYFRAME_ACCESS_UNIT = b"".join(
-    ANNEX_B_START_CODE + bytes([nal_type]) + (b"\x80payload" if nal_type == 0x41 else b"payload")
-    for nal_type in (0x09, 0x41)
-)
 KEYFRAME_WITHOUT_AUD = b"".join(
     ANNEX_B_START_CODE + bytes([nal_type]) + (b"\x80payload" if nal_type == 0x65 else b"payload")
     for nal_type in (0x67, 0x68, 0x65)
@@ -50,18 +46,6 @@ NON_KEYFRAME_WITHOUT_AUD = ANNEX_B_START_CODE + b"\x41\x80payload"
 B_FRAME_ACCESS_UNIT = b"".join(
     ANNEX_B_START_CODE + bytes([nal_type]) + (b"\xa0payload" if nal_type == 0x41 else b"payload")
     for nal_type in (0x09, 0x41)
-)
-ROS2_COMPRESSED_VIDEO_SCHEMA = "\n".join(
-    [
-        "builtin_interfaces/Time timestamp",
-        "string frame_id",
-        "uint8[] data",
-        "string format",
-        "=" * 80,
-        "MSG: builtin_interfaces/Time",
-        "int32 sec",
-        "uint32 nanosec",
-    ]
 )
 
 
@@ -114,66 +98,16 @@ def test_transform_preserves_no_schema_sentinel_and_empty_episode_record(
 
 def test_transform_rejects_nonconforming_passthrough_video(tmp_path: Path) -> None:
     source = tmp_path / "h265.mcap"
-    with source.open("wb") as stream:
-        writer = StockWriter(stream)
-        writer.start(profile="", library="test")
-        schema_id = writer.register_schema(
-            name="foxglove.CompressedVideo",
-            encoding="protobuf",
-            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
-        )
-        channel_id = writer.register_channel(
-            topic="/cam", message_encoding="protobuf", schema_id=schema_id
-        )
-        message = CompressedVideo()
-        message.timestamp.FromNanoseconds(10**9)
-        message.frame_id = "cam"
-        message.data = b"\x00\x00\x00\x01\x40junk"
-        message.format = "h265"
-        writer.add_message(
-            channel_id, log_time=10**9, data=message.SerializeToString(), publish_time=10**9
-        )
-        writer.finish()
+    write_compressed_video_mcap(
+        source, [("/cam", 10**9, b"\x00\x00\x00\x01\x40junk")], video_format="h265"
+    )
     with pytest.raises(SourceNotConforming, match="requires 'h264'"):
         write_canonical_episode(source, tmp_path / "out.mcap")
 
 
-def _write_passthrough_video_source(
-    path: Path, messages: list[tuple[str, int, bytes]]
-) -> dict[str, list[bytes]]:
-    payloads_by_topic: dict[str, list[bytes]] = {}
-    with path.open("wb") as stream:
-        writer = StockWriter(stream)
-        writer.start(profile="", library="test")
-        schema_id = writer.register_schema(
-            name="foxglove.CompressedVideo",
-            encoding="protobuf",
-            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
-        )
-        channel_ids = {
-            topic: writer.register_channel(
-                topic=topic, message_encoding="protobuf", schema_id=schema_id
-            )
-            for topic in dict.fromkeys(topic for topic, _log_time, _data in messages)
-        }
-        for topic, log_time, access_unit_data in messages:
-            message = CompressedVideo()
-            message.timestamp.FromNanoseconds(log_time)
-            message.frame_id = topic.strip("/")
-            message.data = access_unit_data
-            message.format = "h264"
-            payload = message.SerializeToString()
-            writer.add_message(
-                channel_ids[topic], log_time=log_time, data=payload, publish_time=log_time
-            )
-            payloads_by_topic.setdefault(topic, []).append(payload)
-        writer.finish()
-    return payloads_by_topic
-
-
 def test_transform_rejects_passthrough_video_carrying_b_frames(tmp_path: Path) -> None:
     source = tmp_path / "bframe.mcap"
-    _write_passthrough_video_source(
+    write_compressed_video_mcap(
         source,
         [("/cam", 1, KEYFRAME_ACCESS_UNIT), ("/cam", 2, B_FRAME_ACCESS_UNIT)],
     )
@@ -186,7 +120,7 @@ def test_transform_rejects_each_passthrough_video_channel_starting_mid_gop(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "interleaved-mid-gop.mcap"
-    _write_passthrough_video_source(
+    write_compressed_video_mcap(
         source,
         [
             ("/cam/left", 1, KEYFRAME_ACCESS_UNIT),
@@ -203,7 +137,7 @@ def test_transform_accepts_independent_interleaved_passthrough_video_channels(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "interleaved-keyframes.mcap"
-    expected_payloads = _write_passthrough_video_source(
+    expected_payloads = write_compressed_video_mcap(
         source,
         [
             ("/cam/left", 1, KEYFRAME_ACCESS_UNIT),
@@ -228,7 +162,7 @@ def test_transform_accepts_independent_interleaved_passthrough_video_channels(
 
 def test_transform_losslessly_inserts_missing_passthrough_video_auds(tmp_path: Path) -> None:
     source = tmp_path / "missing-auds.mcap"
-    original_payloads = _write_passthrough_video_source(
+    original_payloads = write_compressed_video_mcap(
         source,
         [
             ("/cam", 1, KEYFRAME_WITHOUT_AUD),
@@ -239,20 +173,32 @@ def test_transform_losslessly_inserts_missing_passthrough_video_auds(tmp_path: P
 
     write_canonical_episode(source, output)
 
+    for original, repaired in _assert_only_an_aud_was_prepended(original_payloads, output):
+        assert repaired.timestamp == original.timestamp
+        assert repaired.frame_id == original.frame_id
+        assert repaired.format == original.format
+    report = diagnose(output)
+    assert report.conforming, report.summary()
+
+
+def _assert_only_an_aud_was_prepended(
+    original_payloads: list[bytes], output: Path
+) -> list[tuple[CompressedVideo, CompressedVideo]]:
+    """Pair each source message with its output and check the 6-byte AUD repair.
+
+    Returns the ``(original, repaired)`` pairs for any further field checks.
+    """
     with output.open("rb") as stream:
         output_payloads = [
             message.data for _schema, _channel, message in make_reader(stream).iter_messages()
         ]
     original_messages = [CompressedVideo.FromString(payload) for payload in original_payloads]
     output_messages = [CompressedVideo.FromString(payload) for payload in output_payloads]
-    for original, repaired in zip(original_messages, output_messages, strict=True):
+    pairs = list(zip(original_messages, output_messages, strict=True))
+    for original, repaired in pairs:
         assert bytes(repaired.data).endswith(bytes(original.data))
         assert len(repaired.data) == len(original.data) + 6
-        assert repaired.timestamp == original.timestamp
-        assert repaired.frame_id == original.frame_id
-        assert repaired.format == original.format
-    report = diagnose(output)
-    assert report.conforming, report.summary()
+    return pairs
 
 
 def _provenance_of(episode: Path) -> dict[str, str]:
@@ -267,7 +213,7 @@ def test_transform_repairs_auds_without_refusing_irregular_passthrough_gop(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "irregular-gop-missing-auds.mcap"
-    original_payloads = _write_passthrough_video_source(
+    original_payloads = write_compressed_video_mcap(
         source,
         [
             ("/cam", 0, KEYFRAME_WITHOUT_AUD),
@@ -279,15 +225,7 @@ def test_transform_repairs_auds_without_refusing_irregular_passthrough_gop(
 
     write_canonical_episode(source, output)
 
-    with output.open("rb") as stream:
-        output_payloads = [
-            message.data for _schema, _channel, message in make_reader(stream).iter_messages()
-        ]
-    original_messages = [CompressedVideo.FromString(payload) for payload in original_payloads]
-    output_messages = [CompressedVideo.FromString(payload) for payload in output_payloads]
-    for original, repaired in zip(original_messages, output_messages, strict=True):
-        assert bytes(repaired.data).endswith(bytes(original.data))
-        assert len(repaired.data) == len(original.data) + 6
+    _assert_only_an_aud_was_prepended(original_payloads, output)
 
     # A keyframe every two frames IS a regular cadence. Before the transform
     # measured it, the doctor compared this stream against the encoder's
@@ -307,7 +245,7 @@ def test_doctor_still_reports_a_genuinely_irregular_passthrough_cadence(tmp_path
     against the stream's own cadence rather than against a configured value.
     """
     source = tmp_path / "irregular-gop.mcap"
-    _write_passthrough_video_source(
+    write_compressed_video_mcap(
         source,
         [
             (
@@ -337,7 +275,7 @@ def test_doctor_still_reports_a_genuinely_irregular_passthrough_cadence(tmp_path
 
 def test_transform_still_rejects_undelimited_video_starting_mid_gop(tmp_path: Path) -> None:
     source = tmp_path / "undelimited-mid-gop.mcap"
-    _write_passthrough_video_source(source, [("/cam", 1, NON_KEYFRAME_WITHOUT_AUD)])
+    write_compressed_video_mcap(source, [("/cam", 1, NON_KEYFRAME_WITHOUT_AUD)])
 
     with pytest.raises(SourceNotConforming, match="starts mid-GOP"):
         write_canonical_episode(source, tmp_path / "out.mcap")
@@ -345,7 +283,7 @@ def test_transform_still_rejects_undelimited_video_starting_mid_gop(tmp_path: Pa
 
 def test_transform_and_doctor_reject_multiple_pictures_without_auds(tmp_path: Path) -> None:
     source = tmp_path / "two-pictures-without-auds.mcap"
-    _write_passthrough_video_source(
+    write_compressed_video_mcap(
         source, [("/cam", 1, KEYFRAME_WITHOUT_AUD + NON_KEYFRAME_WITHOUT_AUD)]
     )
 
@@ -358,23 +296,7 @@ def test_transform_and_doctor_reject_multiple_pictures_without_auds(tmp_path: Pa
 
 def test_transform_inserts_missing_aud_into_ros2_video(tmp_path: Path) -> None:
     source = tmp_path / "ros2-missing-aud.mcap"
-    writer = Ros2Writer(str(source))
-    schema = writer.register_msgdef(
-        "foxglove_msgs/msg/CompressedVideo", ROS2_COMPRESSED_VIDEO_SCHEMA
-    )
-    writer.write_message(
-        "/cam",
-        schema,
-        SimpleNamespace(
-            timestamp=SimpleNamespace(sec=0, nanosec=1),
-            frame_id="cam",
-            data=KEYFRAME_WITHOUT_AUD,
-            format="h264",
-        ),
-        log_time=1,
-        publish_time=1,
-    )
-    writer.finish()
+    write_ros2_compressed_video_mcap(source, KEYFRAME_WITHOUT_AUD, log_time=1)
     output = tmp_path / "out.mcap"
 
     write_canonical_episode(source, output)
@@ -401,29 +323,17 @@ def test_transform_preserves_decoder_owned_video_messages(
 ) -> None:
     source = tmp_path / "decoder-owned-video.mcap"
     if encoding == "protobuf":
-        _write_passthrough_video_source(source, [("/cam", 1, data)])
+        write_compressed_video_mcap(source, [("/cam", 1, data)])
     else:
-        writer = Ros2Writer(str(source))
-        schema = writer.register_msgdef(
-            "foxglove_msgs/msg/CompressedVideo",
-            ROS2_COMPRESSED_VIDEO_SCHEMA.replace(
+        write_ros2_compressed_video_mcap(
+            source,
+            data,
+            log_time=1,
+            schema_text=ROS2_COMPRESSED_VIDEO_SCHEMA.replace(
                 "string frame_id", "string frame_id\nstring original"
             ),
+            original="source-recorder",
         )
-        writer.write_message(
-            "/cam",
-            schema,
-            SimpleNamespace(
-                timestamp=SimpleNamespace(sec=0, nanosec=1),
-                frame_id="cam",
-                original="source-recorder",
-                data=data,
-                format="h264",
-            ),
-            log_time=1,
-            publish_time=1,
-        )
-        writer.finish()
 
     resolve_decoder = transform._resolve_decoder
     decoder_owned_messages: list[Any] = []
@@ -967,7 +877,6 @@ def test_non_sync_stages_never_fetch_the_raw_source(tmp_path: Path) -> None:
     canonical episode and the sync-completion marker.
     """
     from hflow.storage import BucketStorageRoot
-    from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
     pytest.importorskip("obstore")
     remote_dir = tmp_path / "bucket"
@@ -994,7 +903,6 @@ def test_non_sync_stages_never_fetch_the_raw_source(tmp_path: Path) -> None:
 def test_missing_artifact_is_the_steps_error_not_the_runs(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
     episode_file = synthesize_episode(
         tmp_path / "e.mcap", SyntheticEpisodeSpec(cameras=(), black_segment=None, duration_s=2.0)
@@ -1031,7 +939,6 @@ def test_source_identity_is_stable_across_vantage_points(
     the runtime, ./data/landing/e.mcap on the host, and the bare key accepted
     by ingest are the same episode.
     """
-    from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
     data_root = tmp_path / "data"
     episode_file = synthesize_episode(
@@ -1085,7 +992,6 @@ def test_vanished_cwd_relative_source_keeps_its_persisted_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The root-key fallback must not rename a prior outside-root source."""
-    from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
     source = synthesize_episode(
         tmp_path / "external" / "e.mcap",

@@ -8,12 +8,11 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
 from mcap.data_stream import RecordBuilder
 from mcap.records import Statistics
 from mcap.writer import CompressionType, IndexType
 from mcap.writer import Writer as StockWriter
-from mcap_protobuf.schema import build_file_descriptor_set
+from mcap_test_helpers import write_compressed_video_mcap
 
 import hflow
 from hflow.checks import (
@@ -714,36 +713,23 @@ def test_keyframe_interval_preserves_measurements_with_one_scan_per_camera(
     aud = b"\x00\x00\x00\x01\x09\xf0"
     keyframe = aud + b"\x00\x00\x00\x01\x65\xb0"
     non_keyframe = aud + b"\x00\x00\x00\x01\x41\xc0"
-    with source.open("wb") as stream:
-        writer = StockWriter(stream)
-        writer.start(profile="", library="test")
-        schema_id = writer.register_schema(
-            name="foxglove.CompressedVideo",
-            encoding="protobuf",
-            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
-        )
-        for camera, keyframes in (("none", ()), ("single", (4,)), ("multiple", (0, 2, 3))):
-            channel_id = writer.register_channel(
-                topic=f"/{camera}/compressed", message_encoding="protobuf", schema_id=schema_id
+    keyframe_indexes_by_camera = {"none": (), "single": (4,), "multiple": (0, 2, 3)}
+    write_compressed_video_mcap(
+        source,
+        [
+            (
+                f"/{camera}/compressed",
+                timestamp_s * 1_000_000_000,
+                keyframe if index in keyframe_indexes else non_keyframe,
             )
-            for index, timestamp_s in enumerate((1, 2, 4, 7, 8)):
-                timestamp_ns = timestamp_s * 1_000_000_000
-                message = CompressedVideo(
-                    frame_id=camera,
-                    format="h264",
-                    data=keyframe if index in keyframes else non_keyframe,
-                )
-                message.timestamp.FromNanoseconds(timestamp_ns)
-                writer.add_message(
-                    channel_id,
-                    log_time=timestamp_ns,
-                    publish_time=timestamp_ns,
-                    data=message.SerializeToString(),
-                )
-        writer.register_channel(
-            topic="/empty/compressed", message_encoding="protobuf", schema_id=schema_id
-        )
-        writer.finish()
+            for camera, keyframe_indexes in keyframe_indexes_by_camera.items()
+            for index, timestamp_s in enumerate((1, 2, 4, 7, 8))
+        ],
+        frame_id_by_topic={
+            f"/{camera}/compressed": camera for camera in keyframe_indexes_by_camera
+        },
+        empty_topics=["/empty/compressed"],
+    )
 
     expected = {
         "/empty/compressed/scanned_frame_count": 0,

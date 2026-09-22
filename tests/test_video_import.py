@@ -13,9 +13,9 @@ import numpy as np
 import pytest
 from mcap.reader import make_reader
 from mcap_protobuf.decoder import DecoderFactory
+from media_test_helpers import render_lavfi, run_ffmpeg, run_ffprobe
 
 import hflow
-from hflow.ffmpeg import ffmpeg_path, ffprobe_path
 from hflow.format import GopPreset
 from hflow.importers.video import VideoImportConfig, import_video_episode
 from hflow.media import VideoLimits
@@ -24,20 +24,11 @@ from hflow.transform import TransformConfig, write_canonical_episode
 
 @pytest.fixture
 def source_video(tmp_path: Path) -> Path:
-    source_path = tmp_path / "source.mp4"
-    subprocess.run(
-        [
-            str(ffmpeg_path()),
-            "-v",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "color=red:size=160x90:rate=4:duration=1",
-            "-f",
-            "lavfi",
-            "-i",
-            "color=blue:size=160x90:rate=4:duration=1",
+    return render_lavfi(
+        tmp_path / "source.mp4",
+        "color=red:size=160x90:rate=4:duration=1",
+        "color=blue:size=160x90:rate=4:duration=1",
+        output_arguments=(
             "-filter_complex",
             "[0:v][1:v]concat=n=2:v=1:a=0",
             "-c:v",
@@ -46,12 +37,8 @@ def source_video(tmp_path: Path) -> Path:
             "yuv420p",
             "-movflags",
             "+faststart",
-            str(source_path),
-        ],
-        capture_output=True,
-        check=True,
+        ),
     )
-    return source_path
 
 
 def _bgr_frame_from_h264(access_unit: bytes, decoder: av.CodecContext) -> np.ndarray:
@@ -320,27 +307,22 @@ def test_window_preparation_preserves_requested_sampling_and_first_video_stream(
     from hflow.media import PreparedVideoWindow, VideoWindow, prepare_video_window
 
     multiple_streams = tmp_path / "multiple.mp4"
-    subprocess.run(
-        [
-            str(ffmpeg_path()),
-            "-v",
-            "error",
-            "-i",
-            str(source_video),
-            "-f",
-            "lavfi",
-            "-i",
-            "color=green:size=320x180:rate=4:duration=2",
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:v:0",
-            "-c:v",
-            "libx264",
-            str(multiple_streams),
-        ],
-        check=True,
-        capture_output=True,
+    run_ffmpeg(
+        "-v",
+        "error",
+        "-i",
+        str(source_video),
+        "-f",
+        "lavfi",
+        "-i",
+        "color=green:size=320x180:rate=4:duration=2",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:v:0",
+        "-c:v",
+        "libx264",
+        str(multiple_streams),
     )
     output = tmp_path / "window.mp4"
     prepared = prepare_video_window(multiple_streams, output, VideoWindow(0.5, 1.0, 4.0))
@@ -398,11 +380,7 @@ def test_tagged_video_duration_is_shared_by_probe_and_import(
     from hflow.importers.video import ImportedVideoEpisode, prepare_video_episode
 
     matroska = tmp_path / "source.mkv"
-    subprocess.run(
-        [str(ffmpeg_path()), "-v", "error", "-i", str(source_video), "-c", "copy", str(matroska)],
-        check=True,
-        capture_output=True,
-    )
+    run_ffmpeg("-v", "error", "-i", str(source_video), "-c", "copy", str(matroska))
     outcome = prepare_video_episode(
         matroska, tmp_path / "tagged.mcap", VideoImportConfig(duration_s=1, image_hz=4)
     )
@@ -481,20 +459,17 @@ def test_direct_model_video_matches_canonical_decoded_pixels(
             output=tmp_path / "reference.mp4",
         )
         fingerprints = [
-            subprocess.check_output(
-                [
-                    str(ffmpeg_path()),
-                    "-v",
-                    "error",
-                    "-i",
-                    str(video),
-                    "-map",
-                    "0:v:0",
-                    "-f",
-                    "framemd5",
-                    "-",
-                ],
-                timeout=30,
+            run_ffmpeg(
+                "-v",
+                "error",
+                "-i",
+                str(video),
+                "-map",
+                "0:v:0",
+                "-f",
+                "framemd5",
+                "-",
+                timeout_seconds=30,
             )
             for video in (reference_video, output)
         ]
@@ -550,24 +525,11 @@ def test_import_lands_h264_without_jpeg_and_canonical_passthrough_shrinks_ratio(
 
 @pytest.fixture
 def moving_video(tmp_path: Path) -> Path:
-    source = tmp_path / "moving.mkv"
-    subprocess.run(
-        [
-            str(ffmpeg_path()),
-            "-v",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=320x240:rate=10:duration=3",
-            "-c:v",
-            "ffv1",
-            str(source),
-        ],
-        check=True,
-        capture_output=True,
+    return render_lavfi(
+        tmp_path / "moving.mkv",
+        "testsrc2=size=320x240:rate=10:duration=3",
+        output_arguments=("-c:v", "ffv1"),
     )
-    return source
 
 
 def _video_payloads(path: Path) -> list[bytes]:
@@ -651,28 +613,23 @@ def test_custom_encoding_matches_independent_moving_video_reference(
     # Independent FFmpeg oracle: the fixture already has the requested rate,
     # dimensions and pixel format, so no importer filter/helper is involved.
     reference = tmp_path / "oracle.mp4"
-    subprocess.run(
-        [
-            str(ffmpeg_path()),
-            "-v",
-            "error",
-            "-i",
-            str(moving_video),
-            "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            str(settings.crf),
-            "-pix_fmt",
-            "yuv420p",
-            "-x264-params",
-            f"keyint={gop_frames}:min-keyint={gop_frames}:scenecut=0:bframes=0:repeat-headers=1:aud=1",
-            str(reference),
-        ],
-        check=True,
-        capture_output=True,
+    run_ffmpeg(
+        "-v",
+        "error",
+        "-i",
+        str(moving_video),
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        str(settings.crf),
+        "-pix_fmt",
+        "yuv420p",
+        "-x264-params",
+        f"keyint={gop_frames}:min-keyint={gop_frames}:scenecut=0:bframes=0:repeat-headers=1:aud=1",
+        str(reference),
     )
     expected = _decoded_yuv(reference)
     assert np.array_equal(_decoded_yuv(exported), expected)
@@ -728,19 +685,16 @@ def test_single_frame_packet_and_container_duration_is_one_second(
     assert prepare_model_video(source_video, direct, config) == direct
     for path in (exported, direct):
         probe = json.loads(
-            subprocess.check_output(
-                [
-                    str(ffprobe_path()),
-                    "-v",
-                    "error",
-                    "-show_packets",
-                    "-show_streams",
-                    "-show_format",
-                    "-of",
-                    "json",
-                    str(path),
-                ],
-                timeout=30,
+            run_ffprobe(
+                "-v",
+                "error",
+                "-show_packets",
+                "-show_streams",
+                "-show_format",
+                "-of",
+                "json",
+                str(path),
+                timeout_seconds=30,
             )
         )
         assert len(probe["packets"]) == 1

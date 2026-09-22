@@ -22,9 +22,9 @@ from hflow.checks import camera_frame_stats
 from hflow.ffmpeg import ffmpeg_path
 
 
-def _load_prepare_module() -> ModuleType:
-    module_path = Path(__file__).parents[1] / "examples" / "egocentric" / "prepare.py"
-    module_spec = importlib.util.spec_from_file_location("egocentric_prepare", module_path)
+def _load_egocentric_example_module(file_name: str, module_name: str) -> ModuleType:
+    module_path = Path(__file__).parents[1] / "examples" / "egocentric" / file_name
+    module_spec = importlib.util.spec_from_file_location(module_name, module_path)
     if module_spec is None or module_spec.loader is None:
         raise RuntimeError(f"could not load {module_path}")
     module = importlib.util.module_from_spec(module_spec)
@@ -33,21 +33,17 @@ def _load_prepare_module() -> ModuleType:
     return module
 
 
-PREPARE = _load_prepare_module()
+PREPARE = _load_egocentric_example_module("prepare.py", "egocentric_prepare")
+CONVERT = _load_egocentric_example_module("convert.py", "egocentric_convert")
 
 
-def _load_convert_module() -> ModuleType:
-    module_path = Path(__file__).parents[1] / "examples" / "egocentric" / "convert.py"
-    module_spec = importlib.util.spec_from_file_location("egocentric_convert", module_path)
-    if module_spec is None or module_spec.loader is None:
-        raise RuntimeError(f"could not load {module_path}")
-    module = importlib.util.module_from_spec(module_spec)
-    sys.modules[module_spec.name] = module
-    module_spec.loader.exec_module(module)
-    return module
-
-
-CONVERT = _load_convert_module()
+def _write_tar(tar_path: Path, members: Mapping[str, bytes]) -> None:
+    """Write ``members`` into a plain tar, in insertion order."""
+    with tarfile.open(tar_path, "w") as tar:
+        for member_name, member_bytes in members.items():
+            member_info = tarfile.TarInfo(member_name)
+            member_info.size = len(member_bytes)
+            tar.addfile(member_info, io.BytesIO(member_bytes))
 
 
 @pytest.fixture(scope="module")
@@ -207,19 +203,12 @@ def _write_shard_tar(
             "codec": "h265",
         }
     sidecar = json.dumps(sidecar_fields)
-    with tarfile.open(tar_path, "w") as tar:
-        video_info = tarfile.TarInfo(video_member)
-        video_info.size = len(video_bytes)
-        tar.addfile(video_info, io.BytesIO(video_bytes))
-        if include_sidecar:
-            sidecar_info = tarfile.TarInfo(sidecar_member)
-            sidecar_info.size = len(sidecar.encode())
-            tar.addfile(sidecar_info, io.BytesIO(sidecar.encode()))
-        if intrinsics_fields is not None:
-            intrinsics_bytes = json.dumps(intrinsics_fields).encode("utf-8")
-            intrinsics_info = tarfile.TarInfo("intrinsics.json")
-            intrinsics_info.size = len(intrinsics_bytes)
-            tar.addfile(intrinsics_info, io.BytesIO(intrinsics_bytes))
+    members = {video_member: video_bytes}
+    if include_sidecar:
+        members[sidecar_member] = sidecar.encode()
+    if intrinsics_fields is not None:
+        members["intrinsics.json"] = json.dumps(intrinsics_fields).encode("utf-8")
+    _write_tar(tar_path, members)
     return (
         video_member,
         hashlib.sha256(video_bytes).hexdigest(),
@@ -513,30 +502,19 @@ def test_convert_webdataset_tar_converts_clips_with_sidecars_and_intrinsics(
         ("factory010_worker002_00001", "factory_010", "worker_002", "tool_setup"),
     ]
 
-    with tarfile.open(tar_path, "w") as tar:
-        # Add intrinsics.json
-        intrinsics_info = tarfile.TarInfo("intrinsics.json")
-        intrinsics_info.size = len(intrinsics_json)
-        tar.addfile(intrinsics_info, io.BytesIO(intrinsics_json))
-
-        # Add clips and sidecars
-        for stem, factory_id, worker_id, task in clips:
-            video_info = tarfile.TarInfo(f"{stem}.mp4")
-            video_info.size = len(video_bytes)
-            tar.addfile(video_info, io.BytesIO(video_bytes))
-
-            sidecar_dict = {
-                "factory_id": factory_id,
-                "worker_id": worker_id,
-                "task": task,
-                "duration_sec": 24.0,
-                "fps": 10.0,
-                "codec": "h265",
-            }
-            sidecar_bytes = json.dumps(sidecar_dict).encode("utf-8")
-            sidecar_info = tarfile.TarInfo(f"{stem}.json")
-            sidecar_info.size = len(sidecar_bytes)
-            tar.addfile(sidecar_info, io.BytesIO(sidecar_bytes))
+    members = {"intrinsics.json": intrinsics_json}
+    for stem, factory_id, worker_id, task in clips:
+        members[f"{stem}.mp4"] = video_bytes
+        sidecar_dict = {
+            "factory_id": factory_id,
+            "worker_id": worker_id,
+            "task": task,
+            "duration_sec": 24.0,
+            "fps": 10.0,
+            "codec": "h265",
+        }
+        members[f"{stem}.json"] = json.dumps(sidecar_dict).encode("utf-8")
+    _write_tar(tar_path, members)
 
     results = CONVERT.convert_webdataset_tar(
         tar_path=tar_path,
@@ -575,12 +553,7 @@ def test_convert_webdataset_tar_missing_sidecar_fails(
     """Missing sidecar in WebDataset tar fails with descriptive error."""
     tar_path = tmp_path / "broken.tar"
     output_dir = tmp_path / "converted"
-    video_bytes = moving_hevc_video.read_bytes()
-
-    with tarfile.open(tar_path, "w") as tar:
-        video_info = tarfile.TarInfo("clip.mp4")
-        video_info.size = len(video_bytes)
-        tar.addfile(video_info, io.BytesIO(video_bytes))
+    _write_tar(tar_path, {"clip.mp4": moving_hevc_video.read_bytes()})
 
     with pytest.raises(
         RuntimeError, match=_exactly("missing sidecar for source video 'clip.mp4' in broken.tar")
@@ -605,15 +578,10 @@ def test_convert_webdataset_tar_preserves_distinct_operator(
         "codec": "h265",
     }
 
-    with tarfile.open(tar_path, "w") as tar:
-        video_info = tarfile.TarInfo("clip.mp4")
-        video_info.size = len(video_bytes)
-        tar.addfile(video_info, io.BytesIO(video_bytes))
-
-        sidecar_bytes = json.dumps(sidecar_dict).encode("utf-8")
-        sidecar_info = tarfile.TarInfo("clip.json")
-        sidecar_info.size = len(sidecar_bytes)
-        tar.addfile(sidecar_info, io.BytesIO(sidecar_bytes))
+    _write_tar(
+        tar_path,
+        {"clip.mp4": video_bytes, "clip.json": json.dumps(sidecar_dict).encode("utf-8")},
+    )
 
     results = CONVERT.convert_webdataset_tar(
         tar_path=tar_path,
@@ -636,21 +604,16 @@ def test_convert_webdataset_tar_staged_validation_leaves_no_partial_mcap(
     output_dir.mkdir(parents=True, exist_ok=True)
     video_bytes = moving_hevc_video.read_bytes()
 
-    with tarfile.open(tar_path, "w") as tar:
-        # First clip has valid sidecar
-        v1 = tarfile.TarInfo("clip1.mp4")
-        v1.size = len(video_bytes)
-        tar.addfile(v1, io.BytesIO(video_bytes))
-
-        s1_bytes = json.dumps({"factory_id": "f1", "worker_id": "w1"}).encode("utf-8")
-        s1 = tarfile.TarInfo("clip1.json")
-        s1.size = len(s1_bytes)
-        tar.addfile(s1, io.BytesIO(s1_bytes))
-
-        # Second clip is missing sidecar
-        v2 = tarfile.TarInfo("clip2.mp4")
-        v2.size = len(video_bytes)
-        tar.addfile(v2, io.BytesIO(video_bytes))
+    _write_tar(
+        tar_path,
+        {
+            # First clip has valid sidecar
+            "clip1.mp4": video_bytes,
+            "clip1.json": json.dumps({"factory_id": "f1", "worker_id": "w1"}).encode("utf-8"),
+            # Second clip is missing sidecar
+            "clip2.mp4": video_bytes,
+        },
+    )
 
     with pytest.raises(
         RuntimeError,
@@ -670,15 +633,13 @@ def test_convert_webdataset_tar_invalid_identity_fails(
     output_dir = tmp_path / "converted"
     video_bytes = moving_hevc_video.read_bytes()
 
-    with tarfile.open(tar_path, "w") as tar:
-        v1 = tarfile.TarInfo("clip1.mp4")
-        v1.size = len(video_bytes)
-        tar.addfile(v1, io.BytesIO(video_bytes))
-
-        s1_bytes = json.dumps({"factory_id": "f1", "worker_id": None}).encode("utf-8")
-        s1 = tarfile.TarInfo("clip1.json")
-        s1.size = len(s1_bytes)
-        tar.addfile(s1, io.BytesIO(s1_bytes))
+    _write_tar(
+        tar_path,
+        {
+            "clip1.mp4": video_bytes,
+            "clip1.json": json.dumps({"factory_id": "f1", "worker_id": None}).encode("utf-8"),
+        },
+    )
 
     with pytest.raises(
         RuntimeError,

@@ -10,9 +10,7 @@ from typing import Any
 
 import numpy as np
 import pytest
-from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
-from mcap.writer import Writer as StockWriter
-from mcap_protobuf.schema import build_file_descriptor_set
+from mcap_test_helpers import write_compressed_video_mcap
 
 import hflow
 from hflow._video_measurements import (
@@ -903,38 +901,23 @@ def test_camera_frame_stats_reports_frames_present_but_not_decoded(tmp_path: Pat
 
     source = tmp_path / "missing-picture.mcap"
     access_unit_delimiter_only = b"\x00\x00\x00\x01\x09\xf0"
-    with source.open("wb") as stream:
-        writer = StockWriter(stream)
-        writer.start(profile="", library="test")
-        schema_id = writer.register_schema(
-            name="foxglove.CompressedVideo",
-            encoding="protobuf",
-            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
-        )
-        topic = "/camera/compressed"
-        channel_id = writer.register_channel(
-            topic=topic, message_encoding="protobuf", schema_id=schema_id
-        )
-        start_time_ns = 1_000_000_000
-        for frame_index, access_unit in enumerate(access_units):
-            log_time_ns = start_time_ns + round(frame_index * 1_000_000_000 / 30)
-            message = CompressedVideo()
-            message.timestamp.FromNanoseconds(log_time_ns)
-            message.frame_id = "camera"
-            message.data = (
+    topic = "/camera/compressed"
+    start_time_ns = 1_000_000_000
+    write_compressed_video_mcap(
+        source,
+        [
+            (
+                topic,
+                start_time_ns + round(frame_index * 1_000_000_000 / 30),
                 access_unit_delimiter_only
                 if frame_index == len(access_units) - 1
-                else access_unit.data
+                else access_unit.data,
             )
-            message.format = "h264"
-            writer.add_message(
-                channel_id,
-                log_time=log_time_ns,
-                data=message.SerializeToString(),
-                publish_time=log_time_ns,
-                sequence=frame_index,
-            )
-        writer.finish()
+            for frame_index, access_unit in enumerate(access_units)
+        ],
+        frame_id_by_topic={topic: "camera"},
+        number_messages_per_topic=True,
+    )
 
     with hflow.Episode(source) as episode:
         result = asyncio.run(camera_frame_stats(episode))

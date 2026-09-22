@@ -2,40 +2,22 @@
 
 import logging
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
 from mcap.writer import Writer as StockWriter
 from mcap_protobuf.schema import build_file_descriptor_set
-from mcap_ros2.writer import Writer as Ros2Writer
+from mcap_test_helpers import (
+    KEYFRAME_ACCESS_UNIT,
+    NON_KEYFRAME_ACCESS_UNIT,
+    write_compressed_video_mcap,
+    write_ros2_compressed_video_mcap,
+)
 
 from hflow.cli import main as cli_main
 from hflow.doctor import DiagnosticLevel, diagnose
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import write_canonical_episode
-
-ROS2_COMPRESSED_VIDEO_SCHEMA = "\n".join(
-    [
-        "builtin_interfaces/Time timestamp",
-        "string frame_id",
-        "uint8[] data",
-        "string format",
-        "=" * 80,
-        "MSG: builtin_interfaces/Time",
-        "int32 sec",
-        "uint32 nanosec",
-    ]
-)
-ANNEX_B_START_CODE = b"\x00\x00\x00\x01"
-KEYFRAME_ACCESS_UNIT = b"".join(
-    ANNEX_B_START_CODE + bytes([nal_type]) + (b"\x80payload" if nal_type == 0x65 else b"payload")
-    for nal_type in (0x09, 0x67, 0x68, 0x65)
-)
-NON_KEYFRAME_ACCESS_UNIT = b"".join(
-    ANNEX_B_START_CODE + bytes([nal_type]) + (b"\x80payload" if nal_type == 0x41 else b"payload")
-    for nal_type in (0x09, 0x41)
-)
 
 
 @pytest.fixture(scope="module")
@@ -200,26 +182,7 @@ def test_unique_topics_do_not_report_multiple_channels(tmp_path: Path) -> None:
 
 def test_nonconforming_video_is_reported(tmp_path: Path) -> None:
     path = tmp_path / "bad_video.mcap"
-    with path.open("wb") as stream:
-        writer = StockWriter(stream)
-        writer.start(profile="", library="test")
-        schema_id = writer.register_schema(
-            name="foxglove.CompressedVideo",
-            encoding="protobuf",
-            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
-        )
-        channel_id = writer.register_channel(
-            topic="/cam", message_encoding="protobuf", schema_id=schema_id
-        )
-        message = CompressedVideo()
-        message.timestamp.FromNanoseconds(10**9)
-        message.frame_id = "cam"
-        message.data = b"\x00\x00\x00\x01\x41not-aud-delimited"
-        message.format = "h264"
-        writer.add_message(
-            channel_id, log_time=10**9, data=message.SerializeToString(), publish_time=10**9
-        )
-        writer.finish()
+    _write_video_message_mcap(path, b"\x00\x00\x00\x01\x41not-aud-delimited")
     report = diagnose(path)
     assert not report.conforming
     codes = {finding.code for finding in report.findings}
@@ -228,23 +191,7 @@ def test_nonconforming_video_is_reported(tmp_path: Path) -> None:
 
 def test_nonconforming_ros2_video_is_reported(tmp_path: Path) -> None:
     path = tmp_path / "bad_ros2_video.mcap"
-    writer = Ros2Writer(str(path))
-    schema = writer.register_msgdef(
-        "foxglove_msgs/msg/CompressedVideo", ROS2_COMPRESSED_VIDEO_SCHEMA
-    )
-    writer.write_message(
-        "/cam",
-        schema,
-        SimpleNamespace(
-            timestamp=SimpleNamespace(sec=1, nanosec=0),
-            frame_id="cam",
-            data=b"\x00\x00\x00\x01\x41not-aud-delimited",
-            format="h264",
-        ),
-        log_time=10**9,
-        publish_time=10**9,
-    )
-    writer.finish()
+    write_ros2_compressed_video_mcap(path, b"\x00\x00\x00\x01\x41not-aud-delimited", log_time=10**9)
 
     report = diagnose(path)
 
@@ -255,68 +202,32 @@ def test_nonconforming_ros2_video_is_reported(tmp_path: Path) -> None:
 
 def _write_video_message_mcap(path: Path, payload: bytes) -> None:
     """One ``foxglove.CompressedVideo`` message carrying ``payload`` on /cam."""
-    with path.open("wb") as stream:
-        writer = StockWriter(stream)
-        writer.start(profile="", library="test")
-        schema_id = writer.register_schema(
-            name="foxglove.CompressedVideo",
-            encoding="protobuf",
-            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
-        )
-        channel_id = writer.register_channel(
-            topic="/cam", message_encoding="protobuf", schema_id=schema_id
-        )
-        message = CompressedVideo()
-        message.timestamp.FromNanoseconds(10**9)
-        message.frame_id = "cam"
-        message.data = payload
-        message.format = "h264"
-        writer.add_message(
-            channel_id, log_time=10**9, data=message.SerializeToString(), publish_time=10**9
-        )
-        writer.finish()
+    write_compressed_video_mcap(path, [("/cam", 10**9, payload)])
 
 
 def _write_video_cadence_mcap(
     path: Path, *, keyframe_positions: set[int], message_count: int, gop_seconds: str = "1"
 ) -> None:
-    with path.open("wb") as stream:
-        writer = StockWriter(stream)
-        writer.start(profile="", library="test")
-        schema_id = writer.register_schema(
-            name="foxglove.CompressedVideo",
-            encoding="protobuf",
-            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
-        )
-        channel_id = writer.register_channel(
-            topic="/cam", message_encoding="protobuf", schema_id=schema_id
-        )
-        for message_index in range(message_count):
-            log_time = message_index * 33_333_333
-            message = CompressedVideo()
-            message.timestamp.FromNanoseconds(log_time)
-            message.frame_id = "cam"
-            message.data = (
+    write_compressed_video_mcap(
+        path,
+        [
+            (
+                "/cam",
+                message_index * 33_333_333,
                 KEYFRAME_ACCESS_UNIT
                 if message_index in keyframe_positions
-                else NON_KEYFRAME_ACCESS_UNIT
+                else NON_KEYFRAME_ACCESS_UNIT,
             )
-            message.format = "h264"
-            writer.add_message(
-                channel_id,
-                log_time=log_time,
-                data=message.SerializeToString(),
-                publish_time=log_time,
-            )
-        writer.add_metadata(
-            "provenance/v1",
-            {
+            for message_index in range(message_count)
+        ],
+        metadata={
+            "provenance/v1": {
                 "schema_version": "1",
                 "pipeline_version": "test",
                 "gop_seconds": gop_seconds,
-            },
-        )
-        writer.finish()
+            }
+        },
+    )
 
 
 def test_doctor_reports_passthrough_keyframes_off_stamped_fixed_gop_grid(
@@ -558,30 +469,55 @@ def test_cli_curate_bad_catalog_prints_one_line(
     assert "Traceback" not in captured.err
 
 
-def test_chunk_mixes_groups_with_map(tmp_path: Path) -> None:
-    path = tmp_path / "mixed.mcap"
+def _write_grouped_json_mcap(
+    path: Path,
+    *,
+    group_by_topic: dict[str, str],
+    messages: list[tuple[str, int, bytes]],
+    chunk_size: int | None = None,
+) -> None:
+    """JSON channels under a ``provenance/v1`` record mapping topics to groups.
+
+    ``messages`` is ``(topic, log_time_ns, data)`` in write order; channels
+    are registered in first-appearance order. An empty ``group_by_topic``
+    writes the provenance record with no group map at all.
+    """
     with path.open("wb") as stream:
-        writer = StockWriter(stream)
+        writer = (
+            StockWriter(stream)
+            if chunk_size is None
+            else StockWriter(stream, chunk_size=chunk_size)
+        )
         writer.start(profile="", library="test")
         writer.add_metadata(
             name="provenance/v1",
             data={
-                "group//joint_states": "state",
-                "group//lidar_points": "bulk",
+                **{f"group/{topic}": group for topic, group in group_by_topic.items()},
                 "schema_version": "1",
                 "pipeline_version": "1",
             },
         )
         schema_id = writer.register_schema(name="dummy", encoding="json", data=b"{}")
-        ch1 = writer.register_channel(
-            topic="/joint_states", message_encoding="json", schema_id=schema_id
-        )
-        ch2 = writer.register_channel(
-            topic="/lidar_points", message_encoding="json", schema_id=schema_id
-        )
-        writer.add_message(ch1, log_time=1000, data=b"{}", publish_time=1000)
-        writer.add_message(ch2, log_time=1000, data=b"{}", publish_time=1000)
+        channel_ids = {
+            topic: writer.register_channel(
+                topic=topic, message_encoding="json", schema_id=schema_id
+            )
+            for topic in dict.fromkeys(topic for topic, _log_time, _data in messages)
+        }
+        for topic, log_time, data in messages:
+            writer.add_message(
+                channel_ids[topic], log_time=log_time, data=data, publish_time=log_time
+            )
         writer.finish()
+
+
+def test_chunk_mixes_groups_with_map(tmp_path: Path) -> None:
+    path = tmp_path / "mixed.mcap"
+    _write_grouped_json_mcap(
+        path,
+        group_by_topic={"/joint_states": "state", "/lidar_points": "bulk"},
+        messages=[("/joint_states", 1000, b"{}"), ("/lidar_points", 1000, b"{}")],
+    )
 
     report = diagnose(path)
     codes = {finding.code for finding in report.findings}
@@ -590,23 +526,11 @@ def test_chunk_mixes_groups_with_map(tmp_path: Path) -> None:
 
 def test_chunk_no_mix_with_map(tmp_path: Path) -> None:
     path = tmp_path / "nomix.mcap"
-    with path.open("wb") as stream:
-        writer = StockWriter(stream)
-        writer.start(profile="", library="test")
-        writer.add_metadata(
-            name="provenance/v1",
-            data={
-                "group//joint_states": "state",
-                "schema_version": "1",
-                "pipeline_version": "1",
-            },
-        )
-        schema_id = writer.register_schema(name="dummy", encoding="json", data=b"{}")
-        ch1 = writer.register_channel(
-            topic="/joint_states", message_encoding="json", schema_id=schema_id
-        )
-        writer.add_message(ch1, log_time=1000, data=b"{}", publish_time=1000)
-        writer.finish()
+    _write_grouped_json_mcap(
+        path,
+        group_by_topic={"/joint_states": "state"},
+        messages=[("/joint_states", 1000, b"{}")],
+    )
 
     report = diagnose(path)
     codes = {finding.code for finding in report.findings}
@@ -657,25 +581,14 @@ def test_chunk_mix_without_map(tmp_path: Path) -> None:
 
 def test_group_chunks_out_of_order(tmp_path: Path) -> None:
     path = tmp_path / "descending.mcap"
-    with path.open("wb") as stream:
-        writer = StockWriter(stream, chunk_size=1)
-        writer.start(profile="", library="test")
-        writer.add_metadata(
-            name="provenance/v1",
-            data={
-                "group//alpha": "state",
-                "schema_version": "1",
-                "pipeline_version": "1",
-            },
-        )
-        schema_id = writer.register_schema(name="dummy", encoding="json", data=b"{}")
-        ch1 = writer.register_channel(topic="/alpha", message_encoding="json", schema_id=schema_id)
-
-        # chunk_size=1 puts every message in its own chunk, so the descending
-        # log times below are descending chunk start times.
-        writer.add_message(ch1, log_time=1000, data=b"{" + b"a" * 2000 + b"}", publish_time=1000)
-        writer.add_message(ch1, log_time=500, data=b"{}", publish_time=500)
-        writer.finish()
+    # chunk_size=1 puts every message in its own chunk, so the descending
+    # log times below are descending chunk start times.
+    _write_grouped_json_mcap(
+        path,
+        group_by_topic={"/alpha": "state"},
+        messages=[("/alpha", 1000, b"{" + b"a" * 2000 + b"}"), ("/alpha", 500, b"{}")],
+        chunk_size=1,
+    )
 
     report = diagnose(path)
     codes = {finding.code for finding in report.findings}
@@ -684,22 +597,12 @@ def test_group_chunks_out_of_order(tmp_path: Path) -> None:
 
 def test_group_chunks_ascending_is_clean(tmp_path: Path) -> None:
     path = tmp_path / "ascending.mcap"
-    with path.open("wb") as stream:
-        writer = StockWriter(stream, chunk_size=1)
-        writer.start(profile="", library="test")
-        writer.add_metadata(
-            name="provenance/v1",
-            data={
-                "group//alpha": "state",
-                "schema_version": "1",
-                "pipeline_version": "1",
-            },
-        )
-        schema_id = writer.register_schema(name="dummy", encoding="json", data=b"{}")
-        ch1 = writer.register_channel(topic="/alpha", message_encoding="json", schema_id=schema_id)
-        writer.add_message(ch1, log_time=500, data=b"x" * 2000, publish_time=500)
-        writer.add_message(ch1, log_time=1000, data=b"x" * 2000, publish_time=1000)
-        writer.finish()
+    _write_grouped_json_mcap(
+        path,
+        group_by_topic={"/alpha": "state"},
+        messages=[("/alpha", 500, b"x" * 2000), ("/alpha", 1000, b"x" * 2000)],
+        chunk_size=1,
+    )
 
     report = diagnose(path)
     codes = {finding.code for finding in report.findings}
@@ -708,29 +611,19 @@ def test_group_chunks_ascending_is_clean(tmp_path: Path) -> None:
 
 def test_group_chunks_interleaved_different_groups_is_clean(tmp_path: Path) -> None:
     path = tmp_path / "interleaved.mcap"
-    with path.open("wb") as stream:
-        writer = StockWriter(stream, chunk_size=1)
-        writer.start(profile="", library="test")
-        writer.add_metadata(
-            name="provenance/v1",
-            data={
-                "group//alpha": "state1",
-                "group//beta": "state2",
-                "schema_version": "1",
-                "pipeline_version": "1",
-            },
-        )
-        schema_id = writer.register_schema(name="dummy", encoding="json", data=b"{}")
-        ch1 = writer.register_channel(topic="/alpha", message_encoding="json", schema_id=schema_id)
-        ch2 = writer.register_channel(topic="/beta", message_encoding="json", schema_id=schema_id)
-
-        # alpha chunk 1: t=1000
-        writer.add_message(ch1, log_time=1000, data=b"x" * 2000, publish_time=1000)
-        # beta chunk 1: t=500
-        writer.add_message(ch2, log_time=500, data=b"x" * 2000, publish_time=500)
-        # alpha chunk 2: t=2000 (ascending for alpha)
-        writer.add_message(ch1, log_time=2000, data=b"x" * 2000, publish_time=2000)
-        writer.finish()
+    _write_grouped_json_mcap(
+        path,
+        group_by_topic={"/alpha": "state1", "/beta": "state2"},
+        messages=[
+            # alpha chunk 1: t=1000
+            ("/alpha", 1000, b"x" * 2000),
+            # beta chunk 1: t=500
+            ("/beta", 500, b"x" * 2000),
+            # alpha chunk 2: t=2000 (ascending for alpha)
+            ("/alpha", 2000, b"x" * 2000),
+        ],
+        chunk_size=1,
+    )
 
     report = diagnose(path)
     codes = {finding.code for finding in report.findings}
@@ -739,22 +632,12 @@ def test_group_chunks_interleaved_different_groups_is_clean(tmp_path: Path) -> N
 
 def test_descending_without_map_is_clean(tmp_path: Path) -> None:
     path = tmp_path / "descending_nomap.mcap"
-    with path.open("wb") as stream:
-        writer = StockWriter(stream, chunk_size=1)
-        writer.start(profile="", library="test")
-        writer.add_metadata(
-            name="provenance/v1",
-            data={
-                "schema_version": "1",
-                "pipeline_version": "1",
-            },
-        )
-        schema_id = writer.register_schema(name="dummy", encoding="json", data=b"{}")
-        ch1 = writer.register_channel(topic="/alpha", message_encoding="json", schema_id=schema_id)
-
-        writer.add_message(ch1, log_time=1000, data=b"x" * 2000, publish_time=1000)
-        writer.add_message(ch1, log_time=500, data=b"x" * 2000, publish_time=500)
-        writer.finish()
+    _write_grouped_json_mcap(
+        path,
+        group_by_topic={},
+        messages=[("/alpha", 1000, b"x" * 2000), ("/alpha", 500, b"x" * 2000)],
+        chunk_size=1,
+    )
 
     report = diagnose(path)
     codes = {finding.code for finding in report.findings}

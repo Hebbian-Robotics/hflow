@@ -44,6 +44,30 @@ def flip_chunk_payload_bytes(episode_path: Path, *, count: int = 4) -> None:
     episode_path.write_bytes(bytes(data))
 
 
+def write_payload_damaged_mcap(path: Path) -> None:
+    """Write a one-message MCAP, then damage its chunk payload in place.
+
+    The chunk is uncompressed because ``flip_chunk_payload_bytes`` can only
+    address a plaintext records region. The result is a structurally valid
+    file whose chunk CRC no longer matches its bytes.
+    """
+    from mcap.writer import CompressionType
+    from mcap.writer import Writer as StockWriter
+
+    with path.open("wb") as stream:
+        writer = StockWriter(stream, compression=CompressionType.NONE)
+        writer.start(profile="", library="test")
+        schema_id = writer.register_schema(
+            name="test.Pointer", encoding="ros2msg", data=b"int32 x\n"
+        )
+        channel_id = writer.register_channel(
+            topic="/pointer", message_encoding="ros2msg", schema_id=schema_id
+        )
+        writer.add_message(channel_id, log_time=10**9, data=b"\x01\x00\x00\x00", publish_time=10**9)
+        writer.finish()
+    flip_chunk_payload_bytes(path)
+
+
 def content_id_differs_from_delivery_receipt(episode_path: Path, receipt_content_id: str) -> bool:
     """True when the file on disk no longer matches the recorded content id."""
     return content_episode_id(episode_path) != receipt_content_id

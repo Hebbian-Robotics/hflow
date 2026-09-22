@@ -1,6 +1,5 @@
 """Tests for the H.264 elementary-stream pipeline (encode, split, remux)."""
 
-import subprocess
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -9,9 +8,9 @@ from typing import Any
 import pytest
 from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
 from mcap_protobuf.writer import Writer
+from media_test_helpers import probe_video_stream, render_lavfi, run_ffmpeg
 
 from hflow.episode import Episode
-from hflow.ffmpeg import ffmpeg_path, ffprobe_path
 from hflow.video import (
     AccessUnit,
     PictureCodingScan,
@@ -41,24 +40,10 @@ def _generate_test_frames(
     image_extension: str,
 ) -> list[bytes]:
     """Render testsrc2 frames (320x240, 12 fps) to individual image files."""
-    subprocess.run(
-        [
-            str(ffmpeg_path()),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=320x240:rate=12",
-            "-frames:v",
-            str(frame_count),
-            "-q:v",
-            "2",
-            str(output_directory / f"%03d.{image_extension}"),
-        ],
-        check=True,
-        capture_output=True,
+    render_lavfi(
+        output_directory / f"%03d.{image_extension}",
+        "testsrc2=size=320x240:rate=12",
+        output_arguments=("-frames:v", str(frame_count), "-q:v", "2"),
     )
     frame_paths = sorted(output_directory.glob(f"*.{image_extension}"))
     assert len(frame_paths) == frame_count
@@ -204,8 +189,7 @@ def test_episode_video_remuxes_batches_without_materializing_a_channel(
 @pytest.fixture(scope="module")
 def b_frame_stream(jpeg_frames: list[bytes]) -> bytes:
     """The same frames re-encoded with libx264 defaults (B-frames enabled)."""
-    command: list[str] = [
-        str(ffmpeg_path()),
+    return run_ffmpeg(
         "-hide_banner",
         "-loglevel",
         "error",
@@ -228,10 +212,8 @@ def b_frame_stream(jpeg_frames: list[bytes]) -> bytes:
         "-f",
         "h264",
         "-",
-    ]
-    completed = subprocess.run(command, input=b"".join(jpeg_frames), capture_output=True)
-    assert completed.returncode == 0, completed.stderr.decode()
-    return completed.stdout
+        stdin=b"".join(jpeg_frames),
+    )
 
 
 def _slice_header_rbsp(first_mb_in_slice: int, slice_type_code: int) -> bytes:
@@ -430,30 +412,9 @@ def test_png_input_codec_upholds_guarantees(tmp_path: Path) -> None:
 
 def _ffprobe_video_stream_fields(mp4_path: Path) -> dict[str, str]:
     """Read codec/profile/decoded-frame-count fields from the first video stream."""
-    ffprobe_binary = ffprobe_path()
-    completed = subprocess.run(
-        [
-            str(ffprobe_binary),
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-count_frames",
-            "-show_entries",
-            "stream=codec_name,profile,nb_read_frames",
-            "-of",
-            "default=noprint_wrappers=1",
-            str(mp4_path),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
+    return probe_video_stream(
+        mp4_path, "codec_name", "profile", "nb_read_frames", count_frames=True
     )
-    stream_fields: dict[str, str] = {}
-    for output_line in completed.stdout.splitlines():
-        field_name, _, field_value = output_line.partition("=")
-        stream_fields[field_name.strip()] = field_value.strip()
-    return stream_fields
 
 
 def test_unescape_ebsp_head_matches_full_unescape_for_the_prefix() -> None:
