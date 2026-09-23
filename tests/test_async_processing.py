@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from collections.abc import Awaitable
 from pathlib import Path
 
 import pytest
@@ -222,6 +223,35 @@ def test_failing_and_recancelled_hook_still_drains_and_propagates_cancellation()
         await asyncio.sleep(0)
         assert not work_task.done()
         hook_may_fail.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(work_task, timeout=10)
+        assert work_finished.is_set()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release_work.set()
+
+
+def test_hook_failing_before_returning_an_awaitable_still_drains() -> None:
+    release_work = threading.Event()
+    work_finished = threading.Event()
+
+    def blocked_work() -> None:
+        if not release_work.wait(timeout=10):
+            raise TimeoutError("test did not release blocking work")
+        work_finished.set()
+
+    def hook_failing_during_setup() -> Awaitable[None]:
+        release_work.set()
+        raise RuntimeError("hook setup failed before returning an awaitable")
+
+    async def scenario() -> None:
+        work_task = asyncio.create_task(
+            run_blocking_with_cancel_hook(hook_failing_during_setup, blocked_work)
+        )
+        await asyncio.sleep(0.05)
+        work_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(work_task, timeout=10)
         assert work_finished.is_set()

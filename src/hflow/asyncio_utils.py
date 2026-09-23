@@ -48,7 +48,13 @@ async def run_blocking_with_cancel_hook(
         return await asyncio.shield(operation_future)
     except asyncio.CancelledError:
         if cancel_hook is not None:
-            await _await_ignoring_cancellation(asyncio.ensure_future(cancel_hook()))
+
+            async def run_cancel_hook() -> None:
+                # Calling the hook inside the task keeps a synchronous failure
+                # before its awaitable exists from skipping the drain below.
+                await cancel_hook()
+
+            await _await_ignoring_cancellation(asyncio.ensure_future(run_cancel_hook()))
         await _await_ignoring_cancellation(operation_future)
         raise
 
