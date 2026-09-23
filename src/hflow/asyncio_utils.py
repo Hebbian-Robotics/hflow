@@ -143,13 +143,9 @@ class PrefetchedItems(Generic[_Item, _Prepared]):
                 released_directory = self._current.directory
                 self._current = None
                 await run_blocking(_remove_directory, released_directory)
-            # The item about to be returned plus ``lookahead`` more, so that
-            # preparation continues while the caller uses the returned item.
-            while len(self._pending) <= self._lookahead:
-                next_item = next(self._remaining_items, _NO_MORE_ITEMS)
-                if next_item is _NO_MORE_ITEMS:
-                    break
-                self._pending.append(self._start_preparation(cast(_Item, next_item)))
+            # Start the requested item only if lookahead has not already; this
+            # keeps at most max(lookahead, 1) preparations running at once.
+            self._start_preparations_until(max(self._lookahead, 1))
             if not self._pending:
                 raise StopAsyncIteration
             pending = self._pending[0]
@@ -158,9 +154,18 @@ class PrefetchedItems(Generic[_Item, _Prepared]):
             prepared_value = await asyncio.shield(pending.task)
             self._pending.popleft()
             self._current = PrefetchedItem(pending.item, prepared_value, pending.directory)
+            # Background preparation continues while the caller uses this item.
+            self._start_preparations_until(self._lookahead)
             return self._current
         finally:
             self._consumer_waiting = False
+
+    def _start_preparations_until(self, pending_limit: int) -> None:
+        while len(self._pending) < pending_limit:
+            next_item = next(self._remaining_items, _NO_MORE_ITEMS)
+            if next_item is _NO_MORE_ITEMS:
+                return
+            self._pending.append(self._start_preparation(cast(_Item, next_item)))
 
     def _start_preparation(self, item: _Item) -> _PendingPreparation[_Item, _Prepared]:
         directory = Path(tempfile.mkdtemp(dir=self._working_directory, prefix="prefetch-"))
@@ -225,9 +230,10 @@ def prefetch(
     ``prepare(item, directory)`` is blocking work, such as sampling frames or
     re-encoding a window, and runs through :func:`run_blocking` in a new empty
     directory under ``working_directory``. Items are yielded in input order.
-    While the caller uses one item, up to ``lookahead`` later items are
-    prepared concurrently, so at most ``lookahead + 1`` directories exist.
-    ``lookahead=0`` prepares each item only when requested.
+    While the caller uses one item, up to ``lookahead`` later items are prepared
+    or kept ready. At most ``max(lookahead, 1)`` preparations run at once and at
+    most ``lookahead + 1`` directories exist. ``lookahead=0`` prepares each item
+    only when requested.
 
     An item's directory is removed when the caller advances to the next item or
     closes the iterator. A preparation failure is raised when the caller

@@ -47,10 +47,12 @@ async with prefetch(
 
 - `prepare(item, directory)` is ordinary blocking code. It runs through
   `run_blocking` in a new, empty directory under `working_directory`.
-- Items arrive in input order, even though preparations run concurrently.
-- `lookahead` is how many later items may be prepared while you use the current
-  one. At most `lookahead + 1` directories exist at once. `lookahead=0` prepares
-  each item only when you ask for it, which is the plain loop.
+- Items arrive in input order, even when several preparations run at once.
+- `lookahead` is how many later items are prepared, or kept ready, while you use
+  the current one. At most `max(lookahead, 1)` preparations run at once and at
+  most `lookahead + 1` directories exist. The next preparation starts when an
+  item is handed to you. `lookahead=0` prepares each item only when you ask for
+  it, which is the plain loop.
 - An item's directory is removed when you advance to the next item or leave the
   `async with` block. Copy anything you need to keep.
 - A failed preparation raises when you reach that item. Earlier items are still
@@ -58,8 +60,9 @@ async with prefetch(
 
 Choose `lookahead` from how long a preparation takes relative to a request. If
 preparing a window takes about as long as scoring it, `1` keeps both busy.
-Raise it when preparation is slower than the endpoint or when the endpoint can
-serve several concurrent requests and you score more than one window at a time.
+Raise it when preparation is slower than the endpoint: more windows then prepare
+in parallel. Each running preparation uses its own CPU time and each held item
+its own directory, so size it to the machine.
 
 ## Stop outside readers before cleanup
 

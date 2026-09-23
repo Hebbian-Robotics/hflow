@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -187,3 +188,31 @@ def test_invalid_lookahead_is_rejected(tmp_path: Path, lookahead: object) -> Non
         prefetch(
             range(1), _write_marker, working_directory=tmp_path, lookahead=cast(Any, lookahead)
         )
+
+
+@pytest.mark.parametrize("lookahead", [0, 1, 3])
+def test_running_preparations_never_exceed_the_lookahead(tmp_path: Path, lookahead: int) -> None:
+    running_lock = threading.Lock()
+    running_count = 0
+    peak_running_count = 0
+
+    def slow_prepare(item: int, directory: Path) -> int:
+        nonlocal running_count, peak_running_count
+        with running_lock:
+            running_count += 1
+            peak_running_count = max(peak_running_count, running_count)
+        time.sleep(0.03)
+        with running_lock:
+            running_count -= 1
+        return item
+
+    async def scenario() -> None:
+        async with prefetch(
+            range(8), slow_prepare, working_directory=tmp_path, lookahead=lookahead
+        ) as prepared_items:
+            async for _prepared in prepared_items:
+                await asyncio.sleep(0.01)
+
+    asyncio.run(scenario())
+    # Reaching the bound shows the overlap; never exceeding it bounds CPU use.
+    assert peak_running_count == max(lookahead, 1)
