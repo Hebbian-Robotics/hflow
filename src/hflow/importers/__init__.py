@@ -6,6 +6,7 @@ from hflow.importers.video import (
     ImportedVideoEpisode,
     VideoImportConfig,
     import_video_episode,
+    prepare_model_frames,
     prepare_video_episode,
 )
 
@@ -14,6 +15,7 @@ __all__ = [
     "VideoImportConfig",
     "import_lerobot_dataset",
     "import_video_episode",
+    "prepare_model_frames",
     "prepare_video_episode",
     "verify_lerobot_import",
 ]

@@ -59,9 +59,12 @@ from hflow.media import (
 )
 
 __all__ = [
+    "IndependentVideoWindowMeasurements",
+    "MeasurementFailure",
     "VideoWindowMeasurements",
     "WindowMeasurementSelection",
     "measure_video_window",
+    "measure_video_window_independently",
 ]
 
 _MAXIMUM_DIAGNOSTIC_BYTES = 65536
@@ -107,6 +110,56 @@ class VideoWindowMeasurements:
     camera_shake: CameraShakeSummary | None
 
 
+@dataclass(frozen=True)
+class MeasurementFailure:
+    """A selected branch failed after the shared source decode began.
+
+    The exception type is retained for diagnosis without publishing raw process
+    diagnostics or any model or source content.
+    """
+
+    error_type: str
+
+
+@dataclass(frozen=True)
+class IndependentVideoWindowMeasurements:
+    """Branch outcomes from one decode; ``None`` means unselected."""
+
+    window: VideoWindow
+    decoded_frame_count: int | None
+    frame_statistics: VideoFrameStatistics | MeasurementFailure | None
+    blur: BlurSummary | MeasurementFailure | None
+    camera_shake: CameraShakeSummary | MeasurementFailure | None
+
+
+def measure_video_window_independently(
+    source: Path,
+    window: VideoWindow,
+    selection: WindowMeasurementSelection,
+    *,
+    limits: VideoLimits = VideoLimits(),
+    toolchain: VideoMeasurementToolchain | None = None,
+) -> IndependentVideoWindowMeasurements | UnreadableVideo | UnsupportedVideo:
+    """Keep usable branch measurements when another branch's calculation fails.
+
+    A source probe, FFmpeg decode, timeout, or filesystem failure remains shared
+    and raises or returns a shared media outcome. This API isolates failures in
+    the Python motion calculation and in parsing each branch's output.
+    """
+    result = _measure_video_window(
+        source, window, selection, limits=limits, toolchain=toolchain, isolate_failures=True
+    )
+    if isinstance(result, VideoWindowMeasurements):
+        return IndependentVideoWindowMeasurements(
+            result.window,
+            result.decoded_frame_count,
+            result.frame_statistics,
+            result.blur,
+            result.camera_shake,
+        )
+    return result
+
+
 def measure_video_window(
     source: Path,
     window: VideoWindow,
@@ -121,6 +174,27 @@ def measure_video_window(
     less than half its duration (at most 0.5 seconds), as ``prepare_video_window`` does.
     FFmpeg's default display-rotation handling applies, so frames are measured upright.
     """
+    result = _measure_video_window(
+        source, window, selection, limits=limits, toolchain=toolchain, isolate_failures=False
+    )
+    assert not isinstance(result, IndependentVideoWindowMeasurements)
+    return result
+
+
+def _measure_video_window(
+    source: Path,
+    window: VideoWindow,
+    selection: WindowMeasurementSelection,
+    *,
+    limits: VideoLimits,
+    toolchain: VideoMeasurementToolchain | None,
+    isolate_failures: bool,
+) -> (
+    VideoWindowMeasurements
+    | IndependentVideoWindowMeasurements
+    | UnreadableVideo
+    | UnsupportedVideo
+):
     resolved_toolchain = (
         toolchain if toolchain is not None else resolved_video_measurement_toolchain()
     )
@@ -193,24 +267,34 @@ def measure_video_window(
 
             watchdog = threading.Timer(limits.timeout_seconds, stop_after_timeout)
             watchdog.start()
-            camera_shake: CameraShakeSummary | None = None
+            camera_shake: CameraShakeSummary | MeasurementFailure | None = None
             luma_frame_count: int | None = None
             try:
                 if selection.camera_shake is not None:
                     assert decoding_process.stdout is not None
                     luma_frames = _Y4mLumaFrames(decoding_process.stdout)
-                    camera_shake = summarize_camera_shake(
-                        filter_camera_shake(
-                            iter_frame_motion(
-                                luma_frames,
-                                settings=CameraMotionStreamSettings(
-                                    frames_per_second=measured_window.frames_per_second
+                    try:
+                        camera_shake = summarize_camera_shake(
+                            filter_camera_shake(
+                                iter_frame_motion(
+                                    luma_frames,
+                                    settings=CameraMotionStreamSettings(
+                                        frames_per_second=measured_window.frames_per_second
+                                    ),
                                 ),
-                            ),
-                            settings=selection.camera_shake,
+                                settings=selection.camera_shake,
+                            )
                         )
-                    )
-                    luma_frame_count = luma_frames.frame_count
+                        luma_frame_count = luma_frames.frame_count
+                    except Exception as error:
+                        if not isolate_failures or isinstance(
+                            error, (OSError, MemoryError, TimeoutError)
+                        ):
+                            raise
+                        camera_shake = MeasurementFailure(type(error).__name__)
+                        # FFmpeg still has other output branches to finish. Drain
+                        # the pipe so their measurements can complete.
+                        decoding_process.stdout.read()
                 return_code = decoding_process.wait()
             except BaseException:
                 decoding_process.kill()
@@ -230,7 +314,7 @@ def measure_video_window(
             ):
                 return UnreadableVideo()
 
-        frame_statistics = None
+        frame_statistics: VideoFrameStatistics | MeasurementFailure | None = None
         if selection.frame_statistics is not None:
             try:
                 with statistics_path.open(encoding="utf-8") as statistics_lines:
@@ -240,33 +324,61 @@ def measure_video_window(
             except _NoInstrumentFramesError:
                 # A window that decodes no frames is unreadable, not a parse failure.
                 return UnreadableVideo()
-            frame_statistics = _attach_provenance(
-                aggregate,
-                FrameStatisticsProvenance(
-                    measurement_definition_version=FRAME_STATISTICS_DEFINITION_VERSION,
-                    ffmpeg_version=resolved_toolchain.ffmpeg_version,
-                    filter_graph=frame_statistics_filter_graph(selection.frame_statistics),
-                    settings=selection.frame_statistics,
-                ),
-            )
-        blur = _read_blur_summary(blur_path) if selection.blur else None
+            except Exception as error:
+                if not isolate_failures or isinstance(error, (OSError, MemoryError, TimeoutError)):
+                    raise
+                frame_statistics = MeasurementFailure(type(error).__name__)
+            else:
+                frame_statistics = _attach_provenance(
+                    aggregate,
+                    FrameStatisticsProvenance(
+                        measurement_definition_version=FRAME_STATISTICS_DEFINITION_VERSION,
+                        ffmpeg_version=resolved_toolchain.ffmpeg_version,
+                        filter_graph=frame_statistics_filter_graph(selection.frame_statistics),
+                        settings=selection.frame_statistics,
+                    ),
+                )
+        blur: BlurSummary | MeasurementFailure | None = None
+        if selection.blur:
+            try:
+                blur = _read_blur_summary(blur_path)
+            except Exception as error:
+                if not isolate_failures or isinstance(error, (OSError, MemoryError, TimeoutError)):
+                    raise
+                blur = MeasurementFailure(type(error).__name__)
 
     decoded_frame_counts = {
         count
         for count in (
-            frame_statistics.decoded_frame_count if frame_statistics is not None else None,
-            blur.frame_count if blur is not None else None,
+            frame_statistics.decoded_frame_count
+            if isinstance(frame_statistics, VideoFrameStatistics)
+            else None,
+            blur.frame_count if isinstance(blur, BlurSummary) else None,
             luma_frame_count,
         )
         if count is not None
     }
-    if len(decoded_frame_counts) != 1:
+    if len(decoded_frame_counts) > 1 or (not isolate_failures and not decoded_frame_counts):
         raise MediaToolError("window measurements observed different frame counts")
-    decoded_frame_count = decoded_frame_counts.pop()
-    if decoded_frame_count / measured_window.frames_per_second < min(
-        0.5, measured_window.duration_seconds * 0.5
+    decoded_frame_count = decoded_frame_counts.pop() if decoded_frame_counts else None
+    if (
+        decoded_frame_count is not None
+        and decoded_frame_count / measured_window.frames_per_second
+        < min(0.5, measured_window.duration_seconds * 0.5)
     ):
         return UnreadableVideo()
+    if isolate_failures:
+        return IndependentVideoWindowMeasurements(
+            window=measured_window,
+            decoded_frame_count=decoded_frame_count,
+            frame_statistics=frame_statistics,
+            blur=blur,
+            camera_shake=camera_shake,
+        )
+    assert decoded_frame_count is not None
+    assert not isinstance(frame_statistics, MeasurementFailure)
+    assert not isinstance(blur, MeasurementFailure)
+    assert not isinstance(camera_shake, MeasurementFailure)
     return VideoWindowMeasurements(
         window=measured_window,
         decoded_frame_count=decoded_frame_count,

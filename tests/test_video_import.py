@@ -680,6 +680,45 @@ def test_single_frame_packet_and_container_duration_is_one_second(
         assert _decoded_yuv(path).shape[0] == 1
 
 
+def test_model_frames_match_canonical_episode_at_selected_indices(
+    source_video: Path, tmp_path: Path
+) -> None:
+    from hflow.importers import prepare_model_frames
+
+    config = VideoImportConfig(duration_s=2, image_hz=4, image_width=160, image_height=90)
+    selected_indices = (0, 3, 7)
+    landing = import_video_episode(source_video, tmp_path / "landing.mcap", config)
+    canonical = tmp_path / "canonical.mcap"
+    write_canonical_episode(landing, canonical)
+    prepared = prepare_model_frames(source_video, tmp_path / "selected", config, selected_indices)
+    assert isinstance(prepared, tuple)
+    with hflow.Episode(canonical) as episode:
+        camera_topic = episode.cameras[0]
+        reference = episode.frames_at_indices(camera_topic, frame_indices=list(selected_indices))
+        assert [frame.read_bytes() for frame in prepared] == [
+            frame.path.read_bytes() for frame in reference
+        ]
+    assert [path.name for path in prepared] == [
+        "frame_000000.jpg",
+        "frame_000001.jpg",
+        "frame_000002.jpg",
+    ]
+    assert not tuple(tmp_path.glob(".model-frames-*"))
+
+
+def test_model_frame_preparation_rejects_invalid_indices_without_output(
+    source_video: Path, tmp_path: Path
+) -> None:
+    from hflow.importers import prepare_model_frames
+
+    config = VideoImportConfig(duration_s=2, image_hz=4)
+    output = tmp_path / "selected"
+    for indices in ((), (3, 3), (7, 1), (8,)):
+        with pytest.raises(ValueError, match="frame indices"):
+            prepare_model_frames(source_video, output, config, indices)
+        assert not output.exists()
+
+
 def test_encoded_byte_budget_is_exclusive_and_all_entrypoints_clean_up(
     moving_video: Path, tmp_path: Path
 ) -> None:

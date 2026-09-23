@@ -6,8 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from hflow.ffmpeg import MediaBinarySpec, verify_media_binary
-from hflow.ffmpeg._process import MediaToolError, media_input_was_rejected, run_media_command
+from hflow.ffmpeg import (
+    MediaBinarySpec,
+    MediaToolError,
+    media_input_was_rejected,
+    run_media_command,
+    verify_media_binary,
+)
 
 
 @pytest.mark.parametrize(

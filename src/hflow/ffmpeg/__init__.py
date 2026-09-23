@@ -16,6 +16,12 @@ from hflow.ffmpeg._binary import (
     ffprobe_version,
 )
 from hflow.ffmpeg._contact_sheet import ContactSheet, contact_sheet
+from hflow.ffmpeg._process import (
+    MediaCommandResult,
+    MediaToolError,
+    media_input_was_rejected,
+    run_media_command,
+)
 from hflow.ffmpeg._verification import (
     PINNED_LINUX_X86_64_FFMPEG,
     PINNED_LINUX_X86_64_FFPROBE,
@@ -33,11 +39,15 @@ __all__ = [
     "FfmpegNotFoundError",
     "FfprobeNotFoundError",
     "MediaBinarySpec",
+    "MediaCommandResult",
+    "MediaToolError",
     "VerifiedMediaBinary",
     "contact_sheet",
     "ffmpeg_path",
     "ffmpeg_version",
     "ffprobe_path",
     "ffprobe_version",
+    "media_input_was_rejected",
+    "run_media_command",
     "verify_media_binary",
 ]

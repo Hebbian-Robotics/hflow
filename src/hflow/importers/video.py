@@ -18,8 +18,7 @@ from hflow._field_guards import (
     require_positive_int,
 )
 from hflow._pinned_asset import sha256_hex_of_file
-from hflow.ffmpeg import ffmpeg_path, ffmpeg_version
-from hflow.ffmpeg._process import media_input_was_rejected, run_media_command
+from hflow.ffmpeg import ffmpeg_path, ffmpeg_version, media_input_was_rejected, run_media_command
 from hflow.format import (
     CANONICAL_VIDEO_SCHEMA_NAME,
     GOP_SECONDS,
@@ -525,3 +524,86 @@ def prepare_model_video(
         )
         os.link(staged_video, output)
     return output
+
+
+def prepare_model_frames(
+    source_video: Path,
+    output_directory: Path,
+    config: VideoImportConfig,
+    frame_indices: tuple[int, ...],
+    *,
+    limits: VideoLimits = VideoLimits(),
+    transform_config: TransformConfig = TransformConfig(),
+    jpeg_quality: int = 2,
+) -> tuple[Path, ...] | UnreadableVideo | UnsupportedVideo:
+    """Select JPEGs by index from the canonical model-video encoding.
+
+    Indices address the fixed-rate prepared video, not source codec frames.
+    The intermediate H.264 video remains task-local and is removed before return.
+    No output directory is published for an unreadable or unsupported source.
+    """
+    if (
+        not frame_indices
+        or any(
+            type(index) is not int or index < 0 or index >= config.frame_count
+            for index in frame_indices
+        )
+        or tuple(sorted(set(frame_indices))) != frame_indices
+    ):
+        raise ValueError("frame indices must be distinct, ordered, and within the excerpt")
+    if type(jpeg_quality) is not int or not 2 <= jpeg_quality <= 31:
+        raise ValueError("JPEG quality must be between 2 and 31")
+    if output_directory.exists() or output_directory.is_symlink():
+        raise FileExistsError(output_directory)
+    output_directory.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        dir=output_directory.parent, prefix=".model-frames-"
+    ) as temporary_directory:
+        work_directory = Path(temporary_directory)
+        prepared_video = prepare_model_video(
+            source_video,
+            work_directory / "model.mp4",
+            config,
+            limits=limits,
+            transform_config=transform_config,
+        )
+        if not isinstance(prepared_video, Path):
+            return prepared_video
+        frame_directory = work_directory / "frames"
+        frame_directory.mkdir()
+        selection_expression = "+".join(f"eq(n\\,{index})" for index in frame_indices)
+        command_result = run_media_command(
+            [
+                str(ffmpeg_path()),
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-n",
+                "-xerror",
+                "-protocol_whitelist",
+                "file",
+                "-i",
+                str(prepared_video),
+                "-vf",
+                f"select={selection_expression}",
+                "-fps_mode",
+                "vfr",
+                "-frames:v",
+                str(len(frame_indices)),
+                "-q:v",
+                str(jpeg_quality),
+                "-start_number",
+                "0",
+                str(frame_directory / "frame_%06d.jpg"),
+            ],
+            timeout_seconds=limits.timeout_seconds,
+            maximum_output_bytes=limits.maximum_probe_bytes,
+        )
+        if command_result.returncode != 0:
+            raise RuntimeError(f"Model frame extraction failed (exit {command_result.returncode})")
+        frame_names = tuple(f"frame_{index:06d}.jpg" for index in range(len(frame_indices)))
+        if not all((frame_directory / name).is_file() for name in frame_names):
+            raise RuntimeError("Model frame extraction omitted selected frames")
+        frame_directory.rename(output_directory)
+    return tuple(output_directory / name for name in frame_names)

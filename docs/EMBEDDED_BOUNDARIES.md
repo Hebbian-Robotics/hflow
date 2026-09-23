@@ -7,6 +7,14 @@ for processing with `App.process_many(record=False)`.
 
 ## Video preparation
 
+`hflow.importers.prepare_model_frames(source, output_directory, config,
+frame_indices, limits=..., transform_config=..., jpeg_quality=2)` selects ordered,
+distinct frame indices from the same H.264 model-video encoding used by
+`prepare_model_video`. Indices address the prepared fixed-rate excerpt, not source
+codec frames. It returns caller-owned JPEG paths, or the same unreadable and
+unsupported outcomes as model-video preparation. The intermediate video is
+removed, and failed preparations do not publish an output directory.
+
 `hflow.media.probe_video(path, limits=VideoLimits(...))` returns one of:
 
 - `VideoProperties`: positive dimensions, finite positive frame rate and duration.
@@ -41,6 +49,16 @@ modules use only the standard library. Public exports load lazily, so these
 imports and their package-level equivalents do not initialize pipeline, media,
 or model code. All modules ship in the single `hflow` distribution; its normal
 installation dependencies are unchanged.
+
+## Bounded media commands
+
+`hflow.ffmpeg.run_media_command` and `media_input_was_rejected` are public
+process-boundary utilities for callers with custom FFmpeg commands. The runner
+bounds combined output and elapsed time, reaps its process, and retains raw
+diagnostics only in a non-repr result field. The classifier recognizes known
+input decode errors; ambiguous and operational failures raise `MediaToolError`.
+Callers remain responsible for choosing a safe command and for cleaning any
+files that command writes.
 
 ## Logging ownership
 

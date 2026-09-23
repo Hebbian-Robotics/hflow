@@ -109,6 +109,14 @@ for original-frame evidence selection.
 
 ## Shared window measurements
 
+`measure_video_window_independently` uses the same single decode and selection,
+but returns an `IndependentVideoWindowMeasurements` with a typed
+`MeasurementFailure` for a branch whose Python motion calculation or output
+parsing fails. `None` still means the branch was not selected. Source probe,
+FFmpeg graph, timeout, and filesystem failures are shared and cannot yield
+independent measurements. The original `measure_video_window` keeps its strict
+all-or-nothing behavior.
+
 `hflow.window_measurements.measure_video_window(source, window, selection,
 limits=VideoLimits(), toolchain=None)` measures one `VideoWindow` of the original
 source with a single decode. FFmpeg seeks the source, applies the window's `fps`

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from hflow.blur import measure_video_blur
+from hflow.blur import BlurSummary, measure_video_blur
 from hflow.camera_motion import (
     CameraMotionStreamSettings,
     CameraShakeSettings,
@@ -21,13 +21,17 @@ from hflow.media import UnreadableVideo, VideoProperties, VideoWindow, probe_vid
 from hflow.video_statistics import (
     FrameStatisticsSettings,
     LumaRangePolicy,
+    VideoFrameStatistics,
     VideoMeasurementToolchain,
     measure_video_frame_statistics,
 )
 from hflow.window_measurements import (
+    IndependentVideoWindowMeasurements,
+    MeasurementFailure,
     VideoWindowMeasurements,
     WindowMeasurementSelection,
     measure_video_window,
+    measure_video_window_independently,
 )
 
 FRAMES_PER_SECOND = 16.0
@@ -158,6 +162,31 @@ def test_only_selected_measurements_are_computed(tmp_path: Path) -> None:
     assert (measurements.blur.frame_count, measurements.blur.scored_frame_count) == (48, 48)
     with pytest.raises(ValueError, match="at least one"):
         WindowMeasurementSelection()
+
+
+def test_independent_measurements_preserve_other_branches_after_motion_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hflow.window_measurements as window_measurements
+
+    source = write_moving_colour_source(tmp_path / "source.mp4", display_rotation_degrees=None)
+
+    def fail_motion_stream(*_arguments: object, **_settings: object) -> None:
+        raise RuntimeError("motion calculation failed")
+
+    monkeypatch.setattr(window_measurements, "iter_frame_motion", fail_motion_stream)
+    result = measure_video_window_independently(
+        source,
+        MEASURED_WINDOW,
+        WindowMeasurementSelection(
+            frame_statistics=FULL_RANGE_STATISTICS, blur=True, camera_shake=SHAKE_SETTINGS
+        ),
+    )
+    assert isinstance(result, IndependentVideoWindowMeasurements)
+    assert result.decoded_frame_count == 48
+    assert isinstance(result.frame_statistics, VideoFrameStatistics)
+    assert isinstance(result.blur, BlurSummary)
+    assert result.camera_shake == MeasurementFailure("RuntimeError")
 
 
 def test_windows_without_decodable_frames_are_unreadable(tmp_path: Path) -> None:
