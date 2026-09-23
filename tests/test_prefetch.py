@@ -279,38 +279,36 @@ def test_preparation_error_allows_consumer_to_recover_and_continue(tmp_path: Pat
     assert not tuple(tmp_path.iterdir())
 
 
-def test_prefetch_creates_uncreated_working_directory(tmp_path: Path) -> None:
-    uncreated_dir = tmp_path / "deep" / "nested" / "scratch"
-    assert not uncreated_dir.exists()
+def test_concurrent_aclose_during_failing_preparation_terminates_cleanly_without_index_error(
+    tmp_path: Path,
+) -> None:
+    preparation_started = threading.Event()
+    release_preparation = threading.Event()
 
-    async def scenario() -> int:
-        async with prefetch(
-            range(1), _write_marker, working_directory=uncreated_dir, lookahead=1
-        ) as prepared_items:
-            async for prepared in prepared_items:
-                return prepared.item
-        return -1
+    def failing_prepare(item: int, directory: Path) -> int:
+        preparation_started.set()
+        if not release_preparation.wait(timeout=10):
+            raise TimeoutError("preparation timed out")
+        raise RuntimeError("preparation failed intentionally")
 
-    assert asyncio.run(scenario()) == 0
-    assert uncreated_dir.is_dir()
-    assert not tuple(uncreated_dir.iterdir())
+    async def scenario() -> list[int]:
+        received: list[int] = []
+        items = prefetch(range(5), failing_prepare, working_directory=tmp_path, lookahead=1)
 
+        async def consumer() -> None:
+            async for item in items:
+                received.append(item.item)
 
-def test_synchronous_cancel_hook_runs_cleanly(tmp_path: Path) -> None:
-    hook_called = False
+        consumer_task = asyncio.create_task(consumer())
+        await asyncio.to_thread(preparation_started.wait, 10)
+        release_preparation.set()
+        await items.aclose()
+        await consumer_task
+        return received
 
-    def sync_stop() -> None:
-        nonlocal hook_called
-        hook_called = True
+    try:
+        assert asyncio.run(scenario()) == []
+    finally:
+        release_preparation.set()
 
-    async def scenario() -> None:
-        async with prefetch(
-            range(5), _write_marker, working_directory=tmp_path, lookahead=1, cancel_hook=sync_stop
-        ) as prepared_items:
-            async for prepared in prepared_items:
-                if prepared.item == 0:
-                    break
-
-    asyncio.run(scenario())
-    assert hook_called
     assert not tuple(tmp_path.iterdir())
