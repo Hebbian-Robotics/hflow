@@ -33,6 +33,12 @@ so episode files remain alive while that work uses them. Use it for blocking
 media decoding and file work. Use native async clients for HTTP/model requests
 so cancellation and `asyncio.timeout(...)` can interrupt waiting for I/O.
 
+If the blocking work waits on something outside its thread, such as a local
+model server reading the same files, use
+`run_blocking_with_cancel_hook(stop_server, operation, ...)`. On cancellation it
+runs the hook to completion before draining the thread, so the drain cannot wait
+on a reader that only the hook can stop.
+
 ## The model: evidence, not verdicts
 
 A check returns `hflow.CheckResult`: **measurements** (episode summaries), **observations** (timestamped repeated evidence), **intervals** (labeled time spans), and **tags**. Every field is recorded regardless of pass or fail. Thresholds are not baked into the corpus, because quality heuristics are known to *invert* on real defects (smoothness metrics have scored an early-gripper-release defect *better* than clean demos); stored evidence lets you re-decide with a query, while a stored verdict bakes in the wrong call.

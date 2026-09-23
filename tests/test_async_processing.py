@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 import hflow
-from hflow.asyncio_utils import run_blocking
+from hflow.asyncio_utils import run_blocking, run_blocking_with_cancel_hook
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
 
@@ -161,3 +161,72 @@ def test_loop_shutdown_finishes_media_before_episode_cleanup(tmp_path: Path) -> 
         if release_timer is not None:
             release_timer.join()
     assert lifecycle == ["media finished", "check finished"]
+
+
+def test_cancel_hook_stops_the_external_reader_before_draining_blocked_work() -> None:
+    # The blocking work waits on an external reader (think: a model server
+    # holding its input files). Only the hook can release it, so the drain must
+    # not start waiting until the hook has run.
+    reader_stopped = threading.Event()
+    lifecycle: list[str] = []
+
+    def wait_for_reader_shutdown() -> str:
+        if not reader_stopped.wait(timeout=10):
+            raise TimeoutError("cancel hook never stopped the reader")
+        lifecycle.append("blocking work finished")
+        return "unused"
+
+    async def stop_reader() -> None:
+        lifecycle.append("hook ran")
+        reader_stopped.set()
+
+    async def scenario() -> None:
+        work_task = asyncio.create_task(
+            run_blocking_with_cancel_hook(stop_reader, wait_for_reader_shutdown)
+        )
+        await asyncio.sleep(0.05)
+        work_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(work_task, timeout=10)
+        lifecycle.append("cancellation propagated")
+
+    asyncio.run(scenario())
+    assert lifecycle == ["hook ran", "blocking work finished", "cancellation propagated"]
+
+
+def test_failing_and_recancelled_hook_still_drains_and_propagates_cancellation() -> None:
+    release_work = threading.Event()
+    work_finished = threading.Event()
+
+    def blocked_work() -> None:
+        if not release_work.wait(timeout=10):
+            raise TimeoutError("test did not release blocking work")
+        work_finished.set()
+
+    async def scenario() -> None:
+        hook_started = asyncio.Event()
+        hook_may_fail = asyncio.Event()
+
+        async def failing_hook() -> None:
+            hook_started.set()
+            await hook_may_fail.wait()
+            release_work.set()
+            raise RuntimeError("reader shutdown failed")
+
+        work_task = asyncio.create_task(run_blocking_with_cancel_hook(failing_hook, blocked_work))
+        await asyncio.sleep(0.05)
+        work_task.cancel()
+        await asyncio.wait_for(hook_started.wait(), timeout=10)
+        # A second cancellation must neither interrupt the hook nor skip the drain.
+        work_task.cancel()
+        await asyncio.sleep(0)
+        assert not work_task.done()
+        hook_may_fail.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(work_task, timeout=10)
+        assert work_finished.is_set()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release_work.set()
