@@ -1,6 +1,7 @@
 """Explicit blocking work inside async pipelines, with lifetime-safe cancellation."""
 
 import asyncio
+import inspect
 import shutil
 import tempfile
 from collections import deque
@@ -33,7 +34,7 @@ async def run_blocking(
 
 
 async def run_blocking_with_cancel_hook(
-    cancel_hook: Callable[[], Awaitable[object]] | None,
+    cancel_hook: Callable[[], Awaitable[object] | object] | None,
     operation: Callable[_Parameters, _Result],
     *arguments: _Parameters.args,
     **keyword_arguments: _Parameters.kwargs,
@@ -61,11 +62,15 @@ async def run_blocking_with_cancel_hook(
         raise
 
 
-async def _run_cancel_hook_to_completion(cancel_hook: Callable[[], Awaitable[object]]) -> None:
+async def _run_cancel_hook_to_completion(
+    cancel_hook: Callable[[], Awaitable[object] | object],
+) -> None:
     async def invoke_cancel_hook() -> None:
         # Calling the hook inside the task keeps a synchronous failure before
         # its awaitable exists from skipping the caller's drain.
-        await cancel_hook()
+        result = cancel_hook()
+        if inspect.isawaitable(result):
+            await result
 
     await _await_ignoring_cancellation(asyncio.ensure_future(invoke_cancel_hook()))
 
@@ -109,13 +114,14 @@ class PrefetchedItems(Generic[_Item, _Prepared]):
         *,
         working_directory: Path,
         lookahead: int,
-        cancel_hook: Callable[[], Awaitable[object]] | None,
+        cancel_hook: Callable[[], Awaitable[object] | object] | None,
     ) -> None:
         if isinstance(lookahead, bool) or not isinstance(lookahead, int) or lookahead < 0:
             raise ValueError("lookahead must be a non-negative integer")
         self._remaining_items: Iterator[_Item] = iter(items)
         self._prepare = prepare
         self._working_directory = Path(working_directory)
+        self._working_directory.mkdir(parents=True, exist_ok=True)
         self._lookahead = lookahead
         self._cancel_hook = cancel_hook
         self._pending: deque[_PendingPreparation[_Item, _Prepared]] = deque()
@@ -143,6 +149,8 @@ class PrefetchedItems(Generic[_Item, _Prepared]):
                 released_directory = self._current.directory
                 self._current = None
                 await run_blocking(_remove_directory, released_directory)
+            if self._release_task is not None:
+                raise StopAsyncIteration
             # Start the requested item only if lookahead has not already; this
             # keeps at most max(lookahead, 1) preparations running at once.
             self._start_preparations_until(max(self._lookahead, 1))
@@ -151,7 +159,15 @@ class PrefetchedItems(Generic[_Item, _Prepared]):
             pending = self._pending[0]
             # Shielded: cancelling the caller must not cancel a preparation
             # whose thread may still write into its directory. aclose drains it.
-            prepared_value = await asyncio.shield(pending.task)
+            try:
+                prepared_value = await asyncio.shield(pending.task)
+            except BaseException:
+                if pending.task.done() and not pending.task.cancelled():
+                    self._pending.popleft()
+                    await run_blocking(_remove_directory, pending.directory)
+                raise
+            if self._release_task is not None:
+                raise StopAsyncIteration
             self._pending.popleft()
             self._current = PrefetchedItem(pending.item, prepared_value, pending.directory)
             # Background preparation continues while the caller uses this item.
@@ -161,6 +177,8 @@ class PrefetchedItems(Generic[_Item, _Prepared]):
             self._consumer_waiting = False
 
     def _start_preparations_until(self, pending_limit: int) -> None:
+        if self._release_task is not None:
+            return
         while len(self._pending) < pending_limit:
             next_item = next(self._remaining_items, _NO_MORE_ITEMS)
             if next_item is _NO_MORE_ITEMS:
@@ -223,7 +241,7 @@ def prefetch(
     *,
     working_directory: Path | str,
     lookahead: int = 1,
-    cancel_hook: Callable[[], Awaitable[object]] | None = None,
+    cancel_hook: Callable[[], Awaitable[object] | object] | None = None,
 ) -> PrefetchedItems[_Item, _Prepared]:
     """Prepare items ahead of their consumer, each in its own scratch directory.
 

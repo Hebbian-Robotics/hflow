@@ -216,3 +216,101 @@ def test_running_preparations_never_exceed_the_lookahead(tmp_path: Path, lookahe
     asyncio.run(scenario())
     # Reaching the bound shows the overlap; never exceeding it bounds CPU use.
     assert peak_running_count == max(lookahead, 1)
+
+
+def test_concurrent_aclose_during_anext_terminates_cleanly_without_index_error(
+    tmp_path: Path,
+) -> None:
+    preparation_started = threading.Event()
+    release_preparation = threading.Event()
+
+    def slow_prepare(item: int, directory: Path) -> int:
+        preparation_started.set()
+        if not release_preparation.wait(timeout=10):
+            raise TimeoutError("preparation timed out")
+        return item
+
+    async def scenario() -> list[int]:
+        received: list[int] = []
+        items = prefetch(range(5), slow_prepare, working_directory=tmp_path, lookahead=1)
+
+        async def consumer() -> None:
+            async for item in items:
+                received.append(item.item)
+
+        consumer_task = asyncio.create_task(consumer())
+        await asyncio.to_thread(preparation_started.wait, 10)
+        release_preparation.set()
+        await items.aclose()
+        await consumer_task
+        return received
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release_preparation.set()
+
+    assert not tuple(tmp_path.iterdir())
+
+
+def test_preparation_error_allows_consumer_to_recover_and_continue(tmp_path: Path) -> None:
+    def prepare(item: int, directory: Path) -> int:
+        if item == 1:
+            raise ValueError("item 1 is unreadable")
+        return item
+
+    async def scenario() -> list[int]:
+        received: list[int] = []
+        async with prefetch(
+            range(4), prepare, working_directory=tmp_path, lookahead=1
+        ) as prepared_items:
+            iterator = aiter(prepared_items)
+            while True:
+                try:
+                    prepared = await anext(iterator)
+                except StopAsyncIteration:
+                    break
+                except ValueError:
+                    continue
+                received.append(prepared.item)
+        return received
+
+    assert asyncio.run(scenario()) == [0, 2, 3]
+    assert not tuple(tmp_path.iterdir())
+
+
+def test_prefetch_creates_uncreated_working_directory(tmp_path: Path) -> None:
+    uncreated_dir = tmp_path / "deep" / "nested" / "scratch"
+    assert not uncreated_dir.exists()
+
+    async def scenario() -> int:
+        async with prefetch(
+            range(1), _write_marker, working_directory=uncreated_dir, lookahead=1
+        ) as prepared_items:
+            async for prepared in prepared_items:
+                return prepared.item
+        return -1
+
+    assert asyncio.run(scenario()) == 0
+    assert uncreated_dir.is_dir()
+    assert not tuple(uncreated_dir.iterdir())
+
+
+def test_synchronous_cancel_hook_runs_cleanly(tmp_path: Path) -> None:
+    hook_called = False
+
+    def sync_stop() -> None:
+        nonlocal hook_called
+        hook_called = True
+
+    async def scenario() -> None:
+        async with prefetch(
+            range(5), _write_marker, working_directory=tmp_path, lookahead=1, cancel_hook=sync_stop
+        ) as prepared_items:
+            async for prepared in prepared_items:
+                if prepared.item == 0:
+                    break
+
+    asyncio.run(scenario())
+    assert hook_called
+    assert not tuple(tmp_path.iterdir())
