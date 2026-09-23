@@ -39,6 +39,9 @@ from examples.build_ai_evaluation.evaluate import (
     app as evaluate_app,
 )
 from examples.build_ai_evaluation.pipeline import (
+    _argument_parser as pipeline_argument_parser,
+)
+from examples.build_ai_evaluation.pipeline import (
     _execution_from_environment,
     app,
 )
@@ -281,6 +284,15 @@ def test_build_ai_pipeline_defaults_to_hosted_and_can_select_openai_compatible_e
         endpoint="http://localhost:8000/v1",
         model="local-vision-model",
     )
+
+
+def test_build_ai_pipeline_requires_an_episode_with_meaningful_footage() -> None:
+    with pytest.raises(SystemExit):
+        pipeline_argument_parser().parse_args([])
+
+    arguments = pipeline_argument_parser().parse_args(["recording.mcap"])
+
+    assert arguments.episode == Path("recording.mcap")
 
 
 def test_summary_reports_prevalence_agreement_and_failures_without_counting_failures_negative() -> (
