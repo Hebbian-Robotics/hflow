@@ -188,9 +188,8 @@ Give an example its own workspace project when it has a substantial dependency
 stack, multiple entry points, or colocated tests that need dependencies the
 root suite should not install. Its `pyproject.toml` should set
 `tool.uv.package = false`, depend on the workspace copy of `hflow`, and declare
-its own development tools. Register the directory in the root workspace and in
-CI's `workspace-example-checks` matrix. Keep small examples that only use HFlow
-or one optional client in the root project.
+its own development tools. Register the directory in the root workspace. Keep
+small examples that only use HFlow or one optional client in the root project.
 
 ## Changing how episodes are processed
 
