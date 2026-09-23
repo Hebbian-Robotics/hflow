@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+from episode_test_helpers import synthesize_canonical_episode
 from mcap.data_stream import RecordBuilder
 from mcap.records import Statistics
 from mcap.writer import CompressionType, IndexType
@@ -35,7 +36,6 @@ from hflow.checks import (
     trajectory_segments,
 )
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
-from hflow.transform import TransformConfig, write_canonical_episode
 
 # A 0.2 s single-joint stream with no cameras or faults: enough for checks
 # whose contract does not depend on footage.
@@ -57,12 +57,10 @@ def test_no_two_builtin_checks_claim_the_same_measurement_key(tmp_path: Path) ->
     built-ins together is the documented path (examples/stress/synthetic.py), so
     their key namespaces must not overlap.
     """
-    source = synthesize_episode(
-        tmp_path / "episode.mcap",
+    canonical = synthesize_canonical_episode(
+        tmp_path,
         SyntheticEpisodeSpec(duration_s=3.0, cameras=("wrist_cam",), joint_jump_at_s=1.5),
     )
-    canonical = tmp_path / "episode.canonical.mcap"
-    write_canonical_episode(source, canonical, TransformConfig())
     with hflow.Episode(canonical) as episode:
         results_by_check = {
             "timestamp_regularity": asyncio.run(timestamp_regularity(episode)),
@@ -564,12 +562,10 @@ def test_content_digest_identifies_duplicate_content(tmp_path: Path) -> None:
 
 
 def test_camera_frame_stats_sees_the_injected_black_segment(tmp_path: Path) -> None:
-    source = synthesize_episode(
-        tmp_path / "episode.mcap",
+    canonical = synthesize_canonical_episode(
+        tmp_path,
         SyntheticEpisodeSpec(duration_s=4.0, cameras=("wrist_cam",), black_segment=(1.0, 2.0)),
     )
-    canonical = tmp_path / "episode.canonical.mcap"
-    write_canonical_episode(source, canonical, TransformConfig())
     with hflow.Episode(canonical) as episode:
         camera_topic = episode.cameras[0]
         result = asyncio.run(camera_frame_stats(episode))
@@ -650,12 +646,10 @@ def test_keyframe_interval_reports_the_encoders_gop(tmp_path: Path) -> None:
     """The canonical encoder writes a keyframe every gop_seconds, so the
     measured cadence is the writer's own contract read back off the stream.
     """
-    source = synthesize_episode(
-        tmp_path / "episode.mcap",
+    canonical = synthesize_canonical_episode(
+        tmp_path,
         SyntheticEpisodeSpec(duration_s=4.0, cameras=("wrist_cam",), black_segment=None),
     )
-    canonical = tmp_path / "episode.canonical.mcap"
-    write_canonical_episode(source, canonical, TransformConfig())
     with hflow.Episode(canonical) as episode:
         camera_topic = episode.cameras[0]
         result = asyncio.run(keyframe_interval(episode))
@@ -878,12 +872,10 @@ def test_action_integrity_reports_a_clean_stream_as_clean(moving_joints_episode:
 
 
 def test_camera_signal_quality_measures_range_exposure_and_stillness(tmp_path: Path) -> None:
-    source = synthesize_episode(
-        tmp_path / "episode.mcap",
+    canonical = synthesize_canonical_episode(
+        tmp_path,
         SyntheticEpisodeSpec(duration_s=3.0, cameras=("wrist_cam",), black_segment=None),
     )
-    canonical = tmp_path / "episode.canonical.mcap"
-    write_canonical_episode(source, canonical, TransformConfig())
     with hflow.Episode(canonical) as episode:
         camera_topic = episode.cameras[0]
         result = asyncio.run(camera_signal_quality(episode))
@@ -920,12 +912,10 @@ def test_camera_signal_quality_sees_a_blacked_out_segment(tmp_path: Path) -> Non
     synthetic instrument text in tests/test_ffmpeg.py; what must hold on any
     build is the threshold-based evidence and the ordering between signals.
     """
-    source = synthesize_episode(
-        tmp_path / "episode.mcap",
+    canonical = synthesize_canonical_episode(
+        tmp_path,
         SyntheticEpisodeSpec(duration_s=4.0, cameras=("wrist_cam",), black_segment=(1.0, 3.0)),
     )
-    canonical = tmp_path / "episode.canonical.mcap"
-    write_canonical_episode(source, canonical, TransformConfig())
     with hflow.Episode(canonical) as episode:
         camera_topic = episode.cameras[0]
         result = asyncio.run(camera_signal_quality(episode))
@@ -954,12 +944,10 @@ def test_registering_both_camera_checks_caches_the_instrument(tmp_path: Path) ->
     MP4 remux cache lives, and the second check reads it without invoking
     ffmpeg again.
     """
-    source = synthesize_episode(
-        tmp_path / "episode.mcap",
+    canonical = synthesize_canonical_episode(
+        tmp_path,
         SyntheticEpisodeSpec(duration_s=2.0, cameras=("wrist_cam",)),
     )
-    canonical = tmp_path / "episode.canonical.mcap"
-    write_canonical_episode(source, canonical, TransformConfig())
     workdir = tmp_path / "workdir"
 
     with hflow.Episode(canonical, workdir=workdir) as episode:

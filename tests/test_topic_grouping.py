@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 import pytest
+from episode_test_helpers import synthesize_canonical_episode
 from mcap.writer import Writer as StockWriter
 
 import hflow
@@ -98,14 +99,13 @@ def test_an_explicit_override_still_wins(tmp_path: Path) -> None:
 def test_a_manipulation_recording_is_laid_out_exactly_as_before(tmp_path: Path) -> None:
     """Cameras plus proprio: the shape the old default already got right, so
     nothing about it changes except that it now says so in provenance."""
-    from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
+    from hflow.testing import SyntheticEpisodeSpec
 
-    source = synthesize_episode(
-        tmp_path / "manipulation.mcap",
+    canonical = synthesize_canonical_episode(
+        tmp_path,
         SyntheticEpisodeSpec(duration_s=1.0, cameras=("wrist_cam",), black_segment=None),
+        stem="manipulation",
     )
-    canonical = tmp_path / "manipulation.canonical.mcap"
-    write_canonical_episode(source, canonical, TransformConfig())
 
     groups = _topic_groups(canonical)
     assert DEFAULT_BULK_GROUP not in groups.values()

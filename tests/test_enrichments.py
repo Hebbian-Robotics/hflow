@@ -8,12 +8,12 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from episode_test_helpers import synthesize_canonical_episode
 
 import hflow
 from hflow.app import MEDIA_CONTACT_SHEET_STEP_NAME
 from hflow.curation import open_catalog_connection
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
-from hflow.transform import write_canonical_episode
 
 FAST_SPEC = SyntheticEpisodeSpec(duration_s=2.0, cameras=())
 
@@ -297,12 +297,9 @@ def test_the_egocentric_example_renders_a_sheet_on_a_multi_camera_episode(
     chdir keeps its artifacts inside tmp_path.
     """
     monkeypatch.chdir(tmp_path)
-    raw = synthesize_episode(
-        tmp_path / "raw.mcap",
-        SyntheticEpisodeSpec(duration_s=2.0, cameras=("wrist_cam", "top_cam")),
+    canonical = synthesize_canonical_episode(
+        tmp_path, SyntheticEpisodeSpec(duration_s=2.0, cameras=("wrist_cam", "top_cam"))
     )
-    canonical = tmp_path / "canonical.mcap"
-    write_canonical_episode(raw, canonical)
 
     pipeline_application = hflow.import_pipeline_application(f"{_EGOCENTRIC_PIPELINE}:pipeline")
     report = asyncio.run(pipeline_application.test(canonical, verbose=False))

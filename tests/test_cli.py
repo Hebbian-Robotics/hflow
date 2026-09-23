@@ -4,12 +4,12 @@ import sys
 from pathlib import Path
 
 import pytest
+from episode_test_helpers import synthesize_canonical_episode
 from pytest import CaptureFixture
 
 from hflow import __version__
 from hflow.cli import _build_parser, main
-from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
-from hflow.transform import write_canonical_episode
+from hflow.testing import SyntheticEpisodeSpec
 
 
 @pytest.mark.parametrize(
@@ -147,11 +147,9 @@ def test_the_module_form_matches_the_console_script(args: list[str]) -> None:
 
 def test_the_module_form_reports_a_conforming_file(tmp_path: Path) -> None:
     """The exit-0 path, over a real episode rather than --help."""
-    source = synthesize_episode(
-        tmp_path / "source.mcap", SyntheticEpisodeSpec(duration_s=1.0, cameras=())
+    canonical = synthesize_canonical_episode(
+        tmp_path, SyntheticEpisodeSpec(duration_s=1.0, cameras=())
     )
-    canonical = tmp_path / "canonical.mcap"
-    write_canonical_episode(source, canonical)
 
     module = _run_module("doctor", str(canonical))
     script = _run_script("doctor", str(canonical))

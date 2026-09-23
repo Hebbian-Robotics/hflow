@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 
 import pytest
+from episode_test_helpers import synthesize_canonical_episode
 from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
 from mcap.writer import Writer as StockWriter
 from mcap_protobuf.schema import build_file_descriptor_set
@@ -17,16 +18,13 @@ from mcap_test_helpers import (
 from hflow.cli import main as cli_main
 from hflow.doctor import DiagnosticLevel, diagnose
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
-from hflow.transform import write_canonical_episode
 
 
 @pytest.fixture(scope="module")
 def canonical_episode(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    root = tmp_path_factory.mktemp("doctor")
-    source = synthesize_episode(root / "source.mcap", SyntheticEpisodeSpec(duration_s=4.0))
-    output = root / "episode.canonical.mcap"
-    write_canonical_episode(source, output)
-    return output
+    return synthesize_canonical_episode(
+        tmp_path_factory.mktemp("doctor"), SyntheticEpisodeSpec(duration_s=4.0)
+    )
 
 
 def test_transform_output_is_conforming(canonical_episode: Path) -> None:

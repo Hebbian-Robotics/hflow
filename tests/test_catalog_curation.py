@@ -16,6 +16,7 @@ from catalog_test_helpers import (
     recorded_at_values,
     write_fake_canonical,
 )
+from episode_test_helpers import synthesize_canonical_episode
 
 import hflow
 from hflow.catalog import (
@@ -353,9 +354,7 @@ def test_episode_time_bounds_are_recorded_as_the_episode_axis(tmp_path: Path) ->
     """A synthesized episode's first and last message stamps land as
     ``start_ns``/``end_ns``; the bounds describe the canonical bytes the
     episode id already hashes, so they never enter the run fingerprint."""
-    raw = synthesize_episode(tmp_path / "raw.mcap", SyntheticEpisodeSpec(duration_s=2.0))
-    canonical = tmp_path / "episode.canonical.mcap"
-    hflow.write_canonical_episode(raw, canonical)
+    canonical = synthesize_canonical_episode(tmp_path, SyntheticEpisodeSpec(duration_s=2.0))
     with hflow.Episode(canonical) as episode:
         time_bounds = episode.time_bounds
         assert time_bounds is not None

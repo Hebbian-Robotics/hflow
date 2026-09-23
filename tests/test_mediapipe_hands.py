@@ -20,6 +20,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from episode_test_helpers import synthesize_canonical_episode
 
 import hflow
 from hflow.mediapipe_hands import (
@@ -33,8 +34,7 @@ from hflow.mediapipe_hands import (
     mediapipe_hand_detection,
     summarize_hand_detections,
 )
-from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
-from hflow.transform import TransformConfig, write_canonical_episode
+from hflow.testing import SyntheticEpisodeSpec
 
 MEDIAPIPE_TESTS_ENABLED = os.environ.get("HFLOW_MEDIAPIPE_TESTS") == "1"
 
@@ -211,11 +211,9 @@ class TestRegistrationWithoutTheModel:
         frames inside one millisecond cannot be distinguished. Refused up
         front rather than producing silently misordered inference.
         """
-        source = synthesize_episode(
-            tmp_path / "episode.mcap", SyntheticEpisodeSpec(duration_s=1.0, cameras=("wrist_cam",))
+        canonical = synthesize_canonical_episode(
+            tmp_path, SyntheticEpisodeSpec(duration_s=1.0, cameras=("wrist_cam",))
         )
-        canonical = tmp_path / "episode.canonical.mcap"
-        write_canonical_episode(source, canonical, TransformConfig())
         with hflow.Episode(canonical) as episode, pytest.raises(ValueError, match="sample_fps"):
             asyncio.run(mediapipe_hand_detection(episode, sample_fps=5000.0))
 
@@ -223,14 +221,10 @@ class TestRegistrationWithoutTheModel:
 @pytest.fixture(scope="module")
 def hands_episode_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """A canonical episode with one camera, built once for the whole module."""
-    directory = tmp_path_factory.mktemp("hands")
-    source = synthesize_episode(
-        directory / "episode.mcap",
+    return synthesize_canonical_episode(
+        tmp_path_factory.mktemp("hands"),
         SyntheticEpisodeSpec(duration_s=3.0, cameras=("wrist_cam",)),
     )
-    canonical = directory / "episode.canonical.mcap"
-    write_canonical_episode(source, canonical, TransformConfig())
-    return canonical
 
 
 @pytest.mark.skipif(
