@@ -15,6 +15,7 @@ from packaging_test_helpers import (
     build_example_overlay,
     example_record_path,
     record_values_for_file,
+    requires_native_overlay_build,
     write_example_distribution,
     write_record,
 )
@@ -33,6 +34,8 @@ from hflow.packaging import (
     load_cython_overlay_manifest,
     verify_cython_overlay,
 )
+
+pytestmark = requires_native_overlay_build
 
 
 def _read_record(record_path: Path) -> dict[str, tuple[str, str]]:

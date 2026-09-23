@@ -14,14 +14,27 @@ import tempfile
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 from hflow.packaging import (
     INSTALLED_CYTHON_OVERLAY_MANIFEST_FILE_NAME,
     CythonOverlayBuildConfig,
     CythonOverlayManifest,
     build_cython_overlay,
+    current_native_build_target,
 )
 
 WORKER_MODULE_NAME = "sample_native_package.worker"
+
+_NATIVE_BUILD_TARGET = current_native_build_target()
+
+# build_cython_overlay refuses every target but CPython on Linux, so a test
+# that compiles an overlay cannot run anywhere else.
+requires_native_overlay_build = pytest.mark.skipif(
+    _NATIVE_BUILD_TARGET.python_implementation != "cpython"
+    or _NATIVE_BUILD_TARGET.operating_system != "linux",
+    reason="native overlay builds currently require CPython on Linux",
+)
 
 
 def write_example_distribution(

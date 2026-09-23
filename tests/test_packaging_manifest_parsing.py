@@ -11,6 +11,7 @@ from packaging_test_helpers import (
     build_example_overlay,
     example_record_path,
     read_manifest_payload,
+    requires_native_overlay_build,
     write_example_distribution,
     write_manifest_bytes,
     write_manifest_payload,
@@ -28,6 +29,8 @@ from hflow.packaging import (
     apply_cython_overlay,
     verify_cython_overlay,
 )
+
+pytestmark = requires_native_overlay_build
 
 
 def _build_overlay(tmp_path: Path) -> tuple[Path, Path, CythonOverlayManifest, bytes, bytes]:
