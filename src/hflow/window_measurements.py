@@ -294,7 +294,8 @@ def _measure_video_window(
                         camera_shake = MeasurementFailure(type(error).__name__)
                         # FFmpeg still has other output branches to finish. Drain
                         # the pipe so their measurements can complete.
-                        decoding_process.stdout.read()
+                        while decoding_process.stdout.read(65536):
+                            pass
                 return_code = decoding_process.wait()
             except BaseException:
                 decoding_process.kill()
