@@ -1,4 +1,4 @@
-"""Airflow REST API v2 client (stdlib-only; the SDK stays dependency-light).
+"""Airflow REST API v2 client.
 
 Facts this encodes (references/airflow3-notes.md):
 
@@ -13,15 +13,14 @@ Facts this encodes (references/airflow3-notes.md):
   (but nullable) ``logical_date``.
 """
 
-import http.client
 import json
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
+
+import httpx2
 
 from hflow.uri import parse_data_root_relative_uri
 
@@ -198,6 +197,16 @@ class AirflowClient:
         self._auth = auth
         self._request_timeout_s = request_timeout_s
         self._token: str | None = None
+        self._client = httpx2.Client()
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> "AirflowClient":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
 
     def _http_json(
         self,
@@ -208,33 +217,44 @@ class AirflowClient:
         bearer_token: str | None = None,
     ) -> dict[str, Any]:
         body = json.dumps(payload).encode() if payload is not None else None
-        request = urllib.request.Request(url, data=body, method=method)
-        request.add_header("Content-Type", "application/json")
-        request.add_header("Accept", "application/json")
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
         if bearer_token is not None:
-            request.add_header("Authorization", f"Bearer {bearer_token}")
+            headers["Authorization"] = f"Bearer {bearer_token}"
         try:
-            with urllib.request.urlopen(request, timeout=self._request_timeout_s) as response:
-                response_body = response.read()
-        except urllib.error.HTTPError as error:
-            error_body = error.read().decode(errors="replace")
+            response = self._client.request(
+                method,
+                url,
+                content=body,
+                headers=headers,
+                timeout=self._request_timeout_s,
+                follow_redirects=method in {"GET", "HEAD"},
+            )
+            response_body = response.content
+        except httpx2.RequestError as error:
+            raise AirflowClientError(f"{method} {url} unreachable: {error}") from error
+        if response.status_code >= 400 or (
+            method in {"POST", "PATCH"} and 300 <= response.status_code < 400
+        ):
+            error_body = response_body.decode(errors="replace")
             # Airflow puts the useful part ("detail") in the body; surface a
             # truncated copy so failures are diagnosable from the message.
             body_excerpt = _body_excerpt(error_body)
+            if method in {"POST", "PATCH"} and 300 <= response.status_code < 400:
+                location = response.headers.get("Location")
+                if location:
+                    body_excerpt = _body_excerpt(
+                        f"redirect location: {_body_excerpt(location)}"
+                        + (f"; {body_excerpt}" if body_excerpt else "")
+                    )
             raise AirflowClientError(
-                f"{method} {url} failed with HTTP {error.code}"
+                f"{method} {url} failed with HTTP {response.status_code}"
                 + (f": {body_excerpt}" if body_excerpt else ""),
-                status=error.code,
+                status=response.status_code,
                 body=error_body,
-            ) from error
-        except urllib.error.URLError as error:
-            raise AirflowClientError(f"{method} {url} unreachable: {error.reason}") from error
-        except (OSError, http.client.HTTPException) as error:
-            # Connection-level failures outside urllib's wrapping (e.g. a
-            # boot-time ConnectionResetError from docker-proxy accepting the
-            # published port before the api-server listens) must also become
-            # AirflowClientError, or wait_until_healthy cannot retry them.
-            raise AirflowClientError(f"{method} {url} failed: {error!r}") from error
+            )
         try:
             response_text = response_body.decode("utf-8")
         except UnicodeDecodeError as error:

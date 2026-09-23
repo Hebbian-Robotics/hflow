@@ -68,20 +68,14 @@ async def my_camera_frame_stats(ep: hflow.Episode) -> hflow.CheckResult:
 """
 
 
-@pytest.fixture(scope="module")
-def source_episode(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    return synthesize_episode(
-        tmp_path_factory.mktemp("planning-source") / "episode_0001.mcap",
-        SyntheticEpisodeSpec(duration_s=1.0, cameras=()),
-    )
-
-
 @pytest.fixture
-def project(tmp_path: Path, source_episode: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def project(
+    tmp_path: Path, one_second_camera_less_episode: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
     data_root = tmp_path / "data"
     episodes_in = data_root / "episodes-in"
     episodes_in.mkdir(parents=True)
-    (episodes_in / "episode_0001.mcap").write_bytes(source_episode.read_bytes())
+    (episodes_in / "episode_0001.mcap").write_bytes(one_second_camera_less_episode.read_bytes())
     (tmp_path / "pipeline.py").write_text(PIPELINE_SOURCE)
     (tmp_path / "hflow.toml").write_text('data_root = "./data"\n')
     monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
@@ -151,12 +145,12 @@ class TestReingestingAnUnchangedCorpus:
 
 
 def test_selected_steps_are_planned_and_replayed_independently(
-    tmp_path: Path, source_episode: Path
+    tmp_path: Path, one_second_camera_less_episode: Path
 ) -> None:
     data_root = tmp_path / "data"
     episode_path = data_root / EPISODE_URI
     episode_path.parent.mkdir(parents=True)
-    episode_path.write_bytes(source_episode.read_bytes())
+    episode_path.write_bytes(one_second_camera_less_episode.read_bytes())
     application = hflow.App("selected-planning", data_root=data_root, default_checks=())
     invocation_counts = {"first_check": 0, "second_check": 0}
 
@@ -251,10 +245,12 @@ async def added_later(ep: hflow.Episode) -> hflow.CheckResult:
             connection.close()
         assert rows == [(pytest.approx(2.0, abs=0.2),)]
 
-    def test_a_source_the_catalog_has_never_seen(self, project: Path, source_episode: Path) -> None:
+    def test_a_source_the_catalog_has_never_seen(
+        self, project: Path, one_second_camera_less_episode: Path
+    ) -> None:
         _ingest(project)
         second_uri = "episodes-in/episode_0002.mcap"
-        (project / "data" / second_uri).write_bytes(source_episode.read_bytes())
+        (project / "data" / second_uri).write_bytes(one_second_camera_less_episode.read_bytes())
 
         both = _ingest(project, EPISODE_URI, second_uri)
 
@@ -407,6 +403,9 @@ class TestARecordingSyncCouldNotCanonicalize:
 
         assert _stage(outcomes, hflow.Stage.SYNC).counts["errors"] == 1
         assert _stage(outcomes, hflow.Stage.META).counts["errors"] == 0
+        # It ran nothing and it is not up to date. Folding it into the
+        # already-current count would report a corrupt recording as done.
+        assert _stage(outcomes, hflow.Stage.META).skipped_as_current == 0
         connection = open_catalog_connection(project / "data" / "catalog")
         try:
             rows = connection.execute(
@@ -416,15 +415,6 @@ class TestARecordingSyncCouldNotCanonicalize:
         finally:
             connection.close()
         assert rows == [("sync", "source-unreadable")]
-
-    def test_it_is_not_counted_as_already_current(self, project: Path) -> None:
-        """It ran nothing and it is not up to date. Folding it into the
-        already-current count would report a corrupt recording as done."""
-        (project / "data" / "episodes-in" / "corrupt.mcap").write_bytes(b"not an mcap file")
-
-        outcomes = _ingest(project, EPISODE_URI, "episodes-in/corrupt.mcap")
-
-        assert _stage(outcomes, hflow.Stage.META).skipped_as_current == 0
 
     def test_the_command_exits_one_even_under_budget(
         self, project: Path, capsys: pytest.CaptureFixture[str]
@@ -721,10 +711,16 @@ class TestTheRenderedPlanTask:
 
         assert excinfo.value.code == 99
 
-    def test_all_stages_hands_the_whole_batch_over(self, project: Path, plan: RenderedPlan) -> None:
+    # Airflow renders params into the call, and a hand-typed conf value
+    # arrives as text. Reading "true" as a true value is what keeps the escape
+    # hatch usable from the trigger form.
+    @pytest.mark.parametrize("all_stages", [True, "true"], ids=["native-bool", "conf-string"])
+    def test_all_stages_hands_the_whole_batch_over(
+        self, project: Path, plan: RenderedPlan, all_stages: object
+    ) -> None:
         _ingest(project)
 
-        batches = plan([EPISODE_URI], "batch", None, True)
+        batches = plan([EPISODE_URI], "batch", None, all_stages)
 
         assert [item for batch in batches for item in batch["items"]] == [EPISODE_URI]
 
@@ -745,21 +741,8 @@ class TestTheRenderedPlanTask:
 
         assert excinfo.value.code == 99
 
-    def test_a_conf_string_reads_as_the_flag_it_spells(
-        self, project: Path, plan: RenderedPlan
-    ) -> None:
-        """Airflow renders params into the call, and a hand-typed conf value
-        arrives as text. Reading "true" as a true value is what keeps the
-        escape hatch usable from the trigger form."""
-        _ingest(project)
-
-        batches = plan([EPISODE_URI], "batch", None, "true")
-
-        assert [item for batch in batches for item in batch["items"]] == [EPISODE_URI]
-
-    @pytest.mark.parametrize("spelling", ["false", "no", "off", "0", "", "   "])
     def test_a_conf_string_that_spells_no_leaves_the_filter_on(
-        self, project: Path, plan: RenderedPlan, spelling: str
+        self, project: Path, plan: RenderedPlan
     ) -> None:
         """The direction where a regression is silent.
 
@@ -767,12 +750,14 @@ class TestTheRenderedPlanTask:
         simply processes everything, which is what it did before this filter
         existed. So the corpus stays correct and the run just costs what #172
         was about, forever, with nothing saying so. Truthiness on the raw
-        string (``bool(all_stages)``) is the obvious wrong implementation and
-        every spelling here survives it.
+        string (``bool(all_stages)``) is the obvious wrong implementation, and
+        "false" is truthy under it. This pins that the rendered plan parses
+        the flag at all; every spelling is covered by
+        ``test_stage_execution.py::TestConfFlags``.
         """
         _ingest(project)
 
         with pytest.raises(SystemExit) as excinfo:
-            plan([EPISODE_URI], "batch", None, spelling)
+            plan([EPISODE_URI], "batch", None, "false")
 
         assert excinfo.value.code == 99

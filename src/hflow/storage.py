@@ -17,7 +17,9 @@ metadata server for GCS, ``AWS_ACCESS_KEY_ID``/... for S3,
 
 Processing model for bucket roots -- **spool through a mirror**: every bucket
 root owns a local mirror directory laid out one-to-one with the bucket prefix
-(``~/.cache/hflow/mirrors/<url hash>``, override the base with
+(the user cache mirrors directory, such as
+``~/Library/Caches/hflow/mirrors/<url hash>`` on macOS or
+``~/.cache/hflow/mirrors/<url hash>`` on Linux, override the base with
 ``HFLOW_MIRROR_DIR``). Sources download into the mirror, the pipeline runs
 on local files exactly as it does for a local root, and results upload back
 to the same relative keys. Two conventions make the mirror a correct cache
@@ -35,14 +37,20 @@ rather than a consistency problem:
 import errno
 import fcntl
 import hashlib
+import logging
 import os
 import shutil
 import tempfile
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
+
+from hflow.cache import user_cache_dir
+
+logger = logging.getLogger(__name__)
 
 # Schemes obstore's from_url() accepts that name an object store we support.
 # file:// maps to a LocalStorageRoot instead (same semantics, no obstore);
@@ -166,18 +174,15 @@ def _default_mirror_directory(url: str) -> Path:
     """The local mirror for one bucket URL: stable across processes.
 
     Base directory precedence: ``HFLOW_MIRROR_DIR``, then
-    ``$XDG_CACHE_HOME/hflow/mirrors``, then ``~/.cache/hflow/mirrors``.
+    the user cache mirrors directory (respects ``$XDG_CACHE_HOME`` if set,
+    otherwise uses the platform-native cache directory such as
+    ``~/Library/Caches/hflow/mirrors`` on macOS or ``~/.cache/hflow/mirrors`` on Linux).
     The per-URL subdirectory is a content hash of the normalized URL, so two
     roots never share a mirror and re-parsing the same URL always finds the
     same cache.
     """
     override = os.environ.get("HFLOW_MIRROR_DIR")
-    if override:
-        base_directory = Path(override)
-    else:
-        cache_home = os.environ.get("XDG_CACHE_HOME")
-        cache_base = Path(cache_home) if cache_home else Path.home() / ".cache"
-        base_directory = cache_base / "hflow" / "mirrors"
+    base_directory = Path(override) if override else user_cache_dir("mirrors")
     url_digest = hashlib.sha256(url.encode()).hexdigest()[:12]
     return base_directory / url_digest
 
@@ -572,6 +577,13 @@ class BucketStorageRoot:
                 and sidecar.read_text() == remote_etag
             ):
                 return local_file
+            if not local_file.is_file():
+                refresh_reason = "missing"
+            elif remote_etag is None:
+                refresh_reason = "no remote etag"
+            else:
+                refresh_reason = "stale"
+            logger.debug("downloading %s into the mirror (%s)", key, refresh_reason)
             get_result = obstore.get(store, key)
             # The GET's own metadata etag (not the earlier HEAD's) goes into
             # the sidecar, so the recorded etag always matches the downloaded
@@ -618,6 +630,9 @@ class BucketStorageRoot:
         obstore = _load_obstore()
         store = self._get_store()
         self.workspace  # noqa: B018  -- ensures the mirror directory exists
+        downloaded = 0
+        transferred_bytes = 0
+        started = time.monotonic()
         for prefix in prefixes:
             for name in self.list_names(prefix):
                 local_file = self.mirror / name
@@ -626,7 +641,17 @@ class BucketStorageRoot:
                 # No lock or sidecar: immutable-file convention -- concurrent
                 # syncers can only write identical bytes, and the replace is
                 # atomic either way.
-                _download_to_file_atomically(obstore.get(store, name), local_file)
+                get_result = obstore.get(store, name)
+                transferred_bytes += get_result.meta["size"]
+                _download_to_file_atomically(get_result, local_file)
+                downloaded += 1
+        if downloaded:
+            logger.info(
+                "synced %d object(s) (%d bytes) into the mirror in %.2fs",
+                downloaded,
+                transferred_bytes,
+                time.monotonic() - started,
+            )
         return self.mirror
 
     def _warm_mirror(self, local_file: Path, key: str, etag: str | None) -> None:

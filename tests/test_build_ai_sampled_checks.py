@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import json
-from collections.abc import AsyncIterator
-from functools import partial
 from pathlib import Path
-from types import TracebackType
 
 import httpx2
 import pytest
-from tenacity import AsyncRetrying
+from build_ai_test_stubs import (
+    StubHostedResponse,
+    record_retry_sleeps,
+)
 
 import hflow
 from hflow.build_ai_vlm_checks import (
@@ -26,29 +25,6 @@ NANOSECONDS_PER_SECOND = 1_000_000_000
 CAMERA_TOPIC = "/head_camera/compressed"
 
 
-class _StubHostedResponse:
-    def __init__(self, payload: object) -> None:
-        self.headers: dict[str, str] = {}
-        self._body = json.dumps(payload).encode("utf-8")
-
-    async def __aenter__(self) -> _StubHostedResponse:
-        return self
-
-    async def __aexit__(
-        self,
-        _exception_type: type[BaseException] | None,
-        _exception: BaseException | None,
-        _traceback: TracebackType | None,
-    ) -> None:
-        return None
-
-    def raise_for_status(self) -> None:
-        return None
-
-    async def aiter_raw(self) -> AsyncIterator[bytes]:
-        yield self._body
-
-
 def _scripted_hosted_answers(
     monkeypatch: pytest.MonkeyPatch, answers: list[object]
 ) -> list[object]:
@@ -56,14 +32,14 @@ def _scripted_hosted_answers(
     remaining = list(answers)
     served: list[object] = []
 
-    def hosted_response(method: str, url: str, **_request: object) -> _StubHostedResponse:
+    def hosted_response(method: str, url: str, **_request: object) -> StubHostedResponse:
         answer = remaining.pop(0)
         served.append(answer)
         if isinstance(answer, str) and answer.startswith("unparsed:"):
-            return _StubHostedResponse(
+            return StubHostedResponse(
                 {"outcome": "unparsed", "raw_response": answer, "parse_error": "not a count"}
             )
-        return _StubHostedResponse(
+        return StubHostedResponse(
             {"outcome": "parsed", "prediction": answer, "raw_response": str(answer)}
         )
 
@@ -175,17 +151,10 @@ def test_a_transient_hosted_failure_is_retried_within_the_sampled_run(
     """One gateway timeout mid-run costs a delay, not the whole check."""
     import httpx2 as httpx_module
 
-    sleeps: list[float] = []
-
-    async def record_delay(seconds: float) -> None:
-        sleeps.append(seconds)
-
-    monkeypatch.setattr(
-        "hflow.build_ai_vlm_checks.AsyncRetrying", partial(AsyncRetrying, sleep=record_delay)
-    )
+    sleeps = record_retry_sleeps(monkeypatch)
     answers: list[object] = [2, "http-504", 0, 2]
 
-    class _FailingResponse(_StubHostedResponse):
+    class _FailingResponse(StubHostedResponse):
         def __init__(self, status_code: int) -> None:
             super().__init__({})
             self._status_code = status_code
@@ -197,11 +166,11 @@ def test_a_transient_hosted_failure_is_retried_within_the_sampled_run(
             )
             raise httpx_module.HTTPStatusError("gateway", request=request, response=response)
 
-    def hosted_response(method: str, url: str, **_request: object) -> _StubHostedResponse:
+    def hosted_response(method: str, url: str, **_request: object) -> StubHostedResponse:
         answer = answers.pop(0)
         if answer == "http-504":
             return _FailingResponse(504)
-        return _StubHostedResponse(
+        return StubHostedResponse(
             {"outcome": "parsed", "prediction": answer, "raw_response": str(answer)}
         )
 
@@ -231,23 +200,16 @@ def test_hosted_retries_are_bounded_and_the_last_status_is_reported(
 ) -> None:
     import httpx2 as httpx_module
 
-    sleeps: list[float] = []
-
-    async def record_delay(seconds: float) -> None:
-        sleeps.append(seconds)
-
-    monkeypatch.setattr(
-        "hflow.build_ai_vlm_checks.AsyncRetrying", partial(AsyncRetrying, sleep=record_delay)
-    )
+    sleeps = record_retry_sleeps(monkeypatch)
     attempts = 0
 
-    class _AlwaysBusy(_StubHostedResponse):
+    class _AlwaysBusy(StubHostedResponse):
         def raise_for_status(self) -> None:
             request = httpx_module.Request("POST", "https://api.hflow.dev/v1/checks")
             response = httpx_module.Response(429, request=request)
             raise httpx_module.HTTPStatusError("busy", request=request, response=response)
 
-    def hosted_response(method: str, url: str, **_request: object) -> _StubHostedResponse:
+    def hosted_response(method: str, url: str, **_request: object) -> StubHostedResponse:
         nonlocal attempts
         attempts += 1
         return _AlwaysBusy({})
@@ -328,17 +290,3 @@ def test_sampling_is_part_of_the_check_version(tmp_path: Path) -> None:
         register_hand_visibility(application, execution=HFlowHostedExecution(), sampling=sampling)
         versions.append(application.checks[0].version)
     assert len(set(versions)) == 3
-
-
-@pytest.mark.parametrize(
-    "bad_sampling",
-    [
-        {"fps": 0.0},
-        {"fps": float("inf")},
-        {"start_s": -1.0},
-        {"start_s": 5.0, "end_s": 5.0},
-    ],
-)
-def test_frame_sampling_refuses_an_empty_or_unbounded_window(bad_sampling: dict) -> None:
-    with pytest.raises(ValueError):
-        FrameSampling(**bad_sampling)

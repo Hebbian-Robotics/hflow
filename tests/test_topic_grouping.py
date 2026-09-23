@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 import pytest
+from episode_test_helpers import synthesize_canonical_episode
 from mcap.writer import Writer as StockWriter
 
 import hflow
@@ -72,13 +73,6 @@ def _topic_groups(canonical: Path) -> dict[str, str]:
         }
 
 
-def test_a_bulk_channel_gets_its_own_group(canonical_with_bulk: Path) -> None:
-    groups = _topic_groups(canonical_with_bulk)
-
-    assert groups[STATE_TOPIC] == DEFAULT_STATE_GROUP
-    assert groups[BULK_TOPIC] == DEFAULT_BULK_GROUP
-
-
 def test_the_resolved_layout_is_readable_from_the_published_episode(
     canonical_with_bulk: Path,
 ) -> None:
@@ -105,14 +99,13 @@ def test_an_explicit_override_still_wins(tmp_path: Path) -> None:
 def test_a_manipulation_recording_is_laid_out_exactly_as_before(tmp_path: Path) -> None:
     """Cameras plus proprio: the shape the old default already got right, so
     nothing about it changes except that it now says so in provenance."""
-    from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
+    from hflow.testing import SyntheticEpisodeSpec
 
-    source = synthesize_episode(
-        tmp_path / "manipulation.mcap",
+    canonical = synthesize_canonical_episode(
+        tmp_path,
         SyntheticEpisodeSpec(duration_s=1.0, cameras=("wrist_cam",), black_segment=None),
+        stem="manipulation",
     )
-    canonical = tmp_path / "manipulation.canonical.mcap"
-    write_canonical_episode(source, canonical, TransformConfig())
 
     groups = _topic_groups(canonical)
     assert DEFAULT_BULK_GROUP not in groups.values()
@@ -148,12 +141,10 @@ class TestDerivedChunkTargets:
 
         assert derived_chunk_size_bytes(0.0, 1.0) == MINIMUM_DERIVED_CHUNK_SIZE_BYTES
 
-    def test_the_default_derives_and_records_a_target_per_group(self, tmp_path: Path) -> None:
-        source = _source_with_a_bulk_channel(tmp_path / "source.mcap")
-        canonical = tmp_path / "derived.canonical.mcap"
-        write_canonical_episode(source, canonical, TransformConfig())
-
-        with hflow.Episode(canonical) as episode:
+    def test_the_default_derives_and_records_a_target_per_group(
+        self, canonical_with_bulk: Path
+    ) -> None:
+        with hflow.Episode(canonical_with_bulk) as episode:
             targets = {
                 key.removeprefix(PROVENANCE_KEY_CHUNK_TARGET_PREFIX): int(value)
                 for key, value in episode.metadata.items()

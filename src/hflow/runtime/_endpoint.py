@@ -107,23 +107,23 @@ def describe_remote_status(endpoint: RemoteRuntimeEndpoint, *, run_limit: int = 
     The backend-neutral half of ``hflow status``: no docker, no local files
     -- everything here works against any reachable Airflow, hosted or local.
     """
-    client = client_for_endpoint(endpoint)
     lines = [f"endpoint: {endpoint.base_url}", f"dag:      {endpoint.dag_id}"]
-    try:
-        health = client.health()
-    except AirflowClientError as error:
-        lines.append(f"health:   unreachable ({error})")
-        return "\n".join(lines)
-    overall = "healthy" if health.healthy else "UNHEALTHY"
-    lines.append(f"health:   {overall} ({health.summary()})")
-    try:
-        client.dag(endpoint.dag_id)
-        # order_by="-id": the server truncates to `limit`, so it must sort
-        # newest-first or a busy DAG would show only its oldest history.
-        recent_runs = client.dag_runs(endpoint.dag_id, limit=run_limit, order_by="-id")
-    except AirflowClientError as error:
-        lines.append(f"dag:      unavailable ({error})")
-        return "\n".join(lines)
+    with client_for_endpoint(endpoint) as client:
+        try:
+            health = client.health()
+        except AirflowClientError as error:
+            lines.append(f"health:   unreachable ({error})")
+            return "\n".join(lines)
+        overall = "healthy" if health.healthy else "UNHEALTHY"
+        lines.append(f"health:   {overall} ({health.summary()})")
+        try:
+            client.dag(endpoint.dag_id)
+            # order_by="-id": the server truncates to `limit`, so it must sort
+            # newest-first or a busy DAG would show only its oldest history.
+            recent_runs = client.dag_runs(endpoint.dag_id, limit=run_limit, order_by="-id")
+        except AirflowClientError as error:
+            lines.append(f"dag:      unavailable ({error})")
+            return "\n".join(lines)
     if not recent_runs:
         lines.append("runs:     none recorded")
     else:

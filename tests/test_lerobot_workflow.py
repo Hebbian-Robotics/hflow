@@ -20,6 +20,8 @@ from typing import cast
 
 import duckdb
 import pytest
+from lerobot_test_helpers import CorpusEpisodeRow, two_camera_v3_info, write_v3_corpus
+from mcap_test_helpers import write_compressed_video_mcap
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -140,151 +142,45 @@ def fixture_archive(tmp_path_factory: pytest.TempPathFactory) -> Path:
     root = tmp_path_factory.mktemp("archive")
     info = {
         "code": "LeRobotDataset/v3",
-        "fps": FPS,
+        **two_camera_v3_info(frames_per_second=FPS, camera_frame_shape=(240, 320, 3)),
         "total_episodes": 3,
         "total_frames": FRAMES * 3,
-        "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
-        "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
-        "features": {
-            "action": {"dtype": "float32", "shape": [6]},
-            "observation.state": {"dtype": "float32", "shape": [6]},
-            CAMS[0]: {"dtype": "video", "shape": [240, 320, 3]},
-            CAMS[1]: {"dtype": "video", "shape": [240, 320, 3]},
-            "timestamp": {"dtype": "float32", "shape": [1]},
-        },
-        "robot_type": "so101",
     }
-    meta_dir = root / "meta"
-    meta_dir.mkdir(parents=True)
-    (meta_dir / "info.json").write_text(json.dumps(info))
-
-    conn = duckdb.connect()
-    ep_rows = []
-    for index in range(3):
-        ep_rows.append(
-            [
-                index,
-                FRAMES,
-                0,
-                0,
-                index * FRAMES,
-                (index + 1) * FRAMES,
-                0,
-                0,
-                0.0,
-                2.0,
-                0,
-                0,
-                0.0,
-                2.0,
-                [],
-            ]
-        )
-    ep_parquet = meta_dir / "episodes" / "chunk-000" / "file-000.parquet"
-    ep_parquet.parent.mkdir(parents=True)
-    ep_cols = [
-        "episode_index",
-        "length",
-        "data/chunk_index",
-        "data/file_index",
-        "dataset_from_index",
-        "dataset_to_index",
-        f"videos/{CAMS[0]}/chunk_index",
-        f"videos/{CAMS[0]}/file_index",
-        f"videos/{CAMS[0]}/from_timestamp",
-        f"videos/{CAMS[0]}/to_timestamp",
-        f"videos/{CAMS[1]}/chunk_index",
-        f"videos/{CAMS[1]}/file_index",
-        f"videos/{CAMS[1]}/from_timestamp",
-        f"videos/{CAMS[1]}/to_timestamp",
-        "tasks",
-    ]
-    vals = ",\n".join(
-        "("
-        + ",".join(
-            "[" + ",".join(f"'{x}'" for x in v) + "]"
-            if isinstance(v, list)
-            else f"'{v!s}'"
-            if isinstance(v, str)
-            else str(v)
-            for v in row
-        )
-        + ")"
-        for row in ep_rows
-    )
-    quoted = str(ep_parquet).replace("'", "''")
-    qcols = ",".join(f'"{c}"' for c in ep_cols)
-    conn.execute(
-        f"COPY (SELECT * FROM (VALUES {vals}) AS t({qcols})) TO '{quoted}' (FORMAT parquet)"
-    )
-
-    data_rows = []
-    for index in range(3):
-        for frame in range(FRAMES):
-            state = "[" + ",".join(str(float(frame)) for _ in range(6)) + "]"
-            action = "[" + ",".join(str(float(frame + 0.5)) for _ in range(6)) + "]"
-            data_rows.append(
-                [index * FRAMES + frame, index, frame, round(frame / FPS, 6), state, action]
+    write_v3_corpus(
+        root,
+        info=info,
+        episode_rows=[
+            CorpusEpisodeRow(
+                episode_index=index,
+                length=FRAMES,
+                dataset_from_index=index * FRAMES,
+                video_to_timestamp=2.0,
+                tasks=(),
             )
-    data_dir = root / "data" / "chunk-000"
-    data_dir.mkdir(parents=True)
-    data_parquet = data_dir / "file-000.parquet"
-    dvals = ",\n".join("(" + ",".join(str(v) for v in row) + ")" for row in data_rows)
-    dquoted = str(data_parquet).replace("'", "''")
-    conn.execute(
-        f"COPY (SELECT * FROM (VALUES {dvals}) AS "
-        't(index, episode_index, frame_index, timestamp, "observation.state", action)) '
-        f"TO '{dquoted}' (FORMAT parquet)"
+            for index in range(3)
+        ],
+        camera_keys=CAMS,
     )
     for camera_key in CAMS:
         video_directory = root / "videos" / camera_key / "chunk-000"
         video_directory.mkdir(parents=True)
         (video_directory / "file-000.mp4").write_bytes(b"fake-mp4-content")
-    conn.close()
     return root
 
 
 def _write_landing(landing_path: Path, episode_index: int, units: list[bytes]) -> Path:
     """Mirror the public importer: foxglove video channels + metadata records."""
-    from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
-    from mcap.writer import Writer as McapWriter
-    from mcap_protobuf.schema import build_file_descriptor_set
-
     landing_path.parent.mkdir(parents=True, exist_ok=True)
     source = landing_path.with_suffix(".source.mcap")
-    with source.open("wb") as stream:
-        writer = McapWriter(stream)
-        writer.start(profile="", library="hflow test fixture")
-        schema_id = writer.register_schema(
-            "foxglove.CompressedVideo",
-            "protobuf",
-            build_file_descriptor_set(CompressedVideo).SerializeToString(),
-        )
-        channels = {
-            cam: writer.register_channel(
-                topic=f"/{cam}", message_encoding="protobuf", schema_id=schema_id
-            )
+    write_compressed_video_mcap(
+        source,
+        [
+            (f"/{cam}", START_NS + round(frame * 1_000_000_000 / FPS), unit)
+            for frame, unit in enumerate(units)
             for cam in CAMS
-        }
-        for frame, unit in enumerate(units):
-            log_ns = START_NS + round(frame * 1_000_000_000 / FPS)
-            for cam in CAMS:
-                message = CompressedVideo()
-                message.timestamp.seconds = log_ns // 1_000_000_000
-                message.timestamp.nanos = log_ns % 1_000_000_000
-                message.frame_id = cam
-                message.data = unit
-                message.format = "h264"
-                writer.add_message(
-                    channel_id=channels[cam],
-                    log_time=log_ns,
-                    data=message.SerializeToString(),
-                    publish_time=log_ns,
-                    sequence=frame,
-                )
-        writer.add_metadata(
-            name="episode/v1",
-            data={
+        ],
+        metadata={
+            "episode/v1": {
                 "task": "fixture_task",
                 "operator": "lerobot_converter",
                 "embodiment": "so101",
@@ -294,16 +190,15 @@ def _write_landing(landing_path: Path, episode_index: int, units: list[bytes]) -
                 "camera_keys": json.dumps(list(CAMS), separators=(",", ":")),
                 "gop_seconds": "1",
             },
-        )
-        writer.add_metadata(
-            name="source-provenance/v1",
-            data={
+            "source-provenance/v1": {
                 "converter_version": "test",
                 "ffmpeg_version": "test",
                 "source_uri": f"hf://datasets/{FIXTURE_MANIFEST['repository']}@{REVISION}",
             },
-        )
-        writer.finish()
+        },
+        number_messages_per_topic=True,
+        library="hflow test fixture",
+    )
 
     from hflow.transform import write_canonical_episode
 

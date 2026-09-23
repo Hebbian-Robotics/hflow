@@ -4,14 +4,14 @@ from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 
+from episode_test_helpers import synthesize_canonical_episode
 from mcap.reader import make_reader
 
 import hflow
-from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
+from hflow.testing import SyntheticEpisodeSpec
 from hflow.transform import (
     TransformConfig,
     compute_pipeline_version,
-    write_canonical_episode,
 )
 
 FAKE_RELEASE = "9.9.9"
@@ -100,8 +100,8 @@ def test_canonical_write_order_is_total_so_identity_cannot_ride_on_append_order(
     canonical embeds transcoded video, so a pinned hash would fail on a
     different ffmpeg build for reasons that have nothing to do with ordering.
     """
-    source = synthesize_episode(
-        tmp_path / "episode.mcap",
+    canonical = synthesize_canonical_episode(
+        tmp_path,
         SyntheticEpisodeSpec(
             duration_s=6.0,
             cameras=("wrist_cam", "overhead_cam"),
@@ -109,8 +109,6 @@ def test_canonical_write_order_is_total_so_identity_cannot_ride_on_append_order(
             joint_hz=100.0,
         ),
     )
-    canonical = tmp_path / "episode.canonical.mcap"
-    write_canonical_episode(source, canonical)
 
     written: list[tuple[int, str]] = []
     with canonical.open("rb") as stream:

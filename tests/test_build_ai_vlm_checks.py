@@ -3,41 +3,23 @@ from __future__ import annotations
 import asyncio
 import gzip
 import json
+import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
-from types import TracebackType
 from typing import Any
 
 import httpx2
 import pytest
+from build_ai_test_stubs import (
+    StubHostedResponse,
+    hosted_retry_records,
+    stub_hosted_stream,
+)
 
 import hflow
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
-
-
-class _StubHostedResponse:
-    def __init__(self, payload: object) -> None:
-        self.headers: dict[str, str] = {}
-        self._body = json.dumps(payload).encode("utf-8")
-
-    async def __aenter__(self) -> _StubHostedResponse:
-        return self
-
-    async def __aexit__(
-        self,
-        _exception_type: type[BaseException] | None,
-        _exception: BaseException | None,
-        _traceback: TracebackType | None,
-    ) -> None:
-        return None
-
-    def raise_for_status(self) -> None:
-        return None
-
-    async def aiter_raw(self) -> AsyncIterator[bytes]:
-        yield self._body
 
 
 def test_build_ai_vlm_checks_register_independent_execution_contracts(tmp_path: Path) -> None:
@@ -70,44 +52,6 @@ def test_build_ai_vlm_checks_register_independent_execution_contracts(tmp_path: 
         for registered_check in application.checks
     )
     assert application.checks[0].version != application.checks[1].version
-
-
-def test_build_ai_check_version_changes_with_model_configuration(tmp_path: Path) -> None:
-    first_application = hflow.App("first", data_root=tmp_path / "first", default_checks=())
-    second_application = hflow.App("second", data_root=tmp_path / "second", default_checks=())
-
-    hflow.build_ai_vlm_checks.register_hand_visibility(
-        first_application,
-        execution=hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
-            endpoint="http://localhost:8000/v1",
-            model="model-a",
-        ),
-    )
-    hflow.build_ai_vlm_checks.register_hand_visibility(
-        second_application,
-        execution=hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
-            endpoint="http://localhost:8000/v1",
-            model="model-b",
-        ),
-    )
-
-    assert first_application.checks[0].version != second_application.checks[0].version
-
-
-def test_build_ai_check_version_changes_with_hosted_check_version(tmp_path: Path) -> None:
-    first_application = hflow.App("first", data_root=tmp_path / "first", default_checks=())
-    second_application = hflow.App("second", data_root=tmp_path / "second", default_checks=())
-
-    hflow.build_ai_vlm_checks.register_hand_visibility(
-        first_application,
-        execution=hflow.build_ai_vlm_checks.HFlowHostedExecution(check_version=1),
-    )
-    hflow.build_ai_vlm_checks.register_hand_visibility(
-        second_application,
-        execution=hflow.build_ai_vlm_checks.HFlowHostedExecution(check_version=2),
-    )
-
-    assert first_application.checks[0].version != second_application.checks[0].version
 
 
 @pytest.mark.parametrize(
@@ -370,9 +314,9 @@ def test_hosted_execution_sends_the_selected_frame_and_returns_standard_evidence
         files: dict[str, tuple[str, bytes, str]],
         timeout: float,
         follow_redirects: bool,
-    ) -> _StubHostedResponse:
+    ) -> StubHostedResponse:
         captured_requests.append((method, url, headers, files, timeout, follow_redirects))
-        return _StubHostedResponse(
+        return StubHostedResponse(
             {
                 "outcome": "parsed",
                 "prediction": 2,
@@ -587,43 +531,10 @@ def test_usage_booleans_are_observations_but_not_numeric_measurements() -> None:
 # --- version contract covers every knob that changes result completeness (#404)
 
 
-def _versions_for(executions: list) -> list:
-    versions = []
-    for index, execution in enumerate(executions):
-        application = hflow.App(
-            f"app-{index}-{abs(hash(execution))}",
-            data_root=Path(f"/tmp/unused-{index}-{abs(hash(execution))}"),
-            default_checks=(),
-        )
-        hflow.build_ai_vlm_checks.register_hand_visibility(application, execution=execution)
-        versions.append(application.checks[0].version)
-    return versions
-
-
-def test_check_version_stable_when_every_covered_field_is_identical(tmp_path: Path) -> None:
-    """DoD 3: a configuration identical in every covered field keeps its
-    current version, so unchanged methodology never silently invalidates."""
-    first_application = hflow.App("first", data_root=tmp_path / "first", default_checks=())
-    second_application = hflow.App("second", data_root=tmp_path / "second", default_checks=())
-    execution = hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
-        endpoint="http://localhost:8000/v1",
-        model="model-a",
-        temperature=0.5,
-        max_tokens=512,
-        max_retries=3,
-    )
-    hflow.build_ai_vlm_checks.register_hand_visibility(first_application, execution=execution)
-    hflow.build_ai_vlm_checks.register_hand_visibility(second_application, execution=execution)
-
-    assert first_application.checks[0].version == second_application.checks[0].version
-
-
 # Golden versions for two fixed configurations, one per execution branch.
 #
-# The equality test above only proves _check_version is a function: it cannot
-# fail unless the same input starts producing two answers. The property DoD 3
-# actually claims is that unchanged methodology keeps its identity across
-# changes to this module, and only a recorded value can hold that. Adding a
+# DoD 3 claims that unchanged methodology keeps its identity across changes
+# to this module, and only a recorded value can hold that. Adding a
 # field to the contract, renaming a key, or reordering nothing at all silently
 # re-mints every stored check version; here it fails instead.
 #
@@ -665,78 +576,70 @@ def test_check_version_is_pinned_for_a_fixed_hosted_configuration(tmp_path: Path
     assert str(application.checks[0].version) == _GOLDEN_HOSTED_CHECK_VERSION
 
 
-def test_check_version_changes_with_max_retries(tmp_path: Path) -> None:
-    """max_retries decides whether a transient error becomes a prediction or
-    a failed run: retries change which items produce answers at all, so two
-    executions differing only in retries must not share a version."""
-    first_application = hflow.App("first", data_root=tmp_path / "first", default_checks=())
-    second_application = hflow.App("second", data_root=tmp_path / "second", default_checks=())
-    hflow.build_ai_vlm_checks.register_hand_visibility(
-        first_application,
-        execution=hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
-            endpoint="http://localhost:8000/v1", model="model-a", max_retries=0
-        ),
+def _registered_version(
+    application_directory: Path,
+    execution: hflow.build_ai_vlm_checks.OpenAICompatibleExecution
+    | hflow.build_ai_vlm_checks.HFlowHostedExecution,
+) -> str:
+    application = hflow.App(
+        application_directory.name, data_root=application_directory, default_checks=()
     )
-    hflow.build_ai_vlm_checks.register_hand_visibility(
-        second_application,
-        execution=hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
-            endpoint="http://localhost:8000/v1", model="model-a", max_retries=5
-        ),
-    )
-
-    assert first_application.checks[0].version != second_application.checks[0].version
+    hflow.build_ai_vlm_checks.register_hand_visibility(application, execution=execution)
+    return str(application.checks[0].version)
 
 
-@pytest.mark.parametrize("timeout_field", ["request_timeout_seconds", "total_timeout_seconds"])
-def test_check_version_changes_with_timeout(tmp_path: Path, timeout_field: str) -> None:
-    """The hosted branch applies the same rule: a timeout decides whether a
-    slow-but-valid response is included, so the field belongs in identity."""
-    first_application = hflow.App("first", data_root=tmp_path / "first", default_checks=())
-    second_application = hflow.App("second", data_root=tmp_path / "second", default_checks=())
-    hflow.build_ai_vlm_checks.register_hand_visibility(
-        first_application,
-        execution=replace(
-            hflow.build_ai_vlm_checks.HFlowHostedExecution(check_version=1), **{timeout_field: 1.0}
+def _openai_execution(**overrides: Any) -> hflow.build_ai_vlm_checks.OpenAICompatibleExecution:
+    return replace(
+        hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
+            endpoint="http://localhost:8000/v1", model="model-a"
         ),
-    )
-    hflow.build_ai_vlm_checks.register_hand_visibility(
-        second_application,
-        execution=replace(
-            hflow.build_ai_vlm_checks.HFlowHostedExecution(check_version=1), **{timeout_field: 60.0}
-        ),
+        **overrides,
     )
 
-    assert first_application.checks[0].version != second_application.checks[0].version
+
+def _hosted_execution(**overrides: Any) -> hflow.build_ai_vlm_checks.HFlowHostedExecution:
+    return replace(hflow.build_ai_vlm_checks.HFlowHostedExecution(check_version=1), **overrides)
 
 
-def test_check_version_applies_the_rule_symmetrically_across_branches(
+@pytest.mark.parametrize(
+    ("first_execution", "second_execution"),
+    [
+        pytest.param(_openai_execution(), _openai_execution(model="model-b"), id="openai-model"),
+        pytest.param(
+            _hosted_execution(), _hosted_execution(check_version=2), id="hosted-check-version"
+        ),
+        # max_retries decides whether a transient error becomes a prediction or
+        # a failed run: retries change which items produce answers at all.
+        pytest.param(
+            _openai_execution(max_retries=0),
+            _openai_execution(max_retries=5),
+            id="openai-max-retries",
+        ),
+        # The hosted branch applies the same rule: a timeout decides whether a
+        # slow-but-valid response is included, so the field belongs in identity.
+        pytest.param(
+            _hosted_execution(request_timeout_seconds=1.0),
+            _hosted_execution(request_timeout_seconds=60.0),
+            id="hosted-request-timeout",
+        ),
+        pytest.param(
+            _hosted_execution(total_timeout_seconds=1.0),
+            _hosted_execution(total_timeout_seconds=60.0),
+            id="hosted-total-timeout",
+        ),
+    ],
+)
+def test_check_version_changes_with_each_identity_knob(
     tmp_path: Path,
+    first_execution: hflow.build_ai_vlm_checks.OpenAICompatibleExecution
+    | hflow.build_ai_vlm_checks.HFlowHostedExecution,
+    second_execution: hflow.build_ai_vlm_checks.OpenAICompatibleExecution
+    | hflow.build_ai_vlm_checks.HFlowHostedExecution,
 ) -> None:
-    """DoD 4: both branches treat the rule the same way. Each branch must
-    change its version when its own completeness knob changes, by the same
-    mechanism (the contract), not by an asymmetric special case."""
-    openai_versions = _versions_for(
-        [
-            hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
-                endpoint="http://localhost:8000/v1", model="model-a", max_retries=0
-            ),
-            hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
-                endpoint="http://localhost:8000/v1", model="model-a", max_retries=5
-            ),
-        ]
+    """Two executions differing in one covered field must not share a version."""
+    assert _registered_version(tmp_path / "first", first_execution) != _registered_version(
+        tmp_path / "second", second_execution
     )
-    hosted_versions = _versions_for(
-        [
-            hflow.build_ai_vlm_checks.HFlowHostedExecution(
-                check_version=1, request_timeout_seconds=1.0
-            ),
-            hflow.build_ai_vlm_checks.HFlowHostedExecution(
-                check_version=1, request_timeout_seconds=60.0
-            ),
-        ]
-    )
-    assert openai_versions[0] != openai_versions[1]
-    assert hosted_versions[0] != hosted_versions[1]
 
 
 @pytest.mark.parametrize(
@@ -876,51 +779,75 @@ def _evaluate_hosted_hand_count(
     )
 
 
+def test_hosted_first_attempt_success_emits_no_retry_record(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="hflow.build_ai_vlm_checks")
+    stub_hosted_stream(monkeypatch, _hosted_success_response)
+
+    outcome = _evaluate_hosted_hand_count()
+
+    assert isinstance(outcome, hflow.build_ai_vlm_checks.ParsedVisionModelOutcome)
+    assert not hosted_retry_records(caplog)
+
+
 @pytest.mark.parametrize("status_code", [429, 502, 503, 504, None])
 def test_hosted_retry_recovers_transient_failures(
     monkeypatch: pytest.MonkeyPatch,
     hosted_clock: list[float],
+    caplog: pytest.LogCaptureFixture,
     status_code: int | None,
 ) -> None:
-    from contextlib import asynccontextmanager
+    caplog.set_level(logging.INFO, logger="hflow.build_ai_vlm_checks")
+    secret = "unique-secret-retry-sentinel"
 
     responses = iter((status_code, 200))
 
-    @asynccontextmanager
-    async def respond(
-        *_arguments: object, **_keyword_arguments: object
-    ) -> AsyncIterator[httpx2.Response]:
+    def next_response() -> httpx2.Response:
         next_status = next(responses)
         if next_status is None:
-            raise httpx2.ConnectError("connection interrupted")
-        response = (
-            _hosted_success_response()
-            if next_status == 200
-            else httpx2.Response(
-                next_status,
-                headers={"Retry-After": "2"},
-                request=httpx2.Request("POST", "https://checks.example/evaluate"),
-            )
+            raise httpx2.ConnectError(f"connection interrupted {secret}")
+        if next_status == 200:
+            return _hosted_success_response()
+        return httpx2.Response(
+            next_status,
+            headers={"Retry-After": "2"},
+            request=httpx2.Request("POST", f"https://checks.example/evaluate?token={secret}"),
         )
-        try:
-            yield response
-        finally:
-            await response.aclose()
 
-    monkeypatch.setattr(httpx2.AsyncClient, "stream", staticmethod(respond))
+    stub_hosted_stream(monkeypatch, next_response)
     outcome = _evaluate_hosted_hand_count()
     assert isinstance(outcome, hflow.build_ai_vlm_checks.ParsedVisionModelOutcome)
     assert outcome.predicted_value == 2
     assert hosted_clock[0] == (1 if status_code is None else 2)
+
+    retry_records = hosted_retry_records(caplog)
+
+    assert len(retry_records) == 1
+
+    message = retry_records[0].getMessage()
+    assert "next_attempt=2" in message
+    assert f"delay_seconds={'1.0' if status_code is None else '2.0'}" in message
+
+    if status_code is None:
+        assert "failure=transport" in message
+    else:
+        assert f"failure=http_{status_code}" in message
+
+    assert all(secret not in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.parametrize("failure", ["authorization", "malformed", "exhausted", "retry-budget"])
 def test_hosted_request_does_not_turn_terminal_failures_into_success(
     monkeypatch: pytest.MonkeyPatch,
     hosted_clock: list[float],
+    caplog: pytest.LogCaptureFixture,
     failure: str,
 ) -> None:
-    from contextlib import asynccontextmanager
+    caplog.set_level(logging.INFO, logger="hflow.build_ai_vlm_checks")
+
+    secret = "unique-secret-terminal-sentinel"
 
     failure_responses = {
         "authorization": [httpx2.Response(401)],
@@ -935,30 +862,33 @@ def test_hosted_request_does_not_turn_terminal_failures_into_success(
     }
     responses = iter([*failure_responses[failure], _hosted_success_response()])
 
-    @asynccontextmanager
-    async def respond(
-        *_arguments: object, **_keyword_arguments: object
-    ) -> AsyncIterator[httpx2.Response]:
+    def next_response() -> httpx2.Response:
         response = next(responses)
-        response.request = httpx2.Request("POST", "https://checks.example/private-input")
-        try:
-            yield response
-        finally:
-            await response.aclose()
+        response.request = httpx2.Request(
+            "POST",
+            f"https://checks.example/private-input?token={secret}",
+        )
+        return response
 
-    monkeypatch.setattr(httpx2.AsyncClient, "stream", staticmethod(respond))
+    stub_hosted_stream(monkeypatch, next_response)
     with pytest.raises(RuntimeError) as captured_error:
         _evaluate_hosted_hand_count(max_retries=1, total_timeout_seconds=5)
     assert "private-input" not in str(captured_error.value)
     assert captured_error.value.__cause__ is None
     assert hosted_clock[0] == (1 if failure == "exhausted" else 0)
 
+    retry_records = hosted_retry_records(caplog)
+
+    assert all(secret not in record.getMessage() for record in caplog.records)
+
+    assert len(retry_records) == (1 if failure == "exhausted" else 0)
+
 
 def test_hosted_response_that_crosses_the_total_budget_is_not_accepted(
     monkeypatch: pytest.MonkeyPatch,
     hosted_clock: list[float],
 ) -> None:
-    class SlowHostedResponse(_StubHostedResponse):
+    class SlowHostedResponse(StubHostedResponse):
         async def aiter_raw(self) -> AsyncIterator[bytes]:
             yield self._body[:1]
             hosted_clock[0] += 6

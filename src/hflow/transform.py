@@ -22,13 +22,13 @@ v1 behavior:
   Raw ``sensor_msgs/msg/Image``/``foxglove.RawImage`` is not supported in v1
   (explicit error).
 - Every other channel passes through byte-for-byte with its original schema.
-  The transform is keyed by CHANNEL, not topic: a source with several
-  channels sharing a topic produces the same number of output channels on
-  that topic, each with its original schema intact. (The old v1
-  one-channel-per-topic requirement existed only because the reader seam was
-  topic-keyed.) Per-message ``sequence`` numbers and per-channel metadata
-  maps are not carried through the batch reader seam and are dropped; both
-  are rare and advisory.
+  A topic may name only one source channel. MCAP allows several channels to
+  share a topic, but topic-keyed reads cannot represent that, and the default
+  checks use those reads. The transform refuses the file with
+  ``SourceNotConforming`` instead of publishing both channels (#597). The
+  reader can still open an already-written file by channel id. Per-message
+  ``sequence`` numbers and per-channel metadata maps are not carried through
+  the batch reader seam and are dropped; both are rare and advisory.
 - Topic-group chunking: camera-schema topics to the ``cameras`` group, bulk
   non-camera channels (mean payload over ``BULK_MESSAGE_BYTES`` -- point
   clouds, occupancy grids) to ``bulk``, everything else to ``state``, with
@@ -313,10 +313,10 @@ def _bulk_topics(
 def _group_for_topic(
     info: TopicInfo, *, bulk_topics: "frozenset[str]", topic_group_overrides: Mapping[str, str]
 ) -> str:
-    """Which chunk group one topic's channels are written into.
+    """Which chunk group one topic's channel is written into.
 
-    Topic-keyed on purpose: an override applies to every channel of a topic,
-    and several channels may legally share one.
+    Topic-keyed on purpose: an override names a topic, and the transform has
+    already refused any topic that has more than one source channel.
     """
     override = topic_group_overrides.get(info.topic)
     if override is not None:
@@ -597,9 +597,44 @@ def write_canonical_episode(
     # check on a pass that was already happening rather than adding one.
     reader = open_reader(source_path, validate_crcs=True)
     try:
-        # Keyed by CHANNEL id: several channels may legally share a topic and
-        # each must survive the transform as its own output channel.
+        # First-party direct-H.264 imports commit quality/GOP at import time.
+        # Never silently accept incompatible transform requests or introduce
+        # another lossy generation. Ordinary recorded H.264 remains pass-through.
+        import_settings = reader.metadata().get("video_import/v1", {})
+        if import_settings.get("landing_format") == "h264":
+            try:
+                settings_match = (
+                    int(import_settings["crf"]) == transform_config.crf
+                    and float(import_settings["gop_seconds"]) == gop_seconds
+                )
+            except (KeyError, ValueError):
+                settings_match = False
+            if not settings_match:
+                raise SourceNotConforming(
+                    "imported H.264 encoding settings do not match TransformConfig; "
+                    "re-import the source video with the requested transform_config"
+                )
+        # One channel per topic. MCAP allows several, but topic-keyed reads
+        # (and the default checks) cannot represent them; publishing both used
+        # to surface later as an infrastructure error (#597).
         infos = reader.channels()
+        channel_ids_by_topic: dict[str, list[int]] = {}
+        for channel_id, info in infos.items():
+            channel_ids_by_topic.setdefault(info.topic, []).append(channel_id)
+        duplicated_topics = {
+            topic: sorted(channel_ids)
+            for topic, channel_ids in channel_ids_by_topic.items()
+            if len(channel_ids) > 1
+        }
+        if duplicated_topics:
+            described = ", ".join(
+                f"{topic!r} (channel ids {channel_ids})"
+                for topic, channel_ids in sorted(duplicated_topics.items())
+            )
+            raise SourceNotConforming(
+                f"source has multiple channels for topic {described}; "
+                "topic-keyed reads cannot represent them"
+            )
         for info in infos.values():
             if info.schema_name in _RAW_IMAGE_SCHEMAS:
                 raise SourceNotConforming(

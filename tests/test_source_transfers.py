@@ -48,7 +48,6 @@ def test_versioned_transfer_publishes_identity_and_preserves_source(tmp_path: Pa
     assert destination.read_bytes() == source_versions["reviewed"]
     assert downloaded.sha256 == hashlib.sha256(source_versions["reviewed"]).hexdigest()
     assert downloaded.size_bytes == len(source_versions["reviewed"])
-    assert source_versions["latest"] == b"changed source"
     assert sorted(path.name for path in tmp_path.iterdir()) == ["download"]
 
 

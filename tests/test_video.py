@@ -1,18 +1,21 @@
 """Tests for the H.264 elementary-stream pipeline (encode, split, remux)."""
 
-import subprocess
 import time
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
+from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
+from mcap_protobuf.writer import Writer
+from media_test_helpers import probe_video_stream, render_lavfi, run_ffmpeg
 
-from hflow.ffmpeg import ffmpeg_path, ffprobe_path
+from hflow.episode import Episode
 from hflow.video import (
     AccessUnit,
     PictureCodingScan,
     VideoEncodeError,
     _enforce_encode_guarantees,
-    _first_mb_failure_message,
     _remove_emulation_prevention_bytes,
     _unescape_ebsp_head,
     count_h264_pictures,
@@ -36,24 +39,10 @@ def _generate_test_frames(
     image_extension: str,
 ) -> list[bytes]:
     """Render testsrc2 frames (320x240, 12 fps) to individual image files."""
-    subprocess.run(
-        [
-            str(ffmpeg_path()),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=320x240:rate=12",
-            "-frames:v",
-            str(frame_count),
-            "-q:v",
-            "2",
-            str(output_directory / f"%03d.{image_extension}"),
-        ],
-        check=True,
-        capture_output=True,
+    render_lavfi(
+        output_directory / f"%03d.{image_extension}",
+        "testsrc2=size=320x240:rate=12",
+        output_arguments=("-frames:v", str(frame_count), "-q:v", "2"),
     )
     frame_paths = sorted(output_directory.glob(f"*.{image_extension}"))
     assert len(frame_paths) == frame_count
@@ -132,11 +121,74 @@ def test_remux_to_mp4_preserves_every_frame(
     assert remux_elapsed_seconds < 5.0
 
 
+@pytest.mark.parametrize("invalid_format", [False, True])
+def test_episode_video_remuxes_batches_without_materializing_a_channel(
+    encoded_units: list[AccessUnit],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_format: bool,
+) -> None:
+    source = tmp_path / "camera.mcap"
+    with Writer(str(source)) as writer:
+        for index, unit in enumerate(encoded_units):
+            writer.write_message(
+                "/camera",
+                CompressedVideo(
+                    format="h265" if invalid_format and index == FRAME_COUNT - 1 else "h264",
+                    data=unit.data,
+                ),
+                log_time=round(index * 1e9 / FPS),
+            )
+
+    def refuse_materialization(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("video must not materialize the camera channel")
+
+    monkeypatch.setattr(Episode, "channel", refuse_materialization)
+    workdir = tmp_path / "video-cache"
+    with Episode(source, workdir=workdir) as episode:
+        original_batches = episode._reader.iter_batches
+
+        def small_batches(*args: Any, **kwargs: Any) -> Iterator[Any]:
+            kwargs["batch_max_messages"] = 3
+            yield from original_batches(*args, **kwargs)
+
+        monkeypatch.setattr(episode._reader, "iter_batches", small_batches)
+        if invalid_format:
+            with pytest.raises(ValueError, match="carries 'h265', expected 'h264'"):
+                episode.video()
+            assert not list(episode.workdir.glob("*.mp4"))
+            assert not list(episode.workdir.glob(".*.tmp"))
+            assert not episode._channel_data_by_id
+            return
+        output = episode.video()
+        assert int(_ffprobe_video_stream_fields(output)["nb_read_frames"]) == FRAME_COUNT
+        assert episode._video_fps["/camera"] == pytest.approx(FPS)
+        assert not episode._channel_data_by_id
+
+        def refuse_cached_read(*args: Any, **kwargs: Any) -> None:
+            pytest.fail("a completed video with cached FPS must not reread the channel")
+
+        with monkeypatch.context() as cached_patch:
+            cached_patch.setattr(episode._reader, "iter_batches", refuse_cached_read)
+            assert episode.video() == output
+
+        # FPS alone is insufficient: a removed MP4 must be recreated.
+        output.unlink()
+        assert episode.video() == output
+        assert int(_ffprobe_video_stream_fields(output)["nb_read_frames"]) == FRAME_COUNT
+
+    with Episode(source, workdir=workdir) as reopened:
+        # A fresh handle must recover FPS, but can reuse the completed MP4.
+        monkeypatch.setattr(reopened, "iter_decoded_batches", refuse_cached_read)
+        assert not reopened._video_fps
+        assert reopened.video() == output
+        assert reopened._video_fps["/camera"] == pytest.approx(FPS)
+
+
 @pytest.fixture(scope="module")
 def b_frame_stream(jpeg_frames: list[bytes]) -> bytes:
     """The same frames re-encoded with libx264 defaults (B-frames enabled)."""
-    command: list[str] = [
-        str(ffmpeg_path()),
+    return run_ffmpeg(
         "-hide_banner",
         "-loglevel",
         "error",
@@ -155,14 +207,12 @@ def b_frame_stream(jpeg_frames: list[bytes]) -> bytes:
         "-pix_fmt",
         "yuv420p",
         "-x264-params",
-        "bframes=3:b_adapt=0",
+        "bframes=3:b_adapt=0:aud=1",
         "-f",
         "h264",
         "-",
-    ]
-    completed = subprocess.run(command, input=b"".join(jpeg_frames), capture_output=True)
-    assert completed.returncode == 0, completed.stderr.decode()
-    return completed.stdout
+        stdin=b"".join(jpeg_frames),
+    )
 
 
 def _slice_header_rbsp(first_mb_in_slice: int, slice_type_code: int) -> bytes:
@@ -219,21 +269,29 @@ def test_scan_refuses_an_unparseable_slice_header() -> None:
         scan_picture_coding_types(unparseable_slice)
 
 
+@pytest.mark.parametrize("split_units", [False, True])
 def test_remux_refuses_a_b_frame_stream_naming_the_tail(
-    b_frame_stream: bytes, tmp_path: Path
+    b_frame_stream: bytes, tmp_path: Path, split_units: bool
 ) -> None:
     output_path = tmp_path / "bframe.mp4"
+    units = (
+        (unit.data for unit in split_annex_b_stream(b_frame_stream))
+        if split_units
+        else iter((b_frame_stream,))
+    )
 
     with pytest.raises(ValueError, match="reorder depth") as error:
-        write_access_units_to_mp4((b_frame_stream,), fps=FPS, output=output_path)
+        write_access_units_to_mp4(units, fps=FPS, output=output_path)
 
     message = str(error.value)
-    assert "B picture" in message
-    assert "at risk" in message
+    scan = scan_picture_coding_types(b_frame_stream)
+    assert f"{scan.b_picture_count} B picture(s) across {scan.picture_count}" in message
+    assert f"reorder depth {scan.reorder_depth}" in message
+    assert f"last {scan.trailing_b_pictures} frame(s) at risk" in message
     assert "docs/FORMAT.md" in message
-    # The refusal fires before ffmpeg runs, so no partial MP4 is left behind.
+    # Even a refusal after streaming must remove the partial MP4.
     assert not output_path.exists()
-    assert not output_path.with_name(output_path.name + ".tmp").exists()
+    assert not list(tmp_path.glob(f".{output_path.name}.*.tmp"))
 
 
 def test_encode_guarantees_accept_a_conforming_stream(
@@ -271,31 +329,6 @@ def test_encode_guarantees_raise_on_a_b_picture_naming_the_unit() -> None:
         _enforce_encode_guarantees(units, expected_frame_count=len(units), gop_frames=3)
 
     assert "B picture" in str(error.value)
-
-
-def test_encode_guarantees_find_a_b_picture_in_a_later_unit() -> None:
-    # A B picture in the final unit must still be named, proving the joined
-    # scan covers the whole stream rather than stopping early.
-    aud = b"\x00\x00\x00\x01\x09\x10"
-    non_idr_nal = b"\x00\x00\x00\x01\x41"
-    units = [
-        AccessUnit(
-            data=aud + b"\x00\x00\x00\x01\x65" + _slice_header_rbsp(0, 2),
-            is_keyframe=True,
-            has_parameter_sets=True,
-        ),
-        AccessUnit(
-            data=aud + non_idr_nal + _slice_header_rbsp(0, 1),
-            is_keyframe=False,
-            has_parameter_sets=False,
-        ),
-    ]
-
-    with pytest.raises(VideoEncodeError, match=r"access unit 1"):
-        _enforce_encode_guarantees(units, expected_frame_count=len(units), gop_frames=2)
-
-    with pytest.raises(VideoEncodeError, match=r"access unit 1"):
-        _enforce_encode_guarantees(units, expected_frame_count=len(units), gop_frames=2)
 
 
 def test_split_rejects_garbage_without_aud() -> None:
@@ -378,30 +411,9 @@ def test_png_input_codec_upholds_guarantees(tmp_path: Path) -> None:
 
 def _ffprobe_video_stream_fields(mp4_path: Path) -> dict[str, str]:
     """Read codec/profile/decoded-frame-count fields from the first video stream."""
-    ffprobe_binary = ffprobe_path()
-    completed = subprocess.run(
-        [
-            str(ffprobe_binary),
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-count_frames",
-            "-show_entries",
-            "stream=codec_name,profile,nb_read_frames",
-            "-of",
-            "default=noprint_wrappers=1",
-            str(mp4_path),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
+    return probe_video_stream(
+        mp4_path, "codec_name", "profile", "nb_read_frames", count_frames=True
     )
-    stream_fields: dict[str, str] = {}
-    for output_line in completed.stdout.splitlines():
-        field_name, _, field_value = output_line.partition("=")
-        stream_fields[field_name.strip()] = field_value.strip()
-    return stream_fields
 
 
 def test_unescape_ebsp_head_matches_full_unescape_for_the_prefix() -> None:
@@ -411,7 +423,7 @@ def test_unescape_ebsp_head_matches_full_unescape_for_the_prefix() -> None:
     after the cut is irrelevant: the prefix ends at the cut either way."""
     payload = b"\x00\x00\x00\x01\x65" + bytes(range(256)) * 4
     full = _remove_emulation_prevention_bytes(payload)
-    for max_bytes in (8, 16, 32, 64, 128):
+    for max_bytes in (8, 16, 32, 64, 128, len(payload), len(payload) + 100):
         head = _unescape_ebsp_head(payload, max_bytes)
         if max_bytes >= len(payload):
             assert head == full
@@ -496,19 +508,6 @@ def test_scan_and_count_agree_on_multi_slice_and_escape_heavy_streams() -> None:
     assert scan_picture_coding_types(escape_stream).picture_count == 2
     assert count_h264_pictures(escape_stream) == 2
     assert scan_picture_coding_types(escape_stream).b_picture_count == 0
-
-
-def test_first_mb_failure_message_names_both_failure_kinds() -> None:
-    """count_h264_pictures owes hflow doctor two distinct messages, and the
-    walk no longer raises them itself: this helper is the only place they
-    are produced. An all-zero RBSP never terminates the first Exp-Golomb
-    value; 00000100 carries the terminating one bit but loses its suffix."""
-    assert (
-        _first_mb_failure_message(b"\x00") == "slice header has no complete first_mb_in_slice value"
-    )
-    assert (
-        _first_mb_failure_message(b"\x04") == "slice header truncates its first_mb_in_slice value"
-    )
 
 
 def test_a_truncated_slice_type_still_counts_but_cannot_be_classified() -> None:

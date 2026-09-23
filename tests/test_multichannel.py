@@ -1,9 +1,10 @@
-"""Multiple channels per topic are represented by channel id.
+"""Multiple channels per topic are represented by channel id, not published.
 
 MCAP legally allows several channels to share a topic (e.g. a json status
 channel and a ros2msg one both on ``/status``). The reader's ``channels()``
-accessor, Episode addressing by channel id, and the transform must all
-represent both channels; only the topic-keyed convenience views refuse.
+accessor and Episode addressing by channel id still represent both. The
+transform refuses that source: topic-keyed reads, which the default checks
+use, cannot.
 """
 
 import json
@@ -12,15 +13,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from mcap.reader import make_reader
 from mcap.writer import CompressionType
 from mcap.writer import Writer as StockWriter
 
-from hflow.doctor import diagnose
 from hflow.episode import Episode
 from hflow.format import METADATA_RECORD_EPISODE
+from hflow.ingest_ledger import IngestFailureKind, classify_ingest_failure
 from hflow.reader import EpisodeReader, PythonMcapEpisodeReader, open_reader
-from hflow.transform import write_canonical_episode
+from hflow.transform import SourceNotConforming, write_canonical_episode
 
 SHARED_TOPIC = "/status"
 BOOL_SCHEMA_NAME = "std_msgs/msg/Bool"
@@ -349,35 +349,20 @@ def test_episode_unknown_keys_raise_helpfully(dual_channel_source: Path) -> None
             episode.channel(9999)
 
 
-def test_transform_round_trips_both_channels(dual_channel_source: Path, tmp_path: Path) -> None:
+def test_transform_refuses_multiple_channels_on_one_topic(
+    dual_channel_source: Path, tmp_path: Path
+) -> None:
+    """Two channels on one topic used to be published, then crash the default
+    checks as an infrastructure failure. The transform now refuses before
+    writing, and ingest classifies that as the source (#597)."""
     output = tmp_path / "dual.canonical.mcap"
-    write_canonical_episode(dual_channel_source, output)
+    with pytest.raises(
+        SourceNotConforming, match=f"multiple channels for topic '{SHARED_TOPIC}'"
+    ) as raised:
+        write_canonical_episode(dual_channel_source, output)
 
-    with output.open("rb") as stream:
-        reader = make_reader(stream)
-        summary = reader.get_summary()
-        assert summary is not None
-        assert [channel.topic for channel in summary.channels.values()] == [
-            SHARED_TOPIC,
-            SHARED_TOPIC,
-        ]
-        channels_by_encoding = {
-            channel.message_encoding: channel for channel in summary.channels.values()
-        }
-        assert set(channels_by_encoding) == {"json", "cdr"}
-        # The schema-less json channel keeps the "no schema" sentinel; the CDR
-        # channel keeps its original schema byte-for-byte.
-        assert channels_by_encoding["json"].schema_id == 0
-        cdr_schema = summary.schemas[channels_by_encoding["cdr"].schema_id]
-        assert cdr_schema.name == BOOL_SCHEMA_NAME
-        assert cdr_schema.encoding == "ros2msg"
-        assert cdr_schema.data == BOOL_SCHEMA_TEXT
-
-        payloads_by_channel_id: dict[int, list[bytes]] = {}
-        for _schema, channel, message in reader.iter_messages(log_time_order=True):
-            payloads_by_channel_id.setdefault(channel.id, []).append(message.data)
-        assert payloads_by_channel_id[channels_by_encoding["json"].id] == JSON_PAYLOADS
-        assert payloads_by_channel_id[channels_by_encoding["cdr"].id] == CDR_PAYLOADS
-
-    report = diagnose(output)
-    assert report.conforming, report.summary()
+    message = str(raised.value)
+    assert "channel ids" in message
+    assert "topic-keyed reads cannot represent them" in message
+    assert classify_ingest_failure(raised.value) == IngestFailureKind.SOURCE_UNSUPPORTED
+    assert not output.exists()

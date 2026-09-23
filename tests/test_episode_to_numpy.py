@@ -52,31 +52,29 @@ def test_empty_channel_refuses() -> None:
         channel.to_numpy()
 
 
-def test_ambiguous_array_fields_list_candidates() -> None:
-    channel = _json_channel(
-        "/multi_array",
-        [{"field_a": [1.0, 2.0], "field_b": [3.0, 4.0]} for _ in range(2)],
-    )
+@pytest.mark.parametrize(
+    ("topic", "message_fields", "expected_message"),
+    [
+        pytest.param(
+            "/multi_array",
+            {"field_a": [1.0, 2.0], "field_b": [3.0, 4.0]},
+            r"topic '/multi_array' has multiple numeric array fields",
+            id="arrays",
+        ),
+        pytest.param(
+            "/multi_scalar",
+            {"field_a": 1.0, "field_b": 2.0},
+            r"topic '/multi_scalar' has multiple numeric fields",
+            id="scalars",
+        ),
+    ],
+)
+def test_ambiguous_fields_list_candidates(
+    topic: str, message_fields: dict[str, object], expected_message: str
+) -> None:
+    channel = _json_channel(topic, [message_fields for _ in range(2)])
 
-    with pytest.raises(
-        ValueError, match=r"topic '/multi_array' has multiple numeric array fields"
-    ) as excinfo:
-        channel.to_numpy()
-    message = str(excinfo.value)
-    assert "'field_a'" in message
-    assert "'field_b'" in message
-    assert "pass field=" in message
-
-
-def test_ambiguous_scalar_fields_list_candidates() -> None:
-    channel = _json_channel(
-        "/multi_scalar",
-        [{"field_a": 1.0, "field_b": 2.0} for _ in range(2)],
-    )
-
-    with pytest.raises(
-        ValueError, match=r"topic '/multi_scalar' has multiple numeric fields"
-    ) as excinfo:
+    with pytest.raises(ValueError, match=expected_message) as excinfo:
         channel.to_numpy()
     message = str(excinfo.value)
     assert "'field_a'" in message
@@ -152,21 +150,26 @@ def test_position_field_wins_over_other_arrays() -> None:
     np.testing.assert_array_equal(result, np.array([[1.0, 2.0], [5.0, 6.0]]))
 
 
-def test_lone_array_field_is_selected() -> None:
-    channel = _json_channel(
-        "/lone_array",
-        [{"joint_angles": [1.0, 2.0, 3.0]}, {"joint_angles": [4.0, 5.0, 6.0]}],
-    )
+@pytest.mark.parametrize(
+    ("topic", "messages", "expected"),
+    [
+        pytest.param(
+            "/lone_array",
+            [{"joint_angles": [1.0, 2.0, 3.0]}, {"joint_angles": [4.0, 5.0, 6.0]}],
+            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+            id="array",
+        ),
+        pytest.param(
+            "/lone_scalar",
+            [{"temperature": 20.5}, {"temperature": 21.0}],
+            [20.5, 21.0],
+            id="scalar",
+        ),
+    ],
+)
+def test_lone_numeric_field_is_selected(
+    topic: str, messages: list[dict[str, object]], expected: list[object]
+) -> None:
+    channel = _json_channel(topic, messages)
 
-    result = channel.to_numpy()
-    np.testing.assert_array_equal(result, np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]))
-
-
-def test_lone_scalar_field_is_selected() -> None:
-    channel = _json_channel(
-        "/lone_scalar",
-        [{"temperature": 20.5}, {"temperature": 21.0}],
-    )
-
-    result = channel.to_numpy()
-    np.testing.assert_array_equal(result, np.array([20.5, 21.0]))
+    np.testing.assert_array_equal(channel.to_numpy(), np.array(expected))

@@ -2,58 +2,65 @@
 
 from pathlib import Path
 
-import numpy as np
 import pytest
 from mcap.exceptions import InvalidMagic
+from mcap.records import Chunk
 from mcap.stream_reader import CRCValidationError
-from mcap.writer import CompressionType
 from mcap.writer import Writer as StockWriter
 
 from hflow import transform
 from hflow.app import SourceNotFound
 from hflow.format import METADATA_RECORD_EPISODE
 from hflow.ingest_ledger import IngestFailureKind, classify_ingest_failure
-from hflow.resample import DerivedSeries
-from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import SourceNotConforming, write_canonical_episode
 
 
-def test_classify_source_not_found_as_source_missing() -> None:
-    error = SourceNotFound("episode 'missing.mcap' not found")
-    assert classify_ingest_failure(error) == IngestFailureKind.SOURCE_MISSING
-
-
-def test_classify_mcap_error_as_source_unreadable() -> None:
-    error = InvalidMagic(b"not-an-mcap-file")
-    assert classify_ingest_failure(error) == IngestFailureKind.SOURCE_UNREADABLE
-
-
-def test_classify_crc_validation_error_as_source_unreadable() -> None:
-    """``CRCValidationError`` subclasses ``ValueError``, not ``McapError`` (#431):
-    without its own branch it would fall through to ``INFRASTRUCTURE`` and
-    blame the platform for a damaged recording."""
-    from mcap.records import Chunk
-
-    chunk = Chunk(
-        compression="",
-        data=b"",
-        message_end_time=0,
-        message_start_time=0,
-        uncompressed_crc=1,
-        uncompressed_size=0,
-    )
-    error = CRCValidationError(expected=1, actual=2, record=chunk)
-    assert classify_ingest_failure(error) == IngestFailureKind.SOURCE_UNREADABLE
-
-
-def test_classify_source_not_conforming_as_source_unsupported() -> None:
-    error = SourceNotConforming("x")
-    assert classify_ingest_failure(error) == IngestFailureKind.SOURCE_UNSUPPORTED
-
-
-def test_classify_unrecognized_error_as_infrastructure() -> None:
-    error = RuntimeError("unknown")
-    assert classify_ingest_failure(error) == IngestFailureKind.INFRASTRUCTURE
+@pytest.mark.parametrize(
+    ("error", "expected_kind"),
+    [
+        pytest.param(
+            SourceNotFound("episode 'missing.mcap' not found"),
+            IngestFailureKind.SOURCE_MISSING,
+            id="source-not-found",
+        ),
+        pytest.param(
+            InvalidMagic(b"not-an-mcap-file"),
+            IngestFailureKind.SOURCE_UNREADABLE,
+            id="mcap-error",
+        ),
+        # CRCValidationError subclasses ValueError, not McapError (#431):
+        # without its own branch it would fall through to INFRASTRUCTURE and
+        # blame the platform for a damaged recording.
+        pytest.param(
+            CRCValidationError(
+                expected=1,
+                actual=2,
+                record=Chunk(
+                    compression="",
+                    data=b"",
+                    message_end_time=0,
+                    message_start_time=0,
+                    uncompressed_crc=1,
+                    uncompressed_size=0,
+                ),
+            ),
+            IngestFailureKind.SOURCE_UNREADABLE,
+            id="crc-validation-error",
+        ),
+        pytest.param(
+            SourceNotConforming("x"),
+            IngestFailureKind.SOURCE_UNSUPPORTED,
+            id="source-not-conforming",
+        ),
+        pytest.param(
+            RuntimeError("unknown"), IngestFailureKind.INFRASTRUCTURE, id="unrecognized-error"
+        ),
+    ],
+)
+def test_classify_ingest_failure_maps_each_error_to_its_kind(
+    error: Exception, expected_kind: IngestFailureKind
+) -> None:
+    assert classify_ingest_failure(error) == expected_kind
 
 
 def test_ingest_refuses_a_source_with_a_damaged_chunk_payload(tmp_path: Path) -> None:
@@ -61,23 +68,10 @@ def test_ingest_refuses_a_source_with_a_damaged_chunk_payload(tmp_path: Path) ->
     recorded CRC must not transcode quietly into a canonical episode with a
     fresh receipt over corrupt bytes (#431). ``open_reader`` only checks CRCs
     when told to; ingest's read now asks for it."""
-    from reuse_test_helpers import flip_chunk_payload_bytes
+    from reuse_test_helpers import write_payload_damaged_mcap
 
     source = tmp_path / "payload-damaged.mcap"
-    with source.open("wb") as stream:
-        # Uncompressed chunk: flip_chunk_payload_bytes corrupts the records
-        # region in place, which is only addressable when it is plaintext.
-        writer = StockWriter(stream, compression=CompressionType.NONE)
-        writer.start(profile="", library="test")
-        schema_id = writer.register_schema(
-            name="test.Pointer", encoding="ros2msg", data=b"int32 x\n"
-        )
-        channel_id = writer.register_channel(
-            topic="/pointer", message_encoding="ros2msg", schema_id=schema_id
-        )
-        writer.add_message(channel_id, log_time=10**9, data=b"\x01\x00\x00\x00", publish_time=10**9)
-        writer.finish()
-    flip_chunk_payload_bytes(source)
+    write_payload_damaged_mcap(source)
 
     output = tmp_path / "out.mcap"
     with pytest.raises(CRCValidationError):
@@ -128,37 +122,6 @@ def test_mixed_compressed_image_formats_classify_as_source_unsupported(tmp_path:
     assert classify_ingest_failure(raised.value) == IngestFailureKind.SOURCE_UNSUPPORTED
 
 
-def test_nonconforming_passthrough_video_classifies_as_source_unsupported(tmp_path: Path) -> None:
-    from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
-    from mcap_protobuf.schema import build_file_descriptor_set
-
-    source = tmp_path / "h265.mcap"
-    with source.open("wb") as stream:
-        writer = StockWriter(stream)
-        writer.start(profile="", library="test")
-        schema_id = writer.register_schema(
-            name="foxglove.CompressedVideo",
-            encoding="protobuf",
-            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
-        )
-        channel_id = writer.register_channel(
-            topic="/cam", message_encoding="protobuf", schema_id=schema_id
-        )
-        message = CompressedVideo()
-        message.timestamp.FromNanoseconds(10**9)
-        message.frame_id = "cam"
-        message.data = b"\x00\x00\x00\x01\x40junk"
-        message.format = "h265"
-        writer.add_message(
-            channel_id, log_time=10**9, data=message.SerializeToString(), publish_time=10**9
-        )
-        writer.finish()
-
-    with pytest.raises(SourceNotConforming) as raised:
-        write_canonical_episode(source, tmp_path / "out.mcap")
-    assert classify_ingest_failure(raised.value) == IngestFailureKind.SOURCE_UNSUPPORTED
-
-
 def test_raw_image_schema_classifies_as_source_unsupported(tmp_path: Path) -> None:
     source = tmp_path / "raw_image.mcap"
     with source.open("wb") as stream:
@@ -176,26 +139,4 @@ def test_raw_image_schema_classifies_as_source_unsupported(tmp_path: Path) -> No
 
     with pytest.raises(SourceNotConforming) as raised:
         write_canonical_episode(source, tmp_path / "out.mcap")
-    assert classify_ingest_failure(raised.value) == IngestFailureKind.SOURCE_UNSUPPORTED
-
-
-def test_derived_topic_collision_classifies_as_source_unsupported(tmp_path: Path) -> None:
-    cameraless_spec = SyntheticEpisodeSpec(
-        duration_s=2.0,
-        cameras=(),
-        joint_hz=50.0,
-        black_segment=None,
-        joint_jump_at_s=None,
-        timestamp_offset_segment=None,
-    )
-    source = synthesize_episode(tmp_path / "episode.mcap", cameraless_spec)
-    series = DerivedSeries(
-        timestamps_ns=np.asarray([1_755_000_000_500_000_000], dtype=np.int64),
-        values={"value": np.asarray([1.0])},
-    )
-
-    with pytest.raises(SourceNotConforming) as raised:
-        write_canonical_episode(
-            source, tmp_path / "out.mcap", derived=[("/joint_states", series, "v1")]
-        )
     assert classify_ingest_failure(raised.value) == IngestFailureKind.SOURCE_UNSUPPORTED

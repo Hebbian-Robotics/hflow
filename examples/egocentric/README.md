@@ -71,6 +71,24 @@ Face's Xet transfer has been seen to hang on this shard; the plain path
 completes. Partial files fail the hash check rather than being used, so a
 stalled attempt costs time and nothing else.
 
+## Convert any WebDataset-style tar archive
+
+To convert full, un-sliced WebDataset-style shards (such as archives from
+[`builddotai/Egocentric-10K`](https://huggingface.co/datasets/builddotai/Egocentric-10K)
+or `builddotai/Egocentric-100K`) containing video clips, `.json` sidecars, and
+`intrinsics.json`:
+
+```bash
+uv run python examples/egocentric/convert.py path/to/shard.tar \
+    --output-dir data/egocentric/converted \
+    --canonical
+```
+
+The converter pairs each clip with its sidecar, maps `factory`, `worker`, `operator`,
+`duration`, `fps`, and `codec` onto `episode/v1` metadata records, attaches
+`intrinsics.json` as a calibration attachment, and encodes directly to Annex B H.264
+without an intermediate JPEG detour.
+
 ## Run the pipeline locally
 
 ```bash

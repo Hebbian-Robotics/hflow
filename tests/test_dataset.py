@@ -32,24 +32,22 @@ async def duration(ep: hflow.Episode) -> hflow.CheckResult:
 """
 
 
-@pytest.fixture(scope="module")
-def source_episode(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    return synthesize_episode(
-        tmp_path_factory.mktemp("dataset-source") / "episode_0001.mcap",
-        SyntheticEpisodeSpec(duration_s=1.0, cameras=()),
-    )
+def _make_project(
+    project_directory: Path, one_second_camera_less_episode: Path, pipeline_source: str
+) -> Path:
+    """A project with one episode waiting in ``episodes-in`` and ``pipeline_source``."""
+    episodes_in = project_directory / "data" / "episodes-in"
+    episodes_in.mkdir(parents=True)
+    (episodes_in / "episode_0001.mcap").write_bytes(one_second_camera_less_episode.read_bytes())
+    (project_directory / "pipeline.py").write_text(pipeline_source)
+    (project_directory / "hflow.toml").write_text('data_root = "./data"\n')
+    return project_directory
 
 
 @pytest.fixture
-def ingested_project(tmp_path: Path, source_episode: Path) -> Path:
+def ingested_project(tmp_path: Path, one_second_camera_less_episode: Path) -> Path:
     """A project whose one episode has been ingested by its own pipeline."""
-    data_root = tmp_path / "data"
-    episodes_in = data_root / "episodes-in"
-    episodes_in.mkdir(parents=True)
-    (episodes_in / "episode_0001.mcap").write_bytes(source_episode.read_bytes())
-    (tmp_path / "pipeline.py").write_text(PIPELINE_SOURCE)
-    (tmp_path / "hflow.toml").write_text('data_root = "./data"\n')
-    return tmp_path
+    return _make_project(tmp_path, one_second_camera_less_episode, PIPELINE_SOURCE)
 
 
 def _ingest(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -60,17 +58,6 @@ def _ingest(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestDefaultPolicy:
-    def test_it_selects_what_the_pipeline_currently_stands_behind(
-        self, ingested_project: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _ingest(ingested_project, monkeypatch)
-        app = hflow.import_pipeline_application(str(ingested_project / "pipeline.py"))
-
-        dataset = create_dataset(app, "clean")
-
-        assert dataset.row_count == 1
-        assert dataset.total_episodes == 1
-
     def test_a_step_that_never_ran_excludes_its_episodes(
         self, ingested_project: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -98,18 +85,41 @@ class TestDefaultPolicy:
         sql = default_dataset_sql(app)
 
         assert "'measured'" in sql
-        assert create_dataset(app, "evidence-only").row_count == 1
+        dataset = create_dataset(app, "evidence-only")
+        assert dataset.row_count == 1
+        assert dataset.total_episodes == 1
 
     def test_a_quarantined_episode_is_left_out(
         self, ingested_project: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        (ingested_project / "pipeline.py").write_text(
+            """
+import hflow
+
+app = hflow.App("dataset-demo", default_checks=())
+
+
+@app.check(
+    version="1",
+    critical=True,
+    gate=hflow.Gate(
+        accept_when=(hflow.Threshold("seconds", hflow.Comparison.AT_MOST, 0.5),)
+    ),
+)
+async def duration(ep: hflow.Episode) -> hflow.CheckResult:
+    return hflow.CheckResult(measurements={"seconds": 1.0})
+"""
+        )
         _ingest(ingested_project, monkeypatch)
         app = hflow.import_pipeline_application(str(ingested_project / "pipeline.py"))
-        sql = default_dataset_sql(app)
-        assert "status = 'ok'" in sql
+
+        dataset = create_dataset(app, "quarantine-excluded")
+
+        assert dataset.total_episodes == 1
+        assert dataset.row_count == 0
 
     def test_a_default_check_the_pipeline_supersedes_is_not_a_hole(
-        self, tmp_path: Path, source_episode: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, one_second_camera_less_episode: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The other empty-dataset trap, and the one the docs walk users into.
 
@@ -121,10 +131,9 @@ class TestDefaultPolicy:
         looked like a policy decision.
         """
         data_root = tmp_path / "data"
-        (data_root / "episodes-in").mkdir(parents=True)
-        (data_root / "episodes-in" / "episode_0001.mcap").write_bytes(source_episode.read_bytes())
-        (tmp_path / "hflow.toml").write_text('data_root = "./data"\n')
-        (tmp_path / "pipeline.py").write_text(
+        _make_project(
+            tmp_path,
+            one_second_camera_less_episode,
             """
 import hflow
 from hflow.checks import episode_duration
@@ -135,7 +144,7 @@ app = hflow.App("wrapper-demo")
 @app.check(version="1")
 async def my_duration(ep: hflow.Episode) -> hflow.CheckResult:
     return await episode_duration(ep)
-"""
+""",
         )
         _ingest(tmp_path, monkeypatch)
         app = hflow.import_pipeline_application(str(tmp_path / "pipeline.py"))
@@ -271,24 +280,18 @@ def test_slugs_fall_back_rather_than_being_refused() -> None:
     assert dataset_slug("!!!") == "dataset"
 
 
-def test_a_bucket_backed_workspace_can_write_a_manifest(tmp_path: Path) -> None:
+def test_a_bucket_backed_workspace_can_write_a_manifest(
+    bucket_over_tmp: tuple[BucketStorageRoot, Path], one_second_camera_less_episode: Path
+) -> None:
     """The hosted case, and the reason this moved out of the server: hosted
     workspaces are bucket data roots, and pinning used to refuse them with a
     501 because it did local path arithmetic."""
-    pytest.importorskip("obstore", reason="bucket tests need the hflow[bucket] extra")
     from hflow.dataset import write_dataset_manifest
-    from hflow.storage import BucketStorageRoot
-    from hflow.workspace import Workspace
 
-    remote_dir = tmp_path / "bucket"
-    remote_dir.mkdir()
-    storage_root = BucketStorageRoot(f"file://{remote_dir}", mirror=tmp_path / "mirror")
+    storage_root, remote_dir = bucket_over_tmp
     workspace = Workspace(storage_root)
     app = hflow.App("bucket-demo", data_root=storage_root, default_checks=())
-    source = synthesize_episode(
-        tmp_path / "episode_0001.mcap", SyntheticEpisodeSpec(duration_s=1.0, cameras=())
-    )
-    asyncio.run(app.process(source, record=True, verbose=False))
+    asyncio.run(app.process(one_second_camera_less_episode, record=True, verbose=False))
 
     written = write_dataset_manifest(workspace, name="clean", sql="SELECT episode_id FROM episodes")
 
@@ -345,7 +348,7 @@ class TestSettledThenCrashed:
     def test_recurring_outcome_becomes_current_and_consecutive_retries_deduplicate(
         self,
         tmp_path: Path,
-        source_episode: Path,
+        one_second_camera_less_episode: Path,
         monkeypatch: pytest.MonkeyPatch,
         bucket_over_tmp: tuple[BucketStorageRoot, Path],
         first_errors: bool,
@@ -368,7 +371,7 @@ class TestSettledThenCrashed:
             for retry in range(2):
                 report = asyncio.run(
                     app.process(
-                        source_episode,
+                        one_second_camera_less_episode,
                         record=True,
                         stages="full" if attempt == retry == 0 else stages,
                         execution_id=f"attempt-{attempt}" if explicit_execution else None,
@@ -408,14 +411,8 @@ class TestSettledThenCrashed:
         assert len({entry.run_fingerprint for entry in entries}) == 3
 
     @pytest.fixture
-    def project(self, tmp_path: Path, source_episode: Path) -> Path:
-        data_root = tmp_path / "data"
-        episodes_in = data_root / "episodes-in"
-        episodes_in.mkdir(parents=True)
-        (episodes_in / "episode_0001.mcap").write_bytes(source_episode.read_bytes())
-        (tmp_path / "pipeline.py").write_text(CRASHING_PIPELINE_SOURCE)
-        (tmp_path / "hflow.toml").write_text('data_root = "./data"\n')
-        return tmp_path
+    def project(self, tmp_path: Path, one_second_camera_less_episode: Path) -> Path:
+        return _make_project(tmp_path, one_second_camera_less_episode, CRASHING_PIPELINE_SOURCE)
 
     def test_a_later_crash_withdraws_an_earlier_settled_result(
         self, project: Path, monkeypatch: pytest.MonkeyPatch

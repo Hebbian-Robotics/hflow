@@ -6,13 +6,16 @@ verify_dataset_snapshot must report exactly the damage -- nothing more,
 nothing less.
 """
 
+import copy
 import hashlib
 import json
 import shutil
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, TypeVar
 
 import pytest
-from test_dataset_snapshot import _append_snapshot_episode
+from catalog_test_helpers import append_snapshot_episode
 
 import hflow
 from hflow.catalog import Catalog
@@ -22,10 +25,10 @@ from hflow.snapshot import verify_dataset_snapshot
 
 def _export_two_episode_snapshot(tmp_path: Path, media_mode: str) -> tuple[Path, dict]:
     catalog = Catalog(tmp_path / "catalog")
-    selected_episode_id, _ = _append_snapshot_episode(
+    selected_episode_id, _ = append_snapshot_episode(
         catalog, tmp_path, name="fold-shirt", score=0.75, with_media=(media_mode == "copy")
     )
-    _append_snapshot_episode(catalog, tmp_path, name="pour-water", score=0.25, with_media=False)
+    append_snapshot_episode(catalog, tmp_path, name="pour-water", score=0.25, with_media=False)
     manifest = tmp_path / "manifest.parquet"
     hflow.curate(
         catalog.location,
@@ -40,6 +43,64 @@ def _export_two_episode_snapshot(tmp_path: Path, media_mode: str) -> tuple[Path,
     return output_directory, marker
 
 
+ExportedSnapshotCopier = Callable[[Path, str], tuple[Path, dict]]
+
+
+@pytest.fixture(scope="module")
+def exported_snapshot_templates(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> dict[str, tuple[Path, dict]]:
+    """One real export per media mode, built once and never handed out.
+
+    Tests damage their delivery, so each one gets a copy (see
+    ``exported_snapshot``). Tests about which root verify reads, and the
+    read-only test that also watches the catalog, export fresh instead: a
+    surviving template would mask a read outside the handed root.
+    """
+    return {
+        media_mode: _export_two_episode_snapshot(
+            tmp_path_factory.mktemp(f"snapshot-template-{media_mode}"), media_mode
+        )
+        for media_mode in ("references", "copy")
+    }
+
+
+@pytest.fixture
+def exported_snapshot(
+    exported_snapshot_templates: dict[str, tuple[Path, dict]],
+) -> ExportedSnapshotCopier:
+    """Copy the module's export for ``media_mode`` under ``destination_root``."""
+
+    def copy_exported_snapshot(destination_root: Path, media_mode: str) -> tuple[Path, dict]:
+        template_directory, marker = exported_snapshot_templates[media_mode]
+        output_directory = destination_root / "dataset-snapshot"
+        shutil.copytree(template_directory, output_directory)
+        return output_directory, copy.deepcopy(marker)
+
+    return copy_exported_snapshot
+
+
+def _flip_middle_byte(path: Path) -> None:
+    """Same length, different content: a damage only the hash can see."""
+    data = bytearray(path.read_bytes())
+    data[len(data) // 2] ^= 0xFF
+    path.write_bytes(bytes(data))
+
+
+EditResult = TypeVar("EditResult")
+
+
+def _edit_marker(
+    output_directory: Path, edit: Callable[[dict[str, Any]], EditResult]
+) -> EditResult:
+    """Apply ``edit`` to format.json in place and rewrite it as hflow does."""
+    marker_path = output_directory / "format.json"
+    marker = json.loads(marker_path.read_text())
+    edit_result = edit(marker)
+    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+    return edit_result
+
+
 def _rewrite_format_without_integrity(output_directory: Path) -> None:
     marker_path = output_directory / "format.json"
     marker = json.loads(marker_path.read_text())
@@ -47,28 +108,24 @@ def _rewrite_format_without_integrity(output_directory: Path) -> None:
     marker_path.write_text(json.dumps(marker, indent=2))
 
 
-def test_clean_snapshot_verifies_clean_in_references_mode(tmp_path: Path) -> None:
-    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
+@pytest.mark.parametrize("media_mode", ["references", "copy"])
+def test_clean_snapshot_verifies_clean(
+    tmp_path: Path, exported_snapshot: ExportedSnapshotCopier, media_mode: str
+) -> None:
+    output_directory, _ = exported_snapshot(tmp_path, media_mode)
     report = verify_dataset_snapshot(output_directory)
     assert report.ok
     assert report.findings == []
 
 
-def test_clean_snapshot_verifies_clean_in_copy_mode(tmp_path: Path) -> None:
-    output_directory, _ = _export_two_episode_snapshot(tmp_path, "copy")
-    report = verify_dataset_snapshot(output_directory)
-    assert report.ok
-    assert report.findings == []
-
-
-def test_bytes_changed_reports_content_mismatch_alone(tmp_path: Path) -> None:
+def test_bytes_changed_reports_content_mismatch_alone(
+    tmp_path: Path, exported_snapshot: ExportedSnapshotCopier
+) -> None:
     """Same size, different bytes: the receipt must call this a content
     mismatch, not a size mismatch, and must not raise."""
-    output_directory, marker = _export_two_episode_snapshot(tmp_path, "references")
+    output_directory, marker = exported_snapshot(tmp_path, "references")
     table_path = output_directory / marker["integrity"]["tables"]["samples"]["path"]
-    data = bytearray(table_path.read_bytes())
-    data[len(data) // 2] ^= 0xFF  # same length, different content
-    table_path.write_bytes(bytes(data))
+    _flip_middle_byte(table_path)  # same length, different content
 
     report = verify_dataset_snapshot(output_directory)
 
@@ -79,8 +136,10 @@ def test_bytes_changed_reports_content_mismatch_alone(tmp_path: Path) -> None:
     assert finding.detail
 
 
-def test_missing_file_reports_missing_alone(tmp_path: Path) -> None:
-    output_directory, marker = _export_two_episode_snapshot(tmp_path, "references")
+def test_missing_file_reports_missing_alone(
+    tmp_path: Path, exported_snapshot: ExportedSnapshotCopier
+) -> None:
+    output_directory, marker = exported_snapshot(tmp_path, "references")
     (output_directory / marker["integrity"]["tables"]["samples"]["path"]).unlink()
 
     report = verify_dataset_snapshot(output_directory)
@@ -90,41 +149,42 @@ def test_missing_file_reports_missing_alone(tmp_path: Path) -> None:
     assert marker["integrity"]["tables"]["samples"]["path"] in report.findings[0].uri
 
 
-def test_removed_receipt_entry_and_file_raise_inventory_mismatch(tmp_path: Path) -> None:
+def test_removed_receipt_entry_and_file_raise_inventory_mismatch(
+    tmp_path: Path, exported_snapshot: ExportedSnapshotCopier
+) -> None:
     """#473's deleted-member case: when a receipt entry and its file are both
     gone, the surviving entries agree with each other and every per-file
     check passes; only the stored inventory content_id, computed over the
     original set, can witness the loss. The marker is internally
     inconsistent, so verify raises (CLI exit 2) instead of certifying."""
 
-    def strip_measurements(output_directory: Path) -> str:
-        marker_path = output_directory / "format.json"
-        marker = json.loads(marker_path.read_text())
-        entry = marker["integrity"]["tables"].pop("measurements")
-        marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+    def strip_measurements(output_directory: Path) -> None:
+        entry = _edit_marker(
+            output_directory, lambda marker: marker["integrity"]["tables"].pop("measurements")
+        )
         (output_directory / entry["path"]).unlink()
-        return entry["path"]
 
-    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
-    removed = strip_measurements(output_directory)
+    output_directory, _ = exported_snapshot(tmp_path, "references")
+    strip_measurements(output_directory)
 
     with pytest.raises(ValueError, match="content_id"):
         verify_dataset_snapshot(output_directory)
 
-    # A fresh export for the CLI path: the raise must map to exit 2, the
+    # A second delivery for the CLI path: the raise must map to exit 2, the
     # unreadable-input code, not to a findings-based exit.
-    output_directory, _ = _export_two_episode_snapshot(tmp_path / "cli", "references")
+    output_directory, _ = exported_snapshot(tmp_path / "cli", "references")
     strip_measurements(output_directory)
     assert cli_main(["verify", "snapshot", str(output_directory)]) == 2
-    assert removed
 
 
-def test_deleted_file_with_intact_receipt_reports_missing(tmp_path: Path) -> None:
+def test_deleted_file_with_intact_receipt_reports_missing(
+    tmp_path: Path, exported_snapshot: ExportedSnapshotCopier
+) -> None:
     """Negative control for #473: delete the file but keep its receipt entry.
     This is the ordinary ``missing`` path and must keep reporting DAMAGED
     with or without the inventory gate; it exercises the per-file loop, not
     the gate."""
-    output_directory, marker = _export_two_episode_snapshot(tmp_path, "references")
+    output_directory, marker = exported_snapshot(tmp_path, "references")
     (output_directory / marker["integrity"]["tables"]["measurements"]["path"]).unlink()
 
     report = verify_dataset_snapshot(output_directory)
@@ -139,7 +199,7 @@ def test_deleted_file_with_intact_receipt_reports_missing(tmp_path: Path) -> Non
     ids=["absent", "empty", "not-a-string", "wrong-type"],
 )
 def test_receipt_without_a_usable_content_id_is_refused(
-    tmp_path: Path, replacement: object, label: str
+    tmp_path: Path, exported_snapshot: ExportedSnapshotCopier, replacement: object, label: str
 ) -> None:
     """The other half of the #473 gate, which the mismatch test cannot reach.
 
@@ -150,14 +210,15 @@ def test_receipt_without_a_usable_content_id_is_refused(
     something hflow writes (both arrived in #401), which is exactly why a
     marker carrying one is unreadable input rather than damaged bytes.
     """
-    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
-    marker_path = output_directory / "format.json"
-    marker = json.loads(marker_path.read_text())
-    if replacement is None:
-        marker["integrity"].pop("content_id")
-    else:
-        marker["integrity"]["content_id"] = replacement
-    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+    output_directory, _ = exported_snapshot(tmp_path, "references")
+
+    def replace_content_id(marker: dict[str, Any]) -> None:
+        if replacement is None:
+            marker["integrity"].pop("content_id")
+        else:
+            marker["integrity"]["content_id"] = replacement
+
+    _edit_marker(output_directory, replace_content_id)
 
     with pytest.raises(ValueError, match="no usable content_id"):
         verify_dataset_snapshot(output_directory)
@@ -165,12 +226,46 @@ def test_receipt_without_a_usable_content_id_is_refused(
     assert cli_main(["verify", "snapshot", str(output_directory)]) == 2, label
 
 
+@pytest.mark.parametrize(
+    ("field", "replacement", "match"),
+    [
+        ("tables", None, r"integrity\.tables must be a JSON object"),
+        ("tables", [], r"integrity\.tables must be a JSON object"),
+        ("assets", None, r"integrity\.assets must be a JSON array"),
+        ("assets", {}, r"integrity\.assets must be a JSON array"),
+    ],
+    ids=["tables-null", "tables-array", "assets-null", "assets-object"],
+)
+def test_null_or_wrong_type_integrity_containers_are_refused_at_the_boundary(
+    tmp_path: Path,
+    exported_snapshot: ExportedSnapshotCopier,
+    field: str,
+    replacement: object,
+    match: str,
+) -> None:
+    """#575: present-but-null (or wrong-type) tables/assets used to crash.
+
+    ``integrity.get("tables", {})`` does not apply when the key exists with
+    JSON ``null``, so verify raised AttributeError/TypeError through the CLI
+    instead of exit 2. Same family as #489's typed entry boundary.
+    """
+    output_directory, _ = exported_snapshot(tmp_path, "references")
+    _edit_marker(
+        output_directory, lambda marker: marker["integrity"].__setitem__(field, replacement)
+    )
+
+    with pytest.raises(ValueError, match=match):
+        verify_dataset_snapshot(output_directory)
+
+    assert cli_main(["verify", "snapshot", str(output_directory)]) == 2
+
+
 def test_truncated_file_reports_size_mismatch_and_skips_the_hash(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, exported_snapshot: ExportedSnapshotCopier, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Size is the cheap pre-filter: a truncated file is reported by size
     alone without spending the hash read."""
-    output_directory, marker = _export_two_episode_snapshot(tmp_path, "references")
+    output_directory, marker = exported_snapshot(tmp_path, "references")
     table_path = output_directory / marker["integrity"]["tables"]["measurements"]["path"]
     original = table_path.read_bytes()
     table_path.write_bytes(original[: len(original) // 2])
@@ -195,15 +290,15 @@ def test_truncated_file_reports_size_mismatch_and_skips_the_hash(
     assert hashed, "spy must have recorded at least one hashed file"
 
 
-def test_copied_asset_damage_is_reported(tmp_path: Path) -> None:
+def test_copied_asset_damage_is_reported(
+    tmp_path: Path, exported_snapshot: ExportedSnapshotCopier
+) -> None:
     """Copy mode stores media inside the snapshot; the receipt covers it."""
-    output_directory, marker = _export_two_episode_snapshot(tmp_path, "copy")
+    output_directory, marker = exported_snapshot(tmp_path, "copy")
     assert marker["integrity"]["assets"], "fixture must include copied assets"
     asset_uri = marker["integrity"]["assets"][0]["path"]
     asset_path = output_directory / asset_uri
-    data = bytearray(asset_path.read_bytes())
-    data[len(data) // 2] ^= 0xFF
-    asset_path.write_bytes(bytes(data))
+    _flip_middle_byte(asset_path)
 
     report = verify_dataset_snapshot(output_directory)
 
@@ -212,10 +307,12 @@ def test_copied_asset_damage_is_reported(tmp_path: Path) -> None:
     assert damaged and damaged[0].reason == "content-id-mismatch"
 
 
-def test_pre_401_format_json_is_unverifiable_not_corrupt(tmp_path: Path) -> None:
+def test_pre_401_format_json_is_unverifiable_not_corrupt(
+    tmp_path: Path, exported_snapshot: ExportedSnapshotCopier
+) -> None:
     """A valid v1 snapshot without an integrity receipt is unverifiable, not
     corrupt: the finding says no_receipt and nothing raises."""
-    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
+    output_directory, _ = exported_snapshot(tmp_path, "references")
     _rewrite_format_without_integrity(output_directory)
 
     report = verify_dataset_snapshot(output_directory)
@@ -255,54 +352,55 @@ def test_foreign_marker_is_refused_at_the_boundary(tmp_path: Path) -> None:
     assert cli_main(["verify", "snapshot", str(foreign)]) == 2
 
 
-def test_unsupported_or_mistyped_version_is_refused(tmp_path: Path) -> None:
-    """#472: version 1 is the only version there has ever been, and the
-    comparison is deliberately identical to the writer, which records the
-    version as a string. A future version raises, and so does a JSON number
-    1: an easy honest mistake, so the error says exactly why."""
-    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
-    marker_path = output_directory / "format.json"
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        # #472: version 1 is the only version there has ever been, and the
+        # comparison is deliberately identical to the writer, which records
+        # the version as a string. A future version raises, and so does a JSON
+        # number 1: an easy honest mistake, so the error says exactly why.
+        pytest.param("format_version", "2", "format_version '2'", id="future-version"),
+        pytest.param("format_version", 1, "JSON number 1 is refused", id="numeric-version"),
+        # The other half of the identity predicate.
+        # `test_foreign_marker_is_refused_at_the_boundary` uses a marker
+        # carrying neither field, so the version check alone refuses it and the
+        # format-name check is never the thing that fires. Dropping the name
+        # comparison from the predicate left the whole suite green. A marker
+        # claiming version 1 of somebody else's format is still not ours.
+        pytest.param(
+            "format",
+            "someone-elses-dataset-snapshot",
+            "someone-elses-dataset-snapshot",
+            id="foreign-format-name",
+        ),
+    ],
+)
+def test_a_marker_that_is_not_our_format_version_1_is_refused(
+    tmp_path: Path, exported_snapshot: ExportedSnapshotCopier, field: str, value: object, match: str
+) -> None:
+    output_directory, _ = exported_snapshot(tmp_path, "references")
+    _edit_marker(output_directory, lambda marker: marker.__setitem__(field, value))
 
-    marker = json.loads(marker_path.read_text())
-    marker["format_version"] = "2"
-    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
-    with pytest.raises(ValueError, match="format_version '2'"):
-        verify_dataset_snapshot(output_directory)
-
-    marker["format_version"] = 1
-    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
-    with pytest.raises(ValueError, match="JSON number 1 is refused"):
-        verify_dataset_snapshot(output_directory)
-
-    marker["format_version"] = "1"
-    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
-    assert cli_main(["verify", "snapshot", str(output_directory)]) == 0
-
-
-def test_a_right_version_with_a_foreign_format_name_is_refused(tmp_path: Path) -> None:
-    """The other half of the identity predicate.
-
-    `test_foreign_marker_is_refused_at_the_boundary` uses a marker carrying
-    neither field, so the version check alone refuses it and the format-name
-    check is never the thing that fires. Dropping the name comparison from
-    the predicate left the whole suite green. This pins it: a marker claiming
-    version 1 of somebody else's format is still not ours to certify.
-    """
-    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
-    marker_path = output_directory / "format.json"
-    marker = json.loads(marker_path.read_text())
-    marker["format"] = "someone-elses-dataset-snapshot"
-    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
-
-    with pytest.raises(ValueError, match="someone-elses-dataset-snapshot"):
+    with pytest.raises(ValueError, match=match):
         verify_dataset_snapshot(output_directory)
     assert cli_main(["verify", "snapshot", str(output_directory)]) == 2
 
 
-def test_extra_files_under_assets_are_ignored(tmp_path: Path) -> None:
+def test_a_rewritten_marker_with_the_string_version_1_still_verifies(
+    tmp_path: Path, exported_snapshot: ExportedSnapshotCopier
+) -> None:
+    """The control for the version refusals: the writer's own spelling passes."""
+    output_directory, _ = exported_snapshot(tmp_path, "references")
+    _edit_marker(output_directory, lambda marker: marker.__setitem__("format_version", "1"))
+    assert cli_main(["verify", "snapshot", str(output_directory)]) == 0
+
+
+def test_extra_files_under_assets_are_ignored(
+    tmp_path: Path, exported_snapshot: ExportedSnapshotCopier
+) -> None:
     """Files the receipt does not name produce no finding and no warning:
     unlisted extras are outside the receipt's contract."""
-    output_directory, _ = _export_two_episode_snapshot(tmp_path, "copy")
+    output_directory, _ = exported_snapshot(tmp_path, "copy")
     (output_directory / "assets" / "unlisted-extra.bin").write_bytes(b"extra bytes")
 
     report = verify_dataset_snapshot(output_directory)
@@ -311,14 +409,14 @@ def test_extra_files_under_assets_are_ignored(tmp_path: Path) -> None:
     assert report.findings == []
 
 
-def test_partial_transfer_reports_every_mismatch_in_one_report(tmp_path: Path) -> None:
+def test_partial_transfer_reports_every_mismatch_in_one_report(
+    tmp_path: Path, exported_snapshot: ExportedSnapshotCopier
+) -> None:
     """A partial transfer usually damages more than one file: the report
     carries every mismatch in one list instead of raising on the first."""
-    output_directory, marker = _export_two_episode_snapshot(tmp_path, "references")
+    output_directory, marker = exported_snapshot(tmp_path, "references")
     samples_path = output_directory / marker["integrity"]["tables"]["samples"]["path"]
-    data = bytearray(samples_path.read_bytes())
-    data[len(data) // 2] ^= 0xFF
-    samples_path.write_bytes(bytes(data))
+    _flip_middle_byte(samples_path)
     (output_directory / marker["integrity"]["tables"]["tags"]["path"]).unlink()
 
     report = verify_dataset_snapshot(output_directory)
@@ -328,18 +426,18 @@ def test_partial_transfer_reports_every_mismatch_in_one_report(tmp_path: Path) -
     assert reasons == ["content-id-mismatch", "missing"]
 
 
-def test_verify_snapshot_cli_exit_codes(tmp_path: Path) -> None:
+def test_verify_snapshot_cli_exit_codes(
+    tmp_path: Path, exported_snapshot: ExportedSnapshotCopier
+) -> None:
     """0 clean, 1 damaged, 3 unverifiable, 2 unreadable -- through the CLI."""
-    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
+    output_directory, _ = exported_snapshot(tmp_path, "references")
     argv = ["verify", "snapshot", str(output_directory)]
     assert cli_main(argv) == 0
 
     marker_path = output_directory / "format.json"
     marker = json.loads(marker_path.read_text())
     table_path = output_directory / marker["integrity"]["tables"]["samples"]["path"]
-    data = bytearray(table_path.read_bytes())
-    data[len(data) // 2] ^= 0xFF
-    table_path.write_bytes(bytes(data))
+    _flip_middle_byte(table_path)
     assert cli_main(argv) == 1
 
     _rewrite_format_without_integrity(output_directory)
@@ -397,9 +495,7 @@ def test_moved_root_verifies_from_the_new_root_alone(tmp_path: Path) -> None:
     assert clean_report.findings == []
 
     table_path = root_b / marker["integrity"]["tables"]["samples"]["path"]
-    data = bytearray(table_path.read_bytes())
-    data[len(data) // 2] ^= 0xFF  # same length, different content
-    table_path.write_bytes(bytes(data))
+    _flip_middle_byte(table_path)  # same length, different content
 
     damaged_report = verify_dataset_snapshot(root_b)
     assert not damaged_report.ok
@@ -417,9 +513,7 @@ def test_damage_is_reported_from_the_verified_root_not_the_export_root(
     root_b = tmp_path / "damaged-delivery"
     shutil.copytree(root_a, root_b)
     table_path = root_b / marker["integrity"]["tables"]["samples"]["path"]
-    data = bytearray(table_path.read_bytes())
-    data[len(data) // 2] ^= 0xFF
-    table_path.write_bytes(bytes(data))
+    _flip_middle_byte(table_path)
 
     assert verify_dataset_snapshot(root_a).ok
     damaged_report = verify_dataset_snapshot(root_b)
@@ -472,9 +566,6 @@ def test_inventory_digest_is_byte_identical_through_the_record_bridge() -> None:
     )
 
     assert new_payload == old_payload
-    assert hflow.snapshot._inventory_content_id(records) == hflow.snapshot._inventory_content_id(
-        [hflow.snapshot._parse_file_integrity_record(entry) for entry in _KNOWN_RECEIPT_ENTRIES]
-    )
     assert hflow.snapshot._inventory_content_id(records) == _GOLDEN_INVENTORY_CONTENT_ID
 
 
@@ -593,15 +684,3 @@ def test_normalized_parent_escape_through_an_existing_subdir_is_refused(
     with pytest.raises(ValueError, match="must stay under the handed snapshot directory"):
         verify_dataset_snapshot(snap)
     assert cli_main(["verify", "snapshot", str(snap)]) == 2
-
-
-def test_honest_relative_receipt_path_still_verifies_after_containment_gate(
-    tmp_path: Path,
-) -> None:
-    """Containment must not break a clean export: relative keys under the root
-    still pass size and sha256 checks."""
-    output_directory, _ = _export_two_episode_snapshot(tmp_path, "references")
-    report = verify_dataset_snapshot(output_directory)
-    assert report.ok
-    assert report.findings == []
-    assert cli_main(["verify", "snapshot", str(output_directory)]) == 0

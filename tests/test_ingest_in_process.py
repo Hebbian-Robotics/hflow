@@ -13,7 +13,6 @@ import pytest
 import hflow
 from hflow.cli import main as cli_main
 from hflow.curation import open_catalog_connection
-from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
 PIPELINE_SOURCE = """
 import hflow
@@ -24,21 +23,13 @@ app.check(version="1")(episode_duration)
 """
 
 
-@pytest.fixture(scope="module")
-def source_episode(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    return synthesize_episode(
-        tmp_path_factory.mktemp("in-process-source") / "episode_0001.mcap",
-        SyntheticEpisodeSpec(duration_s=1.0, cameras=()),
-    )
-
-
 @pytest.fixture
-def project(tmp_path: Path, source_episode: Path) -> Path:
+def project(tmp_path: Path, one_second_camera_less_episode: Path) -> Path:
     """A project with a pipeline, a data root, and one episode to ingest."""
     data_root = tmp_path / "data"
     episodes_in = data_root / "episodes-in"
     episodes_in.mkdir(parents=True)
-    (episodes_in / "episode_0001.mcap").write_bytes(source_episode.read_bytes())
+    (episodes_in / "episode_0001.mcap").write_bytes(one_second_camera_less_episode.read_bytes())
     (tmp_path / "pipeline.py").write_text(PIPELINE_SOURCE)
     (tmp_path / "hflow.toml").write_text('data_root = "./data"\n')
     return tmp_path
@@ -184,7 +175,6 @@ def test_a_failed_source_is_recorded_where_it_can_be_found(
     """A source that never canonicalized has no catalog row to be, and this
     executor has no task log behind it, so without the ledger the only trace
     of a failure is a traceback nobody kept."""
-    from hflow.curation import open_catalog_connection
 
     monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
     monkeypatch.delenv("HFLOW_AIRFLOW_URL", raising=False)
@@ -194,14 +184,18 @@ def test_a_failed_source_is_recorded_where_it_can_be_found(
     assert cli_main(["ingest", "episodes-in/corrupt.mcap"]) == 1
     assert "ingest_failures" in capsys.readouterr().err
 
+    # The ledger writes the catalog's format marker first: otherwise a corpus
+    # whose every episode failed would hold a table no reader would open.
     connection = open_catalog_connection(project / "data" / "catalog")
     try:
         rows = connection.execute(
             "SELECT source_uri, stage, failure_kind, error_type FROM ingest_failures"
         ).fetchall()
+        episode_count = connection.execute("SELECT count(*) FROM episodes").fetchone()
     finally:
         connection.close()
     assert rows == [("episodes-in/corrupt.mcap", "sync", "source-unreadable", "InvalidMagic")]
+    assert episode_count == (0,)
 
 
 def test_a_payload_damaged_source_is_classified_the_same_as_unreadable(
@@ -211,30 +205,13 @@ def test_a_payload_damaged_source_is_classified_the_same_as_unreadable(
     partial copy) must fail ingest the same way a not-MCAP file does (#431),
     not transcode quietly into a canonical episode with a receipt over
     corrupt bytes. Distinct from the not-MCAP case only in ``error_type``."""
-    from mcap.writer import CompressionType
-    from mcap.writer import Writer as StockWriter
-    from reuse_test_helpers import flip_chunk_payload_bytes
-
-    from hflow.curation import open_catalog_connection
+    from reuse_test_helpers import write_payload_damaged_mcap
 
     monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
     monkeypatch.delenv("HFLOW_AIRFLOW_URL", raising=False)
 
     damaged = project / "data" / "episodes-in" / "payload-damaged.mcap"
-    with damaged.open("wb") as stream:
-        # Uncompressed chunk: flip_chunk_payload_bytes corrupts the records
-        # region in place, which is only addressable when it is plaintext.
-        writer = StockWriter(stream, compression=CompressionType.NONE)
-        writer.start(profile="", library="test")
-        schema_id = writer.register_schema(
-            name="test.Pointer", encoding="ros2msg", data=b"int32 x\n"
-        )
-        channel_id = writer.register_channel(
-            topic="/pointer", message_encoding="ros2msg", schema_id=schema_id
-        )
-        writer.add_message(channel_id, log_time=10**9, data=b"\x01\x00\x00\x00", publish_time=10**9)
-        writer.finish()
-    flip_chunk_payload_bytes(damaged)
+    write_payload_damaged_mcap(damaged)
     monkeypatch.chdir(project)
 
     assert cli_main(["ingest", "episodes-in/payload-damaged.mcap"]) == 1
@@ -257,7 +234,6 @@ def test_a_source_that_is_not_there_is_not_blamed_on_the_data(
 ) -> None:
     """ "Your file is bad" and "your file is missing" send people to different
     places, so they are different kinds."""
-    from hflow.curation import open_catalog_connection
 
     monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
     monkeypatch.delenv("HFLOW_AIRFLOW_URL", raising=False)
@@ -276,7 +252,6 @@ def test_a_source_that_is_not_there_is_not_blamed_on_the_data(
 def test_replaying_the_same_failure_records_one_row(
     project: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from hflow.curation import open_catalog_connection
 
     monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
     monkeypatch.delenv("HFLOW_AIRFLOW_URL", raising=False)
@@ -288,28 +263,6 @@ def test_replaying_the_same_failure_records_one_row(
 
     connection = open_catalog_connection(project / "data" / "catalog")
     try:
-        assert connection.execute("SELECT count(*) FROM ingest_failures").fetchone() == (1,)
-    finally:
-        connection.close()
-
-
-def test_a_workspace_where_everything_failed_still_opens(
-    project: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The ledger writes the catalog's format marker first: otherwise a corpus
-    whose every episode failed would hold a table no reader would open."""
-    from hflow.curation import open_catalog_connection
-
-    monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
-    monkeypatch.delenv("HFLOW_AIRFLOW_URL", raising=False)
-    (project / "data" / "episodes-in" / "corrupt.mcap").write_bytes(b"not an mcap file")
-    monkeypatch.chdir(project)
-
-    cli_main(["ingest", "episodes-in/corrupt.mcap"])
-
-    connection = open_catalog_connection(project / "data" / "catalog")
-    try:
-        assert connection.execute("SELECT count(*) FROM episodes").fetchone() == (0,)
         assert connection.execute("SELECT count(*) FROM ingest_failures").fetchone() == (1,)
     finally:
         connection.close()

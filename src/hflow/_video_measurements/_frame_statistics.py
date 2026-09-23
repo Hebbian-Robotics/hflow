@@ -41,6 +41,13 @@ class UnsupportedVideoMeasurementToolchainError(RuntimeError):
     """The supplied FFmpeg build lacks a filter required by the measurement."""
 
 
+class LumaRangePolicy(StrEnum):
+    """Whether measurements retain decoded luma or normalize its declared range."""
+
+    PRESERVE = "preserve"
+    FULL = "full"
+
+
 class LumaRangeEvidence(StrEnum):
     """What decoded luma samples show about the nominal limited range."""
 
@@ -76,8 +83,11 @@ class FrameStatisticsSettings:
     freeze_noise_tolerance_decibels: float = -60.0
     freeze_minimum_duration_seconds: float = 2.0
     overexposed_average_luma_threshold: float = 235.0
+    luma_range: LumaRangePolicy = LumaRangePolicy.PRESERVE
 
     def __post_init__(self) -> None:
+        if not isinstance(self.luma_range, LumaRangePolicy):
+            raise ValueError("luma_range must be a LumaRangePolicy")
         require_int(
             self.black_frame_minimum_pixel_share_percent,
             "black_frame_minimum_pixel_share_percent",
@@ -595,13 +605,27 @@ def _temporary_instrument_cache_output(
 
 def frame_statistics_filter_graph(settings: FrameStatisticsSettings) -> str:
     """Return the effective single-pass FFmpeg measurement graph."""
-    return (
+    return frame_statistics_filter_chain(settings, metadata_destination="-")
+
+
+def frame_statistics_filter_chain(
+    settings: FrameStatisticsSettings, *, metadata_destination: str
+) -> str:
+    """Build the measurement chain, printing per-frame metadata to the destination.
+
+    Provenance always records the ``-`` (standard output) form; a shared decode
+    prints to a private file so one FFmpeg process can emit several measurements.
+    """
+    normalization = (
+        "scale=in_range=auto:out_range=full," if settings.luma_range is LumaRangePolicy.FULL else ""
+    )
+    return normalization + (
         "format=pix_fmts=yuv420p,"
         f"blackframe=amount=0:threshold={settings.black_pixel_luma_threshold},"
         "freezedetect="
         f"n={settings.freeze_noise_tolerance_decibels}dB:"
         f"d={settings.freeze_minimum_duration_seconds},"
-        "signalstats=stat=tout+brng,metadata=mode=print:file=-"
+        f"signalstats=stat=tout+brng,metadata=mode=print:file={metadata_destination}"
     )
 
 

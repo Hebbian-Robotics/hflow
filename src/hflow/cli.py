@@ -1407,39 +1407,40 @@ def _command_ingest(arguments: argparse.Namespace) -> int:
         client = client_for_bundle(paths)
         dag_id = paths.dag_id
         watch_location = paths.api_base_url
-    try:
-        if arguments.step_names is None:
-            dag_run = client.ingest(
-                dag_id,
-                [str(uri) for uri in uris],
-                profile=arguments.profile,
-                online=arguments.online,
-            )
-        else:
-            dag_run = client.ingest(
-                dag_id,
-                [str(uri) for uri in uris],
-                profile=arguments.profile,
-                online=arguments.online,
-                step_names=arguments.step_names,
-            )
-    except AirflowClientError as error:
-        print(f"ingest: {error}", file=sys.stderr)
-        if error.status == 404:
-            if endpoint is None:
-                print(
-                    "hint: the ingest DAG may still be parsing -- retry in a few "
-                    "seconds, or check `docker compose logs airflow-dag-processor`",
-                    file=sys.stderr,
+    with client:
+        try:
+            if arguments.step_names is None:
+                dag_run = client.ingest(
+                    dag_id,
+                    [str(uri) for uri in uris],
+                    profile=arguments.profile,
+                    online=arguments.online,
                 )
             else:
-                print(
-                    f"hint: no DAG {dag_id!r} at {endpoint.base_url} -- verify --dag-id / "
-                    "HFLOW_AIRFLOW_DAG_ID, or retry in a few seconds if the pipeline "
-                    "was just deployed",
-                    file=sys.stderr,
+                dag_run = client.ingest(
+                    dag_id,
+                    [str(uri) for uri in uris],
+                    profile=arguments.profile,
+                    online=arguments.online,
+                    step_names=arguments.step_names,
                 )
-        return 1
+        except AirflowClientError as error:
+            print(f"ingest: {error}", file=sys.stderr)
+            if error.status == 404:
+                if endpoint is None:
+                    print(
+                        "hint: the ingest DAG may still be parsing -- retry in a few "
+                        "seconds, or check `docker compose logs airflow-dag-processor`",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"hint: no DAG {dag_id!r} at {endpoint.base_url} -- verify --dag-id / "
+                        "HFLOW_AIRFLOW_DAG_ID, or retry in a few seconds if the pipeline "
+                        "was just deployed",
+                        file=sys.stderr,
+                    )
+            return 1
     run_id = dag_run.dag_run_id or "<unknown>"
     lane = "online" if arguments.online else "batch"
     print(

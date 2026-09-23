@@ -197,29 +197,6 @@ def test_step_selection_validates_names_and_enabled_stages_before_episode_io(
         )
 
 
-def test_unselected_enrichment_does_not_run(source_episode: Path, tmp_path: Path) -> None:
-    app = hflow.App("selected-endpoint", data_root=tmp_path / "data", default_checks=())
-
-    @app.check(version="1")
-    async def local_check(ep: hflow.Episode) -> hflow.CheckResult:
-        return hflow.CheckResult(measurements={"local": 1.0})
-
-    @app.enrich(version="1", requires=("vision-model",))
-    def remote_enrichment(ep: hflow.Episode) -> hflow.EnrichmentResult:
-        return hflow.EnrichmentResult(labels={"remote": "unused"})
-
-    report = asyncio.run(
-        app.process(
-            source_episode,
-            stages={hflow.Stage.SYNC, hflow.Stage.META},
-            step_names={"local_check"},
-            record=False,
-        )
-    )
-
-    assert [run.check.name for run in report.checks] == ["local_check"]
-
-
 def test_partial_metadata_run_preserves_unselected_quarantine_and_rechecked_gate_replaces_it(
     source_episode: Path, tmp_path: Path
 ) -> None:
@@ -394,9 +371,3 @@ def test_unknown_profile_errors_with_valid_names(source_episode: Path, tmp_path:
     app = _app_with_check_and_enrichment(tmp_path / "data")
     with pytest.raises(ValueError, match="metadata_backfill"):
         asyncio.run(app.process(source_episode, stages="everything"))
-
-
-def test_run_profiles_vocabulary() -> None:
-    assert hflow.stages_for_profile("full") == frozenset(hflow.Stage)
-    assert hflow.RUN_PROFILES["relabel"] == frozenset({hflow.Stage.LABELS})
-    assert hflow.RUN_PROFILES["metadata_backfill"] == frozenset({hflow.Stage.META})

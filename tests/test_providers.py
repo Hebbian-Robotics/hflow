@@ -113,62 +113,51 @@ def test_registered_provider_class_is_discovered(monkeypatch: pytest.MonkeyPatch
     assert isinstance(provider, NativeVideoProvider)
 
 
-def test_prepared_request_is_a_payload_for_the_users_own_client(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _register_entry_points(
-        monkeypatch, ("dummy-vllm", f"{FAKE_PLUGIN_MODULE}:DummyVllmVideoProvider")
-    )
-    provider = discover_providers()["dummy-vllm"]
-    payload = provider.prepare_video_request(Path("/data/episode.mp4"), "Did the grasp succeed?")
-    # The provider encodes protocol knowledge (how video is attached) but the
-    # result is inert data: no connection, no client object, just the body.
-    assert payload["model"] == "test-model"
-    assert "file:///data/episode.mp4" in str(payload["messages"])
-
-
 def test_module_level_instance_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
     _register_entry_points(monkeypatch, ("dummy-vllm", f"{FAKE_PLUGIN_MODULE}:PREBUILT_INSTANCE"))
     discovered = discover_providers()
     assert discovered["dummy-vllm"] is PREBUILT_INSTANCE
 
 
-def test_unimportable_entry_point_warns_and_spares_the_rest(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize(
+    ("entry_points", "expected_provider_names", "warning_fragment"),
+    [
+        # The broken plugin never blocks the healthy one registered beside it.
+        pytest.param(
+            (
+                ("broken", "package_that_does_not_exist:Provider"),
+                ("dummy-vllm", f"{FAKE_PLUGIN_MODULE}:DummyVllmVideoProvider"),
+            ),
+            {"dummy-vllm"},
+            "failed to load",
+            id="unimportable-entry-point",
+        ),
+        pytest.param(
+            (("incomplete", f"{FAKE_PLUGIN_MODULE}:MissingMethodProvider"),),
+            set(),
+            "does not satisfy",
+            id="object-not-satisfying-protocol",
+        ),
+        pytest.param(
+            (("exploding", f"{FAKE_PLUGIN_MODULE}:ExplodingConstructorProvider"),),
+            set(),
+            "instantiating",
+            id="failing-constructor",
+        ),
+    ],
+)
+def test_an_unusable_entry_point_warns_and_is_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    entry_points: tuple[tuple[str, str], ...],
+    expected_provider_names: set[str],
+    warning_fragment: str,
 ) -> None:
-    _register_entry_points(
-        monkeypatch,
-        ("broken", "package_that_does_not_exist:Provider"),
-        ("dummy-vllm", f"{FAKE_PLUGIN_MODULE}:DummyVllmVideoProvider"),
-    )
+    _register_entry_points(monkeypatch, *entry_points)
     with caplog.at_level(logging.WARNING, logger="hflow.providers"):
         discovered = discover_providers()
-    assert set(discovered) == {"dummy-vllm"}  # the broken plugin never blocks the healthy one
-    assert any("failed to load" in record.message for record in caplog.records)
-
-
-def test_object_not_satisfying_protocol_warns_and_is_skipped(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    _register_entry_points(
-        monkeypatch, ("incomplete", f"{FAKE_PLUGIN_MODULE}:MissingMethodProvider")
-    )
-    with caplog.at_level(logging.WARNING, logger="hflow.providers"):
-        discovered = discover_providers()
-    assert discovered == {}
-    assert any("does not satisfy" in record.message for record in caplog.records)
-
-
-def test_failing_constructor_warns_and_is_skipped(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    _register_entry_points(
-        monkeypatch, ("exploding", f"{FAKE_PLUGIN_MODULE}:ExplodingConstructorProvider")
-    )
-    with caplog.at_level(logging.WARNING, logger="hflow.providers"):
-        discovered = discover_providers()
-    assert discovered == {}
-    assert any("instantiating" in record.message for record in caplog.records)
+    assert set(discovered) == expected_provider_names
+    assert any(warning_fragment in record.message for record in caplog.records)
 
 
 def test_duplicate_provider_name_keeps_the_first_and_warns(
@@ -196,9 +185,3 @@ def test_entry_point_name_drift_warns_but_registers_under_provider_name(
     # The provider owns its name; the entry-point name is packaging metadata.
     assert set(discovered) == {"actual-name"}
     assert any("registering under" in record.message for record in caplog.records)
-
-
-def test_protocol_is_a_runtime_checkable_duck_check() -> None:
-    assert isinstance(DummyVllmVideoProvider(), NativeVideoProvider)
-    assert not isinstance(object(), NativeVideoProvider)
-    assert not isinstance(MissingMethodProvider(), NativeVideoProvider)

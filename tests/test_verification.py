@@ -17,11 +17,16 @@ from hflow.verification import (
     REASON_MISSING,
     REASON_NO_RECEIPT,
     REASON_SIZE_MISMATCH,
-    VerificationFinding,
     VerificationReason,
     VerificationStatus,
     exit_code_for,
 )
+
+
+def _write_manifest_text(root: Path, manifest_text: str) -> None:
+    """Create ``root`` holding only a prepared manifest with ``manifest_text``."""
+    root.mkdir()
+    (root / "prepared-manifest.json").write_text(manifest_text, encoding="utf-8")
 
 
 def _write_prepared_delivery(root: Path, *, payload: bytes = b"episode-0") -> Path:
@@ -53,13 +58,6 @@ def test_verification_reason_constants_are_enum_members() -> None:
     assert REASON_CONTENT_ID_MISMATCH is VerificationReason.CONTENT_ID_MISMATCH
     assert REASON_NO_RECEIPT is VerificationReason.NO_RECEIPT
     assert VerificationReason.NO_RECEIPT == "no-receipt"
-
-    finding = VerificationFinding(
-        uri="landing/episode.mcap",
-        reason=VerificationReason.NO_RECEIPT,
-        detail="receipt is missing",
-    )
-    assert finding.reason is VerificationReason.NO_RECEIPT
 
 
 def test_verify_lerobot_import_accepts_an_unchanged_delivery(tmp_path: Path) -> None:
@@ -129,11 +127,7 @@ def test_verify_lerobot_import_is_unverifiable_without_a_manifest(tmp_path: Path
 def test_verify_lerobot_import_accepts_an_empty_episodes_list(tmp_path: Path) -> None:
     """A readable receipt that claims nothing is clean, not unverifiable."""
     root = tmp_path / "delivery"
-    root.mkdir()
-    (root / "prepared-manifest.json").write_text(
-        json.dumps({"schema_version": 3, "episodes": []}),
-        encoding="utf-8",
-    )
+    _write_manifest_text(root, json.dumps({"schema_version": 3, "episodes": []}))
 
     report = verify_lerobot_import(root)
 
@@ -144,8 +138,7 @@ def test_verify_lerobot_import_accepts_an_empty_episodes_list(tmp_path: Path) ->
 
 def test_verify_lerobot_import_refuses_corrupt_manifest_json(tmp_path: Path) -> None:
     root = tmp_path / "delivery"
-    root.mkdir()
-    (root / "prepared-manifest.json").write_text("{not-json", encoding="utf-8")
+    _write_manifest_text(root, "{not-json")
 
     with pytest.raises(ValueError, match="not valid JSON"):
         verify_lerobot_import(root)
@@ -153,11 +146,7 @@ def test_verify_lerobot_import_refuses_corrupt_manifest_json(tmp_path: Path) -> 
 
 def test_verify_lerobot_import_refuses_unsupported_schema_version(tmp_path: Path) -> None:
     root = tmp_path / "delivery"
-    root.mkdir()
-    (root / "prepared-manifest.json").write_text(
-        json.dumps({"schema_version": 2, "episodes": []}),
-        encoding="utf-8",
-    )
+    _write_manifest_text(root, json.dumps({"schema_version": 2, "episodes": []}))
 
     with pytest.raises(ValueError, match="schema_version must be 3"):
         verify_lerobot_import(root)
@@ -273,7 +262,6 @@ def test_cli_verify_lerobot_import_exit_codes(
     assert "unverifiable" in capsys.readouterr().err
 
     bad_root = tmp_path / "bad"
-    bad_root.mkdir()
-    (bad_root / "prepared-manifest.json").write_text("{broken", encoding="utf-8")
+    _write_manifest_text(bad_root, "{broken")
     assert main(["verify", "lerobot-import", str(bad_root)]) == 2
     assert "not valid JSON" in capsys.readouterr().err

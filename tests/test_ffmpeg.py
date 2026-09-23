@@ -13,12 +13,20 @@ import platform
 import shutil
 import subprocess
 import tarfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import httpx2
 import numpy as np
 import pytest
+from media_test_helpers import (
+    make_extracted_frames,
+    render_lavfi,
+    run_ffmpeg,
+    run_ffprobe,
+    video_stream_dimensions,
+)
 
 from hflow._video_measurement_toolchain import (
     _frame_statistics_cache_path,
@@ -73,10 +81,6 @@ from hflow.ffmpeg._contact_sheet import (
 )
 
 
-def _system_ffmpeg() -> str:
-    return os.environ[FFMPEG_ENV_VAR]
-
-
 def _measure_frame_statistics(
     video: Path,
     *,
@@ -107,21 +111,46 @@ def cleared_binary_caches() -> Iterator[None]:
     _clear_all_binary_caches()
 
 
+_BINARY_ENV_OVERRIDES = [
+    pytest.param(ffmpeg_path, FFMPEG_ENV_VAR, FfmpegNotFoundError, "ffmpeg", id="ffmpeg"),
+    pytest.param(ffprobe_path, FFPROBE_ENV_VAR, FfprobeNotFoundError, "my-ffprobe", id="ffprobe"),
+]
+
+
+@pytest.mark.parametrize(
+    ("resolve_binary", "environment_variable", "not_found_error", "file_name"),
+    _BINARY_ENV_OVERRIDES,
+)
 def test_env_override_wins(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cleared_binary_caches: None
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    cleared_binary_caches: None,
+    resolve_binary: Callable[[], Path],
+    environment_variable: str,
+    not_found_error: type[Exception],
+    file_name: str,
 ) -> None:
-    override_ffmpeg = tmp_path / "ffmpeg"
-    override_ffmpeg.touch()
-    monkeypatch.setenv(FFMPEG_ENV_VAR, str(override_ffmpeg))
-    assert ffmpeg_path() == override_ffmpeg
+    override_binary = tmp_path / file_name
+    override_binary.write_text("#!/bin/sh\n")
+    monkeypatch.setenv(environment_variable, str(override_binary))
+    assert resolve_binary() == override_binary
 
 
+@pytest.mark.parametrize(
+    ("resolve_binary", "environment_variable", "not_found_error", "file_name"),
+    _BINARY_ENV_OVERRIDES,
+)
 def test_env_override_to_missing_file_raises(
-    monkeypatch: pytest.MonkeyPatch, cleared_binary_caches: None
+    monkeypatch: pytest.MonkeyPatch,
+    cleared_binary_caches: None,
+    resolve_binary: Callable[[], Path],
+    environment_variable: str,
+    not_found_error: type[Exception],
+    file_name: str,
 ) -> None:
-    monkeypatch.setenv(FFMPEG_ENV_VAR, "/nonexistent/ffmpeg")
-    with pytest.raises(FfmpegNotFoundError, match="does not exist"):
-        ffmpeg_path()
+    monkeypatch.setenv(environment_variable, f"/nonexistent/{file_name}")
+    with pytest.raises(not_found_error, match="does not exist"):
+        resolve_binary()
 
 
 _FAKE_ARCHIVE_ROOT = "ffmpeg-fake-build"
@@ -215,23 +244,6 @@ def test_linux_unsupported_machine_raises_instead_of_path_fallback(
     assert shutil.which("ffmpeg") is not None
     with pytest.raises(FfmpegNotFoundError, match=FFMPEG_ENV_VAR):
         ffmpeg_path()
-
-
-def test_ffprobe_env_override_wins(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cleared_binary_caches: None
-) -> None:
-    override_ffprobe = tmp_path / "my-ffprobe"
-    override_ffprobe.write_text("#!/bin/sh\n")
-    monkeypatch.setenv(FFPROBE_ENV_VAR, str(override_ffprobe))
-    assert ffprobe_path() == override_ffprobe
-
-
-def test_ffprobe_env_override_to_missing_file_raises(
-    monkeypatch: pytest.MonkeyPatch, cleared_binary_caches: None
-) -> None:
-    monkeypatch.setenv(FFPROBE_ENV_VAR, "/nonexistent/ffprobe")
-    with pytest.raises(FfprobeNotFoundError, match="does not exist"):
-        ffprobe_path()
 
 
 def test_ffprobe_prefers_sibling_of_ffmpeg_override(
@@ -445,27 +457,54 @@ def test_synthetic_freeze_intervals_including_unterminated() -> None:
     assert stats.freeze_total_seconds == pytest.approx(3.0)
 
 
-def test_truncated_output_missing_yavg_raises() -> None:
-    truncated = _synthetic_frames({}, {}).replace("lavfi.signalstats.YAVG=100\n", "", 1)
-    with pytest.raises(FrameStatisticsParseError, match="YAVG"):
-        _aggregate_frame_statistics_output(truncated)
-
-
-def test_unparsable_line_raises() -> None:
-    garbled = "frame:0    pts:0    pts_time:0\nlavfi.signalstats.YA\n"
-    with pytest.raises(FrameStatisticsParseError, match="unparsable"):
-        _aggregate_frame_statistics_output(garbled)
-
-
-def test_nan_yavg_raises() -> None:
-    nan_output = "frame:0    pts:0    pts_time:0\nlavfi.signalstats.YAVG=nan\n"
-    with pytest.raises(FrameStatisticsParseError, match="non-finite"):
-        _aggregate_frame_statistics_output(nan_output)
-
-
-def test_empty_output_raises() -> None:
-    with pytest.raises(FrameStatisticsParseError, match="no frames"):
-        _aggregate_frame_statistics_output("")
+@pytest.mark.parametrize(
+    ("output_text", "message"),
+    [
+        pytest.param(
+            _synthetic_frames({}, {}).replace("lavfi.signalstats.YAVG=100\n", "", 1),
+            "YAVG",
+            id="truncated-missing-yavg",
+        ),
+        # A frame silently dropped from a denominator turns "could not
+        # measure" into "measured and clean", which this must never invent.
+        pytest.param(
+            _synthetic_frames({"lavfi.signalstats.YAVG": 100}).replace(
+                "lavfi.signalstats.TOUT=0\n", ""
+            ),
+            "TOUT",
+            id="missing-required-tout",
+        ),
+        pytest.param(
+            "frame:0    pts:0    pts_time:0\nlavfi.signalstats.YA\n",
+            "unparsable",
+            id="unparsable-line",
+        ),
+        pytest.param(
+            "frame:0    pts:0    pts_time:0\nlavfi.signalstats.YAVG=nan\n",
+            "non-finite",
+            id="nan-yavg",
+        ),
+        pytest.param("", "no frames", id="empty-output"),
+        pytest.param(
+            _synthetic_frames(
+                {"lavfi.freezedetect.freeze_start": 2.0},
+                {"lavfi.freezedetect.freeze_end": 1.0},
+            ),
+            "invalid freeze interval",
+            id="freeze-ends-before-it-starts",
+        ),
+        # A lost format pin would put a 10-bit source on a 0-1023 scale, where
+        # every threshold here is off by a factor of four. Fail loudly instead.
+        pytest.param(
+            _synthetic_frames({"lavfi.signalstats.YMAX": 1023}),
+            "outside the 8-bit range",
+            id="ten-bit-luma",
+        ),
+    ],
+)
+def test_malformed_frame_statistics_output_is_a_parse_error(output_text: str, message: str) -> None:
+    with pytest.raises(FrameStatisticsParseError, match=message):
+        _aggregate_frame_statistics_output(output_text)
 
 
 @pytest.mark.parametrize(
@@ -483,106 +522,49 @@ def test_filter_listing_parser_accepts_supported_ffmpeg_layouts(
     assert match.group("filter_name") == expected_filter_name
 
 
-def test_invalid_freeze_interval_is_a_parse_error() -> None:
-    output_text = _synthetic_frames(
-        {"lavfi.freezedetect.freeze_start": 2.0},
-        {"lavfi.freezedetect.freeze_end": 1.0},
+_ULTRAFAST_H264 = ("-c:v", "libx264", "-preset", "ultrafast")
+
+
+def _testsrc2_with_color_tail(output: Path, tail_color: str) -> Path:
+    """4s of testsrc2 followed by 2s of ``tail_color``, 10 fps, h264: 60 frames."""
+    return render_lavfi(
+        output,
+        "testsrc2=size=160x120:rate=10:duration=4,format=yuv420p",
+        f"color={tail_color}:size=160x120:rate=10:duration=2,format=yuv420p",
+        output_arguments=(
+            "-filter_complex",
+            "[0:v][1:v]concat=n=2:v=1:a=0[out]",
+            "-map",
+            "[out]",
+            *_ULTRAFAST_H264,
+        ),
     )
-    with pytest.raises(FrameStatisticsParseError, match="invalid freeze interval"):
-        _aggregate_frame_statistics_output(output_text)
 
 
 @pytest.fixture(scope="module")
 def black_tail_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """4s of testsrc2 followed by 2s of black, 10 fps, h264: 60 frames total."""
-    output = tmp_path_factory.mktemp("videos") / "black_tail.mp4"
-    subprocess.run(
-        [
-            _system_ffmpeg(),
-            "-hide_banner",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=160x120:rate=10:duration=4,format=yuv420p",
-            "-f",
-            "lavfi",
-            "-i",
-            "color=black:size=160x120:rate=10:duration=2,format=yuv420p",
-            "-filter_complex",
-            "[0:v][1:v]concat=n=2:v=1:a=0[out]",
-            "-map",
-            "[out]",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            str(output),
-        ],
-        capture_output=True,
-        check=True,
+    return _testsrc2_with_color_tail(
+        tmp_path_factory.mktemp("videos") / "black_tail.mp4", tail_color="black"
     )
-    return output
 
 
 @pytest.fixture(scope="module")
 def bright_tail_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """4s of testsrc2 followed by 2s of white, 10 fps, h264: 60 frames total."""
-    output = tmp_path_factory.mktemp("videos") / "bright_tail.mp4"
-    subprocess.run(
-        [
-            _system_ffmpeg(),
-            "-hide_banner",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=160x120:rate=10:duration=4,format=yuv420p",
-            "-f",
-            "lavfi",
-            "-i",
-            "color=white:size=160x120:rate=10:duration=2,format=yuv420p",
-            "-filter_complex",
-            "[0:v][1:v]concat=n=2:v=1:a=0[out]",
-            "-map",
-            "[out]",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            str(output),
-        ],
-        capture_output=True,
-        check=True,
+    return _testsrc2_with_color_tail(
+        tmp_path_factory.mktemp("videos") / "bright_tail.mp4", tail_color="white"
     )
-    return output
 
 
 @pytest.fixture(scope="module")
 def frozen_tail_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """2s of testsrc2 then the last frame held (cloned) for 3s, 10 fps."""
-    output = tmp_path_factory.mktemp("videos") / "frozen_tail.mp4"
-    subprocess.run(
-        [
-            _system_ffmpeg(),
-            "-hide_banner",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=160x120:rate=10:duration=2,format=yuv420p",
-            "-vf",
-            "tpad=stop_mode=clone:stop_duration=3",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            str(output),
-        ],
-        capture_output=True,
-        check=True,
+    return render_lavfi(
+        tmp_path_factory.mktemp("videos") / "frozen_tail.mp4",
+        "testsrc2=size=160x120:rate=10:duration=2,format=yuv420p",
+        output_arguments=("-vf", "tpad=stop_mode=clone:stop_duration=3", *_ULTRAFAST_H264),
     )
-    return output
 
 
 def test_frame_stats_black_segment(black_tail_video: Path) -> None:
@@ -638,18 +620,29 @@ def test_frame_stats_freeze_interval(frozen_tail_video: Path) -> None:
 def test_frame_stats_truncated_video_file_raises(tmp_path: Path) -> None:
     not_a_video = tmp_path / "garbage.mp4"
     not_a_video.write_bytes(b"\x00\x01\x02not a video")
-    with pytest.raises(RuntimeError):
+    with pytest.raises(FrameStatisticsExecutionError):
         _measure_frame_statistics(not_a_video)
 
 
-def test_luma_frames_streams_every_frame_at_the_coded_size(black_tail_video: Path) -> None:
+@pytest.mark.parametrize(
+    ("frame_reader", "expected_shape"),
+    [
+        pytest.param(luma_frames, (120, 160), id="luma"),
+        pytest.param(rgb_frames, (120, 160, 3), id="rgb"),
+    ],
+)
+def test_raw_frames_stream_every_frame_at_the_coded_size(
+    black_tail_video: Path,
+    frame_reader: Callable[..., Any],
+    expected_shape: tuple[int, ...],
+) -> None:
     """Full rate and no re-encode, which is what a frame-to-frame measurement
     needs and what ``Episode.frames()`` deliberately does not give.
     """
-    with luma_frames(black_tail_video, toolchain=resolved_video_measurement_toolchain()) as frames:
+    with frame_reader(black_tail_video, toolchain=resolved_video_measurement_toolchain()) as frames:
         shapes = [frame.shape for frame in frames]
     assert len(shapes) == 60
-    assert set(shapes) == {(120, 160)}
+    assert set(shapes) == {expected_shape}
 
 
 def test_luma_frames_reaps_ffmpeg_when_the_caller_stops_early(
@@ -665,56 +658,55 @@ def test_luma_frames_reaps_ffmpeg_when_the_caller_stops_early(
     assert first_frame.shape == (120, 160)
 
 
+def _assert_same_luma_frames(
+    reference_video: Path, candidate_video: Path, *, expected_shape: tuple[int, int] | None
+) -> None:
+    """Both videos decode to the same 60 luma frames, pixel for pixel."""
+    toolchain = resolved_video_measurement_toolchain()
+    with (
+        luma_frames(reference_video, toolchain=toolchain) as reference_frames,
+        luma_frames(candidate_video, toolchain=toolchain) as candidate_frames,
+    ):
+        frame_count = 0
+        for reference_frame, candidate_frame in zip(
+            reference_frames, candidate_frames, strict=True
+        ):
+            if expected_shape is not None:
+                assert reference_frame.shape == candidate_frame.shape == expected_shape
+            np.testing.assert_array_equal(reference_frame, candidate_frame)
+            frame_count += 1
+    assert frame_count == 60
+
+
 def test_display_rotation_preserves_coded_frame_geometry_and_pixels(
     black_tail_video: Path, tmp_path: Path
 ) -> None:
     rotated_video = tmp_path / "rotation-metadata.mp4"
-    subprocess.run(
-        [
-            str(ffmpeg_path()),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-display_rotation",
-            "90",
-            "-i",
-            str(black_tail_video),
-            "-c",
-            "copy",
-            str(rotated_video),
-        ],
-        check=True,
-        capture_output=True,
+    run_ffmpeg(
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-display_rotation",
+        "90",
+        "-i",
+        str(black_tail_video),
+        "-c",
+        "copy",
+        str(rotated_video),
     )
-    rotation_probe = subprocess.run(
-        [
-            str(ffprobe_path()),
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream_side_data=rotation",
-            "-of",
-            "default=nw=1:nk=1",
-            str(rotated_video),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
+    rotation_probe = run_ffprobe(
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream_side_data=rotation",
+        "-of",
+        "default=nw=1:nk=1",
+        str(rotated_video),
     )
-    assert abs(int(rotation_probe.stdout.strip())) == 90
-    toolchain = resolved_video_measurement_toolchain()
-    with (
-        luma_frames(black_tail_video, toolchain=toolchain) as source_frames,
-        luma_frames(rotated_video, toolchain=toolchain) as rotated_frames,
-    ):
-        frame_count = 0
-        for source_frame, rotated_frame in zip(source_frames, rotated_frames, strict=True):
-            assert source_frame.shape == rotated_frame.shape == (120, 160)
-            np.testing.assert_array_equal(source_frame, rotated_frame)
-            frame_count += 1
-    assert frame_count == 60
+    assert abs(int(rotation_probe.strip())) == 90
+    _assert_same_luma_frames(black_tail_video, rotated_video, expected_shape=(120, 160))
 
 
 def test_luma_frames_on_a_non_video_raises(tmp_path: Path) -> None:
@@ -731,50 +723,29 @@ def test_frame_decoder_selects_the_same_video_stream_as_dimension_probing(
     black_tail_video: Path, tmp_path: Path
 ) -> None:
     multi_stream_video = tmp_path / "two-video-streams.mkv"
-    subprocess.run(
-        [
-            str(ffmpeg_path()),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(black_tail_video),
-            "-f",
-            "lavfi",
-            "-i",
-            "color=white:size=320x240:rate=10:duration=6",
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:v:0",
-            "-c:v:0",
-            "copy",
-            "-c:v:1",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            str(multi_stream_video),
-        ],
-        check=True,
-        capture_output=True,
+    run_ffmpeg(
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(black_tail_video),
+        "-f",
+        "lavfi",
+        "-i",
+        "color=white:size=320x240:rate=10:duration=6",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:v:0",
+        "-c:v:0",
+        "copy",
+        "-c:v:1",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        str(multi_stream_video),
     )
-    toolchain = resolved_video_measurement_toolchain()
-    with (
-        luma_frames(black_tail_video, toolchain=toolchain) as source_frames,
-        luma_frames(multi_stream_video, toolchain=toolchain) as decoded_frames,
-    ):
-        frame_count = 0
-        for source_frame, decoded_frame in zip(source_frames, decoded_frames, strict=True):
-            np.testing.assert_array_equal(source_frame, decoded_frame)
-            frame_count += 1
-    assert frame_count == 60
-
-
-def test_rgb_frames_streams_three_channels_at_the_coded_size(black_tail_video: Path) -> None:
-    with rgb_frames(black_tail_video, toolchain=resolved_video_measurement_toolchain()) as frames:
-        shapes = [frame.shape for frame in frames]
-    assert len(shapes) == 60
-    assert set(shapes) == {(120, 160, 3)}
+    _assert_same_luma_frames(black_tail_video, multi_stream_video, expected_shape=None)
 
 
 def test_rgb_frames_resamples_and_resizes_in_one_decode(black_tail_video: Path) -> None:
@@ -863,57 +834,10 @@ def test_missing_motion_extra_names_the_install_command(
         _import_cv2()
 
 
-def _probe_dimensions(image: Path) -> tuple[int, int]:
-    ffprobe_binary = shutil.which("ffprobe")
-    assert ffprobe_binary is not None, "ffprobe required on PATH for tests"
-    completed = subprocess.run(
-        [
-            ffprobe_binary,
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=width,height",
-            "-of",
-            "csv=p=0",
-            str(image),
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    width_text, height_text = completed.stdout.strip().split(",")
-    return int(width_text), int(height_text)
-
-
 @pytest.fixture(scope="module")
 def ten_extracted_frames(tmp_path_factory: pytest.TempPathFactory) -> list[ExtractedFrame]:
     """Ten 320x240 jpegs extracted from a testsrc2 clip, 1s apart."""
-    directory = tmp_path_factory.mktemp("frames")
-    subprocess.run(
-        [
-            _system_ffmpeg(),
-            "-hide_banner",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=320x240:rate=1:duration=10",
-            "-q:v",
-            "2",
-            str(directory / "frame_%02d.jpg"),
-        ],
-        capture_output=True,
-        check=True,
-    )
-    frame_paths = sorted(directory.glob("frame_*.jpg"))
-    assert len(frame_paths) == 10
-    stream_start_ns = 1_755_000_000_000_000_000
-    return [
-        ExtractedFrame(path=frame_path, log_time_ns=stream_start_ns + index * 1_000_000_000)
-        for index, frame_path in enumerate(frame_paths)
-    ]
+    return make_extracted_frames(tmp_path_factory.mktemp("frames"), count=10, size="320x240")
 
 
 def test_contact_sheet_grid_geometry(
@@ -927,7 +851,7 @@ def test_contact_sheet_grid_geometry(
     assert sheet.rows == 3  # ceil(10 / 4)
     assert sheet.frames_sampled_from == 10
     assert sheet.tile_log_times_ns == [frame.log_time_ns for frame in ten_extracted_frames]
-    width, height = _probe_dimensions(output)
+    width, height = video_stream_dimensions(output)
     assert width == 4 * 320
     assert height == 3 * 240  # 320x240 sources scaled to width 320 keep height 240
     assert sheet.timestamps_burned == (
@@ -948,7 +872,7 @@ def test_contact_sheet_max_tiles_sampling(
     assert sheet.tile_log_times_ns[-1] == ten_extracted_frames[-1].log_time_ns
     assert sheet.tile_log_times_ns == sorted(set(sheet.tile_log_times_ns))
     assert sheet.rows == 2  # ceil(6 / 4); tile pads the two empty cells
-    width, _height = _probe_dimensions(output)
+    width, _height = video_stream_dimensions(output)
     assert width == 4 * 160
 
 
@@ -972,7 +896,7 @@ def test_contact_sheet_without_drawtext_still_produces_sheet(
     sheet = contact_sheet(ten_extracted_frames[:2], output, columns=2)
 
     assert output.is_file()
-    assert _probe_dimensions(output) == (640, 240)
+    assert video_stream_dimensions(output) == (640, 240)
     assert sheet.timestamps_burned is False
 
 
@@ -1007,7 +931,7 @@ def test_contact_sheet_accepts_apostrophes_in_external_paths(
     sheet = contact_sheet(copied_frames, output, columns=2)
 
     assert output.is_file()
-    assert _probe_dimensions(output) == (640, 240)
+    assert video_stream_dimensions(output) == (640, 240)
     assert sheet.timestamps_burned is True
 
 
@@ -1194,15 +1118,6 @@ def test_black_pixel_share_is_reported_over_every_frame() -> None:
     assert stats.black_pixel_share_mean == pytest.approx(149.0 / 3.0)
 
 
-def test_luma_above_the_eight_bit_scale_raises() -> None:
-    """A lost format pin would put a 10-bit source on a 0-1023 scale, where
-    every threshold here is off by a factor of four. Fail loudly instead.
-    """
-    ten_bit = _synthetic_frames({"lavfi.signalstats.YMAX": 1023})
-    with pytest.raises(FrameStatisticsParseError, match="outside the 8-bit range"):
-        _aggregate_frame_statistics_output(ten_bit)
-
-
 def test_first_frame_frame_difference_is_excluded_by_position() -> None:
     """The opening frame has no predecessor, so its YDIF is a sentinel zero.
     Dropping zeros by value would delete the real stillness this measures.
@@ -1222,16 +1137,6 @@ def test_first_frame_frame_difference_is_excluded_by_position() -> None:
         _synthetic_frames({"lavfi.signalstats.YDIF": 0}, {"lavfi.signalstats.YDIF": 0})
     )
     assert still.frame_difference_mean == 0.0
-
-
-def test_a_missing_required_signal_raises_instead_of_shrinking_a_denominator() -> None:
-    """A frame silently dropped from a denominator turns "could not measure"
-    into "measured and clean", which is the one answer this must never invent.
-    """
-    missing_tout = _synthetic_frames({"lavfi.signalstats.YAVG": 100})
-    missing_tout = missing_tout.replace("lavfi.signalstats.TOUT=0\n", "")
-    with pytest.raises(FrameStatisticsParseError, match="TOUT"):
-        _aggregate_frame_statistics_output(missing_tout)
 
 
 def test_hflow_cache_key_covers_graph_toolchain_and_video() -> None:

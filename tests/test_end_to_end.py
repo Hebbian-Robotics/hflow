@@ -489,9 +489,17 @@ def test_canonical_episode_extracts_exact_source_frame_indices(
         ([np.bool_(True)], r"^frame indices must be integers, not booleans$"),
         ([3.0], r"^frame indices must be integers$"),
         ([np.float64(3.0)], r"^frame indices must be integers$"),
+        ([0, 0], r"^frame indices must be unique and ascending$"),  # a duplicate index
+        ([5, 3], r"^frame indices must be unique and ascending$"),  # a descending pair
+        ([-1], r"^frame indices must be nonnegative$"),
+        # The nonnegative guard reads only the first index, so it is correct
+        # only after ascending order is established. [-1, -2] violates both
+        # guards and must be reported as not-ascending; if the two guards
+        # were swapped it would instead be reported as "nonnegative".
+        ([-1, -2], r"^frame indices must be unique and ascending$"),
     ],
 )
-def test_canonical_episode_rejects_non_integer_frame_indices(
+def test_canonical_episode_rejects_invalid_frame_indices(
     report_and_app: tuple[hflow.TestReport, hflow.App],
     invalid_frame_indices: list[Any],
     message: str,
@@ -504,48 +512,6 @@ def test_canonical_episode_rejects_non_integer_frame_indices(
                 camera_topic,
                 frame_indices=invalid_frame_indices,
             )
-
-
-@pytest.mark.parametrize(
-    "frame_indices",
-    [
-        [0, 0],  # a duplicate index
-        [5, 3],  # a descending pair
-    ],
-)
-def test_canonical_episode_rejects_non_ascending_frame_indices(
-    report_and_app: tuple[hflow.TestReport, hflow.App],
-    frame_indices: list[int],
-) -> None:
-    report, _app = report_and_app
-    with hflow.Episode(report.canonical_path) as episode:
-        camera_topic = next(topic for topic in episode.cameras if "overhead_cam" in topic)
-        with pytest.raises(ValueError, match=r"^frame indices must be unique and ascending$"):
-            episode.frames_at_indices(camera_topic, frame_indices=frame_indices)
-
-
-def test_canonical_episode_rejects_negative_frame_indices(
-    report_and_app: tuple[hflow.TestReport, hflow.App],
-) -> None:
-    report, _app = report_and_app
-    with hflow.Episode(report.canonical_path) as episode:
-        camera_topic = next(topic for topic in episode.cameras if "overhead_cam" in topic)
-        with pytest.raises(ValueError, match=r"^frame indices must be nonnegative$"):
-            episode.frames_at_indices(camera_topic, frame_indices=[-1])
-
-
-def test_frame_index_guards_run_ascending_before_nonnegative(
-    report_and_app: tuple[hflow.TestReport, hflow.App],
-) -> None:
-    """The nonnegative guard reads only the first index, so it is correct only
-    after ascending order is established. ``[-1, -2]`` violates both guards and
-    must be reported as not-ascending; if the two guards were swapped it would
-    instead be reported as "nonnegative"."""
-    report, _app = report_and_app
-    with hflow.Episode(report.canonical_path) as episode:
-        camera_topic = next(topic for topic in episode.cameras if "overhead_cam" in topic)
-        with pytest.raises(ValueError, match=r"^frame indices must be unique and ascending$"):
-            episode.frames_at_indices(camera_topic, frame_indices=[-1, -2])
 
 
 def test_arrow_export(report_and_app: tuple[hflow.TestReport, hflow.App]) -> None:

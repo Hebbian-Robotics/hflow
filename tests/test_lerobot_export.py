@@ -18,171 +18,55 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from lerobot_test_helpers import (
+    TWO_CAMERA_KEYS,
+    CorpusEpisodeRow,
+    two_camera_v3_info,
+    write_v3_corpus,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import hflow
 from examples.lerobot import export
 
-CAMS = ("observation.images.up", "observation.images.side")
+CAMS = TWO_CAMERA_KEYS
 LENGTHS = [60, 65, 70, 75]  # episode lengths: 60 + i*5
 OFFSETS = [0, 60, 125, 195]  # cumulative data offsets
 
 
-def _fake_corpus(tmp_path: Path, *, chunk1_eps: tuple[int, ...] = ()) -> dict:
+def _fake_corpus(corpus_root: Path, *, chunk1_eps: tuple[int, ...] = ()) -> dict:
     """Synthetic v3 source: 4 episodes, 2 cameras, 6-dim state/action.
 
     Episodes named in ``chunk1_eps`` reference video chunk 1 (files present
     with distinguishable bytes), so a selection can span two source chunks.
     """
-    info = {
-        "fps": 30,
-        "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
-        "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
-        "features": {
-            "action": {"dtype": "float32", "shape": [6]},
-            "observation.state": {"dtype": "float32", "shape": [6]},
-            "observation.images.up": {"dtype": "video", "shape": [480, 640, 3]},
-            "observation.images.side": {"dtype": "video", "shape": [480, 640, 3]},
-            "timestamp": {"dtype": "float32", "shape": [1]},
-        },
-        "robot_type": "so101",
-    }
-    (tmp_path / "meta").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "meta" / "info.json").write_text(json.dumps(info))
-
-    rows = []
-    for i in range(4):
-        length = LENGTHS[i]
-        vchunk = 1 if i in chunk1_eps else 0
-        rows.append(
-            [
-                i,
-                length,
-                0,
-                0,
-                OFFSETS[i],
-                OFFSETS[i] + length,
-                vchunk,
-                0,
-                0.0,
-                2.0 + i * 0.2,
-                vchunk,
-                0,
-                0.0,
-                2.0 + i * 0.2,
-                [f"task-{i}"],
-            ]
-        )
-    ep_cols = [
-        "episode_index",
-        "length",
-        "data/chunk_index",
-        "data/file_index",
-        "dataset_from_index",
-        "dataset_to_index",
-        "videos/observation.images.up/chunk_index",
-        "videos/observation.images.up/file_index",
-        "videos/observation.images.up/from_timestamp",
-        "videos/observation.images.up/to_timestamp",
-        "videos/observation.images.side/chunk_index",
-        "videos/observation.images.side/file_index",
-        "videos/observation.images.side/from_timestamp",
-        "videos/observation.images.side/to_timestamp",
-        "tasks",
-    ]
-    ep_path = tmp_path / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
-    ep_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect()
-    vals = ",".join(
-        "("
-        + ",".join(
-            "[" + ",".join(f"'{x}'" for x in v) + "]"
-            if isinstance(v, list)
-            else f"'{v!s}'"
-            if isinstance(v, str)
-            else str(v)
-            for v in row
-        )
-        + ")"
-        for row in rows
-    )
-    quoted = str(ep_path).replace("'", "''")
-    qcols = ",".join(f'"{c}"' for c in ep_cols)
-    conn.execute(
-        f"COPY (SELECT * FROM (VALUES {vals}) AS t({qcols})) TO '{quoted}' (FORMAT parquet)"
-    )
-
-    # one contiguous data chunk: all episodes' rows, index = row position
-    data_rows = []
-    idx = 0
-    for i in range(4):
-        length = LENGTHS[i]
-        for f in range(length):
-            state = "[" + ",".join(str(float(f)) for _ in range(6)) + "]"
-            action = "[" + ",".join(str(float(f + 0.5)) for _ in range(6)) + "]"
-            data_rows.append([idx, i, f, round(f / 30.0, 6), state, action])
-            idx += 1
-    data_path = tmp_path / "data" / "chunk-000" / "file-000.parquet"
-    data_path.parent.mkdir(parents=True, exist_ok=True)
-    dvals = ",".join("(" + ",".join(str(v) for v in row) + ")" for row in data_rows)
-    dquoted = str(data_path).replace("'", "''")
-    conn.execute(
-        f"COPY (SELECT * FROM (VALUES {dvals}) AS "
-        't(index, episode_index, frame_index, timestamp, "observation.state", action)) '
-        f"TO '{dquoted}' (FORMAT parquet)"
+    info = two_camera_v3_info()
+    write_v3_corpus(
+        corpus_root,
+        info=info,
+        episode_rows=[
+            CorpusEpisodeRow(
+                episode_index=episode_index,
+                length=LENGTHS[episode_index],
+                dataset_from_index=OFFSETS[episode_index],
+                video_to_timestamp=2.0 + episode_index * 0.2,
+                tasks=(f"task-{episode_index}",),
+                video_chunk_index=1 if episode_index in chunk1_eps else 0,
+            )
+            for episode_index in range(4)
+        ],
     )
 
     # Source video chunks retain their repository paths in the SDK cache.
     for chunk in (0, 1) if chunk1_eps else (0,):
-        for cam in ("observation.images.up", "observation.images.side"):
-            vname = "file-000.mp4"
-            vdir = tmp_path / "videos" / cam / f"chunk-{chunk:03d}"
+        for cam in CAMS:
+            vdir = corpus_root / "videos" / cam / f"chunk-{chunk:03d}"
             vdir.mkdir(parents=True, exist_ok=True)
             marker = "" if chunk == 0 else "CHUNK-ONE-"
-            (vdir / vname).write_bytes(f"fake-mp4-{marker}{cam}".encode())
+            (vdir / "file-000.mp4").write_bytes(f"fake-mp4-{marker}{cam}".encode())
 
-    conn.close()
-
-    episodes = []
-    for i in range(4):
-        episodes.append(
-            {
-                "episode_index": i,
-                "task": f"task-{i}",
-                "length": LENGTHS[i],
-                "data_chunk": "0",
-                "data_file": "0",
-                "data_from": OFFSETS[i],
-                "data_to": OFFSETS[i] + LENGTHS[i],
-                "video_windows": {
-                    "observation.images.up": {
-                        "chunk_index": str(vchunk),
-                        "file_index": "0",
-                        "from_timestamp": 0.0,
-                        "to_timestamp": 2.0 + i * 0.2,
-                    },
-                    "observation.images.side": {
-                        "chunk_index": str(vchunk),
-                        "file_index": "0",
-                        "from_timestamp": 0.0,
-                        "to_timestamp": 2.0 + i * 0.2,
-                    },
-                },
-            }
-        )
-
-    return {
-        "info": info,
-        "fps": 30,
-        "data_path": info["data_path"],
-        "video_path": info["video_path"],
-        "cache_dir": tmp_path,
-        "data_chunk": 0,
-        "data_file": 0,
-        "video_keys": ("observation.images.up", "observation.images.side"),
-        "episodes": episodes,
-    }
+    return {"info": info, "cache_dir": corpus_root}
 
 
 def _install_fake_import(corpus: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -331,75 +215,54 @@ def test_export_noncontiguous_selection(
     assert prov["source_commit"] == "a" * 40
 
 
-def test_export_mixed_repositories_fail(fake_corpus: dict, tmp_path: Path) -> None:
-    rows = [
-        {"metadata_json": _provenance_meta(0)},
-        {
-            "metadata_json": json.dumps(
+def _provenance_json(**overrides: object) -> str:
+    return json.dumps({**json.loads(_provenance_meta(0)), **overrides})
+
+
+@pytest.mark.parametrize(
+    ("manifest_rows", "expected_message"),
+    [
+        pytest.param(
+            [
+                {"metadata_json": _provenance_meta(0)},
                 {
-                    "source_dataset": "lerobot/other",
-                    "source_revision": "b" * 40,
-                    "source_episode_index": 1,
-                    "task": "task-1",
-                    "embodiment": "so101",
-                }
-            )
-        },
-    ]
-    manifest = _fake_manifest(tmp_path, rows)
+                    "metadata_json": _provenance_json(
+                        source_dataset="lerobot/other",
+                        source_revision="b" * 40,
+                        source_episode_index=1,
+                        task="task-1",
+                    )
+                },
+            ],
+            "mixes source repositories",
+            id="mixed-repositories",
+        ),
+        pytest.param(
+            [{"metadata_json": _provenance_json(source_revision="main")}],
+            "not an immutable commit sha",
+            id="nonimmutable-revision",
+        ),
+        pytest.param(
+            [{"metadata_json": None}], "lacks LeRobot provenance", id="missing-provenance"
+        ),
+        pytest.param(
+            [{"metadata_json": _provenance_meta(9)}],
+            "source episodes not present",
+            id="missing-source-episode",
+        ),
+        pytest.param(
+            [{"metadata_json": _provenance_meta(0)}, {"metadata_json": _provenance_meta(0)}],
+            "duplicate source episode indexes",
+            id="duplicate-episode",
+        ),
+    ],
+)
+def test_export_refuses_an_unexportable_manifest(
+    fake_corpus: dict, tmp_path: Path, manifest_rows: list[dict], expected_message: str
+) -> None:
+    manifest = _fake_manifest(tmp_path, manifest_rows)
     dest = tmp_path / "out"
-    with pytest.raises(ValueError, match="mixes source repositories"):
-        export.export(dest, manifest=manifest, camera_keys=CAMS)
-    assert not dest.exists()
-
-
-def test_export_nonimmutable_revision_fails(fake_corpus: dict, tmp_path: Path) -> None:
-    rows = [
-        {
-            "metadata_json": json.dumps(
-                {
-                    "source_dataset": "lerobot/fake",
-                    "source_revision": "main",
-                    "source_episode_index": 0,
-                    "task": "task-0",
-                    "embodiment": "so101",
-                }
-            )
-        }
-    ]
-    manifest = _fake_manifest(tmp_path, rows)
-    dest = tmp_path / "out"
-    with pytest.raises(ValueError, match="not an immutable commit sha"):
-        export.export(dest, manifest=manifest, camera_keys=CAMS)
-    assert not dest.exists()
-
-
-def test_export_missing_provenance_fails(fake_corpus: dict, tmp_path: Path) -> None:
-    manifest = _fake_manifest(tmp_path, [{"metadata_json": None}])
-    dest = tmp_path / "out"
-    with pytest.raises(ValueError, match="lacks LeRobot provenance"):
-        export.export(dest, manifest=manifest, camera_keys=CAMS)
-    assert not dest.exists()
-
-
-def test_export_missing_source_episode_fails(fake_corpus: dict, tmp_path: Path) -> None:
-    manifest = _fake_manifest(tmp_path, [{"metadata_json": _provenance_meta(9)}])
-    dest = tmp_path / "out"
-    with pytest.raises(ValueError, match="source episodes not present"):
-        export.export(dest, manifest=manifest, camera_keys=CAMS)
-    assert not dest.exists()
-
-
-def test_export_duplicate_episode_fails(fake_corpus: dict, tmp_path: Path) -> None:
-    manifest = _fake_manifest(
-        tmp_path,
-        [
-            {"metadata_json": _provenance_meta(0)},
-            {"metadata_json": _provenance_meta(0)},
-        ],
-    )
-    dest = tmp_path / "out"
-    with pytest.raises(ValueError, match="duplicate source episode indexes"):
+    with pytest.raises(ValueError, match=expected_message):
         export.export(dest, manifest=manifest, camera_keys=CAMS)
     assert not dest.exists()
 

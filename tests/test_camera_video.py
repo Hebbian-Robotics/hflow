@@ -2,42 +2,19 @@
 to the episode's time axis through its labels."""
 
 import asyncio
-import subprocess
 from pathlib import Path
 
 import pytest
+from media_test_helpers import decoded_frame_count
 
 import hflow
 from hflow.camera_video import CAMERA_VIDEO_VERSION, camera_video, video_artifact_name
 from hflow.curation import open_catalog_connection
-from hflow.ffmpeg import ffprobe_path
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
 TWO_CAMERAS_AT_15_HZ = SyntheticEpisodeSpec(
     duration_s=2.0, cameras=("wrist_cam", "top_cam"), image_hz=15.0
 )
-
-
-def _decoded_frame_count(mp4_path: Path) -> int:
-    completed = subprocess.run(
-        [
-            str(ffprobe_path()),
-            "-v",
-            "error",
-            "-count_frames",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=nb_read_frames",
-            "-of",
-            "csv=p=0",
-            str(mp4_path),
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return int(completed.stdout.strip())
 
 
 def test_camera_video_publishes_a_playable_mp4_per_camera_with_its_clock(
@@ -69,7 +46,7 @@ def test_camera_video_publishes_a_playable_mp4_per_camera_with_its_clock(
         assert published_mp4.suffix == ".mp4"
         labels = video_run.result.labels
         assert labels[f"{topic}/video_fps"] == pytest.approx(15.0, rel=0.05)
-        assert labels[f"{topic}/video_frame_count"] == _decoded_frame_count(published_mp4)
+        assert labels[f"{topic}/video_frame_count"] == decoded_frame_count(published_mp4)
         expected_start_s = (first_frame_stamps[topic] - time_bounds.start_ns) / 1e9
         assert labels[f"{topic}/video_start_s"] == pytest.approx(expected_start_s)
         assert 0.0 <= expected_start_s < 1.0

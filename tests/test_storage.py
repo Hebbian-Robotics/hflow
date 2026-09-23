@@ -12,9 +12,11 @@ A live object-store integration test runs only when
 
 import asyncio
 import errno
+import logging
 import os
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -128,29 +130,6 @@ class TestLocalStorageRoot:
         root = LocalStorageRoot(tmp_path)
         root.write_bytes("landing/e.mcap", b"episode")
         assert root.fetch("landing/e.mcap") == tmp_path / "landing" / "e.mcap"
-        with pytest.raises(FileNotFoundError):
-            root.fetch("landing/missing.mcap")
-
-    def test_fetch_missing_has_oserror_filename(self, tmp_path: Path) -> None:
-        root = LocalStorageRoot(tmp_path)
-        missing = tmp_path / "landing" / "missing.mcap"
-        with pytest.raises(FileNotFoundError) as excinfo:
-            root.fetch("landing/missing.mcap")
-        assert excinfo.value.errno == errno.ENOENT
-        assert excinfo.value.filename == str(missing)
-        assert "No such file or directory" in str(excinfo.value)
-        assert str(missing) in str(excinfo.value)
-
-    def test_fetch_directory_says_is_a_directory(self, tmp_path: Path) -> None:
-        """A directory exists, so ENOENT was the wrong reason (#144)."""
-        root = LocalStorageRoot(tmp_path)
-        a_directory = tmp_path / "landing"
-        a_directory.mkdir()
-        with pytest.raises(FileNotFoundError) as excinfo:
-            root.fetch("landing")
-        assert excinfo.value.errno == errno.EISDIR
-        assert excinfo.value.filename == str(a_directory)
-        assert "Is a directory" in str(excinfo.value)
 
     def test_publish_copies_only_when_needed(self, tmp_path: Path) -> None:
         root = LocalStorageRoot(tmp_path / "root")
@@ -258,39 +237,12 @@ class TestBucketStorageRoot:
         first.write_bytes(b"locally-poisoned")
         assert root.fetch("landing/e.mcap").read_bytes() == b"locally-poisoned"
 
-    def test_fetch_redownloads_when_remote_changed(
-        self, bucket_over_tmp: tuple[BucketStorageRoot, Path]
-    ) -> None:
-        root, _ = bucket_over_tmp
-        root.write_bytes("landing/e.mcap", b"version-one")
-        assert root.fetch("landing/e.mcap").read_bytes() == b"version-one"
-        root.write_bytes("landing/e.mcap", b"version-two!")  # changed size => changed etag
-        assert root.fetch("landing/e.mcap").read_bytes() == b"version-two!"
-
     def test_fetch_missing_raises_file_not_found(
         self, bucket_over_tmp: tuple[BucketStorageRoot, Path]
     ) -> None:
         root, _ = bucket_over_tmp
         with pytest.raises(FileNotFoundError):
             root.fetch("landing/missing.mcap")
-
-    def test_fetch_local_missing_has_oserror_filename(self, tmp_path: Path) -> None:
-        missing = tmp_path / "nope.mcap"
-        with pytest.raises(FileNotFoundError) as excinfo:
-            fetch_uri(missing)
-        assert excinfo.value.errno == 2
-        assert "No such file or directory" in str(excinfo.value)
-        assert str(missing) in str(excinfo.value)
-
-    def test_fetch_local_directory_says_is_a_directory(self, tmp_path: Path) -> None:
-        """`hflow doctor <a directory>` reaches this and reported ENOENT (#144)."""
-        a_directory = tmp_path / "adir"
-        a_directory.mkdir()
-        with pytest.raises(FileNotFoundError) as excinfo:
-            fetch_uri(a_directory)
-        assert excinfo.value.errno == errno.EISDIR
-        assert excinfo.value.filename == str(a_directory)
-        assert "Is a directory" in str(excinfo.value)
 
     def test_publish_uploads_and_warms_mirror(
         self, tmp_path: Path, bucket_over_tmp: tuple[BucketStorageRoot, Path]
@@ -326,6 +278,74 @@ class TestBucketStorageRoot:
         (mirror / "catalog" / "tags" / "t.parquet").write_bytes(b"local-final")
         root.sync_into_mirror(("catalog/tags",))
         assert (mirror / "catalog" / "tags" / "t.parquet").read_bytes() == b"local-final"
+
+    def test_fetch_download_emits_one_debug_record_and_cache_hit_none(
+        self, bucket_over_tmp: tuple[BucketStorageRoot, Path], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        root, _ = bucket_over_tmp
+        root.write_bytes("landing/e.mcap", b"episode-bytes")
+        with caplog.at_level(logging.DEBUG, logger="hflow.storage"):
+            fetched = root.fetch("landing/e.mcap")
+        assert fetched.read_bytes() == b"episode-bytes"
+        (record,) = caplog.records
+        assert record.levelno == logging.DEBUG
+        assert "landing/e.mcap" in record.getMessage()
+        # The mirror had no payload for the key at all.
+        assert "(missing)" in record.getMessage()
+        caplog.clear()
+        # The etag hit is the quiet steady state: a second fetch logs nothing.
+        with caplog.at_level(logging.DEBUG, logger="hflow.storage"):
+            assert root.fetch("landing/e.mcap").read_bytes() == b"episode-bytes"
+        assert caplog.records == []
+
+    def test_fetch_stale_payload_emits_one_debug_record(
+        self, bucket_over_tmp: tuple[BucketStorageRoot, Path], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        root, _ = bucket_over_tmp
+        root.write_bytes("landing/e.mcap", b"version-one")
+        root.fetch("landing/e.mcap")
+        root.write_bytes("landing/e.mcap", b"version-two!")  # changed size => changed etag
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="hflow.storage"):
+            assert root.fetch("landing/e.mcap").read_bytes() == b"version-two!"
+        (record,) = caplog.records
+        assert record.levelno == logging.DEBUG
+        assert "(stale)" in record.getMessage()
+
+    def test_sync_into_mirror_emits_one_info_summary_per_transfer(
+        self, bucket_over_tmp: tuple[BucketStorageRoot, Path], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        root, _ = bucket_over_tmp
+        root.write_bytes("catalog/episodes/a.parquet", b"aa")
+        root.write_bytes("catalog/episodes/b.parquet", b"bbb")
+        root.write_bytes("catalog/tags/t.parquet", b"t")
+        with caplog.at_level(logging.INFO, logger="hflow.storage"):
+            mirror = root.sync_into_mirror(("catalog/episodes", "catalog/tags"))
+        assert (mirror / "catalog" / "episodes" / "b.parquet").read_bytes() == b"bbb"
+        (record,) = caplog.records
+        assert record.levelno == logging.INFO
+        # Three objects, ONE record: the summary is per call, not per object.
+        assert record.getMessage().startswith("synced 3 object(s) (6 bytes) into the mirror in ")
+        assert re.search(r" in \d+\.\d+s$", record.getMessage())
+        caplog.clear()
+        # An already warm mirror transfers nothing and says nothing.
+        with caplog.at_level(logging.INFO, logger="hflow.storage"):
+            root.sync_into_mirror(("catalog/episodes", "catalog/tags"))
+        assert caplog.records == []
+
+    def test_sync_into_mirror_counts_only_what_it_transferred(
+        self, bucket_over_tmp: tuple[BucketStorageRoot, Path], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        root, _ = bucket_over_tmp
+        root.write_bytes("catalog/episodes/a.parquet", b"aa")
+        root.write_bytes("catalog/tags/t.parquet", b"tt")
+        root.sync_into_mirror(("catalog/episodes",))
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="hflow.storage"):
+            root.sync_into_mirror(("catalog/episodes", "catalog/tags"))
+        (record,) = caplog.records
+        # Only the object the mirror lacked is counted, not the warm one.
+        assert record.getMessage().startswith("synced 1 object(s) (2 bytes) into the mirror in ")
 
     def test_child_shares_the_mirror_subtree(
         self, bucket_over_tmp: tuple[BucketStorageRoot, Path]
@@ -385,14 +405,53 @@ class TestBucketStorageRoot:
         assert received_options[-1]["automatic_cleanup"] is True
 
 
+# Both local entry points refuse through one shared path check; each case
+# names the local file path it resolves, relative to ``tmp_path``.
+_LOCAL_FETCHERS = [
+    pytest.param(
+        lambda tmp_path, relative_path: LocalStorageRoot(tmp_path).fetch(relative_path),
+        id="local-root-fetch",
+    ),
+    pytest.param(
+        lambda tmp_path, relative_path: fetch_uri(tmp_path / relative_path), id="fetch-uri"
+    ),
+]
+
+
+@pytest.mark.parametrize("fetch_local", _LOCAL_FETCHERS)
+def test_fetching_a_missing_local_file_has_oserror_filename(
+    tmp_path: Path, fetch_local: Callable[[Path, str], Path]
+) -> None:
+    missing = tmp_path / "landing" / "missing.mcap"
+    with pytest.raises(FileNotFoundError) as excinfo:
+        fetch_local(tmp_path, "landing/missing.mcap")
+    assert excinfo.value.errno == errno.ENOENT
+    assert excinfo.value.filename == str(missing)
+    assert "No such file or directory" in str(excinfo.value)
+    assert str(missing) in str(excinfo.value)
+
+
+@pytest.mark.parametrize("fetch_local", _LOCAL_FETCHERS)
+def test_fetching_a_local_directory_says_is_a_directory(
+    tmp_path: Path, fetch_local: Callable[[Path, str], Path]
+) -> None:
+    """A directory exists, so ENOENT was the wrong reason. `hflow doctor <a
+    directory>` reached this through ``fetch_uri`` and reported ENOENT (#144)."""
+    a_directory = tmp_path / "landing"
+    a_directory.mkdir()
+    with pytest.raises(FileNotFoundError) as excinfo:
+        fetch_local(tmp_path, "landing")
+    assert excinfo.value.errno == errno.EISDIR
+    assert excinfo.value.filename == str(a_directory)
+    assert "Is a directory" in str(excinfo.value)
+
+
 class TestFetchUri:
     def test_local_path_passes_through(self, tmp_path: Path) -> None:
         local_file = tmp_path / "e.mcap"
         local_file.write_bytes(b"x")
         assert fetch_uri(local_file) == local_file
         assert fetch_uri(str(local_file)) == local_file
-        with pytest.raises(FileNotFoundError):
-            fetch_uri(tmp_path / "missing.mcap")
 
     def test_default_mirror_is_stable_per_url(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

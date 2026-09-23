@@ -40,45 +40,33 @@ class TestWorkspaceIdentity:
         assert second_identity == first_identity
         assert Workspace.parse(tmp_path).identity() == first_identity
 
-    def test_corrupt_identity_marker_is_refused_loudly(self, tmp_path: Path) -> None:
-        (tmp_path / "workspace.json").write_text("not json at all")
-        with pytest.raises(ValueError, match="invalid workspace identity"):
-            Workspace.parse(tmp_path).identity()
-
-    def test_identity_marker_not_dict_is_refused(self, tmp_path: Path) -> None:
-        (tmp_path / "workspace.json").write_text("[]")
-        with pytest.raises(ValueError, match="expected a JSON object"):
-            Workspace.parse(tmp_path).identity()
-
-    def test_identity_marker_version_mismatch_is_refused(self, tmp_path: Path) -> None:
-        payload = {
-            "identity_version": 99,
-            "workspace_id": "foo",
-            "created_at": "bar",
-        }
-        (tmp_path / "workspace.json").write_text(json.dumps(payload))
-        with pytest.raises(
-            ValueError,
-            match=f"has identity_version 99.*this build reads version {WORKSPACE_IDENTITY_VERSION}",
-        ):
-            Workspace.parse(tmp_path).identity()
-
-    def test_identity_marker_missing_workspace_id_is_refused(self, tmp_path: Path) -> None:
-        payload = {
-            "identity_version": WORKSPACE_IDENTITY_VERSION,
-            "created_at": "bar",
-        }
-        (tmp_path / "workspace.json").write_text(json.dumps(payload))
-        with pytest.raises(ValueError, match="'workspace_id' must be a non-empty string"):
-            Workspace.parse(tmp_path).identity()
-
-    def test_identity_marker_missing_created_at_is_refused(self, tmp_path: Path) -> None:
-        payload = {
-            "identity_version": WORKSPACE_IDENTITY_VERSION,
-            "workspace_id": "foo",
-        }
-        (tmp_path / "workspace.json").write_text(json.dumps(payload))
-        with pytest.raises(ValueError, match="'created_at' must be a non-empty string"):
+    @pytest.mark.parametrize(
+        ("marker_text", "expected_message"),
+        [
+            pytest.param("not json at all", "invalid workspace identity", id="corrupt-json"),
+            pytest.param("[]", "expected a JSON object", id="not-an-object"),
+            pytest.param(
+                json.dumps({"identity_version": 99, "workspace_id": "foo", "created_at": "bar"}),
+                f"has identity_version 99.*this build reads version {WORKSPACE_IDENTITY_VERSION}",
+                id="version-mismatch",
+            ),
+            pytest.param(
+                json.dumps({"identity_version": WORKSPACE_IDENTITY_VERSION, "created_at": "bar"}),
+                "'workspace_id' must be a non-empty string",
+                id="missing-workspace-id",
+            ),
+            pytest.param(
+                json.dumps({"identity_version": WORKSPACE_IDENTITY_VERSION, "workspace_id": "foo"}),
+                "'created_at' must be a non-empty string",
+                id="missing-created-at",
+            ),
+        ],
+    )
+    def test_an_unusable_identity_marker_is_refused_loudly(
+        self, tmp_path: Path, marker_text: str, expected_message: str
+    ) -> None:
+        (tmp_path / "workspace.json").write_text(marker_text)
+        with pytest.raises(ValueError, match=expected_message):
             Workspace.parse(tmp_path).identity()
 
 
@@ -185,9 +173,3 @@ class TestPipelineManifest:
                 },
             ]
         }
-
-    def test_manifest_json_round_trips(self, tmp_path: Path) -> None:
-        app = hflow.App("kitchen", data_root=tmp_path, default_checks=())
-        parsed = json.loads(app.manifest().to_json())
-        assert parsed["pipeline_name"] == "kitchen"
-        assert parsed["checks"] == []

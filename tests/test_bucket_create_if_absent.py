@@ -7,6 +7,7 @@ from threading import Barrier, Lock
 
 import duckdb
 import pytest
+from catalog_test_helpers import FAKE_STAMPS, recorded_at_values
 
 import hflow
 from hflow.catalog import AppendResult, Catalog, CheckRunRow
@@ -14,7 +15,6 @@ from hflow.curation import open_catalog_connection
 from hflow.dataset import ManifestAlreadyExistsError, write_dataset_manifest
 from hflow.ingest_ledger import IngestFailure, record_ingest_failure
 from hflow.storage import BucketStorageRoot
-from hflow.transform import EpisodeStamps
 from hflow.workspace import Workspace
 
 pytest.importorskip("obstore", reason="bucket tests need the hflow[bucket] extra")
@@ -52,12 +52,6 @@ class _CreateIfAbsentRace:
 
 
 def _append_outcome(catalog: Catalog, canonical_path: Path, value: float = 1.0) -> AppendResult:
-    stamps = EpisodeStamps(
-        schema_version="1",
-        pipeline_version="abc123def456",
-        ffmpeg_version="ffmpeg version test",
-        robot_software_version="sim-0.1.0",
-    )
     row = CheckRunRow(
         check_name="example_check",
         check_version="v1",
@@ -70,7 +64,7 @@ def _append_outcome(catalog: Catalog, canonical_path: Path, value: float = 1.0) 
     )
     return catalog.append_episode(
         canonical_path=canonical_path,
-        stamps=stamps,
+        stamps=FAKE_STAMPS,
         episode_metadata={"task": "bucket race"},
         check_rows=[row],
     )
@@ -113,27 +107,7 @@ def test_concurrent_bucket_catalog_appends_publish_one_complete_outcome(
     assert {result.run_fingerprint for result in results} == {results[0].run_fingerprint}
 
     stem = f"{results[0].episode_id}-{results[0].run_fingerprint}"
-    timestamps: set[str] = set()
-    connection = duckdb.connect()
-    try:
-        for table_name in (
-            "episodes",
-            "check_runs",
-            "measurements",
-            "observations",
-            "tags",
-            "intervals",
-        ):
-            table_file = remote_dir / "catalog" / table_name / f"{stem}.parquet"
-            assert table_file.is_file()
-            rows = connection.execute(
-                "SELECT DISTINCT CAST(recorded_at AS VARCHAR) FROM read_parquet(?)",
-                [str(table_file)],
-            ).fetchall()
-            timestamps.update(recorded_at for (recorded_at,) in rows)
-    finally:
-        connection.close()
-    assert len(timestamps) == 1
+    assert len(recorded_at_values(remote_dir / "catalog", stem)) == 1
 
 
 def test_concurrent_bucket_manifest_writes_publish_once(
@@ -210,11 +184,8 @@ def test_concurrent_bucket_ingest_failures_publish_one_ledger_row(
     assert race.refusals == 1
     assert len(catalog_root.list_names("ingest_failures")) == 1
 
-    connection = open_catalog_connection(catalog_root)
-    try:
+    with open_catalog_connection(catalog_root) as connection:
         rows = connection.execute(
             "SELECT source_uri, stage, pipeline_version, attempt_fingerprint FROM ingest_failures"
         ).fetchall()
-    finally:
-        connection.close()
     assert rows == [("episodes-in/corrupt.mcap", "sync", "v1", results[0].attempt_fingerprint)]

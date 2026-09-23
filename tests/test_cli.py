@@ -4,12 +4,12 @@ import sys
 from pathlib import Path
 
 import pytest
+from episode_test_helpers import synthesize_canonical_episode
 from pytest import CaptureFixture
 
 from hflow import __version__
 from hflow.cli import _build_parser, main
-from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
-from hflow.transform import write_canonical_episode
+from hflow.testing import SyntheticEpisodeSpec
 
 
 @pytest.mark.parametrize(
@@ -18,21 +18,6 @@ from hflow.transform import write_canonical_episode
         ("down", "Stop the local Docker Compose runtime rendered by `hflow up`"),
         ("ingest", "Submit one or more episode URIs to the master ingest DAG"),
         ("status", "Inspect the health of the local or remote Airflow runtime"),
-    ],
-)
-def test_runtime_command_help_has_a_description(
-    command: str, expected_description: str, capsys: CaptureFixture
-) -> None:
-    with pytest.raises(SystemExit) as exception:
-        _build_parser().parse_args([command, "--help"])
-
-    assert exception.value.code == 0
-    assert expected_description in capsys.readouterr().out
-
-
-@pytest.mark.parametrize(
-    ("command", "expected_description"),
-    [
         ("catalog", "Group commands for inspecting and exploring the append-only"),
         ("dataset", "Group commands that turn the pipeline's policy into version-pinned"),
         ("export", "Group commands for exporting catalog selections in portable downstream"),
@@ -40,7 +25,7 @@ def test_runtime_command_help_has_a_description(
         ("serve", "Serve this workspace over HTTP with REST endpoints over the catalog"),
     ],
 )
-def test_top_level_command_help_has_a_description(
+def test_command_help_has_a_description(
     command: str, expected_description: str, capsys: CaptureFixture
 ) -> None:
     with pytest.raises(SystemExit) as exception:
@@ -162,11 +147,9 @@ def test_the_module_form_matches_the_console_script(args: list[str]) -> None:
 
 def test_the_module_form_reports_a_conforming_file(tmp_path: Path) -> None:
     """The exit-0 path, over a real episode rather than --help."""
-    source = synthesize_episode(
-        tmp_path / "source.mcap", SyntheticEpisodeSpec(duration_s=1.0, cameras=())
+    canonical = synthesize_canonical_episode(
+        tmp_path, SyntheticEpisodeSpec(duration_s=1.0, cameras=())
     )
-    canonical = tmp_path / "canonical.mcap"
-    write_canonical_episode(source, canonical)
 
     module = _run_module("doctor", str(canonical))
     script = _run_script("doctor", str(canonical))

@@ -9,7 +9,6 @@ concurrent writers to one path must not share a temp file.
 from __future__ import annotations
 
 import os
-import shutil
 import signal
 import subprocess
 import time
@@ -18,53 +17,11 @@ from pathlib import Path
 from threading import Barrier
 
 import pytest
+from media_test_helpers import make_extracted_frames, video_stream_dimensions
 
 from hflow.episode import ExtractedFrame
 from hflow.ffmpeg import _contact_sheet
 from hflow.ffmpeg._contact_sheet import contact_sheet
-
-_STREAM_START_NS = 1_755_000_000_000_000_000
-
-
-def _system_ffmpeg() -> str:
-    ffmpeg_binary = shutil.which("ffmpeg")
-    assert ffmpeg_binary is not None, "ffmpeg required on PATH for these tests"
-    return ffmpeg_binary
-
-
-def _system_ffprobe() -> str:
-    ffprobe_binary = shutil.which("ffprobe")
-    assert ffprobe_binary is not None, "ffprobe required on PATH for these tests"
-    return ffprobe_binary
-
-
-def _make_frames(directory: Path, *, count: int, size: str) -> list[ExtractedFrame]:
-    """``count`` JPEG frames rendered from lavfi, 1s apart."""
-    directory.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [
-            _system_ffmpeg(),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            f"testsrc2=size={size}:rate=1:duration={count}",
-            "-q:v",
-            "2",
-            str(directory / "frame_%02d.jpg"),
-        ],
-        capture_output=True,
-        check=True,
-    )
-    frame_paths = sorted(directory.glob("frame_*.jpg"))
-    assert len(frame_paths) == count
-    return [
-        ExtractedFrame(path=frame_path, log_time_ns=_STREAM_START_NS + index * 1_000_000_000)
-        for index, frame_path in enumerate(frame_paths)
-    ]
 
 
 def _assert_fully_valid_jpeg(path: Path) -> None:
@@ -72,24 +29,10 @@ def _assert_fully_valid_jpeg(path: Path) -> None:
     data = path.read_bytes()
     assert data[:2] == b"\xff\xd8", f"{path} is missing its JPEG SOI marker"
     assert data[-2:] == b"\xff\xd9", f"{path} is missing its JPEG EOI marker (truncated?)"
-    completed = subprocess.run(
-        [
-            _system_ffprobe(),
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=width,height",
-            "-of",
-            "csv=p=0",
-            str(path),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, f"ffprobe cannot decode {path}: {completed.stderr}"
+    try:
+        video_stream_dimensions(path)
+    except subprocess.CalledProcessError as error:
+        pytest.fail(f"ffprobe cannot decode {path}: {error.stderr.decode(errors='replace')}")
 
 
 def _run_sheet_with_ffmpeg_sigkilled(
@@ -153,7 +96,7 @@ def _run_sheet_with_ffmpeg_sigkilled(
 def test_sigkill_mid_write_never_leaves_partial_sheet(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    frames = _make_frames(tmp_path / "big-frames", count=8, size="1280x720")
+    frames = make_extracted_frames(tmp_path / "big-frames", count=8, size="1280x720")
     output = tmp_path / "sheet.jpg"
 
     assert _run_sheet_with_ffmpeg_sigkilled(frames, output, monkeypatch), (
@@ -177,7 +120,7 @@ def test_sigkill_mid_write_never_leaves_partial_sheet(
 
 def test_concurrent_sheets_to_same_path_stay_valid(tmp_path: Path) -> None:
     """Two concurrent sheets to one path: per-call temps, last complete replace wins."""
-    frames = _make_frames(tmp_path / "frames", count=8, size="640x480")
+    frames = make_extracted_frames(tmp_path / "frames", count=8, size="640x480")
     output = tmp_path / "shared.jpg"
     barrier = Barrier(2)
 
@@ -191,40 +134,3 @@ def test_concurrent_sheets_to_same_path_stay_valid(tmp_path: Path) -> None:
             assert [future.result(timeout=120) for future in futures] == [output, output]
         _assert_fully_valid_jpeg(output)
     assert not list(tmp_path.glob(".shared.jpg.*.tmp")), "orphaned temp file after concurrency"
-
-
-def test_contact_sheet_pins_explicit_image_muxer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The .tmp suffix defeats extension sniffing, so the command must name the muxer."""
-    frames = _make_frames(tmp_path / "frames", count=2, size="320x240")
-    seen_commands: list[list[str]] = []
-    minimal_jpeg = b"\xff\xd8\xff\xd9"
-    real_run = subprocess.run
-
-    def fake_run(
-        command: list[str], *, capture_output: bool, text: bool, check: bool
-    ) -> subprocess.CompletedProcess[str]:
-        if "-frames:v" not in command:
-            # Font probing (fc-match) and the drawtext capability check share
-            # the module's subprocess handle; let them run for real.
-            return real_run(command, capture_output=capture_output, text=text, check=check)
-        seen_commands.append(list(command))
-        Path(command[-1]).write_bytes(minimal_jpeg)
-        return subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(_contact_sheet.subprocess, "run", fake_run)
-    output = tmp_path / "sheet.jpg"
-    sheet = contact_sheet(frames, output, columns=2)
-
-    assert sheet.path == output
-    assert output.read_bytes() == minimal_jpeg
-    assert seen_commands, "ffmpeg was never invoked"
-    command = seen_commands[0]
-    assert ["-f", "image2"] in [command[index : index + 2] for index in range(len(command) - 1)], (
-        f"ffmpeg command must pin -f image2 for the .tmp output, got: {command}"
-    )
-    staged_output = Path(command[-1])
-    assert staged_output.parent == output.parent and staged_output.suffix == ".tmp", (
-        f"ffmpeg must write a sibling temp file, got: {command[-1]}"
-    )

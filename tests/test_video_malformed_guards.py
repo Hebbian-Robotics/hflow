@@ -30,22 +30,24 @@ def test_nal_header_rejects_invalid_annex_b_start_code() -> None:
         _nal_header_offset(b"\x00\x00\x00\xff", 3)
 
 
-def test_ensure_aud_rejects_slice_header_without_complete_first_mb_value() -> None:
-    # first_mb_in_slice is unsigned Exp-Golomb. An all-zero RBSP has no
-    # terminating one bit, so the decoder must reject it as incomplete.
-    malformed_slice = _single_slice_idr(b"\x00")
-    message = "slice header has no complete first_mb_in_slice value"
-
+@pytest.mark.parametrize(
+    ("slice_header_rbsp", "message"),
+    [
+        # first_mb_in_slice is unsigned Exp-Golomb. An all-zero RBSP has no
+        # terminating one bit, so the decoder must reject it as incomplete.
+        pytest.param(
+            b"\x00", "slice header has no complete first_mb_in_slice value", id="no-complete-value"
+        ),
+        # 00000100 starts an Exp-Golomb value with five leading zero bits and
+        # a one bit, but only two suffix bits remain in the byte. This reaches
+        # the truncation guard rather than the no-complete-value guard.
+        pytest.param(
+            b"\x04", "slice header truncates its first_mb_in_slice value", id="truncated-value"
+        ),
+    ],
+)
+def test_ensure_aud_rejects_a_malformed_first_mb_value(
+    slice_header_rbsp: bytes, message: str
+) -> None:
     with pytest.raises(ValueError, match=message):
-        ensure_access_unit_delimiter(malformed_slice)
-
-
-def test_ensure_aud_rejects_truncated_first_mb_value() -> None:
-    # 00000100 starts an Exp-Golomb value with five leading zero bits and a
-    # one bit, but only two suffix bits remain in the byte. This deliberately
-    # reaches the truncation guard rather than the no-complete-value guard.
-    malformed_slice = _single_slice_idr(b"\x04")
-    message = "slice header truncates its first_mb_in_slice value"
-
-    with pytest.raises(ValueError, match=message):
-        ensure_access_unit_delimiter(malformed_slice)
+        ensure_access_unit_delimiter(_single_slice_idr(slice_header_rbsp))

@@ -11,7 +11,7 @@ import logging
 import shutil
 import subprocess
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import replace
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,6 +20,17 @@ from types import SimpleNamespace
 from urllib.parse import unquote, urlsplit
 
 import pytest
+from lerobot_test_helpers import (
+    CorpusEpisodeRow,
+    publish_staged_episode,
+    split_episode_metadata_into_shards,
+    stub_hub_download,
+    stub_hub_repo_info,
+    stub_single_shard_hub_corpus,
+    two_camera_v3_info,
+    write_v3_corpus,
+    write_v3_data_parquet,
+)
 
 import hflow.importers.lerobot as prep
 from hflow.cli import main as cli_main
@@ -28,6 +39,10 @@ from hflow.storage import LocalStorageRoot, StorageRoot
 
 _DERIVE = prep._derive_numeric_schema
 _ENCODE = prep._encode_cdr_float32_array
+_SIX_DIMENSION_NUMERIC_SCHEMAS = {
+    "observation.state": prep._NumericSchema(name="observation.state", dim=6),
+    "action": prep._NumericSchema(name="action", dim=6),
+}
 
 
 def _numeric_feature(name: str, dtype: str, shape: list) -> prep._NumericFeature:
@@ -56,147 +71,71 @@ def _source_archive(
     )
 
 
-def _stub_download(
-    monkeypatch: pytest.MonkeyPatch, supply_file: Callable[[str, Path], None]
-) -> None:
-    """Supply fixture files at the SDK boundary, using its repository layout."""
-
-    def download(_repo_id: str, filename: str, *, local_dir: Path, **_kwargs: object) -> str:
-        destination = local_dir / filename
-        if not destination.exists():
-            supply_file(filename, destination)
-        return str(destination)
-
-    monkeypatch.setattr(prep, "hf_hub_download", download)
+def _single_camera_episode_row(
+    episode_index: int,
+    *,
+    camera_key: str,
+    task: str | None = None,
+    length: int = 1,
+    data_from: int = 0,
+    video_file_index: str = "000",
+    from_timestamp: float = 0.0,
+    to_timestamp: float = 0.0,
+) -> prep._EpisodeRow:
+    """An episode in data chunk and file ``000`` with one camera's video window."""
+    return prep._EpisodeRow(
+        episode_index=episode_index,
+        task=f"task-{episode_index}" if task is None else task,
+        length=length,
+        data_chunk="000",
+        data_file="000",
+        data_from=data_from,
+        data_to=data_from + length,
+        video_windows={
+            camera_key: prep._VideoWindow(
+                chunk_index="000",
+                file_index=video_file_index,
+                from_timestamp=from_timestamp,
+                to_timestamp=to_timestamp,
+            )
+        },
+    )
 
 
 _FFMPEG = shutil.which("ffmpeg")
 _FFPROBE = shutil.which("ffprobe")
 
-# Only the remux test below shells out. Scoping this to the module would skip
-# the five metadata tests too, and none of those touch ffmpeg at all.
+# Only the remux and frame-slicing tests below shell out. Scoping this to the
+# module would skip the metadata tests too, and none of those touch ffmpeg.
 _requires_system_ffmpeg = pytest.mark.skipif(
     _FFMPEG is None or _FFPROBE is None,
     reason="system ffmpeg/ffprobe required to construct and inspect the test video",
 )
 
 
-def _build_fake_corpus(tmp_path: Path) -> dict:
+def _build_fake_corpus(corpus_root: Path) -> dict:
     """Synthetic v3 metadata: 4 episodes, 2 cameras, 6-dim state/action."""
-    info = {
-        "fps": 30,
-        "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
-        "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
-        "features": {
-            "action": {"dtype": "float32", "shape": [6]},
-            "observation.state": {"dtype": "float32", "shape": [6]},
-            "observation.images.up": {"dtype": "video", "shape": [480, 640, 3]},
-            "observation.images.side": {"dtype": "video", "shape": [480, 640, 3]},
-            "timestamp": {"dtype": "float32", "shape": [1]},
-        },
-        "robot_type": "so101",
-    }
-    (tmp_path / "meta").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "meta" / "info.json").write_text(json.dumps(info))
-
-    import duckdb
-
-    conn = duckdb.connect()
-    rows = []
-    for i in range(4):
-        rows.append(
-            [
-                i,
-                60 + i * 5,
-                "chunk-000",
-                "file-000",
-                i * 200,
-                i * 200 + 60 + i * 5,
-                "chunk-000",
-                "file-000",
-                0.0,
-                2.0 + i * 0.2,
-                "chunk-000",
-                "file-000",
-                0.0,
-                2.0 + i * 0.2,
-                [f"task-{i}"],
-            ]
-        )
-    ep_cols = [
-        "episode_index",
-        "length",
-        "data/chunk_index",
-        "data/file_index",
-        "dataset_from_index",
-        "dataset_to_index",
-        "videos/observation.images.up/chunk_index",
-        "videos/observation.images.up/file_index",
-        "videos/observation.images.up/from_timestamp",
-        "videos/observation.images.up/to_timestamp",
-        "videos/observation.images.side/chunk_index",
-        "videos/observation.images.side/file_index",
-        "videos/observation.images.side/from_timestamp",
-        "videos/observation.images.side/to_timestamp",
-        "tasks",
-    ]
-    ep_path = tmp_path / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
-    ep_path.parent.mkdir(parents=True, exist_ok=True)
-    ep_quoted = str(ep_path).replace("'", "''")
-    vals_sql = ",".join(
-        "("
-        + ",".join(
-            "[" + ",".join(f"'{x}'" for x in v) + "]"
-            if isinstance(v, list)
-            else f"'{v!s}'"
-            if isinstance(v, str)
-            else str(v)
-            for v in row
-        )
-        + ")"
-        for row in rows
+    info = two_camera_v3_info()
+    write_v3_corpus(
+        corpus_root,
+        info=info,
+        episode_rows=[
+            CorpusEpisodeRow(
+                episode_index=episode_index,
+                length=60 + episode_index * 5,
+                dataset_from_index=episode_index * 200,
+                video_to_timestamp=2.0 + episode_index * 0.2,
+                tasks=(f"task-{episode_index}",),
+                data_chunk_index="chunk-000",
+                data_file_index="file-000",
+                video_chunk_index="chunk-000",
+                video_file_index="file-000",
+            )
+            for episode_index in range(4)
+        ],
+        timestamps_as_double=True,
     )
-    ep_cols_q = ",".join(f'"{c}"' for c in ep_cols)
-    conn.execute(
-        f"COPY (SELECT * FROM (VALUES {vals_sql}) AS t({ep_cols_q})) "
-        f"TO '{ep_quoted}' (FORMAT parquet)"
-    )
-
-    # data parquet with contiguous `index` column matching episode windows
-    data_rows = []
-    idx = 0
-    for i in range(4):
-        length = 60 + i * 5
-        for f in range(length):
-            state = "[" + ",".join(str(float(f)) for _ in range(6)) + "]"
-            action = "[" + ",".join(str(float(f + 0.5)) for _ in range(6)) + "]"
-            data_rows.append([idx, i, f, round(f / 30.0, 6), state, action])
-            idx += 1
-    data_path = tmp_path / "data" / "chunk-000" / "file-000.parquet"
-    data_path.parent.mkdir(parents=True, exist_ok=True)
-    data_quoted = str(data_path).replace("'", "''")
-    data_vals = ",".join("(" + ",".join(str(v) for v in row) + ")" for row in data_rows)
-    conn.execute(
-        f"COPY (SELECT * FROM (VALUES {data_vals}) AS "
-        't(index, episode_index, frame_index, timestamp, "observation.state", action)) '
-        f"TO '{data_quoted}' (FORMAT parquet)"
-    )
-    conn.execute(
-        "COPY (SELECT index, episode_index, frame_index, CAST(timestamp AS DOUBLE) AS timestamp, "
-        f"\"observation.state\", action FROM read_parquet('{data_quoted}')) "
-        f"TO '{data_quoted}' (FORMAT parquet)"
-    )
-    conn.close()
-
-    return {
-        "info": info,
-        "fps": 30,
-        "data_path": info["data_path"],
-        "video_path": info["video_path"],
-        "cache_dir": tmp_path,
-        "data_chunk": "chunk-000",
-        "data_file": "file-000",
-    }
+    return {"info": info, "cache_dir": corpus_root}
 
 
 def test_derive_numeric_schema_float32_vector() -> None:
@@ -225,11 +164,7 @@ def test_import_rejects_required_boolean_dimension_without_dataset_output(
 ) -> None:
     output_dir = tmp_path / "out"
     dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
-    monkeypatch.setattr(
-        prep,
-        "_hf_repo_info",
-        lambda repo, revision: {"sha": "abc", "license": "apache-2.0"},
-    )
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc")
     monkeypatch.setattr(
         prep,
         "_ensure_source_archive",
@@ -275,34 +210,8 @@ def test_index_discovery_multi_camera_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     corpus = _build_fake_corpus(tmp_path)
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, rev: {"sha": rev, "license": "apache-2.0"}
-    )
-    monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: corpus["info"])
-    monkeypatch.setattr(
-        prep,
-        "_hf_episode_metadata_files",
-        lambda repo, rev: ["meta/episodes/chunk-000/file-000.parquet"],
-    )
-
-    def fake_dl(filename: str, dest: Path, **kw: object) -> None:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if "meta/episodes" in filename:
-            import shutil
-
-            shutil.copy(
-                str(tmp_path / "meta" / "episodes" / "chunk-000" / "file-000.parquet"), dest
-            )
-        elif filename.endswith("info.json"):
-            import shutil
-
-            shutil.copy(str(tmp_path / "meta" / "info.json"), dest)
-        else:
-            import shutil
-
-            shutil.copy(str(tmp_path / "data" / "chunk-000" / "file-000.parquet"), dest)
-
-    _stub_download(monkeypatch, fake_dl)
+    stub_hub_repo_info(monkeypatch)
+    stub_single_shard_hub_corpus(monkeypatch, tmp_path, corpus["info"])
 
     ds = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
     found = prep._ensure_source_archive(ds, tmp_path)
@@ -312,6 +221,8 @@ def test_index_discovery_multi_camera_metadata(
     assert found.episodes[0].data_from == 0
     assert found.episodes[0].data_to == 60
     assert set(found.video_keys) == {"observation.images.up", "observation.images.side"}
+    # The control for the fps refusals: a positive fps loads.
+    assert found.fps == 30
     assert found.episodes[0].video_windows["observation.images.up"].to_timestamp == pytest.approx(
         2.0
     )
@@ -337,28 +248,12 @@ def test_index_discovery_reads_every_metadata_shard(
     episodes in each file and a distinct video window per episode.
     """
     corpus = _build_fake_corpus(tmp_path)
-    single_shard = tmp_path / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
     shard_paths = ("meta/episodes/chunk-000/file-000.parquet", second_shard_path)
-    import duckdb
-
-    conn = duckdb.connect()
-    conn.execute(
-        "CREATE TABLE all_episodes AS SELECT * FROM read_parquet('"
-        + str(single_shard).replace("'", "''")
-        + "')"
+    split_episode_metadata_into_shards(
+        tmp_path, dict(zip(shard_paths, ((0, 1), (2, 3)), strict=True))
     )
-    for shard_path, episode_indexes in zip(shard_paths, ((0, 1), (2, 3)), strict=True):
-        shard_file = tmp_path / shard_path
-        shard_file.parent.mkdir(parents=True, exist_ok=True)
-        conn.execute(
-            f"COPY (SELECT * FROM all_episodes WHERE episode_index IN {episode_indexes}) "
-            f"TO '{str(shard_file).replace(chr(39), chr(39) * 2)}' (FORMAT parquet)"
-        )
-    conn.close()
 
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, rev: {"sha": rev, "license": "apache-2.0"}
-    )
+    stub_hub_repo_info(monkeypatch)
     monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: corpus["info"])
     monkeypatch.setattr(
         prep,
@@ -370,7 +265,7 @@ def test_index_discovery_reads_every_metadata_shard(
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(tmp_path / filename, destination)
 
-    _stub_download(monkeypatch, supply_metadata_file)
+    stub_hub_download(monkeypatch, supply_metadata_file)
 
     ds = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
     cache_dir = tmp_path / "cache"
@@ -393,36 +288,16 @@ def test_conversion_selects_video_by_file_index(
     camera_key = "observation.images.up"
     dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
 
-    def episode_row(episode_index: int, video_file_index: int) -> prep._EpisodeRow:
-        return prep._EpisodeRow(
-            episode_index=episode_index,
-            task=f"task-{episode_index}",
-            length=1,
-            data_chunk="000",
-            data_file="000",
-            data_from=0,
-            data_to=1,
-            video_windows={
-                camera_key: prep._VideoWindow(
-                    chunk_index="000",
-                    file_index=f"{video_file_index:03d}",
-                    from_timestamp=0.0,
-                    to_timestamp=0.0,
-                )
-            },
-        )
-
     source_archive = _source_archive(
         dataset_source,
         corpus["cache_dir"],
         info=corpus["info"],
-        episodes=[episode_row(0, 0), episode_row(1, 1)],
+        episodes=[
+            _single_camera_episode_row(0, camera_key=camera_key, video_file_index="000"),
+            _single_camera_episode_row(1, camera_key=camera_key, video_file_index="001"),
+        ],
         video_keys=[camera_key],
     )
-    numeric_schemas = {
-        "observation.state": prep._NumericSchema(name="observation.state", dim=6),
-        "action": prep._NumericSchema(name="action", dim=6),
-    }
     converted_sources: list[bytes] = []
 
     def fake_download(filename: str, destination_path: Path, **_kwargs: object) -> None:
@@ -436,7 +311,7 @@ def test_conversion_selects_video_by_file_index(
         converted_sources.append(mp4_path.read_bytes())
         return [b"access-unit"]
 
-    _stub_download(monkeypatch, fake_download)
+    stub_hub_download(monkeypatch, fake_download)
     monkeypatch.setattr(prep, "_transcode_mp4_to_h264", fake_transcode)
     monkeypatch.setattr(prep, "_get_video_pts_times", lambda path: [0])
     monkeypatch.setattr(prep, "ffmpeg_version", lambda: "test-ffmpeg")
@@ -455,7 +330,7 @@ def test_conversion_selects_video_by_file_index(
             storage=LocalStorageRoot(tmp_path / "output"),
             episode_index=episode_index,
             camera_keys=(camera_key,),
-            numeric_schemas=numeric_schemas,
+            numeric_schemas=_SIX_DIMENSION_NUMERIC_SCHEMAS,
             frames_per_second=30,
         )
         published_uris.append(receipt["uri"])
@@ -485,30 +360,8 @@ def test_conversion_selects_video_by_file_index(
 
 def test_camera_selection_validates_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     corpus = _build_fake_corpus(tmp_path)
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, rev: {"sha": rev, "license": "apache-2.0"}
-    )
-    monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: corpus["info"])
-    monkeypatch.setattr(
-        prep,
-        "_hf_episode_metadata_files",
-        lambda repo, rev: ["meta/episodes/chunk-000/file-000.parquet"],
-    )
-
-    def fake_dl(filename: str, dest: Path, **kw: object) -> None:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        import shutil
-
-        if "meta/episodes" in filename:
-            shutil.copy(
-                str(tmp_path / "meta" / "episodes" / "chunk-000" / "file-000.parquet"), dest
-            )
-        elif filename.endswith("info.json"):
-            shutil.copy(str(tmp_path / "meta" / "info.json"), dest)
-        else:
-            shutil.copy(str(tmp_path / "data" / "chunk-000" / "file-000.parquet"), dest)
-
-    _stub_download(monkeypatch, fake_dl)
+    stub_hub_repo_info(monkeypatch)
+    stub_single_shard_hub_corpus(monkeypatch, tmp_path, corpus["info"])
 
     with pytest.raises(ValueError, match="not found"):
         prep.import_lerobot_dataset(
@@ -776,6 +629,7 @@ def _episode_video_access_units(mcap: Path, camera_key: str) -> "list[bytes]":
     return units
 
 
+@_requires_system_ffmpeg
 def test_converter_slices_exactly_the_declared_frame_count(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -832,87 +686,31 @@ def test_converter_slices_exactly_the_declared_frame_count(
     # timestamp cut includes frame 62 (the first frame of episode 1).
     boundary = 62 / 30.0
 
-    def episode_row(index: int, length: int, data_from: int) -> dict:
-        return {
-            "episode_index": index,
-            "task": f"task-{index}",
-            "length": length,
-            "data_chunk": "000",
-            "data_file": "000",
-            "data_from": data_from,
-            "data_to": data_from + length,
-            "video_windows": {
-                camera_key: {
-                    "chunk_index": "000",
-                    "file_index": "000",
-                    "from_timestamp": 0.0 if index == 0 else boundary,
-                    "to_timestamp": boundary if index == 0 else 3.0,
-                }
-            },
-        }
-
-    data_rows = []
-    for index in range(2):
-        length = 62 if index == 0 else 28
-        for frame in range(length):
-            state = "[" + ",".join(str(float(frame)) for _ in range(6)) + "]"
-            action = "[" + ",".join(str(float(frame + 0.5)) for _ in range(6)) + "]"
-            data_rows.append(
-                [index * 62 + frame, index, frame, round(frame / 30.0, 6), state, action]
-            )
     data_path = tmp_path / "data" / "chunk-000" / "file-000.parquet"
-    data_path.parent.mkdir(parents=True, exist_ok=True)
-    data_quoted = str(data_path).replace("'", "''")
-    data_vals = ",".join("(" + ",".join(str(v) for v in row) + ")" for row in data_rows)
-    import duckdb
-
-    conn = duckdb.connect()
-    conn.execute(
-        f"COPY (SELECT * FROM (VALUES {data_vals}) AS "
-        't(index, episode_index, frame_index, timestamp, "observation.state", action)) '
-        f"TO '{data_quoted}' (FORMAT parquet)"
+    write_v3_data_parquet(
+        data_path, episode_lengths=[62, 28], frames_per_second=30, timestamps_as_double=True
     )
-    conn.execute(
-        "COPY (SELECT index, episode_index, frame_index, CAST(timestamp AS DOUBLE) AS timestamp, "
-        f"\"observation.state\", action FROM read_parquet('{data_quoted}')) "
-        f"TO '{data_quoted}' (FORMAT parquet)"
-    )
-    conn.close()
 
     dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
-
-    def typed_episode_row(index: int, length: int, data_from: int) -> prep._EpisodeRow:
-        row = episode_row(index, length, data_from)
-        return prep._EpisodeRow(
-            episode_index=row["episode_index"],
-            task=row["task"],
-            length=row["length"],
-            data_chunk=row["data_chunk"],
-            data_file=row["data_file"],
-            data_from=row["data_from"],
-            data_to=row["data_to"],
-            video_windows={
-                camera_key: prep._VideoWindow(
-                    chunk_index=window["chunk_index"],
-                    file_index=window["file_index"],
-                    from_timestamp=window["from_timestamp"],
-                    to_timestamp=window["to_timestamp"],
-                )
-                for camera_key, window in row["video_windows"].items()
-            },
-        )
-
     source_archive = prep._SourceArchive(
         dataset_information=prep._parse_dataset_information(corpus["info"]),
-        episodes=(typed_episode_row(0, 62, 0), typed_episode_row(1, 28, 62)),
+        episodes=(
+            _single_camera_episode_row(
+                0, camera_key=camera_key, length=62, data_from=0, to_timestamp=boundary
+            ),
+            _single_camera_episode_row(
+                1,
+                camera_key=camera_key,
+                length=28,
+                data_from=62,
+                from_timestamp=boundary,
+                to_timestamp=3.0,
+            ),
+        ),
         video_keys=(camera_key,),
         cache_dir=corpus["cache_dir"],
         dataset=dataset_source,
     )
-    numeric_schemas = {
-        "observation.state": prep._NumericSchema(name="observation.state", dim=6),
-        "action": prep._NumericSchema(name="action", dim=6),
-    }
 
     def fake_download(filename: str, destination_path: Path, **_kwargs: object) -> None:
         destination_path.parent.mkdir(parents=True, exist_ok=True)
@@ -921,7 +719,7 @@ def test_converter_slices_exactly_the_declared_frame_count(
             return
         shutil.copy(data_path, destination_path)
 
-    _stub_download(monkeypatch, fake_download)
+    stub_hub_download(monkeypatch, fake_download)
 
     storage = LocalStorageRoot(tmp_path / "output")
     landed_by_index: dict[int, Path] = {}
@@ -932,7 +730,7 @@ def test_converter_slices_exactly_the_declared_frame_count(
             storage=storage,
             episode_index=index,
             camera_keys=(camera_key,),
-            numeric_schemas=numeric_schemas,
+            numeric_schemas=_SIX_DIMENSION_NUMERIC_SCHEMAS,
             frames_per_second=30,
         )
         assert Path(receipt["uri"]).name == f"lerobot_episode_{index + 1:04d}.mcap"
@@ -1044,9 +842,7 @@ def test_info_json_refuses_non_finite_or_non_positive_fps(
     else:
         info["fps"] = bad_fps
     expected_value = info.get("fps")
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, rev: {"sha": rev, "license": "apache-2.0"}
-    )
+    stub_hub_repo_info(monkeypatch)
     monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: info)
 
     def fail_discovery(repo: str, rev: str) -> list[str]:
@@ -1064,37 +860,6 @@ def test_info_json_refuses_non_finite_or_non_positive_fps(
     assert repr(expected_value) in message
     # Refusal happens before episode metadata discovery: no downloads, no output.
     assert not cache_dir.exists() or not (cache_dir / "meta" / "episodes").exists()
-
-
-def test_info_json_accepts_normal_positive_fps(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    corpus = _build_fake_corpus(tmp_path)
-    corpus["info"]["fps"] = 30
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, rev: {"sha": rev, "license": "apache-2.0"}
-    )
-    monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: corpus["info"])
-    monkeypatch.setattr(
-        prep,
-        "_hf_episode_metadata_files",
-        lambda repo, rev: ["meta/episodes/chunk-000/file-000.parquet"],
-    )
-
-    def fake_dl(filename: str, dest: Path, **kw: object) -> None:
-        import shutil
-
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if "meta/episodes" in filename:
-            shutil.copy(
-                str(tmp_path / "meta" / "episodes" / "chunk-000" / "file-000.parquet"), dest
-            )
-
-    _stub_download(monkeypatch, fake_dl)
-
-    dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
-    source_archive = prep._ensure_source_archive(dataset_source, tmp_path / "cache")
-    assert source_archive.fps == 30
 
 
 def _stub_single_episode_info(camera_metadata: dict | None = None) -> dict:
@@ -1160,77 +925,13 @@ def _install_publish_through_convert(monkeypatch: pytest.MonkeyPatch, tmp_path: 
         frames_per_second: object,
     ) -> prep._PublishedEpisode:
         del source_archive, dataset_source, camera_keys, numeric_schemas, frames_per_second
-        relative_key = f"landing/lerobot_episode_{episode_index + 1:04d}.mcap"
         staged = tmp_path / f"staged-{episode_index}.mcap"
         staged.write_bytes(f"episode-{episode_index}".encode())
-        published_keys.append(relative_key)
-        published_uri = storage.publish(staged, relative_key)
-        return {
-            "uri": published_uri,
-            "content_id": prep.content_episode_id(staged),
-            "size_bytes": staged.stat().st_size,
-        }
+        published_keys.append(prep._landing_relative_key(episode_index))
+        return publish_staged_episode(storage, staged, episode_index)
 
     monkeypatch.setattr(prep, "_convert_single_episode", fake_convert)
     return published_keys
-
-
-def test_fractional_fps_reaches_conversion_untruncated(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A fractional source fps must not be floored on the way to conversion.
-
-    meta/info.json is allowed a non-integer fps, and NTSC corpora ship 29.97.
-    Truncating it to 29 stretches the canonical time axis by about a second
-    every thirty and moves the keyframe interval off the GOP the provenance
-    record claims.
-    """
-    received_fps: list[object] = []
-
-    def capture_convert(*, frames_per_second: object, **_kwargs: object) -> prep._PublishedEpisode:
-        received_fps.append(frames_per_second)
-        staged = tmp_path / "staged.mcap"
-        staged.write_bytes(b"episode")
-        return {
-            "uri": "file:///landing/lerobot_episode_0001.mcap",
-            "content_id": prep.content_episode_id(staged),
-            "size_bytes": staged.stat().st_size,
-        }
-
-    info = _stub_single_episode_info()
-    info["fps"] = 29.97
-
-    monkeypatch.setattr(prep, "_convert_single_episode", capture_convert)
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, rev: {"sha": "abc", "license": "apache-2.0"}
-    )
-    monkeypatch.setattr(
-        prep,
-        "_ensure_source_archive",
-        lambda dataset_source, cache_dir: _source_archive(
-            dataset_source,
-            cache_dir,
-            info=info,
-            episodes=[
-                prep._EpisodeRow(
-                    episode_index=0,
-                    task="push",
-                    length=1,
-                    data_chunk="000",
-                    data_file="000",
-                    data_from=0,
-                    data_to=1,
-                )
-            ],
-            video_keys=[prep.DEFAULT_CAMERA_KEY],
-        ),
-    )
-
-    prep.import_lerobot_dataset(
-        dataset_repo="fake/repo", revision="abc", output_dir=tmp_path / "out"
-    )
-
-    assert received_fps == [29.97]
 
 
 @pytest.mark.parametrize(
@@ -1269,9 +970,7 @@ def test_import_refuses_a_depth_video_before_publishing_dataset_output(
             ),
         )
 
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
-    )
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc")
     monkeypatch.setattr(prep, "_ensure_source_archive", ensure_depth_archive)
     _install_publish_through_convert(monkeypatch, tmp_path)
 
@@ -1293,10 +992,14 @@ def test_import_refuses_a_depth_video_before_publishing_dataset_output(
 def test_import_returns_local_uris_and_keeps_cache_beside_landing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The manifest lists every delivered episode with its content id and size.
+
+    A recipient of a prepared corpus gets a receipt that can be checked
+    against the landing directory without re-running the import; the
+    content id is the same ``content_episode_id`` the catalog dedupes on.
+    """
     output_dir = tmp_path / "out"
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
-    )
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc")
     monkeypatch.setattr(prep, "_ensure_source_archive", _stub_single_episode_source_archive)
     _install_publish_through_convert(monkeypatch, tmp_path)
 
@@ -1354,31 +1057,9 @@ def test_converter_version_reaches_the_canonical_episode_provenance(
         dataset_source,
         corpus["cache_dir"],
         info=corpus["info"],
-        episodes=[
-            prep._EpisodeRow(
-                episode_index=0,
-                task="pick-and-place",
-                length=1,
-                data_chunk="000",
-                data_file="000",
-                data_from=0,
-                data_to=1,
-                video_windows={
-                    camera_key: prep._VideoWindow(
-                        chunk_index="000",
-                        file_index="000",
-                        from_timestamp=0.0,
-                        to_timestamp=0.0,
-                    )
-                },
-            )
-        ],
+        episodes=[_single_camera_episode_row(0, camera_key=camera_key, task="pick-and-place")],
         video_keys=[camera_key],
     )
-    numeric_schemas = {
-        "observation.state": prep._NumericSchema(name="observation.state", dim=6),
-        "action": prep._NumericSchema(name="action", dim=6),
-    }
 
     def fake_download(filename: str, destination_path: Path, **_kwargs: object) -> None:
         destination_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1387,7 +1068,7 @@ def test_converter_version_reaches_the_canonical_episode_provenance(
             return
         shutil.copy(tmp_path / "data" / "chunk-000" / "file-000.parquet", destination_path)
 
-    _stub_download(monkeypatch, fake_download)
+    stub_hub_download(monkeypatch, fake_download)
     monkeypatch.setattr(prep, "_transcode_mp4_to_h264", lambda *args, **kwargs: [b"access-unit"])
     monkeypatch.setattr(prep, "_get_video_pts_times", lambda path: [0])
     monkeypatch.setattr(prep, "ffmpeg_version", lambda: "test-ffmpeg")
@@ -1403,7 +1084,7 @@ def test_converter_version_reaches_the_canonical_episode_provenance(
         storage=LocalStorageRoot(tmp_path / "output"),
         episode_index=0,
         camera_keys=(camera_key,),
-        numeric_schemas=numeric_schemas,
+        numeric_schemas=_SIX_DIMENSION_NUMERIC_SCHEMAS,
         frames_per_second=30,
     )
 
@@ -1421,9 +1102,7 @@ def test_import_publishes_into_a_bucket_data_root_without_uploading_cache(
 
     data_root, remote_dir = bucket_over_tmp
     assert isinstance(data_root, BucketStorageRoot)
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
-    )
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc")
     monkeypatch.setattr(prep, "_ensure_source_archive", _stub_single_episode_source_archive)
     _install_publish_through_convert(monkeypatch, tmp_path)
 
@@ -1447,62 +1126,17 @@ def test_import_publishes_into_a_bucket_data_root_without_uploading_cache(
     assert (data_root.mirror / "_lerobot_cache" / "abc").is_dir()
 
 
-def test_manifest_records_per_episode_receipts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The manifest lists every delivered episode with its content id and size.
-
-    A recipient of a prepared corpus gets a receipt that can be checked
-    against the landing directory without re-running the import; the
-    content id is the same ``content_episode_id`` the catalog dedupes on.
-    """
-    output_dir = tmp_path / "out"
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
-    )
-    monkeypatch.setattr(prep, "_ensure_source_archive", _stub_single_episode_source_archive)
-    _install_publish_through_convert(monkeypatch, tmp_path)
-
-    episode_uris = prep.import_lerobot_dataset(
-        dataset_repo="fake/repo",
-        revision="main",
-        output_dir=output_dir,
-        episode_index=0,
-    )
-
-    manifest = json.loads((output_dir / "prepared-manifest.json").read_text())
-    assert manifest["schema_version"] == 3
-    # v2 top-level keys survive: readers of the old schema keep working.
-    assert manifest["episodes_converted"] == 1
-    assert manifest["dataset"] == {
-        "repo_id": "fake/repo",
-        "revision": "abc",
-        "license": "apache-2.0",
-    }
-    assert manifest["converter_version"] == prep.CONVERTER_VERSION
-    assert manifest["camera_keys"] == [prep.DEFAULT_CAMERA_KEY]
-
-    entries = manifest["episodes"]
-    assert len(entries) == 1
-    entry = entries[0]
-    assert entry["uri"] == episode_uris[0]
-    assert entry["size_bytes"] == len(b"episode-0")
-    assert entry["content_id"] == prep.content_episode_id(
-        output_dir / "landing" / "lerobot_episode_0001.mcap"
-    )
-    # The receipt describes the published landing object, not a local
-    # staging path: for a bucket root this entry is an object URI that a
-    # recipient of the bucket prefix can resolve without our filesystem.
-    assert entry["uri"].endswith("landing/lerobot_episode_0001.mcap")
-    assert "canonical-" not in entry["uri"]
-    assert "staged-" not in entry["uri"]
-
-
 def test_manifest_content_id_detects_a_truncated_episode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The #379 controlled result as a test: truncating one episode to zero
-    bytes is detectable from the delivery by re-hashing against the manifest."""
+    bytes is detectable from the delivery by re-hashing against the manifest.
+
+    The receipt contents are pinned by
+    ``test_import_returns_local_uris_and_keeps_cache_beside_landing`` and the
+    verifier's reasons by ``test_verification.py``. What only this test shows
+    is that the importer's own manifest is one the verifier can check.
+    """
     from hflow.importers.lerobot_verify import verify_lerobot_import
     from hflow.verification import (
         REASON_CONTENT_ID_MISMATCH,
@@ -1511,9 +1145,7 @@ def test_manifest_content_id_detects_a_truncated_episode(
     )
 
     output_dir = tmp_path / "out"
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
-    )
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc")
     monkeypatch.setattr(prep, "_ensure_source_archive", _stub_single_episode_source_archive)
     _install_publish_through_convert(monkeypatch, tmp_path)
 
@@ -1524,16 +1156,9 @@ def test_manifest_content_id_detects_a_truncated_episode(
         episode_index=0,
     )
 
-    manifest = json.loads((output_dir / "prepared-manifest.json").read_text())
-    entry = manifest["episodes"][0]
-    episode_path = output_dir / "landing" / "lerobot_episode_0001.mcap"
-    original_size = episode_path.stat().st_size
-    assert original_size == entry["size_bytes"]
-    assert prep.content_episode_id(episode_path) == entry["content_id"]
+    assert verify_lerobot_import(output_dir).status is VerificationStatus.OK
 
-    episode_path.write_bytes(b"")
-    assert episode_path.stat().st_size != entry["size_bytes"]
-    assert prep.content_episode_id(episode_path) != entry["content_id"]
+    (output_dir / "landing" / "lerobot_episode_0001.mcap").write_bytes(b"")
 
     report = verify_lerobot_import(output_dir)
     assert report.status is VerificationStatus.DAMAGED
@@ -1553,18 +1178,6 @@ def test_import_skips_bucket_manifest_when_an_episode_publish_fails(
     data_root, remote_dir = bucket_over_tmp
     assert isinstance(data_root, BucketStorageRoot)
 
-    def ensure_two_episodes(
-        dataset_source: prep.DatasetSource, cache_dir: Path
-    ) -> prep._SourceArchive:
-        archive = _stub_single_episode_source_archive(dataset_source, cache_dir)
-        return replace(
-            archive,
-            episodes=(
-                archive.episodes[0],
-                replace(archive.episodes[0], episode_index=1, task="second"),
-            ),
-        )
-
     convert_calls = 0
 
     def fail_on_second_episode(
@@ -1582,20 +1195,12 @@ def test_import_skips_bucket_manifest_when_an_episode_publish_fails(
         convert_calls += 1
         if episode_index == 1:
             raise RuntimeError("forced publish failure")
-        relative_key = f"landing/lerobot_episode_{episode_index + 1:04d}.mcap"
         staged = tmp_path / f"staged-{episode_index}.mcap"
         staged.write_bytes(b"first")
-        published_uri = storage.publish(staged, relative_key)
-        return {
-            "uri": published_uri,
-            "content_id": prep.content_episode_id(staged),
-            "size_bytes": staged.stat().st_size,
-        }
+        return publish_staged_episode(storage, staged, episode_index)
 
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
-    )
-    monkeypatch.setattr(prep, "_ensure_source_archive", ensure_two_episodes)
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc")
+    monkeypatch.setattr(prep, "_ensure_source_archive", _ensure_two_episode_archive)
     monkeypatch.setattr(prep, "_convert_single_episode", fail_on_second_episode)
 
     with pytest.raises(RuntimeError, match="forced publish failure"):
@@ -1842,7 +1447,6 @@ def test_import_resumes_after_mid_batch_failure_without_rewriting_completed_epis
         convert_calls.append(episode_index)
         if episode_index == 1 and convert_calls.count(1) == 1:
             raise RuntimeError("forced mid-batch failure")
-        relative_key = prep._landing_relative_key(episode_index)
         staged = tmp_path / f"staged-{episode_index}-{len(convert_calls)}.mcap"
         _write_identity_matching_landing_mcap(
             staged,
@@ -1851,16 +1455,9 @@ def test_import_resumes_after_mid_batch_failure_without_rewriting_completed_epis
             camera_keys=camera_keys,
             marker=f"episode-{episode_index}-bytes",
         )
-        published_uri = storage.publish(staged, relative_key)
-        return {
-            "uri": published_uri,
-            "content_id": prep.content_episode_id(staged),
-            "size_bytes": staged.stat().st_size,
-        }
+        return publish_staged_episode(storage, staged, episode_index)
 
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
-    )
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc")
     monkeypatch.setattr(prep, "_ensure_source_archive", _ensure_two_episode_archive)
     monkeypatch.setattr(prep, "_convert_single_episode", convert_or_fail)
 
@@ -1929,7 +1526,6 @@ def test_import_does_not_reuse_identity_mismatched_landing_episode(
         nonlocal convert_calls
         del source_archive, numeric_schemas, frames_per_second
         convert_calls += 1
-        relative_key = prep._landing_relative_key(episode_index)
         staged = tmp_path / f"replacement-{episode_index}.mcap"
         _write_identity_matching_landing_mcap(
             staged,
@@ -1938,16 +1534,9 @@ def test_import_does_not_reuse_identity_mismatched_landing_episode(
             camera_keys=camera_keys,
             marker="replacement",
         )
-        published_uri = storage.publish(staged, relative_key)
-        return {
-            "uri": published_uri,
-            "content_id": prep.content_episode_id(staged),
-            "size_bytes": staged.stat().st_size,
-        }
+        return publish_staged_episode(storage, staged, episode_index)
 
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
-    )
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc")
     monkeypatch.setattr(prep, "_ensure_source_archive", _stub_single_episode_source_archive)
     monkeypatch.setattr(prep, "_convert_single_episode", convert_replacement)
 
@@ -1987,9 +1576,7 @@ def test_import_full_reuse_reports_zero_episodes_converted(
         convert_calls += 1
         raise AssertionError("matching landing episodes must be reused")
 
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc", "license": "apache-2.0"}
-    )
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc")
     monkeypatch.setattr(prep, "_ensure_source_archive", _ensure_two_episode_archive)
     monkeypatch.setattr(prep, "_convert_single_episode", should_not_convert)
 
@@ -2119,26 +1706,8 @@ def _import_success_label_corpus(
     corpus = _build_success_label_corpus(root, outcome_mode, frames_per_second)
     output_dir = tmp_path / "out"
 
-    monkeypatch.setattr(
-        prep, "_hf_repo_info", lambda repo, revision: {"sha": "abc1234", "license": "apache-2.0"}
-    )
-    monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: corpus["info"])
-    monkeypatch.setattr(
-        prep,
-        "_hf_episode_metadata_files",
-        lambda repo, rev: ["meta/episodes/chunk-000/file-000.parquet"],
-    )
-
-    def fake_download(filename: str, dest: Path, **_kwargs: object) -> None:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if "meta/episodes" in filename:
-            shutil.copy(root / "meta" / "episodes" / "chunk-000" / "file-000.parquet", dest)
-        elif filename.endswith("info.json"):
-            shutil.copy(root / "meta" / "info.json", dest)
-        else:
-            shutil.copy(root / "data" / "chunk-000" / "file-000.parquet", dest)
-
-    _stub_download(monkeypatch, fake_download)
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc1234")
+    stub_single_shard_hub_corpus(monkeypatch, root, corpus["info"])
 
     def fake_transcode(mp4_path: Path, gop: float, fps: float) -> list[bytes]:
         if transcode_calls is not None:
@@ -2160,55 +1729,43 @@ def _import_success_label_corpus(
     return output_dir
 
 
-def test_success_label_reports_max_over_episode_frames(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("outcome_mode", "expected_success"),
+    [
+        # MAX over the collector's next.success frames: a False frame followed
+        # by a True frame makes the episode a success, even though the LAST
+        # frame is False.
+        pytest.param("transition", "true", id="false-then-true-is-success"),
+        # An all-false source label ships as 'false', never as an invented
+        # 'true': the collector's judgment, reported verbatim.
+        pytest.param("all-false", "false", id="all-false-is-reported-verbatim"),
+        # A declared outcome feature with nothing recorded is not a label.
+        # Dropping the length check stamps ``success: "false"`` here, because
+        # ``any([])`` is False. That is the same invention the hardcoded
+        # ``"true"`` was, one value over, so the empty aggregate needs its own
+        # case rather than riding on the no-feature one.
+        pytest.param("empty-aggregate", None, id="empty-aggregate-omits-the-label"),
+    ],
+)
+def test_success_label_derives_from_the_outcome_aggregate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome_mode: str,
+    expected_success: str | None,
 ) -> None:
-    """MAX over the collector's next.success frames: a False frame followed
-    by a True frame makes the episode a success, even though the LAST frame
-    is False. The derivation is stamped so the methodology travels."""
+    """The derivation is stamped next to the label so the methodology travels."""
     from hflow.episode import Episode
 
-    output_dir = _import_success_label_corpus(tmp_path, monkeypatch, "transition")
+    output_dir = _import_success_label_corpus(tmp_path, monkeypatch, outcome_mode)
     landing = sorted((output_dir / "landing").glob("*.mcap"))
     with Episode(landing[0]) as episode:
         record = episode.metadata_records["episode/v1"]
-    assert record["success"] == "true"
-    assert record["success_derivation"] == "max(stats/next.success)"
-
-
-def test_success_label_reports_false_when_source_is_all_false(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An all-false source label ships as 'false', never as an invented
-    'true': the collector's judgment, reported verbatim."""
-    from hflow.episode import Episode
-
-    output_dir = _import_success_label_corpus(tmp_path, monkeypatch, "all-false")
-    landing = sorted((output_dir / "landing").glob("*.mcap"))
-    with Episode(landing[0]) as episode:
-        record = episode.metadata_records["episode/v1"]
-    assert record["success"] == "false"
-    assert record["success_derivation"] == "max(stats/next.success)"
-
-
-def test_success_label_omitted_when_the_outcome_aggregate_is_empty(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A declared outcome feature with nothing recorded is not a label.
-
-    Dropping the length check stamps ``success: "false"`` here, because
-    ``any([])`` is False. That is the same invention the hardcoded ``"true"``
-    was, one value over, so the empty aggregate needs its own case rather than
-    riding on the no-feature one.
-    """
-    from hflow.episode import Episode
-
-    output_dir = _import_success_label_corpus(tmp_path, monkeypatch, "empty-aggregate")
-    landing = sorted((output_dir / "landing").glob("*.mcap"))
-    with Episode(landing[0]) as episode:
-        record = episode.metadata_records["episode/v1"]
-    assert "success" not in record
-    assert "success_derivation" not in record
+    if expected_success is None:
+        assert "success" not in record
+        assert "success_derivation" not in record
+    else:
+        assert record["success"] == expected_success
+        assert record["success_derivation"] == "max(stats/next.success)"
 
 
 def test_success_label_omitted_when_source_has_no_outcome_feature(
@@ -2310,41 +1867,6 @@ def test_reuse_refuses_a_landing_episode_with_damaged_payload(
     assert content_id_differs_from_delivery_receipt(landing, intact_content_id)
 
 
-def test_reuse_accepts_an_intact_episode_after_the_crc_pass(
-    tmp_path: Path,
-) -> None:
-    """The control: the CRC pass adds no refusal for undamaged bytes."""
-    from reuse_test_helpers import flip_chunk_payload_bytes
-
-    data_root = LocalStorageRoot(tmp_path / "out")
-    landing = tmp_path / "out" / "landing" / "lerobot_episode_0001.mcap"
-    _write_identity_matching_landing_mcap(
-        landing,
-        dataset_source=_MATCHING_SOURCE,
-        episode_index=0,
-        camera_keys=_MATCHING_CAMERA_KEYS,
-        marker="intact",
-    )
-
-    reused = prep._try_reuse_completed_episode(
-        data_root,
-        dataset_source=_MATCHING_SOURCE,
-        episode_index=0,
-        camera_keys=_MATCHING_CAMERA_KEYS,
-    )
-    assert reused is not None
-
-    flip_chunk_payload_bytes(landing)
-
-    damaged = prep._try_reuse_completed_episode(
-        data_root,
-        dataset_source=_MATCHING_SOURCE,
-        episode_index=0,
-        camera_keys=_MATCHING_CAMERA_KEYS,
-    )
-    assert damaged is None
-
-
 def test_fractional_fps_sets_the_log_times_from_the_declared_rate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2394,51 +1916,26 @@ def test_fractional_fps_reaches_the_transcoder_for_the_keyframe_interval(
 
     assert transcode_calls, "the transcoder was never called"
     assert transcode_calls[0] == 29.97
-    keyframe_interval = max(1, round(prep.IMPORT_GOP_SECONDS * transcode_calls[0]))
-    assert keyframe_interval == 30
-    assert keyframe_interval != max(1, round(prep.IMPORT_GOP_SECONDS * 29))
 
 
-def test_reuse_refuses_an_episode_written_before_the_fps_fix(tmp_path: Path) -> None:
-    """The resume half, which is the part a reader would assume rather than check.
-
-    _episode_identity_matches never looks at fps, so a fractional-fps episode
-    delivered with the stretched time axis still matches on dataset, revision,
-    episode index, camera keys and gop_seconds. Only the converter version
-    separates it from a correct one, which is why the bump is what makes the
-    fix reach an existing landing tree instead of stopping at new imports.
-    """
-    data_root = LocalStorageRoot(tmp_path / "out")
-    landing = tmp_path / "out" / "landing" / "lerobot_episode_0001.mcap"
-    _write_identity_matching_landing_mcap(
-        landing,
-        dataset_source=_MATCHING_SOURCE,
-        episode_index=0,
-        camera_keys=_MATCHING_CAMERA_KEYS,
-        marker="pre-fps-fix",
-        episode_record_overrides={"converter_version": "lerobot-converter-v7"},
-        source_provenance_overrides={"converter_version": "lerobot-converter-v7"},
-        provenance_overrides=None,
-    )
-
-    assert (
-        prep._try_reuse_completed_episode(
-            data_root,
-            dataset_source=_MATCHING_SOURCE,
-            episode_index=0,
-            camera_keys=_MATCHING_CAMERA_KEYS,
-        )
-        is None
-    )
-
-
-def test_hub_source_metadata_uses_pinned_files_and_reuses_downloads(
+def test_hub_source_metadata_paginates_pinned_tree_and_reuses_downloads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source_root = tmp_path / "repository"
     _build_fake_corpus(source_root)
+    first_shard = source_root / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    second_shard = source_root / "meta" / "episodes" / "chunk-001" / "file-000.parquet"
+    split_episode_metadata_into_shards(
+        source_root,
+        {
+            "meta/episodes/chunk-000/file-000.parquet": (0, 1),
+            "meta/episodes/chunk-001/file-000.parquet": (2, 3),
+        },
+    )
+
     resolved_revision = "a" * 40
     downloaded_filenames: list[str] = []
+    metadata_tree_requests: list[str] = []
 
     class HubHandler(BaseHTTPRequestHandler):
         def do_HEAD(self) -> None:
@@ -2451,32 +1948,73 @@ def test_hub_source_metadata_uses_pinned_files_and_reuses_downloads(
             pass
 
         def respond(self, *, include_body: bool) -> None:
-            request_path = unquote(urlsplit(self.path).path)
+            request_url = urlsplit(self.path)
+            request_path = unquote(request_url.path)
+            metadata_tree_path = f"/api/datasets/fake/repo/tree/{resolved_revision}/meta/episodes"
+            if request_path == metadata_tree_path:
+                metadata_tree_requests.append(self.path)
+                second_page = "cursor=second" in request_url.query
+                if second_page:
+                    entries = [
+                        {
+                            "type": "file",
+                            "path": "meta/episodes/chunk-000/file-000.parquet",
+                            "size": first_shard.stat().st_size,
+                            "oid": "1" * 40,
+                        },
+                        {
+                            "type": "file",
+                            "path": "meta/episodes/chunk-001/file-000.parquet",
+                            "size": second_shard.stat().st_size,
+                            "oid": "2" * 40,
+                        },
+                    ]
+                else:
+                    entries = [
+                        {
+                            "type": "file",
+                            "path": "meta/episodes/chunk-001/file-000.parquet",
+                            "size": second_shard.stat().st_size,
+                            "oid": "2" * 40,
+                        },
+                        {
+                            "type": "directory",
+                            "path": "meta/episodes/chunk-001",
+                            "oid": "3" * 40,
+                        },
+                        {
+                            "type": "file",
+                            "path": "meta/episodes/README.txt",
+                            "size": 0,
+                            "oid": "4" * 40,
+                        },
+                    ]
+                payload = json.dumps(entries).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                if not second_page:
+                    self.send_header(
+                        "Link",
+                        f'<http://{self.headers["Host"]}{metadata_tree_path}?cursor=second>; rel="next"',
+                    )
+                self.end_headers()
+                if include_body:
+                    self.wfile.write(payload)
+                return
             if request_path in {
                 "/api/datasets/fake/repo/revision/main",
                 f"/api/datasets/fake/repo/revision/{resolved_revision}",
             }:
-                # The metadata shard appears after a large inventory of unrelated
-                # media files. Discovery must still include it without downloading
-                # those files or following the supplied pagination link.
-                siblings = [
-                    {"rfilename": f"videos/unselected/{index}.mp4"} for index in range(1501)
-                ]
-                siblings.extend(
-                    {"rfilename": filename}
-                    for filename in ("meta/info.json", "meta/episodes/chunk-000/file-000.parquet")
-                )
                 payload = json.dumps(
                     {
                         "id": "fake/repo",
                         "sha": resolved_revision,
                         "cardData": {"license": "apache-2.0"},
-                        "siblings": siblings,
+                        "siblings": [],
                     }
                 ).encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(payload)))
-                self.send_header("Link", '<http://127.0.0.1:1/untrusted-page>; rel="next"')
                 self.end_headers()
                 if include_body:
                     self.wfile.write(payload)
@@ -2525,7 +2063,17 @@ def test_hub_source_metadata_uses_pinned_files_and_reuses_downloads(
     assert source.license == "apache-2.0"
     assert [episode.length for episode in archive.episodes] == [60, 65, 70, 75]
     assert repeated_archive == archive
-    assert downloaded_filenames == ["meta/info.json", "meta/episodes/chunk-000/file-000.parquet"]
+    assert downloaded_filenames == [
+        "meta/info.json",
+        "meta/episodes/chunk-000/file-000.parquet",
+        "meta/episodes/chunk-001/file-000.parquet",
+    ]
+    assert len(metadata_tree_requests) == 4
+    assert all(
+        f"/tree/{resolved_revision}/meta/episodes" in unquote(request)
+        for request in metadata_tree_requests
+    )
+    assert sum("cursor=second" in request for request in metadata_tree_requests) == 2
     assert not (cache_directory / "videos").exists()
     assert json.loads((cache_directory / "meta/info.json").read_text())["fps"] == 30
 

@@ -8,11 +8,11 @@ it proves nothing.
 """
 
 import asyncio
-import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from media_test_helpers import render_lavfi, run_ffmpeg
 
 import hflow
 from hflow._video_measurement_toolchain import resolved_video_measurement_toolchain
@@ -23,72 +23,74 @@ from hflow._video_measurements import (
     measure_camera_motion,
 )
 from hflow.checks import camera_stability
-from hflow.ffmpeg import ffmpeg_path
+from hflow.testing import VideoEpisodeSpec, write_video_episode
+from hflow.transform import TransformConfig, write_canonical_episode
 
 pytest.importorskip("cv2", reason="camera-motion measurement needs the 'motion' extra")
 
 _FRAMES_PER_SECOND = 30
 _DURATION_S = 2
 _SHAKE_HZ = 8
+_H264_FIXED_GOP_ARGUMENTS = (
+    "-c:v",
+    "libx264",
+    "-preset",
+    "ultrafast",
+    "-pix_fmt",
+    "yuv420p",
+    "-x264-params",
+    "keyint=30:min-keyint=30:scenecut=0:bframes=0",
+)
 
 
 @pytest.fixture(scope="module")
 def still_texture(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """One frame of dense static texture, large enough to crop a window from."""
-    path = tmp_path_factory.mktemp("motion") / "still.png"
-    subprocess.run(
-        [
-            str(ffmpeg_path()),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=640x480:rate=1:duration=1",
-            "-frames:v",
-            "1",
-            str(path),
-        ],
-        check=True,
-        capture_output=True,
+    return render_lavfi(
+        tmp_path_factory.mktemp("motion") / "still.png",
+        "testsrc2=size=640x480:rate=1:duration=1",
+        output_arguments=("-frames:v", "1"),
     )
-    return path
 
 
 def _render_camera_path(still_texture: Path, output: Path, offset_x: str, offset_y: str) -> Path:
-    subprocess.run(
-        [
-            str(ffmpeg_path()),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-loop",
-            "1",
-            "-framerate",
-            str(_FRAMES_PER_SECOND),
-            "-t",
-            str(_DURATION_S),
-            "-i",
-            str(still_texture),
-            "-vf",
-            f"crop=320:240:{offset_x}:{offset_y}",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-pix_fmt",
-            "yuv420p",
-            "-x264-params",
-            "keyint=30:min-keyint=30:scenecut=0:bframes=0",
-            str(output),
-        ],
-        check=True,
-        capture_output=True,
+    run_ffmpeg(
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-loop",
+        "1",
+        "-framerate",
+        str(_FRAMES_PER_SECOND),
+        "-t",
+        str(_DURATION_S),
+        "-i",
+        str(still_texture),
+        "-vf",
+        f"crop=320:240:{offset_x}:{offset_y}",
+        *_H264_FIXED_GOP_ARGUMENTS,
+        str(output),
     )
     return output
+
+
+def _canonical_episode(video: Path, directory: Path) -> Path:
+    """Wrap ``video`` as a one-camera episode and canonicalize it."""
+    source = write_video_episode(
+        video,
+        directory / "episode.mcap",
+        VideoEpisodeSpec(
+            duration_s=float(_DURATION_S),
+            image_hz=float(_FRAMES_PER_SECOND),
+            image_width=320,
+            image_height=240,
+            camera_name="head_camera",
+        ),
+    )
+    canonical = directory / "episode.canonical.mcap"
+    write_canonical_episode(source, canonical, TransformConfig())
+    return canonical
 
 
 def _shake(amplitude_px: int) -> tuple[str, str]:
@@ -200,30 +202,10 @@ def test_footage_with_nothing_to_track_reports_no_coverage_not_steadiness(
     honest -- and this is the only fixture that drives the unmeasurable side of
     the accounting above zero at all.
     """
-    flat = tmp_path / "flat.mp4"
-    subprocess.run(
-        [
-            str(ffmpeg_path()),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            f"color=c=gray:size=320x240:rate={_FRAMES_PER_SECOND}:duration={_DURATION_S}",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-pix_fmt",
-            "yuv420p",
-            "-x264-params",
-            "keyint=30:min-keyint=30:scenecut=0:bframes=0",
-            str(flat),
-        ],
-        check=True,
-        capture_output=True,
+    flat = render_lavfi(
+        tmp_path / "flat.mp4",
+        f"color=c=gray:size=320x240:rate={_FRAMES_PER_SECOND}:duration={_DURATION_S}",
+        output_arguments=_H264_FIXED_GOP_ARGUMENTS,
     )
     motion = _measure(flat)
 
@@ -235,49 +217,16 @@ def test_footage_with_nothing_to_track_reports_no_coverage_not_steadiness(
     assert motion.unstable_share == 0.0
 
     # The check turns that into a coverage of zero rather than a clean bill.
-    from hflow.testing import VideoEpisodeSpec, write_video_episode
-    from hflow.transform import TransformConfig, write_canonical_episode
-
-    source = write_video_episode(
-        flat,
-        tmp_path / "episode.mcap",
-        VideoEpisodeSpec(
-            duration_s=float(_DURATION_S),
-            image_hz=float(_FRAMES_PER_SECOND),
-            image_width=320,
-            image_height=240,
-            camera_name="head_camera",
-        ),
-    )
-    canonical = tmp_path / "episode.canonical.mcap"
-    write_canonical_episode(source, canonical, TransformConfig())
-    with hflow.Episode(canonical) as episode:
+    with hflow.Episode(_canonical_episode(flat, tmp_path)) as episode:
         camera_topic = episode.cameras[0]
         result = asyncio.run(camera_stability(episode))
     assert result.measurements[f"{camera_topic}/coverage_share"] == 0.0
     assert result.intervals == []
 
 
-def test_the_check_reports_stability_with_its_coverage(still_texture: Path, tmp_path: Path) -> None:
+def test_the_check_reports_stability_with_its_coverage(stability_episode: Path) -> None:
     """End to end through a canonical episode, which is what a pipeline sees."""
-    from hflow.testing import VideoEpisodeSpec, write_video_episode
-    from hflow.transform import TransformConfig, write_canonical_episode
-
-    shaky = _render_camera_path(still_texture, tmp_path / "shaky.mp4", *_shake(24))
-    source = write_video_episode(
-        shaky,
-        tmp_path / "episode.mcap",
-        VideoEpisodeSpec(
-            duration_s=float(_DURATION_S),
-            image_hz=float(_FRAMES_PER_SECOND),
-            image_width=320,
-            image_height=240,
-            camera_name="head_camera",
-        ),
-    )
-    canonical = tmp_path / "episode.canonical.mcap"
-    write_canonical_episode(source, canonical, TransformConfig())
-    with hflow.Episode(canonical) as episode:
+    with hflow.Episode(stability_episode) as episode:
         camera_topic = episode.cameras[0]
         result = asyncio.run(camera_stability(episode))
 
@@ -295,30 +244,15 @@ def test_the_check_reports_stability_with_its_coverage(still_texture: Path, tmp_
 
 @pytest.fixture(scope="module")
 def stability_episode(still_texture: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """One canonical episode shared by the argument-guard cases.
+    """One canonical episode of shaky footage, shared by every test that only reads it.
 
-    The guards refuse before any frame is read, which is the point of the
-    change they cover, so rendering a video per case buys nothing.
+    The argument guards refuse before any frame is read, and the stability
+    tests measure it without writing to it, so rendering a video per case
+    buys nothing.
     """
-    from hflow.testing import VideoEpisodeSpec, write_video_episode
-    from hflow.transform import TransformConfig, write_canonical_episode
-
-    tmp_path = tmp_path_factory.mktemp("stability-guards")
+    tmp_path = tmp_path_factory.mktemp("stability-episode")
     shaky = _render_camera_path(still_texture, tmp_path / "shaky.mp4", *_shake(24))
-    source = write_video_episode(
-        shaky,
-        tmp_path / "episode.mcap",
-        VideoEpisodeSpec(
-            duration_s=float(_DURATION_S),
-            image_hz=float(_FRAMES_PER_SECOND),
-            image_width=320,
-            image_height=240,
-            camera_name="head_camera",
-        ),
-    )
-    canonical = tmp_path / "episode.canonical.mcap"
-    write_canonical_episode(source, canonical, TransformConfig())
-    return canonical
+    return _canonical_episode(shaky, tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -424,29 +358,12 @@ def test_camera_stability_refuses_a_bad_fov_on_a_camera_less_episode(
 
 
 def test_the_check_knobs_raise_the_bar_without_changing_the_rate_measurements(
-    still_texture: Path, tmp_path: Path
+    stability_episode: Path,
 ) -> None:
     """A shake threshold above the footage's rates leaves nothing unstable, and
     a minimum duration longer than the episode drops every interval while
     the share it was cut from still reports the raw rule."""
-    from hflow.testing import VideoEpisodeSpec, write_video_episode
-    from hflow.transform import TransformConfig, write_canonical_episode
-
-    shaky = _render_camera_path(still_texture, tmp_path / "shaky.mp4", *_shake(24))
-    source = write_video_episode(
-        shaky,
-        tmp_path / "episode.mcap",
-        VideoEpisodeSpec(
-            duration_s=float(_DURATION_S),
-            image_hz=float(_FRAMES_PER_SECOND),
-            image_width=320,
-            image_height=240,
-            camera_name="head_camera",
-        ),
-    )
-    canonical = tmp_path / "episode.canonical.mcap"
-    write_canonical_episode(source, canonical, TransformConfig())
-    with hflow.Episode(canonical) as episode:
+    with hflow.Episode(stability_episode) as episode:
         camera_topic = episode.cameras[0]
         baseline = asyncio.run(camera_stability(episode))
         above_every_rate = asyncio.run(camera_stability(episode, shake_threshold_dps=1e6))

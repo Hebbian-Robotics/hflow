@@ -1,11 +1,20 @@
 """Regression coverage for native overlay manifest parse-stage refusals."""
 
+import hashlib
 import json
 from pathlib import Path
 from typing import cast
 
 import pytest
-from packaging_test_helpers import example_record_path, write_example_distribution
+from packaging_test_helpers import (
+    assert_overlay_left_uninstalled,
+    build_example_overlay,
+    example_record_path,
+    read_manifest_payload,
+    write_example_distribution,
+    write_manifest_bytes,
+    write_manifest_payload,
+)
 
 import hflow.packaging as packaging
 from hflow.packaging import (
@@ -13,39 +22,21 @@ from hflow.packaging import (
     INSTALLED_CYTHON_OVERLAY_MANIFEST_FILE_NAME,
     MAX_NATIVE_OVERLAY_MANIFEST_BYTES,
     CythonOverlayApplyError,
-    CythonOverlayBuildConfig,
     CythonOverlayManifest,
     CythonOverlayManifestError,
     CythonOverlayVerificationCode,
     apply_cython_overlay,
-    build_cython_overlay,
     verify_cython_overlay,
 )
 
 
 def _build_overlay(tmp_path: Path) -> tuple[Path, Path, CythonOverlayManifest, bytes, bytes]:
     package_root, _ = write_example_distribution(tmp_path)
-    source_path = package_root / "worker.py"
-    source_bytes = source_path.read_bytes()
+    source_bytes = (package_root / "worker.py").read_bytes()
     original_record = example_record_path(package_root).read_bytes()
     overlay_directory = tmp_path / "native-overlay"
-    manifest = build_cython_overlay(
-        CythonOverlayBuildConfig(
-            package_root=package_root,
-            module_names=("sample_native_package.worker",),
-        ),
-        overlay_directory,
-    )
+    manifest = build_example_overlay(package_root, overlay_directory)
     return package_root, overlay_directory, manifest, source_bytes, original_record
-
-
-def _manifest_payload(manifest_path: Path) -> dict[str, object]:
-    return cast(dict[str, object], json.loads(manifest_path.read_text(encoding="utf-8")))
-
-
-def _write_manifest_bytes(manifest_path: Path, contents: bytes) -> None:
-    manifest_path.chmod(0o644)
-    manifest_path.write_bytes(contents)
 
 
 def _assert_apply_refused_without_mutation(
@@ -60,12 +51,84 @@ def _assert_apply_refused_without_mutation(
         apply_cython_overlay(overlay_directory, package_root)
 
     assert (package_root / "worker.py").read_bytes() == source_bytes
-    assert not any(
-        (package_root / artifact.installed_artifact_path).exists()
-        for artifact in manifest.artifacts
+    assert_overlay_left_uninstalled(package_root, manifest, original_record)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_message"),
+    [
+        ("schema-version", "unsupported native overlay schema version"),
+        ("format", "unsupported native overlay format"),
+        ("empty-artifacts", "artifacts must not be empty"),
+        ("unsorted-artifacts", "artifacts must be sorted by module_name"),
+        ("duplicate-module", "artifact module names must be unique"),
+    ],
+)
+def test_apply_refuses_invalid_manifest_before_mutation(
+    tmp_path: Path,
+    mutation: str,
+    expected_message: str,
+) -> None:
+    package_root, _ = write_example_distribution(tmp_path)
+    overlay_directory = tmp_path / "native-overlay"
+    # Every eligible module, so the unsorted and duplicate cases have two
+    # artifacts to disorder.
+    manifest = build_example_overlay(package_root, overlay_directory, worker_only=False)
+    manifest_path = overlay_directory / CYTHON_OVERLAY_MANIFEST_FILE_NAME
+    payload = read_manifest_payload(manifest_path)
+    artifacts = cast(list[dict[str, object]], payload["artifacts"])
+    if mutation == "schema-version":
+        assert payload["schema_version"] == packaging.CYTHON_OVERLAY_SCHEMA_VERSION
+        payload["schema_version"] = packaging.CYTHON_OVERLAY_SCHEMA_VERSION + 1
+    elif mutation == "format":
+        payload["format"] = "unsupported-native-overlay"
+    elif mutation == "empty-artifacts":
+        payload["artifacts"] = []
+    elif mutation == "unsorted-artifacts":
+        artifacts.reverse()
+    elif mutation == "duplicate-module":
+        artifacts[1]["module_name"] = artifacts[0]["module_name"]
+    else:
+        raise AssertionError(f"unknown manifest mutation: {mutation}")
+    write_manifest_payload(manifest_path, payload)
+    original_record = example_record_path(package_root).read_bytes()
+
+    with pytest.raises(CythonOverlayManifestError, match=expected_message):
+        apply_cython_overlay(overlay_directory, package_root)
+
+    assert_overlay_left_uninstalled(package_root, manifest, original_record)
+
+
+def test_schema_version_is_bound_into_the_bundle_digest(tmp_path: Path) -> None:
+    package_root, _ = write_example_distribution(tmp_path)
+    overlay_directory = tmp_path / "native-overlay"
+    # A real build, so the digest this test recomputes is the one the builder
+    # wrote rather than a cached copy of it.
+    manifest = build_example_overlay(
+        package_root, overlay_directory, worker_only=False, fresh_build=True
     )
-    assert not (package_root / INSTALLED_CYTHON_OVERLAY_MANIFEST_FILE_NAME).exists()
-    assert example_record_path(package_root).read_bytes() == original_record
+    manifest_path = overlay_directory / CYTHON_OVERLAY_MANIFEST_FILE_NAME
+    payload = read_manifest_payload(manifest_path)
+    assert payload["schema_version"] == packaging.CYTHON_OVERLAY_SCHEMA_VERSION
+    digest_payload = {
+        key: payload[key] for key in ("format", "package_name", "target", "toolchain", "artifacts")
+    }
+    canonical_bytes = json.dumps(
+        digest_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload["bundle_digest"] = "sha256:" + hashlib.sha256(canonical_bytes).hexdigest()
+    write_manifest_payload(manifest_path, payload)
+    original_record = example_record_path(package_root).read_bytes()
+
+    with pytest.raises(
+        CythonOverlayManifestError,
+        match="bundle_digest does not match manifest components",
+    ):
+        apply_cython_overlay(overlay_directory, package_root)
+
+    assert_overlay_left_uninstalled(package_root, manifest, original_record)
 
 
 @pytest.mark.parametrize("oversized", [False, True], ids=["invalid-json", "oversized"])
@@ -76,7 +139,7 @@ def test_apply_refuses_invalid_manifest_json_before_mutation(
         tmp_path
     )
     manifest_path = overlay_directory / CYTHON_OVERLAY_MANIFEST_FILE_NAME
-    _write_manifest_bytes(
+    write_manifest_bytes(
         manifest_path,
         b" " * (MAX_NATIVE_OVERLAY_MANIFEST_BYTES + 1) if oversized else b'{"schema_version":',
     )
@@ -122,7 +185,7 @@ def test_apply_refuses_invalid_manifest_structure_before_mutation(
         tmp_path
     )
     manifest_path = overlay_directory / CYTHON_OVERLAY_MANIFEST_FILE_NAME
-    payload = _manifest_payload(manifest_path)
+    payload = read_manifest_payload(manifest_path)
     container: object = payload
     for component in field_path[:-1]:
         container = (
@@ -131,10 +194,7 @@ def test_apply_refuses_invalid_manifest_structure_before_mutation(
             else cast(dict[str, object], container)[component]
         )
     cast(dict[str, object], container)[str(field_path[-1])] = invalid_value
-    _write_manifest_bytes(
-        manifest_path,
-        (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"),
-    )
+    write_manifest_payload(manifest_path, payload)
 
     _assert_apply_refused_without_mutation(
         package_root,
@@ -153,11 +213,11 @@ def test_apply_refuses_semantically_identical_noncanonical_manifest_before_mutat
         tmp_path
     )
     manifest_path = overlay_directory / CYTHON_OVERLAY_MANIFEST_FILE_NAME
-    payload = _manifest_payload(manifest_path)
+    payload = read_manifest_payload(manifest_path)
     noncanonical_bytes = (json.dumps(payload, indent=4, sort_keys=True) + "\n").encode("utf-8")
     assert json.loads(noncanonical_bytes) == payload
     assert noncanonical_bytes != manifest_path.read_bytes()
-    _write_manifest_bytes(manifest_path, noncanonical_bytes)
+    write_manifest_bytes(manifest_path, noncanonical_bytes)
 
     _assert_apply_refused_without_mutation(
         package_root,
@@ -174,14 +234,14 @@ def test_apply_refuses_duplicate_manifest_fields_before_mutation(tmp_path: Path)
         tmp_path
     )
     manifest_path = overlay_directory / CYTHON_OVERLAY_MANIFEST_FILE_NAME
-    payload = _manifest_payload(manifest_path)
+    payload = read_manifest_payload(manifest_path)
     serialized_manifest = manifest_path.read_text(encoding="utf-8").rstrip("\n")
     assert serialized_manifest.endswith("}")
     duplicated_manifest = (
         serialized_manifest[:-1] + f',\n  "format": {json.dumps(payload["format"])}\n}}\n'
     ).encode("utf-8")
     assert json.loads(duplicated_manifest)["format"] == payload["format"]
-    _write_manifest_bytes(manifest_path, duplicated_manifest)
+    write_manifest_bytes(manifest_path, duplicated_manifest)
 
     _assert_apply_refused_without_mutation(
         package_root,
@@ -201,7 +261,7 @@ def test_invalid_installed_manifest_reports_mismatch_without_mutating_package(
     apply_cython_overlay(overlay_directory, package_root)
     installed_manifest_path = package_root / INSTALLED_CYTHON_OVERLAY_MANIFEST_FILE_NAME
     invalid_manifest = b" " * (MAX_NATIVE_OVERLAY_MANIFEST_BYTES + 1) if oversized else b"{}"
-    _write_manifest_bytes(installed_manifest_path, invalid_manifest)
+    write_manifest_bytes(installed_manifest_path, invalid_manifest)
     preserved_files = {
         path: path.read_bytes()
         for path in (

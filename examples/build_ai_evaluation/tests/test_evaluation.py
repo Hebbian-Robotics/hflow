@@ -529,86 +529,48 @@ def test_prepare_output_directory_refuses_a_different_experiment(tmp_path: Path)
         _prepare_output_directory(different)
 
 
-def test_run_metadata_refuses_a_non_object_run_json(tmp_path: Path) -> None:
+_RUN_METADATA_WITHOUT_PROMPTS = {
+    "label": "run-label",
+    "fingerprint": "x",
+    "model": "vision-model",
+    "dataset_variant": "10k",
+}
+
+
+@pytest.mark.parametrize(
+    ("run_json_text", "expected_fragments"),
+    [
+        pytest.param("[]", ("must contain a JSON object",), id="non-object"),
+        pytest.param("not json", ("could not read run metadata",), id="invalid-json"),
+        pytest.param(json.dumps({"fingerprint": "x"}), ("'label'",), id="missing-label"),
+        pytest.param(json.dumps({"label": 3}), ("'label'",), id="non-string-label"),
+        pytest.param(
+            json.dumps(_RUN_METADATA_WITHOUT_PROMPTS), ("'prompts'",), id="missing-prompts"
+        ),
+        pytest.param(
+            json.dumps(
+                {**_RUN_METADATA_WITHOUT_PROMPTS, "prompts": {"hand-count": {"text": "no digest"}}}
+            ),
+            ("'hand-count'", "'sha256'"),
+            id="prompt-without-digest",
+        ),
+    ],
+)
+def test_run_metadata_names_the_file_and_the_bad_field(
+    tmp_path: Path, run_json_text: str, expected_fragments: tuple[str, ...]
+) -> None:
     configuration = _evaluation_configuration(tmp_path / "run")
     metadata_path = tmp_path / "run" / "run.json"
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata_path.write_text("[]")
+    metadata_path.write_text(run_json_text)
 
     with pytest.raises(ValueError) as error:
         _prepare_output_directory(configuration)
 
     message = str(error.value)
     assert str(metadata_path) in message
-    assert "must contain a JSON object" in message
-
-
-def test_run_metadata_refuses_invalid_json(tmp_path: Path) -> None:
-    configuration = _evaluation_configuration(tmp_path / "run")
-    metadata_path = tmp_path / "run" / "run.json"
-    metadata_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata_path.write_text("not json")
-
-    with pytest.raises(ValueError) as error:
-        _prepare_output_directory(configuration)
-
-    message = str(error.value)
-    assert str(metadata_path) in message
-    assert "could not read run metadata" in message
-
-
-def test_run_metadata_names_the_file_and_the_bad_field(tmp_path: Path) -> None:
-    configuration = _evaluation_configuration(tmp_path / "run")
-    metadata_path = tmp_path / "run" / "run.json"
-    metadata_path.parent.mkdir(parents=True, exist_ok=True)
-
-    metadata_path.write_text(json.dumps({"fingerprint": "x"}))
-    with pytest.raises(ValueError) as error:
-        _prepare_output_directory(configuration)
-    message = str(error.value)
-    assert str(metadata_path) in message
-    assert "'label'" in message
-
-    metadata_path.write_text(json.dumps({"label": 3}))
-    with pytest.raises(ValueError) as error:
-        _prepare_output_directory(configuration)
-    message = str(error.value)
-    assert str(metadata_path) in message
-    assert "'label'" in message
-
-    metadata_path.write_text(
-        json.dumps(
-            {
-                "label": "run-label",
-                "fingerprint": "x",
-                "model": "vision-model",
-                "dataset_variant": "10k",
-            }
-        )
-    )
-    with pytest.raises(ValueError) as error:
-        _prepare_output_directory(configuration)
-    message = str(error.value)
-    assert str(metadata_path) in message
-    assert "'prompts'" in message
-
-    metadata_path.write_text(
-        json.dumps(
-            {
-                "label": "run-label",
-                "fingerprint": "x",
-                "model": "vision-model",
-                "dataset_variant": "10k",
-                "prompts": {"hand-count": {"text": "no digest"}},
-            }
-        )
-    )
-    with pytest.raises(ValueError) as error:
-        _prepare_output_directory(configuration)
-    message = str(error.value)
-    assert str(metadata_path) in message
-    assert "'hand-count'" in message
-    assert "'sha256'" in message
+    for expected_fragment in expected_fragments:
+        assert expected_fragment in message
 
 
 def test_run_metadata_document_persists_the_existing_schema(tmp_path: Path) -> None:
@@ -921,7 +883,14 @@ def test_cli_positive_integer_bounds_rejected(flag: str, invalid_value: str) -> 
 
 
 def test_cli_help_displays_subcommands_and_options() -> None:
-    runner = CliRunner()
+    # Typer styles an option's ``--`` prefix separately from its name, so with
+    # colour on the rendered text is ``--<ANSI>dataset<ANSI>`` and a plain
+    # ``"--dataset" in output`` is False. This passed locally, where Rich
+    # emitted no colour, and failed on CI, where it did. ``TERM=dumb`` is the
+    # lever that actually turns colour off here; ``NO_COLOR`` does not, because
+    # an explicit colour setting still wins over it. COLUMNS is pinned too so a
+    # narrow terminal cannot wrap a flag out of the assertions separately.
+    runner = CliRunner(env={"COLUMNS": "200", "TERM": "dumb"})
 
     top_help = runner.invoke(evaluate_app, ["--help"])
     assert top_help.exit_code == 0

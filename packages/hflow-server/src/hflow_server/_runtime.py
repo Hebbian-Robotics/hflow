@@ -163,6 +163,11 @@ class RuntimeUnavailable:
 RuntimeResolution = ResolvedRuntime | RuntimeUnavailable
 
 
+def _close_resolution(resolution: RuntimeResolution | None) -> None:
+    if isinstance(resolution, ResolvedRuntime):
+        resolution.client.close()
+
+
 class IngestRequest(BaseModel):
     uris: list[str] = Field(min_length=1)
     profile: str = "full"
@@ -265,9 +270,30 @@ class RuntimeResolver:
     def resolve(self) -> RuntimeResolution:
         now_monotonic = time.monotonic()
         if self._cached_resolution is None or now_monotonic >= self._expires_at_monotonic:
-            self._cached_resolution = resolve_runtime(self._data_root)
+            previous_resolution = self._cached_resolution
+            try:
+                self._cached_resolution = resolve_runtime(self._data_root)
+            except BaseException:
+                self._cached_resolution = None
+                self._expires_at_monotonic = 0.0
+                _close_resolution(previous_resolution)
+                raise
+            if previous_resolution is not self._cached_resolution:
+                _close_resolution(previous_resolution)
             self._expires_at_monotonic = now_monotonic + RESOLUTION_CACHE_TTL_S
         return self._cached_resolution
+
+    def close(self) -> None:
+        previous_resolution = self._cached_resolution
+        self._cached_resolution = None
+        self._expires_at_monotonic = 0.0
+        _close_resolution(previous_resolution)
+
+    def __enter__(self) -> "RuntimeResolver":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
 
 
 def optional_string(value: object) -> str | None:

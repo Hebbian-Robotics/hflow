@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import tarfile
+from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType
 
@@ -21,9 +22,9 @@ from hflow.checks import camera_frame_stats
 from hflow.ffmpeg import ffmpeg_path
 
 
-def _load_prepare_module() -> ModuleType:
-    module_path = Path(__file__).parents[1] / "examples" / "egocentric" / "prepare.py"
-    module_spec = importlib.util.spec_from_file_location("egocentric_prepare", module_path)
+def _load_egocentric_example_module(file_name: str, module_name: str) -> ModuleType:
+    module_path = Path(__file__).parents[1] / "examples" / "egocentric" / file_name
+    module_spec = importlib.util.spec_from_file_location(module_name, module_path)
     if module_spec is None or module_spec.loader is None:
         raise RuntimeError(f"could not load {module_path}")
     module = importlib.util.module_from_spec(module_spec)
@@ -32,7 +33,17 @@ def _load_prepare_module() -> ModuleType:
     return module
 
 
-PREPARE = _load_prepare_module()
+PREPARE = _load_egocentric_example_module("prepare.py", "egocentric_prepare")
+CONVERT = _load_egocentric_example_module("convert.py", "egocentric_convert")
+
+
+def _write_tar(tar_path: Path, members: Mapping[str, bytes]) -> None:
+    """Write ``members`` into a plain tar, in insertion order."""
+    with tarfile.open(tar_path, "w") as tar:
+        for member_name, member_bytes in members.items():
+            member_info = tarfile.TarInfo(member_name)
+            member_info.size = len(member_bytes)
+            tar.addfile(member_info, io.BytesIO(member_bytes))
 
 
 @pytest.fixture(scope="module")
@@ -168,8 +179,9 @@ def _write_shard_tar(
     factory_id: str,
     worker_id: str,
     *,
-    sidecar_fields: dict[str, object] | None = None,
+    sidecar_fields: Mapping[str, object] | None = None,
     include_sidecar: bool = True,
+    intrinsics_fields: Mapping[str, object] | None = None,
 ) -> tuple[str, str, str]:
     """One pinned shard tar: a single video plus its sidecar.
 
@@ -191,14 +203,12 @@ def _write_shard_tar(
             "codec": "h265",
         }
     sidecar = json.dumps(sidecar_fields)
-    with tarfile.open(tar_path, "w") as tar:
-        video_info = tarfile.TarInfo(video_member)
-        video_info.size = len(video_bytes)
-        tar.addfile(video_info, io.BytesIO(video_bytes))
-        if include_sidecar:
-            sidecar_info = tarfile.TarInfo(sidecar_member)
-            sidecar_info.size = len(sidecar.encode())
-            tar.addfile(sidecar_info, io.BytesIO(sidecar.encode()))
+    members = {video_member: video_bytes}
+    if include_sidecar:
+        members[sidecar_member] = sidecar.encode()
+    if intrinsics_fields is not None:
+        members["intrinsics.json"] = json.dumps(intrinsics_fields).encode("utf-8")
+    _write_tar(tar_path, members)
     return (
         video_member,
         hashlib.sha256(video_bytes).hexdigest(),
@@ -279,33 +289,6 @@ def test_two_shards_coexist_in_one_output_root(tmp_path: Path, moving_hevc_video
             metadata["factory"]
             == expected_operator.split("_")[0] + "_" + expected_operator.split("_")[1]
         )
-
-
-def test_single_shard_provenance_names_the_real_source(
-    tmp_path: Path, moving_hevc_video: Path
-) -> None:
-    """One shard, one episode: operator and factory come from the sidecar."""
-    source_root = tmp_path / "source"
-    output_root = tmp_path / "corpus"
-    tar_path = source_root / "huggingface" / "shard.tar"
-    tar_path.parent.mkdir(parents=True, exist_ok=True)
-    member, member_sha, archive_sha = _write_shard_tar(
-        tar_path, "factory002_worker001_00000", moving_hevc_video, "factory_002", "worker_001"
-    )
-    manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text(
-        _manifest_json("shard.tar", archive_sha, member, member_sha, "factory_002 task"),
-        encoding="utf-8",
-    )
-
-    report = PREPARE.prepare_corpus(manifest_path, source_root, output_root)
-
-    assert len(report) == 1
-    with Episode(report[0]) as episode:
-        metadata = episode.metadata_records["episode/v1"]
-    assert metadata["operator"] == "factory_002_worker_001"
-    assert metadata["factory"] == "factory_002"
-    assert metadata["source_member"] == member
 
 
 def test_same_member_stem_from_two_shards_never_collides(
@@ -397,3 +380,243 @@ def test_unusable_sidecar_refuses_the_source(
     with pytest.raises(RuntimeError, match=_exactly(expected_message)):
         PREPARE.prepare_corpus(manifest_path, source_root, output_root)
     assert list((output_root / "landing").glob("*.mcap")) == []
+
+
+def test_sidecar_fields_map_to_episode_metadata_and_intrinsics_attached(
+    tmp_path: Path, moving_hevc_video: Path
+) -> None:
+    """#584: Sidecars map cleanly onto episode/v1 metadata (factory, worker,
+    duration, fps, codec) and intrinsics.json maps onto a calibration attachment."""
+    source_root = tmp_path / "source"
+    output_root = tmp_path / "corpus"
+    tar_path = source_root / "huggingface" / "shard.tar"
+    tar_path.parent.mkdir(parents=True, exist_ok=True)
+
+    intrinsics = {"fx": 525.0, "fy": 525.0, "cx": 320.0, "cy": 180.0, "distortion": [0.0, 0.0]}
+    sidecar_data = {
+        "factory_id": "factory_051",
+        "worker_id": "worker_007",
+        "video_index": 0,
+        "duration_sec": 24.0,
+        "width": 160,
+        "height": 90,
+        "fps": 10.0,
+        "codec": "h265",
+    }
+    member, member_sha, archive_sha = _write_shard_tar(
+        tar_path,
+        "factory051_worker007_00000",
+        moving_hevc_video,
+        "factory_051",
+        "worker_007",
+        sidecar_fields=sidecar_data,
+        intrinsics_fields=intrinsics,
+    )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        _manifest_json("shard.tar", archive_sha, member, member_sha, "component_sorting"),
+        encoding="utf-8",
+    )
+
+    report = PREPARE.prepare_corpus(manifest_path, source_root, output_root)
+    assert len(report) == 1
+    landing_path = report[0]
+
+    # Verify landing MCAP
+    with Episode(landing_path) as episode:
+        metadata = episode.metadata_records["episode/v1"]
+        assert metadata["factory"] == "factory_051"
+        assert metadata["worker"] == "worker_007"
+        assert metadata["operator"] == "factory_051_worker_007"
+        assert metadata["duration"] == "24"
+        assert metadata["fps"] == "10"
+        assert metadata["codec"] == "h265"
+        assert metadata["task"] == "component_sorting"
+        assert metadata["source_member"] == member
+
+        attachments = episode.attachments
+        assert len(attachments) == 1
+        assert attachments[0].name == "intrinsics.json"
+        assert attachments[0].media_type == "application/json"
+        assert json.loads(attachments[0].data.decode("utf-8")) == intrinsics
+
+    # Verify canonical MCAP preserves metadata and attachment
+    canonical_path = tmp_path / "canonical.mcap"
+    write_canonical_episode(landing_path, canonical_path, TransformConfig())
+
+    with Episode(canonical_path) as canonical_episode:
+        canonical_metadata = canonical_episode.metadata_records["episode/v1"]
+        assert canonical_metadata["factory"] == "factory_051"
+        assert canonical_metadata["worker"] == "worker_007"
+        assert canonical_metadata["operator"] == "factory_051_worker_007"
+        assert canonical_metadata["duration"] == "24"
+        assert canonical_metadata["fps"] == "10"
+        assert canonical_metadata["codec"] == "h265"
+
+        canonical_attachments = canonical_episode.attachments
+        assert len(canonical_attachments) == 1
+        assert canonical_attachments[0].name == "intrinsics.json"
+        assert json.loads(canonical_attachments[0].data.decode("utf-8")) == intrinsics
+
+
+def test_convert_webdataset_tar_converts_clips_with_sidecars_and_intrinsics(
+    tmp_path: Path, moving_hevc_video: Path
+) -> None:
+    """#584: Worked converter example reads a WebDataset tar, maps sidecars
+    onto episode/v1, attaches intrinsics.json, and writes canonical episodes."""
+    tar_path = tmp_path / "corpus_shard.tar"
+    output_dir = tmp_path / "converted"
+
+    video_bytes = moving_hevc_video.read_bytes()
+    intrinsics = {"fx": 450.0, "fy": 450.0, "cx": 228.0, "cy": 128.0}
+    intrinsics_json = json.dumps(intrinsics).encode("utf-8")
+
+    clips = [
+        ("factory010_worker002_00000", "factory_010", "worker_002", "material_handling"),
+        ("factory010_worker002_00001", "factory_010", "worker_002", "tool_setup"),
+    ]
+
+    members = {"intrinsics.json": intrinsics_json}
+    for stem, factory_id, worker_id, task in clips:
+        members[f"{stem}.mp4"] = video_bytes
+        sidecar_dict = {
+            "factory_id": factory_id,
+            "worker_id": worker_id,
+            "task": task,
+            "duration_sec": 24.0,
+            "fps": 10.0,
+            "codec": "h265",
+        }
+        members[f"{stem}.json"] = json.dumps(sidecar_dict).encode("utf-8")
+    _write_tar(tar_path, members)
+
+    results = CONVERT.convert_webdataset_tar(
+        tar_path=tar_path,
+        output_dir=output_dir,
+        canonical=True,
+        target_fps=10.0,
+        max_duration_s=2.0,
+    )
+
+    assert len(results) == 2
+    for path, (stem, factory_id, worker_id, task) in zip(results, clips, strict=True):
+        assert path.is_file()
+        assert path.name == f"{stem}.canonical.mcap"
+
+        with Episode(path) as episode:
+            metadata = episode.metadata_records["episode/v1"]
+            assert metadata["factory"] == factory_id
+            assert metadata["worker"] == worker_id
+            assert metadata["operator"] == f"{factory_id}_{worker_id}"
+            assert metadata["task"] == task
+            assert metadata["duration"] == "24"
+            assert metadata["fps"] == "10"
+            assert metadata["codec"] == "h265"
+
+            attachments = episode.attachments
+            assert len(attachments) == 1
+            assert attachments[0].name == "intrinsics.json"
+            assert json.loads(attachments[0].data.decode("utf-8")) == intrinsics
+            assert len(episode.cameras) == 1
+            assert episode.cameras[0] == "/head_camera/compressed"
+
+
+def test_convert_webdataset_tar_missing_sidecar_fails(
+    tmp_path: Path, moving_hevc_video: Path
+) -> None:
+    """Missing sidecar in WebDataset tar fails with descriptive error."""
+    tar_path = tmp_path / "broken.tar"
+    output_dir = tmp_path / "converted"
+    _write_tar(tar_path, {"clip.mp4": moving_hevc_video.read_bytes()})
+
+    with pytest.raises(
+        RuntimeError, match=_exactly("missing sidecar for source video 'clip.mp4' in broken.tar")
+    ):
+        CONVERT.convert_webdataset_tar(tar_path, output_dir)
+
+
+def test_convert_webdataset_tar_preserves_distinct_operator(
+    tmp_path: Path, moving_hevc_video: Path
+) -> None:
+    """When sidecar specifies an operator, it is preserved instead of generated."""
+    tar_path = tmp_path / "operator_test.tar"
+    output_dir = tmp_path / "converted"
+    video_bytes = moving_hevc_video.read_bytes()
+
+    sidecar_dict = {
+        "factory_id": "factory_010",
+        "worker_id": "worker_002",
+        "operator": "lead_operator_99",
+        "duration_sec": 24.0,
+        "fps": 10.0,
+        "codec": "h265",
+    }
+
+    _write_tar(
+        tar_path,
+        {"clip.mp4": video_bytes, "clip.json": json.dumps(sidecar_dict).encode("utf-8")},
+    )
+
+    results = CONVERT.convert_webdataset_tar(
+        tar_path=tar_path,
+        output_dir=output_dir,
+        canonical=False,
+        max_duration_s=1.0,
+    )
+    assert len(results) == 1
+    with Episode(results[0]) as episode:
+        metadata = episode.metadata_records["episode/v1"]
+        assert metadata["operator"] == "lead_operator_99"
+
+
+def test_convert_webdataset_tar_staged_validation_leaves_no_partial_mcap(
+    tmp_path: Path, moving_hevc_video: Path
+) -> None:
+    """If a subsequent clip is missing its sidecar, pre-validation fails before any MCAP is written."""
+    tar_path = tmp_path / "partial_test.tar"
+    output_dir = tmp_path / "converted"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    video_bytes = moving_hevc_video.read_bytes()
+
+    _write_tar(
+        tar_path,
+        {
+            # First clip has valid sidecar
+            "clip1.mp4": video_bytes,
+            "clip1.json": json.dumps({"factory_id": "f1", "worker_id": "w1"}).encode("utf-8"),
+            # Second clip is missing sidecar
+            "clip2.mp4": video_bytes,
+        },
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=_exactly(f"missing sidecar for source video 'clip2.mp4' in {tar_path.name}"),
+    ):
+        CONVERT.convert_webdataset_tar(tar_path, output_dir)
+
+    # Assert no partial MCAPs were written to output_dir
+    assert list(output_dir.glob("*.mcap")) == []
+
+
+def test_convert_webdataset_tar_invalid_identity_fails(
+    tmp_path: Path, moving_hevc_video: Path
+) -> None:
+    """Non-string or null factory_id or worker_id fails loudly."""
+    tar_path = tmp_path / "invalid_id.tar"
+    output_dir = tmp_path / "converted"
+    video_bytes = moving_hevc_video.read_bytes()
+
+    _write_tar(
+        tar_path,
+        {
+            "clip1.mp4": video_bytes,
+            "clip1.json": json.dumps({"factory_id": "f1", "worker_id": None}).encode("utf-8"),
+        },
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=_exactly("sidecar 'clip1.json' is missing a usable 'factory_id' or 'worker_id'"),
+    ):
+        CONVERT.convert_webdataset_tar(tar_path, output_dir)

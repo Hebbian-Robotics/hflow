@@ -526,3 +526,67 @@ def test_an_unreachable_bundle_names_the_workspace_host_as_the_caller(
     payload = bundle_api.get("/api/v1/runtime/status").json()
     assert payload["available"] is False
     assert "the workspace host could not reach its own ingest runtime" in payload["detail"]
+
+
+def test_runtime_resolver_lifecycle_and_cache_replacement(
+    bundle_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The resolver caches its resolution and closes superseded clients."""
+    from hflow_server._runtime import RESOLUTION_CACHE_TTL_S, ResolvedRuntime, RuntimeResolver
+
+    simulated_time = 1000.0
+    monkeypatch.setattr("time.monotonic", lambda: simulated_time)
+
+    with RuntimeResolver(str(bundle_workspace)) as resolver:
+        resolution_1 = resolver.resolve()
+        assert isinstance(resolution_1, ResolvedRuntime)
+        client_1 = resolution_1.client
+
+        # Within the TTL, repeated calls return the cached resolution and preserve the client.
+        resolution_cached = resolver.resolve()
+        assert resolution_cached is resolution_1
+        assert resolution_cached.client is client_1
+
+        # Advancing time past the TTL triggers cache replacement.
+        simulated_time += RESOLUTION_CACHE_TTL_S + 1.0
+        resolution_2 = resolver.resolve()
+        assert isinstance(resolution_2, ResolvedRuntime)
+        assert resolution_2 is not resolution_1
+        client_2 = resolution_2.client
+        assert client_2 is not client_1
+
+        # The previous resolution's client was closed on cache replacement.
+        with pytest.raises(RuntimeError, match="client has been closed"):
+            client_1.dag("demo_pipeline_ingest")
+
+    # Exiting the resolver context closes the active cached client.
+    with pytest.raises(RuntimeError, match="client has been closed"):
+        client_2.dag("demo_pipeline_ingest")
+
+
+def test_runtime_resolver_closes_client_when_resolution_fails(
+    bundle_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If cache refresh raises, the previous client is closed and cache is invalidated."""
+    import hflow_server._runtime as runtime_module
+    from hflow_server._runtime import RESOLUTION_CACHE_TTL_S, ResolvedRuntime, RuntimeResolver
+
+    simulated_time = 1000.0
+    monkeypatch.setattr("time.monotonic", lambda: simulated_time)
+
+    with RuntimeResolver(str(bundle_workspace)) as resolver:
+        resolution = resolver.resolve()
+        assert isinstance(resolution, ResolvedRuntime)
+        client = resolution.client
+
+        simulated_time += RESOLUTION_CACHE_TTL_S + 1.0
+
+        def failing_resolve(_data_root: str) -> None:
+            raise RuntimeError("disk error")
+
+        monkeypatch.setattr(runtime_module, "resolve_runtime", failing_resolve)
+        with pytest.raises(RuntimeError, match="disk error"):
+            resolver.resolve()
+
+        with pytest.raises(RuntimeError, match="client has been closed"):
+            client.dag("demo_pipeline_ingest")

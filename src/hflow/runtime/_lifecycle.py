@@ -66,19 +66,19 @@ def start_runtime(
     )
     compose_up_detached(paths.compose_file, project_name=project_name)
     started_at = time.monotonic()
-    client = client_for_bundle(paths)
-    health = client.wait_until_healthy(
-        timeout_s=wait_timeout_s,
-        on_poll=_throttled_health_progress(on_progress) if on_progress is not None else None,
-    )
-    emit_progress("waiting for the ingest DAGs to register")
-    # Component health says nothing about whether the generated DAGs actually
-    # imported; only declare victory once the master AND its four stage
-    # sub-DAGs are triggerable, so an immediate `hflow ingest` never 404s
-    # and the master's first trigger task never fires at an unregistered
-    # sub-DAG.
-    remaining_s = max(30.0, wait_timeout_s - (time.monotonic() - started_at))
-    _wait_until_dag_registered(client, bundle_dag_ids(paths.dag_id), timeout_s=remaining_s)
+    with client_for_bundle(paths) as client:
+        health = client.wait_until_healthy(
+            timeout_s=wait_timeout_s,
+            on_poll=_throttled_health_progress(on_progress) if on_progress is not None else None,
+        )
+        emit_progress("waiting for the ingest DAGs to register")
+        # Component health says nothing about whether the generated DAGs actually
+        # imported; only declare victory once the master AND its four stage
+        # sub-DAGs are triggerable, so an immediate `hflow ingest` never 404s
+        # and the master's first trigger task never fires at an unregistered
+        # sub-DAG.
+        remaining_s = max(30.0, wait_timeout_s - (time.monotonic() - started_at))
+        _wait_until_dag_registered(client, bundle_dag_ids(paths.dag_id), timeout_s=remaining_s)
     return paths, health
 
 
@@ -149,7 +149,8 @@ def describe_runtime_status(paths: BundlePaths, *, project_name: str | None = No
     """Health summary plus ``docker compose ps``, with plain-language hints."""
     lines = [f"bundle:  {paths.bundle_dir}", f"api:     {paths.api_base_url}"]
     try:
-        health = client_for_bundle(paths).health()
+        with client_for_bundle(paths) as client:
+            health = client.health()
     except AirflowClientError as error:
         lines.append(f"health:  unreachable ({error})")
         lines.append(

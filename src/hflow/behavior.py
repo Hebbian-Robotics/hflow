@@ -91,4 +91,10 @@ across these changes.
 # that never encodes, so FORMAT.md's "keyframe interval actually used" was
 # false for pass-through episodes. The added provenance changes canonical
 # bytes for any episode carrying pre-encoded video (#376).
-TRANSFORM_BEHAVIOR_VERSION: str = "9"
+#
+# "10": a source with more than one channel on the same topic is refused
+# instead of being written as two output channels (#597). Those recordings
+# previously produced canonical bytes the topic-keyed checks cannot read, so
+# they must not share a pipeline identity with a transform that will not write
+# them. Unique-topic episodes change bytes only because this constant moved.
+TRANSFORM_BEHAVIOR_VERSION: str = "10"
