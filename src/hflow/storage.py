@@ -17,7 +17,9 @@ metadata server for GCS, ``AWS_ACCESS_KEY_ID``/... for S3,
 
 Processing model for bucket roots -- **spool through a mirror**: every bucket
 root owns a local mirror directory laid out one-to-one with the bucket prefix
-(``~/.cache/hflow/mirrors/<url hash>``, override the base with
+(the user cache mirrors directory, such as
+``~/Library/Caches/hflow/mirrors/<url hash>`` on macOS or
+``~/.cache/hflow/mirrors/<url hash>`` on Linux, override the base with
 ``HFLOW_MIRROR_DIR``). Sources download into the mirror, the pipeline runs
 on local files exactly as it does for a local root, and results upload back
 to the same relative keys. Two conventions make the mirror a correct cache
@@ -45,6 +47,8 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
+
+from hflow.cache import user_cache_dir
 
 logger = logging.getLogger(__name__)
 
@@ -170,18 +174,15 @@ def _default_mirror_directory(url: str) -> Path:
     """The local mirror for one bucket URL: stable across processes.
 
     Base directory precedence: ``HFLOW_MIRROR_DIR``, then
-    ``$XDG_CACHE_HOME/hflow/mirrors``, then ``~/.cache/hflow/mirrors``.
+    the user cache mirrors directory (respects ``$XDG_CACHE_HOME`` if set,
+    otherwise uses the platform-native cache directory such as
+    ``~/Library/Caches/hflow/mirrors`` on macOS or ``~/.cache/hflow/mirrors`` on Linux).
     The per-URL subdirectory is a content hash of the normalized URL, so two
     roots never share a mirror and re-parsing the same URL always finds the
     same cache.
     """
     override = os.environ.get("HFLOW_MIRROR_DIR")
-    if override:
-        base_directory = Path(override)
-    else:
-        cache_home = os.environ.get("XDG_CACHE_HOME")
-        cache_base = Path(cache_home) if cache_home else Path.home() / ".cache"
-        base_directory = cache_base / "hflow" / "mirrors"
+    base_directory = Path(override) if override else user_cache_dir("mirrors")
     url_digest = hashlib.sha256(url.encode()).hexdigest()[:12]
     return base_directory / url_digest
 

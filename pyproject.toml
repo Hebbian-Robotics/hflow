@@ -30,6 +30,7 @@ dependencies = [
     "mcap-protobuf-support>=0.5.4",
     "mcap-ros2-support>=0.5.7",
     "numpy>=2.4.6",
+    "platformdirs>=4.11.3",
     "pydantic>=2.13.4",
     "tenacity>=9.1.4",
     "zstandard>=0.25.0",

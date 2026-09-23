@@ -12,22 +12,16 @@ allowed), because those differ per instrument and are the interesting part.
 """
 
 import hashlib
-import os
 import shutil
 import tempfile
 import urllib.request
 from pathlib import Path
 
+from hflow.cache import user_cache_dir as user_cache_dir
+
 
 class PinnedAssetError(RuntimeError):
     """A pinned asset could not be fetched, or did not match its digest."""
-
-
-def user_cache_dir(component: str) -> Path:
-    """``<user cache>/hflow/<component>`` (respects ``XDG_CACHE_HOME``)."""
-    xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
-    cache_base = Path(xdg_cache_home) if xdg_cache_home else Path.home() / ".cache"
-    return cache_base / "hflow" / component
 
 
 def sha256_hex_of_file(path: Path) -> str:
