@@ -14,13 +14,13 @@ torn down, success or failure.
 """
 
 import os
-import socket
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
 import pytest
+from runtime_test_helpers import unused_local_port
 
 from hflow.curation import open_catalog_connection
 from hflow.runtime import (
@@ -76,12 +76,6 @@ def caption(ep: hflow.Episode) -> hflow.EnrichmentResult:
 PIPELINE_SOURCE_V2 = PIPELINE_SOURCE.replace(
     '@app.enrich(version="1")', '@app.enrich(version="2")'
 ).replace('"caption": "a robot arm moves"', '"caption": "a robot arm moves (v2)"')
-
-
-def _free_port() -> int:
-    with socket.socket() as probe_socket:
-        probe_socket.bind(("127.0.0.1", 0))
-        return probe_socket.getsockname()[1]
 
 
 def _wait_until_dags_registered(
@@ -195,7 +189,7 @@ def test_master_profiles_and_online_lane_end_to_end(tmp_path: Path) -> None:
         pipeline_file=pipeline_file,
         data_root=data_root,
         hflow_source=REPOSITORY_ROOT,
-        api_port=_free_port(),
+        api_port=unused_local_port(),
     )
     paths = render_bundle(config, tmp_path / "bundle")
     client = AirflowClient(paths.api_base_url, paths.admin_username, paths.admin_password)

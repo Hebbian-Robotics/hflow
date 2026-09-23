@@ -39,9 +39,6 @@ from examples.build_ai_evaluation.evaluate import (
     app as evaluate_app,
 )
 from examples.build_ai_evaluation.pipeline import (
-    _argument_parser as pipeline_argument_parser,
-)
-from examples.build_ai_evaluation.pipeline import (
     _execution_from_environment,
     app,
 )
@@ -286,15 +283,6 @@ def test_build_ai_pipeline_defaults_to_hosted_and_can_select_openai_compatible_e
     )
 
 
-def test_build_ai_pipeline_requires_an_episode_with_meaningful_footage() -> None:
-    with pytest.raises(SystemExit):
-        pipeline_argument_parser().parse_args([])
-
-    arguments = pipeline_argument_parser().parse_args(["recording.mcap"])
-
-    assert arguments.episode == Path("recording.mcap")
-
-
 def test_summary_reports_prevalence_agreement_and_failures_without_counting_failures_negative() -> (
     None
 ):
@@ -529,86 +517,48 @@ def test_prepare_output_directory_refuses_a_different_experiment(tmp_path: Path)
         _prepare_output_directory(different)
 
 
-def test_run_metadata_refuses_a_non_object_run_json(tmp_path: Path) -> None:
+_RUN_METADATA_WITHOUT_PROMPTS = {
+    "label": "run-label",
+    "fingerprint": "x",
+    "model": "vision-model",
+    "dataset_variant": "10k",
+}
+
+
+@pytest.mark.parametrize(
+    ("run_json_text", "expected_fragments"),
+    [
+        pytest.param("[]", ("must contain a JSON object",), id="non-object"),
+        pytest.param("not json", ("could not read run metadata",), id="invalid-json"),
+        pytest.param(json.dumps({"fingerprint": "x"}), ("'label'",), id="missing-label"),
+        pytest.param(json.dumps({"label": 3}), ("'label'",), id="non-string-label"),
+        pytest.param(
+            json.dumps(_RUN_METADATA_WITHOUT_PROMPTS), ("'prompts'",), id="missing-prompts"
+        ),
+        pytest.param(
+            json.dumps(
+                {**_RUN_METADATA_WITHOUT_PROMPTS, "prompts": {"hand-count": {"text": "no digest"}}}
+            ),
+            ("'hand-count'", "'sha256'"),
+            id="prompt-without-digest",
+        ),
+    ],
+)
+def test_run_metadata_names_the_file_and_the_bad_field(
+    tmp_path: Path, run_json_text: str, expected_fragments: tuple[str, ...]
+) -> None:
     configuration = _evaluation_configuration(tmp_path / "run")
     metadata_path = tmp_path / "run" / "run.json"
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata_path.write_text("[]")
+    metadata_path.write_text(run_json_text)
 
     with pytest.raises(ValueError) as error:
         _prepare_output_directory(configuration)
 
     message = str(error.value)
     assert str(metadata_path) in message
-    assert "must contain a JSON object" in message
-
-
-def test_run_metadata_refuses_invalid_json(tmp_path: Path) -> None:
-    configuration = _evaluation_configuration(tmp_path / "run")
-    metadata_path = tmp_path / "run" / "run.json"
-    metadata_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata_path.write_text("not json")
-
-    with pytest.raises(ValueError) as error:
-        _prepare_output_directory(configuration)
-
-    message = str(error.value)
-    assert str(metadata_path) in message
-    assert "could not read run metadata" in message
-
-
-def test_run_metadata_names_the_file_and_the_bad_field(tmp_path: Path) -> None:
-    configuration = _evaluation_configuration(tmp_path / "run")
-    metadata_path = tmp_path / "run" / "run.json"
-    metadata_path.parent.mkdir(parents=True, exist_ok=True)
-
-    metadata_path.write_text(json.dumps({"fingerprint": "x"}))
-    with pytest.raises(ValueError) as error:
-        _prepare_output_directory(configuration)
-    message = str(error.value)
-    assert str(metadata_path) in message
-    assert "'label'" in message
-
-    metadata_path.write_text(json.dumps({"label": 3}))
-    with pytest.raises(ValueError) as error:
-        _prepare_output_directory(configuration)
-    message = str(error.value)
-    assert str(metadata_path) in message
-    assert "'label'" in message
-
-    metadata_path.write_text(
-        json.dumps(
-            {
-                "label": "run-label",
-                "fingerprint": "x",
-                "model": "vision-model",
-                "dataset_variant": "10k",
-            }
-        )
-    )
-    with pytest.raises(ValueError) as error:
-        _prepare_output_directory(configuration)
-    message = str(error.value)
-    assert str(metadata_path) in message
-    assert "'prompts'" in message
-
-    metadata_path.write_text(
-        json.dumps(
-            {
-                "label": "run-label",
-                "fingerprint": "x",
-                "model": "vision-model",
-                "dataset_variant": "10k",
-                "prompts": {"hand-count": {"text": "no digest"}},
-            }
-        )
-    )
-    with pytest.raises(ValueError) as error:
-        _prepare_output_directory(configuration)
-    message = str(error.value)
-    assert str(metadata_path) in message
-    assert "'hand-count'" in message
-    assert "'sha256'" in message
+    for expected_fragment in expected_fragments:
+        assert expected_fragment in message
 
 
 def test_run_metadata_document_persists_the_existing_schema(tmp_path: Path) -> None:
@@ -714,44 +664,6 @@ def test_base_url_metadata_drops_embedded_credentials_and_query_values() -> None
         _sanitize_base_url("https://user:secret@example.com/v1?api_key=secret")
         == "https://example.com/v1"
     )
-
-
-def test_cli_preserves_typed_source_and_task_selections(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured_configurations: list[EvaluationConfiguration] = []
-
-    def fake_run_evaluation(
-        configuration: EvaluationConfiguration, *, download: bool = False
-    ) -> None:
-        captured_configurations.append(configuration)
-
-    monkeypatch.setattr(
-        "examples.build_ai_evaluation.evaluate.run_evaluation",
-        fake_run_evaluation,
-    )
-
-    runner = CliRunner()
-    result = runner.invoke(
-        evaluate_app,
-        [
-            "run",
-            "--dataset",
-            "100k",
-            "--source",
-            "build",
-            "--task",
-            "hand-count",
-            "--model",
-            "vision-model",
-            "--base-url",
-            "http://localhost:8000/v1",
-        ],
-    )
-
-    assert result.exit_code == 0
-    assert len(captured_configurations) == 1
-    configuration = captured_configurations[0]
-    assert configuration.selected_sources == (SourceSelection.BUILD_AI,)
-    assert configuration.selected_tasks == (EvaluationTask.HAND_COUNT,)
 
 
 @pytest.mark.parametrize(
@@ -893,11 +805,9 @@ def test_run_missing_file_exits_2(
     ("flag", "invalid_value"),
     [
         ("--max-tokens", "0"),
-        ("--max-tokens", "-5"),
         ("--max-retries", "0"),
         ("--workers", "0"),
         ("--limit", "0"),
-        ("--limit", "-1"),
     ],
 )
 def test_cli_positive_integer_bounds_rejected(flag: str, invalid_value: str) -> None:

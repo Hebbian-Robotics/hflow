@@ -95,3 +95,20 @@ def corrupt_zstd_chunk_payload(episode_path: Path) -> None:
     assert data[records_start : records_start + 4] == b"\x28\xb5\x2f\xfd"
     data[records_start] ^= 0x01
     episode_path.write_bytes(data)
+
+
+def corrupt_first_chunk_crc(episode_path: Path) -> None:
+    """Flip one bit of the first chunk's stored CRC in place.
+
+    Header rot, not payload damage: the payload still decompresses, so only
+    a CRC-validated read knows. The counterpart to
+    ``corrupt_zstd_chunk_payload``, which breaks decompression instead.
+    """
+    from mcap.reader import make_reader
+
+    data = bytearray(episode_path.read_bytes())
+    summary = make_reader(io.BytesIO(bytes(data))).get_summary()
+    assert summary is not None and summary.chunk_indexes
+    crc_offset = summary.chunk_indexes[0].chunk_start_offset + 33
+    data[crc_offset] ^= 0x01
+    episode_path.write_bytes(bytes(data))

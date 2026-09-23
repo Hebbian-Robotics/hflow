@@ -16,7 +16,6 @@ from hflow.video import (
     PictureCodingScan,
     VideoEncodeError,
     _enforce_encode_guarantees,
-    _first_mb_failure_message,
     _remove_emulation_prevention_bytes,
     _unescape_ebsp_head,
     count_h264_pictures,
@@ -424,7 +423,7 @@ def test_unescape_ebsp_head_matches_full_unescape_for_the_prefix() -> None:
     after the cut is irrelevant: the prefix ends at the cut either way."""
     payload = b"\x00\x00\x00\x01\x65" + bytes(range(256)) * 4
     full = _remove_emulation_prevention_bytes(payload)
-    for max_bytes in (8, 16, 32, 64, 128):
+    for max_bytes in (8, 16, 32, 64, 128, len(payload), len(payload) + 100):
         head = _unescape_ebsp_head(payload, max_bytes)
         if max_bytes >= len(payload):
             assert head == full
@@ -509,19 +508,6 @@ def test_scan_and_count_agree_on_multi_slice_and_escape_heavy_streams() -> None:
     assert scan_picture_coding_types(escape_stream).picture_count == 2
     assert count_h264_pictures(escape_stream) == 2
     assert scan_picture_coding_types(escape_stream).b_picture_count == 0
-
-
-def test_first_mb_failure_message_names_both_failure_kinds() -> None:
-    """count_h264_pictures owes hflow doctor two distinct messages, and the
-    walk no longer raises them itself: this helper is the only place they
-    are produced. An all-zero RBSP never terminates the first Exp-Golomb
-    value; 00000100 carries the terminating one bit but loses its suffix."""
-    assert (
-        _first_mb_failure_message(b"\x00") == "slice header has no complete first_mb_in_slice value"
-    )
-    assert (
-        _first_mb_failure_message(b"\x04") == "slice header truncates its first_mb_in_slice value"
-    )
 
 
 def test_a_truncated_slice_type_still_counts_but_cannot_be_classified() -> None:

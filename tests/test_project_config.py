@@ -14,6 +14,8 @@ from hflow.project import (
 )
 from hflow.storage import BucketStorageRoot, LocalStorageRoot
 
+KITCHEN_PIPELINE_SOURCE = "import hflow\n\nkitchen = hflow.App('kitchen', data_root='./data')\n"
+
 
 def _write_config(directory: Path, body: str) -> Path:
     config_file = directory / PROJECT_CONFIG_FILE_NAME
@@ -81,26 +83,28 @@ class TestParsing:
 
         assert found == ProjectConfig(config_file=tmp_path / PROJECT_CONFIG_FILE_NAME)
 
-    def test_malformed_toml_is_refused_naming_the_file(self, tmp_path: Path) -> None:
-        _write_config(tmp_path, "data_root = [unclosed\n")
-        with pytest.raises(ValueError, match=PROJECT_CONFIG_FILE_NAME):
-            find_project_config(tmp_path)
-
-    def test_an_unknown_key_is_refused_rather_than_ignored(self, tmp_path: Path) -> None:
-        """A typo in a settings file is silent by nature: the setting never
-        takes effect and the user concludes the feature does not work."""
-        _write_config(tmp_path, 'data_roots = "./data"\n')
-        with pytest.raises(ValueError, match=r"unknown key 'data_roots'"):
-            find_project_config(tmp_path)
-
-    def test_a_future_config_version_is_refused(self, tmp_path: Path) -> None:
-        _write_config(tmp_path, "config_version = 99\n")
-        with pytest.raises(ValueError, match="config_version 99"):
-            find_project_config(tmp_path)
-
-    def test_a_non_string_setting_is_refused(self, tmp_path: Path) -> None:
-        _write_config(tmp_path, "data_root = 3\n")
-        with pytest.raises(ValueError, match="'data_root' must be a non-empty string"):
+    @pytest.mark.parametrize(
+        ("config_body", "expected_message"),
+        [
+            pytest.param(
+                "data_root = [unclosed\n", PROJECT_CONFIG_FILE_NAME, id="malformed-toml-names-file"
+            ),
+            # A typo in a settings file is silent by nature: the setting never
+            # takes effect and the user concludes the feature does not work.
+            pytest.param('data_roots = "./data"\n', r"unknown key 'data_roots'", id="unknown-key"),
+            pytest.param("config_version = 99\n", "config_version 99", id="future-config-version"),
+            pytest.param(
+                "data_root = 3\n",
+                "'data_root' must be a non-empty string",
+                id="non-string-setting",
+            ),
+        ],
+    )
+    def test_an_unusable_config_file_is_refused(
+        self, tmp_path: Path, config_body: str, expected_message: str
+    ) -> None:
+        _write_config(tmp_path, config_body)
+        with pytest.raises(ValueError, match=expected_message):
             find_project_config(tmp_path)
 
 
@@ -134,9 +138,7 @@ class TestCliPrecedence:
     ) -> None:
         monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
         (tmp_path / "src").mkdir()
-        (tmp_path / "src" / "ingest.py").write_text(
-            "import hflow\n\nkitchen = hflow.App('kitchen', data_root='./data')\n"
-        )
+        (tmp_path / "src" / "ingest.py").write_text(KITCHEN_PIPELINE_SOURCE)
         _write_config(tmp_path, 'pipeline = "src/ingest.py"\n')
         monkeypatch.chdir(tmp_path)
 
@@ -147,9 +149,7 @@ class TestCliPrecedence:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
-        (tmp_path / "pipeline.py").write_text(
-            "import hflow\n\nkitchen = hflow.App('kitchen', data_root='./data')\n"
-        )
+        (tmp_path / "pipeline.py").write_text(KITCHEN_PIPELINE_SOURCE)
         monkeypatch.chdir(tmp_path)
 
         assert cli_main(["manifest"]) == 0
@@ -162,9 +162,7 @@ class TestCliPrecedence:
         from the project and the pipeline from the shell's directory, which is
         the one combination guaranteed to address two different things."""
         monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
-        (tmp_path / "pipeline.py").write_text(
-            "import hflow\n\nkitchen = hflow.App('kitchen', data_root='./data')\n"
-        )
+        (tmp_path / "pipeline.py").write_text(KITCHEN_PIPELINE_SOURCE)
         _write_config(tmp_path, 'data_root = "./data"\n')
         working_directory = tmp_path / "notebooks"
         working_directory.mkdir()

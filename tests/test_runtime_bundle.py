@@ -4,15 +4,20 @@ and the generated master/sub-DAG sources (no Docker, no Airflow imports)."""
 import errno
 import json
 import os
+import stat
+from dataclasses import replace
+from enum import IntEnum
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 import yaml
+from runtime_test_helpers import read_env_file_values
 
 import hflow
-from hflow.runtime import BundlePaths, RuntimeConfig, bundle_dag_ids, render_bundle
-from hflow.runtime._bundle import BUNDLE_MANIFEST_VERSION, infer_hflow_source
+from hflow.runtime import BundlePaths, RuntimeConfig, bundle_dag_ids, load_bundle, render_bundle
+from hflow.runtime._bundle import BUNDLE_MANIFEST_VERSION, STAGE_DESCRIPTIONS, infer_hflow_source
 from hflow.steps import RUN_PROFILES, Stage
 
 AIRFLOW_SERVICE_NAMES = (
@@ -166,8 +171,6 @@ def test_compose_volumes(config: RuntimeConfig, tmp_path: Path) -> None:
 def test_compose_hflow_source_mount_absent_when_unset(
     config: RuntimeConfig, tmp_path: Path
 ) -> None:
-    from dataclasses import replace
-
     paths, compose = _render(replace(config, hflow_source=None), tmp_path / "bundle")
     assert ":/opt/hflow-src:ro" not in paths.compose_file.read_text()
     assert compose["services"]["user-venv-init"]["volumes"] == [
@@ -315,17 +318,11 @@ def test_user_venv_init_prewarms_ffmpeg_best_effort(config: RuntimeConfig, tmp_p
 
 
 def test_env_created_with_config_values_and_secrets(config: RuntimeConfig, tmp_path: Path) -> None:
-    from dataclasses import replace
-
     paths, _ = _render(
         replace(config, api_port=9099, airflow_image="apache/airflow:3.3.1-python3.12"),
         tmp_path / "bundle",
     )
-    env_values = dict(
-        line.split("=", 1)
-        for line in paths.env_file.read_text().splitlines()
-        if line and not line.startswith("#")
-    )
+    env_values = read_env_file_values(paths.env_file)
     assert env_values["AIRFLOW_UID"] == str(os.getuid())
     assert env_values["API_PORT"] == "9099"
     assert env_values["AIRFLOW_IMAGE"] == "apache/airflow:3.3.1-python3.12"
@@ -339,8 +336,6 @@ def test_env_created_with_config_values_and_secrets(config: RuntimeConfig, tmp_p
 
 
 def test_env_preserved_on_rerender(config: RuntimeConfig, tmp_path: Path) -> None:
-    from dataclasses import replace
-
     bundle_dir = tmp_path / "bundle"
     first_paths, _ = _render(config, bundle_dir)
     original_env_text = first_paths.env_file.read_text()
@@ -364,8 +359,6 @@ def test_env_preserved_on_rerender(config: RuntimeConfig, tmp_path: Path) -> Non
 
 
 def test_supplied_admin_password_lands_in_env(config: RuntimeConfig, tmp_path: Path) -> None:
-    from dataclasses import replace
-
     paths, _ = _render(replace(config, admin_password="hunter2"), tmp_path / "bundle")
     assert "AIRFLOW_ADMIN_PASSWORD=hunter2" in paths.env_file.read_text()
     assert paths.admin_password == "hunter2"
@@ -478,6 +471,10 @@ def test_sub_dag_sources_compile_and_encode_contract(config: RuntimeConfig, tmp_
         # a single-batch run from being flattened) and keeps the edge explicit.
         assert "{{ ti.xcom_pull(task_ids=['process_batch']) | list }}" in dag_source
         assert "batch_counts >> gate" in dag_source
+        # Every gate calls a library budget, whose error-budgeting behavior
+        # tests/test_stage_execution.py verifies directly.
+        assert "from hflow.stage_execution import summarize_" in dag_source
+        assert "_budget(batch_counts)" in dag_source
         # The process task exports the environment-resolved data root, then
         # authoritatively refuses an app whose data_root points elsewhere.
         assert "expected_data_root = '/opt/airflow/data'" in dag_source
@@ -501,9 +498,6 @@ def test_bundle_manifest_describes_the_bundle_and_load_bundle_prefers_it(
     """hflow-bundle.json is the machine-readable bundle description a
     provisioning service (and load_bundle) reads instead of regexing
     generated code; pre-manifest bundles still load via the legacy path."""
-    from dataclasses import replace
-
-    from hflow.runtime import load_bundle
 
     paths, _ = _render(replace(config, task_queue="workspace-a"), tmp_path / "bundle")
     manifest_file = paths.bundle_dir / "hflow-bundle.json"
@@ -544,7 +538,6 @@ def test_bundle_manifest_describes_the_bundle_and_load_bundle_prefers_it(
 def test_task_queue_routes_every_stage_task(config: RuntimeConfig, tmp_path: Path) -> None:
     """The worker-pool routing seam: task_queue stamps all stage tasks, and
     the default keeps generated DAGs queue-free (executor default)."""
-    from dataclasses import replace
 
     default_paths, _ = _render(config, tmp_path / "default-bundle")
     for sub_dag_file in default_paths.sub_dag_files:
@@ -563,7 +556,6 @@ def test_task_queue_routes_every_stage_task(config: RuntimeConfig, tmp_path: Pat
 def test_xcom_objectstorage_url_override(config: RuntimeConfig, tmp_path: Path) -> None:
     """Multi-machine executors need an XCom store every host reaches; the
     override replaces the single-host file:// default."""
-    from dataclasses import replace
 
     _, compose = _render(
         replace(config, xcom_objectstorage_url="s3://tenant-bucket/xcom"),
@@ -588,7 +580,6 @@ def test_xcom_objectstorage_url_cannot_inject_a_sibling_environment_key(
     escapes other substitutions into this template, so an embedded
     newline and colon stay part of one literal string value.
     """
-    from dataclasses import replace
 
     injection_payload = "s3://foo/bar\n    AIRFLOW__CORE__LOAD_EXAMPLES: 'true'"
 
@@ -617,7 +608,6 @@ def test_xcom_objectstorage_url_escapes_compose_interpolation(
     single-quoted YAML scalars, so a literal ``$`` has to reach the container
     as ``$$`` in the file. Without this the store URL would silently become
     whatever the launch shell had in that variable, or empty."""
-    from dataclasses import replace
 
     _, compose = _render(
         replace(config, xcom_objectstorage_url="s3://bucket/${HOME}/xcom"),
@@ -634,7 +624,6 @@ def test_explicit_environment_variables_pass_through_by_name(
     config: RuntimeConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An allowlisted value reaches containers but never bundle contents."""
-    from dataclasses import replace
 
     monkeypatch.setenv("MODEL_API_KEY", "secret-value")
     configured = replace(config, passthrough_environment_variables=("MODEL_API_KEY",))
@@ -650,8 +639,6 @@ def test_explicit_environment_variables_pass_through_by_name(
 def test_absent_explicit_environment_variable_is_refused(
     config: RuntimeConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from dataclasses import replace
-
     monkeypatch.delenv("MODEL_API_KEY", raising=False)
     configured = replace(config, passthrough_environment_variables=("MODEL_API_KEY",))
     with pytest.raises(ValueError, match="MODEL_API_KEY"):
@@ -669,8 +656,6 @@ def test_invalid_environment_passthrough_allowlist_is_refused_at_construction(
     config: RuntimeConfig,
     variable_names: tuple[str, ...],
 ) -> None:
-    from dataclasses import replace
-
     with pytest.raises(ValueError, match="environment variable names"):
         replace(config, passthrough_environment_variables=variable_names)
 
@@ -679,11 +664,7 @@ def test_env_file_carries_generated_postgres_password_and_bind_host(
     config: RuntimeConfig, tmp_path: Path
 ) -> None:
     paths, _ = _render(config, tmp_path / "bundle")
-    env_values = dict(
-        line.split("=", 1)
-        for line in paths.env_file.read_text().splitlines()
-        if line and not line.startswith("#")
-    )
+    env_values = read_env_file_values(paths.env_file)
     assert env_values["API_BIND_HOST"] == "127.0.0.1"
     # A generated secret, never the historical fixed default.
     assert env_values["POSTGRES_PASSWORD"] != "airflow"
@@ -695,7 +676,6 @@ def test_dag_sources_carry_airflow_ui_polish(config: RuntimeConfig, tmp_path: Pa
     doc_md pages, a shared pipeline tag for one-click filtering, per-role
     tags, display names, and trigger tasks that explain their deferred wait.
     All five kwargs verified present in apache/airflow:3.3.1."""
-    from hflow.runtime._bundle import STAGE_DESCRIPTIONS
 
     paths, _ = _render(config, tmp_path / "bundle")
 
@@ -778,8 +758,6 @@ def test_render_stays_silent_without_a_differing_data_root_literal(
 
 
 def test_dag_id_override(config: RuntimeConfig, tmp_path: Path) -> None:
-    from dataclasses import replace
-
     paths, _ = _render(replace(config, dag_id="custom_ingest"), tmp_path / "bundle")
     assert paths.dag_id == "custom_ingest"
     assert 'dag_id="custom_ingest"' in paths.dag_file.read_text()
@@ -835,7 +813,6 @@ def test_the_workspace_is_never_copied_whatever_it_is_called(
     literal name `data` excluded exactly one spelling of a configurable thing,
     so a project whose hflow.toml said `data_root = "./workspace"` duplicated
     its whole corpus into the bundle on every `hflow up`."""
-    from dataclasses import replace
 
     workspace = tmp_path / "workspace"
     (workspace / "episodes-in").mkdir(parents=True)
@@ -848,8 +825,6 @@ def test_the_workspace_is_never_copied_whatever_it_is_called(
 
 
 def test_missing_pipeline_file_raises(config: RuntimeConfig, tmp_path: Path) -> None:
-    from dataclasses import replace
-
     broken = replace(config, pipeline_file=tmp_path / "nope.py")
     with pytest.raises(FileNotFoundError):
         render_bundle(broken, tmp_path / "bundle")
@@ -910,8 +885,6 @@ class TestBucketModeBundle:
     def test_published_install_includes_bucket_extra(
         self, bucket_config: RuntimeConfig, tmp_path: Path
     ) -> None:
-        from dataclasses import replace
-
         _, compose = _render(
             replace(bucket_config, hflow_source=None), tmp_path / "published-bundle"
         )
@@ -996,56 +969,51 @@ def test_api_port_outside_the_tcp_range_is_rejected_at_construction(
     render_bundle is never reached: Compose would otherwise be the first thing
     to complain, long after the bundle is on disk.
     """
-    from dataclasses import replace
 
     with pytest.raises(ValueError, match=rf"api_port {bad_port} is not in 1-65535"):
         replace(config, api_port=bad_port)
 
 
-@pytest.mark.parametrize("good_port", [1, 8080, 65535])
-def test_api_port_inside_the_tcp_range_is_accepted(config: RuntimeConfig, good_port: int) -> None:
-    """Both ends of the range are legal, so the check cannot be exclusive."""
-    from dataclasses import replace
-
-    assert replace(config, api_port=good_port).api_port == good_port
+class _Port(IntEnum):
+    API = 9090
 
 
-def test_api_port_accepts_an_int_enum_member(config: RuntimeConfig) -> None:
-    """An IntEnum member is an int, and CONTRIBUTING asks for typed variants.
-
-    This is why the test is `isinstance` and not `type(...) is int`. The member
-    renders as bare digits on 3.11+, so the .env it produces is identical to the
-    one a plain int produces.
-    """
-    from dataclasses import replace
-    from enum import IntEnum
-
-    class Port(IntEnum):
-        API = 9090
-
-    assert replace(config, api_port=Port.API).api_port == 9090
-
-
-def test_api_port_rejects_a_numpy_integer(config: RuntimeConfig) -> None:
-    """A numpy integer is not an int, and a config field is not user data.
-
-    catalog.py coerces numpy scalar measurements at its boundary because
-    those are user data mid-append and refusing would cost the whole episode.
-    api_port is set once by the caller, rendered into a .env that is never
-    rewritten, and interpolated into api_base_url, so refusing it costs one
-    line at the call site and nothing downstream.
-    """
-    from dataclasses import replace
-
-    import numpy as np
-
-    with pytest.raises(ValueError, match="api_port must be an int, not int64"):
-        replace(config, api_port=np.int64(9090))
+@pytest.mark.parametrize(
+    ("good_port", "expected_port"),
+    [
+        # Both ends of the range are legal, so the check cannot be exclusive.
+        (1, 1),
+        (8080, 8080),
+        (65535, 65535),
+        # An IntEnum member is an int, and CONTRIBUTING asks for typed variants.
+        # This is why the check is `isinstance` and not `type(...) is int`. The
+        # member renders as bare digits on 3.11+, so the .env it produces is
+        # identical to the one a plain int produces.
+        pytest.param(_Port.API, 9090, id="int-enum-member"),
+    ],
+)
+def test_api_port_inside_the_tcp_range_is_accepted(
+    config: RuntimeConfig, good_port: int, expected_port: int
+) -> None:
+    assert replace(config, api_port=good_port).api_port == expected_port
 
 
 @pytest.mark.parametrize(
     ("bad_port", "type_name"),
-    [("8080", "str"), (8080.0, "float"), (None, "NoneType"), (True, "bool"), (False, "bool")],
+    [
+        ("8080", "str"),
+        (8080.0, "float"),
+        (None, "NoneType"),
+        (True, "bool"),
+        (False, "bool"),
+        # A numpy integer is not an int, and a config field is not user data.
+        # catalog.py coerces numpy scalar measurements at its boundary because
+        # those are user data mid-append and refusing would cost the whole
+        # episode. api_port is set once by the caller, rendered into a .env that
+        # is never rewritten, and interpolated into api_base_url, so refusing it
+        # costs one line at the call site and nothing downstream.
+        pytest.param(np.int64(9090), "int64", id="numpy-integer"),
+    ],
 )
 def test_api_port_of_the_wrong_type_is_rejected_at_construction(
     config: RuntimeConfig, bad_port: object, type_name: str
@@ -1058,32 +1026,21 @@ def test_api_port_of_the_wrong_type_is_rejected_at_construction(
     which nothing catches: `_command_up` handles ValueError only, so it left
     a traceback. Reporting the type first turns both into one ValueError.
     """
-    from dataclasses import replace
-
     with pytest.raises(ValueError, match=f"api_port must be an int, not {type_name}"):
         replace(config, api_port=bad_port)
 
 
-def test_pipeline_directory_says_is_a_directory(config: RuntimeConfig, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("config_field", "directory_name"),
+    [("pipeline_file", "pipelines"), ("requirements_file", "reqs")],
+)
+def test_a_directory_input_says_is_a_directory(
+    config: RuntimeConfig, tmp_path: Path, config_field: str, directory_name: str
+) -> None:
     """A directory exists, so ENOENT was the wrong reason (#102)."""
-    from dataclasses import replace
-
-    a_directory = tmp_path / "pipelines"
+    a_directory = tmp_path / directory_name
     a_directory.mkdir()
-    broken = replace(config, pipeline_file=a_directory)
-    with pytest.raises(FileNotFoundError) as excinfo:
-        render_bundle(broken, tmp_path / "bundle")
-    assert excinfo.value.errno == errno.EISDIR
-    assert excinfo.value.filename == str(a_directory)
-    assert "Is a directory" in str(excinfo.value)
-
-
-def test_requirements_directory_says_is_a_directory(config: RuntimeConfig, tmp_path: Path) -> None:
-    from dataclasses import replace
-
-    a_directory = tmp_path / "reqs"
-    a_directory.mkdir()
-    broken = replace(config, requirements_file=a_directory)
+    broken = replace(config, **{config_field: a_directory})
     with pytest.raises(FileNotFoundError) as excinfo:
         render_bundle(broken, tmp_path / "bundle")
     assert excinfo.value.errno == errno.EISDIR
@@ -1144,7 +1101,6 @@ class TestScheduledStagePlanning:
         channel list downloads the whole file. This one never opens an episode:
         it syncs catalog parquet through the mirror, so the reason does not
         transfer and a bucket deployment gets the saving too."""
-        from dataclasses import replace
 
         sources = self._sub_dag_sources(
             replace(config, data_root="gs://bucket/robot-data"), tmp_path / "bucket-bundle"
@@ -1167,3 +1123,59 @@ class TestScheduledStagePlanning:
             source = sources[stage_name]
             assert "if not all_stages:" in source
             assert 'all_stages="{{ params.all_stages }}"' in source
+
+
+# Generated runtime bundle security, path, and lifecycle regressions.
+
+
+def test_env_file_is_owner_only_and_healed_on_rerender(
+    config: RuntimeConfig, tmp_path: Path
+) -> None:
+    bundle_dir = tmp_path / "bundle"
+    paths = render_bundle(config, bundle_dir)
+    assert stat.S_IMODE(paths.env_file.stat().st_mode) == 0o600
+
+    paths.env_file.chmod(0o644)
+    original_content = paths.env_file.read_text()
+    render_bundle(config, bundle_dir)
+    assert stat.S_IMODE(paths.env_file.stat().st_mode) == 0o600
+    assert paths.env_file.read_text() == original_content
+
+
+def test_bundles_get_unique_stable_project_names(config: RuntimeConfig, tmp_path: Path) -> None:
+    first = render_bundle(config, tmp_path / "proj-a" / "data" / "runtime")
+    second = render_bundle(config, tmp_path / "proj-b" / "data" / "runtime")
+    names = []
+    for paths in (first, second):
+        parsed = yaml.safe_load(paths.compose_file.read_text())
+        names.append(parsed["name"])
+        assert parsed["name"].startswith("hflow-")
+    assert names[0] != names[1], "default bundles must never share a Compose project"
+
+    rerendered = render_bundle(config, tmp_path / "proj-a" / "data" / "runtime")
+    assert yaml.safe_load(rerendered.compose_file.read_text())["name"] == names[0]
+
+
+def test_awkward_paths_render_parseable_compose(config: RuntimeConfig, tmp_path: Path) -> None:
+    awkward_root = tmp_path / "o'brien" / "$JWT_SECRET-data"
+    awkward_root.mkdir(parents=True)
+    paths = render_bundle(
+        replace(config, data_root=awkward_root, hflow_source=awkward_root),
+        tmp_path / "bundle",
+    )
+    parsed = yaml.safe_load(paths.compose_file.read_text())
+    volumes = parsed["services"]["airflow-scheduler"]["volumes"]
+    data_mounts = [volume for volume in volumes if volume.endswith(":/opt/airflow/data")]
+    # YAML sees the doubled '' as one quote; $ stays doubled for compose to undo.
+    assert data_mounts and "$$JWT_SECRET" in data_mounts[0]
+
+
+@pytest.mark.parametrize(
+    ("hostile_field", "hostile_value"),
+    [("dag_id", 'x"; import os #'), ("app_variable", "app; run()")],
+)
+def test_hostile_dag_identifiers_are_rejected(
+    config: RuntimeConfig, tmp_path: Path, hostile_field: str, hostile_value: str
+) -> None:
+    with pytest.raises(ValueError, match=hostile_field):
+        render_bundle(replace(config, **{hostile_field: hostile_value}), tmp_path / "bundle")

@@ -21,6 +21,7 @@ from typing import cast
 import duckdb
 import pytest
 from lerobot_test_helpers import CorpusEpisodeRow, two_camera_v3_info, write_v3_corpus
+from mcap_test_helpers import write_compressed_video_mcap
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -169,45 +170,17 @@ def fixture_archive(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 def _write_landing(landing_path: Path, episode_index: int, units: list[bytes]) -> Path:
     """Mirror the public importer: foxglove video channels + metadata records."""
-    from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
-    from mcap.writer import Writer as McapWriter
-    from mcap_protobuf.schema import build_file_descriptor_set
-
     landing_path.parent.mkdir(parents=True, exist_ok=True)
     source = landing_path.with_suffix(".source.mcap")
-    with source.open("wb") as stream:
-        writer = McapWriter(stream)
-        writer.start(profile="", library="hflow test fixture")
-        schema_id = writer.register_schema(
-            "foxglove.CompressedVideo",
-            "protobuf",
-            build_file_descriptor_set(CompressedVideo).SerializeToString(),
-        )
-        channels = {
-            cam: writer.register_channel(
-                topic=f"/{cam}", message_encoding="protobuf", schema_id=schema_id
-            )
+    write_compressed_video_mcap(
+        source,
+        [
+            (f"/{cam}", START_NS + round(frame * 1_000_000_000 / FPS), unit)
+            for frame, unit in enumerate(units)
             for cam in CAMS
-        }
-        for frame, unit in enumerate(units):
-            log_ns = START_NS + round(frame * 1_000_000_000 / FPS)
-            for cam in CAMS:
-                message = CompressedVideo()
-                message.timestamp.seconds = log_ns // 1_000_000_000
-                message.timestamp.nanos = log_ns % 1_000_000_000
-                message.frame_id = cam
-                message.data = unit
-                message.format = "h264"
-                writer.add_message(
-                    channel_id=channels[cam],
-                    log_time=log_ns,
-                    data=message.SerializeToString(),
-                    publish_time=log_ns,
-                    sequence=frame,
-                )
-        writer.add_metadata(
-            name="episode/v1",
-            data={
+        ],
+        metadata={
+            "episode/v1": {
                 "task": "fixture_task",
                 "operator": "lerobot_converter",
                 "embodiment": "so101",
@@ -217,16 +190,15 @@ def _write_landing(landing_path: Path, episode_index: int, units: list[bytes]) -
                 "camera_keys": json.dumps(list(CAMS), separators=(",", ":")),
                 "gop_seconds": "1",
             },
-        )
-        writer.add_metadata(
-            name="source-provenance/v1",
-            data={
+            "source-provenance/v1": {
                 "converter_version": "test",
                 "ffmpeg_version": "test",
                 "source_uri": f"hf://datasets/{FIXTURE_MANIFEST['repository']}@{REVISION}",
             },
-        )
-        writer.finish()
+        },
+        number_messages_per_topic=True,
+        library="hflow test fixture",
+    )
 
     from hflow.transform import write_canonical_episode
 

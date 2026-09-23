@@ -3,77 +3,17 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from catalog_test_helpers import SNAPSHOT_EPISODE_STAMPS, append_snapshot_episode
 
 import hflow
 import hflow.snapshot as snapshot_module
 from hflow.catalog import Catalog, CheckRunRow
 from hflow.cli import main as cli_main
-from hflow.transform import EpisodeStamps
-
-TEST_EPISODE_STAMPS = EpisodeStamps(
-    schema_version="1",
-    pipeline_version="snapshot-pipeline-v1",
-    ffmpeg_version="ffmpeg test",
-    robot_software_version="robot test",
-)
-
-
-def _append_snapshot_episode(
-    catalog: Catalog,
-    working_directory: Path,
-    *,
-    name: str,
-    score: float,
-    with_media: bool,
-    score_key: str = "quality/score",
-) -> tuple[str, Path | None]:
-    canonical_episode = working_directory / f"{name}.canonical.mcap"
-    canonical_episode.write_bytes(f"canonical bytes for {name}".encode())
-    preview_file: Path | None = None
-    media_measurements: dict[str, hflow.MeasurementValue] = {}
-    if with_media:
-        preview_file = working_directory / f"{name}-preview.jpg"
-        preview_file.write_bytes(b"portable preview bytes")
-        media_measurements["artifact//wrist_cam/compressed"] = str(preview_file.resolve())
-
-    append_result = catalog.append_episode(
-        canonical_path=canonical_episode,
-        stamps=TEST_EPISODE_STAMPS,
-        episode_metadata={"task": name, "operator": "robot-01"},
-        check_rows=[
-            CheckRunRow(
-                check_name="quality",
-                check_version="quality-v1",
-                critical=False,
-                status=hflow.CheckStatus.MEASURED,
-                duration_s=0.1,
-                measurements={score_key: score, "caption": f"sample {name}"},
-                observations=[
-                    hflow.Observation(
-                        observation_id="frame:1",
-                        timestamp_ns=10,
-                        values={"score": score, "reviewed": True},
-                    )
-                ],
-                tags=["needs-inspection"],
-                intervals=[hflow.Interval(start_ns=10, end_ns=20, label="inspect")],
-            ),
-            CheckRunRow(
-                check_name="media/contact_sheet",
-                check_version="media-v1",
-                critical=False,
-                status=hflow.CheckStatus.MEASURED,
-                duration_s=0.2,
-                measurements=media_measurements,
-            ),
-        ],
-    )
-    return append_result.episode_id, preview_file
 
 
 def test_case_collisions_refuse_snapshot_without_replacing_existing_output(tmp_path: Path) -> None:
     catalog = Catalog(tmp_path / "catalog")
-    _append_snapshot_episode(
+    append_snapshot_episode(
         catalog, tmp_path, name="first", score=0.1, with_media=False, score_key="/Camera/score"
     )
     destination = tmp_path / "snapshot"
@@ -83,7 +23,7 @@ def test_case_collisions_refuse_snapshot_without_replacing_existing_output(tmp_p
         for path in destination.rglob("*")
         if path.is_file()
     }
-    _append_snapshot_episode(
+    append_snapshot_episode(
         catalog, tmp_path, name="second", score=0.9, with_media=False, score_key="/camera/score"
     )
 
@@ -148,7 +88,7 @@ def _append_media_priority_episode(
 
     append_result = catalog.append_episode(
         canonical_path=canonical_episode,
-        stamps=TEST_EPISODE_STAMPS,
+        stamps=SNAPSHOT_EPISODE_STAMPS,
         episode_metadata={"task": name},
         check_rows=check_rows,
     )
@@ -157,7 +97,7 @@ def _append_media_priority_episode(
 
 def test_dataset_snapshot_is_tool_neutral_and_selected_by_manifest(tmp_path: Path) -> None:
     catalog = Catalog(tmp_path / "catalog")
-    selected_episode_id, preview_file = _append_snapshot_episode(
+    selected_episode_id, preview_file = append_snapshot_episode(
         catalog,
         tmp_path,
         name="fold-shirt",
@@ -165,7 +105,7 @@ def test_dataset_snapshot_is_tool_neutral_and_selected_by_manifest(tmp_path: Pat
         with_media=True,
     )
     assert preview_file is not None
-    _append_snapshot_episode(
+    append_snapshot_episode(
         catalog,
         tmp_path,
         name="pour-water",
@@ -217,16 +157,11 @@ def test_dataset_snapshot_is_tool_neutral_and_selected_by_manifest(tmp_path: Pat
     assert integrity["assets"] == []
     assert set(integrity["tables"]) == set(format_marker["tables"])
     for table_name, file_name in format_marker["tables"].items():
-        receipt = integrity["tables"][table_name]
-        assert receipt["path"] == file_name
-        assert receipt["size_bytes"] == (output_directory / file_name).stat().st_size
-        assert receipt["sha256"] == snapshot_module._sha256_hex(output_directory / file_name)
-    inventory_records = [
-        snapshot_module._parse_file_integrity_record(entry)
-        for entry in [*integrity["tables"].values(), *integrity["assets"]]
-    ]
-    assert integrity["content_id"] == snapshot_module._inventory_content_id(inventory_records)
+        assert integrity["tables"][table_name]["path"] == file_name
     assert len(integrity["content_id"]) == 64
+    # The receipts' sizes, hashes, and inventory digest are checked through the
+    # public verifier, the same comparison a recipient of the delivery runs.
+    assert hflow.verify_dataset_snapshot(output_directory).ok
 
     sample_row = duckdb.execute(
         """
@@ -291,7 +226,7 @@ def test_cli_snapshot_copy_mode_materializes_media_and_refuses_implicit_overwrit
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     catalog = Catalog(tmp_path / "catalog")
-    selected_episode_id, preview_file = _append_snapshot_episode(
+    selected_episode_id, preview_file = append_snapshot_episode(
         catalog,
         tmp_path,
         name="stack-blocks",
@@ -513,7 +448,7 @@ def test_dataset_snapshot_excludes_check_runs_without_a_committed_episode(tmp_pa
     canonical_episode.write_bytes(b"committed canonical bytes")
     append_result = catalog.append_episode(
         canonical_path=canonical_episode,
-        stamps=TEST_EPISODE_STAMPS,
+        stamps=SNAPSHOT_EPISODE_STAMPS,
         episode_metadata={"task": "committed"},
         check_rows=[
             CheckRunRow(
@@ -570,7 +505,7 @@ def test_dataset_snapshot_reports_retained_backup_when_cleanup_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     catalog = Catalog(tmp_path / "catalog")
-    _append_snapshot_episode(
+    append_snapshot_episode(
         catalog,
         tmp_path,
         name="cleanup-outcome",
@@ -674,7 +609,7 @@ def test_exporting_without_a_manifest_takes_one_row_per_source(tmp_path: Path) -
         canonical_episode.write_bytes(content)
         catalog.append_episode(
             canonical_path=canonical_episode,
-            stamps=TEST_EPISODE_STAMPS,
+            stamps=SNAPSHOT_EPISODE_STAMPS,
             episode_metadata={"task": "fold_napkin"},
             check_rows=[
                 CheckRunRow(
@@ -716,7 +651,7 @@ def test_snapshot_samples_report_unverified_for_a_crashed_critical_check(
     canonical_episode.write_bytes(b"canonical bytes for a crashed critical check")
     append_result = catalog.append_episode(
         canonical_path=canonical_episode,
-        stamps=TEST_EPISODE_STAMPS,
+        stamps=SNAPSHOT_EPISODE_STAMPS,
         episode_metadata={"task": "fold-shirt", "operator": "robot-01"},
         check_rows=[
             CheckRunRow(
@@ -742,7 +677,7 @@ def test_snapshot_samples_report_unverified_for_a_crashed_critical_check(
 
 def test_dataset_snapshot_copy_mode_records_asset_integrity(tmp_path: Path) -> None:
     catalog = Catalog(tmp_path / "catalog")
-    _append_snapshot_episode(
+    append_snapshot_episode(
         catalog,
         tmp_path,
         name="copy-integrity",
@@ -768,21 +703,16 @@ def test_dataset_snapshot_copy_mode_records_asset_integrity(tmp_path: Path) -> N
     asset_path = output_directory / asset_receipt["path"]
     assert asset_path.is_file()
     assert asset_receipt["path"].startswith("assets/")
-    assert asset_receipt["size_bytes"] == asset_path.stat().st_size
-    assert asset_receipt["sha256"] == snapshot_module._sha256_hex(asset_path)
-    inventory_records = [
-        snapshot_module._parse_file_integrity_record(entry)
-        for entry in [*integrity["tables"].values(), *integrity["assets"]]
-    ]
-    assert integrity["content_id"] == snapshot_module._inventory_content_id(inventory_records)
     assert len(integrity["content_id"]) == 64
+    # The asset receipt joins the inventory the verifier re-derives.
+    assert hflow.verify_dataset_snapshot(output_directory).ok
 
 
 def test_dataset_snapshot_overwrite_still_accepts_integrity_enriched_v1_marker(
     tmp_path: Path,
 ) -> None:
     catalog = Catalog(tmp_path / "catalog")
-    _append_snapshot_episode(
+    append_snapshot_episode(
         catalog,
         tmp_path,
         name="overwrite-v1",

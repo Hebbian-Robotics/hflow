@@ -3,6 +3,7 @@
 import asyncio
 import math
 import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -243,14 +244,22 @@ def test_a_non_gate_argument_is_refused_at_registration() -> None:
     assert app.checks == []
 
 
-def test_an_empty_gate_is_refused_at_construction() -> None:
-    with pytest.raises(ValueError, match="holds no thresholds"):
-        hflow.Gate(accept_when=())
-
-
-def test_a_nan_threshold_is_refused_at_construction() -> None:
-    with pytest.raises(ValueError, match="not NaN"):
-        hflow.Threshold("v", hflow.Comparison.AT_MOST, math.nan)
+@pytest.mark.parametrize(
+    ("construct", "refusal_pattern"),
+    [
+        pytest.param(lambda: hflow.Gate(accept_when=()), "holds no thresholds", id="empty-gate"),
+        pytest.param(
+            lambda: hflow.Threshold("v", hflow.Comparison.AT_MOST, math.nan),
+            "not NaN",
+            id="nan-threshold",
+        ),
+    ],
+)
+def test_a_gate_that_can_never_decide_is_refused_at_construction(
+    construct: Callable[[], object], refusal_pattern: str
+) -> None:
+    with pytest.raises(ValueError, match=refusal_pattern):
+        construct()
 
 
 @pytest.mark.parametrize(

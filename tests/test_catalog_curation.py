@@ -2,6 +2,7 @@
 
 import asyncio
 import tempfile
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -9,6 +10,12 @@ from typing import cast
 import duckdb
 import numpy as np
 import pytest
+from catalog_test_helpers import (
+    FAKE_STAMPS,
+    example_check_row,
+    recorded_at_values,
+    write_fake_canonical,
+)
 
 import hflow
 from hflow.catalog import (
@@ -33,54 +40,21 @@ from hflow.format import CATALOG_FORMAT_VERSION
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import EpisodeStamps
 
-FAKE_STAMPS = EpisodeStamps(
-    schema_version="1",
-    pipeline_version="abc123def456",
-    ffmpeg_version="ffmpeg version test",
-    robot_software_version="sim-0.1.0",
-)
-
-
-def _fake_canonical(tmp_path: Path, content: bytes = b"fake canonical bytes") -> Path:
-    path = tmp_path / "episode.canonical.mcap"
-    path.write_bytes(content)
-    return path
-
-
-def _check_row(version: str = "v1", value: float = 1.0) -> CheckRunRow:
-    return CheckRunRow(
-        check_name="example_check",
-        check_version=version,
-        critical=False,
-        status=hflow.CheckStatus.MEASURED,
-        duration_s=0.01,
-        measurements={"example_metric": value, "note": "text", "flag": True},
-        observations=[
-            hflow.Observation(
-                observation_id="frame:3",
-                timestamp_ns=30,
-                values={"score": value, "reviewed": True, "note": "clear"},
-            )
-        ],
-        tags=["seen"],
-        intervals=[hflow.Interval(start_ns=0, end_ns=10, label="span")],
-    )
-
 
 def test_append_is_idempotent_for_the_same_content_versions_and_outcome(tmp_path: Path) -> None:
     catalog = Catalog(tmp_path / "catalog")
-    canonical = _fake_canonical(tmp_path)
+    canonical = write_fake_canonical(tmp_path)
     first = catalog.append_episode(
         canonical_path=canonical,
         stamps=FAKE_STAMPS,
         episode_metadata={"task": "fold_napkin"},
-        check_rows=[_check_row()],
+        check_rows=[example_check_row()],
     )
     second = catalog.append_episode(
         canonical_path=canonical,
         stamps=FAKE_STAMPS,
         episode_metadata={"task": "fold_napkin"},
-        check_rows=[_check_row()],
+        check_rows=[example_check_row()],
     )
     assert first.written and not second.written
     assert first.episode_id == second.episode_id == content_episode_id(canonical)
@@ -105,9 +79,9 @@ def test_checks_without_observations_keep_the_pre_observation_fingerprint() -> N
 
 def test_selective_appends_do_not_replay_an_obsolete_full_outcome(tmp_path: Path) -> None:
     catalog = Catalog(tmp_path / "catalog")
-    canonical = _fake_canonical(tmp_path)
-    measured = replace(_check_row(), critical=True)
-    other = replace(_check_row(), check_name="other", measurements={"other_score": 1.0})
+    canonical = write_fake_canonical(tmp_path)
+    measured = replace(example_check_row(), critical=True)
+    other = replace(example_check_row(), check_name="other", measurements={"other_score": 1.0})
     errored = CheckRunRow(
         check_name=measured.check_name,
         check_version=measured.check_version,
@@ -132,8 +106,7 @@ def test_selective_appends_do_not_replay_an_obsolete_full_outcome(tmp_path: Path
         assert result.written
         assert _status_of_only_episode(catalog.root) == expected_status
 
-    connection = open_catalog_connection(catalog.root)
-    try:
+    with open_catalog_connection(catalog.root) as connection:
         assert connection.execute("SELECT count(*) FROM episodes_raw").fetchone() == (4,)
         assert connection.execute(
             "SELECT DISTINCT run_fingerprint FROM check_runs_latest"
@@ -141,21 +114,19 @@ def test_selective_appends_do_not_replay_an_obsolete_full_outcome(tmp_path: Path
         assert connection.execute(
             "SELECT DISTINCT run_fingerprint FROM observations_latest"
         ).fetchall() == [(result.run_fingerprint,)]
-    finally:
-        connection.close()
 
 
 @pytest.mark.parametrize("execution_id", ["", "  ", "\t\n"])
 def test_append_rejects_blank_execution_id(tmp_path: Path, execution_id: str) -> None:
     catalog = Catalog(tmp_path / "catalog")
-    canonical = _fake_canonical(tmp_path)
+    canonical = write_fake_canonical(tmp_path)
 
     with pytest.raises(ValueError, match=r"^execution_id must be non-empty when supplied$"):
         catalog.append_episode(
             canonical_path=canonical,
             stamps=FAKE_STAMPS,
             episode_metadata={},
-            check_rows=[_check_row()],
+            check_rows=[example_check_row()],
             execution_id=execution_id,
         )
 
@@ -169,14 +140,14 @@ def test_execution_identity_replays_history_without_reordering_it(
     bucket: bool,
 ) -> None:
     root = bucket_over_tmp[0].child("catalog") if bucket else tmp_path / "catalog"
-    canonical = _fake_canonical(tmp_path)
+    canonical = write_fake_canonical(tmp_path)
 
     def append(execution_id: str, value: float = 1.0) -> hflow.catalog.AppendResult:
         return Catalog(root).append_episode(
             canonical_path=canonical,
             stamps=FAKE_STAMPS,
             episode_metadata={},
-            check_rows=[_check_row(value=value)],
+            check_rows=[example_check_row(value=value)],
             execution_id=execution_id,
         )
 
@@ -193,11 +164,8 @@ def test_execution_identity_replays_history_without_reordering_it(
     replay = append("first")
     assert not replay.written
     assert replay.run_fingerprint == first.run_fingerprint
-    connection = open_catalog_connection(root)
-    try:
+    with open_catalog_connection(root) as connection:
         assert connection.execute("SELECT example_metric FROM episodes").fetchone() == (2.0,)
-    finally:
-        connection.close()
     returned = append("third")
     assert returned.written
     assert returned.run_fingerprint != first.run_fingerprint
@@ -207,8 +175,7 @@ def test_execution_identity_replays_history_without_reordering_it(
             location.read_bytes(f"{table}/{first.episode_id}-{first.run_fingerprint}.parquet")
             == content
         )
-    connection = open_catalog_connection(root)
-    try:
+    with open_catalog_connection(root) as connection:
         assert connection.execute("SELECT example_metric FROM episodes").fetchone() == (1.0,)
         assert connection.execute("SELECT count(*) FROM episodes_raw").fetchone() == (3,)
         for table in TABLE_COLUMN_DDL:
@@ -216,8 +183,6 @@ def test_execution_identity_replays_history_without_reordering_it(
             assert connection.execute(
                 f"SELECT count(DISTINCT run_fingerprint) FROM {relation}"
             ).fetchone() == (3,)
-    finally:
-        connection.close()
 
 
 def test_timestamped_observations_round_trip_as_typed_long_rows(tmp_path: Path) -> None:
@@ -232,7 +197,7 @@ def test_timestamped_observations_round_trip_as_typed_long_rows(tmp_path: Path) 
         ]
     )
     catalog.append_episode(
-        canonical_path=_fake_canonical(tmp_path),
+        canonical_path=write_fake_canonical(tmp_path),
         stamps=FAKE_STAMPS,
         episode_metadata={},
         check_rows=[
@@ -248,8 +213,7 @@ def test_timestamped_observations_round_trip_as_typed_long_rows(tmp_path: Path) 
         ],
     )
 
-    connection = open_catalog_connection(tmp_path / "catalog")
-    try:
+    with open_catalog_connection(tmp_path / "catalog") as connection:
         assert connection.execute(
             """
             SELECT observation_id, timestamp_ns, key, value_double, value_text, value_bool
@@ -274,23 +238,21 @@ def test_timestamped_observations_round_trip_as_typed_long_rows(tmp_path: Path) 
             )
             """
         ).fetchall() == [("frame:3", 30, "clear", "true", "1.0")]
-    finally:
-        connection.close()
 
 
 def test_observations_latest_switches_a_check_result_as_one_unit(tmp_path: Path) -> None:
     import time
 
     catalog = Catalog(tmp_path / "catalog")
-    canonical = _fake_canonical(tmp_path)
+    canonical = write_fake_canonical(tmp_path)
     catalog.append_episode(
         canonical_path=canonical,
         stamps=FAKE_STAMPS,
         episode_metadata={},
-        check_rows=[_check_row(version="model-a")],
+        check_rows=[example_check_row(version="model-a")],
     )
     time.sleep(0.01)
-    replacement_row = _check_row(version="model-b")
+    replacement_row = example_check_row(version="model-b")
     replacement_row = hflow.CheckRunRow(
         check_name=replacement_row.check_name,
         check_version=replacement_row.check_version,
@@ -312,14 +274,11 @@ def test_observations_latest_switches_a_check_result_as_one_unit(tmp_path: Path)
         check_rows=[replacement_row],
     )
 
-    connection = open_catalog_connection(tmp_path / "catalog")
-    try:
+    with open_catalog_connection(tmp_path / "catalog") as connection:
         assert connection.execute(
             "SELECT check_version, key, value_double FROM observations_latest"
         ).fetchall() == [("model-b", "score", 0.5)]
         assert connection.execute("SELECT count(*) FROM observations").fetchone() == (4,)
-    finally:
-        connection.close()
 
 
 def test_duplicate_observation_ids_are_refused_before_catalog_writes(tmp_path: Path) -> None:
@@ -327,7 +286,7 @@ def test_duplicate_observation_ids_are_refused_before_catalog_writes(tmp_path: P
         hflow.Observation(observation_id="frame:3", timestamp_ns=30, values={"score": 1.0}),
         hflow.Observation(observation_id="frame:3", timestamp_ns=30, values={"score": 0.5}),
     ]
-    check_row = _check_row()
+    check_row = example_check_row()
     check_row = hflow.CheckRunRow(
         check_name=check_row.check_name,
         check_version=check_row.check_version,
@@ -339,7 +298,7 @@ def test_duplicate_observation_ids_are_refused_before_catalog_writes(tmp_path: P
 
     with pytest.raises(ValueError, match="duplicate observation id 'frame:3'"):
         Catalog(tmp_path / "catalog").append_episode(
-            canonical_path=_fake_canonical(tmp_path),
+            canonical_path=write_fake_canonical(tmp_path),
             stamps=FAKE_STAMPS,
             episode_metadata={},
             check_rows=[check_row],
@@ -359,19 +318,19 @@ def test_the_orchestrator_run_id_is_recorded_without_entering_the_fingerprint(
     still intact: same outcome under a different run id is still one append.
     """
     catalog = Catalog(tmp_path / "catalog")
-    canonical = _fake_canonical(tmp_path)
+    canonical = write_fake_canonical(tmp_path)
     first = catalog.append_episode(
         canonical_path=canonical,
         stamps=FAKE_STAMPS,
         episode_metadata={},
-        check_rows=[_check_row()],
+        check_rows=[example_check_row()],
         orchestrator_run_id="manual__2026-08-23T00:00:00+00:00",
     )
     replayed_under_another_run = catalog.append_episode(
         canonical_path=canonical,
         stamps=FAKE_STAMPS,
         episode_metadata={},
-        check_rows=[_check_row()],
+        check_rows=[example_check_row()],
         orchestrator_run_id="scheduled__2026-08-24T00:00:00+00:00",
     )
 
@@ -379,35 +338,15 @@ def test_the_orchestrator_run_id_is_recorded_without_entering_the_fingerprint(
     assert first.run_fingerprint == replayed_under_another_run.run_fingerprint
     assert len(list((tmp_path / "catalog" / "episodes").glob("*.parquet"))) == 1
 
-    connection = open_catalog_connection(tmp_path / "catalog")
-    try:
+    with open_catalog_connection(tmp_path / "catalog") as connection:
         # The row keeps the run that FIRST recorded the outcome: the second
         # append did nothing, so claiming it as that run's output would be a
-        # fiction. Documented on append_episode.
+        # fiction. Documented on append_episode. The id is stored verbatim,
+        # never normalized beyond blankness: it has to compare equal to the id
+        # the orchestrator's own API reports, or the join it exists for breaks.
         assert connection.execute("SELECT orchestrator_run_id FROM episodes").fetchall() == [
             ("manual__2026-08-23T00:00:00+00:00",)
         ]
-    finally:
-        connection.close()
-
-
-def test_an_unorchestrated_append_records_no_run(tmp_path: Path) -> None:
-    """The dev loop and any non-runtime caller pass nothing and stay valid."""
-    catalog = Catalog(tmp_path / "catalog")
-    catalog.append_episode(
-        canonical_path=_fake_canonical(tmp_path),
-        stamps=FAKE_STAMPS,
-        episode_metadata={},
-        check_rows=[_check_row()],
-    )
-
-    connection = open_catalog_connection(tmp_path / "catalog")
-    try:
-        assert connection.execute("SELECT orchestrator_run_id FROM episodes").fetchall() == [
-            (None,)
-        ]
-    finally:
-        connection.close()
 
 
 def test_episode_time_bounds_are_recorded_as_the_episode_axis(tmp_path: Path) -> None:
@@ -430,25 +369,22 @@ def test_episode_time_bounds_are_recorded_as_the_episode_axis(tmp_path: Path) ->
         canonical_path=canonical,
         stamps=FAKE_STAMPS,
         episode_metadata={},
-        check_rows=[_check_row()],
+        check_rows=[example_check_row()],
         time_bounds=time_bounds,
     )
     replayed_without_bounds = catalog.append_episode(
         canonical_path=canonical,
         stamps=FAKE_STAMPS,
         episode_metadata={},
-        check_rows=[_check_row()],
+        check_rows=[example_check_row()],
     )
     assert with_bounds.written and not replayed_without_bounds.written
     assert with_bounds.run_fingerprint == replayed_without_bounds.run_fingerprint
 
-    connection = open_catalog_connection(tmp_path / "catalog")
-    try:
+    with open_catalog_connection(tmp_path / "catalog") as connection:
         assert connection.execute("SELECT start_ns, end_ns FROM episodes_latest").fetchall() == [
             (time_bounds.start_ns, time_bounds.end_ns)
         ]
-    finally:
-        connection.close()
 
 
 def test_a_catalog_written_before_time_bounds_still_reads_beside_new_rows(
@@ -460,10 +396,10 @@ def test_a_catalog_written_before_time_bounds_still_reads_beside_new_rows(
     catalog_root = tmp_path / "catalog"
     catalog = Catalog(catalog_root)
     older = catalog.append_episode(
-        canonical_path=_fake_canonical(tmp_path, b"older canonical"),
+        canonical_path=write_fake_canonical(tmp_path, b"older canonical"),
         stamps=FAKE_STAMPS,
         episode_metadata={},
-        check_rows=[_check_row()],
+        check_rows=[example_check_row()],
         time_bounds=hflow.EpisodeTimeBounds(start_ns=5, end_ns=50),
     )
     # Rewrite the older row's file the way a pre-bounds hflow laid it out.
@@ -480,29 +416,36 @@ def test_a_catalog_written_before_time_bounds_still_reads_beside_new_rows(
     older_layout.replace(older_file)
 
     newer = catalog.append_episode(
-        canonical_path=_fake_canonical(tmp_path, b"newer canonical"),
+        canonical_path=write_fake_canonical(tmp_path, b"newer canonical"),
         stamps=FAKE_STAMPS,
         episode_metadata={},
-        check_rows=[_check_row()],
+        check_rows=[example_check_row()],
         time_bounds=hflow.EpisodeTimeBounds(start_ns=100, end_ns=900),
     )
 
-    connection = open_catalog_connection(catalog_root)
-    try:
+    with open_catalog_connection(catalog_root) as connection:
         bounds_by_episode = dict(
             connection.execute(
                 "SELECT episode_id, (start_ns, end_ns) FROM episodes_latest"
             ).fetchall()
         )
-    finally:
-        connection.close()
     assert bounds_by_episode[older.episode_id] == (None, None)
     assert bounds_by_episode[newer.episode_id] == (100, 900)
 
 
-@pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+@pytest.mark.parametrize(
+    "blank",
+    [
+        # The dev loop and any non-runtime caller pass nothing (the None
+        # default) and stay valid.
+        pytest.param(None, id="unorchestrated"),
+        pytest.param("", id="empty"),
+        pytest.param("   ", id="spaces"),
+        pytest.param("\t\n", id="whitespace"),
+    ],
+)
 def test_a_blank_run_id_records_as_absent_rather_than_as_a_value(
-    tmp_path: Path, blank: str
+    tmp_path: Path, blank: str | None
 ) -> None:
     """One stored representation of "no orchestrator".
 
@@ -513,42 +456,17 @@ def test_a_blank_run_id_records_as_absent_rather_than_as_a_value(
     """
     catalog = Catalog(tmp_path / "catalog")
     catalog.append_episode(
-        canonical_path=_fake_canonical(tmp_path),
+        canonical_path=write_fake_canonical(tmp_path),
         stamps=FAKE_STAMPS,
         episode_metadata={},
-        check_rows=[_check_row()],
+        check_rows=[example_check_row()],
         orchestrator_run_id=blank,
     )
 
-    connection = open_catalog_connection(tmp_path / "catalog")
-    try:
-        assert connection.execute(
-            "SELECT count(*) FROM episodes WHERE orchestrator_run_id IS NULL"
-        ).fetchone() == (1,)
-    finally:
-        connection.close()
-
-
-def test_a_real_run_id_is_stored_verbatim(tmp_path: Path) -> None:
-    """Never normalized beyond blankness: it has to compare equal to the id
-    the orchestrator's own API reports, or the join it exists for breaks."""
-    run_id = "scheduled__2026-08-23T00:00:00+00:00"
-    catalog = Catalog(tmp_path / "catalog")
-    catalog.append_episode(
-        canonical_path=_fake_canonical(tmp_path),
-        stamps=FAKE_STAMPS,
-        episode_metadata={},
-        check_rows=[_check_row()],
-        orchestrator_run_id=run_id,
-    )
-
-    connection = open_catalog_connection(tmp_path / "catalog")
-    try:
+    with open_catalog_connection(tmp_path / "catalog") as connection:
         assert connection.execute("SELECT orchestrator_run_id FROM episodes").fetchall() == [
-            (run_id,)
+            (None,)
         ]
-    finally:
-        connection.close()
 
 
 def test_a_corpus_written_before_the_run_id_column_still_reads(tmp_path: Path) -> None:
@@ -562,10 +480,10 @@ def test_a_corpus_written_before_the_run_id_column_still_reads(tmp_path: Path) -
     catalog_root = tmp_path / "catalog"
     catalog = Catalog(catalog_root)
     catalog.append_episode(
-        canonical_path=_fake_canonical(tmp_path, b"new bytes"),
+        canonical_path=write_fake_canonical(tmp_path, b"new bytes"),
         stamps=FAKE_STAMPS,
         episode_metadata={},
-        check_rows=[_check_row()],
+        check_rows=[example_check_row()],
         orchestrator_run_id="manual__2026-08-23T00:00:00+00:00",
     )
 
@@ -589,36 +507,32 @@ def test_a_corpus_written_before_the_run_id_column_still_reads(tmp_path: Path) -
     finally:
         writer.close()
 
-    connection = open_catalog_connection(catalog_root)
-    try:
+    with open_catalog_connection(catalog_root) as connection:
         rows = connection.execute(
             "SELECT episode_id, orchestrator_run_id FROM episodes ORDER BY episode_id"
         ).fetchall()
-    finally:
-        connection.close()
     assert ("legacyepisode", None) in rows
     assert any(run_id == "manual__2026-08-23T00:00:00+00:00" for _episode_id, run_id in rows)
 
 
 def test_rerunning_a_changed_check_appends_new_version_rows(tmp_path: Path) -> None:
     catalog = Catalog(tmp_path / "catalog")
-    canonical = _fake_canonical(tmp_path)
+    canonical = write_fake_canonical(tmp_path)
     catalog.append_episode(
         canonical_path=canonical,
         stamps=FAKE_STAMPS,
         episode_metadata={},
-        check_rows=[_check_row(version="v1", value=1.0)],
+        check_rows=[example_check_row(version="v1", value=1.0)],
     )
     result = catalog.append_episode(
         canonical_path=canonical,
         stamps=FAKE_STAMPS,
         episode_metadata={},
-        check_rows=[_check_row(version="v2", value=2.0)],
+        check_rows=[example_check_row(version="v2", value=2.0)],
     )
     assert result.written
 
-    connection = open_catalog_connection(tmp_path / "catalog")
-    try:
+    with open_catalog_connection(tmp_path / "catalog") as connection:
         rows = connection.execute(
             "SELECT check_version, value_double FROM measurements "
             "WHERE key = 'example_metric' ORDER BY check_version"
@@ -630,13 +544,11 @@ def test_rerunning_a_changed_check_appends_new_version_rows(tmp_path: Path) -> N
         assert latest_row == (2.0,)
         wide_row = connection.execute("SELECT example_metric FROM episodes").fetchone()
         assert wide_row == (2.0,)
-    finally:
-        connection.close()
 
 
 def test_successful_retry_after_error_appends_repaired_outcome(tmp_path: Path) -> None:
     catalog = Catalog(tmp_path / "catalog")
-    canonical = _fake_canonical(tmp_path)
+    canonical = write_fake_canonical(tmp_path)
     failed_row = CheckRunRow(
         check_name="remote_check",
         check_version="v1",
@@ -669,33 +581,36 @@ def test_successful_retry_after_error_appends_repaired_outcome(tmp_path: Path) -
 
     assert first.written and second.written
     assert first.run_fingerprint != second.run_fingerprint
-    connection = open_catalog_connection(tmp_path / "catalog")
-    try:
+    with open_catalog_connection(tmp_path / "catalog") as connection:
         assert connection.execute(
             "SELECT status FROM check_runs ORDER BY recorded_at"
         ).fetchall() == [("error",), ("measured",)]
         assert connection.execute("SELECT score FROM episodes").fetchone() == (1.0,)
-    finally:
-        connection.close()
 
 
-def test_catalog_refuses_unknown_format_version(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("open_catalog", "expected_message"),
+    [
+        pytest.param(
+            Catalog,
+            f"has format version '999'.*this build reads/writes version '{CATALOG_FORMAT_VERSION}'",
+            id="catalog-writer",
+        ),
+        pytest.param(
+            open_catalog_connection,
+            f"has format version '999'.*this build reads version '{CATALOG_FORMAT_VERSION}'",
+            id="curation-reader",
+        ),
+    ],
+)
+def test_every_catalog_entry_point_refuses_an_unknown_format_version(
+    tmp_path: Path, open_catalog: Callable[[Path], object], expected_message: str
+) -> None:
     root = tmp_path / "catalog"
     root.mkdir()
     (root / "format_version").write_text("999\n")
-    with pytest.raises(ValueError, match="format version '999'"):
-        Catalog(root)
-
-
-def test_open_catalog_connection_refuses_unknown_format_version(tmp_path: Path) -> None:
-    root = tmp_path / "catalog"
-    root.mkdir()
-    (root / "format_version").write_text("999\n")
-    with pytest.raises(
-        ValueError,
-        match=f"has format version '999'.*this build reads version '{CATALOG_FORMAT_VERSION}'",
-    ):
-        open_catalog_connection(root)
+    with pytest.raises(ValueError, match=expected_message):
+        open_catalog(root)
 
 
 def test_curate_on_empty_catalog(tmp_path: Path) -> None:
@@ -705,13 +620,10 @@ def test_curate_on_empty_catalog(tmp_path: Path) -> None:
     assert report.coverage == []
     assert report.row_count == 1
 
-    connection = open_catalog_connection(tmp_path / "catalog")
-    try:
+    with open_catalog_connection(tmp_path / "catalog") as connection:
         assert connection.execute("SELECT count(*) FROM episodes").fetchone() == (0,)
         assert connection.execute("SELECT count(*) FROM episodes_latest").fetchone() == (0,)
         assert connection.execute("SELECT count(*) FROM measurements_latest").fetchone() == (0,)
-    finally:
-        connection.close()
 
 
 @pytest.fixture(scope="module")
@@ -790,13 +702,10 @@ def test_readme_style_curation_query(recorded_data_root: Path, tmp_path: Path) -
 
 
 def test_quarantined_episode_is_filtered_by_status(recorded_data_root: Path) -> None:
-    connection = open_catalog_connection(recorded_data_root / "catalog")
-    try:
+    with open_catalog_connection(recorded_data_root / "catalog") as connection:
         rows = dict(
             connection.execute("SELECT task, status FROM episodes ORDER BY task").fetchall()
         )
-    finally:
-        connection.close()
     assert rows == {"fold_napkin": "ok", "pour_water": "quarantined"}
 
 
@@ -897,7 +806,7 @@ def test_stale_episodes_lists_only_episodes_behind_the_current_versions(tmp_path
         ffmpeg_version="ffmpeg version test",
         robot_software_version="sim-0.1.0",
     )
-    behind = _fake_canonical(tmp_path, content=b"behind the current pipeline")
+    behind = write_fake_canonical(tmp_path, content=b"behind the current pipeline")
     current = tmp_path / "current.canonical.mcap"
     current.write_bytes(b"already reprocessed")
     catalog.append_episode(
@@ -962,12 +871,12 @@ def test_reprocessing_a_source_supersedes_its_previous_generation(tmp_path: Path
     duplicate is not even distinguishable by address.
     """
     catalog = Catalog(tmp_path / "catalog")
-    first_generation = _fake_canonical(tmp_path, content=b"first canonical bytes")
+    first_generation = write_fake_canonical(tmp_path, content=b"first canonical bytes")
     catalog.append_episode(
         canonical_path=first_generation,
         stamps=FAKE_STAMPS,
         episode_metadata={"task": "fold_napkin"},
-        check_rows=[_check_row(value=1.0)],
+        check_rows=[example_check_row(value=1.0)],
         source_uri="episodes-in/fold.mcap",
         uri="/data/episodes/fold.canonical.mcap",
     )
@@ -977,13 +886,12 @@ def test_reprocessing_a_source_supersedes_its_previous_generation(tmp_path: Path
         canonical_path=reprocessed,
         stamps=FAKE_STAMPS,
         episode_metadata={"task": "fold_napkin"},
-        check_rows=[_check_row(value=2.0)],
+        check_rows=[example_check_row(value=2.0)],
         source_uri="episodes-in/fold.mcap",
         uri="/data/episodes/fold.canonical.mcap",
     )
 
-    connection = open_catalog_connection(tmp_path / "catalog")
-    try:
+    with open_catalog_connection(tmp_path / "catalog") as connection:
         assert connection.execute("SELECT count(*) FROM episodes_raw").fetchone() == (2,)
         latest = connection.execute("SELECT episode_id FROM episodes_latest").fetchall()
         assert latest == [(second_append.episode_id,)]
@@ -991,8 +899,6 @@ def test_reprocessing_a_source_supersedes_its_previous_generation(tmp_path: Path
         # otherwise every user query counts the recording twice.
         wide = connection.execute("SELECT task, example_metric FROM episodes").fetchall()
         assert wide == [("fold_napkin", 2.0)]
-    finally:
-        connection.close()
 
     # Coverage is the honesty feature: the denominator is the corpus, not the
     # corpus plus its history.
@@ -1007,7 +913,7 @@ def test_cli_stale_prints_source_uris_for_ingest(
 ) -> None:
     catalog = Catalog(tmp_path / "catalog")
     catalog.append_episode(
-        canonical_path=_fake_canonical(tmp_path),
+        canonical_path=write_fake_canonical(tmp_path),
         stamps=FAKE_STAMPS,
         episode_metadata={},
         check_rows=[],
@@ -1029,25 +935,40 @@ def test_cli_stale_prints_source_uris_for_ingest(
     assert "1 episode(s)" in captured.err
 
 
-def test_cli_stale_reports_a_broken_pipeline_file_instead_of_crashing(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    Catalog(tmp_path / "catalog")
-    broken_pipeline = tmp_path / "pipeline.py"
-    broken_pipeline.write_text("raise RuntimeError('boom at import time')\n")
-    exit_code = cli_main(
-        ["stale", "--catalog", str(tmp_path / "catalog"), "--pipeline", str(broken_pipeline)]
-    )
-    assert exit_code == 2
-    assert "boom at import time" in capsys.readouterr().err
-
-
-def test_cli_stale_reports_an_explicitly_named_missing_app(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("pipeline_source", "app_selector", "expected_stderr_fragments"),
+    [
+        pytest.param(
+            "raise RuntimeError('boom at import time')\n",
+            "",
+            ("boom at import time",),
+            id="broken-pipeline-file",
+        ),
+        pytest.param(
+            "value = 42\n",
+            ":custom_name",
+            ("has no hflow.App named 'custom_name'",),
+            id="named-app-missing",
+        ),
+        pytest.param("value = 42\n", "", ("defines no hflow.App",), id="no-apps"),
+        pytest.param(
+            "import hflow\n\nkitchen = hflow.App('kitchen')\ngarage = hflow.App('garage')\n",
+            "",
+            ("defines 2 hflow.App objects", "'kitchen'", "'garage'"),
+            id="ambiguous-apps",
+        ),
+    ],
+)
+def test_cli_stale_reports_an_unusable_pipeline_instead_of_crashing(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    pipeline_source: str,
+    app_selector: str,
+    expected_stderr_fragments: tuple[str, ...],
 ) -> None:
     Catalog(tmp_path / "catalog")
     pipeline = tmp_path / "pipeline.py"
-    pipeline.write_text("value = 42\n")
+    pipeline.write_text(pipeline_source)
 
     exit_code = cli_main(
         [
@@ -1055,47 +976,14 @@ def test_cli_stale_reports_an_explicitly_named_missing_app(
             "--catalog",
             str(tmp_path / "catalog"),
             "--pipeline",
-            f"{pipeline}:custom_name",
+            f"{pipeline}{app_selector}",
         ]
     )
 
     assert exit_code == 2
-    assert "has no hflow.App named 'custom_name'" in capsys.readouterr().err
-
-
-def test_cli_stale_reports_a_pipeline_with_no_apps(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    Catalog(tmp_path / "catalog")
-    pipeline = tmp_path / "pipeline.py"
-    pipeline.write_text("value = 42\n")
-
-    exit_code = cli_main(
-        ["stale", "--catalog", str(tmp_path / "catalog"), "--pipeline", str(pipeline)]
-    )
-
-    assert exit_code == 2
-    assert "defines no hflow.App" in capsys.readouterr().err
-
-
-def test_cli_stale_reports_every_app_when_a_pipeline_is_ambiguous(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    Catalog(tmp_path / "catalog")
-    pipeline = tmp_path / "pipeline.py"
-    pipeline.write_text(
-        "import hflow\n\nkitchen = hflow.App('kitchen')\ngarage = hflow.App('garage')\n"
-    )
-
-    exit_code = cli_main(
-        ["stale", "--catalog", str(tmp_path / "catalog"), "--pipeline", str(pipeline)]
-    )
-
-    assert exit_code == 2
     stderr = capsys.readouterr().err
-    assert "defines 2 hflow.App objects" in stderr
-    assert "'kitchen'" in stderr
-    assert "'garage'" in stderr
+    for fragment in expected_stderr_fragments:
+        assert fragment in stderr
 
 
 def test_cli_stale_exit_code_returns_one_when_episodes_are_behind(
@@ -1103,7 +991,7 @@ def test_cli_stale_exit_code_returns_one_when_episodes_are_behind(
 ) -> None:
     catalog = Catalog(tmp_path / "catalog")
     catalog.append_episode(
-        canonical_path=_fake_canonical(tmp_path),
+        canonical_path=write_fake_canonical(tmp_path),
         stamps=FAKE_STAMPS,
         episode_metadata={},
         check_rows=[],
@@ -1129,7 +1017,7 @@ def test_cli_stale_exit_code_returns_zero_when_nothing_is_behind(
 ) -> None:
     catalog = Catalog(tmp_path / "catalog")
     catalog.append_episode(
-        canonical_path=_fake_canonical(tmp_path),
+        canonical_path=write_fake_canonical(tmp_path),
         stamps=FAKE_STAMPS,
         episode_metadata={},
         check_rows=[],
@@ -1157,14 +1045,13 @@ def test_constrained_connection_confines_sql_to_the_catalog(tmp_path: Path) -> N
     """
     catalog = Catalog(tmp_path / "catalog")
     catalog.append_episode(
-        canonical_path=_fake_canonical(tmp_path),
+        canonical_path=write_fake_canonical(tmp_path),
         stamps=FAKE_STAMPS,
         episode_metadata={"task": "fold_napkin"},
-        check_rows=[_check_row()],
+        check_rows=[example_check_row()],
     )
 
-    connection = open_catalog_connection(tmp_path / "catalog", constrained=True)
-    try:
+    with open_catalog_connection(tmp_path / "catalog", constrained=True) as connection:
         assert connection.execute("SELECT count(*) FROM episodes").fetchone() == (1,)
         assert connection.execute("SELECT example_metric FROM episodes").fetchone() == (1.0,)
         with pytest.raises(duckdb.Error, match=r"allowed_directories|[Pp]ermission"):
@@ -1183,8 +1070,6 @@ def test_constrained_connection_confines_sql_to_the_catalog(tmp_path: Path) -> N
         episodes_glob = tmp_path / "catalog" / "episodes" / "*.parquet"
         with pytest.raises(duckdb.Error, match=r"allowed_directories|[Pp]ermission"):
             connection.execute(f"SELECT * FROM read_parquet('{episodes_glob}')")
-    finally:
-        connection.close()
 
 
 # The SQL surface curate() accepts, written down (#279). Each row is
@@ -1274,10 +1159,10 @@ def test_curate_sql_surface_is_pinned(
     catalog_dir = tmp_path / "catalog"
     catalog = Catalog(catalog_dir)
     catalog.append_episode(
-        canonical_path=_fake_canonical(tmp_path),
+        canonical_path=write_fake_canonical(tmp_path),
         stamps=FAKE_STAMPS,
         episode_metadata={},
-        check_rows=[_check_row()],
+        check_rows=[example_check_row()],
     )
     staging_dir = tmp_path / "staging"
     staging_dir.mkdir()
@@ -1334,10 +1219,10 @@ def test_curate_output_none_sql_surface_matches_manifest_gate(
     catalog_dir = tmp_path / "catalog"
     catalog = Catalog(catalog_dir)
     catalog.append_episode(
-        canonical_path=_fake_canonical(tmp_path),
+        canonical_path=write_fake_canonical(tmp_path),
         stamps=FAKE_STAMPS,
         episode_metadata={},
-        check_rows=[_check_row()],
+        check_rows=[example_check_row()],
     )
     decoy_path = tmp_path / "decoy.parquet"
     sql = sql_template.replace("{decoy}", str(decoy_path))
@@ -1375,107 +1260,87 @@ def test_cli_curate_dry_run_refuses_non_single_select(
     assert not (data_root / "manifest.parquet").exists()
 
 
-def test_reject_non_single_select_refuses_a_single_non_select_statement() -> None:
+_SQL_REFUSED_AS_NOT_ONE_SELECT = [
     # A lone well-formed CREATE TABLE parses cleanly but is not a SELECT:
     # a rule rejection, never a parser error.
-    with pytest.raises(NonSingleSelectQueryError, match="exactly one SELECT"):
-        reject_non_single_select("CREATE TABLE t(x INT)")
-
-
-def test_reject_non_single_select_refuses_multiple_statements() -> None:
-    with pytest.raises(NonSingleSelectQueryError, match="exactly one SELECT"):
-        reject_non_single_select("SELECT 1 AS one; CREATE TABLE pwned AS SELECT 1")
-    with pytest.raises(NonSingleSelectQueryError, match="exactly one SELECT"):
-        reject_non_single_select("SELECT 1 AS one; DROP TABLE episodes_raw")
-
-
-def test_reject_non_single_select_accepts_a_single_select() -> None:
-    reject_non_single_select("SELECT 1 AS one")
-    reject_non_single_select("SELECT episode_id FROM episodes")
-
-
-def test_reject_non_single_select_distinguishes_parse_failure_from_rule_rejection() -> None:
-    # Syntactically invalid SQL surfaces DuckDB's own parser error (which a
-    # service renders as the diagnostic message); a well-formed non-SELECT is
-    # the rule's ValueError instead. The server's 400 detail depends on the
-    # two staying apart.
-    with pytest.raises(duckdb.Error, match="Parser Error"):
-        reject_non_single_select("SELEC 1")
-    with pytest.raises(NonSingleSelectQueryError):
-        reject_non_single_select("CREATE TABLE t(x INT)")
-
-
-def test_reject_non_single_select_refuses_pragma_and_describe_labeled_as_select() -> None:
+    pytest.param("CREATE TABLE t(x INT)", id="lone-create-table"),
+    pytest.param("SELECT 1 AS one; CREATE TABLE pwned AS SELECT 1", id="select-then-create"),
+    pytest.param("SELECT 1 AS one; DROP TABLE episodes_raw", id="select-then-drop"),
     # DuckDB labels PRAGMA, DESCRIBE, SHOW, SUMMARIZE as StatementType.SELECT
     # because they are table functions, but the curation endpoints advertise
     # exactly one read-only SELECT. Preview interpolated the SQL as
     # ``SELECT * FROM (<sql>)`` where PRAGMA is a syntax error, so the
     # wrapper's parse failure leaked as the caller's error and preview/pin
     # disagreed. The gate now refuses these four by leading keyword (#450).
-    for sql in (
-        "PRAGMA database_list",
-        "PRAGMA show_tables",
-        "PRAGMA version",
-        "DESCRIBE SELECT 1",
-        "SHOW TABLES",
-        "SUMMARIZE SELECT 1",
-    ):
-        with pytest.raises(NonSingleSelectQueryError, match=r"exactly one.*SELECT"):
-            reject_non_single_select(sql)
+    pytest.param("PRAGMA database_list", id="pragma-database-list"),
+    pytest.param("PRAGMA show_tables", id="pragma-show-tables"),
+    pytest.param("PRAGMA version", id="pragma-version"),
+    pytest.param("DESCRIBE SELECT 1", id="describe"),
+    pytest.param("SHOW TABLES", id="show"),
+    pytest.param("SUMMARIZE SELECT 1", id="summarize"),
     # Case-insensitive and comment-prefixed forms are likewise rejected.
-    with pytest.raises(NonSingleSelectQueryError):
-        reject_non_single_select("pragma database_list")
-    with pytest.raises(NonSingleSelectQueryError):
-        reject_non_single_select("-- comment\nPRAGMA database_list")
-    with pytest.raises(NonSingleSelectQueryError):
-        reject_non_single_select("/* block */ DESCRIBE SELECT 1")
+    pytest.param("pragma database_list", id="lowercase-pragma"),
+    pytest.param("-- comment\nPRAGMA database_list", id="line-comment-then-pragma"),
+    pytest.param("/* block */ DESCRIBE SELECT 1", id="block-comment-then-describe"),
+]
 
-
-def test_reject_non_single_select_accepts_select_with_leading_comments_and_cte() -> None:
+_SQL_ACCEPTED_AS_ONE_SELECT = [
+    pytest.param("SELECT 1 AS one", id="select-literal"),
+    pytest.param("SELECT episode_id FROM episodes", id="select-from-catalog"),
     # Leading -- and /* */ comments do not change the statement type.
-    reject_non_single_select("-- comment\nSELECT 1")
-    reject_non_single_select("/* block comment */ SELECT 1")
-    reject_non_single_select("/*c*/--line\n  SELECT 1")
-    reject_non_single_select("WITH c AS (SELECT 1) SELECT * FROM c")
-    reject_non_single_select("with c as (select 1) select * from c")
+    pytest.param("-- comment\nSELECT 1", id="line-comment-then-select"),
+    pytest.param("/* block comment */ SELECT 1", id="block-comment-then-select"),
+    pytest.param("/*c*/--line\n  SELECT 1", id="mixed-comments-then-select"),
+    pytest.param("WITH c AS (SELECT 1) SELECT * FROM c", id="cte"),
+    pytest.param("with c as (select 1) select * from c", id="lowercase-cte"),
     # A SELECT that reads a pragma as a table function is still SELECT text.
-    reject_non_single_select("SELECT * FROM pragma_version()")
-
-
-def test_reject_non_single_select_accepts_legal_selects_that_do_not_start_with_select() -> None:
+    pytest.param("SELECT * FROM pragma_version()", id="pragma-table-function"),
     # Review of #453: the previous text-prefix heuristic rejected every query
     # that didn't start with SELECT or WITH, but DuckDB labels FROM-first
     # queries, parenthesized selects, and VALUES clauses as
     # StatementType.SELECT and accepts them inside ``FROM (<sql>)``, the
     # shape preview interpolates. The gate must accept them too.
-    reject_non_single_select("FROM range(3)")
-    reject_non_single_select("FROM range(3) WHERE range > 0")
-    reject_non_single_select("(SELECT 1)")
-    reject_non_single_select("(SELECT 1 AS one)")
-    reject_non_single_select("VALUES (1), (2)")
-    reject_non_single_select("VALUES (1, 'a'), (2, 'b')")
+    pytest.param("FROM range(3)", id="from-first"),
+    pytest.param("FROM range(3) WHERE range > 0", id="from-first-where"),
+    pytest.param("(SELECT 1)", id="parenthesized-select"),
+    pytest.param("(SELECT 1 AS one)", id="parenthesized-select-alias"),
+    pytest.param("VALUES (1), (2)", id="values"),
+    pytest.param("VALUES (1, 'a'), (2, 'b')", id="values-tuples"),
     # FROM-first against a real catalog column. A SELECT previewed from this
     # is the case the reviewer flagged as "the one that matters".
-    reject_non_single_select("FROM episodes WHERE status = 'ok'")
-
-
-def test_reject_non_single_select_accepts_trailing_line_comment_without_newline() -> None:
+    pytest.param("FROM episodes WHERE status = 'ok'", id="from-first-catalog"),
     # Without the fix, ``SELECT * FROM (SELECT 1 -- trailing comment)`` is a
     # parser error: the trailing line comment swallows the wrapper's closing
     # paren. Appending a newline before wrapping ends the comment first.
-    reject_non_single_select("SELECT 1 -- trailing comment without newline")
-
-
-def test_reject_non_single_select_keyword_refusal_is_about_the_leading_word() -> None:
+    pytest.param("SELECT 1 -- trailing comment without newline", id="trailing-line-comment"),
     # The PRAGMA/DESCRIBE/SHOW/SUMMARIZE refusal reads the first identifier,
     # so a parenthesized DESCRIBE is not headed by the keyword and is
     # accepted. Pinned deliberately: preview and pin both run that form and
     # agree on it, which is the #450 requirement. Read-only introspection of
     # an in-memory catalog was never what the gate was keeping out.
-    reject_non_single_select("(DESCRIBE SELECT 1)")
-    reject_non_single_select("SELECT * FROM (SHOW TABLES)")
-    with pytest.raises(NonSingleSelectQueryError):
-        reject_non_single_select("DESCRIBE SELECT 1")
+    pytest.param("(DESCRIBE SELECT 1)", id="parenthesized-describe"),
+    pytest.param("SELECT * FROM (SHOW TABLES)", id="show-inside-select"),
+]
+
+
+@pytest.mark.parametrize("sql", _SQL_REFUSED_AS_NOT_ONE_SELECT)
+def test_reject_non_single_select_refuses_anything_but_one_select(sql: str) -> None:
+    with pytest.raises(NonSingleSelectQueryError, match=r"exactly one.*SELECT"):
+        reject_non_single_select(sql)
+
+
+@pytest.mark.parametrize("sql", _SQL_ACCEPTED_AS_ONE_SELECT)
+def test_reject_non_single_select_accepts_one_select(sql: str) -> None:
+    reject_non_single_select(sql)
+
+
+def test_reject_non_single_select_distinguishes_parse_failure_from_rule_rejection() -> None:
+    # Syntactically invalid SQL surfaces DuckDB's own parser error (which a
+    # service renders as the diagnostic message); a well-formed non-SELECT is
+    # the rule's ValueError instead, as the refusal table above pins. The
+    # server's 400 detail depends on the two staying apart.
+    with pytest.raises(duckdb.Error, match="Parser Error"):
+        reject_non_single_select("SELEC 1")
 
 
 def test_constrained_curate_writes_the_manifest_but_refuses_outside_reads(
@@ -1484,10 +1349,10 @@ def test_constrained_curate_writes_the_manifest_but_refuses_outside_reads(
     catalog_dir = tmp_path / "catalog"
     catalog = Catalog(catalog_dir)
     catalog.append_episode(
-        canonical_path=_fake_canonical(tmp_path),
+        canonical_path=write_fake_canonical(tmp_path),
         stamps=FAKE_STAMPS,
         episode_metadata={},
-        check_rows=[_check_row()],
+        check_rows=[example_check_row()],
     )
     manifest_path = tmp_path / "out" / "manifest.parquet"
 
@@ -1549,8 +1414,7 @@ def test_numpy_scalar_measurements_round_trip(tmp_path: Path) -> None:
         check_rows=[row],
     )
     assert result.written is True
-    connection = open_catalog_connection(tmp_path / "catalog")
-    try:
+    with open_catalog_connection(tmp_path / "catalog") as connection:
         raw_rows = connection.execute(
             "SELECT key, value_double, value_text, value_bool FROM measurements"
         ).fetchall()
@@ -1562,8 +1426,6 @@ def test_numpy_scalar_measurements_round_trip(tmp_path: Path) -> None:
             "SELECT ratio, frames FROM episodes WHERE episode_id = ?",
             [result.episode_id],
         ).fetchone()
-    finally:
-        connection.close()
     # The measurements table holds one typed column per value.
     assert raw["ratio"] == (np.float32(0.4).item(), None, None)
     assert raw["frames"] == (3.0, None, None)
@@ -1572,7 +1434,15 @@ def test_numpy_scalar_measurements_round_trip(tmp_path: Path) -> None:
     assert wide == pytest.approx((np.float32(0.4).item(), 3.0))
 
 
-@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="inf"),
+        pytest.param(float("-inf"), id="negative-inf"),
+        pytest.param(np.float64("nan"), id="numpy-nan"),
+    ],
+)
 def test_non_finite_float_measurements_are_refused(tmp_path: Path, bad_value: float) -> None:
     canonical = tmp_path / "e.canonical.mcap"
     canonical.write_bytes(b"episode-bytes")
@@ -1588,28 +1458,6 @@ def test_non_finite_float_measurements_are_refused(tmp_path: Path, bad_value: fl
         ValueError,
         match=r"camera_blackout.*black_pct.*omit the key.*no finite value",
     ):
-        Catalog(tmp_path / "catalog").append_episode(
-            canonical_path=canonical,
-            stamps=FAKE_STAMPS,
-            episode_metadata={},
-            check_rows=[row],
-        )
-
-
-def test_numpy_nan_measurements_are_refused(tmp_path: Path) -> None:
-    import numpy as np
-
-    canonical = tmp_path / "e.canonical.mcap"
-    canonical.write_bytes(b"episode-bytes")
-    row = CheckRunRow(
-        check_name="numpy_check",
-        check_version="v1",
-        critical=False,
-        status=hflow.CheckStatus.MEASURED,
-        duration_s=0.1,
-        measurements=cast(dict, {"ratio": np.float64("nan")}),
-    )
-    with pytest.raises(ValueError, match=r"numpy_check.*ratio.*omit the key"):
         Catalog(tmp_path / "catalog").append_episode(
             canonical_path=canonical,
             stamps=FAKE_STAMPS,
@@ -1661,13 +1509,10 @@ def test_numpy_measured_episode_survives_a_manifest_filter(tmp_path: Path) -> No
                 )
             ],
         )
-    connection = open_catalog_connection(catalog_dir)
-    try:
+    with open_catalog_connection(catalog_dir) as connection:
         kept = connection.execute(
             "SELECT episode_id FROM episodes WHERE black_pct < 1.0 AND status != 'quarantined'"
         ).fetchall()
-    finally:
-        connection.close()
     assert len(kept) == 2
 
 
@@ -1751,65 +1596,11 @@ def test_numpy_scalar_interval_bounds_round_trip(tmp_path: Path) -> None:
         check_rows=[row],
     )
     assert result.written is True
-    connection = open_catalog_connection(tmp_path / "catalog")
-    try:
+    with open_catalog_connection(tmp_path / "catalog") as connection:
         stored = connection.execute(
             "SELECT start_ns, end_ns, label FROM intervals WHERE start_ns = 0 AND end_ns = 5"
         ).fetchall()
-    finally:
-        connection.close()
     assert stored == [(0, 5, "segment")]
-
-
-def test_a_float_interval_bound_is_refused_naming_the_check_and_bound(
-    tmp_path: Path,
-) -> None:
-    """A float bound is not a nanosecond timestamp, so it raises rather than coercing."""
-    import numpy as np
-
-    canonical = tmp_path / "e.canonical.mcap"
-    canonical.write_bytes(b"episode-bytes")
-    row = CheckRunRow(
-        check_name="segment_check",
-        check_version="v1",
-        critical=False,
-        status=hflow.CheckStatus.MEASURED,
-        duration_s=0.1,
-        # cast: the misuse this test exists to refuse.
-        intervals=[hflow.Interval(start_ns=cast(int, np.float64(5.0)), end_ns=10)],
-    )
-    with pytest.raises(ValueError, match=r"segment_check.*start_ns.*float"):
-        Catalog(tmp_path / "catalog").append_episode(
-            canonical_path=canonical,
-            stamps=FAKE_STAMPS,
-            episode_metadata={},
-            check_rows=[row],
-        )
-
-
-def test_a_bool_interval_bound_is_refused_rather_than_stored_as_one_nanosecond(
-    tmp_path: Path,
-) -> None:
-    """``bool`` subclasses ``int``, so ``True`` passes an isinstance test and
-    would store as 1 ns. It is a mistake, not a timestamp."""
-    canonical = tmp_path / "e.canonical.mcap"
-    canonical.write_bytes(b"episode-bytes")
-    row = CheckRunRow(
-        check_name="segment_check",
-        check_version="v1",
-        critical=False,
-        status=hflow.CheckStatus.MEASURED,
-        duration_s=0.1,
-        # cast: the misuse this test exists to refuse.
-        intervals=[hflow.Interval(start_ns=cast(int, True), end_ns=10)],
-    )
-    with pytest.raises(ValueError, match=r"segment_check.*start_ns.*bool"):
-        Catalog(tmp_path / "catalog").append_episode(
-            canonical_path=canonical,
-            stamps=FAKE_STAMPS,
-            episode_metadata={},
-            check_rows=[row],
-        )
 
 
 def _appended_with_interval(tmp_path: Path, interval: hflow.Interval) -> None:
@@ -1833,42 +1624,72 @@ def _appended_with_interval(tmp_path: Path, interval: hflow.Interval) -> None:
     )
 
 
-def test_an_inverted_interval_is_refused_naming_the_check_and_the_label(
-    tmp_path: Path,
+# Every interval refusal names the check, and the label where one exists,
+# because a check emitting many intervals gives the reader no other way to
+# tell which one is wrong (#161). The casts are the misuse each case refuses.
+_REFUSED_INTERVALS = [
+    # A float bound is not a nanosecond timestamp, so it raises rather than coercing.
+    pytest.param(
+        hflow.Interval(start_ns=cast(int, np.float64(5.0)), end_ns=10),
+        r"segment_check.*start_ns.*float",
+        id="float-bound",
+    ),
+    # ``bool`` subclasses ``int``, so ``True`` passes an isinstance test and
+    # would store as 1 ns. It is a mistake, not a timestamp.
+    pytest.param(
+        hflow.Interval(start_ns=cast(int, True), end_ns=10),
+        r"segment_check.*start_ns.*bool",
+        id="bool-bound",
+    ),
+    # An end before its start is a negative duration to everything downstream.
+    pytest.param(
+        hflow.Interval(start_ns=10, end_ns=5, label="peak_velocity"),
+        r"segment_check.*'peak_velocity'.*end must be >= start",
+        id="inverted",
+    ),
+    # Log time is nanoseconds since the epoch, so a negative bound is a bug.
+    pytest.param(
+        hflow.Interval(start_ns=-5, end_ns=-1, label="gap"),
+        r"segment_check.*'gap'.*non-negative",
+        id="negative-bound",
+    ),
+    # A label that is not a string reaches the run fingerprint and breaks its
+    # sort. The failure it replaces was data dependent: the fingerprint sorts
+    # ``(start_ns, end_ns, label)`` tuples, so a bad label is only ever
+    # compared against another when two intervals share both bounds. One
+    # interval stored fine, two colliding ones raised a ``TypeError`` several
+    # frames inside ``append_episode`` naming neither the check nor the field
+    # (#392).
+    pytest.param(
+        hflow.Interval(start_ns=0, end_ns=10, label=cast(str, None)),
+        r"segment_check.*NoneType.*labels are strings",
+        id="non-string-label",
+    ),
+    # An unserializable label used to surface as a json.dumps TypeError. That
+    # one fired whatever the bounds were, because the fingerprint payload is
+    # serialized after the sort. It is now refused where the bounds are, so
+    # the message names the check.
+    pytest.param(
+        hflow.Interval(start_ns=0, end_ns=10, label=cast(str, object())),
+        r"segment_check.*object.*labels are strings",
+        id="non-serializable-label",
+    ),
+    # Labels are stored verbatim, so " freeze " and "freeze" would be two
+    # names for one thing. The same rule an observation id already carries.
+    pytest.param(
+        hflow.Interval(start_ns=0, end_ns=10, label=" freeze "),
+        r"segment_check.*' freeze '.*stored verbatim",
+        id="padded-label",
+    ),
+]
+
+
+@pytest.mark.parametrize(("interval", "expected_message"), _REFUSED_INTERVALS)
+def test_an_unstoreable_interval_is_refused_before_any_write(
+    tmp_path: Path, interval: hflow.Interval, expected_message: str
 ) -> None:
-    """An end before its start is a negative duration to everything downstream.
-
-    The label is in the message because a check emitting many intervals gives
-    the reader no other way to tell which one is wrong (#161).
-    """
-    with pytest.raises(ValueError, match=r"segment_check.*'peak_velocity'.*end must be >= start"):
-        _appended_with_interval(
-            tmp_path, hflow.Interval(start_ns=10, end_ns=5, label="peak_velocity")
-        )
-    assert list((tmp_path / "catalog" / "episodes").glob("*.parquet")) == []
-
-
-def test_a_negative_interval_bound_is_refused(tmp_path: Path) -> None:
-    """Log time is nanoseconds since the epoch, so a negative bound is a bug."""
-    with pytest.raises(ValueError, match=r"segment_check.*'gap'.*non-negative"):
-        _appended_with_interval(tmp_path, hflow.Interval(start_ns=-5, end_ns=-1, label="gap"))
-
-
-def test_a_non_string_interval_label_is_refused_naming_the_check(tmp_path: Path) -> None:
-    """A label that is not a string reaches the run fingerprint and breaks its sort.
-
-    The failure it replaces was data dependent: the fingerprint sorts
-    ``(start_ns, end_ns, label)`` tuples, so a bad label is only ever compared
-    against another when two intervals share both bounds. One interval stored
-    fine, two colliding ones raised a ``TypeError`` several frames inside
-    ``append_episode`` naming neither the check nor the field (#392).
-    """
-    with pytest.raises(ValueError, match=r"segment_check.*NoneType.*labels are strings"):
-        _appended_with_interval(
-            # cast: the misuse this test exists to refuse.
-            tmp_path,
-            hflow.Interval(start_ns=0, end_ns=10, label=cast(str, None)),
-        )
+    with pytest.raises(ValueError, match=expected_message):
+        _appended_with_interval(tmp_path, interval)
     assert list((tmp_path / "catalog" / "episodes").glob("*.parquet")) == []
 
 
@@ -1902,41 +1723,14 @@ def test_colliding_intervals_with_a_bad_label_are_refused_not_crashed(tmp_path: 
         )
 
 
-def test_a_non_serializable_interval_label_is_refused_before_the_fingerprint(
-    tmp_path: Path,
-) -> None:
-    """An unserializable label used to surface as a json.dumps TypeError.
-
-    That one fired whatever the bounds were, because the fingerprint payload is
-    serialized after the sort. It is now refused where the bounds are, so the
-    message names the check.
-    """
-    with pytest.raises(ValueError, match=r"segment_check.*object.*labels are strings"):
-        _appended_with_interval(
-            # cast: the misuse this test exists to refuse.
-            tmp_path,
-            hflow.Interval(start_ns=0, end_ns=10, label=cast(str, object())),
-        )
-
-
-def test_a_padded_interval_label_is_refused(tmp_path: Path) -> None:
-    """Labels are stored verbatim, so " freeze " and "freeze" would be two names
-    for one thing. The same rule an observation id already carries."""
-    with pytest.raises(ValueError, match=r"segment_check.*' freeze '.*stored verbatim"):
-        _appended_with_interval(tmp_path, hflow.Interval(start_ns=0, end_ns=10, label=" freeze "))
-
-
 def test_an_empty_interval_label_is_allowed(tmp_path: Path) -> None:
     """``label: str = ""`` is the dataclass default, so empty is a real value
     rather than an omission. Pinned so the padding rule above cannot grow into
     refusing it."""
     _appended_with_interval(tmp_path, hflow.Interval(start_ns=0, end_ns=10))
 
-    connection = open_catalog_connection(tmp_path / "catalog")
-    try:
+    with open_catalog_connection(tmp_path / "catalog") as connection:
         assert connection.execute("SELECT label FROM intervals").fetchall() == [("",)]
-    finally:
-        connection.close()
 
 
 def test_a_zero_length_interval_is_allowed(tmp_path: Path) -> None:
@@ -1947,13 +1741,10 @@ def test_a_zero_length_interval_is_allowed(tmp_path: Path) -> None:
     """
     _appended_with_interval(tmp_path, hflow.Interval(start_ns=5, end_ns=5, label="touchdown"))
 
-    connection = open_catalog_connection(tmp_path / "catalog")
-    try:
+    with open_catalog_connection(tmp_path / "catalog") as connection:
         stored = connection.execute(
             "SELECT start_ns, end_ns, label FROM intervals WHERE label = 'touchdown'"
         ).fetchall()
-    finally:
-        connection.close()
     assert stored == [(5, 5, "touchdown")]
 
 
@@ -2012,22 +1803,19 @@ def test_catalog_timestamp_bigint_boundaries_round_trip(tmp_path: Path) -> None:
     )
     catalog = Catalog(tmp_path / "catalog")
     catalog.append_episode(
-        canonical_path=_fake_canonical(tmp_path),
+        canonical_path=write_fake_canonical(tmp_path),
         stamps=FAKE_STAMPS,
         episode_metadata={},
         check_rows=[row],
     )
 
-    connection = open_catalog_connection(tmp_path / "catalog")
-    try:
+    with open_catalog_connection(tmp_path / "catalog") as connection:
         assert connection.execute(
             "SELECT observation_id, timestamp_ns FROM observations_latest ORDER BY timestamp_ns"
         ).fetchall() == [("zero", 0), ("maximum", maximum)]
         assert connection.execute(
             "SELECT label, start_ns, end_ns FROM intervals ORDER BY start_ns"
         ).fetchall() == [("zero", 0, 0), ("maximum", maximum, maximum)]
-    finally:
-        connection.close()
 
 
 @pytest.mark.parametrize("timestamp_ns", [2**63, np.uint64(2**63)])
@@ -2048,7 +1836,7 @@ def test_out_of_range_observation_timestamp_is_refused_before_catalog_writes(
         match=r"range_check.*'frame:1'.*timestamp_ns=9223372036854775808.*BIGINT",
     ):
         Catalog(tmp_path / "catalog").append_episode(
-            canonical_path=_fake_canonical(tmp_path),
+            canonical_path=write_fake_canonical(tmp_path),
             stamps=FAKE_STAMPS,
             episode_metadata={},
             check_rows=[row],
@@ -2078,7 +1866,7 @@ def test_out_of_range_interval_bound_is_refused_before_catalog_writes(
         match=rf"range_check.*'segment'.*{bound_name}=9223372036854775808.*BIGINT",
     ):
         Catalog(tmp_path / "catalog").append_episode(
-            canonical_path=_fake_canonical(tmp_path),
+            canonical_path=write_fake_canonical(tmp_path),
             stamps=FAKE_STAMPS,
             episode_metadata={},
             check_rows=[row],
@@ -2087,44 +1875,32 @@ def test_out_of_range_interval_bound_is_refused_before_catalog_writes(
     assert not list((tmp_path / "catalog").rglob("*.parquet"))
 
 
-def test_non_scalar_measurement_is_refused_naming_the_check_and_key(
-    tmp_path: Path,
-) -> None:
-    """An unstoreable measurement raises loudly instead of writing NULLs."""
-    canonical = tmp_path / "e.canonical.mcap"
-    canonical.write_bytes(b"episode-bytes")
-    row = CheckRunRow(
-        check_name="broken_check",
-        check_version="v1",
-        critical=False,
-        status=hflow.CheckStatus.MEASURED,
-        duration_s=0.1,
-        # cast: the misuse this test exists to refuse.
-        measurements=cast(dict, {"bad": {"nested": 1}}),
-    )
-    with pytest.raises(ValueError, match=r"broken_check.*'bad'.*dict"):
-        Catalog(tmp_path / "catalog").append_episode(
-            canonical_path=canonical,
-            stamps=FAKE_STAMPS,
-            episode_metadata={},
-            check_rows=[row],
-        )
-
-
 @pytest.mark.parametrize(
-    ("check_name", "measurement_key", "expected_message"),
+    ("check_name", "measurement_key", "measurement_value", "expected_message"),
     [
+        # An unstoreable measurement raises loudly instead of writing NULLs.
         pytest.param(
-            "claims_task", "task", r"'claims_task'.*'task'", id="claims-an-episodes-column"
+            "broken_check", "bad", {"nested": 1}, r"broken_check.*'bad'.*dict", id="non-scalar"
         ),
-        pytest.param("empty_key_check", "", r"'empty_key_check'.*''", id="empty"),
-        pytest.param("blank_key_check", "   ", r"'blank_key_check'", id="whitespace-only"),
+        pytest.param(
+            "claims_task", "task", 99.0, r"'claims_task'.*'task'", id="claims-an-episodes-column"
+        ),
+        # DuckDB identifiers are case-insensitive, so 'Task' shadows 'task' too.
+        pytest.param(
+            "claims_task", "Task", 1.0, r"'Task'.*shadows 'task'", id="shadows-case-insensitively"
+        ),
+        pytest.param("empty_key_check", "", 99.0, r"'empty_key_check'.*''", id="empty"),
+        pytest.param("blank_key_check", "   ", 99.0, r"'blank_key_check'", id="whitespace-only"),
     ],
 )
-def test_a_measurement_key_that_cannot_become_a_column_is_refused(
-    check_name: str, measurement_key: str, expected_message: str, tmp_path: Path
+def test_a_measurement_that_cannot_become_a_column_is_refused(
+    check_name: str,
+    measurement_key: str,
+    measurement_value: object,
+    expected_message: str,
+    tmp_path: Path,
 ) -> None:
-    """Every measurement key has to survive the pivot into a wide-view column (#160).
+    """Every measurement has to survive the pivot into a wide-view column (#160).
 
     A key named like an episodes column pivots into ``<key>_1`` beside it. An
     empty or whitespace-only key pivots into a column named for the SQL
@@ -2140,7 +1916,8 @@ def test_a_measurement_key_that_cannot_become_a_column_is_refused(
         critical=False,
         status=hflow.CheckStatus.MEASURED,
         duration_s=0.1,
-        measurements={measurement_key: 99.0},
+        # cast: the non-scalar case is the misuse this test exists to refuse.
+        measurements=cast(dict, {measurement_key: measurement_value}),
     )
     with pytest.raises(ValueError, match=expected_message):
         Catalog(tmp_path / "catalog").append_episode(
@@ -2157,19 +1934,16 @@ def test_episodes_view_reserved_columns_match_queryable_episode_columns(
 ) -> None:
     """Keep the shadow guard aligned with the curated episodes view."""
     Catalog(tmp_path / "catalog").append_episode(
-        canonical_path=_fake_canonical(tmp_path),
+        canonical_path=write_fake_canonical(tmp_path),
         stamps=FAKE_STAMPS,
         episode_metadata={},
         check_rows=[],
     )
 
-    connection = open_catalog_connection(tmp_path / "catalog")
-    try:
+    with open_catalog_connection(tmp_path / "catalog") as connection:
         view_columns = [
             column[0] for column in connection.execute("SELECT * FROM episodes").description
         ]
-    finally:
-        connection.close()
 
     view_columns_by_lookup_key = {column.lower(): column for column in view_columns}
     reserved_columns_by_lookup_key = dict(_EPISODES_VIEW_RESERVED_COLUMNS)
@@ -2195,33 +1969,12 @@ def test_episodes_view_reserved_columns_match_queryable_episode_columns(
     )
 
 
-def test_measurement_key_shadowing_is_case_insensitive(tmp_path: Path) -> None:
-    """DuckDB identifiers are case-insensitive, so 'Task' shadows 'task' too."""
-    canonical = tmp_path / "e.canonical.mcap"
-    canonical.write_bytes(b"episode-bytes")
-    row = CheckRunRow(
-        check_name="claims_task",
-        check_version="v1",
-        critical=False,
-        status=hflow.CheckStatus.MEASURED,
-        duration_s=0.1,
-        measurements={"Task": 1.0},
-    )
-    with pytest.raises(ValueError, match=r"'Task'.*shadows 'task'"):
-        Catalog(tmp_path / "catalog").append_episode(
-            canonical_path=canonical,
-            stamps=FAKE_STAMPS,
-            episode_metadata={},
-            check_rows=[row],
-        )
-
-
 def test_append_refuses_case_colliding_keys_before_writing(tmp_path: Path) -> None:
     catalog = Catalog(tmp_path / "catalog")
-    row = replace(_check_row(), measurements={"/Camera/score": 0.1, "/camera/score": 0.9})
+    row = replace(example_check_row(), measurements={"/Camera/score": 0.1, "/camera/score": 0.9})
     with pytest.raises(ValueError, match=r"'/Camera/score'.*'/camera/score'.*collide"):
         catalog.append_episode(
-            canonical_path=_fake_canonical(tmp_path),
+            canonical_path=write_fake_canonical(tmp_path),
             stamps=FAKE_STAMPS,
             episode_metadata={},
             check_rows=[row],
@@ -2238,12 +1991,12 @@ def test_case_collisions_across_appends_refuse_curation_without_replacing_output
     manifest = tmp_path / "manifest.parquet"
     for index, key in enumerate(("/Camera/score", "/camera/score")):
         catalog.append_episode(
-            canonical_path=_fake_canonical(
+            canonical_path=write_fake_canonical(
                 tmp_path, b"same episode" if same_episode else f"episode {index}".encode()
             ),
             stamps=FAKE_STAMPS,
             episode_metadata={},
-            check_rows=[replace(_check_row(), measurements={key: 0.1 + index * 0.8})],
+            check_rows=[replace(example_check_row(), measurements={key: 0.1 + index * 0.8})],
         )
         if index == 0:
             curate(catalog.root, "SELECT episode_id FROM episodes", output=manifest)
@@ -2274,10 +2027,12 @@ def test_case_collisions_across_appends_refuse_curation_without_replacing_output
 def test_existing_catalog_with_case_colliding_keys_is_refused(tmp_path: Path) -> None:
     catalog = Catalog(tmp_path / "catalog")
     catalog.append_episode(
-        canonical_path=_fake_canonical(tmp_path),
+        canonical_path=write_fake_canonical(tmp_path),
         stamps=FAKE_STAMPS,
         episode_metadata={},
-        check_rows=[replace(_check_row(), measurements={"/Camera/score": 0.1, "other": 0.9})],
+        check_rows=[
+            replace(example_check_row(), measurements={"/Camera/score": 0.1, "other": 0.9})
+        ],
     )
     # Model evidence written before validation existed, without bypassing the
     # reader under test or relying on today's append accepting invalid input.
@@ -2310,12 +2065,13 @@ def test_distinct_unicode_keys_and_exact_key_reuse_remain_queryable(tmp_path: Pa
     ]
     for index in range(2):
         catalog.append_episode(
-            canonical_path=_fake_canonical(tmp_path, f"episode {index}".encode()),
+            canonical_path=write_fake_canonical(tmp_path, f"episode {index}".encode()),
             stamps=FAKE_STAMPS,
             episode_metadata={},
             check_rows=[
                 replace(
-                    _check_row(), measurements={key: index + n / 10 for n, key in enumerate(keys)}
+                    example_check_row(),
+                    measurements={key: index + n / 10 for n, key in enumerate(keys)},
                 )
             ],
         )
@@ -2351,8 +2107,6 @@ def test_crash_repaired_append_keeps_one_recorded_at_across_tables(
     run's rows to this one.
     """
     import time
-
-    import duckdb
 
     canonical = tmp_path / "e.canonical.mcap"
     canonical.write_bytes(b"episode-bytes")
@@ -2395,28 +2149,8 @@ def test_crash_repaired_append_keeps_one_recorded_at_across_tables(
     assert repaired.written is True
     assert repaired.run_fingerprint == first.run_fingerprint
 
-    connection = duckdb.connect()
-    try:
-        timestamps = set()
-        for table_name in (
-            "episodes",
-            "check_runs",
-            "measurements",
-            "observations",
-            "tags",
-            "intervals",
-        ):
-            table_file = tmp_path / "catalog" / table_name / f"{stem}.parquet"
-            assert table_file.is_file(), f"{table_name} file missing after repair"
-            rows = connection.execute(
-                # VARCHAR cast: comparing timestamps as text avoids a pytz
-                # dependency for TIMESTAMPTZ materialization.
-                f"SELECT DISTINCT CAST(recorded_at AS VARCHAR) FROM read_parquet('{table_file}')"
-            ).fetchall()
-            timestamps.update(value for (value,) in rows)
-        assert len(timestamps) == 1, f"mixed recorded_at across tables: {timestamps}"
-    finally:
-        connection.close()
+    timestamps = recorded_at_values(tmp_path / "catalog", stem)
+    assert len(timestamps) == 1, f"mixed recorded_at across tables: {timestamps}"
 
 
 @pytest.mark.parametrize("recurring", [False, True])
@@ -2432,9 +2166,9 @@ def test_replaying_an_append_heals_dependents_left_stale_by_a_crashed_repair(
     """
     import duckdb
 
-    canonical = _fake_canonical(tmp_path)
+    canonical = write_fake_canonical(tmp_path)
     catalog = Catalog(tmp_path / "catalog")
-    row = _check_row()
+    row = example_check_row()
 
     def append_same_outcome() -> "hflow.catalog.AppendResult":
         return catalog.append_episode(
@@ -2450,7 +2184,7 @@ def test_replaying_an_append_heals_dependents_left_stale_by_a_crashed_repair(
             canonical_path=canonical,
             stamps=FAKE_STAMPS,
             episode_metadata={},
-            check_rows=[_check_row(value=2.0)],
+            check_rows=[example_check_row(value=2.0)],
         )
     first = append_same_outcome()
     stem = f"{first.episode_id}-{first.run_fingerprint}"
@@ -2479,25 +2213,8 @@ def test_replaying_an_append_heals_dependents_left_stale_by_a_crashed_repair(
     assert replay.written is False
     assert replay.run_fingerprint == first.run_fingerprint
 
-    connection = duckdb.connect()
-    try:
-        timestamps = set()
-        for table_name in (
-            "episodes",
-            "check_runs",
-            "measurements",
-            "observations",
-            "tags",
-            "intervals",
-        ):
-            table_file = tmp_path / "catalog" / table_name / f"{stem}.parquet"
-            rows = connection.execute(
-                f"SELECT DISTINCT CAST(recorded_at AS VARCHAR) FROM read_parquet('{table_file}')"
-            ).fetchall()
-            timestamps.update(value for (value,) in rows)
-        assert len(timestamps) == 1, f"replay left mixed recorded_at across tables: {timestamps}"
-    finally:
-        connection.close()
+    timestamps = recorded_at_values(tmp_path / "catalog", stem)
+    assert len(timestamps) == 1, f"replay left mixed recorded_at across tables: {timestamps}"
 
 
 def test_replaying_an_append_refuses_a_corrupt_empty_commit_marker(tmp_path: Path) -> None:
@@ -2506,9 +2223,9 @@ def test_replaying_an_append_refuses_a_corrupt_empty_commit_marker(tmp_path: Pat
     silently skipping reconciliation against it."""
     import duckdb
 
-    canonical = _fake_canonical(tmp_path)
+    canonical = write_fake_canonical(tmp_path)
     catalog = Catalog(tmp_path / "catalog")
-    row = _check_row()
+    row = example_check_row()
 
     def append_same_outcome() -> "hflow.catalog.AppendResult":
         return catalog.append_episode(
@@ -2555,14 +2272,12 @@ def test_concurrent_append_of_the_identical_outcome_keeps_one_recorded_at(
     """
     import threading
 
-    import duckdb
-
-    canonical = _fake_canonical(tmp_path)
+    canonical = write_fake_canonical(tmp_path)
     catalog = Catalog(tmp_path / "catalog")
-    row = _check_row()
+    row = example_check_row()
 
     if recurring:
-        for prior_row in [row, _check_row(value=2.0)]:
+        for prior_row in [row, example_check_row(value=2.0)]:
             catalog.append_episode(
                 canonical_path=canonical,
                 stamps=FAKE_STAMPS,
@@ -2613,26 +2328,8 @@ def test_concurrent_append_of_the_identical_outcome_keeps_one_recorded_at(
     assert {result.written for result in results.values()} == {True, False}
     stem = f"{results['A'].episode_id}-{results['A'].run_fingerprint}"
 
-    connection = duckdb.connect()
-    try:
-        timestamps = set()
-        for table_name in (
-            "episodes",
-            "check_runs",
-            "measurements",
-            "observations",
-            "tags",
-            "intervals",
-        ):
-            table_file = tmp_path / "catalog" / table_name / f"{stem}.parquet"
-            assert table_file.is_file(), f"{table_name} file missing after the race"
-            rows = connection.execute(
-                f"SELECT DISTINCT CAST(recorded_at AS VARCHAR) FROM read_parquet('{table_file}')"
-            ).fetchall()
-            timestamps.update(value for (value,) in rows)
-        assert len(timestamps) == 1, f"mixed recorded_at across tables: {timestamps}"
-    finally:
-        connection.close()
+    timestamps = recorded_at_values(tmp_path / "catalog", stem)
+    assert len(timestamps) == 1, f"mixed recorded_at across tables: {timestamps}"
 
 
 def test_measurements_latest_ranks_by_the_owning_episodes_recorded_at(tmp_path: Path) -> None:
@@ -2648,21 +2345,21 @@ def test_measurements_latest_ranks_by_the_owning_episodes_recorded_at(tmp_path: 
 
     import duckdb
 
-    canonical = _fake_canonical(tmp_path)
+    canonical = write_fake_canonical(tmp_path)
     catalog = Catalog(tmp_path / "catalog")
 
     older = catalog.append_episode(
         canonical_path=canonical,
         stamps=FAKE_STAMPS,
         episode_metadata={},
-        check_rows=[_check_row(version="v1", value=1.0)],
+        check_rows=[example_check_row(version="v1", value=1.0)],
     )
     time.sleep(0.01)
     newer = catalog.append_episode(
         canonical_path=canonical,
         stamps=FAKE_STAMPS,
         episode_metadata={},
-        check_rows=[_check_row(version="v2", value=2.0)],
+        check_rows=[example_check_row(version="v2", value=2.0)],
     )
     assert older.written and newer.written
     assert older.run_fingerprint != newer.run_fingerprint
@@ -2693,8 +2390,7 @@ def test_measurements_latest_ranks_by_the_owning_episodes_recorded_at(tmp_path: 
     finally:
         connection.close()
 
-    connection = open_catalog_connection(tmp_path / "catalog")
-    try:
+    with open_catalog_connection(tmp_path / "catalog") as connection:
         # episodes_latest ranks off its own always-authoritative recorded_at,
         # so it is unaffected and still correctly calls the newer run latest.
         assert connection.execute("SELECT run_fingerprint FROM episodes_latest").fetchone() == (
@@ -2705,8 +2401,6 @@ def test_measurements_latest_ranks_by_the_owning_episodes_recorded_at(tmp_path: 
         assert connection.execute(
             "SELECT value_double FROM measurements_latest WHERE key = 'example_metric'"
         ).fetchone() == (2.0,)
-    finally:
-        connection.close()
 
 
 def test_curate_accepts_file_url_output(tmp_path: Path) -> None:
@@ -2746,7 +2440,7 @@ def _episode_with_check(
         error="boom" if status is hflow.CheckStatus.ERROR else None,
     )
     catalog.append_episode(
-        canonical_path=_fake_canonical(tmp_path),
+        canonical_path=write_fake_canonical(tmp_path),
         stamps=FAKE_STAMPS,
         episode_metadata={},
         check_rows=[check_row],
@@ -2756,24 +2450,30 @@ def _episode_with_check(
 
 
 def _status_of_only_episode(catalog_root: Path, *, constrained: bool = False) -> str:
-    connection = open_catalog_connection(catalog_root, constrained=constrained)
-    try:
+    with open_catalog_connection(catalog_root, constrained=constrained) as connection:
         row = connection.execute("SELECT status FROM episodes").fetchone()
-    finally:
-        connection.close()
     assert row is not None
     return str(row[0])
 
 
-def test_errored_critical_check_reports_unverified(tmp_path: Path) -> None:
-    """#164 item 1: a crashed critical check no longer reads as a pass."""
-    catalog_root = _episode_with_check(tmp_path, critical=True, status=hflow.CheckStatus.ERROR)
-    assert _status_of_only_episode(catalog_root) == "unverified"
-
-
-def test_passing_critical_check_still_reports_ok(tmp_path: Path) -> None:
-    catalog_root = _episode_with_check(tmp_path, critical=True, status=hflow.CheckStatus.PASSED)
-    assert _status_of_only_episode(catalog_root) == "ok"
+@pytest.mark.parametrize(
+    ("critical", "status", "expected_episode_status"),
+    [
+        # #164 item 1: a crashed critical check no longer reads as a pass.
+        pytest.param(True, hflow.CheckStatus.ERROR, "unverified", id="critical-error"),
+        pytest.param(True, hflow.CheckStatus.PASSED, "ok", id="critical-pass"),
+        # #164 item 3: only a CRITICAL crash leaves an episode unverified.
+        pytest.param(False, hflow.CheckStatus.ERROR, "ok", id="non-critical-error"),
+        # Skipped and superseded are not crashes, so neither reads unverified.
+        pytest.param(True, hflow.CheckStatus.SKIPPED, "ok", id="critical-skipped"),
+        pytest.param(True, hflow.CheckStatus.SUPERSEDED, "ok", id="critical-superseded"),
+    ],
+)
+def test_episode_status_reflects_its_single_check(
+    tmp_path: Path, critical: bool, status: hflow.CheckStatus, expected_episode_status: str
+) -> None:
+    catalog_root = _episode_with_check(tmp_path, critical=critical, status=status)
+    assert _status_of_only_episode(catalog_root) == expected_episode_status
 
 
 def test_quarantine_outranks_a_critical_error(tmp_path: Path) -> None:
@@ -2781,7 +2481,7 @@ def test_quarantine_outranks_a_critical_error(tmp_path: Path) -> None:
     catalog_root = tmp_path / "catalog"
     catalog = Catalog(catalog_root)
     catalog.append_episode(
-        canonical_path=_fake_canonical(tmp_path),
+        canonical_path=write_fake_canonical(tmp_path),
         stamps=FAKE_STAMPS,
         episode_metadata={},
         check_rows=[
@@ -2806,26 +2506,11 @@ def test_quarantine_outranks_a_critical_error(tmp_path: Path) -> None:
     assert _status_of_only_episode(catalog_root) == "quarantined"
 
 
-def test_non_critical_error_still_reports_ok(tmp_path: Path) -> None:
-    """#164 item 3: only a CRITICAL crash leaves an episode unverified."""
-    catalog_root = _episode_with_check(tmp_path, critical=False, status=hflow.CheckStatus.ERROR)
-    assert _status_of_only_episode(catalog_root) == "ok"
-
-
-@pytest.mark.parametrize("status", [hflow.CheckStatus.SKIPPED, hflow.CheckStatus.SUPERSEDED])
-def test_critical_check_that_did_not_crash_reports_ok(
-    tmp_path: Path, status: hflow.CheckStatus
-) -> None:
-    """Skipped and superseded are not crashes, so neither reads unverified."""
-    catalog_root = _episode_with_check(tmp_path, critical=True, status=status)
-    assert _status_of_only_episode(catalog_root) == "ok"
-
-
 def test_successful_rerun_clears_unverified(tmp_path: Path) -> None:
     """#164 item 4: a later good run of the same check reports ok again."""
     catalog_root = tmp_path / "catalog"
     catalog = Catalog(catalog_root)
-    canonical = _fake_canonical(tmp_path)
+    canonical = write_fake_canonical(tmp_path)
     errored = CheckRunRow(
         check_name="blur",
         check_version="v1",
@@ -2874,7 +2559,7 @@ def test_both_view_definitions_agree_on_unverified(tmp_path: Path) -> None:
     wide_root = wide_base / "catalog"
     catalog = Catalog(wide_root)
     catalog.append_episode(
-        canonical_path=_fake_canonical(wide_base),
+        canonical_path=write_fake_canonical(wide_base),
         stamps=FAKE_STAMPS,
         episode_metadata={},
         check_rows=[
@@ -2930,11 +2615,8 @@ def test_one_errored_episode_does_not_mark_its_neighbours_unverified(
         )
         canonicals[name] = append.episode_id
 
-    connection = open_catalog_connection(catalog_root)
-    try:
+    with open_catalog_connection(catalog_root) as connection:
         statuses = dict(connection.execute("SELECT episode_id, status FROM episodes").fetchall())
-    finally:
-        connection.close()
 
     assert statuses[canonicals["crashed"]] == "unverified"
     assert statuses[canonicals["healthy"]] == "ok"

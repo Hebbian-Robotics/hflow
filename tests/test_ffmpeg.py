@@ -13,8 +13,9 @@ import platform
 import shutil
 import subprocess
 import tarfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import httpx2
 import numpy as np
@@ -110,21 +111,46 @@ def cleared_binary_caches() -> Iterator[None]:
     _clear_all_binary_caches()
 
 
+_BINARY_ENV_OVERRIDES = [
+    pytest.param(ffmpeg_path, FFMPEG_ENV_VAR, FfmpegNotFoundError, "ffmpeg", id="ffmpeg"),
+    pytest.param(ffprobe_path, FFPROBE_ENV_VAR, FfprobeNotFoundError, "my-ffprobe", id="ffprobe"),
+]
+
+
+@pytest.mark.parametrize(
+    ("resolve_binary", "environment_variable", "not_found_error", "file_name"),
+    _BINARY_ENV_OVERRIDES,
+)
 def test_env_override_wins(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cleared_binary_caches: None
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    cleared_binary_caches: None,
+    resolve_binary: Callable[[], Path],
+    environment_variable: str,
+    not_found_error: type[Exception],
+    file_name: str,
 ) -> None:
-    override_ffmpeg = tmp_path / "ffmpeg"
-    override_ffmpeg.touch()
-    monkeypatch.setenv(FFMPEG_ENV_VAR, str(override_ffmpeg))
-    assert ffmpeg_path() == override_ffmpeg
+    override_binary = tmp_path / file_name
+    override_binary.write_text("#!/bin/sh\n")
+    monkeypatch.setenv(environment_variable, str(override_binary))
+    assert resolve_binary() == override_binary
 
 
+@pytest.mark.parametrize(
+    ("resolve_binary", "environment_variable", "not_found_error", "file_name"),
+    _BINARY_ENV_OVERRIDES,
+)
 def test_env_override_to_missing_file_raises(
-    monkeypatch: pytest.MonkeyPatch, cleared_binary_caches: None
+    monkeypatch: pytest.MonkeyPatch,
+    cleared_binary_caches: None,
+    resolve_binary: Callable[[], Path],
+    environment_variable: str,
+    not_found_error: type[Exception],
+    file_name: str,
 ) -> None:
-    monkeypatch.setenv(FFMPEG_ENV_VAR, "/nonexistent/ffmpeg")
-    with pytest.raises(FfmpegNotFoundError, match="does not exist"):
-        ffmpeg_path()
+    monkeypatch.setenv(environment_variable, f"/nonexistent/{file_name}")
+    with pytest.raises(not_found_error, match="does not exist"):
+        resolve_binary()
 
 
 _FAKE_ARCHIVE_ROOT = "ffmpeg-fake-build"
@@ -218,23 +244,6 @@ def test_linux_unsupported_machine_raises_instead_of_path_fallback(
     assert shutil.which("ffmpeg") is not None
     with pytest.raises(FfmpegNotFoundError, match=FFMPEG_ENV_VAR):
         ffmpeg_path()
-
-
-def test_ffprobe_env_override_wins(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cleared_binary_caches: None
-) -> None:
-    override_ffprobe = tmp_path / "my-ffprobe"
-    override_ffprobe.write_text("#!/bin/sh\n")
-    monkeypatch.setenv(FFPROBE_ENV_VAR, str(override_ffprobe))
-    assert ffprobe_path() == override_ffprobe
-
-
-def test_ffprobe_env_override_to_missing_file_raises(
-    monkeypatch: pytest.MonkeyPatch, cleared_binary_caches: None
-) -> None:
-    monkeypatch.setenv(FFPROBE_ENV_VAR, "/nonexistent/ffprobe")
-    with pytest.raises(FfprobeNotFoundError, match="does not exist"):
-        ffprobe_path()
 
 
 def test_ffprobe_prefers_sibling_of_ffmpeg_override(
@@ -448,27 +457,54 @@ def test_synthetic_freeze_intervals_including_unterminated() -> None:
     assert stats.freeze_total_seconds == pytest.approx(3.0)
 
 
-def test_truncated_output_missing_yavg_raises() -> None:
-    truncated = _synthetic_frames({}, {}).replace("lavfi.signalstats.YAVG=100\n", "", 1)
-    with pytest.raises(FrameStatisticsParseError, match="YAVG"):
-        _aggregate_frame_statistics_output(truncated)
-
-
-def test_unparsable_line_raises() -> None:
-    garbled = "frame:0    pts:0    pts_time:0\nlavfi.signalstats.YA\n"
-    with pytest.raises(FrameStatisticsParseError, match="unparsable"):
-        _aggregate_frame_statistics_output(garbled)
-
-
-def test_nan_yavg_raises() -> None:
-    nan_output = "frame:0    pts:0    pts_time:0\nlavfi.signalstats.YAVG=nan\n"
-    with pytest.raises(FrameStatisticsParseError, match="non-finite"):
-        _aggregate_frame_statistics_output(nan_output)
-
-
-def test_empty_output_raises() -> None:
-    with pytest.raises(FrameStatisticsParseError, match="no frames"):
-        _aggregate_frame_statistics_output("")
+@pytest.mark.parametrize(
+    ("output_text", "message"),
+    [
+        pytest.param(
+            _synthetic_frames({}, {}).replace("lavfi.signalstats.YAVG=100\n", "", 1),
+            "YAVG",
+            id="truncated-missing-yavg",
+        ),
+        # A frame silently dropped from a denominator turns "could not
+        # measure" into "measured and clean", which this must never invent.
+        pytest.param(
+            _synthetic_frames({"lavfi.signalstats.YAVG": 100}).replace(
+                "lavfi.signalstats.TOUT=0\n", ""
+            ),
+            "TOUT",
+            id="missing-required-tout",
+        ),
+        pytest.param(
+            "frame:0    pts:0    pts_time:0\nlavfi.signalstats.YA\n",
+            "unparsable",
+            id="unparsable-line",
+        ),
+        pytest.param(
+            "frame:0    pts:0    pts_time:0\nlavfi.signalstats.YAVG=nan\n",
+            "non-finite",
+            id="nan-yavg",
+        ),
+        pytest.param("", "no frames", id="empty-output"),
+        pytest.param(
+            _synthetic_frames(
+                {"lavfi.freezedetect.freeze_start": 2.0},
+                {"lavfi.freezedetect.freeze_end": 1.0},
+            ),
+            "invalid freeze interval",
+            id="freeze-ends-before-it-starts",
+        ),
+        # A lost format pin would put a 10-bit source on a 0-1023 scale, where
+        # every threshold here is off by a factor of four. Fail loudly instead.
+        pytest.param(
+            _synthetic_frames({"lavfi.signalstats.YMAX": 1023}),
+            "outside the 8-bit range",
+            id="ten-bit-luma",
+        ),
+    ],
+)
+def test_malformed_frame_statistics_output_is_a_parse_error(output_text: str, message: str) -> None:
+    with pytest.raises(FrameStatisticsParseError, match=message):
+        _aggregate_frame_statistics_output(output_text)
 
 
 @pytest.mark.parametrize(
@@ -484,15 +520,6 @@ def test_filter_listing_parser_accepts_supported_ffmpeg_layouts(
     match = _FILTER_LIST_ENTRY_PATTERN.match(filter_listing_line)
     assert match is not None
     assert match.group("filter_name") == expected_filter_name
-
-
-def test_invalid_freeze_interval_is_a_parse_error() -> None:
-    output_text = _synthetic_frames(
-        {"lavfi.freezedetect.freeze_start": 2.0},
-        {"lavfi.freezedetect.freeze_end": 1.0},
-    )
-    with pytest.raises(FrameStatisticsParseError, match="invalid freeze interval"):
-        _aggregate_frame_statistics_output(output_text)
 
 
 _ULTRAFAST_H264 = ("-c:v", "libx264", "-preset", "ultrafast")
@@ -597,14 +624,25 @@ def test_frame_stats_truncated_video_file_raises(tmp_path: Path) -> None:
         _measure_frame_statistics(not_a_video)
 
 
-def test_luma_frames_streams_every_frame_at_the_coded_size(black_tail_video: Path) -> None:
+@pytest.mark.parametrize(
+    ("frame_reader", "expected_shape"),
+    [
+        pytest.param(luma_frames, (120, 160), id="luma"),
+        pytest.param(rgb_frames, (120, 160, 3), id="rgb"),
+    ],
+)
+def test_raw_frames_stream_every_frame_at_the_coded_size(
+    black_tail_video: Path,
+    frame_reader: Callable[..., Any],
+    expected_shape: tuple[int, ...],
+) -> None:
     """Full rate and no re-encode, which is what a frame-to-frame measurement
     needs and what ``Episode.frames()`` deliberately does not give.
     """
-    with luma_frames(black_tail_video, toolchain=resolved_video_measurement_toolchain()) as frames:
+    with frame_reader(black_tail_video, toolchain=resolved_video_measurement_toolchain()) as frames:
         shapes = [frame.shape for frame in frames]
     assert len(shapes) == 60
-    assert set(shapes) == {(120, 160)}
+    assert set(shapes) == {expected_shape}
 
 
 def test_luma_frames_reaps_ffmpeg_when_the_caller_stops_early(
@@ -708,13 +746,6 @@ def test_frame_decoder_selects_the_same_video_stream_as_dimension_probing(
         str(multi_stream_video),
     )
     _assert_same_luma_frames(black_tail_video, multi_stream_video, expected_shape=None)
-
-
-def test_rgb_frames_streams_three_channels_at_the_coded_size(black_tail_video: Path) -> None:
-    with rgb_frames(black_tail_video, toolchain=resolved_video_measurement_toolchain()) as frames:
-        shapes = [frame.shape for frame in frames]
-    assert len(shapes) == 60
-    assert set(shapes) == {(120, 160, 3)}
 
 
 def test_rgb_frames_resamples_and_resizes_in_one_decode(black_tail_video: Path) -> None:
@@ -1087,15 +1118,6 @@ def test_black_pixel_share_is_reported_over_every_frame() -> None:
     assert stats.black_pixel_share_mean == pytest.approx(149.0 / 3.0)
 
 
-def test_luma_above_the_eight_bit_scale_raises() -> None:
-    """A lost format pin would put a 10-bit source on a 0-1023 scale, where
-    every threshold here is off by a factor of four. Fail loudly instead.
-    """
-    ten_bit = _synthetic_frames({"lavfi.signalstats.YMAX": 1023})
-    with pytest.raises(FrameStatisticsParseError, match="outside the 8-bit range"):
-        _aggregate_frame_statistics_output(ten_bit)
-
-
 def test_first_frame_frame_difference_is_excluded_by_position() -> None:
     """The opening frame has no predecessor, so its YDIF is a sentinel zero.
     Dropping zeros by value would delete the real stillness this measures.
@@ -1115,16 +1137,6 @@ def test_first_frame_frame_difference_is_excluded_by_position() -> None:
         _synthetic_frames({"lavfi.signalstats.YDIF": 0}, {"lavfi.signalstats.YDIF": 0})
     )
     assert still.frame_difference_mean == 0.0
-
-
-def test_a_missing_required_signal_raises_instead_of_shrinking_a_denominator() -> None:
-    """A frame silently dropped from a denominator turns "could not measure"
-    into "measured and clean", which is the one answer this must never invent.
-    """
-    missing_tout = _synthetic_frames({"lavfi.signalstats.YAVG": 100})
-    missing_tout = missing_tout.replace("lavfi.signalstats.TOUT=0\n", "")
-    with pytest.raises(FrameStatisticsParseError, match="TOUT"):
-        _aggregate_frame_statistics_output(missing_tout)
 
 
 def test_hflow_cache_key_covers_graph_toolchain_and_video() -> None:

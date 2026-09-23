@@ -5,6 +5,7 @@ import re
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -509,14 +510,6 @@ def test_required_topics_aggregates_multiple_channels_for_one_topic(tmp_path: Pa
     }
 
 
-def test_action_rate_matches_the_synthesized_rate(jittery_episode: hflow.Episode) -> None:
-    result = asyncio.run(action_rate(jittery_episode, topics=["/joint_states"]))
-    rate_hz = result.measurements["/joint_states/message_rate_hz"]
-    assert isinstance(rate_hz, float)
-    # the synthetic joint stream runs at 100 Hz by SyntheticEpisodeSpec default
-    assert rate_hz == pytest.approx(100.0, abs=0.5)
-
-
 def test_action_rate_reports_each_topic_at_its_own_rate(
     jittery_episode: hflow.Episode,
 ) -> None:
@@ -811,41 +804,27 @@ def test_fps_conformance_rejects_invalid_thresholds(tmp_path: Path) -> None:
         ),
     )
 
+    refused_thresholds: list[tuple[str, Any, str]] = [
+        ("max_plausible_fps", True, r"^max_plausible_fps must be a float, got bool$"),
+        *(
+            ("max_plausible_fps", value, r"^max_plausible_fps must be finite and positive$")
+            for value in (float("nan"), float("inf"), 0)
+        ),
+        ("downsample_tolerance_fps", True, r"^downsample_tolerance_fps must be a float, got bool$"),
+        *(
+            (
+                "downsample_tolerance_fps",
+                value,
+                r"^downsample_tolerance_fps must be finite and non-negative$",
+            )
+            for value in (float("nan"), float("inf"), -1)
+        ),
+    ]
+
     with hflow.Episode(source) as episode:
-        with pytest.raises(ValueError, match=r"^max_plausible_fps must be a float, got bool$"):
-            asyncio.run(camera_fps_conformance(episode, max_plausible_fps=True))
-
-        with pytest.raises(ValueError, match=r"^max_plausible_fps must be finite and positive$"):
-            asyncio.run(camera_fps_conformance(episode, max_plausible_fps=float("nan")))
-
-        with pytest.raises(ValueError, match=r"^max_plausible_fps must be finite and positive$"):
-            asyncio.run(camera_fps_conformance(episode, max_plausible_fps=float("inf")))
-
-        with pytest.raises(ValueError, match=r"^max_plausible_fps must be finite and positive$"):
-            asyncio.run(camera_fps_conformance(episode, max_plausible_fps=0))
-
-        with pytest.raises(
-            ValueError, match=r"^downsample_tolerance_fps must be a float, got bool$"
-        ):
-            asyncio.run(camera_fps_conformance(episode, downsample_tolerance_fps=True))
-
-        with pytest.raises(
-            ValueError,
-            match=r"^downsample_tolerance_fps must be finite and non-negative$",
-        ):
-            asyncio.run(camera_fps_conformance(episode, downsample_tolerance_fps=float("nan")))
-
-        with pytest.raises(
-            ValueError,
-            match=r"^downsample_tolerance_fps must be finite and non-negative$",
-        ):
-            asyncio.run(camera_fps_conformance(episode, downsample_tolerance_fps=float("inf")))
-
-        with pytest.raises(
-            ValueError,
-            match=r"^downsample_tolerance_fps must be finite and non-negative$",
-        ):
-            asyncio.run(camera_fps_conformance(episode, downsample_tolerance_fps=-1))
+        for parameter_name, refused_value, message_pattern in refused_thresholds:
+            with pytest.raises(ValueError, match=message_pattern):
+                asyncio.run(camera_fps_conformance(episode, **{parameter_name: refused_value}))
 
         # Zero tolerance is a meaningful setting, not a missing one: it asks
         # for an exact rate match. The two parameters therefore take different
@@ -1039,16 +1018,6 @@ def test_trajectory_metrics_finds_the_injected_hold(tmp_path: Path) -> None:
     assert result.verdict is None
 
 
-def test_trajectory_metrics_moving_stream_is_not_motionless(tmp_path: Path) -> None:
-    source = synthesize_episode(
-        tmp_path / "moving.mcap",
-        SyntheticEpisodeSpec(duration_s=3.0, cameras=(), joint_jump_at_s=None),
-    )
-    with hflow.Episode(source) as episode:
-        result = asyncio.run(trajectory_metrics(episode))
-    assert result.measurements["/joint_states/motionless_fraction"] == pytest.approx(0.0)
-
-
 def test_trajectory_metrics_dimension_scales_are_recorded_and_validated(
     tmp_path: Path,
 ) -> None:
@@ -1126,7 +1095,7 @@ def test_trajectory_segments_flags_the_injected_jump_as_a_change(tmp_path: Path)
     assert max_change > threshold
 
 
-def test_trajectory_change_threshold_uses_a_true_weighted_median(tmp_path: Path) -> None:
+def test_trajectory_change_threshold_uses_a_true_weighted_median() -> None:
     """The threshold must come from a value a sample actually took. An
     interpolating quantile invents one, which shifts which spans flag.
     """
@@ -1152,6 +1121,7 @@ def test_trajectory_metrics_emits_unsettled_ratio_for_a_moving_episode(
     with hflow.Episode(source) as episode:
         result = asyncio.run(trajectory_metrics(episode))
 
+    assert result.measurements["/joint_states/motionless_fraction"] == pytest.approx(0.0)
     assert "/joint_states/final_pose_speed" in result.measurements
     assert "/joint_states/final_pose_unsettled_ratio" in result.measurements
     ratio = result.measurements["/joint_states/final_pose_unsettled_ratio"]

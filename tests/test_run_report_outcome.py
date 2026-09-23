@@ -7,22 +7,19 @@ import pytest
 import hflow
 
 
-def _registered_check() -> Any:
-    return cast(Any, object())
-
-
-def _registered_enrichment() -> Any:
+def _opaque_registration() -> Any:
+    """Stands in for a registered check or enrichment; the report only holds it."""
     return cast(Any, object())
 
 
 def test_a_check_report_cannot_be_built_without_an_outcome() -> None:
     with pytest.raises(TypeError):
-        cast(Any, hflow.CheckRunReport)(check=_registered_check())
+        cast(Any, hflow.CheckRunReport)(check=_opaque_registration())
 
 
 def test_an_enrichment_report_cannot_be_built_without_an_outcome() -> None:
     with pytest.raises(TypeError):
-        cast(Any, hflow.EnrichmentRunReport)(enrichment=_registered_enrichment())
+        cast(Any, hflow.EnrichmentRunReport)(enrichment=_opaque_registration())
 
 
 @pytest.mark.parametrize(
@@ -45,7 +42,7 @@ def test_an_enrichment_report_cannot_be_built_without_an_outcome() -> None:
 def test_every_check_status_still_comes_from_the_same_condition(
     outcome: hflow.CheckOutcome, expected: hflow.CheckStatus
 ) -> None:
-    run = hflow.CheckRunReport(check=_registered_check(), outcome=outcome)
+    run = hflow.CheckRunReport(check=_opaque_registration(), outcome=outcome)
     assert run.status is expected
 
 
@@ -71,27 +68,27 @@ def test_every_check_status_still_comes_from_the_same_condition(
 def test_every_enrichment_status_still_comes_from_the_same_condition(
     outcome: hflow.EnrichmentOutcome, expected: hflow.CheckStatus
 ) -> None:
-    run = hflow.EnrichmentRunReport(enrichment=_registered_enrichment(), outcome=outcome)
+    run = hflow.EnrichmentRunReport(enrichment=_opaque_registration(), outcome=outcome)
     assert run.status is expected
 
 
 def test_a_check_report_reads_back_exactly_the_outcome_it_holds() -> None:
     result = hflow.CheckResult(measurements={"fps": 30.0})
-    measured = hflow.CheckRunReport(check=_registered_check(), outcome=hflow.Measured(result))
+    measured = hflow.CheckRunReport(check=_opaque_registration(), outcome=hflow.Measured(result))
     assert (measured.result, measured.error, measured.not_run) == (result, None, None)
 
-    errored = hflow.CheckRunReport(check=_registered_check(), outcome=hflow.Errored("boom"))
+    errored = hflow.CheckRunReport(check=_opaque_registration(), outcome=hflow.Errored("boom"))
     assert (errored.result, errored.error, errored.not_run) == (None, "boom", None)
 
     skipped = hflow.SkippedByQuarantine(("quarantined:x",))
-    not_run = hflow.CheckRunReport(check=_registered_check(), outcome=hflow.NotRun(skipped))
+    not_run = hflow.CheckRunReport(check=_opaque_registration(), outcome=hflow.NotRun(skipped))
     assert (not_run.result, not_run.error, not_run.not_run) == (None, None, skipped)
 
 
 def test_a_publish_failure_keeps_the_labels_it_already_had() -> None:
     result = hflow.EnrichmentResult(labels={"caption": "a robot"})
     run = hflow.EnrichmentRunReport(
-        enrichment=_registered_enrichment(),
+        enrichment=_opaque_registration(),
         outcome=hflow.PublishFailed(result=result, error="artifact 'sheet' could not be published"),
     )
     assert run.status is hflow.CheckStatus.ERROR

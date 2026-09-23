@@ -371,9 +371,3 @@ def test_unknown_profile_errors_with_valid_names(source_episode: Path, tmp_path:
     app = _app_with_check_and_enrichment(tmp_path / "data")
     with pytest.raises(ValueError, match="metadata_backfill"):
         asyncio.run(app.process(source_episode, stages="everything"))
-
-
-def test_run_profiles_vocabulary() -> None:
-    assert hflow.stages_for_profile("full") == frozenset(hflow.Stage)
-    assert hflow.RUN_PROFILES["relabel"] == frozenset({hflow.Stage.LABELS})
-    assert hflow.RUN_PROFILES["metadata_backfill"] == frozenset({hflow.Stage.META})

@@ -215,75 +215,54 @@ def test_export_noncontiguous_selection(
     assert prov["source_commit"] == "a" * 40
 
 
-def test_export_mixed_repositories_fail(fake_corpus: dict, tmp_path: Path) -> None:
-    rows = [
-        {"metadata_json": _provenance_meta(0)},
-        {
-            "metadata_json": json.dumps(
+def _provenance_json(**overrides: object) -> str:
+    return json.dumps({**json.loads(_provenance_meta(0)), **overrides})
+
+
+@pytest.mark.parametrize(
+    ("manifest_rows", "expected_message"),
+    [
+        pytest.param(
+            [
+                {"metadata_json": _provenance_meta(0)},
                 {
-                    "source_dataset": "lerobot/other",
-                    "source_revision": "b" * 40,
-                    "source_episode_index": 1,
-                    "task": "task-1",
-                    "embodiment": "so101",
-                }
-            )
-        },
-    ]
-    manifest = _fake_manifest(tmp_path, rows)
+                    "metadata_json": _provenance_json(
+                        source_dataset="lerobot/other",
+                        source_revision="b" * 40,
+                        source_episode_index=1,
+                        task="task-1",
+                    )
+                },
+            ],
+            "mixes source repositories",
+            id="mixed-repositories",
+        ),
+        pytest.param(
+            [{"metadata_json": _provenance_json(source_revision="main")}],
+            "not an immutable commit sha",
+            id="nonimmutable-revision",
+        ),
+        pytest.param(
+            [{"metadata_json": None}], "lacks LeRobot provenance", id="missing-provenance"
+        ),
+        pytest.param(
+            [{"metadata_json": _provenance_meta(9)}],
+            "source episodes not present",
+            id="missing-source-episode",
+        ),
+        pytest.param(
+            [{"metadata_json": _provenance_meta(0)}, {"metadata_json": _provenance_meta(0)}],
+            "duplicate source episode indexes",
+            id="duplicate-episode",
+        ),
+    ],
+)
+def test_export_refuses_an_unexportable_manifest(
+    fake_corpus: dict, tmp_path: Path, manifest_rows: list[dict], expected_message: str
+) -> None:
+    manifest = _fake_manifest(tmp_path, manifest_rows)
     dest = tmp_path / "out"
-    with pytest.raises(ValueError, match="mixes source repositories"):
-        export.export(dest, manifest=manifest, camera_keys=CAMS)
-    assert not dest.exists()
-
-
-def test_export_nonimmutable_revision_fails(fake_corpus: dict, tmp_path: Path) -> None:
-    rows = [
-        {
-            "metadata_json": json.dumps(
-                {
-                    "source_dataset": "lerobot/fake",
-                    "source_revision": "main",
-                    "source_episode_index": 0,
-                    "task": "task-0",
-                    "embodiment": "so101",
-                }
-            )
-        }
-    ]
-    manifest = _fake_manifest(tmp_path, rows)
-    dest = tmp_path / "out"
-    with pytest.raises(ValueError, match="not an immutable commit sha"):
-        export.export(dest, manifest=manifest, camera_keys=CAMS)
-    assert not dest.exists()
-
-
-def test_export_missing_provenance_fails(fake_corpus: dict, tmp_path: Path) -> None:
-    manifest = _fake_manifest(tmp_path, [{"metadata_json": None}])
-    dest = tmp_path / "out"
-    with pytest.raises(ValueError, match="lacks LeRobot provenance"):
-        export.export(dest, manifest=manifest, camera_keys=CAMS)
-    assert not dest.exists()
-
-
-def test_export_missing_source_episode_fails(fake_corpus: dict, tmp_path: Path) -> None:
-    manifest = _fake_manifest(tmp_path, [{"metadata_json": _provenance_meta(9)}])
-    dest = tmp_path / "out"
-    with pytest.raises(ValueError, match="source episodes not present"):
-        export.export(dest, manifest=manifest, camera_keys=CAMS)
-    assert not dest.exists()
-
-
-def test_export_duplicate_episode_fails(fake_corpus: dict, tmp_path: Path) -> None:
-    manifest = _fake_manifest(
-        tmp_path,
-        [
-            {"metadata_json": _provenance_meta(0)},
-            {"metadata_json": _provenance_meta(0)},
-        ],
-    )
-    dest = tmp_path / "out"
-    with pytest.raises(ValueError, match="duplicate source episode indexes"):
+    with pytest.raises(ValueError, match=expected_message):
         export.export(dest, manifest=manifest, camera_keys=CAMS)
     assert not dest.exists()
 

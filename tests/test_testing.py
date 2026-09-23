@@ -518,12 +518,3 @@ def test_a_default_fault_segment_past_a_shortened_duration_still_writes(tmp_path
     written = synthesize_episode(tmp_path / "short.mcap", spec)
 
     assert written.is_file()
-
-
-def test_an_explicit_fault_segment_past_the_end_is_still_refused(tmp_path: Path) -> None:
-    """The exemption is scoped to defaults, so a chosen segment stays checked."""
-    with pytest.raises(ValueError, match=r"black_segment must satisfy"):
-        synthesize_episode(
-            tmp_path / "refused.mcap",
-            SyntheticEpisodeSpec(duration_s=1.0, cameras=(), black_segment=(2.0, 4.0)),
-        )

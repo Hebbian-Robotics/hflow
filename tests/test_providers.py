@@ -119,42 +119,45 @@ def test_module_level_instance_is_accepted(monkeypatch: pytest.MonkeyPatch) -> N
     assert discovered["dummy-vllm"] is PREBUILT_INSTANCE
 
 
-def test_unimportable_entry_point_warns_and_spares_the_rest(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize(
+    ("entry_points", "expected_provider_names", "warning_fragment"),
+    [
+        # The broken plugin never blocks the healthy one registered beside it.
+        pytest.param(
+            (
+                ("broken", "package_that_does_not_exist:Provider"),
+                ("dummy-vllm", f"{FAKE_PLUGIN_MODULE}:DummyVllmVideoProvider"),
+            ),
+            {"dummy-vllm"},
+            "failed to load",
+            id="unimportable-entry-point",
+        ),
+        pytest.param(
+            (("incomplete", f"{FAKE_PLUGIN_MODULE}:MissingMethodProvider"),),
+            set(),
+            "does not satisfy",
+            id="object-not-satisfying-protocol",
+        ),
+        pytest.param(
+            (("exploding", f"{FAKE_PLUGIN_MODULE}:ExplodingConstructorProvider"),),
+            set(),
+            "instantiating",
+            id="failing-constructor",
+        ),
+    ],
+)
+def test_an_unusable_entry_point_warns_and_is_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    entry_points: tuple[tuple[str, str], ...],
+    expected_provider_names: set[str],
+    warning_fragment: str,
 ) -> None:
-    _register_entry_points(
-        monkeypatch,
-        ("broken", "package_that_does_not_exist:Provider"),
-        ("dummy-vllm", f"{FAKE_PLUGIN_MODULE}:DummyVllmVideoProvider"),
-    )
+    _register_entry_points(monkeypatch, *entry_points)
     with caplog.at_level(logging.WARNING, logger="hflow.providers"):
         discovered = discover_providers()
-    assert set(discovered) == {"dummy-vllm"}  # the broken plugin never blocks the healthy one
-    assert any("failed to load" in record.message for record in caplog.records)
-
-
-def test_object_not_satisfying_protocol_warns_and_is_skipped(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    _register_entry_points(
-        monkeypatch, ("incomplete", f"{FAKE_PLUGIN_MODULE}:MissingMethodProvider")
-    )
-    with caplog.at_level(logging.WARNING, logger="hflow.providers"):
-        discovered = discover_providers()
-    assert discovered == {}
-    assert any("does not satisfy" in record.message for record in caplog.records)
-
-
-def test_failing_constructor_warns_and_is_skipped(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    _register_entry_points(
-        monkeypatch, ("exploding", f"{FAKE_PLUGIN_MODULE}:ExplodingConstructorProvider")
-    )
-    with caplog.at_level(logging.WARNING, logger="hflow.providers"):
-        discovered = discover_providers()
-    assert discovered == {}
-    assert any("instantiating" in record.message for record in caplog.records)
+    assert set(discovered) == expected_provider_names
+    assert any(warning_fragment in record.message for record in caplog.records)
 
 
 def test_duplicate_provider_name_keeps_the_first_and_warns(

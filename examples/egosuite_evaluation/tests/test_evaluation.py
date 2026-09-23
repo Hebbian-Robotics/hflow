@@ -969,106 +969,59 @@ def test_prepare_output_directory_refuses_a_different_experiment(tmp_path: Path)
         _prepare_output_directory(different)
 
 
-def test_run_metadata_refuses_a_non_object_run_json(tmp_path: Path) -> None:
+_RUN_METADATA_PREFIX = {
+    "label": "run-label",
+    "fingerprint": "x",
+    "model": "vision-model",
+    "camera_view": "head-left",
+}
+
+
+@pytest.mark.parametrize(
+    ("run_json_text", "expected_fragment"),
+    [
+        pytest.param("[]", "must contain a JSON object", id="non-object"),
+        pytest.param("not json", "could not read run metadata", id="invalid-json"),
+        pytest.param(json.dumps({"fingerprint": "x"}), "'label'", id="missing-label"),
+        pytest.param(json.dumps({"label": 3}), "'label'", id="non-string-label"),
+        pytest.param(
+            json.dumps({**_RUN_METADATA_PREFIX, "frame_stride": "30"}),
+            "'frame_stride'",
+            id="string-frame-stride",
+        ),
+        pytest.param(
+            json.dumps({**_RUN_METADATA_PREFIX, "frame_stride": 30, "sample_seed": True}),
+            "'sample_seed'",
+            id="bool-sample-seed",
+        ),
+        pytest.param(
+            json.dumps(
+                {
+                    **_RUN_METADATA_PREFIX,
+                    "frame_stride": 30,
+                    "sample_seed": 42,
+                    "episode_count": "none",
+                }
+            ),
+            "'episode_count'",
+            id="string-episode-count",
+        ),
+    ],
+)
+def test_run_metadata_names_the_file_and_the_bad_field(
+    tmp_path: Path, run_json_text: str, expected_fragment: str
+) -> None:
     configuration = _evaluation_configuration(tmp_path / "run")
     metadata_path = tmp_path / "run" / "run.json"
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata_path.write_text("[]")
+    metadata_path.write_text(run_json_text)
 
     with pytest.raises(ValueError) as error:
         _prepare_output_directory(configuration)
 
     message = str(error.value)
     assert str(metadata_path) in message
-    assert "must contain a JSON object" in message
-
-
-def test_run_metadata_refuses_invalid_json(tmp_path: Path) -> None:
-    configuration = _evaluation_configuration(tmp_path / "run")
-    metadata_path = tmp_path / "run" / "run.json"
-    metadata_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata_path.write_text("not json")
-
-    with pytest.raises(ValueError) as error:
-        _prepare_output_directory(configuration)
-
-    message = str(error.value)
-    assert str(metadata_path) in message
-    assert "could not read run metadata" in message
-
-
-def test_run_metadata_names_the_file_and_the_bad_field(tmp_path: Path) -> None:
-    configuration = _evaluation_configuration(tmp_path / "run")
-    metadata_path = tmp_path / "run" / "run.json"
-    metadata_path.parent.mkdir(parents=True, exist_ok=True)
-
-    metadata_path.write_text(json.dumps({"fingerprint": "x"}))
-    with pytest.raises(ValueError) as error:
-        _prepare_output_directory(configuration)
-    message = str(error.value)
-    assert str(metadata_path) in message
-    assert "'label'" in message
-
-    metadata_path.write_text(json.dumps({"label": 3}))
-    with pytest.raises(ValueError) as error:
-        _prepare_output_directory(configuration)
-    message = str(error.value)
-    assert str(metadata_path) in message
-    assert "'label'" in message
-
-    metadata_path.write_text(
-        json.dumps(
-            {
-                "label": "run-label",
-                "fingerprint": "x",
-                "model": "vision-model",
-                "camera_view": "head-left",
-                "frame_stride": "30",
-            }
-        )
-    )
-    with pytest.raises(ValueError) as error:
-        _prepare_output_directory(configuration)
-    message = str(error.value)
-    assert str(metadata_path) in message
-    assert "'frame_stride'" in message
-
-    metadata_path.write_text(
-        json.dumps(
-            {
-                "label": "run-label",
-                "fingerprint": "x",
-                "model": "vision-model",
-                "camera_view": "head-left",
-                "frame_stride": 30,
-                "sample_seed": True,
-            }
-        )
-    )
-    with pytest.raises(ValueError) as error:
-        _prepare_output_directory(configuration)
-    message = str(error.value)
-    assert str(metadata_path) in message
-    assert "'sample_seed'" in message
-
-    metadata_path.write_text(
-        json.dumps(
-            {
-                "label": "run-label",
-                "fingerprint": "x",
-                "model": "vision-model",
-                "camera_view": "head-left",
-                "frame_stride": 30,
-                "sample_seed": 42,
-                "episode_count": "none",
-            }
-        )
-    )
-    with pytest.raises(ValueError) as error:
-        _prepare_output_directory(configuration)
-    message = str(error.value)
-    assert str(metadata_path) in message
-    assert "'episode_count'" in message
+    assert expected_fragment in message
 
 
 def test_run_metadata_document_persists_the_existing_schema(tmp_path: Path) -> None:

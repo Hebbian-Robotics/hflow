@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -129,29 +130,6 @@ class TestLocalStorageRoot:
         root = LocalStorageRoot(tmp_path)
         root.write_bytes("landing/e.mcap", b"episode")
         assert root.fetch("landing/e.mcap") == tmp_path / "landing" / "e.mcap"
-        with pytest.raises(FileNotFoundError):
-            root.fetch("landing/missing.mcap")
-
-    def test_fetch_missing_has_oserror_filename(self, tmp_path: Path) -> None:
-        root = LocalStorageRoot(tmp_path)
-        missing = tmp_path / "landing" / "missing.mcap"
-        with pytest.raises(FileNotFoundError) as excinfo:
-            root.fetch("landing/missing.mcap")
-        assert excinfo.value.errno == errno.ENOENT
-        assert excinfo.value.filename == str(missing)
-        assert "No such file or directory" in str(excinfo.value)
-        assert str(missing) in str(excinfo.value)
-
-    def test_fetch_directory_says_is_a_directory(self, tmp_path: Path) -> None:
-        """A directory exists, so ENOENT was the wrong reason (#144)."""
-        root = LocalStorageRoot(tmp_path)
-        a_directory = tmp_path / "landing"
-        a_directory.mkdir()
-        with pytest.raises(FileNotFoundError) as excinfo:
-            root.fetch("landing")
-        assert excinfo.value.errno == errno.EISDIR
-        assert excinfo.value.filename == str(a_directory)
-        assert "Is a directory" in str(excinfo.value)
 
     def test_publish_copies_only_when_needed(self, tmp_path: Path) -> None:
         root = LocalStorageRoot(tmp_path / "root")
@@ -265,24 +243,6 @@ class TestBucketStorageRoot:
         root, _ = bucket_over_tmp
         with pytest.raises(FileNotFoundError):
             root.fetch("landing/missing.mcap")
-
-    def test_fetch_local_missing_has_oserror_filename(self, tmp_path: Path) -> None:
-        missing = tmp_path / "nope.mcap"
-        with pytest.raises(FileNotFoundError) as excinfo:
-            fetch_uri(missing)
-        assert excinfo.value.errno == 2
-        assert "No such file or directory" in str(excinfo.value)
-        assert str(missing) in str(excinfo.value)
-
-    def test_fetch_local_directory_says_is_a_directory(self, tmp_path: Path) -> None:
-        """`hflow doctor <a directory>` reaches this and reported ENOENT (#144)."""
-        a_directory = tmp_path / "adir"
-        a_directory.mkdir()
-        with pytest.raises(FileNotFoundError) as excinfo:
-            fetch_uri(a_directory)
-        assert excinfo.value.errno == errno.EISDIR
-        assert excinfo.value.filename == str(a_directory)
-        assert "Is a directory" in str(excinfo.value)
 
     def test_publish_uploads_and_warms_mirror(
         self, tmp_path: Path, bucket_over_tmp: tuple[BucketStorageRoot, Path]
@@ -445,14 +405,53 @@ class TestBucketStorageRoot:
         assert received_options[-1]["automatic_cleanup"] is True
 
 
+# Both local entry points refuse through one shared path check; each case
+# names the local file path it resolves, relative to ``tmp_path``.
+_LOCAL_FETCHERS = [
+    pytest.param(
+        lambda tmp_path, relative_path: LocalStorageRoot(tmp_path).fetch(relative_path),
+        id="local-root-fetch",
+    ),
+    pytest.param(
+        lambda tmp_path, relative_path: fetch_uri(tmp_path / relative_path), id="fetch-uri"
+    ),
+]
+
+
+@pytest.mark.parametrize("fetch_local", _LOCAL_FETCHERS)
+def test_fetching_a_missing_local_file_has_oserror_filename(
+    tmp_path: Path, fetch_local: Callable[[Path, str], Path]
+) -> None:
+    missing = tmp_path / "landing" / "missing.mcap"
+    with pytest.raises(FileNotFoundError) as excinfo:
+        fetch_local(tmp_path, "landing/missing.mcap")
+    assert excinfo.value.errno == errno.ENOENT
+    assert excinfo.value.filename == str(missing)
+    assert "No such file or directory" in str(excinfo.value)
+    assert str(missing) in str(excinfo.value)
+
+
+@pytest.mark.parametrize("fetch_local", _LOCAL_FETCHERS)
+def test_fetching_a_local_directory_says_is_a_directory(
+    tmp_path: Path, fetch_local: Callable[[Path, str], Path]
+) -> None:
+    """A directory exists, so ENOENT was the wrong reason. `hflow doctor <a
+    directory>` reached this through ``fetch_uri`` and reported ENOENT (#144)."""
+    a_directory = tmp_path / "landing"
+    a_directory.mkdir()
+    with pytest.raises(FileNotFoundError) as excinfo:
+        fetch_local(tmp_path, "landing")
+    assert excinfo.value.errno == errno.EISDIR
+    assert excinfo.value.filename == str(a_directory)
+    assert "Is a directory" in str(excinfo.value)
+
+
 class TestFetchUri:
     def test_local_path_passes_through(self, tmp_path: Path) -> None:
         local_file = tmp_path / "e.mcap"
         local_file.write_bytes(b"x")
         assert fetch_uri(local_file) == local_file
         assert fetch_uri(str(local_file)) == local_file
-        with pytest.raises(FileNotFoundError):
-            fetch_uri(tmp_path / "missing.mcap")
 
     def test_default_mirror_is_stable_per_url(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

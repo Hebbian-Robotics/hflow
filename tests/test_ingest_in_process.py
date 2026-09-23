@@ -193,14 +193,18 @@ def test_a_failed_source_is_recorded_where_it_can_be_found(
     assert cli_main(["ingest", "episodes-in/corrupt.mcap"]) == 1
     assert "ingest_failures" in capsys.readouterr().err
 
+    # The ledger writes the catalog's format marker first: otherwise a corpus
+    # whose every episode failed would hold a table no reader would open.
     connection = open_catalog_connection(project / "data" / "catalog")
     try:
         rows = connection.execute(
             "SELECT source_uri, stage, failure_kind, error_type FROM ingest_failures"
         ).fetchall()
+        episode_count = connection.execute("SELECT count(*) FROM episodes").fetchone()
     finally:
         connection.close()
     assert rows == [("episodes-in/corrupt.mcap", "sync", "source-unreadable", "InvalidMagic")]
+    assert episode_count == (0,)
 
 
 def test_a_payload_damaged_source_is_classified_the_same_as_unreadable(
@@ -268,27 +272,6 @@ def test_replaying_the_same_failure_records_one_row(
 
     connection = open_catalog_connection(project / "data" / "catalog")
     try:
-        assert connection.execute("SELECT count(*) FROM ingest_failures").fetchone() == (1,)
-    finally:
-        connection.close()
-
-
-def test_a_workspace_where_everything_failed_still_opens(
-    project: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The ledger writes the catalog's format marker first: otherwise a corpus
-    whose every episode failed would hold a table no reader would open."""
-
-    monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
-    monkeypatch.delenv("HFLOW_AIRFLOW_URL", raising=False)
-    (project / "data" / "episodes-in" / "corrupt.mcap").write_bytes(b"not an mcap file")
-    monkeypatch.chdir(project)
-
-    cli_main(["ingest", "episodes-in/corrupt.mcap"])
-
-    connection = open_catalog_connection(project / "data" / "catalog")
-    try:
-        assert connection.execute("SELECT count(*) FROM episodes").fetchone() == (0,)
         assert connection.execute("SELECT count(*) FROM ingest_failures").fetchone() == (1,)
     finally:
         connection.close()

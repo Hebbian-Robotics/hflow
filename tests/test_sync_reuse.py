@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -46,35 +47,35 @@ def _camera_episode(path: Path, *, duration_s: float = 0.5, seed: int = 0) -> Pa
     )
 
 
-def test_an_unchanged_source_is_not_transcoded_twice(tmp_path: Path) -> None:
-    source = _episode(tmp_path / "episode_0001.mcap")
+def _sync(app: hflow.App, source: Path) -> hflow.ProcessReport:
+    """One unrecorded sync-only run, the operation every reuse test repeats."""
+    return asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+
+
+@pytest.mark.parametrize(
+    ("make_source", "uses_ffmpeg"),
+    [
+        pytest.param(_episode, False, id="camera-less"),
+        # Control: the ffmpeg reuse comparisons are reachable, and still pass.
+        pytest.param(_camera_episode, True, id="with-camera"),
+    ],
+)
+def test_an_unchanged_source_is_not_transcoded_twice(
+    tmp_path: Path, make_source: Callable[[Path], Path], uses_ffmpeg: bool
+) -> None:
+    source = make_source(tmp_path / "episode_0001.mcap")
     app = hflow.App("reuse", data_root=tmp_path / "data", default_checks=())
 
-    first = asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    first = _sync(app, source)
     # Read BEFORE the second run: reading after would compare the same file
     # against itself and pass whatever happened.
     mtime_after_first = first.canonical_path.stat().st_mtime_ns
-    second = asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    second = _sync(app, source)
 
+    assert (first.stamps.ffmpeg_version != FFMPEG_VERSION_NOT_USED) is uses_ffmpeg
     assert first.sync_reused is False
     assert second.sync_reused is True
     # The canonical file was not rewritten, which is the whole point.
-    assert second.canonical_path.stat().st_mtime_ns == mtime_after_first
-    assert first.stamps == second.stamps
-
-
-def test_an_unchanged_source_with_a_camera_is_not_transcoded_twice(tmp_path: Path) -> None:
-    """Control: the ffmpeg reuse comparisons are reachable, and still pass."""
-    source = _camera_episode(tmp_path / "episode_0001.mcap")
-    app = hflow.App("reuse-camera", data_root=tmp_path / "data", default_checks=())
-
-    first = asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
-    mtime_after_first = first.canonical_path.stat().st_mtime_ns
-    second = asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
-
-    assert first.stamps.ffmpeg_version != FFMPEG_VERSION_NOT_USED
-    assert first.sync_reused is False
-    assert second.sync_reused is True
     assert second.canonical_path.stat().st_mtime_ns == mtime_after_first
     assert first.stamps == second.stamps
 
@@ -84,7 +85,7 @@ def test_a_marker_recording_a_different_ffmpeg_version_is_not_reused(tmp_path: P
     recorded version cannot prove the next transcode would match those bytes."""
     source = _camera_episode(tmp_path / "episode_0001.mcap")
     app = hflow.App("marker-ffmpeg", data_root=tmp_path / "data", default_checks=())
-    first = asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    first = _sync(app, source)
 
     marker_path = first.canonical_path.parent / ".sync-complete.json"
     marker_payload = json.loads(marker_path.read_text())
@@ -98,7 +99,7 @@ def test_a_marker_recording_a_different_ffmpeg_version_is_not_reused(tmp_path: P
     assert witness is not None
     assert witness.ffmpeg_version != first.stamps.ffmpeg_version
 
-    second = asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    second = _sync(app, source)
     assert second.sync_reused is False
 
 
@@ -109,14 +110,14 @@ def test_a_canonical_ffmpeg_version_that_no_longer_matches_the_live_build_is_not
     must refuse reuse even when the marker still agrees with the canonical."""
     source = _camera_episode(tmp_path / "episode_0001.mcap")
     app = hflow.App("live-ffmpeg", data_root=tmp_path / "data", default_checks=())
-    first = asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    first = _sync(app, source)
     assert first.stamps.ffmpeg_version != FFMPEG_VERSION_NOT_USED
 
     # Local import inside the reuse gate: patch the source module, not a name
     # bound on hflow.app.
     monkeypatch.setattr("hflow.ffmpeg.ffmpeg_version", lambda: "ffmpeg version not-the-live-build")
 
-    second = asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    second = _sync(app, source)
     assert second.sync_reused is False
 
 
@@ -125,7 +126,7 @@ def test_sync_completion_marker_keeps_its_existing_json_bytes(tmp_path: Path) ->
     source = _episode(tmp_path / "episode_0001.mcap")
     app = hflow.App("marker-bytes", data_root=tmp_path / "data", default_checks=())
 
-    first = asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    first = _sync(app, source)
     marker_path = first.canonical_path.parent / ".sync-complete.json"
     expected_payload = {
         "ffmpeg_version": first.stamps.ffmpeg_version,
@@ -165,7 +166,7 @@ def test_a_source_replaced_in_place_is_transcoded_again(tmp_path: Path) -> None:
     source_path = tmp_path / "episode_0001.mcap"
     _episode(source_path, seed=1)
     app = hflow.App("replaced", data_root=tmp_path / "data", default_checks=())
-    first = asyncio.run(app.process(source_path, record=False, stages=SYNC_ONLY, verbose=False))
+    first = _sync(app, source_path)
     original_stat = source_path.stat()
     canonical_after_first = first.canonical_path.read_bytes()
 
@@ -173,7 +174,7 @@ def test_a_source_replaced_in_place_is_transcoded_again(tmp_path: Path) -> None:
     source_path.write_bytes(replacement.read_bytes())
     os.utime(source_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
 
-    second = asyncio.run(app.process(source_path, record=False, stages=SYNC_ONLY, verbose=False))
+    second = _sync(app, source_path)
 
     assert second.sync_reused is False
     # The canonical really was rebuilt from the new source, not just re-stamped.
@@ -195,7 +196,7 @@ def test_a_changed_transform_config_is_transcoded_again(tmp_path: Path) -> None:
         transform=TransformConfig(chunk_size_bytes=400_000),
         default_checks=(),
     )
-    second = asyncio.run(retuned.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    second = _sync(retuned, source)
 
     assert second.sync_reused is False
 
@@ -204,7 +205,7 @@ def test_a_marker_without_a_witness_transcodes_once_and_gains_one(tmp_path: Path
     """The whole migration for corpora written before the witness existed."""
     source = _episode(tmp_path / "episode_0001.mcap")
     app = hflow.App("legacy", data_root=tmp_path / "data", default_checks=())
-    first = asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    first = _sync(app, source)
 
     marker_path = first.canonical_path.parent / ".sync-complete.json"
     legacy_payload = {
@@ -214,10 +215,10 @@ def test_a_marker_without_a_witness_transcodes_once_and_gains_one(tmp_path: Path
     }
     marker_path.write_text(json.dumps(legacy_payload))
 
-    second = asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    second = _sync(app, source)
     assert second.sync_reused is False
 
-    third = asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    third = _sync(app, source)
     assert third.sync_reused is True
 
 
@@ -237,7 +238,7 @@ def test_every_partial_reuse_witness_stays_readable_but_is_not_reused(
 ) -> None:
     source = _episode(tmp_path / "episode_0001.mcap")
     app = hflow.App("partial-witness", data_root=tmp_path / "data", default_checks=())
-    first = asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    first = _sync(app, source)
 
     marker_path = first.canonical_path.parent / ".sync-complete.json"
     marker_payload = json.loads(marker_path.read_text())
@@ -261,7 +262,7 @@ def test_every_partial_reuse_witness_stays_readable_but_is_not_reused(
     )
     assert metadata_only.canonical_path == first.canonical_path
 
-    second = asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    second = _sync(app, source)
     assert second.sync_reused is False
 
 
@@ -273,7 +274,7 @@ def test_a_marker_without_a_known_transform_kind_stays_readable_but_is_not_reuse
 ) -> None:
     source = _episode(tmp_path / "episode_0001.mcap")
     app = hflow.App("unknown-kind", data_root=tmp_path / "data", default_checks=())
-    first = asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    first = _sync(app, source)
     marker_path = first.canonical_path.parent / ".sync-complete.json"
     marker_payload = json.loads(marker_path.read_text())
     if raw_transform_kind is None:
@@ -289,7 +290,7 @@ def test_a_marker_without_a_known_transform_kind_stays_readable_but_is_not_reuse
     )
     assert metadata_only.canonical_path == first.canonical_path
 
-    second = asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    second = _sync(app, source)
     assert second.sync_reused is False
 
 
@@ -299,24 +300,21 @@ def test_deleting_the_marker_is_the_way_to_force_a_retranscode(tmp_path: Path) -
     the switch, at every vantage."""
     source = _episode(tmp_path / "episode_0001.mcap")
     app = hflow.App("forced", data_root=tmp_path / "data", default_checks=())
-    first = asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    first = _sync(app, source)
 
     (first.canonical_path.parent / ".sync-complete.json").unlink()
 
-    assert (
-        asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False)).sync_reused
-        is False
-    )
+    assert _sync(app, source).sync_reused is False
 
 
 def test_a_missing_canonical_transcodes_rather_than_raising(tmp_path: Path) -> None:
     source = _episode(tmp_path / "episode_0001.mcap")
     app = hflow.App("missing", data_root=tmp_path / "data", default_checks=())
-    first = asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    first = _sync(app, source)
 
     first.canonical_path.unlink()
 
-    second = asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    second = _sync(app, source)
     assert second.sync_reused is False
     assert second.canonical_path.is_file()
 
@@ -330,10 +328,10 @@ def test_a_registered_transform_override_never_reuses(tmp_path: Path) -> None:
     def passthrough(source_path: Path, output_path: Path, config: TransformConfig) -> EpisodeStamps:
         return write_canonical_episode(source_path, output_path, config)
 
-    first = asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    first = _sync(app, source)
     marker_path = first.canonical_path.parent / ".sync-complete.json"
     assert json.loads(marker_path.read_text())["transform_kind"] == "override"
-    second = asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    second = _sync(app, source)
 
     assert second.sync_reused is False
 
@@ -352,7 +350,7 @@ def test_removing_an_override_does_not_reuse_its_canonical(tmp_path: Path) -> No
     def passthrough(source_path: Path, output_path: Path, config: TransformConfig) -> EpisodeStamps:
         return write_canonical_episode(source_path, output_path, config)
 
-    asyncio.run(with_override.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    _sync(with_override, source)
 
     without_override = hflow.App("swap", data_root=data_root, default_checks=())
     second = asyncio.run(
@@ -380,7 +378,7 @@ def test_later_stages_still_read_what_a_reused_sync_left(tmp_path: Path) -> None
 def test_the_summary_says_when_it_reused(tmp_path: Path) -> None:
     source = _episode(tmp_path / "episode_0001.mcap")
     app = hflow.App("summary", data_root=tmp_path / "data", default_checks=())
-    asyncio.run(app.process(source, record=False, stages=SYNC_ONLY, verbose=False))
+    _sync(app, source)
 
     summary = asyncio.run(
         app.process(source, record=False, stages=SYNC_ONLY, verbose=False)

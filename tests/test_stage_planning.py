@@ -407,6 +407,9 @@ class TestARecordingSyncCouldNotCanonicalize:
 
         assert _stage(outcomes, hflow.Stage.SYNC).counts["errors"] == 1
         assert _stage(outcomes, hflow.Stage.META).counts["errors"] == 0
+        # It ran nothing and it is not up to date. Folding it into the
+        # already-current count would report a corrupt recording as done.
+        assert _stage(outcomes, hflow.Stage.META).skipped_as_current == 0
         connection = open_catalog_connection(project / "data" / "catalog")
         try:
             rows = connection.execute(
@@ -416,15 +419,6 @@ class TestARecordingSyncCouldNotCanonicalize:
         finally:
             connection.close()
         assert rows == [("sync", "source-unreadable")]
-
-    def test_it_is_not_counted_as_already_current(self, project: Path) -> None:
-        """It ran nothing and it is not up to date. Folding it into the
-        already-current count would report a corrupt recording as done."""
-        (project / "data" / "episodes-in" / "corrupt.mcap").write_bytes(b"not an mcap file")
-
-        outcomes = _ingest(project, EPISODE_URI, "episodes-in/corrupt.mcap")
-
-        assert _stage(outcomes, hflow.Stage.META).skipped_as_current == 0
 
     def test_the_command_exits_one_even_under_budget(
         self, project: Path, capsys: pytest.CaptureFixture[str]
@@ -721,10 +715,16 @@ class TestTheRenderedPlanTask:
 
         assert excinfo.value.code == 99
 
-    def test_all_stages_hands_the_whole_batch_over(self, project: Path, plan: RenderedPlan) -> None:
+    # Airflow renders params into the call, and a hand-typed conf value
+    # arrives as text. Reading "true" as a true value is what keeps the escape
+    # hatch usable from the trigger form.
+    @pytest.mark.parametrize("all_stages", [True, "true"], ids=["native-bool", "conf-string"])
+    def test_all_stages_hands_the_whole_batch_over(
+        self, project: Path, plan: RenderedPlan, all_stages: object
+    ) -> None:
         _ingest(project)
 
-        batches = plan([EPISODE_URI], "batch", None, True)
+        batches = plan([EPISODE_URI], "batch", None, all_stages)
 
         assert [item for batch in batches for item in batch["items"]] == [EPISODE_URI]
 
@@ -745,21 +745,8 @@ class TestTheRenderedPlanTask:
 
         assert excinfo.value.code == 99
 
-    def test_a_conf_string_reads_as_the_flag_it_spells(
-        self, project: Path, plan: RenderedPlan
-    ) -> None:
-        """Airflow renders params into the call, and a hand-typed conf value
-        arrives as text. Reading "true" as a true value is what keeps the
-        escape hatch usable from the trigger form."""
-        _ingest(project)
-
-        batches = plan([EPISODE_URI], "batch", None, "true")
-
-        assert [item for batch in batches for item in batch["items"]] == [EPISODE_URI]
-
-    @pytest.mark.parametrize("spelling", ["false", "no", "off", "0", "", "   "])
     def test_a_conf_string_that_spells_no_leaves_the_filter_on(
-        self, project: Path, plan: RenderedPlan, spelling: str
+        self, project: Path, plan: RenderedPlan
     ) -> None:
         """The direction where a regression is silent.
 
@@ -767,12 +754,14 @@ class TestTheRenderedPlanTask:
         simply processes everything, which is what it did before this filter
         existed. So the corpus stays correct and the run just costs what #172
         was about, forever, with nothing saying so. Truthiness on the raw
-        string (``bool(all_stages)``) is the obvious wrong implementation and
-        every spelling here survives it.
+        string (``bool(all_stages)``) is the obvious wrong implementation, and
+        "false" is truthy under it. This pins that the rendered plan parses
+        the flag at all; every spelling is covered by
+        ``test_stage_execution.py::TestConfFlags``.
         """
         _ingest(project)
 
         with pytest.raises(SystemExit) as excinfo:
-            plan([EPISODE_URI], "batch", None, spelling)
+            plan([EPISODE_URI], "batch", None, "false")
 
         assert excinfo.value.code == 99

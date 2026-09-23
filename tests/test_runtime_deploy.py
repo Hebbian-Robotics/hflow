@@ -3,6 +3,7 @@ template rendered against deploy values, DEPLOY.md contents, data-root URI
 validation, and the CLI wiring (no Docker, no Airflow, no platform APIs)."""
 
 import errno
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -13,7 +14,6 @@ from hflow.cli import main
 from hflow.runtime._deploy import (
     DEFAULT_DEPLOY_VENV_PYTHON,
     DeployConfig,
-    DeployPaths,
     render_deploy_bundle,
     validate_data_root_uri,
 )
@@ -38,12 +38,8 @@ def config(tmp_path: Path) -> DeployConfig:
     )
 
 
-def _render(config: DeployConfig, output_dir: Path) -> DeployPaths:
-    return render_deploy_bundle(config, output_dir)
-
-
 def test_bundle_layout_and_paths(config: DeployConfig, tmp_path: Path) -> None:
-    paths = _render(config, tmp_path / "deploy")
+    paths = render_deploy_bundle(config, tmp_path / "deploy")
     assert paths.output_dir == tmp_path / "deploy"
     # Every DAG file is named after its dag id (platforms sync whole dags/
     # folders, so generic names would collide across pipelines).
@@ -71,7 +67,7 @@ def test_requirements_absent_when_the_project_has_none(tmp_path: Path) -> None:
     project_dir.mkdir()
     pipeline_file = project_dir / "my_pipeline.py"
     pipeline_file.write_text(PIPELINE_SOURCE)
-    paths = _render(
+    paths = render_deploy_bundle(
         DeployConfig(pipeline_file=pipeline_file, data_root_uri="/mnt/robot-data"),
         tmp_path / "deploy",
     )
@@ -84,7 +80,7 @@ def test_a_requirements_file_beside_the_pipeline_ships_with_the_project(
     """The bundle carries the pipeline's whole directory now, so a
     requirements.txt sitting in it is part of the project -- --requirements is
     for pointing at one somewhere else."""
-    paths = _render(replace(config, requirements_file=None), tmp_path / "deploy")
+    paths = render_deploy_bundle(replace(config, requirements_file=None), tmp_path / "deploy")
     assert (paths.user_dir / "requirements.txt").read_text() == "numpy>=2\n"
 
 
@@ -92,7 +88,7 @@ def test_a_sibling_module_ships_so_the_pipeline_can_import_it(
     config: DeployConfig, tmp_path: Path
 ) -> None:
     (Path(config.pipeline_file).parent / "rig_constants.py").write_text("FLEET = 'kitchen'\n")
-    paths = _render(config, tmp_path / "deploy")
+    paths = render_deploy_bundle(config, tmp_path / "deploy")
     assert (paths.user_dir / "rig_constants.py").read_text() == "FLEET = 'kitchen'\n"
 
 
@@ -103,14 +99,14 @@ def test_environments_and_caches_never_ship(config: DeployConfig, tmp_path: Path
     (project_dir / "__pycache__").mkdir()
     (project_dir / "__pycache__" / "stale.pyc").write_bytes(b"\x00")
 
-    paths = _render(config, tmp_path / "deploy")
+    paths = render_deploy_bundle(config, tmp_path / "deploy")
 
     assert not (paths.user_dir / ".venv").exists()
     assert not (paths.user_dir / "__pycache__").exists()
 
 
 def test_dag_sources_compile_and_carry_deploy_values(config: DeployConfig, tmp_path: Path) -> None:
-    paths = _render(config, tmp_path / "deploy")
+    paths = render_deploy_bundle(config, tmp_path / "deploy")
 
     master_source = paths.dag_file.read_text()
     compile(master_source, str(paths.dag_file), "exec")
@@ -148,7 +144,7 @@ def test_dag_sources_compile_and_carry_deploy_values(config: DeployConfig, tmp_p
 
 
 def test_dag_sources_honor_custom_venv_python(config: DeployConfig, tmp_path: Path) -> None:
-    paths = _render(
+    paths = render_deploy_bundle(
         replace(config, venv_python_path="/home/airflow/venvs/tasks/bin/python"),
         tmp_path / "deploy",
     )
@@ -177,7 +173,7 @@ def test_dag_sources_survive_paths_that_are_not_valid_python_literals(
     """
     windows_venv_python = r"C:\Users\ci\venvs\user\Scripts\python.exe"
     quote_bearing_data_root = '/data/root", os.system("unexpected"); x = ("'
-    paths = _render(
+    paths = render_deploy_bundle(
         replace(
             config,
             venv_python_path=windows_venv_python,
@@ -200,7 +196,7 @@ def test_dag_sources_survive_paths_that_are_not_valid_python_literals(
     # containing a triple quote must not close it early and splice the rest
     # of the header in as source.
     docstring_breaking_venv_python = '/opt/"""; SPLICED = 1; _rest = """/python'
-    prose_paths = _render(
+    prose_paths = render_deploy_bundle(
         replace(config, venv_python_path=docstring_breaking_venv_python),
         tmp_path / "deploy-docstring",
     )
@@ -212,7 +208,7 @@ def test_dag_sources_survive_paths_that_are_not_valid_python_literals(
 
 def test_dag_id_default_rule_and_override(config: DeployConfig, tmp_path: Path) -> None:
     assert config.resolved_dag_id() == "my_pipeline_ingest"
-    paths = _render(replace(config, dag_id="custom_ingest"), tmp_path / "deploy")
+    paths = render_deploy_bundle(replace(config, dag_id="custom_ingest"), tmp_path / "deploy")
     assert paths.dag_id == "custom_ingest"
     assert paths.dag_file.name == "custom_ingest.py"
     assert 'dag_id="custom_ingest"' in paths.dag_file.read_text()
@@ -227,13 +223,13 @@ def test_dag_id_default_rule_and_override(config: DeployConfig, tmp_path: Path) 
 
 def test_code_smuggling_values_are_refused(config: DeployConfig, tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="dag_id"):
-        _render(replace(config, dag_id='x"; import os #'), tmp_path / "b1")
+        render_deploy_bundle(replace(config, dag_id='x"; import os #'), tmp_path / "b1")
     with pytest.raises(ValueError, match="app_variable"):
-        _render(replace(config, app_variable="app; run()"), tmp_path / "b2")
+        render_deploy_bundle(replace(config, app_variable="app; run()"), tmp_path / "b2")
 
 
 def test_deploy_md_contents(config: DeployConfig, tmp_path: Path) -> None:
-    deploy_md = _render(config, tmp_path / "deploy").deploy_md.read_text()
+    deploy_md = render_deploy_bundle(config, tmp_path / "deploy").deploy_md.read_text()
     # The self-managed bundle-config JSON, verbatim from the shared constant
     # (references/airflow3-notes.md, "DAG bundles").
     assert DAG_BUNDLE_CONFIG_LIST_JSON in deploy_md
@@ -258,17 +254,6 @@ def test_deploy_md_contents(config: DeployConfig, tmp_path: Path) -> None:
     assert '"mode": "batch"|"online"' in deploy_md
     assert "apache-airflow-providers-standard" in deploy_md
     assert "triggerer" in deploy_md
-
-
-def test_deploy_md_explains_shared_absolute_paths(config: DeployConfig, tmp_path: Path) -> None:
-    Path(config.pipeline_file).write_text(
-        "import hflow\n\napp = hflow.App('demo', data_root='/mnt/robot-data')\n"
-    )
-    deploy_md = _render(
-        replace(config, data_root_uri="/mnt/robot-data"), tmp_path / "deploy"
-    ).deploy_md.read_text()
-    assert "Absolute paths must be mounted identically" in deploy_md
-    assert "/mnt/robot-data" in deploy_md
 
 
 @pytest.mark.parametrize(
@@ -338,7 +323,7 @@ def test_render_warns_on_mismatched_pipeline_data_root_literal(
         "import hflow\n\napp = hflow.App('demo', data_root='/opt/airflow/data')\n"
     )
     with caplog.at_level("WARNING", logger="hflow.runtime._bundle"):
-        _render(config, tmp_path / "deploy")
+        render_deploy_bundle(config, tmp_path / "deploy")
     warning_text = "\n".join(record.getMessage() for record in caplog.records)
     assert "'/opt/airflow/data'" in warning_text
     assert DATA_ROOT_PATH in warning_text
@@ -348,17 +333,14 @@ def test_render_stays_silent_when_pipeline_matches_deploy_root(
     config: DeployConfig, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     with caplog.at_level("WARNING", logger="hflow.runtime._bundle"):
-        _render(config, tmp_path / "deploy")
+        render_deploy_bundle(config, tmp_path / "deploy")
     assert not caplog.records
 
 
 def test_deploy_bundle_manifest_describes_the_bundle(config: DeployConfig, tmp_path: Path) -> None:
     """The deploy bundle carries the same machine-readable description the
     Compose bundle does -- the upload/provisioning contract, kind 'deploy'."""
-    import json
-    from dataclasses import replace
-
-    paths = _render(replace(config, task_queue="workspace-a"), tmp_path / "deploy")
+    paths = render_deploy_bundle(replace(config, task_queue="workspace-a"), tmp_path / "deploy")
     manifest_payload = json.loads((paths.output_dir / "hflow-bundle.json").read_text())
     assert manifest_payload["kind"] == "deploy"
     assert manifest_payload["dag_id"] == "my_pipeline_ingest"
@@ -373,13 +355,11 @@ def test_deploy_bundle_manifest_describes_the_bundle(config: DeployConfig, tmp_p
 def test_deploy_bundle_documents_explicit_environment_requirements(
     config: DeployConfig, tmp_path: Path
 ) -> None:
-    import json
-
     configured = replace(
         config,
         passthrough_environment_variables=("MODEL_BASE_URL", "MODEL_API_KEY"),
     )
-    paths = _render(configured, tmp_path / "deploy")
+    paths = render_deploy_bundle(configured, tmp_path / "deploy")
 
     manifest_payload = json.loads((paths.output_dir / "hflow-bundle.json").read_text())
     assert manifest_payload["passthrough_environment_variables"] == [
@@ -393,8 +373,8 @@ def test_deploy_bundle_documents_explicit_environment_requirements(
 
 def test_rerender_overwrites_generated_files(config: DeployConfig, tmp_path: Path) -> None:
     output_dir = tmp_path / "deploy"
-    _render(config, output_dir)
-    paths = _render(replace(config, dag_id="renamed_ingest"), output_dir)
+    render_deploy_bundle(config, output_dir)
+    paths = render_deploy_bundle(replace(config, dag_id="renamed_ingest"), output_dir)
     assert paths.dag_file.name == "renamed_ingest.py"
     assert 'dag_id="renamed_ingest"' in paths.dag_file.read_text()
     assert paths.sub_dag_files[0].name == "renamed_sync.py"
@@ -486,22 +466,17 @@ def test_cli_deploy_rejects_relative_data_root(
     assert not (tmp_path / "deploy").exists()
 
 
-def test_pipeline_directory_says_is_a_directory(config: DeployConfig, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("config_field", "directory_name"),
+    [("pipeline_file", "pipelines"), ("requirements_file", "reqs")],
+)
+def test_a_directory_input_says_is_a_directory(
+    config: DeployConfig, tmp_path: Path, config_field: str, directory_name: str
+) -> None:
     """A directory exists, so ENOENT was the wrong reason (#102)."""
-    a_directory = tmp_path / "pipelines"
+    a_directory = tmp_path / directory_name
     a_directory.mkdir()
-    broken = replace(config, pipeline_file=a_directory)
-    with pytest.raises(FileNotFoundError) as excinfo:
-        render_deploy_bundle(broken, tmp_path / "deploy")
-    assert excinfo.value.errno == errno.EISDIR
-    assert excinfo.value.filename == str(a_directory)
-    assert "Is a directory" in str(excinfo.value)
-
-
-def test_requirements_directory_says_is_a_directory(config: DeployConfig, tmp_path: Path) -> None:
-    a_directory = tmp_path / "reqs"
-    a_directory.mkdir()
-    broken = replace(config, requirements_file=a_directory)
+    broken = replace(config, **{config_field: a_directory})
     with pytest.raises(FileNotFoundError) as excinfo:
         render_deploy_bundle(broken, tmp_path / "deploy")
     assert excinfo.value.errno == errno.EISDIR

@@ -291,33 +291,6 @@ def test_two_shards_coexist_in_one_output_root(tmp_path: Path, moving_hevc_video
         )
 
 
-def test_single_shard_provenance_names_the_real_source(
-    tmp_path: Path, moving_hevc_video: Path
-) -> None:
-    """One shard, one episode: operator and factory come from the sidecar."""
-    source_root = tmp_path / "source"
-    output_root = tmp_path / "corpus"
-    tar_path = source_root / "huggingface" / "shard.tar"
-    tar_path.parent.mkdir(parents=True, exist_ok=True)
-    member, member_sha, archive_sha = _write_shard_tar(
-        tar_path, "factory002_worker001_00000", moving_hevc_video, "factory_002", "worker_001"
-    )
-    manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text(
-        _manifest_json("shard.tar", archive_sha, member, member_sha, "factory_002 task"),
-        encoding="utf-8",
-    )
-
-    report = PREPARE.prepare_corpus(manifest_path, source_root, output_root)
-
-    assert len(report) == 1
-    with Episode(report[0]) as episode:
-        metadata = episode.metadata_records["episode/v1"]
-    assert metadata["operator"] == "factory_002_worker_001"
-    assert metadata["factory"] == "factory_002"
-    assert metadata["source_member"] == member
-
-
 def test_same_member_stem_from_two_shards_never_collides(
     tmp_path: Path, moving_hevc_video: Path
 ) -> None:
@@ -459,6 +432,7 @@ def test_sidecar_fields_map_to_episode_metadata_and_intrinsics_attached(
         assert metadata["fps"] == "10"
         assert metadata["codec"] == "h265"
         assert metadata["task"] == "component_sorting"
+        assert metadata["source_member"] == member
 
         attachments = episode.attachments
         assert len(attachments) == 1

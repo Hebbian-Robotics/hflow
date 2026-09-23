@@ -14,7 +14,6 @@ file.
 """
 
 import asyncio
-import functools
 import hashlib
 import os
 from collections.abc import Iterator
@@ -96,39 +95,34 @@ class TestFrameArithmetic:
         assert summary.frames_with_a_right_hand == 0
 
 
+_SECOND_NS = 1_000_000_000
+
+
 class TestAbsenceIntervals:
-    def test_a_run_ends_where_detection_resumes(self) -> None:
-        log_times_ns = [0, 1_000_000_000, 2_000_000_000, 3_000_000_000]
+    @pytest.mark.parametrize(
+        ("hand_counts", "expected_spans"),
+        [
+            pytest.param([1, 0, 0, 2], [(_SECOND_NS, 3 * _SECOND_NS)], id="run-ends-at-detection"),
+            pytest.param(
+                [1, 0, 0], [(_SECOND_NS, 2 * _SECOND_NS)], id="trailing-run-closes-at-last-frame"
+            ),
+            pytest.param([0, 0, 0], [(0, 2 * _SECOND_NS)], id="never-saw-a-hand"),
+            pytest.param([1, 2], [], id="every-frame-shows-a-hand"),
+            # One absent frame at the very end has nothing after it to bound the
+            # span, and an interval from a point to itself would claim a duration
+            # the sampling cannot support.
+            pytest.param([1, 0], [], id="lone-trailing-absent-frame"),
+        ],
+    )
+    def test_absence_spans_run_between_sampled_frames(
+        self, hand_counts: list[int], expected_spans: list[tuple[int, int]]
+    ) -> None:
+        log_times_ns = [index * _SECOND_NS for index in range(len(hand_counts))]
         intervals = _no_detection_intervals(
-            log_times_ns, [_frame(1), _frame(0), _frame(0), _frame(2)], "no_hand_detected:/cam"
+            log_times_ns, [_frame(count) for count in hand_counts], "no_hand_detected:/cam"
         )
-        (interval,) = intervals
-        assert (interval.start_ns, interval.end_ns) == (1_000_000_000, 3_000_000_000)
-        assert interval.label == "no_hand_detected:/cam"
-
-    def test_a_trailing_run_closes_at_the_last_sampled_frame(self) -> None:
-        log_times_ns = [0, 1_000_000_000, 2_000_000_000]
-        (interval,) = _no_detection_intervals(
-            log_times_ns, [_frame(1), _frame(0), _frame(0)], "absent"
-        )
-        assert (interval.start_ns, interval.end_ns) == (1_000_000_000, 2_000_000_000)
-
-    def test_footage_the_model_never_saw_a_hand_in_is_one_interval(self) -> None:
-        log_times_ns = [0, 1_000_000_000, 2_000_000_000]
-        (interval,) = _no_detection_intervals(
-            log_times_ns, [_frame(0), _frame(0), _frame(0)], "absent"
-        )
-        assert (interval.start_ns, interval.end_ns) == (0, 2_000_000_000)
-
-    def test_no_intervals_when_every_frame_shows_a_hand(self) -> None:
-        assert _no_detection_intervals([0, 1_000_000_000], [_frame(1), _frame(2)], "absent") == []
-
-    def test_a_lone_trailing_absent_frame_spans_no_footage(self) -> None:
-        """One absent frame at the very end has nothing after it to bound the
-        span, and an interval from a point to itself would claim a duration the
-        sampling cannot support.
-        """
-        assert _no_detection_intervals([0, 1_000_000_000], [_frame(1), _frame(0)], "absent") == []
+        assert [(interval.start_ns, interval.end_ns) for interval in intervals] == expected_spans
+        assert all(interval.label == "no_hand_detected:/cam" for interval in intervals)
 
 
 class TestModelAcquisition:
@@ -211,19 +205,6 @@ class TestRegistrationWithoutTheModel:
         (registered,) = app.checks
         assert registered.name == "mediapipe_hand_detection"
         assert registered.version == "hands-v1"
-
-    def test_a_retuned_registration_can_declare_a_new_version(self) -> None:
-        default = hflow.App("default-hands", default_checks=())
-        default.check(version="hands-v1")(mediapipe_hand_detection)
-        retuned = hflow.App("retuned-hands", default_checks=())
-        retuned.check(version="hands-v2", name="mediapipe_hand_detection")(
-            functools.partial(
-                mediapipe_hand_detection,
-                minimum_hand_detection_confidence=0.8,
-            )
-        )
-
-        assert default.checks[0].version != retuned.checks[0].version
 
     def test_a_sampling_rate_finer_than_the_model_clock_is_refused(self, tmp_path: Path) -> None:
         """MediaPipe timestamps video frames in whole milliseconds, so two

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from mcap.exceptions import InvalidMagic
+from mcap.records import Chunk
 from mcap.stream_reader import CRCValidationError
 from mcap.writer import Writer as StockWriter
 
@@ -14,42 +15,52 @@ from hflow.ingest_ledger import IngestFailureKind, classify_ingest_failure
 from hflow.transform import SourceNotConforming, write_canonical_episode
 
 
-def test_classify_source_not_found_as_source_missing() -> None:
-    error = SourceNotFound("episode 'missing.mcap' not found")
-    assert classify_ingest_failure(error) == IngestFailureKind.SOURCE_MISSING
-
-
-def test_classify_mcap_error_as_source_unreadable() -> None:
-    error = InvalidMagic(b"not-an-mcap-file")
-    assert classify_ingest_failure(error) == IngestFailureKind.SOURCE_UNREADABLE
-
-
-def test_classify_crc_validation_error_as_source_unreadable() -> None:
-    """``CRCValidationError`` subclasses ``ValueError``, not ``McapError`` (#431):
-    without its own branch it would fall through to ``INFRASTRUCTURE`` and
-    blame the platform for a damaged recording."""
-    from mcap.records import Chunk
-
-    chunk = Chunk(
-        compression="",
-        data=b"",
-        message_end_time=0,
-        message_start_time=0,
-        uncompressed_crc=1,
-        uncompressed_size=0,
-    )
-    error = CRCValidationError(expected=1, actual=2, record=chunk)
-    assert classify_ingest_failure(error) == IngestFailureKind.SOURCE_UNREADABLE
-
-
-def test_classify_source_not_conforming_as_source_unsupported() -> None:
-    error = SourceNotConforming("x")
-    assert classify_ingest_failure(error) == IngestFailureKind.SOURCE_UNSUPPORTED
-
-
-def test_classify_unrecognized_error_as_infrastructure() -> None:
-    error = RuntimeError("unknown")
-    assert classify_ingest_failure(error) == IngestFailureKind.INFRASTRUCTURE
+@pytest.mark.parametrize(
+    ("error", "expected_kind"),
+    [
+        pytest.param(
+            SourceNotFound("episode 'missing.mcap' not found"),
+            IngestFailureKind.SOURCE_MISSING,
+            id="source-not-found",
+        ),
+        pytest.param(
+            InvalidMagic(b"not-an-mcap-file"),
+            IngestFailureKind.SOURCE_UNREADABLE,
+            id="mcap-error",
+        ),
+        # CRCValidationError subclasses ValueError, not McapError (#431):
+        # without its own branch it would fall through to INFRASTRUCTURE and
+        # blame the platform for a damaged recording.
+        pytest.param(
+            CRCValidationError(
+                expected=1,
+                actual=2,
+                record=Chunk(
+                    compression="",
+                    data=b"",
+                    message_end_time=0,
+                    message_start_time=0,
+                    uncompressed_crc=1,
+                    uncompressed_size=0,
+                ),
+            ),
+            IngestFailureKind.SOURCE_UNREADABLE,
+            id="crc-validation-error",
+        ),
+        pytest.param(
+            SourceNotConforming("x"),
+            IngestFailureKind.SOURCE_UNSUPPORTED,
+            id="source-not-conforming",
+        ),
+        pytest.param(
+            RuntimeError("unknown"), IngestFailureKind.INFRASTRUCTURE, id="unrecognized-error"
+        ),
+    ],
+)
+def test_classify_ingest_failure_maps_each_error_to_its_kind(
+    error: Exception, expected_kind: IngestFailureKind
+) -> None:
+    assert classify_ingest_failure(error) == expected_kind
 
 
 def test_ingest_refuses_a_source_with_a_damaged_chunk_payload(tmp_path: Path) -> None:

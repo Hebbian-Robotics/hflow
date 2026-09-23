@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -20,6 +21,11 @@ FAST_SPEC = SyntheticEpisodeSpec(duration_s=2.0, cameras=())
 @pytest.fixture()
 def source_episode(tmp_path: Path) -> Path:
     return synthesize_episode(tmp_path / "episode.mcap", FAST_SPEC)
+
+
+def _first_catalog_row(data_root: Path, sql: str) -> tuple[object, ...] | None:
+    with open_catalog_connection(data_root / "catalog") as connection:
+        return connection.execute(sql).fetchone()
 
 
 def test_enrichments_run_after_all_checks(source_episode: Path, tmp_path: Path) -> None:
@@ -145,31 +151,23 @@ def test_enrichment_labels_and_artifacts_land_in_the_catalog(
         )
 
     asyncio.run(app.test(source_episode, verbose=False, record=True))
-    connection = open_catalog_connection(data_root / "catalog")
-    try:
-        caption_row = connection.execute(
-            "SELECT value_text FROM measurements WHERE key = 'caption'"
-        ).fetchone()
-        assert caption_row == ("synthetic joints wiggle",)
-        confidence_row = connection.execute(
-            "SELECT value_double FROM measurements WHERE key = 'confidence'"
-        ).fetchone()
-        assert confidence_row == pytest.approx((np.float32(0.9).item(),))
-        artifact_row = connection.execute(
-            "SELECT value_text FROM measurements WHERE key = 'artifact/segments'"
-        ).fetchone()
-        assert artifact_row is not None
-        assert str(artifact_row[0]).endswith("segments.json")
-        run_row = connection.execute(
-            "SELECT status FROM check_runs WHERE check_name = 'labeling'"
-        ).fetchone()
-        assert run_row == ("measured",)
-        tag_row = connection.execute(
-            "SELECT tag FROM tags WHERE check_name = 'labeling'"
-        ).fetchone()
-        assert tag_row == ("labeled",)
-    finally:
-        connection.close()
+    assert _first_catalog_row(
+        data_root, "SELECT value_text FROM measurements WHERE key = 'caption'"
+    ) == ("synthetic joints wiggle",)
+    assert _first_catalog_row(
+        data_root, "SELECT value_double FROM measurements WHERE key = 'confidence'"
+    ) == pytest.approx((np.float32(0.9).item(),))
+    artifact_row = _first_catalog_row(
+        data_root, "SELECT value_text FROM measurements WHERE key = 'artifact/segments'"
+    )
+    assert artifact_row is not None
+    assert str(artifact_row[0]).endswith("segments.json")
+    assert _first_catalog_row(
+        data_root, "SELECT status FROM check_runs WHERE check_name = 'labeling'"
+    ) == ("measured",)
+    assert _first_catalog_row(data_root, "SELECT tag FROM tags WHERE check_name = 'labeling'") == (
+        "labeled",
+    )
 
 
 def test_step_names_are_unique_across_checks_and_enrichments(tmp_path: Path) -> None:
@@ -202,14 +200,7 @@ def test_built_in_media_step_name_is_reserved_for_user_steps(tmp_path: Path) -> 
         app.enrich(version="1", name=MEDIA_CONTACT_SHEET_STEP_NAME)(enrichment)
 
 
-def test_enrichment_label_claiming_the_artifact_namespace_is_refused(
-    source_episode: Path, tmp_path: Path
-) -> None:
-    """A user label under `artifact/` is indistinguishable from a published
-    artifact in the catalog, and snapshot.py ships every such key as media."""
-    data_root = tmp_path / "data"
-    app = hflow.App("artifact-claim", data_root=data_root)
-
+def _register_enrichment_label_claiming_the_artifact_namespace(app: hflow.App) -> None:
     @app.enrich(version="1")
     def labeling(ep: hflow.Episode) -> hflow.EnrichmentResult:
         return hflow.EnrichmentResult(
@@ -219,23 +210,41 @@ def test_enrichment_label_claiming_the_artifact_namespace_is_refused(
             )
         )
 
-    with pytest.raises(ValueError, match=r"'artifact/notes'.*'labeling'"):
-        asyncio.run(app.test(source_episode, verbose=False, record=True))
-    assert list((data_root / "catalog" / "episodes").glob("*.parquet")) == []
 
-
-def test_check_measurement_claiming_the_artifact_namespace_is_refused(
-    source_episode: Path, tmp_path: Path
-) -> None:
-    """A check measurement key under `artifact/` is refused the same way."""
-    data_root = tmp_path / "data"
-    app = hflow.App("artifact-claim-check", data_root=data_root)
-
+def _register_check_measurement_claiming_the_artifact_namespace(app: hflow.App) -> None:
     @app.check(version="1")
     async def labeled(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"artifact/frames": 1.0})
 
-    with pytest.raises(ValueError, match=r"'artifact/frames'.*'labeled'"):
+
+@pytest.mark.parametrize(
+    ("register_claiming_step", "refusal_pattern"),
+    [
+        pytest.param(
+            _register_enrichment_label_claiming_the_artifact_namespace,
+            r"'artifact/notes'.*'labeling'",
+            id="enrichment-label",
+        ),
+        pytest.param(
+            _register_check_measurement_claiming_the_artifact_namespace,
+            r"'artifact/frames'.*'labeled'",
+            id="check-measurement",
+        ),
+    ],
+)
+def test_a_step_output_claiming_the_artifact_namespace_is_refused(
+    source_episode: Path,
+    tmp_path: Path,
+    register_claiming_step: Callable[[hflow.App], None],
+    refusal_pattern: str,
+) -> None:
+    """A user key under `artifact/` is indistinguishable from a published
+    artifact in the catalog, and snapshot.py ships every such key as media."""
+    data_root = tmp_path / "data"
+    app = hflow.App("artifact-claim", data_root=data_root)
+    register_claiming_step(app)
+
+    with pytest.raises(ValueError, match=refusal_pattern):
         asyncio.run(app.test(source_episode, verbose=False, record=True))
     assert list((data_root / "catalog" / "episodes").glob("*.parquet")) == []
 
@@ -259,19 +268,14 @@ def test_labels_near_the_artifact_namespace_still_land_with_real_artifacts(
         )
 
     asyncio.run(app.test(source_episode, verbose=False, record=True))
-    connection = open_catalog_connection(data_root / "catalog")
-    try:
-        label_row = connection.execute(
-            "SELECT value_text FROM measurements WHERE key = 'artifact_notes'"
-        ).fetchone()
-        assert label_row == ("s3://bucket/notes",)
-        artifact_row = connection.execute(
-            "SELECT value_text FROM measurements WHERE key = 'artifact/segments'"
-        ).fetchone()
-        assert artifact_row is not None
-        assert str(artifact_row[0]).endswith("segments.json")
-    finally:
-        connection.close()
+    assert _first_catalog_row(
+        data_root, "SELECT value_text FROM measurements WHERE key = 'artifact_notes'"
+    ) == ("s3://bucket/notes",)
+    artifact_row = _first_catalog_row(
+        data_root, "SELECT value_text FROM measurements WHERE key = 'artifact/segments'"
+    )
+    assert artifact_row is not None
+    assert str(artifact_row[0]).endswith("segments.json")
 
 
 _EGOCENTRIC_PIPELINE = Path(__file__).resolve().parents[1] / "examples/egocentric/pipeline.py"

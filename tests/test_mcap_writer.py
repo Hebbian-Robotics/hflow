@@ -9,7 +9,7 @@ never mix channels from different topic groups.
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import IO, Literal
+from typing import IO, Any, Literal
 
 import pytest
 from mcap.data_stream import ReadDataStream
@@ -126,9 +126,15 @@ def _write_two_group_episode(
     )
 
 
-def test_round_trip_two_groups(tmp_path: Path) -> None:
+@pytest.mark.parametrize("compression", ["zstd", "none"])
+def test_round_trip_two_groups(tmp_path: Path, compression: Literal["zstd", "none"]) -> None:
     mcap_path = tmp_path / "episode.mcap"
-    episode = _write_two_group_episode(mcap_path)
+    episode = _write_two_group_episode(mcap_path, compression=compression)
+
+    if compression == "none":
+        for chunk in _read_raw_chunks(mcap_path):
+            assert chunk.compression == ""
+            assert len(chunk.data) == chunk.uncompressed_size
 
     with mcap_path.open("rb") as stream:
         reader = make_reader(stream, validate_crcs=True)
@@ -262,25 +268,6 @@ def test_metadata_and_attachment_round_trip(tmp_path: Path) -> None:
     assert summary.attachment_indexes[0].data_size == len(attachment_data)
 
 
-def test_compression_none_round_trips(tmp_path: Path) -> None:
-    mcap_path = tmp_path / "episode.mcap"
-    episode = _write_two_group_episode(mcap_path, compression="none")
-
-    for chunk in _read_raw_chunks(mcap_path):
-        assert chunk.compression == ""
-        assert len(chunk.data) == chunk.uncompressed_size
-
-    with mcap_path.open("rb") as stream:
-        reader = make_reader(stream, validate_crcs=True)
-        read_back = [
-            (channel.topic, message.log_time, message.data)
-            for _, channel, message in reader.iter_messages(log_time_order=True)
-        ]
-    assert read_back == [
-        (expected.topic, expected.log_time, expected.data) for expected in episode.expected_messages
-    ]
-
-
 def test_zero_message_file_is_readable() -> None:
     stream = BytesIO()
     with GroupedMcapWriter(stream) as writer:
@@ -376,22 +363,19 @@ def test_register_channel_with_unknown_schema_id_raises() -> None:
 
 
 @pytest.mark.parametrize(
-    ("chunk_size", "error_pattern"),
+    ("writer_options", "error_pattern"),
     [
-        (0, "chunk_size must be >= 1"),
-        ({STATE_GROUP: 0}, "chunk size for group 'state' must be >= 1"),
+        ({"chunk_size": 0}, "chunk_size must be >= 1"),
+        ({"chunk_size": {STATE_GROUP: 0}}, "chunk size for group 'state' must be >= 1"),
+        ({"chunk_size": {}, "default_chunk_size": 0}, "default_chunk_size must be >= 1"),
     ],
+    ids=["chunk-size", "group-chunk-size", "mapping-fallback"],
 )
 def test_nonpositive_chunk_targets_are_rejected(
-    chunk_size: int | dict[str, int], error_pattern: str
+    writer_options: dict[str, Any], error_pattern: str
 ) -> None:
     with pytest.raises(ValueError, match=error_pattern):
-        GroupedMcapWriter(BytesIO(), chunk_size=chunk_size)
-
-
-def test_nonpositive_mapping_fallback_is_rejected() -> None:
-    with pytest.raises(ValueError, match="default_chunk_size must be >= 1"):
-        GroupedMcapWriter(BytesIO(), chunk_size={}, default_chunk_size=0)
+        GroupedMcapWriter(BytesIO(), **writer_options)
 
 
 def test_unknown_compression_is_rejected() -> None:
@@ -517,10 +501,3 @@ class TestPerGroupChunkTargets:
 
         assert omitted[STATE_GROUP] == pinned[STATE_GROUP]
         assert omitted[CAMERA_GROUP] > pinned[CAMERA_GROUP]
-
-    def test_a_plain_int_still_targets_every_group(self) -> None:
-        """The public contract callers already pass."""
-        per_group = self._chunks_per_group(self._write(32 * 1024))
-
-        assert per_group[CAMERA_GROUP] > 1
-        assert per_group[STATE_GROUP] > 1

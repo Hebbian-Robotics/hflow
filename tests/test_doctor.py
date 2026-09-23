@@ -310,30 +310,30 @@ def test_doctor_reports_a_b_picture_from_slice_headers(tmp_path: Path) -> None:
     assert "video-invalid-slice-header" not in {finding.code for finding in report.findings}
 
 
+@pytest.mark.parametrize(
+    ("malformed_rbsp", "pinned_message"),
+    [
+        (b"\x00", "slice header has no complete first_mb_in_slice value"),
+        (b"\x04", "slice header truncates its first_mb_in_slice value"),
+    ],
+)
 def test_doctor_keeps_both_pinned_count_messages_when_the_scan_refuses(
-    tmp_path: Path,
+    tmp_path: Path, malformed_rbsp: bytes, pinned_message: str
 ) -> None:
     # The scan fails closed on both payloads; the doctor delegates the count
     # on that error path, so the emitted text is count_h264_pictures' own.
-    malformed_first_byte_to_pinned_message = {
-        b"\x00": "slice header has no complete first_mb_in_slice value",
-        b"\x04": "slice header truncates its first_mb_in_slice value",
-    }
-    for message_index, (malformed_rbsp, pinned_message) in enumerate(
-        malformed_first_byte_to_pinned_message.items()
-    ):
-        path = tmp_path / f"malformed_{message_index}.mcap"
-        _write_video_message_mcap(
-            path, b"\x00\x00\x00\x01\x09\x10\x00\x00\x00\x01\x65" + malformed_rbsp
-        )
+    path = tmp_path / "malformed.mcap"
+    _write_video_message_mcap(
+        path, b"\x00\x00\x00\x01\x09\x10\x00\x00\x00\x01\x65" + malformed_rbsp
+    )
 
-        report = diagnose(path)
+    report = diagnose(path)
 
-        finding = next(
-            finding for finding in report.findings if finding.code == "video-invalid-slice-header"
-        )
-        assert finding.message.endswith(pinned_message)
-        assert not any(finding.code == "video-b-picture" for finding in report.findings)
+    finding = next(
+        finding for finding in report.findings if finding.code == "video-invalid-slice-header"
+    )
+    assert finding.message.endswith(pinned_message)
+    assert not any(finding.code == "video-b-picture" for finding in report.findings)
 
 
 def test_doctor_reports_invalid_slice_header_over_b_picture_when_a_header_is_malformed(
@@ -412,17 +412,6 @@ def test_cli_logs_library_warning_to_stderr(
     assert "WARNING hflow.test: test library warning" in captured.err
 
 
-def test_cli_doctor_missing_file_prints_one_line(capsys: pytest.CaptureFixture[str]) -> None:
-    missing = "C:/definitely/not/here.mcap"
-    assert cli_main(["doctor", missing]) == 2
-    captured = capsys.readouterr()
-    assert "doctor:" in captured.out
-    assert "[error] unreadable:" in captured.out
-    assert "No such file or directory" in captured.out
-    assert "Traceback" not in captured.out
-    assert "Traceback" not in captured.err
-
-
 def test_cli_doctor_continues_past_unreadable_file(
     canonical_episode: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -438,12 +427,18 @@ def test_cli_doctor_continues_past_unreadable_file(
     assert "Traceback" not in out
 
 
-def test_cli_doctor_all_unreadable_exits_2(capsys: pytest.CaptureFixture[str]) -> None:
+@pytest.mark.parametrize("unreadable_file_count", [1, 2])
+def test_cli_doctor_all_unreadable_prints_one_line_each_and_exits_2(
+    capsys: pytest.CaptureFixture[str], unreadable_file_count: int
+) -> None:
     missing = "C:/definitely/not/here.mcap"
-    assert cli_main(["doctor", missing, missing]) == 2
+    assert cli_main(["doctor", *[missing] * unreadable_file_count]) == 2
     captured = capsys.readouterr()
-    assert captured.out.count("[error] unreadable:") == 2
+    assert "doctor:" in captured.out
+    assert captured.out.count("[error] unreadable:") == unreadable_file_count
+    assert "No such file or directory" in captured.out
     assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err
 
 
 def test_cli_curate_bad_catalog_prints_one_line(
@@ -511,30 +506,35 @@ def _write_grouped_json_mcap(
         writer.finish()
 
 
-def test_chunk_mixes_groups_with_map(tmp_path: Path) -> None:
-    path = tmp_path / "mixed.mcap"
-    _write_grouped_json_mcap(
-        path,
-        group_by_topic={"/joint_states": "state", "/lidar_points": "bulk"},
-        messages=[("/joint_states", 1000, b"{}"), ("/lidar_points", 1000, b"{}")],
-    )
+@pytest.mark.parametrize(
+    ("group_by_topic", "messages", "mixes_groups"),
+    [
+        pytest.param(
+            {"/joint_states": "state", "/lidar_points": "bulk"},
+            [("/joint_states", 1000, b"{}"), ("/lidar_points", 1000, b"{}")],
+            True,
+            id="two-groups-in-one-chunk",
+        ),
+        pytest.param(
+            {"/joint_states": "state"},
+            [("/joint_states", 1000, b"{}")],
+            False,
+            id="one-group",
+        ),
+    ],
+)
+def test_chunk_mixes_groups_with_map(
+    tmp_path: Path,
+    group_by_topic: dict[str, str],
+    messages: list[tuple[str, int, bytes]],
+    mixes_groups: bool,
+) -> None:
+    path = tmp_path / "grouped.mcap"
+    _write_grouped_json_mcap(path, group_by_topic=group_by_topic, messages=messages)
 
     report = diagnose(path)
     codes = {finding.code for finding in report.findings}
-    assert "chunk-mixes-groups" in codes
-
-
-def test_chunk_no_mix_with_map(tmp_path: Path) -> None:
-    path = tmp_path / "nomix.mcap"
-    _write_grouped_json_mcap(
-        path,
-        group_by_topic={"/joint_states": "state"},
-        messages=[("/joint_states", 1000, b"{}")],
-    )
-
-    report = diagnose(path)
-    codes = {finding.code for finding in report.findings}
-    assert "chunk-mixes-groups" not in codes
+    assert ("chunk-mixes-groups" in codes) is mixes_groups
 
 
 def test_chunk_mix_without_map(tmp_path: Path) -> None:
@@ -579,66 +579,53 @@ def test_chunk_mix_without_map(tmp_path: Path) -> None:
     assert "chunk-mixes-groups" not in codes
 
 
-def test_group_chunks_out_of_order(tmp_path: Path) -> None:
-    path = tmp_path / "descending.mcap"
-    # chunk_size=1 puts every message in its own chunk, so the descending
-    # log times below are descending chunk start times.
-    _write_grouped_json_mcap(
-        path,
-        group_by_topic={"/alpha": "state"},
-        messages=[("/alpha", 1000, b"{" + b"a" * 2000 + b"}"), ("/alpha", 500, b"{}")],
-        chunk_size=1,
-    )
+# chunk_size=1 puts every message in its own chunk, so each message's log
+# time is its chunk's start time.
+@pytest.mark.parametrize(
+    ("group_by_topic", "messages", "out_of_order"),
+    [
+        pytest.param(
+            {"/alpha": "state"},
+            [("/alpha", 1000, b"{" + b"a" * 2000 + b"}"), ("/alpha", 500, b"{}")],
+            True,
+            id="descending-within-a-group",
+        ),
+        pytest.param(
+            {"/alpha": "state"},
+            [("/alpha", 500, b"x" * 2000), ("/alpha", 1000, b"x" * 2000)],
+            False,
+            id="ascending-within-a-group",
+        ),
+        pytest.param(
+            {"/alpha": "state1", "/beta": "state2"},
+            [
+                # alpha chunk 1: t=1000
+                ("/alpha", 1000, b"x" * 2000),
+                # beta chunk 1: t=500
+                ("/beta", 500, b"x" * 2000),
+                # alpha chunk 2: t=2000 (ascending for alpha)
+                ("/alpha", 2000, b"x" * 2000),
+            ],
+            False,
+            id="interleaved-different-groups",
+        ),
+        pytest.param(
+            {},
+            [("/alpha", 1000, b"x" * 2000), ("/alpha", 500, b"x" * 2000)],
+            False,
+            id="descending-without-a-group-map",
+        ),
+    ],
+)
+def test_group_chunks_out_of_order(
+    tmp_path: Path,
+    group_by_topic: dict[str, str],
+    messages: list[tuple[str, int, bytes]],
+    out_of_order: bool,
+) -> None:
+    path = tmp_path / "grouped.mcap"
+    _write_grouped_json_mcap(path, group_by_topic=group_by_topic, messages=messages, chunk_size=1)
 
     report = diagnose(path)
     codes = {finding.code for finding in report.findings}
-    assert "group-chunks-out-of-order" in codes
-
-
-def test_group_chunks_ascending_is_clean(tmp_path: Path) -> None:
-    path = tmp_path / "ascending.mcap"
-    _write_grouped_json_mcap(
-        path,
-        group_by_topic={"/alpha": "state"},
-        messages=[("/alpha", 500, b"x" * 2000), ("/alpha", 1000, b"x" * 2000)],
-        chunk_size=1,
-    )
-
-    report = diagnose(path)
-    codes = {finding.code for finding in report.findings}
-    assert "group-chunks-out-of-order" not in codes
-
-
-def test_group_chunks_interleaved_different_groups_is_clean(tmp_path: Path) -> None:
-    path = tmp_path / "interleaved.mcap"
-    _write_grouped_json_mcap(
-        path,
-        group_by_topic={"/alpha": "state1", "/beta": "state2"},
-        messages=[
-            # alpha chunk 1: t=1000
-            ("/alpha", 1000, b"x" * 2000),
-            # beta chunk 1: t=500
-            ("/beta", 500, b"x" * 2000),
-            # alpha chunk 2: t=2000 (ascending for alpha)
-            ("/alpha", 2000, b"x" * 2000),
-        ],
-        chunk_size=1,
-    )
-
-    report = diagnose(path)
-    codes = {finding.code for finding in report.findings}
-    assert "group-chunks-out-of-order" not in codes
-
-
-def test_descending_without_map_is_clean(tmp_path: Path) -> None:
-    path = tmp_path / "descending_nomap.mcap"
-    _write_grouped_json_mcap(
-        path,
-        group_by_topic={},
-        messages=[("/alpha", 1000, b"x" * 2000), ("/alpha", 500, b"x" * 2000)],
-        chunk_size=1,
-    )
-
-    report = diagnose(path)
-    codes = {finding.code for finding in report.findings}
-    assert "group-chunks-out-of-order" not in codes
+    assert ("group-chunks-out-of-order" in codes) is out_of_order

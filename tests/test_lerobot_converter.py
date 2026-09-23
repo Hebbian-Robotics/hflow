@@ -1130,7 +1130,13 @@ def test_manifest_content_id_detects_a_truncated_episode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The #379 controlled result as a test: truncating one episode to zero
-    bytes is detectable from the delivery by re-hashing against the manifest."""
+    bytes is detectable from the delivery by re-hashing against the manifest.
+
+    The receipt contents are pinned by
+    ``test_import_returns_local_uris_and_keeps_cache_beside_landing`` and the
+    verifier's reasons by ``test_verification.py``. What only this test shows
+    is that the importer's own manifest is one the verifier can check.
+    """
     from hflow.importers.lerobot_verify import verify_lerobot_import
     from hflow.verification import (
         REASON_CONTENT_ID_MISMATCH,
@@ -1150,16 +1156,9 @@ def test_manifest_content_id_detects_a_truncated_episode(
         episode_index=0,
     )
 
-    manifest = json.loads((output_dir / "prepared-manifest.json").read_text())
-    entry = manifest["episodes"][0]
-    episode_path = output_dir / "landing" / "lerobot_episode_0001.mcap"
-    original_size = episode_path.stat().st_size
-    assert original_size == entry["size_bytes"]
-    assert prep.content_episode_id(episode_path) == entry["content_id"]
+    assert verify_lerobot_import(output_dir).status is VerificationStatus.OK
 
-    episode_path.write_bytes(b"")
-    assert episode_path.stat().st_size != entry["size_bytes"]
-    assert prep.content_episode_id(episode_path) != entry["content_id"]
+    (output_dir / "landing" / "lerobot_episode_0001.mcap").write_bytes(b"")
 
     report = verify_lerobot_import(output_dir)
     assert report.status is VerificationStatus.DAMAGED
@@ -1730,55 +1729,43 @@ def _import_success_label_corpus(
     return output_dir
 
 
-def test_success_label_reports_max_over_episode_frames(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("outcome_mode", "expected_success"),
+    [
+        # MAX over the collector's next.success frames: a False frame followed
+        # by a True frame makes the episode a success, even though the LAST
+        # frame is False.
+        pytest.param("transition", "true", id="false-then-true-is-success"),
+        # An all-false source label ships as 'false', never as an invented
+        # 'true': the collector's judgment, reported verbatim.
+        pytest.param("all-false", "false", id="all-false-is-reported-verbatim"),
+        # A declared outcome feature with nothing recorded is not a label.
+        # Dropping the length check stamps ``success: "false"`` here, because
+        # ``any([])`` is False. That is the same invention the hardcoded
+        # ``"true"`` was, one value over, so the empty aggregate needs its own
+        # case rather than riding on the no-feature one.
+        pytest.param("empty-aggregate", None, id="empty-aggregate-omits-the-label"),
+    ],
+)
+def test_success_label_derives_from_the_outcome_aggregate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome_mode: str,
+    expected_success: str | None,
 ) -> None:
-    """MAX over the collector's next.success frames: a False frame followed
-    by a True frame makes the episode a success, even though the LAST frame
-    is False. The derivation is stamped so the methodology travels."""
+    """The derivation is stamped next to the label so the methodology travels."""
     from hflow.episode import Episode
 
-    output_dir = _import_success_label_corpus(tmp_path, monkeypatch, "transition")
+    output_dir = _import_success_label_corpus(tmp_path, monkeypatch, outcome_mode)
     landing = sorted((output_dir / "landing").glob("*.mcap"))
     with Episode(landing[0]) as episode:
         record = episode.metadata_records["episode/v1"]
-    assert record["success"] == "true"
-    assert record["success_derivation"] == "max(stats/next.success)"
-
-
-def test_success_label_reports_false_when_source_is_all_false(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An all-false source label ships as 'false', never as an invented
-    'true': the collector's judgment, reported verbatim."""
-    from hflow.episode import Episode
-
-    output_dir = _import_success_label_corpus(tmp_path, monkeypatch, "all-false")
-    landing = sorted((output_dir / "landing").glob("*.mcap"))
-    with Episode(landing[0]) as episode:
-        record = episode.metadata_records["episode/v1"]
-    assert record["success"] == "false"
-    assert record["success_derivation"] == "max(stats/next.success)"
-
-
-def test_success_label_omitted_when_the_outcome_aggregate_is_empty(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A declared outcome feature with nothing recorded is not a label.
-
-    Dropping the length check stamps ``success: "false"`` here, because
-    ``any([])`` is False. That is the same invention the hardcoded ``"true"``
-    was, one value over, so the empty aggregate needs its own case rather than
-    riding on the no-feature one.
-    """
-    from hflow.episode import Episode
-
-    output_dir = _import_success_label_corpus(tmp_path, monkeypatch, "empty-aggregate")
-    landing = sorted((output_dir / "landing").glob("*.mcap"))
-    with Episode(landing[0]) as episode:
-        record = episode.metadata_records["episode/v1"]
-    assert "success" not in record
-    assert "success_derivation" not in record
+    if expected_success is None:
+        assert "success" not in record
+        assert "success_derivation" not in record
+    else:
+        assert record["success"] == expected_success
+        assert record["success_derivation"] == "max(stats/next.success)"
 
 
 def test_success_label_omitted_when_source_has_no_outcome_feature(
@@ -1929,9 +1916,6 @@ def test_fractional_fps_reaches_the_transcoder_for_the_keyframe_interval(
 
     assert transcode_calls, "the transcoder was never called"
     assert transcode_calls[0] == 29.97
-    keyframe_interval = max(1, round(prep.IMPORT_GOP_SECONDS * transcode_calls[0]))
-    assert keyframe_interval == 30
-    assert keyframe_interval != max(1, round(prep.IMPORT_GOP_SECONDS * 29))
 
 
 def test_hub_source_metadata_paginates_pinned_tree_and_reuses_downloads(

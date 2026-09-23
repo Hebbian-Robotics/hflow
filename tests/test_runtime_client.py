@@ -1,8 +1,8 @@
 """AirflowClient against a stub HTTP server (no Docker, no Airflow)."""
 
 import contextlib
+import copy
 import json
-import socket
 import threading
 import time
 import urllib.parse
@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, ClassVar
 
 import pytest
+from runtime_test_helpers import InstantlyAdvancingClock, unused_local_port
 
 from hflow.runtime import (
     AirflowClient,
@@ -97,8 +98,7 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
             self._respond(201, {"access_token": token})
             return
         if self.path.startswith("/api/v2/dags/") and self.path.endswith("/dagRuns"):
-            if not self._bearer_ok(authorization):
-                self._respond(401, {"detail": "expired"})
+            if not self._require_bearer(authorization):
                 return
             redirect_status = type(self).dag_run_redirect_status
             if redirect_status is not None:
@@ -115,12 +115,7 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
                     {"detail": "scheduler accepted nothing"},
                 )
                 return
-            body = type(self).dag_run_response_body
-            if body is not None:
-                if isinstance(body, bytes):
-                    self._respond_bytes(200, body)
-                    return
-                self._respond(200, body)
+            if self._respond_with_body_override(type(self).dag_run_response_body):
                 return
             requested_run_id = (payload or {}).get("dag_run_id")
             if requested_run_id == "already-exists" or (payload or {}).get("conf", {}).get(
@@ -177,15 +172,9 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
             )
             return
         if request_path.endswith("/taskInstances"):
-            if not self._bearer_ok(authorization):
-                self._respond(401, {"detail": "expired"})
+            if not self._require_bearer(authorization):
                 return
-            body = type(self).task_instances_response_body
-            if body is not None:
-                if isinstance(body, bytes):
-                    self._respond_bytes(200, body)
-                    return
-                self._respond(200, body)
+            if self._respond_with_body_override(type(self).task_instances_response_body):
                 return
             page = self._task_instance_page(request_query)
             if page is None:
@@ -194,35 +183,22 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
             self._respond(200, page)
             return
         if "/dagRuns/" in self.path:
-            if not self._bearer_ok(authorization):
-                self._respond(401, {"detail": "expired"})
+            if not self._require_bearer(authorization):
                 return
-            if type(self).dag_run_response_body is not None:
-                body = type(self).dag_run_response_body
-                if isinstance(body, bytes):
-                    self._respond_bytes(200, body)
-                else:
-                    self._respond_bytes(200, json.dumps(body).encode())
+            if self._respond_with_body_override(type(self).dag_run_response_body):
                 return
             existing_run_id = self.path.rsplit("/", 1)[-1]
             self._respond(200, {"dag_run_id": existing_run_id, "state": "running"})
             return
         if "/dagRuns" in self.path:  # the run LIST (with or without ?limit=)
-            if not self._bearer_ok(authorization):
-                self._respond(401, {"detail": "expired"})
+            if not self._require_bearer(authorization):
                 return
-            if type(self).dag_run_response_body is not None:
-                body = type(self).dag_run_response_body
-                if isinstance(body, bytes):
-                    self._respond_bytes(200, body)
-                else:
-                    self._respond_bytes(200, json.dumps(body).encode())
+            if self._respond_with_body_override(type(self).dag_run_response_body):
                 return
             self._respond(200, {"dag_runs": [{"dag_run_id": "manual__1", "state": "success"}]})
             return
         if self.path.startswith("/api/v2/dags/"):
-            if not self._bearer_ok(authorization):
-                self._respond(401, {"detail": "expired"})
+            if not self._require_bearer(authorization):
                 return
             requested_dag_id = self.path.rsplit("/", 1)[-1]
             if requested_dag_id == "missing_dag":
@@ -263,8 +239,7 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
         payload = self._read_json()
         authorization = self._record(payload)
         if self.path.startswith("/api/v2/dags/"):
-            if not self._bearer_ok(authorization):
-                self._respond(401, {"detail": "expired"})
+            if not self._require_bearer(authorization):
                 return
             patch_redirect_status = type(self).patch_redirect_status
             if patch_redirect_status is not None:
@@ -279,6 +254,23 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
             return
         self._respond(404, {"detail": self.path})
 
+    def _require_bearer(self, authorization: str | None) -> bool:
+        """Answer 401 and return False unless ``authorization`` is a live token."""
+        if self._bearer_ok(authorization):
+            return True
+        self._respond(401, {"detail": "expired"})
+        return False
+
+    def _respond_with_body_override(self, body: dict[str, Any] | bytes | None) -> bool:
+        """Serve a test-supplied body verbatim, returning whether one was set."""
+        if body is None:
+            return False
+        if isinstance(body, bytes):
+            self._respond_bytes(200, body)
+        else:
+            self._respond(200, body)
+        return True
+
     def _bearer_ok(self, authorization: str | None) -> bool:
         if authorization is None or not authorization.startswith("Bearer "):
             return False
@@ -291,31 +283,23 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
         pass
 
 
+# Every knob a test can set on the stub, captured at its class default. A knob
+# added to the class is reset without also being listed here.
+_STUB_AIRFLOW_DEFAULTS = {
+    attribute_name: copy.copy(default_value)
+    for attribute_name, default_value in vars(_StubAirflowHandler).items()
+    if not attribute_name.startswith("_") and not callable(default_value)
+}
+
+
 def _reset_stub_airflow_state() -> None:
-    _StubAirflowHandler.issued_tokens = []
-    _StubAirflowHandler.requests_seen = []
-    _StubAirflowHandler.request_headers_seen = []
-    _StubAirflowHandler.healthy = True
-    _StubAirflowHandler.expire_first_token = False
-    _StubAirflowHandler.health_response_body = None
-    _StubAirflowHandler.health_delay_s = 0.0
-    _StubAirflowHandler.dag_run_response_body = None
-    _StubAirflowHandler.task_instances_response_body = None
-    _StubAirflowHandler.mapped_instance_count = 0
-    _StubAirflowHandler.task_instance_pages_served = []
-    _StubAirflowHandler.fail_task_instances_at_offset = None
-    _StubAirflowHandler.task_instance_page_overlap = 0
-    _StubAirflowHandler.task_instance_max_page_limit = None
-    _StubAirflowHandler.task_instance_omit_total = False
-    _StubAirflowHandler.task_instance_ignores_offset = False
-    _StubAirflowHandler.dag_run_redirect_status = None
-    _StubAirflowHandler.dag_run_redirect_location = None
-    _StubAirflowHandler.dag_run_failure_status = None
-    _StubAirflowHandler.patch_redirect_status = None
-    _StubAirflowHandler.patch_redirect_location = None
-    _StubAirflowHandler.health_redirect_location = None
-    _StubAirflowHandler.health_redirect_served = False
-    _StubAirflowHandler.missing_dag_response_body = None
+    for attribute_name, default_value in _STUB_AIRFLOW_DEFAULTS.items():
+        setattr(_StubAirflowHandler, attribute_name, copy.copy(default_value))
+
+
+def _requests_to(path_suffix: str) -> list[tuple[str, str, dict[str, Any] | None, str | None]]:
+    """Recorded requests whose path ends with ``path_suffix``, in arrival order."""
+    return [entry for entry in _StubAirflowHandler.requests_seen if entry[1].endswith(path_suffix)]
 
 
 @pytest.fixture(scope="module")
@@ -348,31 +332,18 @@ def test_trigger_fetches_token_once_and_sends_bearer(stub_server: str) -> None:
     assert first.state == "queued" and second.state == "queued"
     assert len(_StubAirflowHandler.issued_tokens) == 1  # token cached across calls
 
-    trigger_requests = [
-        entry for entry in _StubAirflowHandler.requests_seen if entry[1].endswith("/dagRuns")
-    ]
-    method, path, payload, authorization = trigger_requests[0]
-    assert (method, path) == ("POST", "/api/v2/dags/pipeline_ingest/dagRuns")
-    assert payload == {"logical_date": None, "conf": {"uris": ["a.mcap"]}}
-    assert authorization == "Bearer token-0"
-
-
-def test_request_header_and_body_shape_is_preserved(stub_server: str) -> None:
-    client = AirflowClient(stub_server, "airflow", "right-password")
-
-    client.trigger_dag_run("pipeline_ingest", conf={"uris": ["a.mcap"]})
-
     trigger_index = next(
         index
         for index, entry in enumerate(_StubAirflowHandler.requests_seen)
         if entry[1].endswith("/dagRuns")
     )
-    _method, _path, payload, authorization = _StubAirflowHandler.requests_seen[trigger_index]
+    method, path, payload, authorization = _StubAirflowHandler.requests_seen[trigger_index]
+    assert (method, path) == ("POST", "/api/v2/dags/pipeline_ingest/dagRuns")
+    assert payload == {"logical_date": None, "conf": {"uris": ["a.mcap"]}}
+    assert authorization == "Bearer token-0"
     headers = _StubAirflowHandler.request_headers_seen[trigger_index]
     assert headers["Accept"] == "application/json"
     assert headers["Content-Type"] == "application/json"
-    assert authorization == "Bearer token-0"
-    assert payload == {"logical_date": None, "conf": {"uris": ["a.mcap"]}}
 
 
 def test_dag_get_request(stub_server: str) -> None:
@@ -408,10 +379,7 @@ def test_unpause_dag_patch_request(stub_server: str) -> None:
 
 
 def test_connection_error_maps_to_typed_client_error() -> None:
-    with socket.socket() as port_probe:
-        port_probe.bind(("127.0.0.1", 0))
-        unused_port = port_probe.getsockname()[1]
-    client = AirflowClient(f"http://127.0.0.1:{unused_port}", "airflow", "right-password")
+    client = AirflowClient(f"http://127.0.0.1:{unused_local_port()}", "airflow", "right-password")
 
     with pytest.raises(AirflowClientError) as error_info:
         client.health()
@@ -423,16 +391,11 @@ def test_connection_error_maps_to_typed_client_error() -> None:
 
 def test_request_timeout_expiry_maps_to_typed_client_error(stub_server: str) -> None:
     _StubAirflowHandler.health_delay_s = 0.2
-    try:
-        with (
-            AirflowClient(
-                stub_server, "airflow", "right-password", request_timeout_s=0.01
-            ) as client,
-            pytest.raises(AirflowClientError) as error_info,
-        ):
-            client.health()
-    finally:
-        _StubAirflowHandler.health_delay_s = 0.0
+    with (
+        AirflowClient(stub_server, "airflow", "right-password", request_timeout_s=0.01) as client,
+        pytest.raises(AirflowClientError) as error_info,
+    ):
+        client.health()
 
     assert error_info.value.status is None
     assert error_info.value.body == ""
@@ -443,7 +406,6 @@ def test_request_timeout_expiry_maps_to_typed_client_error(stub_server: str) -> 
 def test_expired_token_is_refreshed_once(stub_server: str) -> None:
     _StubAirflowHandler.expire_first_token = True
     client = AirflowClient(stub_server, "airflow", "right-password")
-    client._token = None  # force initial fetch
     result = client.trigger_dag_run("pipeline_ingest")
     assert result.state == "queued"
     assert len(_StubAirflowHandler.issued_tokens) == 2  # refreshed exactly once
@@ -643,44 +605,32 @@ def test_ingest_rejects_invalid_uri_before_making_http_requests(stub_server: str
 
 
 @pytest.mark.parametrize(
-    "uri",
+    ("uri", "uri_in_trigger_conf"),
     [
-        "episodes-in/run_0001.mcap",
+        ("episodes-in/run_0001.mcap", "episodes-in/run_0001.mcap"),
         # Not a drive: two letters before the colon. A coarser "contains a
         # colon" or "second character is a colon" rule would refuse these,
         # and they are legal relative paths on a POSIX data root.
-        "CC:/notadrive/a.mcap",
-        "file:with:colons.mcap",
+        ("CC:/notadrive/a.mcap", "CC:/notadrive/a.mcap"),
+        ("file:with:colons.mcap", "file:with:colons.mcap"),
         # A safe internal segment: refused would be wrong, and rewriting it to
         # 'b.mcap' would change the persisted identity (#314 non-goal).
-        "a/../b.mcap",
+        ("a/../b.mcap", "a/../b.mcap"),
+        # Surrounding whitespace is the one rewrite: it is trimmed.
+        pytest.param("  a.mcap  ", "a.mcap", id="surrounding-whitespace-trimmed"),
     ],
 )
-def test_ingest_accepts_safe_uris_unchanged(stub_server: str, uri: str) -> None:
+def test_ingest_sends_safe_uris_in_trigger_conf(
+    stub_server: str, uri: str, uri_in_trigger_conf: str
+) -> None:
     client = AirflowClient(stub_server, "airflow", "right-password")
 
     client.ingest("pipeline_ingest", [uri])
 
-    trigger_request = next(
-        entry for entry in _StubAirflowHandler.requests_seen if entry[1].endswith("/dagRuns")
-    )
+    trigger_request = _requests_to("/dagRuns")[0]
     assert trigger_request[2] == {
         "logical_date": None,
-        "conf": {"uris": [uri], "profile": "full", "mode": "batch"},
-    }
-
-
-def test_ingest_trims_surrounding_uri_whitespace_in_trigger_conf(stub_server: str) -> None:
-    client = AirflowClient(stub_server, "airflow", "right-password")
-
-    client.ingest("pipeline_ingest", ["  a.mcap  "])
-
-    trigger_request = next(
-        entry for entry in _StubAirflowHandler.requests_seen if entry[1].endswith("/dagRuns")
-    )
-    assert trigger_request[2] == {
-        "logical_date": None,
-        "conf": {"uris": ["a.mcap"], "profile": "full", "mode": "batch"},
+        "conf": {"uris": [uri_in_trigger_conf], "profile": "full", "mode": "batch"},
     }
 
 
@@ -693,9 +643,7 @@ def test_ingest_serializes_selected_step_names(stub_server: str) -> None:
         step_names=("camera_integrity", "hand_activity"),
     )
 
-    trigger_request = next(
-        entry for entry in _StubAirflowHandler.requests_seen if entry[1].endswith("/dagRuns")
-    )
+    trigger_request = _requests_to("/dagRuns")[0]
     assert trigger_request[2] == {
         "logical_date": None,
         "conf": {
@@ -750,12 +698,8 @@ def test_post_redirect_is_refused_without_rewrite_to_get(stub_server: str) -> No
         client.trigger_dag_run("pipeline_ingest")
 
     assert error_info.value.status == 307
-    trigger_requests = [
-        entry for entry in _StubAirflowHandler.requests_seen if entry[1].endswith("/dagRuns")
-    ]
-    redirected_requests = [
-        entry for entry in _StubAirflowHandler.requests_seen if entry[1] == "/api/v2/redirected"
-    ]
+    trigger_requests = _requests_to("/dagRuns")
+    redirected_requests = _requests_to("/api/v2/redirected")
     assert len(trigger_requests) == 1
     assert redirected_requests == []
 
@@ -817,9 +761,7 @@ def test_post_is_sent_once_on_server_failure(stub_server: str) -> None:
         client.trigger_dag_run("pipeline_ingest")
 
     assert error_info.value.status == 503
-    trigger_requests = [
-        entry for entry in _StubAirflowHandler.requests_seen if entry[1].endswith("/dagRuns")
-    ]
+    trigger_requests = _requests_to("/dagRuns")
     assert len(trigger_requests) == 1
 
 
@@ -897,9 +839,7 @@ def test_bearer_token_auth_never_calls_the_token_endpoint(stub_server: str) -> N
     client = AirflowClient(stub_server, auth=BearerToken("pre-issued-token"))
     result = client.trigger_dag_run("pipeline_ingest")
     assert result.state == "queued"
-    token_endpoint_requests = [
-        entry for entry in _StubAirflowHandler.requests_seen if entry[1] == "/auth/token"
-    ]
+    token_endpoint_requests = _requests_to("/auth/token")
     assert token_endpoint_requests == []
 
 
@@ -908,9 +848,7 @@ def test_rejected_bearer_token_fails_without_a_refresh_loop(stub_server: str) ->
     with pytest.raises(AirflowClientError, match="expired or invalid"):
         client.trigger_dag_run("pipeline_ingest")
     # Exactly one request went out: retrying the same token bytes is useless.
-    trigger_requests = [
-        entry for entry in _StubAirflowHandler.requests_seen if entry[1].endswith("/dagRuns")
-    ]
+    trigger_requests = _requests_to("/dagRuns")
     assert len(trigger_requests) == 1
 
 
@@ -1054,11 +992,8 @@ def test_describe_remote_status_reports_health_dag_and_recent_runs(stub_server: 
 def test_describe_remote_status_reports_an_unreachable_endpoint() -> None:
     """The primary operator-facing failure: the workspace is down or the URL
     is wrong. Status must report it, never raise."""
-    with socket.socket() as port_probe:  # find a port with no listener
-        port_probe.bind(("127.0.0.1", 0))
-        unused_port = port_probe.getsockname()[1]
     endpoint = RemoteRuntimeEndpoint(
-        base_url=f"http://127.0.0.1:{unused_port}",
+        base_url=f"http://127.0.0.1:{unused_local_port()}",
         dag_id="pipeline_ingest",
         auth=BearerToken("irrelevant"),
     )
@@ -1081,16 +1016,6 @@ def test_describe_remote_status_reports_an_unavailable_dag(stub_server: str) -> 
 
 
 def test_wait_until_healthy_times_out_with_last_status(stub_server: str) -> None:
-    class InstantlyAdvancingClock:
-        def __init__(self) -> None:
-            self.current_time_s = 0.0
-
-        def monotonic(self) -> float:
-            return self.current_time_s
-
-        def sleep(self, duration_s: float) -> None:
-            self.current_time_s += duration_s
-
     _StubAirflowHandler.healthy = False
     client = AirflowClient(stub_server, "airflow", "right-password")
     instantly_advancing_clock = InstantlyAdvancingClock()

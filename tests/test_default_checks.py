@@ -165,22 +165,7 @@ def test_a_default_yields_to_a_pipeline_step_measuring_the_same_thing(
     assert "default_checks" in superseded.not_run.reason
     # The pipeline's own measurements survive intact.
     assert any(key.endswith("/median_dt_s") for key in by_name["timestamps"].result.measurements)
-
-
-def test_a_default_that_does_not_overlap_keeps_running(
-    source_episode: Path, tmp_path: Path
-) -> None:
-    """Only the overlapping default yields; the rest of the baseline stands."""
-    app = hflow.App("partial-overlap", data_root=tmp_path / "data")
-
-    @app.check(version="1")
-    async def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
-        return await hflow.checks.timestamp_regularity(ep)
-
-    report = asyncio.run(app.test(source_episode, verbose=False))
-
-    by_name = {run.check.name: run for run in report.checks}
-    assert by_name["timestamp_regularity"].status is hflow.CheckStatus.SUPERSEDED
+    # Only the overlapping default yields; the rest of the baseline stands.
     assert by_name["episode_duration"].result is not None
     assert by_name["content_digest"].result is not None
 
@@ -278,6 +263,10 @@ def test_a_wrapper_with_non_default_parameters_supersedes_the_default_without_ru
     assert isinstance(default.not_run, hflow.SupersededByPipeline)
     assert "default_checks" in default.not_run.reason
     assert default.duration_s == pytest.approx(0.0)
+    # The pre-execution path records the overlapping keys, the same shape the
+    # post-execution backstop produces, so the planner, the catalog, and
+    # downstream consumers see one "superseded by the pipeline" either way.
+    assert any(key.endswith("/decoded_frame_count") for key in default.not_run.superseded_keys)
 
 
 def test_a_wrapper_with_default_parameters_uses_the_post_execution_backstop(
@@ -312,6 +301,8 @@ def test_a_wrapper_with_default_parameters_uses_the_post_execution_backstop(
     # message names the source ("default_checks") and the user can grep
     # for it.
     assert "default_checks" in default.not_run.reason
+    # So is the overlapping key list.
+    assert any(key.endswith("/decoded_frame_count") for key in default.not_run.superseded_keys)
 
 
 def test_a_non_overlapping_user_step_does_not_supersede(
@@ -331,30 +322,6 @@ def test_a_non_overlapping_user_step_does_not_supersede(
     by_name = {run.check.name: run for run in report.checks}
     assert by_name["camera_frame_stats"].result is not None
     assert by_name["unrelated"].result is not None
-
-
-def test_superseded_default_reports_the_overlapping_keys(
-    camera_source: Path, tmp_path: Path
-) -> None:
-    """The post-execution backstop also records the overlapping key list;
-    the pre-execution path must produce the same information so the
-    planner, the catalog, and downstream consumers see one shape for
-    "superseded by the pipeline" regardless of which path fired."""
-    app = hflow.App("keys-listed", data_root=tmp_path / "data")
-
-    @app.check(version="1")
-    async def camera_health(ep: hflow.Episode) -> hflow.CheckResult:
-        return await hflow.checks.camera_frame_stats(ep, freeze_min_duration_s=2.0)
-
-    report = asyncio.run(app.test(camera_source, verbose=False))
-    by_name = {run.check.name: run for run in report.checks}
-    superseded = by_name["camera_frame_stats"].not_run
-    assert isinstance(superseded, hflow.SupersededByPipeline)
-    # At least one ``/decoded_frame_count``-shaped key survived, and the
-    # default's per-camera expected/deficit and luma keys are all in the
-    # overlapping list.
-    assert len(superseded.superseded_keys) > 0
-    assert any(key.endswith("/decoded_frame_count") for key in superseded.superseded_keys)
 
 
 def test_partial_camera_coverage_drops_the_uncovered_camera_too(tmp_path: Path) -> None:

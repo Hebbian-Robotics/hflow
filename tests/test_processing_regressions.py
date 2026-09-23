@@ -647,62 +647,66 @@ def test_two_steps_may_share_a_tag(tmp_path: Path) -> None:
     assert not report.has_errors
 
 
-def test_check_with_required_extra_parameter_fails_at_registration() -> None:
+def _check_requiring_topics(ep: hflow.Episode, *, topics: list[str]) -> hflow.CheckResult:
+    return hflow.CheckResult(measurements={"n": len(topics)})
+
+
+def _check_without_an_episode() -> hflow.CheckResult:
+    return hflow.CheckResult(measurements={"n": 1})
+
+
+def _check_taking_only_kwargs(**kwargs: object) -> hflow.CheckResult:
+    return hflow.CheckResult(measurements={"n": len(kwargs)})
+
+
+async def _check_with_an_optional_topic(
+    ep: hflow.Episode, *, topics: tuple[str, ...] = ("/joint_states",)
+) -> hflow.CheckResult:
+    return hflow.CheckResult(measurements={"n": len(topics)})
+
+
+async def _check_taking_varargs(*args: object) -> hflow.CheckResult:
+    return hflow.CheckResult(measurements={"n": len(args)})
+
+
+@pytest.mark.parametrize(
+    ("check_function", "message"),
+    [
+        pytest.param(_check_requiring_topics, "topics", id="required-extra-parameter"),
+        pytest.param(_check_without_an_episode, "cannot accept the episode", id="no-episode"),
+        pytest.param(_check_taking_only_kwargs, "cannot accept the episode", id="only-kwargs"),
+    ],
+)
+def test_a_check_the_runtime_cannot_call_fails_at_registration(
+    check_function: object, message: str
+) -> None:
     app = hflow.App("signature-guard", data_root=Path("/tmp"), default_checks=())
 
-    def requires_topics(ep: hflow.Episode, *, topics: list[str]) -> hflow.CheckResult:
-        return hflow.CheckResult(measurements={"n": len(topics)})
-
-    with pytest.raises(ValueError, match="topics"):
-        app.check(version="1")(cast(hflow.steps.CheckFunction, requires_topics))
+    with pytest.raises(ValueError, match=message):
+        app.check(version="1")(cast(hflow.steps.CheckFunction, check_function))
 
     assert app.checks == []
 
 
-def test_check_with_optional_extra_parameter_registers() -> None:
-    app = hflow.App("signature-optional", data_root=Path("/tmp"), default_checks=())
+@pytest.mark.parametrize(
+    ("check_function", "expected_name"),
+    [
+        pytest.param(
+            _check_with_an_optional_topic,
+            "_check_with_an_optional_topic",
+            id="optional-extra-parameter",
+        ),
+        pytest.param(_check_taking_varargs, "_check_taking_varargs", id="varargs"),
+    ],
+)
+def test_a_check_the_runtime_can_call_registers(
+    check_function: hflow.steps.CheckFunction, expected_name: str
+) -> None:
+    app = hflow.App("signature-accepted", data_root=Path("/tmp"), default_checks=())
 
-    @app.check(version="1")
-    async def optional_topic(
-        ep: hflow.Episode, *, topics: tuple[str, ...] = ("/joint_states",)
-    ) -> hflow.CheckResult:
-        return hflow.CheckResult(measurements={"n": len(topics)})
+    app.check(version="1")(check_function)
 
-    assert {check.name for check in app.checks} == {"optional_topic"}
-
-
-def test_check_without_episode_parameter_fails_at_registration() -> None:
-    app = hflow.App("signature-zeroarg", data_root=Path("/tmp"), default_checks=())
-
-    def no_episode() -> hflow.CheckResult:
-        return hflow.CheckResult(measurements={"n": 1})
-
-    with pytest.raises(ValueError, match="cannot accept the episode"):
-        app.check(version="1")(cast(hflow.steps.CheckFunction, no_episode))
-
-    assert app.checks == []
-
-
-def test_check_with_only_kwargs_fails_at_registration() -> None:
-    app = hflow.App("signature-kwargs-only", data_root=Path("/tmp"), default_checks=())
-
-    def kwargs_only(**kwargs: object) -> hflow.CheckResult:
-        return hflow.CheckResult(measurements={"n": len(kwargs)})
-
-    with pytest.raises(ValueError, match="cannot accept the episode"):
-        app.check(version="1")(cast(hflow.steps.CheckFunction, kwargs_only))
-
-    assert app.checks == []
-
-
-def test_check_with_varargs_registers() -> None:
-    app = hflow.App("signature-varargs", data_root=Path("/tmp"), default_checks=())
-
-    @app.check(version="1")
-    async def varargs_check(*args: object) -> hflow.CheckResult:
-        return hflow.CheckResult(measurements={"n": len(args)})
-
-    assert {check.name for check in app.checks} == {"varargs_check"}
+    assert [check.name for check in app.checks] == [expected_name]
 
 
 def test_check_whose_episode_parameter_has_a_default_registers_and_runs() -> None:

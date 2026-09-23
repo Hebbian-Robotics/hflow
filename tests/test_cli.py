@@ -18,21 +18,6 @@ from hflow.transform import write_canonical_episode
         ("down", "Stop the local Docker Compose runtime rendered by `hflow up`"),
         ("ingest", "Submit one or more episode URIs to the master ingest DAG"),
         ("status", "Inspect the health of the local or remote Airflow runtime"),
-    ],
-)
-def test_runtime_command_help_has_a_description(
-    command: str, expected_description: str, capsys: CaptureFixture
-) -> None:
-    with pytest.raises(SystemExit) as exception:
-        _build_parser().parse_args([command, "--help"])
-
-    assert exception.value.code == 0
-    assert expected_description in capsys.readouterr().out
-
-
-@pytest.mark.parametrize(
-    ("command", "expected_description"),
-    [
         ("catalog", "Group commands for inspecting and exploring the append-only"),
         ("dataset", "Group commands that turn the pipeline's policy into version-pinned"),
         ("export", "Group commands for exporting catalog selections in portable downstream"),
@@ -40,7 +25,7 @@ def test_runtime_command_help_has_a_description(
         ("serve", "Serve this workspace over HTTP with REST endpoints over the catalog"),
     ],
 )
-def test_top_level_command_help_has_a_description(
+def test_command_help_has_a_description(
     command: str, expected_description: str, capsys: CaptureFixture
 ) -> None:
     with pytest.raises(SystemExit) as exception:

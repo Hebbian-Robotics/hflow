@@ -7,15 +7,34 @@ are stubbed at the AirflowClient method level.
 
 import sys
 import types
+from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 
 import pytest
+from runtime_test_helpers import InstantlyAdvancingClock, read_env_file_values
 
 import hflow
+import hflow.runtime._endpoint as endpoint_module
+import hflow.runtime._lifecycle as lifecycle_module
+from hflow import import_pipeline_application
 from hflow.app import parse_pipeline_spec, resolve_pipeline_spec_for_rendering
 from hflow.cli import main
-from hflow.runtime import AirflowDagRun, AirflowHealth, RuntimeConfig, render_bundle
+from hflow.runtime import (
+    AirflowDagRun,
+    AirflowHealth,
+    BearerToken,
+    RemoteRuntimeEndpoint,
+    RuntimeConfig,
+    describe_remote_status,
+    describe_runtime_status,
+    load_bundle,
+    render_bundle,
+    start_runtime,
+)
 from hflow.runtime._client import AirflowClient, AirflowClientError, PasswordCredentials
+from hflow.runtime._endpoint import AIRFLOW_TOKEN_ENVIRONMENT_VARIABLE
+from hflow.runtime._lifecycle import _wait_until_dag_registered
 
 HEALTHY = AirflowHealth(
     components={
@@ -69,6 +88,85 @@ def _rendered_bundle(tmp_path: Path, pipeline_file: Path) -> Path:
         RuntimeConfig(pipeline_file=pipeline_file, data_root=tmp_path / "data"), bundle_dir
     )
     return bundle_dir
+
+
+def _up_arguments(pipeline_file: Path, tmp_path: Path, bundle_dir: Path, *extra: str) -> list[str]:
+    """``hflow up`` for ``pipeline_file`` over ``tmp_path/data``, rendering into ``bundle_dir``."""
+    return [
+        "up",
+        "--pipeline",
+        str(pipeline_file),
+        "--data-root",
+        str(tmp_path / "data"),
+        "--bundle-dir",
+        str(bundle_dir),
+        *extra,
+    ]
+
+
+def _queued_run(dag_run_id: str, state: str = "queued") -> AirflowDagRun:
+    return AirflowDagRun(
+        dag_run_id=dag_run_id,
+        state=state,
+        logical_date=None,
+        start_date=None,
+        end_date=None,
+        conf={},
+    )
+
+
+@dataclass(frozen=True)
+class _RecordedIngest:
+    client: AirflowClient
+    dag_id: str
+    uris: list[str]
+    profile: str
+    online: bool
+
+
+RECORDED_INGEST_RUN_ID = "manual__recorded"
+
+
+@pytest.fixture
+def recorded_ingests(monkeypatch: pytest.MonkeyPatch) -> list[_RecordedIngest]:
+    """Every ``AirflowClient.ingest`` call, answered with a queued run."""
+    recorded: list[_RecordedIngest] = []
+
+    def record_ingest(
+        self: AirflowClient,
+        dag_id: str,
+        uris: list[str],
+        *,
+        profile: str = "full",
+        online: bool = False,
+        dag_run_id: str | None = None,
+    ) -> AirflowDagRun:
+        recorded.append(_RecordedIngest(self, dag_id, list(uris), profile, online))
+        return _queued_run(RECORDED_INGEST_RUN_ID)
+
+    monkeypatch.setattr(AirflowClient, "ingest", record_ingest)
+    return recorded
+
+
+def _track_created_clients(
+    monkeypatch: pytest.MonkeyPatch, factory_module: ModuleType, factory_name: str
+) -> list[AirflowClient]:
+    """Wrap a client factory so the test can inspect every client it built."""
+    created_clients: list[AirflowClient] = []
+    original_factory = getattr(factory_module, factory_name)
+
+    def tracking_factory(*arguments: object) -> AirflowClient:
+        client = original_factory(*arguments)
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr(factory_module, factory_name, tracking_factory)
+    return created_clients
+
+
+def _assert_closed(client: AirflowClient) -> None:
+    with pytest.raises(RuntimeError, match="client has been closed"):
+        client.task_instances("d", "r")
 
 
 def test_parse_pipeline_spec_variants() -> None:
@@ -157,8 +255,6 @@ class TestNamingTheAppInARenderedBundle:
 def test_addressing_a_pipeline_by_spec_string_imports_its_siblings(tmp_path: Path) -> None:
     # The same multi-file guarantee the runtime path has: `hflow manifest`,
     # `hflow stale --pipeline`, and `hflow serve --pipeline` all arrive here.
-    from hflow import import_pipeline_application
-
     (tmp_path / "rig_constants.py").write_text("FLEET_NAME = 'kitchen'\n")
     pipeline_file = tmp_path / "pipeline.py"
     pipeline_file.write_text(
@@ -215,8 +311,6 @@ def test_start_runtime_emits_progress_events_in_phase_order(
     pipeline_file: Path,
     tmp_path: Path,
 ) -> None:
-    from hflow.runtime import start_runtime
-
     progress_events: list[str] = []
     start_runtime(
         RuntimeConfig(pipeline_file=pipeline_file, data_root=tmp_path / "data"),
@@ -239,8 +333,6 @@ def test_start_runtime_ticks_health_summaries_while_waiting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The health wait narrates its latest summary on a throttled heartbeat."""
-    from hflow.runtime import start_runtime
-
     unhealthy = AirflowHealth(
         components={
             "metadatabase": "healthy",
@@ -274,8 +366,6 @@ def test_start_runtime_stays_silent_without_a_callback(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """on_progress defaults to None: no narration anywhere, contract unchanged."""
-    from hflow.runtime import start_runtime
-
     paths, health = start_runtime(
         RuntimeConfig(pipeline_file=pipeline_file, data_root=tmp_path / "data"),
         tmp_path / "bundle",
@@ -298,17 +388,7 @@ def test_up_honors_bundle_dir_and_hflow_source(
     source_dir.mkdir()
     (source_dir / "pyproject.toml").write_text('[project]\nname = "hflow"\n')
     exit_code = main(
-        [
-            "up",
-            "--pipeline",
-            str(pipeline_file),
-            "--data-root",
-            str(tmp_path / "data"),
-            "--bundle-dir",
-            str(bundle_dir),
-            "--hflow-source",
-            str(source_dir),
-        ]
+        _up_arguments(pipeline_file, tmp_path, bundle_dir, "--hflow-source", str(source_dir))
     )
     assert exit_code == 0
     compose_text = (bundle_dir / "docker-compose.yaml").read_text()
@@ -316,52 +396,27 @@ def test_up_honors_bundle_dir_and_hflow_source(
     assert compose_calls[0][0] == str(bundle_dir / "docker-compose.yaml")
 
 
-def test_up_api_port_reaches_the_rendered_env(
+@pytest.mark.parametrize(
+    ("api_port_arguments", "expected_env_line"),
+    [
+        # --api-port is the whole point: it has to land in the bundle's .env.
+        pytest.param(("--api-port", "9090"), "API_PORT=9090", id="api-port-reaches-env"),
+        # The flag is additive: omitting it has to leave existing bundles where they were.
+        pytest.param((), "API_PORT=8080", id="default-stays-8080"),
+    ],
+)
+def test_up_api_port_in_the_rendered_env(
     compose_calls: list[list[str]],
     healthy_client: None,
     pipeline_file: Path,
     tmp_path: Path,
+    api_port_arguments: tuple[str, ...],
+    expected_env_line: str,
 ) -> None:
-    """--api-port is the whole point: it has to land in the bundle's .env."""
     bundle_dir = tmp_path / "runtime"
-    exit_code = main(
-        [
-            "up",
-            "--pipeline",
-            str(pipeline_file),
-            "--data-root",
-            str(tmp_path / "data"),
-            "--bundle-dir",
-            str(bundle_dir),
-            "--api-port",
-            "9090",
-        ]
-    )
+    exit_code = main(_up_arguments(pipeline_file, tmp_path, bundle_dir, *api_port_arguments))
     assert exit_code == 0
-    assert "API_PORT=9090" in (bundle_dir / ".env").read_text()
-
-
-def test_up_without_api_port_keeps_8080(
-    compose_calls: list[list[str]],
-    healthy_client: None,
-    pipeline_file: Path,
-    tmp_path: Path,
-) -> None:
-    """The flag is additive: omitting it has to leave existing bundles where they were."""
-    bundle_dir = tmp_path / "runtime"
-    exit_code = main(
-        [
-            "up",
-            "--pipeline",
-            str(pipeline_file),
-            "--data-root",
-            str(tmp_path / "data"),
-            "--bundle-dir",
-            str(bundle_dir),
-        ]
-    )
-    assert exit_code == 0
-    assert "API_PORT=8080" in (bundle_dir / ".env").read_text()
+    assert expected_env_line in (bundle_dir / ".env").read_text()
 
 
 def test_up_api_port_does_not_rewrite_a_preserved_env(
@@ -378,15 +433,7 @@ def test_up_api_port_does_not_rewrite_a_preserved_env(
     true rather than a claim.
     """
     bundle_dir = tmp_path / "runtime"
-    common = [
-        "up",
-        "--pipeline",
-        str(pipeline_file),
-        "--data-root",
-        str(tmp_path / "data"),
-        "--bundle-dir",
-        str(bundle_dir),
-    ]
+    common = _up_arguments(pipeline_file, tmp_path, bundle_dir)
     assert main([*common, "--api-port", "9090"]) == 0
     assert main([*common, "--api-port", "9091"]) == 0
     assert "API_PORT=9090" in (bundle_dir / ".env").read_text()
@@ -406,19 +453,7 @@ def test_up_rejects_an_out_of_range_api_port_before_rendering(
     to explain.
     """
     bundle_dir = tmp_path / "runtime"
-    exit_code = main(
-        [
-            "up",
-            "--pipeline",
-            str(pipeline_file),
-            "--data-root",
-            str(tmp_path / "data"),
-            "--bundle-dir",
-            str(bundle_dir),
-            "--api-port",
-            "70000",
-        ]
-    )
+    exit_code = main(_up_arguments(pipeline_file, tmp_path, bundle_dir, "--api-port", "70000"))
     assert exit_code == 2
     assert not bundle_dir.exists()
     assert compose_calls == []
@@ -444,15 +479,7 @@ def test_up_rejects_an_out_of_range_api_port_on_an_existing_bundle(
     preserved .env is left exactly as it was.
     """
     bundle_dir = tmp_path / "runtime"
-    common = [
-        "up",
-        "--pipeline",
-        str(pipeline_file),
-        "--data-root",
-        str(tmp_path / "data"),
-        "--bundle-dir",
-        str(bundle_dir),
-    ]
+    common = _up_arguments(pipeline_file, tmp_path, bundle_dir)
     assert main([*common, "--api-port", "9090"]) == 0
     calls_after_first_up = len(compose_calls)
 
@@ -479,17 +506,7 @@ def test_up_reports_a_missing_pipeline_file_as_bad_input(
     missing = tmp_path / "no-such-pipeline.py"
     bundle_dir = tmp_path / "runtime"
 
-    exit_code = main(
-        [
-            "up",
-            "--pipeline",
-            str(missing),
-            "--data-root",
-            str(tmp_path / "data"),
-            "--bundle-dir",
-            str(bundle_dir),
-        ]
-    )
+    exit_code = main(_up_arguments(missing, tmp_path, bundle_dir))
 
     assert exit_code == 2
     assert not bundle_dir.exists()
@@ -601,17 +618,7 @@ def test_up_from_published_install_uses_matching_distribution(
 ) -> None:
     monkeypatch.setattr("hflow.runtime.infer_hflow_source", lambda: None)
     bundle_dir = tmp_path / "published-bundle"
-    exit_code = main(
-        [
-            "up",
-            "--pipeline",
-            str(pipeline_file),
-            "--data-root",
-            str(tmp_path / "data"),
-            "--bundle-dir",
-            str(bundle_dir),
-        ]
-    )
+    exit_code = main(_up_arguments(pipeline_file, tmp_path, bundle_dir))
     assert exit_code == 0
     compose_text = (bundle_dir / "docker-compose.yaml").read_text()
     assert f"hflow_install_target='hflow=={hflow.__version__}'" in compose_text
@@ -631,92 +638,41 @@ def test_down_invokes_compose_down(
 
 
 def test_ingest_uses_env_credentials_and_dag_id(
-    monkeypatch: pytest.MonkeyPatch,
+    recorded_ingests: list[_RecordedIngest],
     pipeline_file: Path,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     bundle_dir = _rendered_bundle(tmp_path, pipeline_file)
-    env_values = dict(
-        line.split("=", 1)
-        for line in (bundle_dir / ".env").read_text().splitlines()
-        if line and not line.startswith("#")
-    )
-    captured: dict[str, object] = {}
+    env_values = read_env_file_values(bundle_dir / ".env")
 
-    def fake_ingest(
-        self: AirflowClient,
-        dag_id: str,
-        uris: list[str],
-        *,
-        profile: str = "full",
-        online: bool = False,
-        dag_run_id: str | None = None,
-    ) -> AirflowDagRun:
-        client_auth = self._auth
-        assert isinstance(client_auth, PasswordCredentials)
-        captured["credentials"] = (client_auth.username, client_auth.password)
-        captured["dag_id"] = dag_id
-        captured["uris"] = uris
-        captured["profile"] = profile
-        captured["online"] = online
-        return AirflowDagRun(
-            dag_run_id="manual__test",
-            state="queued",
-            logical_date=None,
-            start_date=None,
-            end_date=None,
-            conf={},
-        )
-
-    monkeypatch.setattr(AirflowClient, "ingest", fake_ingest)
     exit_code = main(["ingest", "  a.mcap  ", "sub/b.mcap", "--bundle-dir", str(bundle_dir)])
     assert exit_code == 0
-    assert captured["credentials"] == ("airflow", env_values["AIRFLOW_ADMIN_PASSWORD"])
-    assert captured["dag_id"] == "demo_pipeline_ingest"
-    assert captured["uris"] == ["a.mcap", "sub/b.mcap"]
+    (recorded,) = recorded_ingests
+    client_auth = recorded.client._auth
+    assert isinstance(client_auth, PasswordCredentials)
+    assert (client_auth.username, client_auth.password) == (
+        "airflow",
+        env_values["AIRFLOW_ADMIN_PASSWORD"],
+    )
+    assert recorded.dag_id == "demo_pipeline_ingest"
+    assert recorded.uris == ["a.mcap", "sub/b.mcap"]
     # Defaults: the full profile over the batch lane.
-    assert captured["profile"] == "full"
-    assert captured["online"] is False
+    assert recorded.profile == "full"
+    assert recorded.online is False
     output = capsys.readouterr().out
-    assert "manual__test" in output
+    assert RECORDED_INGEST_RUN_ID in output
     assert "profile full, batch lane" in output
 
 
 def test_ingest_targets_a_remote_endpoint_without_any_bundle(
+    recorded_ingests: list[_RecordedIngest],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The hosted addressing path: --airflow-url + --dag-id + an environment
     credential drive a remote workspace with no local bundle directory at
     all. Credentials never travel via argv."""
-    from hflow.runtime import BearerToken
-
-    captured: dict[str, object] = {}
-
-    def fake_ingest(
-        self: AirflowClient,
-        dag_id: str,
-        uris: list[str],
-        *,
-        profile: str = "full",
-        online: bool = False,
-        dag_run_id: str | None = None,
-    ) -> AirflowDagRun:
-        captured["base_url"] = self.base_url
-        captured["auth"] = self._auth
-        captured["dag_id"] = dag_id
-        captured["uris"] = uris
-        return AirflowDagRun(
-            dag_run_id="manual__remote",
-            state="queued",
-            logical_date=None,
-            start_date=None,
-            end_date=None,
-            conf={},
-        )
-
-    monkeypatch.setattr(AirflowClient, "ingest", fake_ingest)
     monkeypatch.setenv("HFLOW_AIRFLOW_TOKEN", "minted-token")
     exit_code = main(
         [
@@ -729,12 +685,13 @@ def test_ingest_targets_a_remote_endpoint_without_any_bundle(
         ]
     )
     assert exit_code == 0
-    assert captured["base_url"] == "https://workspace.example.com"
-    assert captured["auth"] == BearerToken("minted-token")
-    assert captured["dag_id"] == "kitchen_ingest"
-    assert captured["uris"] == ["episodes-in/a.mcap"]
+    (recorded,) = recorded_ingests
+    assert recorded.client.base_url == "https://workspace.example.com"
+    assert recorded.client._auth == BearerToken("minted-token")
+    assert recorded.dag_id == "kitchen_ingest"
+    assert recorded.uris == ["episodes-in/a.mcap"]
     output = capsys.readouterr().out
-    assert "manual__remote" in output
+    assert RECORDED_INGEST_RUN_ID in output
     assert "watch it at https://workspace.example.com" in output
 
 
@@ -781,6 +738,7 @@ def test_ingest_remote_with_hostless_url_names_the_fix(
 
 
 def test_explicit_bundle_dir_stays_local_even_with_remote_environment(
+    recorded_ingests: list[_RecordedIngest],
     monkeypatch: pytest.MonkeyPatch,
     pipeline_file: Path,
     tmp_path: Path,
@@ -790,31 +748,11 @@ def test_explicit_bundle_dir_stays_local_even_with_remote_environment(
     explicitly addressed a local bundle."""
     bundle_dir = _rendered_bundle(tmp_path, pipeline_file)
     monkeypatch.setenv("HFLOW_AIRFLOW_URL", "https://workspace.example.com")
-    captured: dict[str, object] = {}
 
-    def fake_ingest(
-        self: AirflowClient,
-        dag_id: str,
-        uris: list[str],
-        *,
-        profile: str = "full",
-        online: bool = False,
-        dag_run_id: str | None = None,
-    ) -> AirflowDagRun:
-        captured["base_url"] = self.base_url
-        return AirflowDagRun(
-            dag_run_id="manual__local",
-            state="queued",
-            logical_date=None,
-            start_date=None,
-            end_date=None,
-            conf={},
-        )
-
-    monkeypatch.setattr(AirflowClient, "ingest", fake_ingest)
     assert main(["ingest", "a.mcap", "--bundle-dir", str(bundle_dir)]) == 0
-    assert str(captured["base_url"]).startswith("http://127.0.0.1")
-    assert "manual__local" in capsys.readouterr().out
+    (recorded,) = recorded_ingests
+    assert recorded.client.base_url.startswith("http://127.0.0.1")
+    assert RECORDED_INGEST_RUN_ID in capsys.readouterr().out
 
 
 def test_status_remote_reports_health_and_runs_without_a_bundle(
@@ -831,16 +769,7 @@ def test_status_remote_reports_health_and_runs_without_a_bundle(
     monkeypatch.setattr(
         AirflowClient,
         "dag_runs",
-        lambda self, dag_id, **_kwargs: [
-            AirflowDagRun(
-                dag_run_id="manual__1",
-                state="success",
-                logical_date=None,
-                start_date=None,
-                end_date=None,
-                conf={},
-            )
-        ],
+        lambda self, dag_id, **_kwargs: [_queued_run("manual__1", state="success")],
     )
     monkeypatch.setenv("HFLOW_AIRFLOW_URL", "https://workspace.example.com")
     monkeypatch.setenv("HFLOW_AIRFLOW_DAG_ID", "kitchen_ingest")
@@ -872,14 +801,7 @@ def test_ingest_plumbs_profile_lane_and_steps_into_conf(
     ) -> AirflowDagRun:
         captured["dag_id"] = dag_id
         captured["conf"] = conf
-        return AirflowDagRun(
-            dag_run_id="manual__relabel",
-            state="queued",
-            logical_date=None,
-            start_date=None,
-            end_date=None,
-            conf={},
-        )
+        return _queued_run("manual__relabel")
 
     monkeypatch.setattr(AirflowClient, "trigger_dag_run", fake_trigger)
     exit_code = main(
@@ -935,38 +857,15 @@ def test_ingest_rejects_uris_outside_data_root(
 
 
 def test_ingest_rejects_blank_uri_before_triggering(
-    monkeypatch: pytest.MonkeyPatch,
+    recorded_ingests: list[_RecordedIngest],
     pipeline_file: Path,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     bundle_dir = _rendered_bundle(tmp_path, pipeline_file)
-    called = False
-
-    def fake_ingest(
-        self: AirflowClient,
-        dag_id: str,
-        uris: list[str],
-        *,
-        profile: str = "full",
-        online: bool = False,
-        dag_run_id: str | None = None,
-    ) -> AirflowDagRun:
-        nonlocal called
-        called = True
-        return AirflowDagRun(
-            dag_run_id="manual__unexpected",
-            state="queued",
-            logical_date=None,
-            start_date=None,
-            end_date=None,
-            conf={},
-        )
-
-    monkeypatch.setattr(AirflowClient, "ingest", fake_ingest)
 
     assert main(["ingest", "   ", "--bundle-dir", str(bundle_dir)]) == 2
-    assert not called
+    assert recorded_ingests == []
     assert "non-empty" in capsys.readouterr().err
 
 
@@ -977,8 +876,6 @@ def test_start_runtime_waits_for_all_five_dags(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`up` declares victory only once the master AND the sub-DAGs registered."""
-    from hflow.runtime import start_runtime
-
     monkeypatch.setattr(AirflowClient, "wait_until_healthy", lambda self, **_kwargs: HEALTHY)
     polled_dag_ids: list[str] = []
     monkeypatch.setattr(
@@ -1002,18 +899,6 @@ def test_start_runtime_waits_for_all_five_dags(
 def test_dag_registration_poll_does_not_sleep_past_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from hflow.runtime._lifecycle import _wait_until_dag_registered
-
-    class InstantlyAdvancingClock:
-        def __init__(self) -> None:
-            self.current_time_s = 0.0
-
-        def monotonic(self) -> float:
-            return self.current_time_s
-
-        def sleep(self, duration_s: float) -> None:
-            self.current_time_s += duration_s
-
     def unavailable_dag(_self: AirflowClient, dag_id: str) -> dict[str, object]:
         raise AirflowClientError(f"{dag_id} unavailable", status=404)
 
@@ -1090,81 +975,7 @@ def test_app_run_errors_helpfully_without_a_script_file(
         app.run()
 
 
-def test_serve_refuses_a_port_it_cannot_serve(capsys: pytest.CaptureFixture[str]) -> None:
-    """Bad launch input is exit 2 and one line, the answer every other command gives.
-
-    Exit 1 would say the server started and then failed. Nothing started: the
-    port never got as far as the free-port probe.
-    """
-    for unusable_port in ("99999", "0"):
-        exit_code = main(["serve", "--data-root", "/tmp", "--port", unusable_port, "--no-browser"])
-        assert exit_code == 2
-        stderr = capsys.readouterr().err
-        assert stderr.startswith("serve: ")
-        assert "1-65535" in stderr
-        assert "Traceback" not in stderr
-
-
-def test_serve_refuses_a_data_root_that_is_not_a_directory(
-    capsys: pytest.CaptureFixture[str], tmp_path: Path
-) -> None:
-    """A file used to serve an empty workspace and say nothing about why.
-
-    It answers with the stock errno sentence the rest of the CLI uses, so the
-    caller is not left guessing why their workspace looks empty.
-    """
-    data_root_file = tmp_path / "not-a-directory"
-    data_root_file.write_text("")
-
-    exit_code = main(["serve", "--data-root", str(data_root_file), "--no-browser"])
-
-    assert exit_code == 2
-    stderr = capsys.readouterr().err
-    assert stderr.startswith("serve: ")
-    assert "Not a directory" in stderr
-    assert str(data_root_file) in stderr
-
-
-def test_serve_refuses_a_host_it_cannot_bind(capsys: pytest.CaptureFixture[str]) -> None:
-    """The probe's failure is a launch failure, so it exits 2 like the rest.
-
-    This one arrives as ServerStartupError rather than ValueError, which is why
-    it gets its own handler around ``serve`` instead of being folded into the
-    construction handler above.
-    """
-    exit_code = main(
-        ["serve", "--data-root", "/tmp", "--host", "not-a-host", "--port", "4512", "--no-browser"]
-    )
-    assert exit_code == 2
-    stderr = capsys.readouterr().err
-    assert stderr.startswith("serve: ")
-    assert "no free port" in stderr
-    assert "Traceback" not in stderr
-
-
-def test_serve_does_not_turn_a_running_server_crash_into_bad_input(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The handler catches the startup failure only, not RuntimeError at large.
-
-    A RuntimeError out of a server that is already up means it started and then
-    died, which is exit 1. Widening the handler to RuntimeError would report
-    that as bad launch input and exit 2, which is the bug this issue is about
-    in reverse.
-    """
-    import hflow_server
-
-    def crash_once_running(_settings: object) -> None:
-        raise RuntimeError("uvicorn fell over mid-run")
-
-    monkeypatch.setattr(hflow_server, "serve", crash_once_running)
-    with pytest.raises(RuntimeError, match="mid-run"):
-        main(["serve", "--data-root", "/tmp", "--no-browser"])
-
-
 def test_an_address_without_a_variable_discovers_the_sole_app(tmp_path: Path) -> None:
-    from hflow import import_pipeline_application
-
     pipeline_file = tmp_path / "pipeline.py"
     pipeline_file.write_text("import hflow\n\nkitchen = hflow.App('kitchen', data_root='./data')\n")
     assert import_pipeline_application(str(pipeline_file)).name == "kitchen"
@@ -1173,8 +984,6 @@ def test_an_address_without_a_variable_discovers_the_sole_app(tmp_path: Path) ->
 def test_the_conventional_name_still_wins_over_discovery(tmp_path: Path) -> None:
     # Two Apps is normally ambiguous, but a file that binds `app` has already
     # said which one it means, and always resolved that way.
-    from hflow import import_pipeline_application
-
     pipeline_file = tmp_path / "pipeline.py"
     pipeline_file.write_text(
         "import hflow\n\n"
@@ -1185,8 +994,6 @@ def test_the_conventional_name_still_wins_over_discovery(tmp_path: Path) -> None
 
 
 def test_several_apps_refuse_and_name_the_candidates(tmp_path: Path) -> None:
-    from hflow import import_pipeline_application
-
     pipeline_file = tmp_path / "pipeline.py"
     pipeline_file.write_text(
         "import hflow\n\n"
@@ -1202,8 +1009,6 @@ def test_several_apps_refuse_and_name_the_candidates(tmp_path: Path) -> None:
 def test_a_file_with_no_app_says_so_rather_than_naming_a_missing_variable(
     tmp_path: Path,
 ) -> None:
-    from hflow import import_pipeline_application
-
     pipeline_file = tmp_path / "pipeline.py"
     pipeline_file.write_text("value = 42\n")
     with pytest.raises(ValueError, match=r"defines no hflow\.App"):
@@ -1213,8 +1018,6 @@ def test_a_file_with_no_app_says_so_rather_than_naming_a_missing_variable(
 def test_an_app_imported_from_a_sibling_does_not_create_ambiguity(tmp_path: Path) -> None:
     # Only names bound in the pipeline file count, so a shared helper module
     # that builds an App cannot make every pipeline importing it ambiguous.
-    from hflow import import_pipeline_application
-
     (tmp_path / "shared_rig.py").write_text(
         "import hflow\n\nshared = hflow.App('shared', data_root='./data')\n"
     )
@@ -1229,8 +1032,6 @@ def test_an_app_imported_from_a_sibling_does_not_create_ambiguity(tmp_path: Path
 def test_naming_a_missing_variable_is_still_refused(tmp_path: Path) -> None:
     # Discovery is for addresses that did not say; one that did must not
     # quietly resolve to something else.
-    from hflow import import_pipeline_application
-
     pipeline_file = tmp_path / "pipeline.py"
     pipeline_file.write_text("import hflow\n\nkitchen = hflow.App('kitchen', data_root='./data')\n")
     with pytest.raises(ValueError, match=r"no hflow\.App named 'garage'"):
@@ -1240,19 +1041,8 @@ def test_naming_a_missing_variable_is_still_refused(tmp_path: Path) -> None:
 def test_describe_remote_status_closes_client_on_success_and_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import hflow.runtime._endpoint as endpoint_module
-    from hflow.runtime import BearerToken, RemoteRuntimeEndpoint, describe_remote_status
-
     endpoint = RemoteRuntimeEndpoint("http://airflow.example", "test_dag", BearerToken("token"))
-    tracked_clients: list[AirflowClient] = []
-    original_client_for_endpoint = endpoint_module.client_for_endpoint
-
-    def tracking_client_for_endpoint(ep: RemoteRuntimeEndpoint) -> AirflowClient:
-        client = original_client_for_endpoint(ep)
-        tracked_clients.append(client)
-        return client
-
-    monkeypatch.setattr(endpoint_module, "client_for_endpoint", tracking_client_for_endpoint)
+    tracked_clients = _track_created_clients(monkeypatch, endpoint_module, "client_for_endpoint")
 
     # 1. Success case:
     monkeypatch.setattr(AirflowClient, "health", lambda self: HEALTHY)
@@ -1260,8 +1050,7 @@ def test_describe_remote_status_closes_client_on_success_and_errors(
     monkeypatch.setattr(AirflowClient, "dag_runs", lambda self, dag_id, **kw: [])
     describe_remote_status(endpoint)
     assert len(tracked_clients) == 1
-    with pytest.raises(RuntimeError, match="client has been closed"):
-        tracked_clients[-1].task_instances("d", "r")
+    _assert_closed(tracked_clients[-1])
 
     # 2. Early return on unreachable health:
     def unreachable_health(self: AirflowClient) -> AirflowHealth:
@@ -1270,8 +1059,7 @@ def test_describe_remote_status_closes_client_on_success_and_errors(
     monkeypatch.setattr(AirflowClient, "health", unreachable_health)
     describe_remote_status(endpoint)
     assert len(tracked_clients) == 2
-    with pytest.raises(RuntimeError, match="client has been closed"):
-        tracked_clients[-1].task_instances("d", "r")
+    _assert_closed(tracked_clients[-1])
 
     # 3. Early return on unavailable dag:
     def unavailable_dag(self: AirflowClient, dag_id: str) -> dict[str, object]:
@@ -1281,34 +1069,21 @@ def test_describe_remote_status_closes_client_on_success_and_errors(
     monkeypatch.setattr(AirflowClient, "dag", unavailable_dag)
     describe_remote_status(endpoint)
     assert len(tracked_clients) == 3
-    with pytest.raises(RuntimeError, match="client has been closed"):
-        tracked_clients[-1].task_instances("d", "r")
+    _assert_closed(tracked_clients[-1])
 
 
 def test_describe_runtime_status_closes_client_on_success_and_error(
     monkeypatch: pytest.MonkeyPatch, pipeline_file: Path, tmp_path: Path
 ) -> None:
-    import hflow.runtime._lifecycle as lifecycle_module
-    from hflow.runtime import BundlePaths, describe_runtime_status, load_bundle
-
     bundle_dir = _rendered_bundle(tmp_path, pipeline_file)
     paths = load_bundle(bundle_dir)
-    tracked_clients: list[AirflowClient] = []
-    original_client_for_bundle = lifecycle_module.client_for_bundle
-
-    def tracking_client_for_bundle(bpaths: BundlePaths) -> AirflowClient:
-        client = original_client_for_bundle(bpaths)
-        tracked_clients.append(client)
-        return client
-
-    monkeypatch.setattr(lifecycle_module, "client_for_bundle", tracking_client_for_bundle)
+    tracked_clients = _track_created_clients(monkeypatch, lifecycle_module, "client_for_bundle")
 
     # 1. Success case:
     monkeypatch.setattr(AirflowClient, "health", lambda self: HEALTHY)
     describe_runtime_status(paths)
     assert len(tracked_clients) == 1
-    with pytest.raises(RuntimeError, match="client has been closed"):
-        tracked_clients[-1].task_instances("d", "r")
+    _assert_closed(tracked_clients[-1])
 
     # 2. Error case:
     def unreachable_health(self: AirflowClient) -> AirflowHealth:
@@ -1317,8 +1092,7 @@ def test_describe_runtime_status_closes_client_on_success_and_error(
     monkeypatch.setattr(AirflowClient, "health", unreachable_health)
     describe_runtime_status(paths)
     assert len(tracked_clients) == 2
-    with pytest.raises(RuntimeError, match="client has been closed"):
-        tracked_clients[-1].task_instances("d", "r")
+    _assert_closed(tracked_clients[-1])
 
 
 def test_start_runtime_closes_client_on_success_and_failure(
@@ -1327,27 +1101,15 @@ def test_start_runtime_closes_client_on_success_and_failure(
     pipeline_file: Path,
     tmp_path: Path,
 ) -> None:
-    import hflow.runtime._lifecycle as lifecycle_module
-    from hflow.runtime import BundlePaths, RuntimeConfig, start_runtime
-
     config = RuntimeConfig(pipeline_file=pipeline_file, data_root=tmp_path / "data")
-    tracked_clients: list[AirflowClient] = []
-    original_client_for_bundle = lifecycle_module.client_for_bundle
-
-    def tracking_client_for_bundle(bpaths: BundlePaths) -> AirflowClient:
-        client = original_client_for_bundle(bpaths)
-        tracked_clients.append(client)
-        return client
-
-    monkeypatch.setattr(lifecycle_module, "client_for_bundle", tracking_client_for_bundle)
+    tracked_clients = _track_created_clients(monkeypatch, lifecycle_module, "client_for_bundle")
     monkeypatch.setattr(AirflowClient, "wait_until_healthy", lambda self, **kw: HEALTHY)
     monkeypatch.setattr(AirflowClient, "dag", lambda self, dag_id: {"dag_id": dag_id})
 
     # 1. Success case:
     start_runtime(config, tmp_path / "bundle1")
     assert len(tracked_clients) == 1
-    with pytest.raises(RuntimeError, match="client has been closed"):
-        tracked_clients[-1].task_instances("d", "r")
+    _assert_closed(tracked_clients[-1])
 
     # 2. Failure case (wait_until_healthy raises):
     def failing_health_wait(self: AirflowClient, **kw: object) -> AirflowHealth:
@@ -1357,8 +1119,7 @@ def test_start_runtime_closes_client_on_success_and_failure(
     with pytest.raises(AirflowClientError):
         start_runtime(config, tmp_path / "bundle2")
     assert len(tracked_clients) == 2
-    with pytest.raises(RuntimeError, match="client has been closed"):
-        tracked_clients[-1].task_instances("d", "r")
+    _assert_closed(tracked_clients[-1])
 
     # 3. Failure case (_wait_until_dag_registered raises TimeoutError):
     monkeypatch.setattr(AirflowClient, "wait_until_healthy", lambda self, **kw: HEALTHY)
@@ -1370,8 +1131,7 @@ def test_start_runtime_closes_client_on_success_and_failure(
     with pytest.raises(TimeoutError):
         start_runtime(config, tmp_path / "bundle3")
     assert len(tracked_clients) == 3
-    with pytest.raises(RuntimeError, match="client has been closed"):
-        tracked_clients[-1].task_instances("d", "r")
+    _assert_closed(tracked_clients[-1])
 
 
 def test_ingest_closes_client_on_success_and_error(
@@ -1379,36 +1139,19 @@ def test_ingest_closes_client_on_success_and_error(
     pipeline_file: Path,
     tmp_path: Path,
 ) -> None:
-    from hflow.runtime import BundlePaths
-
     bundle_dir = _rendered_bundle(tmp_path, pipeline_file)
-    tracked_clients: list[AirflowClient] = []
-
-    def tracking_client_for_bundle(paths: BundlePaths) -> AirflowClient:
-        client = AirflowClient(paths.api_base_url, paths.admin_username, paths.admin_password)
-        tracked_clients.append(client)
-        return client
-
-    monkeypatch.setattr("hflow.runtime.client_for_bundle", tracking_client_for_bundle)
+    tracked_clients = _track_created_clients(monkeypatch, hflow.runtime, "client_for_bundle")
 
     # 1. Success case:
     monkeypatch.setattr(
         AirflowClient,
         "ingest",
-        lambda self, dag_id, uris, **kw: AirflowDagRun(
-            dag_run_id="run_1",
-            state="running",
-            logical_date=None,
-            start_date=None,
-            end_date=None,
-            conf={},
-        ),
+        lambda self, dag_id, uris, **kw: _queued_run("run_1", state="running"),
     )
     exit_code = main(["ingest", "a.mcap", "--bundle-dir", str(bundle_dir)])
     assert exit_code == 0
     assert len(tracked_clients) == 1
-    with pytest.raises(RuntimeError, match="client has been closed"):
-        tracked_clients[-1].task_instances("d", "r")
+    _assert_closed(tracked_clients[-1])
 
     # 2. Error case (AirflowClientError):
     def failing_ingest(
@@ -1420,46 +1163,27 @@ def test_ingest_closes_client_on_success_and_error(
     exit_code = main(["ingest", "a.mcap", "--bundle-dir", str(bundle_dir)])
     assert exit_code == 1
     assert len(tracked_clients) == 2
-    with pytest.raises(RuntimeError, match="client has been closed"):
-        tracked_clients[-1].task_instances("d", "r")
+    _assert_closed(tracked_clients[-1])
 
 
 def test_ingest_remote_closes_client_on_success_and_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from hflow.runtime import RemoteRuntimeEndpoint
-    from hflow.runtime._endpoint import AIRFLOW_TOKEN_ENVIRONMENT_VARIABLE
-
     monkeypatch.setenv(AIRFLOW_TOKEN_ENVIRONMENT_VARIABLE, "token123")
-    tracked_clients: list[AirflowClient] = []
-
-    def tracking_client_for_endpoint(ep: RemoteRuntimeEndpoint) -> AirflowClient:
-        client = AirflowClient(ep.base_url, auth=ep.auth)
-        tracked_clients.append(client)
-        return client
-
-    monkeypatch.setattr("hflow.runtime.client_for_endpoint", tracking_client_for_endpoint)
+    tracked_clients = _track_created_clients(monkeypatch, hflow.runtime, "client_for_endpoint")
 
     # 1. Success case:
     monkeypatch.setattr(
         AirflowClient,
         "ingest",
-        lambda self, dag_id, uris, **kw: AirflowDagRun(
-            dag_run_id="run_1",
-            state="running",
-            logical_date=None,
-            start_date=None,
-            end_date=None,
-            conf={},
-        ),
+        lambda self, dag_id, uris, **kw: _queued_run("run_1", state="running"),
     )
     exit_code = main(
         ["ingest", "a.mcap", "--airflow-url", "http://airflow.example", "--dag-id", "test_dag"]
     )
     assert exit_code == 0
     assert len(tracked_clients) == 1
-    with pytest.raises(RuntimeError, match="client has been closed"):
-        tracked_clients[-1].task_instances("d", "r")
+    _assert_closed(tracked_clients[-1])
 
     # 2. Error case:
     def failing_ingest(
@@ -1473,5 +1197,4 @@ def test_ingest_remote_closes_client_on_success_and_error(
     )
     assert exit_code == 1
     assert len(tracked_clients) == 2
-    with pytest.raises(RuntimeError, match="client has been closed"):
-        tracked_clients[-1].task_instances("d", "r")
+    _assert_closed(tracked_clients[-1])

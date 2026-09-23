@@ -6,8 +6,19 @@ import base64
 import csv
 import hashlib
 import io
+import json
 import sys
 from pathlib import Path
+from typing import cast
+
+from hflow.packaging import (
+    INSTALLED_CYTHON_OVERLAY_MANIFEST_FILE_NAME,
+    CythonOverlayBuildConfig,
+    CythonOverlayManifest,
+    build_cython_overlay,
+)
+
+WORKER_MODULE_NAME = "sample_native_package.worker"
 
 
 def write_example_distribution(
@@ -115,3 +126,48 @@ def write_record(record_path: Path, rows: dict[str, tuple[str, str]]) -> None:
 
 def example_record_path(package_root: Path) -> Path:
     return package_root.parent / "sample_native_package-7.2.dist-info" / "RECORD"
+
+
+def build_example_overlay(
+    package_root: Path, overlay_directory: Path, *, worker_only: bool = True
+) -> CythonOverlayManifest:
+    """Build the example distribution's overlay.
+
+    ``worker_only`` compiles just ``sample_native_package.worker``; otherwise
+    every eligible module is compiled, which gives the manifest more than one
+    artifact.
+    """
+    config = (
+        CythonOverlayBuildConfig(package_root=package_root, module_names=(WORKER_MODULE_NAME,))
+        if worker_only
+        else CythonOverlayBuildConfig(package_root=package_root)
+    )
+    return build_cython_overlay(config, overlay_directory)
+
+
+def read_manifest_payload(manifest_path: Path) -> dict[str, object]:
+    return cast(dict[str, object], json.loads(manifest_path.read_text(encoding="utf-8")))
+
+
+def write_manifest_bytes(manifest_path: Path, contents: bytes) -> None:
+    manifest_path.chmod(0o644)
+    manifest_path.write_bytes(contents)
+
+
+def write_manifest_payload(manifest_path: Path, payload: dict[str, object]) -> None:
+    write_manifest_bytes(
+        manifest_path, (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    )
+
+
+def assert_overlay_left_uninstalled(
+    package_root: Path, manifest: CythonOverlayManifest, original_record: bytes
+) -> None:
+    """A refused apply left every source, artifact slot, and the RECORD untouched."""
+    assert all((package_root / artifact.source_path).is_file() for artifact in manifest.artifacts)
+    assert not any(
+        (package_root / artifact.installed_artifact_path).exists()
+        for artifact in manifest.artifacts
+    )
+    assert not (package_root / INSTALLED_CYTHON_OVERLAY_MANIFEST_FILE_NAME).exists()
+    assert example_record_path(package_root).read_bytes() == original_record

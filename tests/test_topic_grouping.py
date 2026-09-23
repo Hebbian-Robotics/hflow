@@ -141,12 +141,10 @@ class TestDerivedChunkTargets:
 
         assert derived_chunk_size_bytes(0.0, 1.0) == MINIMUM_DERIVED_CHUNK_SIZE_BYTES
 
-    def test_the_default_derives_and_records_a_target_per_group(self, tmp_path: Path) -> None:
-        source = _source_with_a_bulk_channel(tmp_path / "source.mcap")
-        canonical = tmp_path / "derived.canonical.mcap"
-        write_canonical_episode(source, canonical, TransformConfig())
-
-        with hflow.Episode(canonical) as episode:
+    def test_the_default_derives_and_records_a_target_per_group(
+        self, canonical_with_bulk: Path
+    ) -> None:
+        with hflow.Episode(canonical_with_bulk) as episode:
             targets = {
                 key.removeprefix(PROVENANCE_KEY_CHUNK_TARGET_PREFIX): int(value)
                 for key, value in episode.metadata.items()
