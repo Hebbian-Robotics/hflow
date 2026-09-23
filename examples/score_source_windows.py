@@ -32,10 +32,23 @@ from hflow import (
     plan_source_windows,
     sample_source_frames,
 )
-from hflow.asyncio_utils import prefetch
+from hflow.asyncio_utils import prefetch, run_blocking
 from hflow.media import UnreadableVideo, UnsupportedVideo, VideoProperties, probe_video
 
 REQUEST_TIMEOUT_SECONDS = 120.0
+
+
+def encode_image_parts(samples: SourceFrameSamples) -> list[dict[str, object]]:
+    return [
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": "data:image/jpeg;base64,"
+                + base64.b64encode(frame.path.read_bytes()).decode("ascii")
+            },
+        }
+        for frame in samples.frames
+    ]
 
 
 async def ask_about_frames(
@@ -46,16 +59,8 @@ async def ask_about_frames(
     question: str,
     samples: SourceFrameSamples,
 ) -> str:
-    image_parts = [
-        {
-            "type": "image_url",
-            "image_url": {
-                "url": "data:image/jpeg;base64,"
-                + base64.b64encode(frame.path.read_bytes()).decode("ascii")
-            },
-        }
-        for frame in samples.frames
-    ]
+    # File reads and encoding are blocking; keep them off the event loop.
+    image_parts = await run_blocking(encode_image_parts, samples)
     response = await client.post(
         f"{endpoint.rstrip('/')}/chat/completions",
         json={
