@@ -21,9 +21,11 @@ from hflow.steps import evaluate_gate
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
 
-def _state_only_episode(tmp_path: Path) -> Path:
+@pytest.fixture(scope="module")
+def state_only_episode(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Read by every test here and written by none, so it is synthesized once."""
     return synthesize_episode(
-        tmp_path / "episode.mcap",
+        tmp_path_factory.mktemp("gates-source") / "episode.mcap",
         SyntheticEpisodeSpec(duration_s=2.0, cameras=(), joint_jump_at_s=1.0),
     )
 
@@ -32,13 +34,15 @@ def _gate(*thresholds: hflow.Threshold) -> hflow.Gate:
     return hflow.Gate(accept_when=thresholds)
 
 
-def test_a_gate_fires_only_when_the_pipeline_opts_in(tmp_path: Path) -> None:
+def test_a_gate_fires_only_when_the_pipeline_opts_in(
+    tmp_path: Path, state_only_episode: Path
+) -> None:
     """The requirement: HFlow ships the number, the pipeline decides it gates.
 
     Same check, same evidence, both directions -- without a gate the episode is
     evidence only; with one it quarantines.
     """
-    episode_path = _state_only_episode(tmp_path)
+    episode_path = state_only_episode
 
     ungated = hflow.App("ungated", data_root=tmp_path / "ungated", default_checks=())
 
@@ -63,19 +67,19 @@ def test_a_gate_fires_only_when_the_pipeline_opts_in(tmp_path: Path) -> None:
     assert gated_report.quarantine_tags == ["quarantined:blackout_gated"]
 
 
-def test_a_shipped_gate_accepts_healthy_evidence(tmp_path: Path) -> None:
+def test_a_shipped_gate_accepts_healthy_evidence(tmp_path: Path, state_only_episode: Path) -> None:
     app = hflow.App("healthy", data_root=tmp_path / "data", default_checks=())
 
     @app.check(version="1", critical=True, gate=RECOMMENDED_CAMERA_INTEGRITY)
     async def camera(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"black_frame_pct": 0.0, "freeze_total_s": 0.0})
 
-    report = asyncio.run(app.test(_state_only_episode(tmp_path), verbose=False))
+    report = asyncio.run(app.test(state_only_episode, verbose=False))
     assert report.checks[0].status is hflow.CheckStatus.PASSED
     assert not report.quarantined
 
 
-def test_no_shipped_gate_thresholds_a_motion_smoothness_key(tmp_path: Path) -> None:
+def test_no_shipped_gate_thresholds_a_motion_smoothness_key(state_only_episode: Path) -> None:
     """Smoothness metrics ship as flags only, never a default reject rule.
 
     Voxel51's audit found them scoring an early-gripper-release defect better
@@ -83,7 +87,7 @@ def test_no_shipped_gate_thresholds_a_motion_smoothness_key(tmp_path: Path) -> N
     episodes with our name on it. This walks the keys the smoothness checks
     actually emit rather than trusting the constant to look innocent.
     """
-    source = _state_only_episode(tmp_path)
+    source = state_only_episode
     with hflow.Episode(source) as episode:
         smoothness_keys: set[str] = set()
         for smoothness_check in (
@@ -107,7 +111,9 @@ def test_no_shipped_gate_thresholds_a_motion_smoothness_key(tmp_path: Path) -> N
             )
 
 
-def test_a_clause_matching_no_key_abstains_instead_of_passing(tmp_path: Path) -> None:
+def test_a_clause_matching_no_key_abstains_instead_of_passing(
+    tmp_path: Path, state_only_episode: Path
+) -> None:
     """A typo'd threshold must not report a pass over evidence nobody read."""
     decision = evaluate_gate(
         _gate(hflow.Threshold("*/absent_key", hflow.Comparison.AT_MOST, 1.0)),
@@ -125,7 +131,7 @@ def test_a_clause_matching_no_key_abstains_instead_of_passing(tmp_path: Path) ->
     async def measures(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"present": 5.0})
 
-    report = asyncio.run(app.test(_state_only_episode(tmp_path), verbose=False))
+    report = asyncio.run(app.test(state_only_episode, verbose=False))
     run_result = report.checks[0].result
     assert run_result is not None
     assert run_result.verdict is None
@@ -173,7 +179,9 @@ def test_comparisons_are_inclusive_at_the_threshold() -> None:
     assert evaluate_gate(_gate(at_least), {"v": 50.0}) == hflow.GateDecided(verdict=True)
 
 
-def test_a_gate_can_only_tighten_a_checks_own_verdict(tmp_path: Path) -> None:
+def test_a_gate_can_only_tighten_a_checks_own_verdict(
+    tmp_path: Path, state_only_episode: Path
+) -> None:
     """A gate is an additional accept condition, so it never resurrects an
     episode the check itself rejected.
     """
@@ -184,12 +192,14 @@ def test_a_gate_can_only_tighten_a_checks_own_verdict(tmp_path: Path) -> None:
     async def rejects_itself(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"v": 1.0}, verdict=False)
 
-    report = asyncio.run(app.test(_state_only_episode(tmp_path), verbose=False))
+    report = asyncio.run(app.test(state_only_episode, verbose=False))
     assert report.checks[0].status is hflow.CheckStatus.FAILED
     assert report.quarantine_tags == ["quarantined:rejects_itself"]
 
 
-def test_a_gate_on_a_noncritical_check_tags_and_the_run_proceeds(tmp_path: Path) -> None:
+def test_a_gate_on_a_noncritical_check_tags_and_the_run_proceeds(
+    tmp_path: Path, state_only_episode: Path
+) -> None:
     app = hflow.App("flags-only", data_root=tmp_path / "data", default_checks=())
 
     @app.check(version="1", gate=_gate(hflow.Threshold("v", hflow.Comparison.AT_MOST, 1.0)))
@@ -200,7 +210,7 @@ def test_a_gate_on_a_noncritical_check_tags_and_the_run_proceeds(tmp_path: Path)
     async def runs_after(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"ran": 1})
 
-    report = asyncio.run(app.test(_state_only_episode(tmp_path), verbose=False))
+    report = asyncio.run(app.test(state_only_episode, verbose=False))
     flags_result = report.checks[0].result
     assert flags_result is not None
     assert "failed:flags" in flags_result.tags

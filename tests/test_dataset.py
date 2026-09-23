@@ -32,28 +32,22 @@ async def duration(ep: hflow.Episode) -> hflow.CheckResult:
 """
 
 
-@pytest.fixture(scope="module")
-def source_episode(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    return synthesize_episode(
-        tmp_path_factory.mktemp("dataset-source") / "episode_0001.mcap",
-        SyntheticEpisodeSpec(duration_s=1.0, cameras=()),
-    )
-
-
-def _make_project(project_directory: Path, source_episode: Path, pipeline_source: str) -> Path:
+def _make_project(
+    project_directory: Path, one_second_camera_less_episode: Path, pipeline_source: str
+) -> Path:
     """A project with one episode waiting in ``episodes-in`` and ``pipeline_source``."""
     episodes_in = project_directory / "data" / "episodes-in"
     episodes_in.mkdir(parents=True)
-    (episodes_in / "episode_0001.mcap").write_bytes(source_episode.read_bytes())
+    (episodes_in / "episode_0001.mcap").write_bytes(one_second_camera_less_episode.read_bytes())
     (project_directory / "pipeline.py").write_text(pipeline_source)
     (project_directory / "hflow.toml").write_text('data_root = "./data"\n')
     return project_directory
 
 
 @pytest.fixture
-def ingested_project(tmp_path: Path, source_episode: Path) -> Path:
+def ingested_project(tmp_path: Path, one_second_camera_less_episode: Path) -> Path:
     """A project whose one episode has been ingested by its own pipeline."""
-    return _make_project(tmp_path, source_episode, PIPELINE_SOURCE)
+    return _make_project(tmp_path, one_second_camera_less_episode, PIPELINE_SOURCE)
 
 
 def _ingest(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -125,7 +119,7 @@ async def duration(ep: hflow.Episode) -> hflow.CheckResult:
         assert dataset.row_count == 0
 
     def test_a_default_check_the_pipeline_supersedes_is_not_a_hole(
-        self, tmp_path: Path, source_episode: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, one_second_camera_less_episode: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The other empty-dataset trap, and the one the docs walk users into.
 
@@ -139,7 +133,7 @@ async def duration(ep: hflow.Episode) -> hflow.CheckResult:
         data_root = tmp_path / "data"
         _make_project(
             tmp_path,
-            source_episode,
+            one_second_camera_less_episode,
             """
 import hflow
 from hflow.checks import episode_duration
@@ -287,7 +281,7 @@ def test_slugs_fall_back_rather_than_being_refused() -> None:
 
 
 def test_a_bucket_backed_workspace_can_write_a_manifest(
-    bucket_over_tmp: tuple[BucketStorageRoot, Path], source_episode: Path
+    bucket_over_tmp: tuple[BucketStorageRoot, Path], one_second_camera_less_episode: Path
 ) -> None:
     """The hosted case, and the reason this moved out of the server: hosted
     workspaces are bucket data roots, and pinning used to refuse them with a
@@ -297,7 +291,7 @@ def test_a_bucket_backed_workspace_can_write_a_manifest(
     storage_root, remote_dir = bucket_over_tmp
     workspace = Workspace(storage_root)
     app = hflow.App("bucket-demo", data_root=storage_root, default_checks=())
-    asyncio.run(app.process(source_episode, record=True, verbose=False))
+    asyncio.run(app.process(one_second_camera_less_episode, record=True, verbose=False))
 
     written = write_dataset_manifest(workspace, name="clean", sql="SELECT episode_id FROM episodes")
 
@@ -354,7 +348,7 @@ class TestSettledThenCrashed:
     def test_recurring_outcome_becomes_current_and_consecutive_retries_deduplicate(
         self,
         tmp_path: Path,
-        source_episode: Path,
+        one_second_camera_less_episode: Path,
         monkeypatch: pytest.MonkeyPatch,
         bucket_over_tmp: tuple[BucketStorageRoot, Path],
         first_errors: bool,
@@ -377,7 +371,7 @@ class TestSettledThenCrashed:
             for retry in range(2):
                 report = asyncio.run(
                     app.process(
-                        source_episode,
+                        one_second_camera_less_episode,
                         record=True,
                         stages="full" if attempt == retry == 0 else stages,
                         execution_id=f"attempt-{attempt}" if explicit_execution else None,
@@ -417,8 +411,8 @@ class TestSettledThenCrashed:
         assert len({entry.run_fingerprint for entry in entries}) == 3
 
     @pytest.fixture
-    def project(self, tmp_path: Path, source_episode: Path) -> Path:
-        return _make_project(tmp_path, source_episode, CRASHING_PIPELINE_SOURCE)
+    def project(self, tmp_path: Path, one_second_camera_less_episode: Path) -> Path:
+        return _make_project(tmp_path, one_second_camera_less_episode, CRASHING_PIPELINE_SOURCE)
 
     def test_a_later_crash_withdraws_an_earlier_settled_result(
         self, project: Path, monkeypatch: pytest.MonkeyPatch

@@ -68,20 +68,14 @@ async def my_camera_frame_stats(ep: hflow.Episode) -> hflow.CheckResult:
 """
 
 
-@pytest.fixture(scope="module")
-def source_episode(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    return synthesize_episode(
-        tmp_path_factory.mktemp("planning-source") / "episode_0001.mcap",
-        SyntheticEpisodeSpec(duration_s=1.0, cameras=()),
-    )
-
-
 @pytest.fixture
-def project(tmp_path: Path, source_episode: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def project(
+    tmp_path: Path, one_second_camera_less_episode: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
     data_root = tmp_path / "data"
     episodes_in = data_root / "episodes-in"
     episodes_in.mkdir(parents=True)
-    (episodes_in / "episode_0001.mcap").write_bytes(source_episode.read_bytes())
+    (episodes_in / "episode_0001.mcap").write_bytes(one_second_camera_less_episode.read_bytes())
     (tmp_path / "pipeline.py").write_text(PIPELINE_SOURCE)
     (tmp_path / "hflow.toml").write_text('data_root = "./data"\n')
     monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
@@ -151,12 +145,12 @@ class TestReingestingAnUnchangedCorpus:
 
 
 def test_selected_steps_are_planned_and_replayed_independently(
-    tmp_path: Path, source_episode: Path
+    tmp_path: Path, one_second_camera_less_episode: Path
 ) -> None:
     data_root = tmp_path / "data"
     episode_path = data_root / EPISODE_URI
     episode_path.parent.mkdir(parents=True)
-    episode_path.write_bytes(source_episode.read_bytes())
+    episode_path.write_bytes(one_second_camera_less_episode.read_bytes())
     application = hflow.App("selected-planning", data_root=data_root, default_checks=())
     invocation_counts = {"first_check": 0, "second_check": 0}
 
@@ -251,10 +245,12 @@ async def added_later(ep: hflow.Episode) -> hflow.CheckResult:
             connection.close()
         assert rows == [(pytest.approx(2.0, abs=0.2),)]
 
-    def test_a_source_the_catalog_has_never_seen(self, project: Path, source_episode: Path) -> None:
+    def test_a_source_the_catalog_has_never_seen(
+        self, project: Path, one_second_camera_less_episode: Path
+    ) -> None:
         _ingest(project)
         second_uri = "episodes-in/episode_0002.mcap"
-        (project / "data" / second_uri).write_bytes(source_episode.read_bytes())
+        (project / "data" / second_uri).write_bytes(one_second_camera_less_episode.read_bytes())
 
         both = _ingest(project, EPISODE_URI, second_uri)
 

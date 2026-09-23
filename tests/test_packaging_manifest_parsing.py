@@ -102,7 +102,11 @@ def test_apply_refuses_invalid_manifest_before_mutation(
 def test_schema_version_is_bound_into_the_bundle_digest(tmp_path: Path) -> None:
     package_root, _ = write_example_distribution(tmp_path)
     overlay_directory = tmp_path / "native-overlay"
-    manifest = build_example_overlay(package_root, overlay_directory, worker_only=False)
+    # A real build, so the digest this test recomputes is the one the builder
+    # wrote rather than a cached copy of it.
+    manifest = build_example_overlay(
+        package_root, overlay_directory, worker_only=False, fresh_build=True
+    )
     manifest_path = overlay_directory / CYTHON_OVERLAY_MANIFEST_FILE_NAME
     payload = read_manifest_payload(manifest_path)
     assert payload["schema_version"] == packaging.CYTHON_OVERLAY_SCHEMA_VERSION

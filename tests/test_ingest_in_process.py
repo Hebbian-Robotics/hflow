@@ -13,7 +13,6 @@ import pytest
 import hflow
 from hflow.cli import main as cli_main
 from hflow.curation import open_catalog_connection
-from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
 PIPELINE_SOURCE = """
 import hflow
@@ -24,21 +23,13 @@ app.check(version="1")(episode_duration)
 """
 
 
-@pytest.fixture(scope="module")
-def source_episode(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    return synthesize_episode(
-        tmp_path_factory.mktemp("in-process-source") / "episode_0001.mcap",
-        SyntheticEpisodeSpec(duration_s=1.0, cameras=()),
-    )
-
-
 @pytest.fixture
-def project(tmp_path: Path, source_episode: Path) -> Path:
+def project(tmp_path: Path, one_second_camera_less_episode: Path) -> Path:
     """A project with a pipeline, a data root, and one episode to ingest."""
     data_root = tmp_path / "data"
     episodes_in = data_root / "episodes-in"
     episodes_in.mkdir(parents=True)
-    (episodes_in / "episode_0001.mcap").write_bytes(source_episode.read_bytes())
+    (episodes_in / "episode_0001.mcap").write_bytes(one_second_camera_less_episode.read_bytes())
     (tmp_path / "pipeline.py").write_text(PIPELINE_SOURCE)
     (tmp_path / "hflow.toml").write_text('data_root = "./data"\n')
     return tmp_path

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import atexit
 import base64
 import csv
 import hashlib
 import io
 import json
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import cast
 
@@ -128,21 +131,64 @@ def example_record_path(package_root: Path) -> Path:
     return package_root.parent / "sample_native_package-7.2.dist-info" / "RECORD"
 
 
+def _package_source_digest(package_root: Path) -> str:
+    """SHA-256 over every file under ``package_root``, keyed by relative path."""
+    source_digest = hashlib.sha256()
+    for file_path in sorted(path for path in package_root.rglob("*") if path.is_file()):
+        source_digest.update(file_path.relative_to(package_root).as_posix().encode("utf-8"))
+        source_digest.update(b"\0")
+        source_digest.update(hashlib.sha256(file_path.read_bytes()).digest())
+    return source_digest.hexdigest()
+
+
+# Compiling the overlay dominates these tests' runtime. The build reads only
+# the package's own files (not its location, and not the dist-info RECORD) and
+# leaves the package untouched, so an overlay built from identical sources is
+# byte-identical wherever it was built. Each test gets a fresh copy of one
+# pristine build per source digest and module selection, and may mutate it.
+_pristine_overlay_builds: dict[tuple[str, bool], tuple[Path, CythonOverlayManifest]] = {}
+
+
+def _build_pristine_overlay(
+    config: CythonOverlayBuildConfig, cache_key: tuple[str, bool]
+) -> tuple[Path, CythonOverlayManifest]:
+    pristine_root = Path(tempfile.mkdtemp(prefix="hflow-pristine-overlay-"))
+    atexit.register(shutil.rmtree, pristine_root, ignore_errors=True)
+    pristine_directory = pristine_root / "native-overlay"
+    pristine_manifest = build_cython_overlay(config, pristine_directory)
+    _pristine_overlay_builds[cache_key] = (pristine_directory, pristine_manifest)
+    return pristine_directory, pristine_manifest
+
+
 def build_example_overlay(
-    package_root: Path, overlay_directory: Path, *, worker_only: bool = True
+    package_root: Path,
+    overlay_directory: Path,
+    *,
+    worker_only: bool = True,
+    fresh_build: bool = False,
 ) -> CythonOverlayManifest:
-    """Build the example distribution's overlay.
+    """Build the example distribution's overlay into ``overlay_directory``.
 
     ``worker_only`` compiles just ``sample_native_package.worker``; otherwise
     every eligible module is compiled, which gives the manifest more than one
-    artifact.
+    artifact. Unless ``fresh_build`` is set, the result is copied from a
+    cached build of the same sources rather than compiled again.
     """
     config = (
         CythonOverlayBuildConfig(package_root=package_root, module_names=(WORKER_MODULE_NAME,))
         if worker_only
         else CythonOverlayBuildConfig(package_root=package_root)
     )
-    return build_cython_overlay(config, overlay_directory)
+    if fresh_build:
+        return build_cython_overlay(config, overlay_directory)
+    cache_key = (_package_source_digest(package_root), worker_only)
+    pristine_directory, pristine_manifest = _pristine_overlay_builds.get(
+        cache_key
+    ) or _build_pristine_overlay(config, cache_key)
+    # copytree refuses an existing destination, as build_cython_overlay does,
+    # and keeps the build's read-only file modes.
+    shutil.copytree(pristine_directory, overlay_directory)
+    return pristine_manifest
 
 
 def read_manifest_payload(manifest_path: Path) -> dict[str, object]:

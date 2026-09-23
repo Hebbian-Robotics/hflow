@@ -37,6 +37,18 @@ from hflow.checks import (
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import TransformConfig, write_canonical_episode
 
+# A 0.2 s single-joint stream with no cameras or faults: enough for checks
+# whose contract does not depend on footage.
+TINY_STATE_ONLY_SPEC = SyntheticEpisodeSpec(
+    duration_s=0.2,
+    cameras=(),
+    joint_hz=10.0,
+    joint_count=1,
+    black_segment=None,
+    joint_jump_at_s=None,
+    timestamp_offset_segment=None,
+)
+
 
 def test_no_two_builtin_checks_claim_the_same_measurement_key(tmp_path: Path) -> None:
     """The catalog ranks measurement rows per (episode_id, key) and every step of
@@ -536,30 +548,9 @@ def test_action_rate_reports_each_topic_at_its_own_rate(
 def test_content_digest_identifies_duplicate_content(tmp_path: Path) -> None:
     # Digest behavior is independent of camera encoding. A tiny state stream
     # keeps this contract focused on message content instead of fixture cost.
-    spec = SyntheticEpisodeSpec(
-        duration_s=0.2,
-        cameras=(),
-        joint_hz=10.0,
-        joint_count=1,
-        black_segment=None,
-        joint_jump_at_s=None,
-        timestamp_offset_segment=None,
-    )
-    first = synthesize_episode(tmp_path / "a.mcap", spec)
-    duplicate = synthesize_episode(tmp_path / "b.mcap", spec)
-    different = synthesize_episode(
-        tmp_path / "c.mcap",
-        SyntheticEpisodeSpec(
-            duration_s=0.2,
-            cameras=(),
-            joint_hz=10.0,
-            joint_count=1,
-            black_segment=None,
-            joint_jump_at_s=None,
-            timestamp_offset_segment=None,
-            seed=1,
-        ),
-    )
+    first = synthesize_episode(tmp_path / "a.mcap", TINY_STATE_ONLY_SPEC)
+    duplicate = synthesize_episode(tmp_path / "b.mcap", TINY_STATE_ONLY_SPEC)
+    different = synthesize_episode(tmp_path / "c.mcap", replace(TINY_STATE_ONLY_SPEC, seed=1))
     with (
         hflow.Episode(first) as ep_a,
         hflow.Episode(duplicate) as ep_b,
@@ -794,16 +785,7 @@ def test_fps_conformance_classifies_matching_and_half_rate_streams(tmp_path: Pat
     assert undeclared.measurements[f"{camera_topic}/fps_resolution"] == "no-nominal-declared"
 
 
-def test_fps_conformance_rejects_invalid_thresholds(tmp_path: Path) -> None:
-    source = synthesize_episode(
-        tmp_path / "episode.mcap",
-        SyntheticEpisodeSpec(
-            cameras=(),
-            black_segment=None,
-            timestamp_offset_segment=None,
-        ),
-    )
-
+def test_fps_conformance_rejects_invalid_thresholds(camera_less_episode: Path) -> None:
     refused_thresholds: list[tuple[str, Any, str]] = [
         ("max_plausible_fps", True, r"^max_plausible_fps must be a float, got bool$"),
         *(
@@ -821,7 +803,7 @@ def test_fps_conformance_rejects_invalid_thresholds(tmp_path: Path) -> None:
         ),
     ]
 
-    with hflow.Episode(source) as episode:
+    with hflow.Episode(camera_less_episode) as episode:
         for parameter_name, refused_value, message_pattern in refused_thresholds:
             with pytest.raises(ValueError, match=message_pattern):
                 asyncio.run(camera_fps_conformance(episode, **{parameter_name: refused_value}))
@@ -839,12 +821,11 @@ def test_fps_conformance_rejects_invalid_thresholds(tmp_path: Path) -> None:
         )
 
 
-def test_action_integrity_finds_the_injected_frozen_run(tmp_path: Path) -> None:
-    """A stalled publisher repeats samples bit-for-bit; a still robot does not.
-    The fixture holds every joint for 1 s of a 4 s stream.
-    """
-    source = synthesize_episode(
-        tmp_path / "frozen.mcap",
+@pytest.fixture(scope="module")
+def held_joints_episode(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Every joint held for 1 s of a 4 s camera-less stream, read-only."""
+    return synthesize_episode(
+        tmp_path_factory.mktemp("held") / "held.mcap",
         SyntheticEpisodeSpec(
             duration_s=4.0,
             cameras=(),
@@ -852,7 +833,22 @@ def test_action_integrity_finds_the_injected_frozen_run(tmp_path: Path) -> None:
             joint_freeze_segment=(1.0, 2.0),
         ),
     )
-    with hflow.Episode(source) as episode:
+
+
+@pytest.fixture(scope="module")
+def moving_joints_episode(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A 3 s camera-less stream that never holds or jumps, read-only."""
+    return synthesize_episode(
+        tmp_path_factory.mktemp("moving") / "moving.mcap",
+        SyntheticEpisodeSpec(duration_s=3.0, cameras=(), joint_jump_at_s=None),
+    )
+
+
+def test_action_integrity_finds_the_injected_frozen_run(held_joints_episode: Path) -> None:
+    """A stalled publisher repeats samples bit-for-bit; a still robot does not.
+    The fixture holds every joint for 1 s of a 4 s stream.
+    """
+    with hflow.Episode(held_joints_episode) as episode:
         result = asyncio.run(action_integrity(episode))
 
     assert result.measurements["/joint_states/nan_count"] == 0
@@ -870,12 +866,8 @@ def test_action_integrity_finds_the_injected_frozen_run(tmp_path: Path) -> None:
     assert result.verdict is None
 
 
-def test_action_integrity_reports_a_clean_stream_as_clean(tmp_path: Path) -> None:
-    source = synthesize_episode(
-        tmp_path / "clean.mcap",
-        SyntheticEpisodeSpec(duration_s=3.0, cameras=(), joint_jump_at_s=None),
-    )
-    with hflow.Episode(source) as episode:
+def test_action_integrity_reports_a_clean_stream_as_clean(moving_joints_episode: Path) -> None:
+    with hflow.Episode(moving_joints_episode) as episode:
         result = asyncio.run(action_integrity(episode))
 
     assert result.measurements["/joint_states/nan_count"] == 0
@@ -990,20 +982,11 @@ def test_registering_both_camera_checks_caches_the_instrument(tmp_path: Path) ->
     assert f"{camera_topic}/signal_frame_count" in second.measurements
 
 
-def test_trajectory_metrics_finds_the_injected_hold(tmp_path: Path) -> None:
+def test_trajectory_metrics_finds_the_injected_hold(held_joints_episode: Path) -> None:
     """A held publisher is motionless, and the fraction is time-weighted over
     the span actually measured rather than the episode span.
     """
-    source = synthesize_episode(
-        tmp_path / "held.mcap",
-        SyntheticEpisodeSpec(
-            duration_s=4.0,
-            cameras=(),
-            joint_jump_at_s=None,
-            joint_freeze_segment=(1.0, 2.0),
-        ),
-    )
-    with hflow.Episode(source) as episode:
+    with hflow.Episode(held_joints_episode) as episode:
         result = asyncio.run(trajectory_metrics(episode))
 
     motionless_fraction = result.measurements["/joint_states/motionless_fraction"]
@@ -1044,17 +1027,8 @@ def test_trajectory_metrics_dimension_scales_are_recorded_and_validated(
     assert scaled_peak == pytest.approx(raw_peak / 2.0)
 
 
-def test_trajectory_segments_localizes_the_hold(tmp_path: Path) -> None:
-    source = synthesize_episode(
-        tmp_path / "held.mcap",
-        SyntheticEpisodeSpec(
-            duration_s=4.0,
-            cameras=(),
-            joint_jump_at_s=None,
-            joint_freeze_segment=(1.0, 2.0),
-        ),
-    )
-    with hflow.Episode(source) as episode:
+def test_trajectory_segments_localizes_the_hold(held_joints_episode: Path) -> None:
+    with hflow.Episode(held_joints_episode) as episode:
         result = asyncio.run(trajectory_segments(episode))
 
     motionless = [i for i in result.intervals if i.label == "motionless:/joint_states"]
@@ -1109,16 +1083,12 @@ def test_trajectory_change_threshold_uses_a_true_weighted_median() -> None:
 
 
 def test_trajectory_metrics_emits_unsettled_ratio_for_a_moving_episode(
-    tmp_path: Path,
+    moving_joints_episode: Path,
 ) -> None:
     """A moving episode has mean_velocity > 0, so the unsettled ratio is
     defined and must be emitted alongside final_pose_speed.
     """
-    source = synthesize_episode(
-        tmp_path / "moving.mcap",
-        SyntheticEpisodeSpec(duration_s=3.0, cameras=(), joint_jump_at_s=None),
-    )
-    with hflow.Episode(source) as episode:
+    with hflow.Episode(moving_joints_episode) as episode:
         result = asyncio.run(trajectory_metrics(episode))
 
     assert result.measurements["/joint_states/motionless_fraction"] == pytest.approx(0.0)
@@ -1160,16 +1130,7 @@ def camera_less_episode(tmp_path_factory: pytest.TempPathFactory) -> Path:
     raises ValueError from camera processing and cannot tell the two apart.
     """
     return synthesize_episode(
-        tmp_path_factory.mktemp("guards") / "episode.mcap",
-        SyntheticEpisodeSpec(
-            duration_s=0.2,
-            cameras=(),
-            joint_hz=10.0,
-            joint_count=1,
-            black_segment=None,
-            joint_jump_at_s=None,
-            timestamp_offset_segment=None,
-        ),
+        tmp_path_factory.mktemp("guards") / "episode.mcap", TINY_STATE_ONLY_SPEC
     )
 
 
