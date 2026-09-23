@@ -39,6 +39,11 @@ model server reading the same files, use
 runs the hook to completion before draining the thread, so the drain cannot wait
 on a reader that only the hook can stop.
 
+If existing code loops over windows, preparing each one and then waiting on a
+model, `prefetch` from `hflow.asyncio_utils` prepares the next windows while the
+current one is scored. See
+[Score source windows with a model](./how-to/score-source-windows-with-a-model.md).
+
 ## The model: evidence, not verdicts
 
 A check returns `hflow.CheckResult`: **measurements** (episode summaries), **observations** (timestamped repeated evidence), **intervals** (labeled time spans), and **tags**. Every field is recorded regardless of pass or fail. Thresholds are not baked into the corpus, because quality heuristics are known to *invert* on real defects (smoothness metrics have scored an early-gripper-release defect *better* than clean demos); stored evidence lets you re-decide with a query, while a stored verdict bakes in the wrong call.

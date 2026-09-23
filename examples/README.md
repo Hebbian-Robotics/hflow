@@ -77,6 +77,29 @@ Guide: [Sample original video frames](../docs/how-to/sample-source-video.md)
 
 Code: [`sample_source_video.py`](./sample_source_video.py)
 
+## Model scoring for source windows
+
+**Use it for:** asking a vision model about every window of a long recording
+while the following windows are sampled in the background.
+
+**Prerequisites:** the root uv environment, a local video, FFmpeg/ffprobe, and an
+OpenAI-compatible chat completions endpoint that accepts images, such as a local
+vLLM server. Set `OPENAI_API_KEY` only if the endpoint requires a key.
+
+```bash
+uv run python examples/score_source_windows.py recording.mp4 \
+    --endpoint http://localhost:8000/v1 --model Qwen/Qwen2.5-VL-7B-Instruct \
+    --question "Are human hands visible? Answer yes or no." --lookahead 2
+```
+
+The example prints one JSON record per window, in order, with frame timestamps
+and the model's answer. It sends sampled frames to the endpoint, reads the source
+without modifying it, and deletes each window's JPEGs after scoring.
+
+Guide: [Score source windows with a model](../docs/how-to/score-source-windows-with-a-model.md)
+
+Code: [`score_source_windows.py`](./score_source_windows.py)
+
 ## Continuous camera motion
 
 **Use it for:** streaming per-frame-pair motion and optional continuous shake

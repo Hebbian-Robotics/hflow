@@ -57,6 +57,7 @@ Use these when you already know the outcome you need.
 - [Port existing processing and quality-check code](./PORTING.md)
 - [Run embedded workers and import video](./how-to/run-embedded-workers.md)
 - [Plan source windows and sample original frames](./how-to/sample-source-video.md)
+- [Score source windows with a model while the next ones are prepared](./how-to/score-source-windows-with-a-model.md)
 - [Summarize weighted measurements](./how-to/summarize-measurements.md)
 - [Stream continuous camera motion](./how-to/stream-camera-motion.md)
 - [Serve a workspace over HTTP](./SERVE.md)

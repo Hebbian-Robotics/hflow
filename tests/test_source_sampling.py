@@ -4,8 +4,10 @@ import hashlib
 import json
 import subprocess
 import sys
+import threading
 from dataclasses import replace
 from fractions import Fraction
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import cv2
@@ -485,6 +487,73 @@ def test_example_emits_complete_windows_with_readable_frame_paths(
     frames = [frame for record in records for frame in record["frames"]]
     assert [frame["timestamp_seconds"] for frame in frames] == list(range(6))
     assert all(cv2.imread(frame["path"]) is not None for frame in frames)
+
+
+def test_scoring_example_sends_every_window_to_the_endpoint_in_order(
+    color_video: Path,
+) -> None:
+    received_requests: list[dict[str, object]] = []
+
+    class FakeChatCompletions(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            received_requests.append({"path": self.path, "body": request})
+            image_count = sum(
+                part["type"] == "image_url" for part in request["messages"][0]["content"]
+            )
+            body = json.dumps(
+                {"choices": [{"message": {"content": f"saw {image_count} frames"}}]}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FakeChatCompletions)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    try:
+        repository_root = Path(__file__).resolve().parents[1]
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(repository_root / "examples" / "score_source_windows.py"),
+                str(color_video),
+                "--endpoint",
+                f"http://127.0.0.1:{server.server_address[1]}/v1",
+                "--model",
+                "test-model",
+                "--question",
+                "What color is the frame?",
+                "--maximum-window-millis",
+                "2500",
+                "--maximum-frames",
+                "2",
+                "--lookahead",
+                "2",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    finally:
+        server.shutdown()
+        server_thread.join()
+    records = [json.loads(line) for line in completed.stdout.splitlines()]
+    assert [(record["start_millis"], record["end_millis"]) for record in records] == [
+        (0, 2000),
+        (2000, 4000),
+        (4000, 6000),
+    ]
+    assert [record["frame_timestamps_seconds"] for record in records] == [[0, 1], [2, 3], [4, 5]]
+    assert [record["answer"] for record in records] == ["saw 2 frames"] * 3
+    assert all(request["path"] == "/v1/chat/completions" for request in received_requests)
+    assert len(received_requests) == 3
 
 
 @pytest.mark.parametrize("timestamp_offset", ["0", "5", "-1", "5.033333", "-3.033333"])

@@ -4,7 +4,9 @@ Use this when a worker needs bounded previews of an original local video before
 importing it into a canonical episode. The
 [runnable example](../../examples/sample_source_video.py) probes the original
 duration, plans complete windows, writes JPEGs, and prints one JSON record per
-window with source timestamps and any keyframe fallback reason.
+window with source timestamps and any keyframe fallback reason. To send each
+window's frames to a model while later windows are sampled, see
+[Score source windows with a model](./score-source-windows-with-a-model.md).
 
 ## Run the example
 
