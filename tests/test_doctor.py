@@ -121,6 +121,58 @@ def test_video_channel_with_missing_schema_is_reported_not_corrupt(tmp_path: Pat
     assert "/good-cam" in b_finding.message
 
 
+def test_chunk_with_missing_channel_is_reported_not_crash(tmp_path: Path) -> None:
+    """A chunk index referencing a channel id the file does not carry in its
+    summary is a real defect, but it gets its own finding, never raises KeyError,
+    and reports chunk-channel-missing (#620)."""
+    bad_path = tmp_path / "missing_channel.mcap"
+    good_path = tmp_path / "valid.mcap"
+
+    with bad_path.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        schema_id = writer.register_schema(name="json", encoding="json", data=b"{}")
+        valid_channel_id = writer.register_channel(
+            topic="/valid", message_encoding="json", schema_id=schema_id
+        )
+        writer.add_message(valid_channel_id, log_time=10**9, data=b"{}", publish_time=10**9)
+        writer.add_message(99, log_time=10**9, data=b"{}", publish_time=10**9)
+        writer.add_metadata(
+            "provenance/v1",
+            {"group//valid": "state", "schema_version": "1", "pipeline_version": "1"},
+        )
+        writer.finish()
+
+    with good_path.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        schema_id = writer.register_schema(name="json", encoding="json", data=b"{}")
+        valid_channel_id = writer.register_channel(
+            topic="/valid", message_encoding="json", schema_id=schema_id
+        )
+        writer.add_message(valid_channel_id, log_time=10**9, data=b"{}", publish_time=10**9)
+        writer.add_metadata(
+            "provenance/v1",
+            {"group//valid": "state", "schema_version": "1", "pipeline_version": "1"},
+        )
+        writer.finish()
+
+    report = diagnose(bad_path)
+    assert not report.conforming
+    codes = {finding.code for finding in report.findings}
+    assert "chunk-channel-missing" in codes
+    assert "read-failed" in codes
+    missing_finding = next(
+        finding for finding in report.findings if finding.code == "chunk-channel-missing"
+    )
+    assert "channel id 99" in missing_finding.message
+    assert "summary section" in missing_finding.message
+
+    # CLI batch execution diagnoses both files and returns 1 without crashing
+    exit_code = cli_main(["doctor", str(bad_path), str(good_path)])
+    assert exit_code == 1
+
+
 def test_duplicate_topic_channels_are_an_error(tmp_path: Path) -> None:
     """A file that already has two channels on one topic is not canonical,
     even when the transform was never asked to rewrite it (#597)."""

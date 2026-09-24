@@ -357,9 +357,25 @@ def diagnose(path: Path | str) -> DoctorReport:
                 )
                 continue
 
+            missing_channel_ids = sorted(
+                channel_id for channel_id in chunk_channel_ids if channel_id not in summary.channels
+            )
+            if missing_channel_ids:
+                for channel_id in missing_channel_ids:
+                    collector.add(
+                        DiagnosticLevel.ERROR,
+                        "chunk-channel-missing",
+                        f"chunk {chunk_number} references channel id {channel_id} which has no "
+                        "Channel record in the summary section",
+                    )
+
+            valid_chunk_channel_ids = {
+                channel_id for channel_id in chunk_channel_ids if channel_id in summary.channels
+            }
+
             if group_by_topic:
                 chunk_groups = set()
-                for channel_id in chunk_channel_ids:
+                for channel_id in valid_chunk_channel_ids:
                     topic = topics_by_channel_id[channel_id]
                     if topic in group_by_topic:
                         chunk_groups.add(group_by_topic[topic])
@@ -374,7 +390,7 @@ def diagnose(path: Path | str) -> DoctorReport:
 
                 if len(chunk_groups) > 1:
                     mixed_topics = sorted(
-                        topics_by_channel_id[channel_id] for channel_id in chunk_channel_ids
+                        topics_by_channel_id[channel_id] for channel_id in valid_chunk_channel_ids
                     )
                     collector.add(
                         DiagnosticLevel.WARNING,
@@ -383,13 +399,15 @@ def diagnose(path: Path | str) -> DoctorReport:
                         "the default convention separates them",
                     )
             else:
-                has_video = any(channel_id in video_channel_ids for channel_id in chunk_channel_ids)
+                has_video = any(
+                    channel_id in video_channel_ids for channel_id in valid_chunk_channel_ids
+                )
                 has_state = any(
-                    channel_id not in video_channel_ids for channel_id in chunk_channel_ids
+                    channel_id not in video_channel_ids for channel_id in valid_chunk_channel_ids
                 )
                 if has_video and has_state:
                     mixed_topics = sorted(
-                        topics_by_channel_id[channel_id] for channel_id in chunk_channel_ids
+                        topics_by_channel_id[channel_id] for channel_id in valid_chunk_channel_ids
                     )
                     collector.add(
                         # A custom topic-group assignment could legally do this;

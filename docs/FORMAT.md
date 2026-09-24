@@ -237,6 +237,7 @@ automation. An `error` breaks the canonical convention (or the MCAP spec); a
 | `no-statistics` | error | The summary has no `Statistics` record. |
 | `no-chunk-indexes` | error | The summary has no `ChunkIndex` records. |
 | `chunk-missing-message-indexes` | error | A chunk index has no per-channel `MessageIndex` offsets. |
+| `chunk-channel-missing` | error | A chunk index references a channel ID that has no Channel record in the summary section. |
 | `chunk-mixes-groups` | warning | One chunk contains channels assigned to different groups; custom grouping can make this intentional. |
 | `group-chunks-out-of-order` | warning | A group's chunks are not ascending by `message_start_time`. |
 | `chunk-mixes-video-and-state` | warning | One chunk contains both video and state channels, reported only when the file has no group map; custom grouping can make this intentional. |
