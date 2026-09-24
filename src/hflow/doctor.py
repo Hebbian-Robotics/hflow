@@ -347,7 +347,6 @@ def diagnose(path: Path | str) -> DoctorReport:
         last_chunk_start_by_group: dict[str, int] = {}
         out_of_order_groups: set[str] = set()
 
-        missing_channels_by_chunk: dict[int, list[int]] = {}
         for chunk_number, chunk_index in enumerate(summary.chunk_indexes):
             chunk_channel_ids = set(chunk_index.message_index_offsets.keys())
             if not chunk_channel_ids:
@@ -362,13 +361,12 @@ def diagnose(path: Path | str) -> DoctorReport:
                 channel_id for channel_id in chunk_channel_ids if channel_id not in summary.channels
             )
             if missing_channel_ids:
-                missing_channels_by_chunk[chunk_number] = missing_channel_ids
                 for channel_id in missing_channel_ids:
                     collector.add(
                         DiagnosticLevel.ERROR,
                         "chunk-channel-missing",
                         f"chunk {chunk_number} references channel id {channel_id} which has no "
-                        "Channel record in the file",
+                        "Channel record in the summary section",
                     )
 
             valid_chunk_channel_ids = {
@@ -519,21 +517,11 @@ def diagnose(path: Path | str) -> DoctorReport:
                     video_log_times.setdefault(channel_id, []).append(log_time)
                     video_keyframes.setdefault(channel_id, []).append(is_keyframe)
         except Exception as error:
-            reported_missing_channels = {
-                channel_id
-                for missing_ids in missing_channels_by_chunk.values()
-                for channel_id in missing_ids
-            }
-            if not (
-                isinstance(error, KeyError)
-                and error.args
-                and error.args[0] in reported_missing_channels
-            ):
-                collector.add(
-                    DiagnosticLevel.ERROR,
-                    "read-failed",
-                    f"reading messages failed (corrupt chunk or bad CRC?): {error}",
-                )
+            collector.add(
+                DiagnosticLevel.ERROR,
+                "read-failed",
+                f"reading messages failed (corrupt chunk or bad CRC?): {error}",
+            )
         else:
             for channel_id in sorted(video_channel_ids):
                 topic = topics_by_channel_id[channel_id]

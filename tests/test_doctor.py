@@ -161,12 +161,12 @@ def test_chunk_with_missing_channel_is_reported_not_crash(tmp_path: Path) -> Non
     assert not report.conforming
     codes = {finding.code for finding in report.findings}
     assert "chunk-channel-missing" in codes
+    assert "read-failed" in codes
     missing_finding = next(
         finding for finding in report.findings if finding.code == "chunk-channel-missing"
     )
     assert "channel id 99" in missing_finding.message
-    assert "no Channel record" in missing_finding.message
-    assert not any(finding.code == "read-failed" for finding in report.findings)
+    assert "summary section" in missing_finding.message
 
     # CLI batch execution diagnoses both files and returns 1 without crashing
     exit_code = cli_main(["doctor", str(bad_path), str(good_path)])
