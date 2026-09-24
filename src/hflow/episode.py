@@ -708,9 +708,7 @@ class Episode:
             if staging_directory.exists():
                 shutil.rmtree(staging_directory)
             staging_directory.mkdir(parents=True)
-            filter_script_path = staging_directory / "select.filter"
             selection_expression = _frame_selection_expression(selected_frame_indices)
-            filter_script_path.write_text(f"select={selection_expression}")
             command = [
                 str(ffmpeg_path()),
                 "-hide_banner",
@@ -719,8 +717,8 @@ class Episode:
                 "-y",
                 "-i",
                 str(mp4_path),
-                "-filter_script:v",
-                str(filter_script_path),
+                "-vf",
+                f"select={selection_expression}",
                 "-fps_mode",
                 "vfr",
                 "-frames:v",
@@ -748,7 +746,6 @@ class Episode:
                     f"{len(selected_frame_indices)} selected frames from {topic!r} "
                     f"(exit {completed_process.returncode}): {stderr_tail}"
                 )
-            filter_script_path.unlink()
             staging_directory.replace(output_directory)
 
         return [
