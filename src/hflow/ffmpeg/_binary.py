@@ -32,6 +32,7 @@ binaries from a fresh verified download.
 import logging
 import os
 import platform
+import re
 import shutil
 import tarfile
 import tempfile
@@ -275,6 +276,22 @@ def _first_version_line(binary: Path) -> str:
     return lines[0].strip()
 
 
+def _parse_major_version(version_line: str) -> int | None:
+    tokens = version_line.split()
+    if len(tokens) >= 3 and tokens[1] == "version":
+        token = tokens[2].lstrip("n")
+        match = re.match(r"^(\d+)", token)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _filter_script_flag_for_major(major: int | None) -> str:
+    if major is not None and major < 7:
+        return "-filter_script:v"
+    return "-/filter:v"
+
+
 @lru_cache(maxsize=1)
 def ffmpeg_version() -> str:
     """First line of ``ffmpeg -version`` for the resolved binary."""
@@ -282,6 +299,35 @@ def ffmpeg_version() -> str:
 
 
 @lru_cache(maxsize=1)
+def ffmpeg_major_version() -> int | None:
+    """Major version number of the resolved ffmpeg binary, or None if unparseable."""
+    try:
+        return _parse_major_version(ffmpeg_version())
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=1)
+def ffmpeg_filter_script_flag() -> str:
+    """Option flag for loading a video filtergraph from a file.
+
+    FFmpeg 7.0 introduced the ``-/opt <file>`` syntax and deprecated ``-filter_script``,
+    which was removed in FFmpeg 9.0. Uses ``-/filter:v`` for FFmpeg >= 7.0 and
+    ``-filter_script:v`` for earlier versions.
+    """
+    return _filter_script_flag_for_major(ffmpeg_major_version())
+
+
+@lru_cache(maxsize=1)
 def ffprobe_version() -> str:
     """First line of ``ffprobe -version`` for the resolved binary."""
     return _first_version_line(ffprobe_path())
+
+
+@lru_cache(maxsize=1)
+def ffprobe_major_version() -> int | None:
+    """Major version number of the resolved ffprobe binary, or None if unparseable."""
+    try:
+        return _parse_major_version(ffprobe_version())
+    except Exception:
+        return None

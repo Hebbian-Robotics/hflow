@@ -27,7 +27,7 @@ import numpy as np
 from mcap.records import Attachment, Schema
 
 from hflow import video as video_module
-from hflow.ffmpeg import ffmpeg_path
+from hflow.ffmpeg import ffmpeg_filter_script_flag, ffmpeg_path
 from hflow.format import (
     CAMERA_SCHEMA_NAMES,
     CANONICAL_VIDEO_SCHEMA_NAME,
@@ -719,7 +719,7 @@ class Episode:
                 "-y",
                 "-i",
                 str(mp4_path),
-                "-filter_script:v",
+                ffmpeg_filter_script_flag(),
                 str(filter_script_path),
                 "-fps_mode",
                 "vfr",
