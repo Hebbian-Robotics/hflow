@@ -626,6 +626,13 @@ def _parse_dataset_information(dataset_information: dict) -> _DatasetInformation
     fields its own call site supplies, so a template the converter could not
     use is refused before any download.
     """
+    storage_format = dataset_information.get("storage_format")
+    if storage_format is not None and storage_format != "parquet":
+        raise ValueError(
+            f"LeRobot meta/info.json has unsupported storage_format={storage_format!r}; "
+            "only the default 'parquet' format is supported"
+        )
+
     frames_per_second = dataset_information.get("fps")
     if (
         isinstance(frames_per_second, bool)
