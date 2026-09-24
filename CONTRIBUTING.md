@@ -39,6 +39,8 @@ macOS, install the Xcode Command Line Tools with `xcode-select --install`.
 
 Linux and macOS both work for native development. CI runs on Linux only, so
 run the quality checks yourself before opening a pull request on macOS.
+Native overlay builds require CPython on Linux, so the packaging tests that
+compile one are skipped on macOS.
 
 Native Windows is not supported: pipeline and storage operations use `fcntl`
 for file locking (`src/hflow/storage.py`), which does not exist on Windows. Work inside WSL2 with an Ubuntu
