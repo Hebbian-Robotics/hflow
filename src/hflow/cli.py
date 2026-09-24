@@ -1073,10 +1073,12 @@ def _register_curate_command(app: typer.Typer, result_holder: list[int]) -> None
         ),
     ) -> int:
         if dry_run and _parameter_was_explicit(ctx, "output"):
-            print("curate: --output/-o and --dry-run are mutually exclusive", file=sys.stderr)
-            code = 2
-        else:
-            code = _command_curate(sql, sql_file, catalog, output, dry_run)
+            # A usage error, like argparse's mutex group before it: raised
+            # before any command body runs, so `main()` surfaces it as
+            # SystemExit rather than a plain return, matching every other
+            # parse error.
+            raise typer.BadParameter("--output/-o and --dry-run are mutually exclusive", ctx=ctx)
+        code = _command_curate(sql, sql_file, catalog, output, dry_run)
         result_holder.append(code)
         return code
 
@@ -1405,10 +1407,10 @@ def _register_stale_command(app: typer.Typer, result_holder: list[int]) -> None:
         ),
     ) -> int:
         if pipeline is not None and pipeline_version is not None:
-            print("stale: pass at most one of --pipeline or --pipeline-version", file=sys.stderr)
-            code = 2
-        else:
-            code = _command_stale(catalog, pipeline, pipeline_version, exit_code_flag)
+            # A usage error, like argparse's mutex group before it: see the
+            # matching comment in curate_command above.
+            raise typer.BadParameter("pass at most one of --pipeline or --pipeline-version")
+        code = _command_stale(catalog, pipeline, pipeline_version, exit_code_flag)
         result_holder.append(code)
         return code
 

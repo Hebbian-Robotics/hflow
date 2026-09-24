@@ -771,18 +771,19 @@ def test_cli_curate_dry_run_reports_without_writing_a_manifest(
 def test_cli_curate_rejects_dry_run_with_an_explicit_output(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    exit_code = cli_main(
-        [
-            "curate",
-            "SELECT 1",
-            "--catalog",
-            str(tmp_path),
-            "--dry-run",
-            "--output",
-            str(tmp_path / "manifest.parquet"),
-        ]
-    )
-    assert exit_code == 2
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main(
+            [
+                "curate",
+                "SELECT 1",
+                "--catalog",
+                str(tmp_path),
+                "--dry-run",
+                "--output",
+                str(tmp_path / "manifest.parquet"),
+            ]
+        )
+    assert exc_info.value.code == 2
     assert "mutually exclusive" in capsys.readouterr().err
 
 
@@ -939,18 +940,19 @@ def test_cli_stale_prints_source_uris_for_ingest(
 def test_cli_stale_rejects_pipeline_and_pipeline_version_together(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    exit_code = cli_main(
-        [
-            "stale",
-            "--catalog",
-            str(tmp_path / "catalog"),
-            "--pipeline",
-            "pipeline.py",
-            "--pipeline-version",
-            "somethingnewer",
-        ]
-    )
-    assert exit_code == 2
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main(
+            [
+                "stale",
+                "--catalog",
+                str(tmp_path / "catalog"),
+                "--pipeline",
+                "pipeline.py",
+                "--pipeline-version",
+                "somethingnewer",
+            ]
+        )
+    assert exc_info.value.code == 2
     assert "at most one" in capsys.readouterr().err
 
 
