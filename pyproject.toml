@@ -33,6 +33,7 @@ dependencies = [
     "platformdirs>=4.11.3",
     "pydantic>=2.13.4",
     "tenacity>=9.1.4",
+    "typer>=0.27.2",
     "zstandard>=0.25.0",
 ]
 

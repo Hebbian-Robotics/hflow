@@ -768,7 +768,9 @@ def test_cli_curate_dry_run_reports_without_writing_a_manifest(
     assert not (data_root / "manifest.parquet").exists()
 
 
-def test_cli_curate_rejects_dry_run_with_an_explicit_output(tmp_path: Path) -> None:
+def test_cli_curate_rejects_dry_run_with_an_explicit_output(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     with pytest.raises(SystemExit) as exc_info:
         cli_main(
             [
@@ -782,6 +784,7 @@ def test_cli_curate_rejects_dry_run_with_an_explicit_output(tmp_path: Path) -> N
             ]
         )
     assert exc_info.value.code == 2
+    assert "mutually exclusive" in capsys.readouterr().err
 
 
 def test_curation_report_summary_renders_the_no_output_case() -> None:
@@ -932,6 +935,25 @@ def test_cli_stale_prints_source_uris_for_ingest(
     # stdout is exactly the pipeable URI list; the summary goes to stderr.
     assert captured.out.splitlines() == ["episodes-in/run_0001.mcap"]
     assert "1 episode(s)" in captured.err
+
+
+def test_cli_stale_rejects_pipeline_and_pipeline_version_together(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main(
+            [
+                "stale",
+                "--catalog",
+                str(tmp_path / "catalog"),
+                "--pipeline",
+                "pipeline.py",
+                "--pipeline-version",
+                "somethingnewer",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "at most one" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

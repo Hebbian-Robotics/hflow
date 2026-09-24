@@ -8,7 +8,7 @@ from episode_test_helpers import synthesize_canonical_episode
 from pytest import CaptureFixture
 
 from hflow import __version__
-from hflow.cli import _build_parser, main
+from hflow.cli import main
 from hflow.testing import SyntheticEpisodeSpec
 
 
@@ -29,7 +29,7 @@ def test_command_help_has_a_description(
     command: str, expected_description: str, capsys: CaptureFixture
 ) -> None:
     with pytest.raises(SystemExit) as exception:
-        _build_parser().parse_args([command, "--help"])
+        main([command, "--help"])
 
     assert exception.value.code == 0
     assert expected_description in capsys.readouterr().out
@@ -37,7 +37,7 @@ def test_command_help_has_a_description(
 
 def test_cli_version(capsys: CaptureFixture) -> None:
     with pytest.raises(SystemExit) as exception:
-        _build_parser().parse_args(["--version"])
+        main(["--version"])
 
     assert exception.value.code == 0
     assert f"hflow {__version__}" in capsys.readouterr().out
@@ -69,19 +69,45 @@ def test_cli_defaults_follow_the_environment_data_root(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A shell configured with HFLOW_DATA_ROOT must not have curate/stale/up
-    silently address a hardcoded ./data beside the workspace the App uses."""
+    silently address a hardcoded ./data beside the workspace the App uses.
+
+    Each command's own default is re-resolved fresh on every ``main()`` call
+    (the Typer app is rebuilt from scratch each time, exactly like the old
+    argparse parser was), so this drives real invocations end to end and
+    intercepts the library call each command ultimately reaches, rather than
+    inspecting a parsed Namespace.
+    """
+    from hflow.catalog_ui import CatalogUiSettings
+
+    captured_catalogs: list[str] = []
+    captured_data_roots: list[str] = []
+
+    def record_stale_episodes(catalog_root: object, **_kwargs: object) -> list[object]:
+        captured_catalogs.append(str(catalog_root))
+        return []
+
+    def record_catalog_ui(settings: CatalogUiSettings) -> None:
+        captured_catalogs.append(str(settings.catalog_root))
+
+    def record_runtime_config(**kwargs: object) -> None:
+        captured_data_roots.append(str(kwargs["data_root"]))
+        raise ValueError("stop before actually starting anything")
+
+    monkeypatch.setattr("hflow.cli.stale_episodes", record_stale_episodes)
+    monkeypatch.setattr("hflow.catalog_ui.serve_catalog_ui", record_catalog_ui)
+    monkeypatch.setattr("hflow.runtime.RuntimeConfig", record_runtime_config)
+
     monkeypatch.setenv("HFLOW_DATA_ROOT", str(tmp_path / "workspace"))
-    parser = _build_parser()
-    stale_arguments = parser.parse_args(["stale", "--pipeline-version", "abc"])
-    assert stale_arguments.catalog == f"{tmp_path / 'workspace'}/catalog"
-    catalog_ui_arguments = parser.parse_args(["catalog", "ui", "--no-browser"])
-    assert catalog_ui_arguments.catalog == f"{tmp_path / 'workspace'}/catalog"
-    up_arguments = parser.parse_args(["up", "--pipeline", "p.py"])
-    assert up_arguments.data_root == str(tmp_path / "workspace")
+    assert main(["stale", "--pipeline-version", "abc"]) == 0
+    assert captured_catalogs[-1] == f"{tmp_path / 'workspace'}/catalog"
+    assert main(["catalog", "ui", "--no-browser"]) == 0
+    assert captured_catalogs[-1] == f"{tmp_path / 'workspace'}/catalog"
+    assert main(["up", "--pipeline", "p.py"]) == 2
+    assert captured_data_roots[-1] == str(tmp_path / "workspace")
 
     monkeypatch.delenv("HFLOW_DATA_ROOT")
-    default_arguments = _build_parser().parse_args(["stale", "--pipeline-version", "abc"])
-    assert default_arguments.catalog == "./data/catalog"
+    assert main(["stale", "--pipeline-version", "abc"]) == 0
+    assert captured_catalogs[-1] == "./data/catalog"
 
 
 def test_cli_manifest_reports_a_broken_pipeline_instead_of_crashing(
@@ -164,7 +190,6 @@ def test_catalog_ui_cli_accepts_bucket_catalog_urls(
     scheme: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from hflow.catalog_ui import CatalogUiSettings
-    from hflow.cli import _command_catalog_ui
 
     served_catalog_roots: list[str] = []
 
@@ -172,11 +197,11 @@ def test_catalog_ui_cli_accepts_bucket_catalog_urls(
         served_catalog_roots.append(str(settings.catalog_root))
 
     monkeypatch.setattr("hflow.catalog_ui.serve_catalog_ui", record_serve)
-    parser = _build_parser()
     catalog_url = f"{scheme}://robot-data/production/catalog"
-    arguments = parser.parse_args(["catalog", "ui", "--no-browser", "--catalog", catalog_url])
 
-    assert _command_catalog_ui(arguments) == 0
+    exit_code = main(["catalog", "ui", "--no-browser", "--catalog", catalog_url])
+
+    assert exit_code == 0
     assert served_catalog_roots == [catalog_url]
 
 

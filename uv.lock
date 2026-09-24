@@ -7,7 +7,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
+exclude-newer = "2026-09-19T03:56:48.769808897Z"
 exclude-newer-span = "P5D"
 
 [manifest]
@@ -1083,6 +1083,7 @@ dependencies = [
     { name = "platformdirs" },
     { name = "pydantic" },
     { name = "tenacity" },
+    { name = "typer" },
     { name = "zstandard" },
 ]
 
@@ -1148,6 +1149,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.13.4" },
     { name = "setuptools", marker = "extra == 'native-build'", specifier = ">=84.0.0" },
     { name = "tenacity", specifier = ">=9.1.4" },
+    { name = "typer", specifier = ">=0.27.2" },
     { name = "zstandard", specifier = ">=0.25.0" },
 ]
 provides-extras = ["arrow", "bucket", "mediapipe", "motion", "video", "native-build", "openai"]
