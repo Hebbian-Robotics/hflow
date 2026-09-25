@@ -68,7 +68,11 @@ from hflow.ffmpeg._binary import (
     FfprobeNotFoundError,
     PinnedBuild,
     PinnedDownloadError,
+    _ffmpeg_filter_script_flag,
+    _ffmpeg_major_version,
+    _filter_script_flag_for_major,
     _install_pinned_build,
+    _parse_major_version,
     _pinned_install_dir,
     ffmpeg_path,
     ffmpeg_version,
@@ -100,6 +104,8 @@ def _measure_frame_statistics(
 def _clear_all_binary_caches() -> None:
     ffmpeg_path.cache_clear()
     ffmpeg_version.cache_clear()
+    _ffmpeg_major_version.cache_clear()
+    _ffmpeg_filter_script_flag.cache_clear()
     ffprobe_path.cache_clear()
     ffprobe_version.cache_clear()
 
@@ -1221,3 +1227,73 @@ def test_corrupt_cache_is_replaced_from_a_fresh_decode(
     assert repaired.decoded_frame_count == first.decoded_frame_count
     assert "lavfi.signalstats.YAVG" in cache_path.read_text(encoding="utf-8")
     assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize(
+    ("banner", "expected_major"),
+    [
+        ("ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers", 9),
+        ("ffmpeg version n8.1.2-50-g1a748fe2cd Copyright (c) 2000-2025 the FFmpeg developers", 8),
+        ("ffmpeg version 7.0-static https://johnvansickle.com/ffmpeg/", 7),
+        ("ffmpeg version 7.1.1 Copyright (c) 2000-2024 the FFmpeg developers", 7),
+        ("ffmpeg version 6.1.1-1ubuntu1 Copyright (c) 2000-2023 the FFmpeg developers", 6),
+        ("ffmpeg version 4.4.2-0ubuntu0.22.04.1 Copyright (c) 2000-2021 the FFmpeg developers", 4),
+        ("ffprobe version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers", 9),
+        ("ffmpeg version git-unknown", None),
+        ("invalid version string", None),
+    ],
+)
+def test_parse_major_version(banner: str, expected_major: int | None) -> None:
+    assert _parse_major_version(banner) == expected_major
+
+
+@pytest.mark.parametrize(
+    ("major", "expected_flag"),
+    [
+        (4, "-filter_script:v"),
+        (5, "-filter_script:v"),
+        (6, "-filter_script:v"),
+        (7, "-/filter:v"),
+        (8, "-/filter:v"),
+        (9, "-/filter:v"),
+        (None, "-/filter:v"),
+    ],
+)
+def test_filter_script_flag_for_major(major: int | None, expected_flag: str) -> None:
+    assert _filter_script_flag_for_major(major) == expected_flag
+
+
+def test_ffmpeg_filter_script_flag_matches_resolved_binary() -> None:
+    major = _ffmpeg_major_version()
+    flag = _ffmpeg_filter_script_flag()
+    if major is not None and major < 7:
+        assert flag == "-filter_script:v"
+    else:
+        assert flag == "-/filter:v"
+
+
+@pytest.mark.parametrize(
+    ("banner", "expected_flag"),
+    [
+        ("ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers", "-/filter:v"),
+        (
+            "ffmpeg version n8.1.2-50-g1a748fe2cd Copyright (c) 2000-2025 the FFmpeg developers",
+            "-/filter:v",
+        ),
+        ("ffmpeg version 7.0-static https://johnvansickle.com/ffmpeg/", "-/filter:v"),
+        (
+            "ffmpeg version 6.1.1-1ubuntu1 Copyright (c) 2000-2023 the FFmpeg developers",
+            "-filter_script:v",
+        ),
+        ("ffmpeg version git-unknown", "-/filter:v"),
+        ("ffmpeg version N-12345-gabcdef", "-/filter:v"),
+    ],
+)
+def test_ffmpeg_filter_script_flag_for_simulated_versions(
+    monkeypatch: pytest.MonkeyPatch,
+    cleared_binary_caches: None,
+    banner: str,
+    expected_flag: str,
+) -> None:
+    monkeypatch.setattr(_binary, "ffmpeg_version", lambda: banner)
+    assert _ffmpeg_filter_script_flag() == expected_flag
