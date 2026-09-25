@@ -862,6 +862,62 @@ def test_info_json_refuses_non_finite_or_non_positive_fps(
     assert not cache_dir.exists() or not (cache_dir / "meta" / "episodes").exists()
 
 
+@pytest.mark.parametrize(
+    "storage_format",
+    ["lance", "arrow", "parquet2", "sqlite"],
+    ids=["lance", "arrow", "parquet2", "sqlite"],
+)
+def test_info_json_refuses_unsupported_storage_format(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage_format: str
+) -> None:
+    """Non-parquet storage_format metadata must be refused before any episode discovery runs."""
+    corpus = _build_fake_corpus(tmp_path)
+    info = dict(corpus["info"])
+    info["storage_format"] = storage_format
+    stub_hub_repo_info(monkeypatch)
+    monkeypatch.setattr(prep, "_fetch_info_json", lambda repo, rev, cache: info)
+
+    def fail_discovery(repo: str, rev: str) -> list[str]:
+        raise AssertionError("episode metadata discovery must not run after invalid storage_format")
+
+    def fail_download(repo_id: str, revision: str, filename: str, cache_dir: Path) -> Path:
+        raise AssertionError("file download must not run after invalid storage_format")
+
+    monkeypatch.setattr(prep, "_hf_episode_metadata_files", fail_discovery)
+    monkeypatch.setattr(prep, "_download_file", fail_download)
+
+    dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
+    cache_dir = tmp_path / "cache"
+    with pytest.raises(ValueError, match="storage_format") as excinfo:
+        prep._ensure_source_archive(dataset_source, cache_dir)
+
+    message = str(excinfo.value)
+    assert repr(storage_format) in message
+    assert "storage_format" in message
+    # Refusal happens before episode metadata discovery: no downloads, no output.
+    assert not cache_dir.exists() or not (cache_dir / "meta" / "episodes").exists()
+
+
+@pytest.mark.parametrize(
+    "valid_storage_format",
+    [None, "parquet"],
+    ids=["absent", "explicit-parquet"],
+)
+def test_info_json_accepts_parquet_or_absent_storage_format(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, valid_storage_format: str | None
+) -> None:
+    """Absent or 'parquet' storage_format metadata is accepted as the LeRobot default."""
+    corpus = _build_fake_corpus(tmp_path)
+    info = dict(corpus["info"])
+    if valid_storage_format is None:
+        info.pop("storage_format", None)
+    else:
+        info["storage_format"] = valid_storage_format
+
+    parsed = prep._parse_dataset_information(info)
+    assert parsed.fps == 30
+
+
 def _stub_single_episode_info(camera_metadata: dict | None = None) -> dict:
     """One RGB camera and the two required numeric features.
 
