@@ -151,10 +151,7 @@ def camera_shake_rate_percentile(
     upper_index = len(ordered_bins) - 1
     while lower_index < upper_index:
         middle_index = (lower_index + upper_index) // 2
-        prefix_seconds = math.fsum(bin_durations[: middle_index + 1])
-        if prefix_seconds >= target_seconds or (
-            percentile < 100 and math.isclose(prefix_seconds, target_seconds, rel_tol=1e-15)
-        ):
+        if math.fsum(bin_durations[: middle_index + 1]) >= target_seconds:
             upper_index = middle_index
         else:
             lower_index = middle_index + 1

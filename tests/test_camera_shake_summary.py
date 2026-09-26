@@ -145,7 +145,13 @@ def test_p99_stays_in_lower_bin_at_a_30_fps_duration_boundary() -> None:
             pair_index,
             duration_seconds=1 / 30,
             shake=measured_shake(
-                11.25 if pair_index < 5 else 12.25 if pair_index < 297 else 2261.0
+                11.25
+                if pair_index < 1
+                else 12.25
+                if pair_index < 23
+                else 13.25
+                if pair_index < 297
+                else 2261.0
             ),
         )
         for pair_index in range(300)
@@ -154,18 +160,30 @@ def test_p99_stays_in_lower_bin_at_a_30_fps_duration_boundary() -> None:
     summary = summarize_camera_shake(observations)
 
     assert summary.maximum_shake_degrees_per_second == 2261.0
-    assert summary.p99_shake_degrees_per_second == 13.0
+    assert summary.p99_shake_degrees_per_second == 14.0
     assert (
         camera_shake_rate_percentile(
             (
-                CameraShakeRateBin(11, 5 / 30),
-                CameraShakeRateBin(12, 292 / 30),
+                CameraShakeRateBin(11, 1 / 30),
+                CameraShakeRateBin(12, 22 / 30),
+                CameraShakeRateBin(13, 274 / 30),
                 CameraShakeRateBin(2261, 3 / 30),
             ),
             percentile=99,
             maximum_shake_degrees_per_second=2261.0,
         )
-        == 13.0
+        == 14.0
+    )
+    assert (
+        camera_shake_rate_percentile(
+            (
+                CameraShakeRateBin(11, 0.9899999999999995),
+                CameraShakeRateBin(2261, 0.0100000000000005),
+            ),
+            percentile=99,
+            maximum_shake_degrees_per_second=2261.0,
+        )
+        == 2261.0
     )
 
 
