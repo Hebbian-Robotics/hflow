@@ -11,6 +11,7 @@ Decoding happens here, above the batch reader seam: CDR via
 standard library.
 """
 
+import fcntl
 import hashlib
 import json
 import re
@@ -18,6 +19,7 @@ import shutil
 import subprocess
 import tempfile
 from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
@@ -108,6 +110,83 @@ def _frame_selection_expression(frame_indices: Sequence[int]) -> str:
         else f"between(n\\,{range_start}\\,{range_end})"
         for range_start, range_end in consecutive_ranges
     )
+
+
+_FRAME_STAGING_MARKER = ".hflow_staging"
+
+
+@contextmanager
+def _frame_cache_staging(
+    output_directory: Path,
+    *,
+    is_cached: Callable[[], bool],
+) -> Iterator[Path | None]:
+    # Fast path: if the cache is already fully populated, return immediately
+    # without creating parent directories or acquiring locks. This enables
+    # read-only workdirs to serve cache hits.
+    if is_cached():
+        yield None
+        return
+
+    output_directory.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = output_directory.with_name(f"{output_directory.name}.lock")
+
+    # A filesystem lock coordinates separate threads and processes.
+    # Advisory flock, POSIX-only, which covers every supported runtime
+    # (Windows runs via WSL2). Matches the pattern in storage._mirror_entry_lock.
+    with lock_path.open("a") as lock_stream:
+        fcntl.flock(lock_stream, fcntl.LOCK_EX)
+        try:
+            # Recheck after acquiring the lock: another worker may have finished.
+            if is_cached():
+                yield None
+                return
+
+            # Repair an incomplete cache only while holding its lock.
+            if output_directory.exists() or output_directory.is_symlink():
+                if output_directory.is_dir() and not output_directory.is_symlink():
+                    shutil.rmtree(output_directory)
+                else:
+                    output_directory.unlink()
+
+            # Clean up any stranded staging directories left behind by killed
+            # workers for this cache target. To avoid deleting unrelated caller
+            # files or backup directories that happen to match the naming
+            # pattern, verify that the directory contains the staging marker
+            # created specifically for this cache.
+            staging_prefix = f"{output_directory.name}."
+            staging_suffix = ".tmp"
+            for entry in output_directory.parent.iterdir():
+                if (
+                    entry.is_dir()
+                    and not entry.is_symlink()
+                    and entry.name.startswith(staging_prefix)
+                    and entry.name.endswith(staging_suffix)
+                ):
+                    marker = entry / _FRAME_STAGING_MARKER
+                    if marker.is_file():
+                        try:
+                            if marker.read_text().strip() == output_directory.name:
+                                shutil.rmtree(entry, ignore_errors=True)
+                        except OSError:
+                            pass
+
+            with tempfile.TemporaryDirectory(
+                prefix=f"{output_directory.name}.",
+                suffix=".tmp",
+                dir=output_directory.parent,
+            ) as temporary_directory:
+                staging_directory = Path(temporary_directory)
+                marker_path = staging_directory / _FRAME_STAGING_MARKER
+                marker_path.write_text(output_directory.name)
+
+                yield staging_directory
+
+                # Runs only if extraction and validation completed successfully.
+                marker_path.unlink(missing_ok=True)
+                staging_directory.replace(output_directory)
+        finally:
+            fcntl.flock(lock_stream, fcntl.LOCK_UN)
 
 
 def _message_field_names(message: Any) -> list[str]:
@@ -616,28 +695,24 @@ class Episode:
         end_label = f"{end_s:.6f}" if end_s is not None else "end"
         label = f"{_sanitize_topic(topic)}_f{fps:.6f}_s{window_start_s:.6f}_e{end_label}"
         output_dir = self.workdir / f"frames_{label}"
-        if not output_dir.exists():
-            # Extract into a temp dir and rename on success: a bare directory
-            # is the cache key, so a failed run must never leave one behind.
-            staging_dir = self.workdir / f"frames_{label}.tmp"
-            if staging_dir.exists():
-                shutil.rmtree(staging_dir)
-            staging_dir.mkdir(parents=True)
-            command: list[str] = [str(ffmpeg_path()), "-hide_banner", "-y", "-i", str(mp4)]
-            if start_s is not None:
-                command += ["-ss", f"{start_s:.6f}"]
-            if end_s is not None:
-                command += ["-to", f"{end_s:.6f}"]
-            command += ["-vf", f"fps={fps:g}", "-q:v", "2", str(staging_dir / "frame_%06d.jpg")]
-            completed = subprocess.run(command, capture_output=True, text=True, check=False)
-            if completed.returncode != 0 or not any(staging_dir.glob("frame_*.jpg")):
-                stderr_tail = completed.stderr.strip().splitlines()[-5:]
-                shutil.rmtree(staging_dir)
-                raise RuntimeError(
-                    f"ffmpeg frame extraction produced no frames for {topic!r} "
-                    f"(exit {completed.returncode}): {stderr_tail}"
-                )
-            staging_dir.replace(output_dir)
+        with _frame_cache_staging(
+            output_dir,
+            is_cached=output_dir.exists,
+        ) as staging_dir:
+            if staging_dir is not None:
+                command: list[str] = [str(ffmpeg_path()), "-hide_banner", "-y", "-i", str(mp4)]
+                if start_s is not None:
+                    command += ["-ss", f"{start_s:.6f}"]
+                if end_s is not None:
+                    command += ["-to", f"{end_s:.6f}"]
+                command += ["-vf", f"fps={fps:g}", "-q:v", "2", str(staging_dir / "frame_%06d.jpg")]
+                completed = subprocess.run(command, capture_output=True, text=True, check=False)
+                if completed.returncode != 0 or not any(staging_dir.glob("frame_*.jpg")):
+                    stderr_tail = completed.stderr.strip().splitlines()[-5:]
+                    raise RuntimeError(
+                        f"ffmpeg frame extraction produced no frames for {topic!r} "
+                        f"(exit {completed.returncode}): {stderr_tail}"
+                    )
 
         # Map each extracted frame back to the source message it came from.
         frame_paths = sorted(output_dir.glob("frame_*.jpg"))
@@ -702,55 +777,51 @@ class Episode:
             output_directory / f"frame_{output_index:06d}.jpg"
             for output_index in range(len(selected_frame_indices))
         ]
-        if not all(frame_path.is_file() for frame_path in expected_frame_paths):
-            if output_directory.exists():
-                shutil.rmtree(output_directory)
-            staging_directory = output_directory.with_name(f"{output_directory.name}.tmp")
-            if staging_directory.exists():
-                shutil.rmtree(staging_directory)
-            staging_directory.mkdir(parents=True)
-            filter_script_path = staging_directory / "select.filter"
-            selection_expression = _frame_selection_expression(selected_frame_indices)
-            filter_script_path.write_text(f"select={selection_expression}")
-            command = [
-                str(ffmpeg_path()),
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                str(mp4_path),
-                _ffmpeg_filter_script_flag(),
-                str(filter_script_path),
-                "-fps_mode",
-                "vfr",
-                "-frames:v",
-                str(len(selected_frame_indices)),
-                "-q:v",
-                "2",
-                "-start_number",
-                "0",
-                str(staging_directory / "frame_%06d.jpg"),
-            ]
-            completed_process = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            staged_frame_paths = sorted(staging_directory.glob("frame_*.jpg"))
-            if completed_process.returncode != 0 or len(staged_frame_paths) != len(
-                selected_frame_indices
-            ):
-                stderr_tail = completed_process.stderr.strip().splitlines()[-5:]
-                shutil.rmtree(staging_directory)
-                raise RuntimeError(
-                    f"ffmpeg extracted {len(staged_frame_paths)} of "
-                    f"{len(selected_frame_indices)} selected frames from {topic!r} "
-                    f"(exit {completed_process.returncode}): {stderr_tail}"
+        with _frame_cache_staging(
+            output_directory,
+            is_cached=lambda: all(frame_path.is_file() for frame_path in expected_frame_paths),
+        ) as staging_directory:
+            if staging_directory is not None:
+                filter_script_path = staging_directory / "select.filter"
+                selection_expression = _frame_selection_expression(selected_frame_indices)
+                filter_script_path.write_text(f"select={selection_expression}")
+                command = [
+                    str(ffmpeg_path()),
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(mp4_path),
+                    _ffmpeg_filter_script_flag(),
+                    str(filter_script_path),
+                    "-fps_mode",
+                    "vfr",
+                    "-frames:v",
+                    str(len(selected_frame_indices)),
+                    "-q:v",
+                    "2",
+                    "-start_number",
+                    "0",
+                    str(staging_directory / "frame_%06d.jpg"),
+                ]
+                completed_process = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    check=False,
                 )
-            filter_script_path.unlink()
-            staging_directory.replace(output_directory)
+                staged_frame_paths = sorted(staging_directory.glob("frame_*.jpg"))
+                if completed_process.returncode != 0 or len(staged_frame_paths) != len(
+                    selected_frame_indices
+                ):
+                    stderr_tail = completed_process.stderr.strip().splitlines()[-5:]
+                    raise RuntimeError(
+                        f"ffmpeg extracted {len(staged_frame_paths)} of "
+                        f"{len(selected_frame_indices)} selected frames from {topic!r} "
+                        f"(exit {completed_process.returncode}): {stderr_tail}"
+                    )
+                filter_script_path.unlink()
 
         return [
             ExtractedFrame(
