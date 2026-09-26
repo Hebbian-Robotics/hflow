@@ -8,12 +8,14 @@ from hflow.camera_motion import (
     CameraMotionStreamSettings,
     CameraMotionTransform,
     CameraShakeObservation,
+    CameraShakeRateBin,
     CameraShakeSettings,
     MeasuredCameraMotion,
     MeasuredCameraShake,
     MotionFitEvidence,
     UnavailableCameraShake,
     UnmeasuredCameraMotion,
+    camera_shake_rate_percentile,
     summarize_camera_shake,
 )
 
@@ -85,6 +87,104 @@ def test_summary_weights_shake_and_coverage_by_observed_duration() -> None:
     assert summary.mean_shake_degrees_per_second == pytest.approx(10 / 3)
     assert summary.rms_shake_degrees_per_second == pytest.approx(math.sqrt(12))
     assert summary.maximum_shake_degrees_per_second == pytest.approx(4.0)
+    assert [
+        (rate_bin.rate_floor_degrees_per_second, rate_bin.assessed_seconds)
+        for rate_bin in summary.rate_bins
+    ] == [
+        (2, 0.25),
+        (4, 0.5),
+    ]
+    assert summary.p99_shake_degrees_per_second == 4.0
+
+
+def test_merged_p99_ignores_one_extreme_pair_without_losing_its_duration() -> None:
+    normal_observations = tuple(
+        shake_observation(index, duration_seconds=0.0625, shake=measured_shake(11.25))
+        for index in range(99)
+    )
+    extreme_observation = shake_observation(
+        99, duration_seconds=0.0625, shake=measured_shake(2261.0)
+    )
+    first_window = summarize_camera_shake(iter(normal_observations[:49]))
+    second_window = summarize_camera_shake(iter((*normal_observations[49:], extreme_observation)))
+
+    assert second_window.maximum_shake_degrees_per_second == 2261.0
+    assert (
+        camera_shake_rate_percentile(
+            (*first_window.rate_bins, *second_window.rate_bins),
+            percentile=99,
+            maximum_shake_degrees_per_second=2261.0,
+        )
+        == 12.0
+    )
+    assert (
+        camera_shake_rate_percentile(
+            (CameraShakeRateBin(11, 0.98), CameraShakeRateBin(2261, 0.02)),
+            percentile=99,
+            maximum_shake_degrees_per_second=2261.0,
+        )
+        == 2261.0
+    )
+    assert (
+        camera_shake_rate_percentile(
+            (CameraShakeRateBin(4992, 0.99), CameraShakeRateBin(6016, 0.01)),
+            percentile=99,
+            maximum_shake_degrees_per_second=6100.0,
+        )
+        == 5056.0
+    )
+    large_rate_summary = summarize_camera_shake(
+        iter((shake_observation(0, duration_seconds=0.5, shake=measured_shake(5000.0)),))
+    )
+    assert large_rate_summary.rate_bins == (CameraShakeRateBin(4992, 0.5),)
+
+
+def test_p99_stays_in_lower_bin_at_a_30_fps_duration_boundary() -> None:
+    observations = (
+        shake_observation(
+            pair_index,
+            duration_seconds=1 / 30,
+            shake=measured_shake(
+                11.25
+                if pair_index < 1
+                else 12.25
+                if pair_index < 23
+                else 13.25
+                if pair_index < 297
+                else 2261.0
+            ),
+        )
+        for pair_index in range(300)
+    )
+
+    summary = summarize_camera_shake(observations)
+
+    assert summary.maximum_shake_degrees_per_second == 2261.0
+    assert summary.p99_shake_degrees_per_second == 14.0
+    assert (
+        camera_shake_rate_percentile(
+            (
+                CameraShakeRateBin(11, 1 / 30),
+                CameraShakeRateBin(12, 22 / 30),
+                CameraShakeRateBin(13, 274 / 30),
+                CameraShakeRateBin(2261, 3 / 30),
+            ),
+            percentile=99,
+            maximum_shake_degrees_per_second=2261.0,
+        )
+        == 14.0
+    )
+    assert (
+        camera_shake_rate_percentile(
+            (
+                CameraShakeRateBin(11, 0.9899999999999995),
+                CameraShakeRateBin(2261, 0.0100000000000005),
+            ),
+            percentile=99,
+            maximum_shake_degrees_per_second=2261.0,
+        )
+        == 2261.0
+    )
 
 
 @pytest.mark.parametrize("empty", [True, False])
@@ -115,3 +215,5 @@ def test_no_assessed_motion_is_missing_instead_of_zero(empty: bool) -> None:
     assert summary.mean_shake_degrees_per_second is None
     assert summary.rms_shake_degrees_per_second is None
     assert summary.maximum_shake_degrees_per_second is None
+    assert summary.rate_bins == ()
+    assert summary.p99_shake_degrees_per_second is None

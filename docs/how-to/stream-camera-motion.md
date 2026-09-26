@@ -133,6 +133,18 @@ outcomes; they do not establish optimal defaults. Parameter calibration would
 require representative footage with reference motion and sensitivity testing
 across resolutions, frame rates, textures, and motion magnitudes.
 
+`summarize_camera_shake` also returns `rate_bins`: assessed seconds grouped into
+one-degree-per-second residual-rate bins below 4,096°/s and 64 bins per doubling
+above it. This keeps summary memory bounded even for long streams. Combine bins
+from separate windows and call `camera_shake_rate_percentile` to estimate a
+duration-weighted percentile
+over all assessed frame pairs. The returned value is the upper edge of the
+selected bin, capped by the observed maximum, so it can exceed the exact
+percentile by at most one degree per second below 4,096°/s, or at most
+1.5625% of the rate above it. `summary.p99_shake_degrees_per_second`
+applies the same rule to one summary. Neither value certifies the physical
+accuracy of a fitted motion estimate.
+
 ## Configure the estimator
 
 All numerical tuning parameters of the current estimator are exposed through
