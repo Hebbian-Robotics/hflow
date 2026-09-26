@@ -161,6 +161,10 @@ def _window_index(vw: dict, field: str, cam: str) -> int:
 
 def _format_ref(template: str, **values: int | str | None) -> str:
     """Resolve a v3 path template with an episode row's index fields."""
+    if "video_key" in values and "camera_key" not in values:
+        values["camera_key"] = values["video_key"]
+    elif "camera_key" in values and "video_key" not in values:
+        values["video_key"] = values["camera_key"]
     try:
         return template.format(**values)
     except (KeyError, TypeError, ValueError) as e:
@@ -549,6 +553,7 @@ def _validate_v3(dataset_dir: Path) -> None:
                     vrel = _format_ref(
                         info["video_path"],
                         video_key=cam,
+                        camera_key=cam,
                         chunk_index=d.get(f"videos/{cam}/chunk_index"),
                         file_index=d.get(f"videos/{cam}/file_index"),
                     )

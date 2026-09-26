@@ -619,3 +619,32 @@ def test_validate_v3_rejects_corrupted_task_index(fake_corpus: dict, tmp_path: P
         match=r"episode 0 frame 3: task_index 99 references an unpublished task",
     ):
         export._validate_v3(dest)
+
+
+def test_format_ref_aliases_video_key_and_camera_key() -> None:
+    """_format_ref supports templates referencing either camera_key or video_key."""
+    tpl_cam = "videos/{camera_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+    tpl_vid = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+
+    # Only video_key supplied
+    assert export._format_ref(tpl_cam, video_key="cam_up", chunk_index=0, file_index=1) == (
+        "videos/cam_up/chunk-000/file-001.mp4"
+    )
+    # Only camera_key supplied
+    assert export._format_ref(tpl_vid, camera_key="cam_up", chunk_index=0, file_index=1) == (
+        "videos/cam_up/chunk-000/file-001.mp4"
+    )
+
+
+def test_validate_v3_accepts_camera_key_template(fake_corpus: dict, tmp_path: Path) -> None:
+    """_validate_v3 accepts video_path templates using {camera_key}."""
+    dest = _exported_dataset(fake_corpus, tmp_path)
+    info_path = dest / "meta" / "info.json"
+    info = json.loads(info_path.read_text())
+
+    # Switch info["video_path"] to use {camera_key} instead of {video_key}
+    info["video_path"] = "videos/{camera_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+    info_path.write_text(json.dumps(info))
+
+    # Must validate cleanly without KeyError or ValueError
+    export._validate_v3(dest)
