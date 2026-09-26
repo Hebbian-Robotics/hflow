@@ -139,6 +139,36 @@ def test_merged_p99_ignores_one_extreme_pair_without_losing_its_duration() -> No
     assert large_rate_summary.rate_bins == (CameraShakeRateBin(4992, 0.5),)
 
 
+def test_p99_stays_in_lower_bin_at_a_30_fps_duration_boundary() -> None:
+    observations = (
+        shake_observation(
+            pair_index,
+            duration_seconds=1 / 30,
+            shake=measured_shake(
+                11.25 if pair_index < 5 else 12.25 if pair_index < 297 else 2261.0
+            ),
+        )
+        for pair_index in range(300)
+    )
+
+    summary = summarize_camera_shake(observations)
+
+    assert summary.maximum_shake_degrees_per_second == 2261.0
+    assert summary.p99_shake_degrees_per_second == 13.0
+    assert (
+        camera_shake_rate_percentile(
+            (
+                CameraShakeRateBin(11, 5 / 30),
+                CameraShakeRateBin(12, 292 / 30),
+                CameraShakeRateBin(2261, 3 / 30),
+            ),
+            percentile=99,
+            maximum_shake_degrees_per_second=2261.0,
+        )
+        == 13.0
+    )
+
+
 @pytest.mark.parametrize("empty", [True, False])
 def test_no_assessed_motion_is_missing_instead_of_zero(empty: bool) -> None:
     observations = (

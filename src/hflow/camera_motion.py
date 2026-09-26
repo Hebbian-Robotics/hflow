@@ -142,22 +142,44 @@ def camera_shake_rate_percentile(
     ordered_bins = tuple(
         sorted(rate_bins, key=lambda rate_bin: rate_bin.rate_floor_degrees_per_second)
     )
-    assessed_seconds = math.fsum(rate_bin.assessed_seconds for rate_bin in ordered_bins)
+    bin_durations = tuple(rate_bin.assessed_seconds for rate_bin in ordered_bins)
+    assessed_seconds = math.fsum(bin_durations)
     if assessed_seconds <= 0:
         raise ValueError("rate bins must contain assessed duration")
     target_seconds = assessed_seconds * percentile / 100
-    elapsed_seconds = 0.0
-    for rate_bin in ordered_bins:
-        elapsed_seconds += rate_bin.assessed_seconds
-        if elapsed_seconds >= target_seconds:
-            try:
-                bin_upper_bound = _camera_shake_rate_bin_upper_bound(
-                    rate_bin.rate_floor_degrees_per_second
-                )
-            except OverflowError:
-                return maximum_shake_degrees_per_second
-            return min(bin_upper_bound, maximum_shake_degrees_per_second)
-    return maximum_shake_degrees_per_second
+    lower_index = 0
+    upper_index = len(ordered_bins) - 1
+    while lower_index < upper_index:
+        middle_index = (lower_index + upper_index) // 2
+        prefix_seconds = math.fsum(bin_durations[: middle_index + 1])
+        if prefix_seconds >= target_seconds or (
+            percentile < 100 and math.isclose(prefix_seconds, target_seconds, rel_tol=1e-15)
+        ):
+            upper_index = middle_index
+        else:
+            lower_index = middle_index + 1
+    selected_bin = ordered_bins[lower_index]
+    try:
+        bin_upper_bound = _camera_shake_rate_bin_upper_bound(
+            selected_bin.rate_floor_degrees_per_second
+        )
+    except OverflowError:
+        return maximum_shake_degrees_per_second
+    return min(bin_upper_bound, maximum_shake_degrees_per_second)
+
+
+@dataclass(slots=True)
+class _DurationAccumulator:
+    """Accumulate repeated frame durations without drifting across quantile edges."""
+
+    total_seconds: float = 0.0
+    correction_seconds: float = 0.0
+
+    def add(self, duration_seconds: float) -> None:
+        corrected_duration = duration_seconds - self.correction_seconds
+        updated_total = self.total_seconds + corrected_duration
+        self.correction_seconds = (updated_total - self.total_seconds) - corrected_duration
+        self.total_seconds = updated_total
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,7 +242,7 @@ def summarize_camera_shake(observations: Iterable[CameraShakeObservation]) -> Ca
     mean_shake_degrees_per_second = 0.0
     rms_shake_degrees_per_second = 0.0
     maximum_shake_degrees_per_second = 0.0
-    rate_duration_by_floor: dict[int, float] = {}
+    rate_duration_by_floor: dict[int, _DurationAccumulator] = {}
 
     for observation in observations:
         pair_count += 1
@@ -235,9 +257,7 @@ def summarize_camera_shake(observations: Iterable[CameraShakeObservation]) -> Ca
             assessed_seconds += pair_seconds
             shake_degrees_per_second = shake.residual.magnitude_degrees_per_second
             rate_floor = _camera_shake_rate_floor(shake_degrees_per_second)
-            rate_duration_by_floor[rate_floor] = (
-                rate_duration_by_floor.get(rate_floor, 0.0) + pair_seconds
-            )
+            rate_duration_by_floor.setdefault(rate_floor, _DurationAccumulator()).add(pair_seconds)
             duration_share = pair_seconds / assessed_seconds
             mean_shake_degrees_per_second += duration_share * (
                 shake_degrees_per_second - mean_shake_degrees_per_second
@@ -277,7 +297,7 @@ def summarize_camera_shake(observations: Iterable[CameraShakeObservation]) -> Ca
             maximum_shake_degrees_per_second if measured_shake_pair_count else None
         ),
         rate_bins=tuple(
-            CameraShakeRateBin(rate_floor, assessed_duration)
-            for rate_floor, assessed_duration in sorted(rate_duration_by_floor.items())
+            CameraShakeRateBin(rate_floor, duration_accumulator.total_seconds)
+            for rate_floor, duration_accumulator in sorted(rate_duration_by_floor.items())
         ),
     )
