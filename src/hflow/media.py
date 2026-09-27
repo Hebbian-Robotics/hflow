@@ -1,8 +1,10 @@
-"""Bounded local video inspection and fixed-rate window preparation.
+"""Bounded video inspection and fixed-rate window preparation.
 
 Unreadable and unsupported media are expected outcomes. Process, timeout, and
 filesystem failures raise MediaToolError or OSError and must not be counted as
-unreadable recordings. No source file is changed and no network input is read.
+unreadable recordings. No source file is changed. The only network input is a
+caller's :class:`hflow.byte_range_source.LoopbackVideoSource`, whose reader
+failures are re-raised as the reader's own exception.
 """
 
 import json
@@ -14,6 +16,7 @@ from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from pathlib import Path
 
+from hflow.byte_range_source import LoopbackVideoSource, media_input
 from hflow.ffmpeg import ffmpeg_path, ffprobe_path
 from hflow.ffmpeg._process import MediaToolError, media_input_was_rejected, run_media_command
 
@@ -126,28 +129,33 @@ def _duration_from_stream(stream: dict[str, object], document: dict[str, object]
 
 
 def probe_video(
-    source: Path, *, limits: VideoLimits = VideoLimits(), executable: Path | None = None
+    source: Path | LoopbackVideoSource,
+    *,
+    limits: VideoLimits = VideoLimits(),
+    executable: Path | None = None,
 ) -> VideoInspection:
     """Parse video properties once, retaining exact decimal duration for planning."""
-    source = source.resolve(strict=True)
+    source_input = media_input(source, local_protocols="file,pipe")
     completed = run_media_command(
         [
             str(executable or ffprobe_path()),
             "-v",
             "error",
             "-protocol_whitelist",
-            "file,pipe",
+            source_input.protocols,
             "-select_streams",
             "v:0",
             "-show_entries",
             "stream=width,height,avg_frame_rate,duration:stream_tags=DURATION:format=duration,nb_streams",
             "-of",
             "json",
-            str(source),
+            source_input.location,
         ],
         timeout_seconds=limits.timeout_seconds,
         maximum_output_bytes=limits.maximum_probe_bytes,
+        environment=source_input.environment,
     )
+    source_input.raise_for_reader_failure()
     if media_input_was_rejected(completed):
         return UnreadableVideo()
     try:

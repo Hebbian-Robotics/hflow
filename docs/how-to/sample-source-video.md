@@ -1,7 +1,9 @@
 # Sample original video frames with complete window coverage
 
-Use this when a worker needs bounded previews of an original local video before
-importing it into a canonical episode. The
+Use this when a worker needs bounded previews of an original video before
+importing it into a canonical episode. The video can be a local file or, through
+a byte-range reader, an object in storage that is never downloaded in full (see
+[Sample a video in object storage](#sample-a-video-in-object-storage)). The
 [runnable example](../../examples/sample_source_video.py) probes the original
 duration, plans complete windows, writes JPEGs, and prints one JSON record per
 window with source timestamps and any keyframe fallback reason. To send each
@@ -51,7 +53,7 @@ Pass a `SourceFrameSampling` configuration to `hflow.sample_source_frames`:
 | Mode | Selection |
 | --- | --- |
 | `UNIFORM` | First original frame in each temporal bin. Bin length is the greater of `minimum_interval_millis` (default 1,000) and window duration divided by `maximum_frames` (default 16). |
-| `KEYFRAMES` | First encoded keyframe in each of `maximum_frames` equal temporal bins. |
+| `KEYFRAMES` | First encoded keyframe in each of `maximum_frames` equal temporal bins. The sampler seeks to each bin, so it reads only the bytes near the selected keyframes. |
 | `KEYFRAMES_FIRST` | Try keyframes; fall back to uniform if fewer than two were selected or their timestamp span covers less than half the window. |
 
 Bins start at the window boundary. The sampler probes the source time base and
@@ -89,6 +91,58 @@ to the surrounding worker.
 failed extraction removes its new output directory; completed earlier windows
 in the example remain available. The caller owns successful local output and its
 cleanup. These files do not establish resumable or durable run state.
+
+## Sample a video in object storage
+
+Implement `hflow.ByteRangeReader` over one immutable object: a `size_bytes`
+property and `read_range(start, stop)`, which returns exactly `stop - start`
+bytes or raises. Then pass the source that `hflow.serve_byte_ranges` yields to
+`hflow.media.probe_video` and `hflow.sample_source_frames` in place of a path:
+
+```python
+import hflow
+from hflow.media import probe_video
+
+
+class ObjectVersionReader:
+    def __init__(self, store, key, version, size_bytes):
+        self.store, self.key, self.version = store, key, version
+        self.size_bytes = size_bytes
+
+    def read_range(self, start, stop):
+        return self.store.read(self.key, self.version, start, stop)
+
+
+with hflow.serve_byte_ranges(ObjectVersionReader(store, key, version, size)) as source:
+    duration_millis = probe_video(source).duration_millis
+    samples = hflow.sample_source_frames(
+        source,
+        output_directory,
+        window=hflow.SourceWindow(0, duration_millis),
+        settings=hflow.SourceFrameSampling(
+            mode=hflow.SourceSamplingMode.KEYFRAMES,
+            maximum_frames=3,
+            maximum_window_millis=duration_millis,
+        ),
+    )
+    fetched_bytes = source.bytes_fetched
+```
+
+`serve_byte_ranges` runs a server on 127.0.0.1 with a random path until the
+`with` block exits. FFmpeg and ffprobe read the object through it, so a probe or
+sample returns the same result as it would for a local copy of the same bytes.
+The server fetches 256 KiB blocks only as FFmpeg reads them and caches them for
+the block, because every FFmpeg run re-reads the container header. HTTP proxy
+environment variables are removed for these runs. Credentials and object
+versions stay in your reader and never appear in FFmpeg's arguments.
+
+What is read depends on the mode. `KEYFRAMES` reads the container header and
+the bytes from each bin start to its first keyframe. `UNIFORM`,
+`NEAREST_KEYFRAMES`, and a `KEYFRAMES_FIRST` fallback read the whole window.
+
+If your reader raises, the consuming call re-raises that exception, not
+`UnreadableVideo` or `SourceSamplingError`, so a storage or credential failure
+is never recorded as unreadable media.
 
 ## Include sampling in check identity
 

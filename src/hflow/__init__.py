@@ -37,6 +37,7 @@ if TYPE_CHECKING:
         import_pipeline_application,
     )
     from hflow.batching import PlannedBatch, plan_batches, plan_batches_from_files
+    from hflow.byte_range_source import ByteRangeReader, LoopbackVideoSource, serve_byte_ranges
     from hflow.catalog import AppendResult, Catalog, CheckRunRow
     from hflow.catalog_ui import (
         DEFAULT_CATALOG_UI_PORT,
@@ -174,6 +175,11 @@ _ATTRIBUTE_NAMES_BY_MODULE: dict[str, tuple[str, ...]] = {
         "PlannedBatch",
         "plan_batches",
         "plan_batches_from_files",
+    ),
+    "hflow.byte_range_source": (
+        "ByteRangeReader",
+        "LoopbackVideoSource",
+        "serve_byte_ranges",
     ),
     "hflow.catalog": (
         "AppendResult",
@@ -359,6 +365,7 @@ __all__ = [
     "App",
     "AppendResult",
     "BucketStorageRoot",
+    "ByteRangeReader",
     "Catalog",
     "CatalogUiSettings",
     "CatalogUiStartupError",
@@ -397,6 +404,7 @@ __all__ = [
     "Interval",
     "KeyframeFallbackReason",
     "LocalStorageRoot",
+    "LoopbackVideoSource",
     "Measured",
     "MeasurementValue",
     "MessageBatch",
@@ -468,6 +476,7 @@ __all__ = [
     "plan_source_windows",
     "providers",
     "sample_source_frames",
+    "serve_byte_ranges",
     "serve_catalog_ui",
     "stages_for_profile",
     "stale_episodes",

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Literal
 
 from hflow._field_guards import require_positive_float, require_positive_int
+from hflow.byte_range_source import LoopbackVideoSource, MediaInput, media_input
 from hflow.ffmpeg._process import MediaCommandResult, MediaToolError, run_media_command
 from hflow.source_windows import SourceWindow
 
@@ -24,6 +25,9 @@ _TIMESTAMP_PATTERN = re.compile(
     rb"\[Parsed_showinfo_[^\]]+\].*\bn:\s*\d+\s+pts:\s*(-?\d+)\s+pts_time:"
 )
 _TIME_BASE_PATTERN = re.compile(rb"\[Parsed_showinfo_[^\]]+\].*config in time_base:\s*(\d+)/(\d+)")
+# The first keyframe probe after a bin start reads this much source time, and
+# doubles until it finds a keyframe or reaches the window end.
+_KEYFRAME_PROBE_SECONDS = Fraction(1, 2)
 
 
 class SourceSamplingMode(StrEnum):
@@ -49,9 +53,11 @@ class SourceFrameSampling:
 
     Uniform sampling uses the first frame in each temporal bin, whose length
     is the greater of ``minimum_interval_millis`` and window length divided
-    by ``maximum_frames``. Keyframe sampling uses equal bins with no minimum
-    interval. Keyframes-first falls back to uniform when fewer than two
-    keyframes were selected or their span is less than half the window.
+    by ``maximum_frames``. Keyframe sampling uses the first keyframe in each of
+    ``maximum_frames`` equal bins, found by seeking to each bin start, so it
+    reads only the source bytes near the selected keyframes. Keyframes-first
+    falls back to uniform when fewer than two keyframes were selected or their
+    span is less than half the window; uniform reads the whole window.
 
     All sizes are output bounds; callers own source download/decoder memory
     limits. The default canvas preserves aspect ratio with black padding; FIT omits
@@ -153,40 +159,44 @@ def _remaining_seconds(deadline: float) -> float:
 
 
 def _run_sampling_command(
-    arguments: list[str], *, deadline: float, maximum_log_bytes: int
+    arguments: list[str], *, deadline: float, maximum_log_bytes: int, source_input: MediaInput
 ) -> MediaCommandResult:
     try:
         completed = run_media_command(
             arguments,
             timeout_seconds=_remaining_seconds(deadline),
             maximum_output_bytes=maximum_log_bytes,
+            environment=source_input.environment,
         )
     except MediaToolError as error:
+        source_input.raise_for_reader_failure()
         raise SourceSamplingError(str(error)) from None
+    source_input.raise_for_reader_failure()
     if completed.returncode != 0:
         raise SourceSamplingError("source frame extraction failed")
     _remaining_seconds(deadline)
     return completed
 
 
-def _source_time_base(source_path: Path, executable: Path, *, deadline: float) -> Fraction:
+def _source_time_base(source_input: MediaInput, executable: Path, *, deadline: float) -> Fraction:
     completed = _run_sampling_command(
         [
             str(executable),
             "-v",
             "error",
             "-protocol_whitelist",
-            "file",
+            source_input.protocols,
             "-select_streams",
             "v:0",
             "-show_entries",
             "stream=time_base",
             "-of",
             "default=noprint_wrappers=1:nokey=1",
-            str(source_path),
+            source_input.location,
         ],
         deadline=deadline,
         maximum_log_bytes=65_536,
+        source_input=source_input,
     )
     try:
         # MPEG-TS may repeat the selected stream inside a program section.
@@ -204,30 +214,25 @@ def _source_time_base(source_path: Path, executable: Path, *, deadline: float) -
     return time_base
 
 
-def _nearest_keyframe_times(
-    source_path: Path,
-    window: SourceWindow,
-    settings: SourceFrameSampling,
-    *,
-    executable: Path,
-    deadline: float,
-    time_base: Fraction,
-) -> tuple[Fraction, ...]:
+def _aligned_playback_origin(
+    source_input: MediaInput, executable: Path, *, deadline: float, time_base: Fraction
+) -> Fraction:
     origin_result = _run_sampling_command(
         [
             str(executable),
             "-v",
             "error",
             "-protocol_whitelist",
-            "file",
+            source_input.protocols,
             "-show_entries",
             "format=start_time",
             "-of",
             "default=noprint_wrappers=1:nokey=1",
-            str(source_path),
+            source_input.location,
         ],
         deadline=deadline,
         maximum_log_bytes=65_536,
+        source_input=source_input,
     )
     try:
         origin = Fraction(origin_result.stdout.decode("ascii").strip())
@@ -241,35 +246,47 @@ def _nearest_keyframe_times(
         if origin_ticks >= 0
         else math.ceil(origin_ticks - Fraction(1, 2))
     )
-    aligned_origin = rounded_origin_ticks * time_base
-    start = Fraction(window.start_millis, 1000)
-    end = Fraction(window.end_millis, 1000)
+    return rounded_origin_ticks * time_base
+
+
+def _keyframe_times_in_interval(
+    source_input: MediaInput,
+    read_interval: str,
+    *,
+    executable: Path,
+    deadline: float,
+    time_base: Fraction,
+    aligned_origin: Fraction,
+    maximum_probe_bytes: int,
+) -> set[Fraction]:
+    """Keyframe times from the playback origin, for packets ffprobe reads in ``read_interval``."""
     packet_result = _run_sampling_command(
         [
             str(executable),
             "-v",
             "error",
             "-protocol_whitelist",
-            "file",
+            source_input.protocols,
             "-select_streams",
             "v:0",
             "-read_intervals",
-            f"%{float(aligned_origin + end):.9f}",
+            read_interval,
             "-show_packets",
             "-show_entries",
             "packet=pts,flags",
             "-of",
             "json",
-            str(source_path),
+            source_input.location,
         ],
         deadline=deadline,
-        maximum_log_bytes=settings.maximum_probe_bytes,
+        maximum_log_bytes=maximum_probe_bytes,
+        source_input=source_input,
     )
     try:
         document = json.loads(packet_result.stdout)
         if not isinstance(document, dict) or not isinstance(document.get("packets"), list):
             raise ValueError("invalid packet document")
-        available_times: set[Fraction] = set()
+        keyframe_times: set[Fraction] = set()
         for packet in document["packets"]:
             if not isinstance(packet, dict) or not isinstance(packet.get("flags"), str):
                 raise ValueError("invalid packet")
@@ -277,11 +294,39 @@ def _nearest_keyframe_times(
                 continue
             if type(packet.get("pts")) is not int:
                 raise ValueError("keyframe has no presentation timestamp")
-            timestamp = packet["pts"] * time_base - aligned_origin
-            if start <= timestamp < end:
-                available_times.add(timestamp)
+            keyframe_times.add(packet["pts"] * time_base - aligned_origin)
     except (ValueError, TypeError, KeyError) as error:
         raise SourceSamplingError("source keyframes have invalid presentation times") from error
+    return keyframe_times
+
+
+def _nearest_keyframe_times(
+    source_input: MediaInput,
+    window: SourceWindow,
+    settings: SourceFrameSampling,
+    *,
+    executable: Path,
+    deadline: float,
+    time_base: Fraction,
+) -> tuple[Fraction, ...]:
+    aligned_origin = _aligned_playback_origin(
+        source_input, executable, deadline=deadline, time_base=time_base
+    )
+    start = Fraction(window.start_millis, 1000)
+    end = Fraction(window.end_millis, 1000)
+    available_times = {
+        timestamp
+        for timestamp in _keyframe_times_in_interval(
+            source_input,
+            f"%{float(aligned_origin + end):.9f}",
+            executable=executable,
+            deadline=deadline,
+            time_base=time_base,
+            aligned_origin=aligned_origin,
+            maximum_probe_bytes=settings.maximum_probe_bytes,
+        )
+        if start <= timestamp < end
+    }
     if not available_times:
         return ()
     return tuple(
@@ -300,22 +345,153 @@ def _nearest_keyframe_times(
     )
 
 
+def _extraction_arguments(
+    source_input: MediaInput,
+    output_directory: Path,
+    settings: SourceFrameSampling,
+    *,
+    executable: Path,
+    video_filter: str,
+    seek_seconds: str,
+    duration_seconds: str,
+    maximum_frames: int,
+    skip_non_keyframes: bool,
+    first_frame_number: int = 1,
+) -> list[str]:
+    arguments = [
+        str(executable),
+        "-hide_banner",
+        "-loglevel",
+        "info",
+        "-nostats",
+        "-nostdin",
+        "-xerror",
+        "-protocol_whitelist",
+        source_input.protocols,
+        "-threads",
+        "2",
+    ]
+    if skip_non_keyframes:
+        arguments.extend(("-skip_frame", "nokey"))
+    # Preserve the original playback PTS through a seek. Adding a seek offset
+    # back to rebased PTS would introduce rounding at non-tick-aligned starts.
+    # Accurate seeking discards preceding-GOP frames before the input duration
+    # limit is applied. Disabling it can exhaust a short window before its start.
+    arguments.extend(
+        (
+            "-copyts",
+            "-start_at_zero",
+            "-ss",
+            seek_seconds,
+            "-t",
+            duration_seconds,
+            "-i",
+            source_input.location,
+            "-map",
+            "0:v:0",
+            "-an",
+            "-map_metadata",
+            "-1",
+            "-vf",
+            video_filter,
+            "-filter_threads",
+            "1",
+            "-frames:v",
+            str(maximum_frames),
+            "-fps_mode",
+            "passthrough",
+            "-pix_fmt",
+            "yuvj420p",
+            "-c:v",
+            "mjpeg",
+            "-q:v",
+            str(settings.jpeg_quality),
+            "-threads",
+            "2",
+            "-f",
+            "image2",
+            "-start_number",
+            str(first_frame_number),
+            str(output_directory / "frame_%06d.jpg"),
+        )
+    )
+    return arguments
+
+
+def _resize_filters(settings: SourceFrameSampling) -> list[str]:
+    resize_filters = [
+        f"scale={settings.width}:{settings.height}:force_original_aspect_ratio=decrease:flags={settings.scaling_algorithm}",
+    ]
+    if settings.resize is SourceFrameResize.PAD:
+        resize_filters.append(f"pad={settings.width}:{settings.height}:(ow-iw)/2:(oh-ih)/2:black")
+    return resize_filters
+
+
+def _run_extraction(
+    arguments: list[str],
+    settings: SourceFrameSampling,
+    *,
+    deadline: float,
+    time_base: Fraction,
+    source_input: MediaInput,
+) -> tuple[Fraction, ...]:
+    """Run one extraction and return the presentation times FFmpeg reported."""
+    diagnostics = _run_sampling_command(
+        arguments,
+        deadline=deadline,
+        maximum_log_bytes=settings.maximum_log_bytes,
+        source_input=source_input,
+    ).stderr
+    time_bases = {
+        (int(match.group(1)), int(match.group(2)))
+        for match in _TIME_BASE_PATTERN.finditer(diagnostics)
+    }
+    if len(time_bases) != 1:
+        raise SourceSamplingError("source frame extraction did not report one time base")
+    numerator, denominator = time_bases.pop()
+    if numerator <= 0 or denominator <= 0 or Fraction(numerator, denominator) != time_base:
+        raise SourceSamplingError("source frame extraction reported an invalid time base")
+    return tuple(
+        int(match.group(1)) * Fraction(numerator, denominator)
+        for match in _TIMESTAMP_PATTERN.finditer(diagnostics)
+    )
+
+
+def _validated_frames(
+    output_directory: Path,
+    timestamps: tuple[Fraction, ...],
+    window: SourceWindow,
+    settings: SourceFrameSampling,
+) -> tuple[SampledSourceFrame, ...]:
+    frame_paths = tuple(sorted(output_directory.glob("frame_*.jpg")))
+    if len(frame_paths) != len(timestamps) or len(frame_paths) > settings.maximum_frames:
+        raise SourceSamplingError("source frame extraction produced inconsistent samples")
+    if any(
+        not Fraction(window.start_millis, 1000) <= timestamp < Fraction(window.end_millis, 1000)
+        for timestamp in timestamps
+    ) or any(later <= earlier for earlier, later in pairwise(timestamps)):
+        raise SourceSamplingError("source frame extraction produced invalid timestamps")
+    if any(not 0 < path.stat().st_size <= settings.maximum_frame_bytes for path in frame_paths):
+        raise SourceSamplingError("source frame extraction exceeded its frame byte limit")
+    return tuple(
+        SampledSourceFrame(path, timestamp)
+        for path, timestamp in zip(frame_paths, timestamps, strict=True)
+    )
+
+
 def _extract_frames(
-    source_path: Path,
+    source_input: MediaInput,
     output_directory: Path,
     window: SourceWindow,
     settings: SourceFrameSampling,
-    mode: Literal[
-        SourceSamplingMode.UNIFORM,
-        SourceSamplingMode.KEYFRAMES,
-        SourceSamplingMode.NEAREST_KEYFRAMES,
-    ],
+    mode: Literal[SourceSamplingMode.UNIFORM, SourceSamplingMode.NEAREST_KEYFRAMES],
     *,
     executable: Path,
     deadline: float,
     time_base: Fraction,
     probe_executable: Path,
 ) -> tuple[SampledSourceFrame, ...]:
+    """Extract uniform or nearest-keyframe samples in one pass over the window."""
     duration_seconds = window.duration_millis / 1000
     start_seconds = window.start_millis / 1000
     sampling_interval_millis = Fraction(window.duration_millis, settings.maximum_frames)
@@ -356,7 +532,7 @@ def _extract_frames(
     selected_times: tuple[Fraction, ...] = ()
     if mode is SourceSamplingMode.NEAREST_KEYFRAMES:
         selected_times = _nearest_keyframe_times(
-            source_path,
+            source_input,
             window,
             settings,
             executable=probe_executable,
@@ -368,103 +544,144 @@ def _extract_frames(
         selection_filter = "select=" + "+".join(
             f"eq(pts\\,{int(timestamp / time_base)})" for timestamp in selected_times
         )
-    resize_filters = [
-        f"scale={settings.width}:{settings.height}:force_original_aspect_ratio=decrease:flags={settings.scaling_algorithm}",
-    ]
-    if settings.resize is SourceFrameResize.PAD:
-        resize_filters.append(f"pad={settings.width}:{settings.height}:(ow-iw)/2:(oh-ih)/2:black")
-    video_filter = ",".join((selection_filter, *resize_filters, "showinfo"))
-    arguments = [
-        str(executable),
-        "-hide_banner",
-        "-loglevel",
-        "info",
-        "-nostats",
-        "-nostdin",
-        "-xerror",
-        "-protocol_whitelist",
-        "file",
-        "-threads",
-        "2",
-    ]
-    if mode in (SourceSamplingMode.KEYFRAMES, SourceSamplingMode.NEAREST_KEYFRAMES):
-        arguments.extend(("-skip_frame", "nokey"))
-    # Preserve the original playback PTS through a seek. Adding a seek offset
-    # back to rebased PTS would introduce rounding at non-tick-aligned starts.
-    # Accurate seeking discards preceding-GOP frames before the input duration
-    # limit is applied. Disabling it can exhaust a short window before its start.
-    arguments.extend(
-        (
-            "-copyts",
-            "-start_at_zero",
-            "-ss",
-            f"{start_seconds:.3f}",
-            "-t",
-            f"{duration_seconds:.3f}",
-            "-i",
-            str(source_path),
-            "-map",
-            "0:v:0",
-            "-an",
-            "-map_metadata",
-            "-1",
-            "-vf",
-            video_filter,
-            "-filter_threads",
-            "1",
-            "-frames:v",
-            str(settings.maximum_frames),
-            "-fps_mode",
-            "passthrough",
-            "-pix_fmt",
-            "yuvj420p",
-            "-c:v",
-            "mjpeg",
-            "-q:v",
-            str(settings.jpeg_quality),
-            "-threads",
-            "2",
-            "-f",
-            "image2",
-            str(output_directory / "frame_%06d.jpg"),
-        )
-    )
-    diagnostics = _run_sampling_command(
-        arguments, deadline=deadline, maximum_log_bytes=settings.maximum_log_bytes
-    ).stderr
-    time_bases = {
-        (int(match.group(1)), int(match.group(2)))
-        for match in _TIME_BASE_PATTERN.finditer(diagnostics)
-    }
-    if len(time_bases) != 1:
-        raise SourceSamplingError("source frame extraction did not report one time base")
-    numerator, denominator = time_bases.pop()
-    if numerator <= 0 or denominator <= 0 or Fraction(numerator, denominator) != time_base:
-        raise SourceSamplingError("source frame extraction reported an invalid time base")
-    timestamps = tuple(
-        int(match.group(1)) * Fraction(numerator, denominator)
-        for match in _TIMESTAMP_PATTERN.finditer(diagnostics)
+    video_filter = ",".join((selection_filter, *_resize_filters(settings), "showinfo"))
+    timestamps = _run_extraction(
+        _extraction_arguments(
+            source_input,
+            output_directory,
+            settings,
+            executable=executable,
+            video_filter=video_filter,
+            seek_seconds=f"{start_seconds:.3f}",
+            duration_seconds=f"{duration_seconds:.3f}",
+            maximum_frames=settings.maximum_frames,
+            skip_non_keyframes=mode is SourceSamplingMode.NEAREST_KEYFRAMES,
+        ),
+        settings,
+        deadline=deadline,
+        time_base=time_base,
+        source_input=source_input,
     )
     if mode is SourceSamplingMode.NEAREST_KEYFRAMES and timestamps != selected_times:
         raise SourceSamplingError("extraction did not reproduce the selected keyframes")
-    frame_paths = tuple(sorted(output_directory.glob("frame_*.jpg")))
-    if len(frame_paths) != len(timestamps) or len(frame_paths) > settings.maximum_frames:
-        raise SourceSamplingError("source frame extraction produced inconsistent samples")
-    if any(
-        not Fraction(window.start_millis, 1000) <= timestamp < Fraction(window.end_millis, 1000)
-        for timestamp in timestamps
-    ) or any(later <= earlier for earlier, later in pairwise(timestamps)):
-        raise SourceSamplingError("source frame extraction produced invalid timestamps")
-    if any(not 0 < path.stat().st_size <= settings.maximum_frame_bytes for path in frame_paths):
-        raise SourceSamplingError("source frame extraction exceeded its frame byte limit")
-    return tuple(
-        SampledSourceFrame(path, timestamp)
-        for path, timestamp in zip(frame_paths, timestamps, strict=True)
+    return _validated_frames(output_directory, timestamps, window, settings)
+
+
+def _first_keyframe_in_each_bin(
+    source_input: MediaInput,
+    window: SourceWindow,
+    settings: SourceFrameSampling,
+    *,
+    executable: Path,
+    deadline: float,
+    time_base: Fraction,
+    aligned_origin: Fraction,
+) -> tuple[Fraction, ...]:
+    """Select the first keyframe of each of ``maximum_frames`` equal bins, skipping empty bins.
+
+    Each bin is probed from its start, so ffprobe reads packets from the
+    keyframe before the bin start to the first keyframe inside it rather
+    than the whole window.
+    """
+    start = Fraction(window.start_millis, 1000)
+    end = Fraction(window.end_millis, 1000)
+    bin_seconds = Fraction(window.duration_millis, 1000 * settings.maximum_frames)
+    selected: list[Fraction] = []
+    bin_index = 0
+    while bin_index < settings.maximum_frames:
+        bin_start = start + bin_index * bin_seconds
+        probe_seconds = _KEYFRAME_PROBE_SECONDS
+        while True:
+            keyframe_times = [
+                timestamp
+                for timestamp in _keyframe_times_in_interval(
+                    source_input,
+                    f"{float(aligned_origin + bin_start):.9f}%+{float(probe_seconds):.9f}",
+                    executable=executable,
+                    deadline=deadline,
+                    time_base=time_base,
+                    aligned_origin=aligned_origin,
+                    maximum_probe_bytes=settings.maximum_probe_bytes,
+                )
+                if bin_start <= timestamp < end
+            ]
+            if keyframe_times or bin_start + probe_seconds >= end:
+                break
+            probe_seconds *= 2
+        if not keyframe_times:
+            break
+        first_keyframe_time = min(keyframe_times)
+        selected.append(first_keyframe_time)
+        bin_index = math.floor((first_keyframe_time - start) / bin_seconds) + 1
+    return tuple(selected)
+
+
+def _extract_keyframes_by_seeking(
+    source_input: MediaInput,
+    output_directory: Path,
+    window: SourceWindow,
+    settings: SourceFrameSampling,
+    *,
+    executable: Path,
+    deadline: float,
+    time_base: Fraction,
+    probe_executable: Path,
+) -> tuple[SampledSourceFrame, ...]:
+    """Extract the first keyframe of each bin, seeking to each one.
+
+    The decoder is not told to skip non-keyframes: with nothing to output it
+    reads far past the keyframe before stopping. Selection by exact PTS keeps
+    any frame decoded after the keyframe out of the result.
+    """
+    aligned_origin = _aligned_playback_origin(
+        source_input, probe_executable, deadline=deadline, time_base=time_base
     )
+    selected_times = _first_keyframe_in_each_bin(
+        source_input,
+        window,
+        settings,
+        executable=probe_executable,
+        deadline=deadline,
+        time_base=time_base,
+        aligned_origin=aligned_origin,
+    )
+    end = Fraction(window.end_millis, 1000)
+    timestamps: list[Fraction] = []
+    for frame_number, keyframe_time in enumerate(selected_times, start=1):
+        # Seek to the keyframe, floored to FFmpeg's microsecond precision.
+        seek = Fraction(math.floor(keyframe_time * 1_000_000), 1_000_000)
+        extracted = _run_extraction(
+            _extraction_arguments(
+                source_input,
+                output_directory,
+                settings,
+                executable=executable,
+                video_filter=",".join(
+                    (
+                        f"select=eq(pts\\,{int(keyframe_time / time_base)})",
+                        *_resize_filters(settings),
+                        "showinfo",
+                    )
+                ),
+                seek_seconds=f"{float(seek):.6f}",
+                duration_seconds=f"{math.ceil((end - seek) * 1_000_000) / 1_000_000:.6f}",
+                maximum_frames=1,
+                skip_non_keyframes=False,
+                first_frame_number=frame_number,
+            ),
+            settings,
+            deadline=deadline,
+            time_base=time_base,
+            source_input=source_input,
+        )
+        if extracted != (keyframe_time,):
+            raise SourceSamplingError("extraction did not reproduce the selected keyframes")
+        timestamps.append(keyframe_time)
+    return _validated_frames(output_directory, tuple(timestamps), window, settings)
 
 
 def sample_source_frames(
-    source_path: Path,
+    source_path: Path | LoopbackVideoSource,
     output_directory: Path,
     *,
     window: SourceWindow,
@@ -478,6 +695,8 @@ def sample_source_frames(
     remove newly created output; an existing destination is never overwritten.
     The deadline starts after resolving HFlow's FFmpeg binary (which may
     download a managed build). No source file is modified or re-encoded.
+    ``source_path`` may be a :class:`~hflow.byte_range_source.LoopbackVideoSource`;
+    its reader failures are re-raised as the reader's own exception.
     """
     if not isinstance(window, SourceWindow):
         raise ValueError("window must be a SourceWindow")
@@ -491,8 +710,9 @@ def sample_source_frames(
         finite_end = False
     if not finite_end:
         raise ValueError("window exceeds the supported playback timeline")
-    if not source_path.is_file():
+    if isinstance(source_path, Path) and not source_path.is_file():
         raise FileNotFoundError("sampling source is not a local file")
+    source_input = media_input(source_path, local_protocols="file")
     from hflow.ffmpeg import ffmpeg_path, ffprobe_path
 
     executable = ffmpeg_path()
@@ -512,22 +732,34 @@ def sample_source_frames(
     )
     fallback_reason = None
     try:
-        time_base = _source_time_base(source_path.resolve(), probe_executable, deadline=deadline)
+        time_base = _source_time_base(source_input, probe_executable, deadline=deadline)
         with tempfile.TemporaryDirectory(
             dir=output_directory, prefix="frames-"
         ) as temporary_directory:
             staging_directory = Path(temporary_directory)
-            frames = _extract_frames(
-                source_path.resolve(),
-                staging_directory,
-                window,
-                settings,
-                actual_mode,
-                executable=executable,
-                deadline=deadline,
-                time_base=time_base,
-                probe_executable=probe_executable,
-            )
+            if actual_mode is SourceSamplingMode.KEYFRAMES:
+                frames = _extract_keyframes_by_seeking(
+                    source_input,
+                    staging_directory,
+                    window,
+                    settings,
+                    executable=executable,
+                    deadline=deadline,
+                    time_base=time_base,
+                    probe_executable=probe_executable,
+                )
+            else:
+                frames = _extract_frames(
+                    source_input,
+                    staging_directory,
+                    window,
+                    settings,
+                    actual_mode,
+                    executable=executable,
+                    deadline=deadline,
+                    time_base=time_base,
+                    probe_executable=probe_executable,
+                )
             if settings.mode is SourceSamplingMode.KEYFRAMES_FIRST:
                 if len(frames) < 2:
                     fallback_reason = KeyframeFallbackReason.TOO_FEW_KEYFRAMES
@@ -540,7 +772,7 @@ def sample_source_frames(
                         frame.path.unlink()
                     actual_mode = SourceSamplingMode.UNIFORM
                     frames = _extract_frames(
-                        source_path.resolve(),
+                        source_input,
                         staging_directory,
                         window,
                         settings,

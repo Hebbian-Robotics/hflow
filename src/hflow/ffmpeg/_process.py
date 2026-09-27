@@ -4,6 +4,7 @@ import os
 import selectors
 import subprocess
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 
@@ -19,13 +20,24 @@ class MediaCommandResult:
 
 
 def run_media_command(
-    arguments: list[str], *, timeout_seconds: float, maximum_output_bytes: int = 65536
+    arguments: list[str],
+    *,
+    timeout_seconds: float,
+    maximum_output_bytes: int = 65536,
+    environment: Mapping[str, str] | None = None,
 ) -> MediaCommandResult:
-    """Drain bounded output, retain private diagnostics, and reap the process on every exit."""
+    """Drain bounded output, retain private diagnostics, and reap the process on every exit.
+
+    ``environment`` replaces the inherited process environment when given.
+    """
     deadline = time.monotonic() + timeout_seconds
     try:
         with subprocess.Popen(
-            arguments, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            arguments,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=None if environment is None else dict(environment),
         ) as process:
             try:
                 assert process.stdout is not None
