@@ -2811,12 +2811,13 @@ class App:
                     except ValueError:
                         artifact_is_scratch_bound = False
 
+                    step_directory = (
+                        f"{_sanitize_topic(enrichment_run.enrichment.name)}-"
+                        f"{enrichment_run.enrichment.version}"
+                    )
+                    artifact_name_digest = hashlib.sha256(artifact_name.encode()).hexdigest()[:8]
+
                     if artifact_is_scratch_bound:
-                        step_directory = (
-                            f"{_sanitize_topic(enrichment_run.enrichment.name)}-"
-                            f"{enrichment_run.enrichment.version}"
-                        )
-                        artifact_name_digest = hashlib.sha256(artifact_name.encode()).hexdigest()[:8]
                         with resolved_artifact_path.open("rb") as artifact_stream:
                             artifact_content_digest = hashlib.file_digest(
                                 artifact_stream, "sha256"
@@ -2833,13 +2834,8 @@ class App:
                             )
                             artifact_key = artifact_relative_path.as_posix()
                         except ValueError:
-                            step_directory = (
-                                f"{_sanitize_topic(enrichment_run.enrichment.name)}-"
-                                f"{enrichment_run.enrichment.version}"
-                            )
-                            artifact_name_digest = hashlib.sha256(
-                                artifact_name.encode()
-                            ).hexdigest()[:8]
+                            # Preserve the established key layout for already-durable
+                            # artifacts; only scratch-bound outputs need content addressing.
                             artifact_key = (
                                 f"artifacts/{step_directory}/{_sanitize_topic(artifact_name)}-"
                                 f"{artifact_name_digest}/{artifact_path.name}"
