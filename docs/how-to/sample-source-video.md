@@ -95,8 +95,9 @@ cleanup. These files do not establish resumable or durable run state.
 ## Sample a video in object storage
 
 Wrap one pinned object version in `hflow.sources.PinnedSourceRangeReader`, which
-takes an obstore store and the same `SourceExpectation` as `download_source`,
-including its size. Then pass the source that `hflow.serve_byte_ranges` yields to
+takes an obstore store and a `SourceExpectation` with the revision and size. It
+refuses an expectation that carries a SHA-256, because byte ranges cannot verify
+a whole-object digest. Then pass the source that `hflow.serve_byte_ranges` yields to
 `hflow.media.probe_video` and `hflow.sample_source_frames` in place of a path:
 
 ```python
