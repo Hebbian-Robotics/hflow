@@ -182,6 +182,72 @@ def download_source(
         raise SourceReadError("source transfer failed") from error
 
 
+class PinnedSourceRangeReader:
+    """Byte ranges of one pinned revision, for :func:`hflow.serve_byte_ranges`.
+
+    Every range re-checks the provider's revision, path, and total size, so a
+    replaced object fails instead of mixing bytes from two versions. Provider
+    failures raise :class:`SourceReadError` with the original error as its cause.
+    """
+
+    def __init__(
+        self,
+        object_store: object,
+        expectation: SourceExpectation,
+        *,
+        object_getter: SourceObjectGetter | None = None,
+    ) -> None:
+        if expectation.size_bytes is None or expectation.size_bytes <= 0:
+            raise ValueError("a range reader needs the pinned, positive source size")
+        self._object_store = object_store
+        self._expectation = expectation
+        self._size_bytes = expectation.size_bytes
+        self._object_getter = object_getter or get_source_object
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}()"
+
+    @property
+    def size_bytes(self) -> int:
+        return self._size_bytes
+
+    def read_range(self, start: int, stop: int) -> bytes:
+        if (
+            type(start) is not int
+            or type(stop) is not int
+            or not 0 <= start < stop <= self._size_bytes
+        ):
+            raise ValueError("source range is outside the pinned object")
+        revision = self._expectation.revision
+        try:
+            result = self._object_getter(
+                self._object_store,
+                revision.object_name,
+                options={"version": revision.version, "range": (start, stop)},
+            )
+            metadata = result.meta
+            if (
+                metadata.get("size") != self._size_bytes
+                or metadata.get("version") != revision.version
+                or ("path" in metadata and metadata["path"] != revision.object_name)
+            ):
+                raise SourceReadError("source metadata does not match its pinned revision")
+            data = bytearray()
+            for chunk in result.stream(SOURCE_STREAM_CHUNK_BYTES):
+                if not isinstance(chunk, bytes):
+                    raise SourceReadError("source returned invalid bytes")
+                if len(data) + len(chunk) > stop - start:
+                    raise SourceReadError("source range exceeded its requested length")
+                data.extend(chunk)
+            if len(data) != stop - start:
+                raise SourceReadError("source range read was incomplete")
+            return bytes(data)
+        except SourceReadError:
+            raise
+        except Exception as error:
+            raise SourceReadError("source range read failed") from error
+
+
 def get_source_object(
     object_store: object,
     object_name: str,

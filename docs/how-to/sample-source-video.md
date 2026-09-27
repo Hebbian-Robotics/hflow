@@ -94,26 +94,21 @@ cleanup. These files do not establish resumable or durable run state.
 
 ## Sample a video in object storage
 
-Implement `hflow.ByteRangeReader` over one immutable object: a `size_bytes`
-property and `read_range(start, stop)`, which returns exactly `stop - start`
-bytes or raises. Then pass the source that `hflow.serve_byte_ranges` yields to
+Wrap one pinned object version in `hflow.sources.PinnedSourceRangeReader`, which
+takes an obstore store and the same `SourceExpectation` as `download_source`,
+including its size. Then pass the source that `hflow.serve_byte_ranges` yields to
 `hflow.media.probe_video` and `hflow.sample_source_frames` in place of a path:
 
 ```python
 import hflow
 from hflow.media import probe_video
+from hflow.sources import PinnedSourceRangeReader, SourceExpectation, SourceRevision
 
-
-class ObjectVersionReader:
-    def __init__(self, store, key, version, size_bytes):
-        self.store, self.key, self.version = store, key, version
-        self.size_bytes = size_bytes
-
-    def read_range(self, start, stop):
-        return self.store.read(self.key, self.version, start, stop)
-
-
-with hflow.serve_byte_ranges(ObjectVersionReader(store, key, version, size)) as source:
+reader = PinnedSourceRangeReader(
+    object_store,
+    SourceExpectation(SourceRevision(object_key, object_version), size_bytes=object_size),
+)
+with hflow.serve_byte_ranges(reader) as source:
     duration_millis = probe_video(source).duration_millis
     samples = hflow.sample_source_frames(
         source,
@@ -127,6 +122,11 @@ with hflow.serve_byte_ranges(ObjectVersionReader(store, key, version, size)) as 
     )
     fetched_bytes = source.bytes_fetched
 ```
+
+Any object with a `size_bytes` property and a `read_range(start, stop)` method
+that returns exactly `stop - start` bytes or raises also works (see
+`hflow.ByteRangeReader`). `PinnedSourceRangeReader` re-checks the revision, path,
+and size on every range, so a replaced object fails with `SourceReadError`.
 
 `serve_byte_ranges` runs a server on 127.0.0.1 with a random path until the
 `with` block exits. FFmpeg and ffprobe read the object through it, so a probe or
