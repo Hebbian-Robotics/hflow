@@ -30,6 +30,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+import duckdb
 import typer
 
 from hflow import __version__
@@ -413,7 +414,7 @@ def _command_stale(
             pipeline_version=resolved_pipeline_version,
             schema_version=schema_version,
         )
-    except (ValueError, FileNotFoundError) as error:
+    except (ValueError, FileNotFoundError, duckdb.Error) as error:
         print(f"stale: {error}", file=sys.stderr)
         return 2
     for episode in stale:
@@ -832,7 +833,9 @@ def _command_curate(
         resolved_sql = sql
     try:
         report = curate(catalog, resolved_sql, output=None if dry_run else output)
-    except (ValueError, FileNotFoundError) as error:
+    # curate() lets duckdb.Error through rather than wrapping it as ValueError:
+    # the server maps the two apart (bad SQL vs catalog unavailable).
+    except (ValueError, FileNotFoundError, duckdb.Error) as error:
         print(f"curate: {error}", file=sys.stderr)
         return 2
     print(report.summary())
