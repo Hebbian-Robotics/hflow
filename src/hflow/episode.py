@@ -291,6 +291,11 @@ class ChannelData:
             is_numeric_list = _is_numeric_sequence(first)
             if not (is_primitive or is_numeric_list):
                 continue
+            if name in columns:
+                raise ValueError(
+                    f"field {name!r} of topic {self.topic!r} conflicts with "
+                    f"reserved Arrow column {name!r}"
+                )
             if isinstance(first, np.ndarray):
                 values = [np.asarray(value).tolist() for value in values]
             columns[name] = pyarrow.array(values)
