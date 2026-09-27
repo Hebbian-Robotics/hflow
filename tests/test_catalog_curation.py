@@ -1058,6 +1058,30 @@ def test_cli_stale_exit_code_returns_zero_when_nothing_is_behind(
     assert capsys.readouterr().out == ""
 
 
+def test_cli_stale_reports_an_unreadable_catalog_table_instead_of_crashing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#638: a truncated catalog Parquet file raises duckdb.Error while the views
+    are read; the command must refuse it as bad input (exit 2), not traceback."""
+    catalog_dir = tmp_path / "catalog"
+    Catalog(catalog_dir).append_episode(
+        canonical_path=write_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[],
+        source_uri="episodes-in/run_0001.mcap",
+    )
+    (episodes_file,) = (catalog_dir / "episodes").glob("*.parquet")
+    episodes_file.write_bytes(episodes_file.read_bytes()[:16])
+
+    exit_code = cli_main(
+        ["stale", "--catalog", str(catalog_dir), "--pipeline-version", "somethingnewer"]
+    )
+
+    assert exit_code == 2
+    assert capsys.readouterr().err.startswith("stale: ")
+
+
 def test_constrained_connection_confines_sql_to_the_catalog(tmp_path: Path) -> None:
     """The service posture for tenant-supplied SQL: catalog views stay
     queryable, but file access outside the catalog and configuration changes
@@ -1279,6 +1303,37 @@ def test_cli_curate_dry_run_refuses_non_single_select(
     printed = capsys.readouterr()
     assert "exactly one" in printed.err
     assert not (data_root / "manifest.parquet").exists()
+
+
+@pytest.mark.parametrize("dry_run", [True, False], ids=["dry-run", "manifest-write"])
+@pytest.mark.parametrize(
+    "sql",
+    ["SELECT * FROM no_such_relation", "SELECT no_such_column FROM episodes"],
+    ids=["unknown-relation", "unknown-column"],
+)
+def test_cli_curate_reports_duckdb_execution_errors_instead_of_crashing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], sql: str, dry_run: bool
+) -> None:
+    """#638: a legal single SELECT passes the gate, then fails in DuckDB's binder.
+    The CLI must print DuckDB's diagnostic and exit 2 on both the report-only
+    and the manifest-write path, not traceback, and must not leave a manifest."""
+    catalog_dir = tmp_path / "catalog"
+    Catalog(catalog_dir).append_episode(
+        canonical_path=write_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[example_check_row()],
+    )
+    manifest = tmp_path / "manifest.parquet"
+    destination = ["--dry-run"] if dry_run else ["--output", str(manifest)]
+
+    exit_code = cli_main(["curate", sql, "--catalog", str(catalog_dir), *destination])
+
+    assert exit_code == 2
+    stderr = capsys.readouterr().err
+    assert stderr.startswith("curate: ")
+    assert "no_such" in stderr
+    assert not manifest.exists()
 
 
 _SQL_REFUSED_AS_NOT_ONE_SELECT = [
