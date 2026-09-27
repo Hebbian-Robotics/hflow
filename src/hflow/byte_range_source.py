@@ -13,6 +13,11 @@ them, and caches every block it fetched until the ``with`` block exits, because
 each FFmpeg run re-reads the container's header. A reader failure is kept and
 re-raised by the consuming call as the original exception, so a storage or
 credential failure is never reported as unreadable media.
+
+The URL's random path is its only access check, and FFmpeg receives the URL as
+a command-line argument. While the ``with`` block runs, any local process that
+can read FFmpeg's command line can read the object's bytes (never the reader's
+credentials). Use it on hosts that do not run untrusted local users.
 """
 
 from __future__ import annotations
@@ -176,7 +181,10 @@ class _RangeRequestHandler(http.server.BaseHTTPRequestHandler):
 
 
 class _LoopbackServer(http.server.ThreadingHTTPServer):
-    daemon_threads = True
+    # Non-daemon handler threads let server_close() wait for in-flight reads,
+    # so no read_range call outlives the with block.
+    daemon_threads = False
+    block_on_close = True
 
     def __init__(self, cache: _BlockCache) -> None:
         super().__init__(("127.0.0.1", 0), _RangeRequestHandler)

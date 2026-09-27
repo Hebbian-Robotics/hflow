@@ -134,7 +134,10 @@ sample returns the same result as it would for a local copy of the same bytes.
 The server fetches 256 KiB blocks only as FFmpeg reads them and caches them for
 the block, because every FFmpeg run re-reads the container header. HTTP proxy
 environment variables are removed for these runs. Credentials and object
-versions stay in your reader and never appear in FFmpeg's arguments.
+versions stay in your reader and never appear in FFmpeg's arguments. The URL
+does: while the block runs, any local process that can read FFmpeg's command
+line can read the object's bytes. Use it on hosts that do not run untrusted
+local users. Leaving the block waits for any read still in progress.
 
 What is read depends on the mode. `KEYFRAMES` reads the container header and
 the bytes from each bin start to its first keyframe. `UNIFORM`,

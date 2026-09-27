@@ -596,7 +596,10 @@ def _first_keyframe_in_each_bin(
                 timestamp
                 for timestamp in _keyframe_times_in_interval(
                     source_input,
-                    f"{float(aligned_origin + bin_start):.9f}%+{float(probe_seconds):.9f}",
+                    # An absolute end: an offset end would count from the keyframe the
+                    # seek lands on, before the bin start, and stop short of the probe.
+                    f"{float(aligned_origin + bin_start):.9f}"
+                    f"%{float(aligned_origin + bin_start + probe_seconds):.9f}",
                     executable=executable,
                     deadline=deadline,
                     time_base=time_base,

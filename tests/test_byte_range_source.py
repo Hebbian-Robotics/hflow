@@ -1,9 +1,12 @@
 """Keyframe sampling reads only what it needs, locally and through a byte-range reader."""
 
 import hashlib
+import http.client
 import math
 import re
 import subprocess
+import threading
+import time
 import urllib.error
 import urllib.request
 from fractions import Fraction
@@ -88,7 +91,14 @@ def recordings(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
         "-i", str(fixed), "-c", "copy", "-output_ts_offset", "5.033333",
     )  # fmt: skip
     matroska = _encode(directory / "matroska.mkv", "-i", str(fixed), "-c", "copy")
+    # The last bin starts 5.5 s after the keyframe before it and 4.5 s before its own.
+    late_keyframe = _encode(
+        directory / "late_keyframe.mp4",
+        "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=10:duration=20",
+        *x264, "-g", "1000", "-sc_threshold", "0", "-force_key_frames", "0,10,19.5",
+    )  # fmt: skip
     return {
+        "late_keyframe": late_keyframe,
         "fixed": fixed,
         "scene_cuts": scene_cuts,
         "shifted": shifted,
@@ -184,6 +194,7 @@ def _sampled(
         ("shifted", SourceWindow(0, 12_000), 3, SourceFrameResize.FIT),
         ("shifted", SourceWindow(2_333, 8_001), 4, SourceFrameResize.PAD),
         ("matroska", SourceWindow(0, 12_000), 3, SourceFrameResize.FIT),
+        ("late_keyframe", SourceWindow(0, 20_000), 4, SourceFrameResize.PAD),
     ],
 )
 def test_seeking_selects_the_same_keyframes_and_pixels_as_one_pass(
@@ -304,3 +315,33 @@ def test_the_loopback_server_serves_only_its_own_path(recordings: dict[str, Path
         with urllib.request.urlopen(request, timeout=10) as response:
             assert response.status == 206
             assert response.read() == recordings["fixed"].read_bytes()[4:12]
+
+
+class SlowRangeReader(FileRangeReader):
+    """Takes a while per range and records how many reads are still running."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.reads_in_progress = 0
+        self.read_started = threading.Event()
+
+    def read_range(self, start: int, stop: int) -> bytes:
+        self.reads_in_progress += 1
+        self.read_started.set()
+        try:
+            time.sleep(0.5)
+            return super().read_range(start, stop)
+        finally:
+            self.reads_in_progress -= 1
+
+
+def test_leaving_the_block_waits_for_reads_in_progress(recordings: dict[str, Path]) -> None:
+    reader = SlowRangeReader(recordings["fixed"])
+    with serve_byte_ranges(reader, block_bytes=16 * 1024) as source:
+        host_and_port, path = source.url.removeprefix("http://").split("/", 1)
+        connection = http.client.HTTPConnection(host_and_port, timeout=10)
+        connection.request("GET", "/" + path, headers={"Range": "bytes=0-"})
+        assert reader.read_started.wait(timeout=10)
+        # Abandon the response mid-body, as FFmpeg does once it has what it needs.
+        connection.close()
+    assert reader.reads_in_progress == 0

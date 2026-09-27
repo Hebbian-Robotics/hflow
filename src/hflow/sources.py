@@ -199,6 +199,10 @@ class PinnedSourceRangeReader:
     ) -> None:
         if expectation.size_bytes is None or expectation.size_bytes <= 0:
             raise ValueError("a range reader needs the pinned, positive source size")
+        if expectation.sha256 is not None:
+            # Ranges cannot prove a whole-object digest; refusing it keeps the
+            # expectation from implying a check that never runs.
+            raise ValueError("a range reader cannot verify an expected SHA-256")
         self._object_store = object_store
         self._expectation = expectation
         self._size_bytes = expectation.size_bytes

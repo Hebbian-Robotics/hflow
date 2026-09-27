@@ -165,9 +165,14 @@ def test_a_range_from_a_different_object_or_a_partial_body_is_refused(mismatch: 
     assert "canary" not in str(captured.value)
 
 
-def test_a_range_reader_requires_the_pinned_size() -> None:
+def test_a_range_reader_requires_the_pinned_size_and_refuses_a_digest_it_cannot_check() -> None:
+    revision = SourceRevision("media/source", "v")
     with pytest.raises(ValueError, match="pinned, positive source size"):
-        PinnedSourceRangeReader(object(), SourceExpectation(SourceRevision("media/source", "v")))
+        PinnedSourceRangeReader(object(), SourceExpectation(revision))
+    with pytest.raises(ValueError, match="cannot verify an expected SHA-256"):
+        PinnedSourceRangeReader(
+            object(), SourceExpectation(revision, size_bytes=10, sha256="0" * 64)
+        )
 
 
 def test_a_replaced_object_fails_probing_as_a_read_error_through_loopback(
