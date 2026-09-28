@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 
 import pytest
 from mcap.writer import CompressionType, Writer
@@ -63,3 +64,182 @@ def test_episode_channel_reads_only_the_selected_channel(
         assert channel.channel_id == selected_channel_id
         assert len(channel) == 1
         assert channel.raw == [payloads[0]]
+
+
+def test_concurrent_frame_extractions_share_workdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
+    from hflow.transform import write_canonical_episode
+
+    source_mcap = tmp_path / "source.mcap"
+    canonical_mcap = tmp_path / "canonical.mcap"
+    workdir = tmp_path / "workdir"
+    synthesize_episode(
+        source_mcap,
+        SyntheticEpisodeSpec(duration_s=1.0, cameras=("cam",), image_hz=5.0),
+    )
+    write_canonical_episode(source_mcap, canonical_mcap)
+
+    def extract_frames() -> list[str]:
+        with Episode(canonical_mcap, workdir=workdir) as ep:
+            return [str(frame.path) for frame in ep.frames(fps=2.0)]
+
+    def extract_indices() -> list[str]:
+        with Episode(canonical_mcap, workdir=workdir) as ep:
+            return [str(frame.path) for frame in ep.frames_at_indices(frame_indices=[0, 2])]
+
+    # Synchronize callers so both pass the cache-miss check and stage concurrently
+    # before either caller publishes.
+    barrier_frames = threading.Barrier(2)
+    original_run = subprocess.run
+
+    def barrier_run_frames(*args: Any, **kwargs: Any) -> Any:
+        barrier_frames.wait(timeout=5.0)
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", barrier_run_frames)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(extract_frames) for _ in range(2)]
+        results = [f.result() for f in futures]
+    assert results[0] == results[1]
+    assert len(results[0]) == 2
+    assert all(Path(p).is_file() for p in results[0])
+
+    barrier_indices = threading.Barrier(2)
+
+    def barrier_run_indices(*args: Any, **kwargs: Any) -> Any:
+        barrier_indices.wait(timeout=5.0)
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", barrier_run_indices)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(extract_indices) for _ in range(2)]
+        results = [f.result() for f in futures]
+    assert results[0] == results[1]
+    assert len(results[0]) == 2
+    assert all(Path(p).is_file() for p in results[0])
+
+    assert not [d for d in workdir.iterdir() if d.is_dir() and d.name.endswith(".tmp")]
+
+
+def test_frames_at_indices_rejects_incomplete_cache(tmp_path: Path) -> None:
+    from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
+    from hflow.transform import write_canonical_episode
+
+    source_mcap = tmp_path / "source.mcap"
+    canonical_mcap = tmp_path / "canonical.mcap"
+    workdir = tmp_path / "workdir_incomplete"
+    synthesize_episode(
+        source_mcap,
+        SyntheticEpisodeSpec(duration_s=1.0, cameras=("cam",), image_hz=5.0),
+    )
+    write_canonical_episode(source_mcap, canonical_mcap)
+
+    with Episode(canonical_mcap, workdir=workdir) as ep:
+        frames = ep.frames_at_indices(frame_indices=[0, 2])
+        assert len(frames) == 2
+
+    # Simulate an incomplete cache by deleting one frame
+    frames[0].path.unlink()
+
+    with (
+        Episode(canonical_mcap, workdir=workdir) as ep,
+        pytest.raises(RuntimeError, match="Incomplete frame cache"),
+    ):
+        ep.frames_at_indices(frame_indices=[0, 2])
+
+
+@pytest.mark.parametrize("method", ["frames", "frames_at_indices"])
+def test_rename_failure_propagates_and_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
+    from hflow.transform import write_canonical_episode
+
+    source_mcap = tmp_path / "source.mcap"
+    canonical_mcap = tmp_path / "canonical.mcap"
+    workdir = tmp_path / f"workdir_err_{method}"
+    synthesize_episode(
+        source_mcap,
+        SyntheticEpisodeSpec(duration_s=1.0, cameras=("cam",), image_hz=5.0),
+    )
+    write_canonical_episode(source_mcap, canonical_mcap)
+
+    original_rename = Path.rename
+
+    def fail_rename(self: Path, target: Path) -> Path:
+        if not target.exists():
+            raise PermissionError("simulated permission denied")
+        return original_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", fail_rename)
+
+    with (
+        Episode(canonical_mcap, workdir=workdir) as ep,
+        pytest.raises(PermissionError, match="simulated permission denied"),
+    ):
+        if method == "frames":
+            ep.frames(fps=2.0)
+        else:
+            ep.frames_at_indices(frame_indices=[0, 2])
+
+    assert not [d for d in workdir.iterdir() if d.is_dir() and d.name.endswith(".tmp")]
+
+
+@pytest.mark.parametrize("method", ["frames", "frames_at_indices"])
+def test_failed_ffmpeg_extraction_cleans_up_and_allows_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    import subprocess
+
+    from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
+    from hflow.transform import write_canonical_episode
+
+    source_mcap = tmp_path / "source.mcap"
+    canonical_mcap = tmp_path / "canonical.mcap"
+    workdir = tmp_path / f"workdir_fail_{method}"
+    synthesize_episode(
+        source_mcap,
+        SyntheticEpisodeSpec(duration_s=1.0, cameras=("cam",), image_hz=5.0),
+    )
+    write_canonical_episode(source_mcap, canonical_mcap)
+
+    def failing_run(*args: Any, **kwargs: Any) -> Any:
+        return subprocess.CompletedProcess(
+            args=["ffmpeg"], returncode=1, stdout="", stderr="ffmpeg crashed"
+        )
+
+    monkeypatch.setattr(subprocess, "run", failing_run)
+
+    expected_error = (
+        "ffmpeg frame extraction produced no frames"
+        if method == "frames"
+        else "ffmpeg extracted 0 of 2 selected frames"
+    )
+
+    with (
+        Episode(canonical_mcap, workdir=workdir) as ep,
+        pytest.raises(RuntimeError, match=expected_error),
+    ):
+        if method == "frames":
+            ep.frames(fps=2.0)
+        else:
+            ep.frames_at_indices(frame_indices=[0, 2])
+
+    assert not [d for d in workdir.iterdir() if d.is_dir()]
+
+    monkeypatch.undo()
+    with Episode(canonical_mcap, workdir=workdir) as ep:
+        if method == "frames":
+            frames = ep.frames(fps=2.0)
+        else:
+            frames = ep.frames_at_indices(frame_indices=[0, 2])
+        assert len(frames) == 2
+        assert all(f.path.is_file() for f in frames)
