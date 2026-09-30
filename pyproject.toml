@@ -29,7 +29,7 @@ dependencies = [
     "mcap>=1.4.0",
     "mcap-protobuf-support>=0.5.4",
     "mcap-ros2-support>=0.5.7",
-    "numpy>=2.4.6",
+    "numpy>=2.3.5",
     "platformdirs>=4.11.3",
     "pydantic>=2.13.4",
     "tenacity>=9.1.4",
@@ -103,6 +103,7 @@ members = [
     "packages/*",
     "examples/build_ai_evaluation",
     "examples/egosuite_evaluation",
+    "examples/video_preparation_autoresearch",
 ]
 
 [tool.uv.sources]
@@ -154,4 +155,5 @@ exclude = [
     "examples/build_ai_evaluation/",
     "examples/egosuite_evaluation/",
     "examples/openai_vision/",
+    "examples/video_preparation_autoresearch/",
 ]

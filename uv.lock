@@ -16,6 +16,7 @@ members = [
     "hflow-example-build-ai-evaluation",
     "hflow-example-egosuite-evaluation",
     "hflow-server",
+    "hflow-video-preparation-autoresearch-example",
 ]
 
 [[package]]
@@ -1140,7 +1141,7 @@ requires-dist = [
     { name = "mcap-protobuf-support", specifier = ">=0.5.4" },
     { name = "mcap-ros2-support", specifier = ">=0.5.7" },
     { name = "mediapipe", marker = "extra == 'mediapipe'", specifier = ">=1.0.1" },
-    { name = "numpy", specifier = ">=2.4.6" },
+    { name = "numpy", specifier = ">=2.3.5" },
     { name = "obstore", marker = "extra == 'bucket'", specifier = ">=0.11.1" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=3.3.1" },
     { name = "opencv-python-headless", marker = "extra == 'motion'", specifier = ">=5.0.0.93" },
@@ -1253,6 +1254,40 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.141.1" },
     { name = "hflow", editable = "." },
     { name = "uvicorn", specifier = ">=0.52.4" },
+]
+
+[[package]]
+name = "hflow-video-preparation-autoresearch-example"
+version = "0.1.0"
+source = { virtual = "examples/video_preparation_autoresearch" }
+dependencies = [
+    { name = "hflow", extra = ["video"] },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "pydantic" },
+    { name = "typer" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "ruff" },
+    { name = "ty" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "hflow", extras = ["video"], editable = "." },
+    { name = "numpy", specifier = ">=2.3.5" },
+    { name = "pydantic", specifier = ">=2.13.4" },
+    { name = "typer", specifier = ">=0.27.2" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=9.1.1" },
+    { name = "ruff", specifier = ">=0.16.4" },
+    { name = "ty", specifier = ">=0.0.74" },
 ]
 
 [[package]]

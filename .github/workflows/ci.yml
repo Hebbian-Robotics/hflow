@@ -20,6 +20,7 @@ jobs:
       matrix:
         # Test the supported floor and current runtime. Static analysis runs once below.
         python-version: ["3.11", "3.14"]
+        numpy-version: ["locked", "2.3.5"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install ffmpeg (the test suite pins to the system binary)
@@ -31,15 +32,39 @@ jobs:
         # Not --all-extras: the mediapipe extra is a model, deliberately not
         # exercised here (see pyproject.toml).
         run: uv sync --locked
+      - name: Install minimum supported NumPy
+        if: matrix.numpy-version != 'locked'
+        run: uv pip install "numpy==${{ matrix.numpy-version }}"
       - name: Lint
-        if: matrix.python-version == '3.14'
-        run: uv run ruff check
+        if: matrix.python-version == '3.14' && matrix.numpy-version == 'locked'
+        run: uv run --no-sync ruff check
       - name: Format check
-        if: matrix.python-version == '3.14'
-        run: uv run ruff format --check
+        if: matrix.python-version == '3.14' && matrix.numpy-version == 'locked'
+        run: uv run --no-sync ruff format --check
       - name: Typecheck
-        if: matrix.python-version == '3.14'
-        run: uv run ty check
+        if: matrix.python-version == '3.14' && matrix.numpy-version == 'locked'
+        run: uv run --no-sync ty check
       - name: Tests
         # Public ubuntu-latest runners have four CPUs; keep media-heavy tests within that limit.
-        run: uv run pytest -q -n 4
+        run: uv run --no-sync pytest -q -n 4
+
+  video-preparation-example:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          python-version: "3.14"
+      - name: Sync example environment
+        run: uv sync --locked --project examples/video_preparation_autoresearch
+      - name: Typecheck example
+        run: >-
+          uv run --locked --project examples/video_preparation_autoresearch
+          ty check --project examples/video_preparation_autoresearch --extra-search-path .
+          examples/video_preparation_autoresearch
+      - name: Test example
+        run: >-
+          uv run --locked --project examples/video_preparation_autoresearch
+          pytest -q examples/video_preparation_autoresearch/tests

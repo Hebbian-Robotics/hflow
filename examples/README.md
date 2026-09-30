@@ -100,6 +100,30 @@ Guide: [Score source windows with a model](../docs/how-to/score-source-windows-w
 
 Code: [`score_source_windows.py`](./score_source_windows.py)
 
+## Model-input preparation autoresearch
+
+**Use it for:** exploring frame rate and resolution with a fixed evaluator and
+separate confirmation, while HFlow owns model-input video preparation.
+
+**Prerequisites:** the example's uv workspace environment and FFmpeg/ffprobe.
+No model service, weights, API key or GPU. HFlow may download managed binaries.
+
+```bash
+uv sync --locked --project examples/video_preparation_autoresearch
+uv run --locked --project examples/video_preparation_autoresearch \
+  python examples/video_preparation_autoresearch/evaluate.py demo \
+  --output data/video-preparation-demo
+```
+
+This writes synthetic source/prepared clips, development reports, a frozen
+selection, and disjoint confirmation reports into a fresh output directory.
+The CPU sweep verifies example mechanics; a coding agent supplies the research
+loop by following the fixed [instructions](./video_preparation_autoresearch/program.md).
+
+Guide: [Search video preparation budgets](../docs/how-to/search-video-preparation-budgets.md)
+
+Code: [`evaluate.py`](./video_preparation_autoresearch/evaluate.py)
+
 ## Continuous camera motion
 
 **Use it for:** streaming per-frame-pair motion and optional continuous shake
