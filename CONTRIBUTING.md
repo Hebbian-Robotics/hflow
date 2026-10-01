@@ -121,6 +121,17 @@ uv run --python 3.14 --locked pytest -q
 CI uses four pytest workers for the default suite. To match its test execution
 locally, run `uv run pytest -q -n 4`.
 
+CI also runs both Python versions with the minimum supported NumPy. To reproduce
+that compatibility check after syncing the chosen Python environment:
+
+```bash
+uv pip install "numpy==2.3.5"
+uv run --no-sync pytest -q -n 4
+```
+
+`--no-sync` retains the minimum version instead of restoring the lockfile's
+NumPy. Run `uv sync --locked` afterwards to restore the normal environment.
+
 Four integration test suites are intentionally opt-in because they need network
 access, Docker, a writable object-store prefix, or a model outside the default
 environment:

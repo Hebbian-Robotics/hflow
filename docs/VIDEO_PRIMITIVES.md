@@ -27,7 +27,7 @@ The existing canonical `camera_video` enrichment keeps its constant-rate contrac
 
 ## Direct model-video preparation
 
-`hflow.importers.video.prepare_model_video(source, output, config, limits=...,
+`hflow.importers.prepare_model_video(source, output, config, limits=...,
 transform_config=...)` uses `VideoImportConfig` and `TransformConfig` to produce
 canonical model-input pixels without first writing an MCAP. It shares the video
 importer's direct source-to-H.264 encoding: fixed-rate sampling, aspect-preserving
