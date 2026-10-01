@@ -3,6 +3,7 @@
 import itertools
 import math
 
+import numpy as np
 import pytest
 
 from hflow import (
@@ -163,6 +164,19 @@ def test_mean_combines_tiny_contributions_before_rounding_to_smallest_float() ->
     )
     assert distribution is not None
     assert distribution.mean == smallest_float
+
+
+def test_measurements_accept_finite_numpy_numeric_scalars() -> None:
+    observation = WeightedValue(np.float32(0.5), np.int64(30))
+    assert observation == WeightedValue(0.5, 30)
+
+
+@pytest.mark.parametrize("invalid_numpy_bool", [np.bool_(True), np.bool_(False)])
+def test_measurements_reject_numpy_booleans(invalid_numpy_bool: np.bool_) -> None:
+    with pytest.raises(ValueError, match="value must be a finite number"):
+        WeightedValue(invalid_numpy_bool, 1)  # ty: ignore[invalid-argument-type]
+    with pytest.raises(ValueError, match="weight must be a finite number"):
+        WeightedValue(1, invalid_numpy_bool)  # ty: ignore[invalid-argument-type]
 
 
 @pytest.mark.parametrize("invalid_value", [True, "1", None, math.inf, -math.inf, math.nan])
