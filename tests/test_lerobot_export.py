@@ -577,6 +577,46 @@ def test_export_refuses_frame_referencing_unpublished_task(
     assert not dest.exists()
 
 
+def test_export_preserves_multitask_frame_indexes(fake_corpus: dict, tmp_path: Path) -> None:
+    """#632: validate task_index against the source episode's full task list."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    source_root = Path(fake_corpus["cache_dir"])
+    episodes_pq = source_root / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    episodes = pq.read_table(str(episodes_pq))
+    task_lists = episodes.column("tasks").to_pylist()
+    task_lists[0] = ["pick cup", "place cup"]
+    episodes = episodes.set_column(
+        episodes.schema.get_field_index("tasks"),
+        "tasks",
+        pa.array(task_lists, type=episodes.schema.field("tasks").type),
+    )
+    pq.write_table(episodes, str(episodes_pq))
+
+    src_pq = source_root / "data" / "chunk-000" / "file-000.parquet"
+    frames = pq.read_table(str(src_pq))
+    task_indices = [0] * frames.num_rows
+    task_indices[1] = 1
+    frames = frames.append_column("task_index", pa.array(task_indices, pa.int64()))
+    pq.write_table(frames, str(src_pq))
+
+    manifest = _fake_manifest(
+        tmp_path,
+        [{"metadata_json": _provenance_meta(0, task="pick cup")}],
+    )
+    dest = tmp_path / "out_multitask"
+    export.export(dest, manifest=manifest, camera_keys=CAMS)
+
+    output_episodes = pq.read_table(
+        str(dest / "meta" / "episodes" / "chunk-000" / "file-000.parquet")
+    )
+    assert output_episodes.column("tasks").to_pylist() == [["pick cup", "place cup"]]
+
+    output_frames = pq.read_table(str(dest / "data" / "chunk-000" / "file-000.parquet"))
+    assert output_frames.column("task_index").to_pylist()[0:2] == [0, 1]
+
+
 def test_export_preserves_valid_task_index(fake_corpus: dict, tmp_path: Path) -> None:
     """A task_index matching the published task (index 0) exports cleanly."""
     import pyarrow as pa
