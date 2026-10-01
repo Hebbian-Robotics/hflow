@@ -13,6 +13,7 @@ exclude-newer-span = "P5D"
 [manifest]
 members = [
     "hflow",
+    "hflow-example-build-ai-autoresearch",
     "hflow-example-build-ai-evaluation",
     "hflow-example-egosuite-evaluation",
     "hflow-server",
@@ -1167,6 +1168,43 @@ dev = [
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "ruff", specifier = ">=0.16.4" },
     { name = "setuptools", specifier = ">=84.0.0" },
+    { name = "ty", specifier = ">=0.0.74" },
+]
+
+[[package]]
+name = "hflow-example-build-ai-autoresearch"
+version = "0.1.0"
+source = { virtual = "examples/build_ai_autoresearch" }
+dependencies = [
+    { name = "duckdb" },
+    { name = "hflow" },
+    { name = "huggingface-hub" },
+    { name = "pillow" },
+    { name = "pyarrow" },
+    { name = "typer" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "ruff" },
+    { name = "ty" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "duckdb", specifier = ">=1.5.5" },
+    { name = "hflow", editable = "." },
+    { name = "huggingface-hub", specifier = ">=1.31.0,<2" },
+    { name = "pillow", specifier = ">=12.3.0" },
+    { name = "pyarrow", specifier = ">=25.0.1" },
+    { name = "typer", specifier = ">=0.27.2" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=9.1.1" },
+    { name = "ruff", specifier = ">=0.16.4" },
     { name = "ty", specifier = ">=0.0.74" },
 ]
 

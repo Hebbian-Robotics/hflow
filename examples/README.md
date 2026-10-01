@@ -15,6 +15,30 @@ uv run --project examples/path_to_example python examples/path_to_example/main.p
 These projects share the repository lockfile and use the workspace copy of
 HFlow, but their dependencies are not installed by a normal root `uv sync`.
 
+## Build AI autoresearch data preparation
+
+**Use it for:** combining both public Build AI evaluation releases, deduplicating
+identical image pixels, resolving contradictory teacher labels, and freezing
+training/development/test manifests with HFlow.
+
+**Prerequisites:** the example's own uv environment and disk for approximately
+12 GB of source Parquet plus retained images. `--download` fetches pinned public
+data; model APIs, model weights, GPU, and Gemini credentials are not required.
+
+```bash
+uv run --locked --project examples/build_ai_autoresearch \
+  python examples/build_ai_autoresearch/prepare.py \
+  data/build-ai-autoresearch/prepared --download
+```
+
+Writes deduplicated frames, conflict evidence, manifests, and provenance
+receipts. This currently implements data preparation; training and the agent
+loop are the next stage. These are frame-level splits, with recording
+independence unavailable from the published files.
+
+Workflow, limitations, and planned research cycle:
+[Build AI autoresearch](./build_ai_autoresearch/README.md).
+
 ## Five-minute quickstart
 
 **Use it for:** seeing the complete in-process lifecycle on a small multimodal

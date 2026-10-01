@@ -1,0 +1,38 @@
+[project]
+name = "hflow-example-build-ai-autoresearch"
+version = "0.1.0"
+description = "Frozen public teacher-labelled data for egocentric VLM autoresearch"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb>=1.5.5",
+    "hflow",
+    "huggingface-hub>=1.31.0,<2",
+    "pillow>=12.3.0",
+    "pyarrow>=25.0.1",
+    "typer>=0.27.2",
+]
+
+[dependency-groups]
+dev = ["pytest>=9.1.1", "ruff>=0.16.4", "ty>=0.0.74"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+hflow = { workspace = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["../.."]
+
+[tool.ruff]
+extend = "../../pyproject.toml"
+
+[tool.ty.environment]
+extra-paths = ["../.."]
+
+[tool.ty.rules]
+division-by-zero = "error"
+deprecated = "error"
+unused-ignore-comment = "error"
+possibly-unresolved-reference = "error"
