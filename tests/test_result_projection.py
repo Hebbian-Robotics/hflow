@@ -4,6 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import hflow
@@ -76,6 +77,25 @@ def test_result_domain_refuses_nonfinite_measurements_and_duplicate_names() -> N
     measured = MeasuredCheck("quality", {"score": 0.0}, None)
     with pytest.raises(ValueError, match="unique"):
         ResultProjection((measured, measured))
+
+
+def test_camera_evidence_accepts_numpy_numeric_scalars_and_rejects_numpy_bool() -> None:
+    measurements = {
+        "/head/black_frame_pct": np.float32(25.0),
+        "/head/clipped_highlight_pct": np.float64(10.0),
+        "/head/crushed_shadow_pct": np.int64(0),
+        "/head/freeze_total_s": np.float32(2.0),
+    }
+
+    evidence = CameraQualityEvidence.from_measurements(measurements, "/head")
+
+    assert evidence.black_frame_percent == 25.0
+    assert evidence.frozen_seconds == 2.0
+
+    with pytest.raises(ValueError, match="numeric"):
+        CameraQualityEvidence.from_measurements(
+            {**measurements, "/head/black_frame_pct": np.bool_(True)}, "/head"
+        )
 
 
 def test_camera_evidence_preserves_units_and_rejects_invalid_percentages() -> None:
