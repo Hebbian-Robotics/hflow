@@ -73,6 +73,13 @@ if TYPE_CHECKING:
         StepKind,
         StepManifest,
     )
+    from hflow.manifest_splits import (
+        ManifestPartition,
+        ManifestPartitionReport,
+        ManifestSplitReport,
+        ManifestSplitSettings,
+        split_manifest,
+    )
     from hflow.reader import (
         EpisodeReader,
         EpisodeTimeBounds,
@@ -149,6 +156,13 @@ if TYPE_CHECKING:
     from hflow.workspace import Workspace, WorkspaceIdentity
 
 _ATTRIBUTE_NAMES_BY_MODULE: dict[str, tuple[str, ...]] = {
+    "hflow.manifest_splits": (
+        "ManifestPartition",
+        "ManifestPartitionReport",
+        "ManifestSplitReport",
+        "ManifestSplitSettings",
+        "split_manifest",
+    ),
     "hflow.app": (
         "App",
         "CheckOutcome",
@@ -405,6 +419,10 @@ __all__ = [
     "KeyframeFallbackReason",
     "LocalStorageRoot",
     "LoopbackVideoSource",
+    "ManifestPartition",
+    "ManifestPartitionReport",
+    "ManifestSplitReport",
+    "ManifestSplitSettings",
     "Measured",
     "MeasurementValue",
     "MessageBatch",
@@ -478,6 +496,7 @@ __all__ = [
     "sample_source_frames",
     "serve_byte_ranges",
     "serve_catalog_ui",
+    "split_manifest",
     "stages_for_profile",
     "stale_episodes",
     "step_version_from_contract",
