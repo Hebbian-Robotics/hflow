@@ -1,6 +1,7 @@
 """Weighted summaries of numeric measurements without acceptance thresholds."""
 
 import math
+import sys
 from bisect import bisect_right
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -8,6 +9,13 @@ from itertools import pairwise
 
 
 def _finite_number(value: float, name: str) -> float:
+    # Measurements often come out of NumPy as np.float32 or np.int64, which are
+    # not int/float subclasses. Coerce them the way catalog.py does. A NumPy
+    # scalar can only exist once numpy is loaded, so look it up rather than
+    # importing it here and keep this module free of pipeline dependencies.
+    numpy = sys.modules.get("numpy")
+    if numpy is not None and isinstance(value, numpy.generic):
+        value = value.item()
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a finite number")
     try:

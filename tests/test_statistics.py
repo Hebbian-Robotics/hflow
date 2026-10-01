@@ -3,6 +3,7 @@
 import itertools
 import math
 
+import numpy as np
 import pytest
 
 from hflow import (
@@ -175,6 +176,36 @@ def test_measurements_reject_nonfinite_or_nonnumeric_values(invalid_value: objec
 def test_measurements_reject_invalid_weights(invalid_weight: object) -> None:
     with pytest.raises(ValueError, match="weight must be"):
         WeightedValue(1, invalid_weight)  # ty: ignore[invalid-argument-type]
+
+
+@pytest.mark.parametrize(
+    ("value", "weight"),
+    [
+        (np.float32(0.5), 1),
+        (0.5, np.int64(30)),
+        (np.int32(-3), np.float16(2)),
+        (np.uint8(7), np.float64(1.5)),
+    ],
+)
+def test_measurements_accept_numpy_scalars(value: object, weight: object) -> None:
+    measurement = WeightedValue(value, weight)  # ty: ignore[invalid-argument-type]
+
+    assert type(measurement.value) is float
+    assert type(measurement.weight) is float
+    assert measurement == WeightedValue(float(value), float(weight))  # ty: ignore[invalid-argument-type]
+
+
+@pytest.mark.parametrize("invalid_value", [np.bool_(True), np.float32(np.nan), np.float64(np.inf)])
+def test_measurements_reject_numpy_bools_and_nonfinite_scalars(invalid_value: object) -> None:
+    with pytest.raises(ValueError, match="value must be a finite number"):
+        WeightedValue(invalid_value, 1)  # ty: ignore[invalid-argument-type]
+    with pytest.raises(ValueError, match="weight must be a finite number"):
+        WeightedValue(1, invalid_value)  # ty: ignore[invalid-argument-type]
+
+
+def test_negative_numpy_weight_is_rejected() -> None:
+    with pytest.raises(ValueError, match="weight must be nonnegative"):
+        WeightedValue(1, np.int64(-1))  # ty: ignore[invalid-argument-type]
 
 
 @pytest.mark.parametrize("bin_edges", [(), (0,), (0, 0), (10, 0), (0, math.nan), (0, math.inf)])

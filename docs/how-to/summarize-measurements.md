@@ -25,6 +25,9 @@ weight. HFlow does not guess either from a measurement's name:
 - Use assessed sample counts when combining rates measured over samples.
 - Use a weight of one when each observation should contribute equally.
 
+Both fields accept NumPy scalars, such as sample counts summed from an array
+as `np.int64`, and store them as Python floats.
+
 Only combine values with the same meaning, scale, and observation unit. A
 distribution of window scores is not a distribution of individual frames or
 source recordings. Group windows by recording first if recordings are the
