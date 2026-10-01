@@ -761,9 +761,8 @@ def _validate_v3(dataset_dir: Path) -> None:
                         t_val = drow[t_idx_col]
                         if t_val is not None:
                             t_int = int(t_val)
-                            is_valid = (
-                                (0 <= t_int < published_task_count)
-                                or (bool(valid_registry_indices) and t_int in valid_registry_indices)
+                            is_valid = (0 <= t_int < published_task_count) or (
+                                bool(valid_registry_indices) and t_int in valid_registry_indices
                             )
                             if not is_valid:
                                 raise ValueError(
