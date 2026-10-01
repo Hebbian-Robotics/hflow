@@ -206,13 +206,17 @@ def _read_corpus_from_cache(cache_dir: Path) -> dict:
                 ep_idx = int(d["episode_index"])
                 tasks = d.get("tasks")
                 if isinstance(tasks, list):
-                    task = str(tasks[0]) if tasks else ""
+                    published_tasks = [str(task) for task in tasks]
+                elif tasks:
+                    published_tasks = [str(tasks)]
                 else:
-                    task = str(tasks or "")
+                    published_tasks = []
+                task = published_tasks[0] if published_tasks else ""
                 rows.append(
                     {
                         "episode_index": ep_idx,
                         "task": task,
+                        "tasks": published_tasks,
                         "length": int(d["length"]),
                         "data_chunk": str(d["data/chunk_index"]).split("/")[-1],
                         "data_file": str(d["data/file_index"]).split("/")[-1],
@@ -362,7 +366,12 @@ def _write_v3_repository(
                 f"found {len(rows)}"
             )
 
-        published_tasks = [sel.task] if sel.task else []
+        source_tasks = src.get("tasks")
+        published_tasks = (
+            [str(task) for task in source_tasks]
+            if isinstance(source_tasks, list)
+            else ([sel.task] if sel.task else [])
+        )
         if "task_index" in cols:
             task_col_idx = cols.index("task_index")
             for local_frame, row in enumerate(rows):
@@ -435,7 +444,7 @@ def _write_v3_repository(
         ep_out: dict = {
             "episode_index": new_idx,
             "length": length,
-            "tasks": [sel.task] if sel.task else [],
+            "tasks": list(src.get("tasks") or ([sel.task] if sel.task else [])),
             "data/chunk_index": 0,
             "data/file_index": new_idx,
             "dataset_from_index": (total_frames - length),
