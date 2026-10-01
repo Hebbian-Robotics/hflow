@@ -133,6 +133,63 @@ def test_camera_channels_became_compressed_video(
     assert joint_channel.message_encoding == "cdr"
 
 
+def _write_state_source(path: Path, *, include_empty_camera: bool) -> Path:
+    from mcap.writer import Writer as StockWriter
+
+    with path.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        if include_empty_camera:
+            camera_schema_id = writer.register_schema(
+                name="sensor_msgs/msg/CompressedImage",
+                encoding="ros2msg",
+                data=b"",
+            )
+            writer.register_channel(
+                topic="/camera/empty",
+                message_encoding="cdr",
+                schema_id=camera_schema_id,
+            )
+        state_schema_id = writer.register_schema(name="state", encoding="jsonschema", data=b"{}")
+        state_channel_id = writer.register_channel(
+            topic="/state",
+            message_encoding="json",
+            schema_id=state_schema_id,
+        )
+        writer.add_message(
+            state_channel_id,
+            log_time=1_000_000_000,
+            publish_time=1_000_000_000,
+            data=b'{"value": 1}',
+        )
+        writer.finish()
+    return path
+
+
+def test_empty_camera_declaration_survives_transform_and_changes_identity(tmp_path: Path) -> None:
+    with_camera = _write_state_source(tmp_path / "with-camera.mcap", include_empty_camera=True)
+    without_camera = _write_state_source(tmp_path / "without-camera.mcap", include_empty_camera=False)
+    canonical_with = tmp_path / "with-camera.canonical.mcap"
+    canonical_without = tmp_path / "without-camera.canonical.mcap"
+
+    write_canonical_episode(with_camera, canonical_with)
+    write_canonical_episode(without_camera, canonical_without)
+
+    with canonical_with.open("rb") as stream:
+        summary = make_reader(stream).get_summary()
+        assert summary is not None
+        by_topic = {
+            channel.topic: (channel, summary.schemas[channel.schema_id])
+            for channel in summary.channels.values()
+        }
+
+    camera_channel, camera_schema = by_topic["/camera/empty"]
+    assert camera_schema.name == CANONICAL_VIDEO_SCHEMA_NAME
+    assert camera_schema.encoding == "protobuf"
+    assert camera_channel.message_encoding == "protobuf"
+    assert canonical_with.read_bytes() != canonical_without.read_bytes()
+
+
 def test_state_messages_pass_through_byte_for_byte(
     source_episode: Path, canonical_episode: Path
 ) -> None:
