@@ -4,11 +4,15 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+import numpy as np
+
 from hflow.steps import MeasurementValue
 
 
 def finite_measurement(value: object, *, minimum: float = 0.0, maximum: float = math.inf) -> float:
     """Parse a numeric measurement without accepting booleans or nonfinite values."""
+    if isinstance(value, np.generic):
+        value = value.item()
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise ValueError("measurement must be numeric")
     try:
