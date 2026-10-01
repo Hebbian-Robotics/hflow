@@ -283,7 +283,11 @@ class ChannelData:
             raise ImportError(
                 "pyarrow is required for to_arrow(); install the 'arrow' extra"
             ) from error
-        columns: dict[str, Any] = {"log_time_ns": pyarrow.array(self._log_times)}
+        columns: dict[str, Any] = {
+            "log_time_ns": pyarrow.array(self._log_times, type=pyarrow.int64())
+        }
+        if not self._raw:
+            return pyarrow.table(columns)
         for name in _message_field_names(self.messages[0]):
             values = [_message_field(message, name) for message in self.messages]
             first = values[0]

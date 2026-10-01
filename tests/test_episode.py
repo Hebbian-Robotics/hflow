@@ -243,3 +243,26 @@ def test_failed_ffmpeg_extraction_cleans_up_and_allows_retry(
             frames = ep.frames_at_indices(frame_indices=[0, 2])
         assert len(frames) == 2
         assert all(f.path.is_file() for f in frames)
+
+
+def test_empty_channel_to_arrow(tmp_path: Path) -> None:
+    pyarrow = pytest.importorskip("pyarrow")
+    mcap_path = tmp_path / "empty_channel.mcap"
+    with mcap_path.open("wb") as stream:
+        writer = Writer(stream, chunk_size=64 * 1024, compression=CompressionType.NONE)
+        writer.start()
+        writer.register_channel(topic="/empty_json", message_encoding="json", schema_id=0)
+        writer.register_channel(
+            topic="/empty_unsupported", message_encoding="unsupported_custom", schema_id=0
+        )
+        writer.finish()
+
+    with Episode(mcap_path) as episode:
+        for topic in ("/empty_json", "/empty_unsupported"):
+            channel = episode.channel(topic)
+            assert len(channel) == 0
+            table = channel.to_arrow()
+            assert isinstance(table, pyarrow.Table)
+            assert table.num_rows == 0
+            assert table.column_names == ["log_time_ns"]
+            assert table.schema.field("log_time_ns").type == pyarrow.int64()
