@@ -252,12 +252,17 @@ def _read_corpus_from_cache(cache_dir: Path) -> dict:
         tasks_parquet = cache_dir / "meta" / "tasks.parquet"
         tasks_jsonl = cache_dir / "meta" / "tasks.jsonl"
         registry_tasks: list[str] = []
+        MAX_REASONABLE_TASK_INDEX = 50_000
         if tasks_parquet.exists():
             quoted_tasks = str(tasks_parquet).replace("'", "''")
             t_rows = conn.execute(
                 f"SELECT task_index, task FROM read_parquet('{quoted_tasks}') ORDER BY task_index"
             ).fetchall()
             max_idx = max((int(r[0]) for r in t_rows), default=-1)
+            if max_idx > MAX_REASONABLE_TASK_INDEX:
+                raise ValueError(
+                    f"task_index {max_idx} exceeds maximum supported limit ({MAX_REASONABLE_TASK_INDEX})"
+                )
             if max_idx >= 0:
                 registry_tasks = [""] * (max_idx + 1)
                 for r in t_rows:
@@ -270,6 +275,10 @@ def _read_corpus_from_cache(cache_dir: Path) -> dict:
                     t_str = item.get("task", "")
                     if idx is not None:
                         idx_num = int(idx)
+                        if idx_num > MAX_REASONABLE_TASK_INDEX:
+                            raise ValueError(
+                                f"task_index {idx_num} exceeds maximum supported limit ({MAX_REASONABLE_TASK_INDEX})"
+                            )
                         while len(registry_tasks) <= idx_num:
                             registry_tasks.append("")
                         registry_tasks[idx_num] = str(t_str)
@@ -662,16 +671,22 @@ def _validate_v3(dataset_dir: Path) -> None:
     conn = duckdb.connect()
     try:
         registry_task_count = 0
+        valid_registry_indices: set[int] = set()
         meta_tasks_pq = dataset_dir / "meta" / "tasks.parquet"
         if meta_tasks_pq.exists():
             quoted_tp = str(meta_tasks_pq).replace("'", "''")
-            row_res = conn.execute(f"SELECT count(*) FROM read_parquet('{quoted_tp}')").fetchone()
-            if row_res:
-                registry_task_count = max(registry_task_count, int(row_res[0]))
+            for r in conn.execute(f"SELECT task_index FROM read_parquet('{quoted_tp}')").fetchall():
+                if r[0] is not None:
+                    valid_registry_indices.add(int(r[0]))
+            registry_task_count = max(registry_task_count, len(valid_registry_indices))
         meta_tasks_jl = dataset_dir / "meta" / "tasks.jsonl"
         if meta_tasks_jl.exists():
-            jl_count = sum(1 for line in meta_tasks_jl.read_text().splitlines() if line.strip())
-            registry_task_count = max(registry_task_count, jl_count)
+            for line in meta_tasks_jl.read_text().splitlines():
+                if line.strip():
+                    item = json.loads(line)
+                    if item.get("task_index") is not None:
+                        valid_registry_indices.add(int(item["task_index"]))
+            registry_task_count = max(registry_task_count, len(valid_registry_indices))
 
         all_dataset_tasks: set[str] = set()
         for ep_pq in episodes_parquets:
@@ -744,11 +759,17 @@ def _validate_v3(dataset_dir: Path) -> None:
                         conn.execute(f"SELECT * FROM read_parquet('{dquoted}')").fetchall()
                     ):
                         t_val = drow[t_idx_col]
-                        if t_val is not None and not (0 <= int(t_val) < published_task_count):
-                            raise ValueError(
-                                f"episode {ep} frame {f_idx}: task_index {t_val} "
-                                "references an unpublished task"
+                        if t_val is not None:
+                            t_int = int(t_val)
+                            is_valid = (
+                                (0 <= t_int < published_task_count)
+                                or (bool(valid_registry_indices) and t_int in valid_registry_indices)
                             )
+                            if not is_valid:
+                                raise ValueError(
+                                    f"episode {ep} frame {f_idx}: task_index {t_val} "
+                                    "references an unpublished task"
+                                )
     finally:
         conn.close()
 
