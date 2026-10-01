@@ -640,15 +640,12 @@ def reject_non_single_select(sql: str) -> None:
     parser's ``duckdb.Error`` untouched — that is NOT this exception — so
     the two failure modes stay distinguishable.
 
-    The narrowing for ``PRAGMA`` / ``DESCRIBE`` / ``SHOW`` / ``SUMMARIZE``
-    asks DuckDB the same question the preview wrapper does: does the SQL
-    parse inside ``SELECT * FROM (<sql>)``? ``extract_statements`` on that
-    form accepts everything that runs as a subquery, including FROM-first
-    queries, parenthesized SELECTs, and VALUES clauses that a SELECT/WITH
-    text prefix would refuse (review of #453). Trailing semicolons and whitespace are
-    stripped before wrapping, and a newline is appended when missing, so
-    a trailing ``--`` line comment cannot swallow the wrapper's closing
-    paren.
+    DuckDB reports ``PRAGMA``, ``DESCRIBE``, ``SHOW``, and ``SUMMARIZE``
+    as SELECT statements, so those top-level forms are narrowed separately by
+    their leading keyword. The single standalone parse remains authoritative
+    for all other valid SELECT shapes, including FROM-first queries,
+    parenthesized SELECTs, VALUES clauses, trailing semicolons, and trailing
+    line comments.
     """
     parser_connection = duckdb.connect()
     try:
@@ -661,26 +658,11 @@ def reject_non_single_select(sql: str) -> None:
         if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
             raise NonSingleSelectQueryError("sql must be exactly one SELECT statement")
         # Refuse PRAGMA/DESCRIBE/SHOW/SUMMARIZE by leading keyword. DuckDB
-        # labels them SELECT, and DESCRIBE/SHOW/SUMMARIZE even parse cleanly
-        # as subqueries. Only ``SELECT * FROM (PRAGMA database_list)`` raises
-        # a parser error, so the parse check below is necessary but not
-        # sufficient: this leading-keyword refusal is what keeps the gate in
-        # step with what the endpoints advertise.
+        # labels these top-level introspection forms as SELECT, so the
+        # statement-type check above cannot distinguish them from the curation
+        # queries the endpoints advertise.
         if _leading_keyword(sql) in _SUBQUERY_FORBIDDEN_LEADING_KEYWORDS:
             raise NonSingleSelectQueryError("sql must be exactly one read-only SELECT statement")
-        # Parse the SQL inside the wrapper preview actually applies. Trailing
-        # semicolons and whitespace are stripped so a single ``SELECT 1;``
-        # still parses (curate()'s downstream ``connection.sql()`` handles
-        # trailing ``;`` itself; the server-side preview handler strips them
-        # at the boundary), and a newline is appended so a trailing ``--``
-        # comment without one cannot swallow the wrapper's ``)``.
-        wrapped_input = f"SELECT * FROM ({sql.rstrip().rstrip(';').rstrip()}\n)"
-        try:
-            parser_connection.extract_statements(wrapped_input)
-        except duckdb.Error as exc:
-            raise NonSingleSelectQueryError(
-                "sql must be exactly one read-only SELECT statement"
-            ) from exc
     finally:
         parser_connection.close()
 
