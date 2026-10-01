@@ -619,3 +619,169 @@ def test_validate_v3_rejects_corrupted_task_index(fake_corpus: dict, tmp_path: P
         match=r"episode 0 frame 3: task_index 99 references an unpublished task",
     ):
         export._validate_v3(dest)
+
+
+def test_export_multitask_episode_preserves_task_indices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#632: multi-task episodes with task_index >= 1 must export cleanly."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    corpus_root = tmp_path / "corpus_multitask"
+    info = two_camera_v3_info()
+    write_v3_corpus(
+        corpus_root,
+        info=info,
+        episode_rows=[
+            CorpusEpisodeRow(
+                episode_index=0,
+                length=60,
+                dataset_from_index=0,
+                video_to_timestamp=2.0,
+                tasks=("pick cup", "place cup"),
+            )
+        ],
+    )
+    for cam in CAMS:
+        vdir = corpus_root / "videos" / cam / "chunk-000"
+        vdir.mkdir(parents=True, exist_ok=True)
+        (vdir / "file-000.mp4").write_bytes(f"fake-mp4-{cam}".encode())
+
+    # Write task_index containing both 0 and 1
+    src_pq = corpus_root / "data" / "chunk-000" / "file-000.parquet"
+    table = pq.read_table(str(src_pq))
+    task_indices = [0 if i < 30 else 1 for i in range(table.num_rows)]
+    table = table.append_column("task_index", pa.array(task_indices, pa.int64()))
+    pq.write_table(table, str(src_pq))
+
+    corpus = {"info": info, "cache_dir": corpus_root}
+    _install_fake_import(corpus, corpus_root, monkeypatch)
+
+    manifest = _fake_manifest(
+        tmp_path,
+        [{"metadata_json": _provenance_meta(0, task="pick cup")}],
+    )
+    dest = tmp_path / "out_multitask"
+    export.export(dest, manifest=manifest, camera_keys=CAMS)
+
+    # Check exported data parquet preserves task_indices
+    out_pq = dest / "data" / "chunk-000" / "file-000.parquet"
+    out_table = pq.read_table(str(out_pq))
+    assert "task_index" in out_table.column_names
+    assert out_table.column("task_index").to_pylist() == task_indices
+
+    # Check exported episode parquet has both tasks
+    conn = duckdb.connect()
+    ep_rows = conn.execute(
+        f"SELECT tasks FROM read_parquet('{dest}/meta/episodes/chunk-000/file-000.parquet')"
+    ).fetchall()
+    conn.close()
+    assert ep_rows[0][0] == ["pick cup", "place cup"]
+
+
+def test_export_multitask_refuses_out_of_bounds_task_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#632: multi-task episodes with task_index exceeding published tasks must fail before write."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    corpus_root = tmp_path / "corpus_multitask_oob"
+    info = two_camera_v3_info()
+    write_v3_corpus(
+        corpus_root,
+        info=info,
+        episode_rows=[
+            CorpusEpisodeRow(
+                episode_index=0,
+                length=60,
+                dataset_from_index=0,
+                video_to_timestamp=2.0,
+                tasks=("pick cup", "place cup"),
+            )
+        ],
+    )
+    for cam in CAMS:
+        vdir = corpus_root / "videos" / cam / "chunk-000"
+        vdir.mkdir(parents=True, exist_ok=True)
+        (vdir / "file-000.mp4").write_bytes(f"fake-mp4-{cam}".encode())
+
+    # Frame 10 carries task_index=2 (unpublished since only 2 tasks exist: 0, 1)
+    src_pq = corpus_root / "data" / "chunk-000" / "file-000.parquet"
+    table = pq.read_table(str(src_pq))
+    task_indices = [0] * table.num_rows
+    task_indices[10] = 2
+    table = table.append_column("task_index", pa.array(task_indices, pa.int64()))
+    pq.write_table(table, str(src_pq))
+
+    corpus = {"info": info, "cache_dir": corpus_root}
+    _install_fake_import(corpus, corpus_root, monkeypatch)
+
+    manifest = _fake_manifest(
+        tmp_path,
+        [{"metadata_json": _provenance_meta(0, task="pick cup")}],
+    )
+    dest = tmp_path / "out_multitask_oob"
+    with pytest.raises(
+        ValueError,
+        match=r"source episode 0 frame 10: task_index 2 references an unpublished task",
+    ):
+        export.export(dest, manifest=manifest, camera_keys=CAMS)
+    assert not dest.exists()
+
+
+def test_export_multi_episode_different_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#632: multi-episode selection with different task indices exports cleanly."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    corpus_root = tmp_path / "corpus_multi_ep"
+    info = two_camera_v3_info()
+    write_v3_corpus(
+        corpus_root,
+        info=info,
+        episode_rows=[
+            CorpusEpisodeRow(
+                episode_index=0,
+                length=60,
+                dataset_from_index=0,
+                video_to_timestamp=2.0,
+                tasks=("task-0",),
+            ),
+            CorpusEpisodeRow(
+                episode_index=1,
+                length=65,
+                dataset_from_index=60,
+                video_to_timestamp=2.2,
+                tasks=("task-1",),
+            ),
+        ],
+    )
+    for cam in CAMS:
+        vdir = corpus_root / "videos" / cam / "chunk-000"
+        vdir.mkdir(parents=True, exist_ok=True)
+        (vdir / "file-000.mp4").write_bytes(f"fake-mp4-{cam}".encode())
+
+    # Episode 0 frames have task_index=0, Episode 1 frames have task_index=1
+    src_pq = corpus_root / "data" / "chunk-000" / "file-000.parquet"
+    table = pq.read_table(str(src_pq))
+    task_indices = [0] * 60 + [1] * 65
+    table = table.append_column("task_index", pa.array(task_indices, pa.int64()))
+    pq.write_table(table, str(src_pq))
+
+    corpus = {"info": info, "cache_dir": corpus_root}
+    _install_fake_import(corpus, corpus_root, monkeypatch)
+
+    manifest = _fake_manifest(
+        tmp_path,
+        [
+            {"metadata_json": _provenance_meta(0, task="task-0")},
+            {"metadata_json": _provenance_meta(1, task="task-1")},
+        ],
+    )
+    dest = tmp_path / "out_multi_ep"
+    export.export(dest, manifest=manifest, camera_keys=CAMS)
+    assert dest.exists()
