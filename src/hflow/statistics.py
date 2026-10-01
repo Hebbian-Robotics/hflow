@@ -6,8 +6,12 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 
+import numpy as np
+
 
 def _finite_number(value: float, name: str) -> float:
+    if isinstance(value, np.generic):
+        value = value.item()
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a finite number")
     try:
