@@ -1385,9 +1385,8 @@ _SQL_ACCEPTED_AS_ONE_SELECT = [
     # FROM-first against a real catalog column. A SELECT previewed from this
     # is the case the reviewer flagged as "the one that matters".
     pytest.param("FROM episodes WHERE status = 'ok'", id="from-first-catalog"),
-    # Without the fix, ``SELECT * FROM (SELECT 1 -- trailing comment)`` is a
-    # parser error: the trailing line comment swallows the wrapper's closing
-    # paren. Appending a newline before wrapping ends the comment first.
+    # A trailing line comment is valid in the standalone statement and must not
+    # require wrapper-specific normalization to pass the curation gate.
     pytest.param("SELECT 1 -- trailing comment without newline", id="trailing-line-comment"),
     # The PRAGMA/DESCRIBE/SHOW/SUMMARIZE refusal reads the first identifier,
     # so a parenthesized DESCRIBE is not headed by the keyword and is
