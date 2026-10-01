@@ -20,7 +20,6 @@ jobs:
       matrix:
         # Test the supported floor and current runtime. Static analysis runs once below.
         python-version: ["3.11", "3.14"]
-        numpy-version: ["locked", "2.3.5"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install ffmpeg (the test suite pins to the system binary)
@@ -32,18 +31,23 @@ jobs:
         # Not --all-extras: the mediapipe extra is a model, deliberately not
         # exercised here (see pyproject.toml).
         run: uv sync --locked
-      - name: Install minimum supported NumPy
-        if: matrix.numpy-version != 'locked'
-        run: uv pip install "numpy==${{ matrix.numpy-version }}"
       - name: Lint
-        if: matrix.python-version == '3.14' && matrix.numpy-version == 'locked'
-        run: uv run --no-sync ruff check
+        if: matrix.python-version == '3.14'
+        run: uv run ruff check
       - name: Format check
-        if: matrix.python-version == '3.14' && matrix.numpy-version == 'locked'
-        run: uv run --no-sync ruff format --check
+        if: matrix.python-version == '3.14'
+        run: uv run ruff format --check
       - name: Typecheck
-        if: matrix.python-version == '3.14' && matrix.numpy-version == 'locked'
-        run: uv run --no-sync ty check
+        if: matrix.python-version == '3.14'
+        run: uv run ty check
       - name: Tests
         # Public ubuntu-latest runners have four CPUs; keep media-heavy tests within that limit.
-        run: uv run --no-sync pytest -q -n 4
+        run: uv run pytest -q -n 4
+      - name: Install minimum supported NumPy
+        if: matrix.python-version == '3.14'
+        run: uv pip install "numpy==2.3.5"
+      - name: Test minimum NumPy compatibility
+        if: matrix.python-version == '3.14'
+        run: >-
+          uv run --no-sync pytest -q -n 4
+          tests/test_resample_derive.py tests/test_episode_to_arrow.py tests/test_video_import.py

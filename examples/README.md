@@ -15,26 +15,6 @@ uv run --project examples/path_to_example python examples/path_to_example/main.p
 These projects share the repository lockfile and use the workspace copy of
 HFlow, but their dependencies are not installed by a normal root `uv sync`.
 
-## Split a training manifest
-
-**Use it for:** keeping samples connected by recording or duplicate identity
-in the same training, development, or test partition.
-
-**Prerequisites:** the root development environment. No media, model, network,
-API key, or GPU is needed.
-
-```bash
-uv run --locked python examples/split_training_manifest.py
-```
-
-Writes 42 synthetic labelled samples and frozen split manifests under
-`data/manifest-splits-demo/`. Expected connected-group counts are 16 train,
-2 development, and 2 test. The output directory must be fresh.
-
-Code: [split_training_manifest.py](./split_training_manifest.py).
-Contract and adaptation guide:
-[Split training manifests](../docs/how-to/split-training-manifests.md).
-
 ## Five-minute quickstart
 
 **Use it for:** seeing the complete in-process lifecycle on a small multimodal

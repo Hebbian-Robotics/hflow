@@ -4,22 +4,6 @@ Use `hflow.split_manifest` to produce reproducible partitions of a local
 Parquet manifest. It accepts episode manifests or downstream sample manifests;
 no MCAP conversion, catalog, model, API key, or GPU is required.
 
-## Run the complete CPU example
-
-From the repository root, with the normal locked development environment:
-
-```bash
-uv run --locked python examples/split_training_manifest.py
-```
-
-The example creates 42 synthetic labelled samples in 21 recordings. One
-duplicate relationship connects two recordings, leaving 20 independent groups.
-It writes `data/manifest-splits-demo/samples.parquet` and a `splits/` directory
-containing train, development, and test manifests, `assignments.parquet`, and
-`receipt.json`. Expected group counts are 16, 2, and 2. Repeating the command
-refuses to overwrite the output. All generated data stays local and ignored by
-Git. Code: [split_training_manifest.py](../../examples/split_training_manifest.py).
-
 ## Prepare your manifest
 
 First combine releases, normalize labels, discover image duplicates, resolve
