@@ -3,9 +3,10 @@ the generated DAGs are thin callers of -- lane planning, pipeline loading,
 per-episode accounting, and the error/quarantine budgets."""
 
 import asyncio
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import ClassVar, cast
+from typing import Any, ClassVar, cast
 
 import pytest
 
@@ -102,6 +103,46 @@ class TestLanePlanning:
     def test_unknown_mode_is_refused_loudly(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="unknown mode"):
             plan_stage_batches(["a.mcap"], mode="turbo", batch_count=None, data_root=str(tmp_path))
+
+    def test_batch_lane_queries_file_sizes_concurrently_with_fake_storage(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        queried_keys: list[str] = []
+        sizes = {
+            "episodes/a.mcap": 300,
+            "episodes/b.mcap": 100,
+            "episodes/c.mcap": 200,
+        }
+
+        class FakeStorage:
+            def file_size(self, key: str) -> int:
+                queried_keys.append(key)
+                return sizes[key]
+
+        monkeypatch.setattr(
+            "hflow.stage_execution.parse_storage_root",
+            lambda _: FakeStorage(),
+        )
+
+        recorded_item_sizes: dict[str, int] = {}
+        original_plan_batches = stage_execution.plan_batches
+
+        def capture_plan_batches(item_sizes: Mapping[str, int], **kwargs: Any) -> list[Any]:
+            recorded_item_sizes.update(item_sizes)
+            return original_plan_batches(item_sizes, **kwargs)
+
+        monkeypatch.setattr("hflow.stage_execution.plan_batches", capture_plan_batches)
+
+        uris = ["episodes/a.mcap", "episodes/b.mcap", "episodes/c.mcap"]
+        batches = plan_stage_batches(uris, mode="batch", batch_count=2, data_root="s3://bucket")
+
+        assert list(recorded_item_sizes.keys()) == uris
+        assert recorded_item_sizes == sizes
+        assert set(queried_keys) == set(sizes.keys())
+        assert len(batches) == 2
+        items_by_batch = sorted(batches, key=lambda batch: len(batch["items"]))
+        assert items_by_batch[0]["items"] == ["episodes/a.mcap"]
+        assert sorted(items_by_batch[1]["items"]) == ["episodes/b.mcap", "episodes/c.mcap"]
 
 
 class TestConfFlags:

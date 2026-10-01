@@ -20,6 +20,7 @@ import math
 import os
 import traceback
 from collections.abc import Iterable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -78,6 +79,7 @@ RUN_FAILURE_BUDGET_FRACTION = 0.01
 # The default shard count for the batch lane, capped by item count.
 DEFAULT_BATCH_COUNT_LIMIT = 4
 DEFAULT_STAGGER_INTERVAL_S = 2.0
+STAGE_PLAN_FILE_SIZE_WORKERS = 16
 
 
 def run_failure_budget(total_episodes: int) -> int:
@@ -221,9 +223,14 @@ def plan_stage_batches(
     # The conf keeps the URI's own spelling, so `a/../b.mcap` stays the
     # identity; only the size lookup normalizes, because a storage key is
     # validated for containment and would refuse the literal segments.
-    item_sizes = {
-        str(uri): data_root_storage.file_size(normpath(str(uri))) for uri in validated_uris
-    }
+    workers = min(STAGE_PLAN_FILE_SIZE_WORKERS, len(validated_uris))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        item_sizes = dict(
+            executor.map(
+                lambda uri: (str(uri), data_root_storage.file_size(normpath(str(uri)))),
+                validated_uris,
+            )
+        )
     resolved_batch_count = (
         int(batch_count)
         if batch_count is not None
