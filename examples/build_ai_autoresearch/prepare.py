@@ -12,13 +12,15 @@ import json
 import shutil
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 from pathlib import Path
 
 import duckdb
+import PIL
+import pyarrow
 import pyarrow.parquet as parquet
 import typer
-from hflow import ManifestSplitSettings, split_manifest
+from hflow import ManifestSplitSettings, __version__, split_manifest
 from huggingface_hub import hf_hub_download
 from PIL import Image, ImageOps
 
@@ -42,6 +44,12 @@ class SourceOrigin(StrEnum):
 class SourceVerification(StrEnum):
     PUBLISHED_SHA256 = "matches-pinned-revision-sha256"
     UNVERIFIED = "local-file-revision-unverified"
+
+
+class HandCount(IntEnum):
+    NONE_VISIBLE = 0
+    ONE_VISIBLE = 1
+    TWO_VISIBLE = 2
 
 
 @dataclass(frozen=True)
@@ -121,20 +129,20 @@ class SourceFile:
 @dataclass(frozen=True)
 class TeacherFrame:
     image_bytes: bytes
-    hand_count: int
+    hand_count: HandCount
     source_row_index: int
     upstream_frame_id: str | None
 
 
 @dataclass(frozen=True)
 class SourceReference:
-    release: str
+    release: Release
     corpus: Corpus
     filename: str
     row_index: int
     frame_id: str | None
     encoded_sha256: str
-    hand_count: int
+    hand_count: HandCount
 
 
 @dataclass
@@ -147,7 +155,7 @@ class DeduplicatedFrame:
     references: list[SourceReference] = field(default_factory=list)
 
     @property
-    def labels(self) -> set[int]:
+    def labels(self) -> set[HandCount]:
         return {reference.hand_count for reference in self.references}
 
 
@@ -187,7 +195,7 @@ def _parse_teacher_frame(row: Mapping[str, object], row_index: int) -> TeacherFr
     frame_id = row.get("frame_id")
     if frame_id is not None and (not isinstance(frame_id, str) or not frame_id):
         raise ValueError(f"row {row_index} frame_id must be a nonempty string when supplied")
-    return TeacherFrame(image_value, hand_count, row_index, frame_id)
+    return TeacherFrame(image_value, HandCount(hand_count), row_index, frame_id)
 
 
 def _iter_teacher_frames(path: Path, limit: int | None) -> Iterator[TeacherFrame]:
@@ -236,10 +244,13 @@ def prepare_dataset(
     if not sources or len({source.specification.cache_key for source in sources}) != len(sources):
         raise ValueError("sources must be nonempty with distinct release/file identities")
     if row_limit_per_source is not None and (
-        isinstance(row_limit_per_source, bool) or row_limit_per_source <= 0
+        isinstance(row_limit_per_source, bool)
+        or not isinstance(row_limit_per_source, int)
+        or row_limit_per_source <= 0
     ):
         raise ValueError("row_limit_per_source must be positive")
     settings = ManifestSplitSettings("sample_id", ("pixel_sha256",), seed=seed)
+    preparation_code_sha256 = _file_sha256(Path(__file__))
     output_directory.mkdir(parents=True, exist_ok=False)
     try:
         images_directory = output_directory / "images"
@@ -338,10 +349,19 @@ def prepare_dataset(
         report = PreparedDataset(
             input_rows, len(unique_frames), len(retained), len(conflicts), output_directory
         )
+        if _file_sha256(Path(__file__)) != preparation_code_sha256:
+            raise ValueError("preparation code changed during the run")
         _write_new_json(
             output_directory / "preparation.json",
             {
                 "schema_version": 1,
+                "preparation_code_sha256": preparation_code_sha256,
+                "runtime": {
+                    "hflow": __version__,
+                    "pillow": PIL.__version__,
+                    "pyarrow": pyarrow.__version__,
+                    "duckdb": duckdb.__version__,
+                },
                 "task": "wearer-hand-count",
                 "label_source": "published-gemini-teacher-labels",
                 "independence_scope": "exact-pixel-frame-only",

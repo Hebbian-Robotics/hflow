@@ -87,7 +87,8 @@ The output directory must be new. It contains:
 - `conflicts.json`: contradictory hand labels and their provenance.
 - `splits/`: partition Parquet files, assignments, and HFlow's split receipt.
 - `preparation.json`: source digests, origin verification scope, selection
-  limits, counts, deduplication policy, output hashes, and split receipt hash.
+  limits, counts, deduplication policy, code/runtime identities, output hashes,
+  and split receipt hash.
 
 Receipts are written last. Ordinary failures remove the new output directory;
 termination can leave incomplete output. Consumers must verify the preparation
