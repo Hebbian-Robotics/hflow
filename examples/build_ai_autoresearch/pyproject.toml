@@ -9,7 +9,17 @@ dependencies = [
     "huggingface-hub>=1.31.0,<2",
     "pillow>=12.3.0",
     "pyarrow>=25.0.1",
+    "pydantic>=2.13.4",
     "typer>=0.27.2",
+]
+
+[project.optional-dependencies]
+training = [
+    "torch==2.10.0",
+    "transformers>=5,<6",
+    "peft>=0.18,<0.19",
+    "torchvision==0.25.0",
+    "num2words>=0.5.14",
 ]
 
 [dependency-groups]
@@ -20,6 +30,13 @@ package = false
 
 [tool.uv.sources]
 hflow = { workspace = true }
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
