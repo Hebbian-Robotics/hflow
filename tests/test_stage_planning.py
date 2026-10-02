@@ -18,7 +18,7 @@ import hflow
 from hflow.cli import main as cli_main
 from hflow.curation import open_catalog_connection
 from hflow.stage_execution import StageOutcome, run_stages_directly
-from hflow.stage_planning import StageSelection
+from hflow.stage_planning import OutstandingStages, StageSelection, plan_outstanding_stages
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
 EPISODE_URI = "episodes-in/episode_0001.mcap"
@@ -256,6 +256,44 @@ async def added_later(ep: hflow.Episode) -> hflow.CheckResult:
 
         assert _stage(both, hflow.Stage.META).counts["processed"] == 1
         assert _stage(both, hflow.Stage.META).skipped_as_current == 1
+
+    def test_a_step_that_errored_on_its_latest_run_is_planned_for_retry(
+        self, tmp_path: Path, one_second_camera_less_episode: Path
+    ) -> None:
+        """A check whose latest run crashed/errored must be scheduled for retry,
+        even if an earlier run recorded a settled status (issue #659)."""
+        data_root = tmp_path / "data"
+        episode_path = data_root / EPISODE_URI
+        episode_path.parent.mkdir(parents=True)
+        episode_path.write_bytes(one_second_camera_less_episode.read_bytes())
+        application = hflow.App("errored-step-planning", data_root=data_root, default_checks=())
+
+        should_fail = False
+
+        @application.check(version="1")
+        async def flaky_check(ep: hflow.Episode) -> hflow.CheckResult:
+            if should_fail:
+                raise RuntimeError("simulated check failure")
+            return hflow.CheckResult(measurements={"value": 1.0})
+
+        first_run = asyncio.run(
+            run_stages_directly(application, [EPISODE_URI], hflow.RUN_PROFILES["full"])
+        )
+        assert _stage(first_run, hflow.Stage.META).counts["processed"] == 1
+
+        first_plan = plan_outstanding_stages(application, [EPISODE_URI], [hflow.Stage.META])
+        first_outstanding = first_plan[EPISODE_URI]
+        assert isinstance(first_outstanding, OutstandingStages)
+        assert first_outstanding.outstanding_steps == ()
+
+        should_fail = True
+        with pytest.raises(RuntimeError):
+            asyncio.run(run_stages_directly(application, [EPISODE_URI], {hflow.Stage.META}))
+
+        second_plan = plan_outstanding_stages(application, [EPISODE_URI], [hflow.Stage.META])
+        second_outstanding = second_plan[EPISODE_URI]
+        assert isinstance(second_outstanding, OutstandingStages)
+        assert second_outstanding.outstanding_steps == ("flaky_check",)
 
 
 class TestTheEscapeHatches:

@@ -188,7 +188,7 @@ def _settled_step_names(
         parameters.extend((name, version))
     rows = connection.execute(
         f"""
-        SELECT episode_id, check_name FROM check_runs
+        SELECT episode_id, check_name FROM check_runs_latest
         WHERE status IN ({statuses})
           AND episode_id IN ({episode_placeholders})
           AND ({identity_clauses})
