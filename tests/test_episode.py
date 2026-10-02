@@ -266,3 +266,46 @@ def test_empty_channel_to_arrow(tmp_path: Path) -> None:
             assert table.num_rows == 0
             assert table.column_names == ["log_time_ns"]
             assert table.schema.field("log_time_ns").type == pyarrow.int64()
+
+
+def test_channel_to_arrow_numeric_list_with_null_elements() -> None:
+    import json
+
+    import numpy as np
+
+    from hflow.episode import ChannelData
+    from hflow.reader import TopicInfo
+
+    info = TopicInfo(
+        topic="/arm/joint_state",
+        channel_id=1,
+        schema_name="JointState",
+        schema_encoding="jsonschema",
+        message_encoding="json",
+        message_count=4,
+        schema_data=b"{}",
+    )
+    cd = ChannelData(
+        topic="/arm/joint_state",
+        channel_id=1,
+        info=info,
+        log_times=np.array([1000, 2000, 3000, 4000], dtype=np.int64),
+        publish_times=np.array([1000, 2000, 3000, 4000], dtype=np.int64),
+        raw=[
+            b'{"position": [1.0, 2.0, null], "untyped": [null, null]}',
+            b'{"position": [null, 2.0, 3.0], "untyped": [null, null]}',
+            b'{"position": [null, null, null], "untyped": [null, null]}',
+            b'{"position": [1.0, 2.0, 3.0], "untyped": [null, null]}',
+        ],
+        decoder=lambda b: json.loads(b.decode()),
+    )
+    table = cd.to_arrow()
+    assert "position" in table.column_names
+    # Untyped all-null list column carries no element type and is omitted like an empty list
+    assert "untyped" not in table.column_names
+    assert table["position"].to_pylist() == [
+        [1.0, 2.0, None],
+        [None, 2.0, 3.0],
+        [None, None, None],
+        [1.0, 2.0, 3.0],
+    ]
