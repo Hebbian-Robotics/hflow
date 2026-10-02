@@ -77,8 +77,7 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-            self.wfile.write(body)
+        self.wfile.write(body)
 
     def _record(self, payload: dict[str, Any] | None) -> str | None:
         authorization = self.headers.get("Authorization")

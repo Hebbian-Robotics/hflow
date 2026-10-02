@@ -828,3 +828,48 @@ def test_fetch_task_registry_downloads_from_hub(
     assert (cache / "meta" / "tasks.parquet").exists()
     cached_table = pq.read_table(str(cache / "meta" / "tasks.parquet"))
     assert cached_table.column("task").to_pylist() == ["task_a", "task_b"]
+
+
+def test_fetch_task_registry_fails_loudly_on_download_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_fetch_task_registry fails loudly when download encounters an error."""
+    import huggingface_hub
+
+    def _failing_download(*args: object, **kwargs: object) -> str:
+        raise RuntimeError("network failure downloading task registry")
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", _failing_download)
+
+    cache = tmp_path / "cache_fail"
+    cache.mkdir()
+    with pytest.raises(RuntimeError, match="network failure downloading task registry"):
+        export._fetch_task_registry("lerobot/mock-repo", "a" * 40, cache)
+
+
+def test_read_task_registry_helper(tmp_path: Path) -> None:
+    """_read_task_registry parses both parquet and jsonl formats."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    # Empty dir returns empty dict
+    meta_empty = tmp_path / "empty"
+    meta_empty.mkdir()
+    assert export._read_task_registry(meta_empty) == {}
+
+    # Parquet registry
+    meta_pq = tmp_path / "pq"
+    meta_pq.mkdir()
+    pq_table = pa.Table.from_arrays(
+        [pa.array([0, 10], type=pa.int64()), pa.array(["task-0", "task-10"], type=pa.string())],
+        names=["task_index", "task"],
+    )
+    pq.write_table(pq_table, meta_pq / "tasks.parquet")
+    assert export._read_task_registry(meta_pq) == {0: "task-0", 10: "task-10"}
+
+    # JSONL registry
+    meta_jl = tmp_path / "jl"
+    meta_jl.mkdir()
+    jl_lines = '{"task_index": 1, "task": "task-1"}\n{"task_index": 5, "task": "task-5"}\n'
+    (meta_jl / "tasks.jsonl").write_text(jl_lines)
+    assert export._read_task_registry(meta_jl) == {1: "task-1", 5: "task-5"}

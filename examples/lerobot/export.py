@@ -176,6 +176,36 @@ def _format_ref(template: str, **values: int | str | None) -> str:
         raise ValueError(f"template {template!r} cannot format references {values!r}: {e}") from e
 
 
+def _read_task_registry(meta_dir: Path) -> dict[int, str]:
+    """Read task registry from meta/tasks.parquet or meta/tasks.jsonl."""
+    tasks: dict[int, str] = {}
+    tasks_parquet = meta_dir / "tasks.parquet"
+    tasks_jsonl = meta_dir / "tasks.jsonl"
+    if tasks_parquet.exists():
+        table = pq.read_table(str(tasks_parquet))
+        cols = table.column_names
+        if "task_index" in cols:
+            indices = table["task_index"].to_pylist()
+            names = table["task"].to_pylist() if "task" in cols else [""] * len(indices)
+            for idx, name in zip(indices, names, strict=False):
+                if idx is not None:
+                    tasks[int(idx)] = str(name or "")
+        elif "task" in cols:
+            for idx, name in enumerate(table["task"].to_pylist()):
+                tasks[idx] = str(name or "")
+    elif tasks_jsonl.exists():
+        for line_idx, line in enumerate(tasks_jsonl.read_text().splitlines()):
+            if line.strip():
+                item = json.loads(line)
+                idx = item.get("task_index")
+                name = item.get("task", "")
+                if idx is not None:
+                    tasks[int(idx)] = str(name)
+                else:
+                    tasks[line_idx] = str(name)
+    return tasks
+
+
 def _read_corpus_from_cache(cache_dir: Path) -> dict:
     """Reconstruct the source corpus from the importer's materialized archive.
 
@@ -249,39 +279,7 @@ def _read_corpus_from_cache(cache_dir: Path) -> dict:
                         }
                 windows.setdefault(ep_idx, {}).update(cam_windows)
 
-        tasks_parquet = cache_dir / "meta" / "tasks.parquet"
-        tasks_jsonl = cache_dir / "meta" / "tasks.jsonl"
-        registry_tasks: list[str] = []
-        MAX_REASONABLE_TASK_INDEX = 50_000
-        if tasks_parquet.exists():
-            quoted_tasks = str(tasks_parquet).replace("'", "''")
-            t_rows = conn.execute(
-                f"SELECT task_index, task FROM read_parquet('{quoted_tasks}') ORDER BY task_index"
-            ).fetchall()
-            max_idx = max((int(r[0]) for r in t_rows), default=-1)
-            if max_idx > MAX_REASONABLE_TASK_INDEX:
-                raise ValueError(
-                    f"task_index {max_idx} exceeds maximum supported limit ({MAX_REASONABLE_TASK_INDEX})"
-                )
-            if max_idx >= 0:
-                registry_tasks = [""] * (max_idx + 1)
-                for r in t_rows:
-                    registry_tasks[int(r[0])] = str(r[1])
-        elif tasks_jsonl.exists():
-            for line in tasks_jsonl.read_text().splitlines():
-                if line.strip():
-                    item = json.loads(line)
-                    idx = item.get("task_index")
-                    t_str = item.get("task", "")
-                    if idx is not None:
-                        idx_num = int(idx)
-                        if idx_num > MAX_REASONABLE_TASK_INDEX:
-                            raise ValueError(
-                                f"task_index {idx_num} exceeds maximum supported limit ({MAX_REASONABLE_TASK_INDEX})"
-                            )
-                        while len(registry_tasks) <= idx_num:
-                            registry_tasks.append("")
-                        registry_tasks[idx_num] = str(t_str)
+        registry_tasks = _read_task_registry(cache_dir / "meta")
     finally:
         conn.close()
 
@@ -303,8 +301,10 @@ def _fetch_task_registry(src_ds: str, src_rev: str, cache_dir: Path) -> None:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src_file, target)
                 break
+            continue
         try:
             from huggingface_hub import hf_hub_download
+            from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError
 
             downloaded = hf_hub_download(
                 src_ds,
@@ -320,8 +320,8 @@ def _fetch_task_registry(src_ds: str, src_rev: str, cache_dir: Path) -> None:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(downloaded_path, target)
                 break
-        except Exception:
-            pass
+        except (EntryNotFoundError, RepositoryNotFoundError, FileNotFoundError):
+            continue
 
 
 def _materialize_source_archive(
@@ -404,7 +404,11 @@ def _write_v3_repository(
         return local
 
     # Pre-validate all selections and frame rows before creating directories or writing any files
-    dataset_tasks: list[str] = list(corpus.get("tasks") or [])
+    raw_corpus_tasks = corpus.get("tasks")
+    if isinstance(raw_corpus_tasks, dict):
+        dataset_tasks: list[str] = [raw_corpus_tasks[k] for k in sorted(raw_corpus_tasks)]
+    else:
+        dataset_tasks = list(raw_corpus_tasks or [])
     if not dataset_tasks:
         seen_tasks: set[str] = set()
         for s in selections:
@@ -476,15 +480,21 @@ def _write_v3_repository(
             ep_published_tasks = []
 
         published_task_count = max(len(ep_published_tasks), len(dataset_tasks))
+        registry_task_map = corpus.get("tasks") if isinstance(corpus.get("tasks"), dict) else {}
         if "task_index" in cols:
             task_col_idx = cols.index("task_index")
             for local_frame, row in enumerate(rows):
                 task_idx = row[task_col_idx]
-                if task_idx is not None and not (0 <= int(task_idx) < published_task_count):
-                    raise ValueError(
-                        f"source episode {sel.source_episode_index} frame {local_frame}: "
-                        f"task_index {task_idx} references an unpublished task"
+                if task_idx is not None:
+                    t_idx_int = int(task_idx)
+                    is_valid = (0 <= t_idx_int < published_task_count) or (
+                        bool(registry_task_map) and t_idx_int in registry_task_map
                     )
+                    if not is_valid:
+                        raise ValueError(
+                            f"source episode {sel.source_episode_index} frame {local_frame}: "
+                            f"task_index {task_idx} references an unpublished task"
+                        )
 
         for cam in camera_keys:
             vw = (src.get("video_windows") or {}).get(cam)
@@ -670,23 +680,9 @@ def _validate_v3(dataset_dir: Path) -> None:
         raise ValueError("staged dataset has no episode parquets")
     conn = duckdb.connect()
     try:
-        registry_task_count = 0
-        valid_registry_indices: set[int] = set()
-        meta_tasks_pq = dataset_dir / "meta" / "tasks.parquet"
-        if meta_tasks_pq.exists():
-            quoted_tp = str(meta_tasks_pq).replace("'", "''")
-            for r in conn.execute(f"SELECT task_index FROM read_parquet('{quoted_tp}')").fetchall():
-                if r[0] is not None:
-                    valid_registry_indices.add(int(r[0]))
-            registry_task_count = max(registry_task_count, len(valid_registry_indices))
-        meta_tasks_jl = dataset_dir / "meta" / "tasks.jsonl"
-        if meta_tasks_jl.exists():
-            for line in meta_tasks_jl.read_text().splitlines():
-                if line.strip():
-                    item = json.loads(line)
-                    if item.get("task_index") is not None:
-                        valid_registry_indices.add(int(item["task_index"]))
-            registry_task_count = max(registry_task_count, len(valid_registry_indices))
+        registry_tasks = _read_task_registry(dataset_dir / "meta")
+        valid_registry_indices = set(registry_tasks.keys())
+        registry_task_count = len(valid_registry_indices)
 
         all_dataset_tasks: set[str] = set()
         for ep_pq in episodes_parquets:
