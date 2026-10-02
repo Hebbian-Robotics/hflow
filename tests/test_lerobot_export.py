@@ -873,3 +873,186 @@ def test_read_task_registry_helper(tmp_path: Path) -> None:
     jl_lines = '{"task_index": 1, "task": "task-1"}\n{"task_index": 5, "task": "task-5"}\n'
     (meta_jl / "tasks.jsonl").write_text(jl_lines)
     assert export._read_task_registry(meta_jl) == {1: "task-1", 5: "task-5"}
+
+
+def test_export_refuses_frame_task_index_missing_from_sparse_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pre-validation refuses frames with task_index missing from source task registry.
+
+    If source task registry has indices 0 and 10, a frame with task_index 1 must be
+    refused even though 1 < len(registry).
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    corpus_root = tmp_path / "corpus_sparse_reg_refuse"
+    info = two_camera_v3_info()
+    write_v3_corpus(
+        corpus_root,
+        info=info,
+        episode_rows=[
+            CorpusEpisodeRow(
+                episode_index=0,
+                length=60,
+                dataset_from_index=0,
+                video_to_timestamp=2.0,
+                tasks=("task-0", "task-10"),
+            )
+        ],
+    )
+    for cam in CAMS:
+        vdir = corpus_root / "videos" / cam / "chunk-000"
+        vdir.mkdir(parents=True, exist_ok=True)
+        (vdir / "file-000.mp4").write_bytes(f"fake-mp4-{cam}".encode())
+
+    # Write source tasks.parquet with sparse indices [0, 10]
+    tasks_table = pa.Table.from_arrays(
+        [pa.array([0, 10], type=pa.int64()), pa.array(["task-0", "task-10"], type=pa.string())],
+        names=["task_index", "task"],
+    )
+    pq.write_table(tasks_table, corpus_root / "meta" / "tasks.parquet")
+
+    # Frame 5 carries task_index=1 (missing from registry [0, 10])
+    src_pq = corpus_root / "data" / "chunk-000" / "file-000.parquet"
+    table = pq.read_table(str(src_pq))
+    task_indices = [0] * table.num_rows
+    task_indices[5] = 1
+    table = table.append_column("task_index", pa.array(task_indices, pa.int64()))
+    pq.write_table(table, str(src_pq))
+
+    corpus = export._read_corpus_from_cache(corpus_root)
+    _install_fake_import(corpus, corpus_root, monkeypatch)
+
+    manifest = _fake_manifest(
+        tmp_path,
+        [{"metadata_json": _provenance_meta(0, task="task-0")}],
+    )
+    dest = tmp_path / "out_sparse_refuse"
+    with pytest.raises(
+        ValueError,
+        match=r"source episode 0 frame 5: task_index 1 references an unpublished task",
+    ):
+        export.export(dest, manifest=manifest, camera_keys=CAMS)
+    assert not dest.exists()
+
+
+def test_validate_v3_refuses_frame_task_index_missing_from_sparse_registry(
+    tmp_path: Path,
+) -> None:
+    """_validate_v3 refuses frames when task_index is missing from destination registry."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    dataset_dir = tmp_path / "dataset_sparse_validate"
+    dataset_dir.mkdir()
+    meta_dir = dataset_dir / "meta"
+    meta_dir.mkdir()
+    (meta_dir / "info.json").write_text(
+        json.dumps(
+            {
+                "code": "LeRobotDataset/v3",
+                "total_episodes": 1,
+                "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+            }
+        )
+    )
+
+    # Registry with indices [0, 10]
+    tasks_table = pa.Table.from_arrays(
+        [pa.array([0, 10], type=pa.int64()), pa.array(["task-0", "task-10"], type=pa.string())],
+        names=["task_index", "task"],
+    )
+    pq.write_table(tasks_table, meta_dir / "tasks.parquet")
+
+    # Episode metadata
+    ep_dir = meta_dir / "episodes" / "chunk-000"
+    ep_dir.mkdir(parents=True)
+    ep_table = pa.Table.from_pydict(
+        {
+            "episode_index": [0],
+            "length": [10],
+            "dataset_from_index": [0],
+            "dataset_to_index": [10],
+            "data/chunk_index": [0],
+            "data/file_index": [0],
+            "tasks": [["task-0", "task-10"]],
+        }
+    )
+    pq.write_table(ep_table, ep_dir / "file-000.parquet")
+
+    # Data file where frame 5 has task_index 1 (not in [0, 10])
+    data_dir = dataset_dir / "data" / "chunk-000"
+    data_dir.mkdir(parents=True)
+    data_table = pa.Table.from_pydict(
+        {
+            "index": list(range(10)),
+            "task_index": [0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
+        }
+    )
+    pq.write_table(data_table, data_dir / "file-000.parquet")
+
+    with pytest.raises(
+        ValueError,
+        match=r"episode 0 frame 5: task_index 1 references an unpublished task",
+    ):
+        export._validate_v3(dataset_dir)
+
+
+def test_export_sparse_registry_preserves_valid_indices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Multi-task dataset with sparse registry indices [0, 10] exports cleanly."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    corpus_root = tmp_path / "corpus_sparse_valid"
+    info = two_camera_v3_info()
+    write_v3_corpus(
+        corpus_root,
+        info=info,
+        episode_rows=[
+            CorpusEpisodeRow(
+                episode_index=0,
+                length=60,
+                dataset_from_index=0,
+                video_to_timestamp=2.0,
+                tasks=("task-0", "task-10"),
+            )
+        ],
+    )
+    for cam in CAMS:
+        vdir = corpus_root / "videos" / cam / "chunk-000"
+        vdir.mkdir(parents=True, exist_ok=True)
+        (vdir / "file-000.mp4").write_bytes(f"fake-mp4-{cam}".encode())
+
+    # Write source tasks.parquet with sparse indices [0, 10]
+    tasks_table = pa.Table.from_arrays(
+        [pa.array([0, 10], type=pa.int64()), pa.array(["task-0", "task-10"], type=pa.string())],
+        names=["task_index", "task"],
+    )
+    pq.write_table(tasks_table, corpus_root / "meta" / "tasks.parquet")
+
+    # Frames have task_index 0 and 10
+    src_pq = corpus_root / "data" / "chunk-000" / "file-000.parquet"
+    table = pq.read_table(str(src_pq))
+    task_indices = [0 if i < 30 else 10 for i in range(table.num_rows)]
+    table = table.append_column("task_index", pa.array(task_indices, pa.int64()))
+    pq.write_table(table, str(src_pq))
+
+    corpus = export._read_corpus_from_cache(corpus_root)
+    _install_fake_import(corpus, corpus_root, monkeypatch)
+
+    manifest = _fake_manifest(
+        tmp_path,
+        [{"metadata_json": _provenance_meta(0, task="task-0")}],
+    )
+    dest = tmp_path / "out_sparse_valid"
+    export.export(dest, manifest=manifest, camera_keys=CAMS)
+
+    assert dest.exists()
+    dest_tasks = dest / "meta" / "tasks.parquet"
+    assert dest_tasks.exists()
+    t_table = pq.read_table(str(dest_tasks))
+    assert t_table.column("task_index").to_pylist() == [0, 10]
+    assert t_table.column("task").to_pylist() == ["task-0", "task-10"]

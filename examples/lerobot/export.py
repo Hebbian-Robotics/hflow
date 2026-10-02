@@ -291,6 +291,9 @@ def _read_corpus_from_cache(cache_dir: Path) -> dict:
 
 def _fetch_task_registry(src_ds: str, src_rev: str, cache_dir: Path) -> None:
     """Download meta/tasks.parquet or meta/tasks.jsonl if present in source repository."""
+    import huggingface_hub
+    from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError
+
     for filename in ("meta/tasks.parquet", "meta/tasks.jsonl"):
         target = cache_dir / filename
         if target.exists():
@@ -303,10 +306,7 @@ def _fetch_task_registry(src_ds: str, src_rev: str, cache_dir: Path) -> None:
                 break
             continue
         try:
-            from huggingface_hub import hf_hub_download
-            from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError
-
-            downloaded = hf_hub_download(
+            downloaded = huggingface_hub.hf_hub_download(
                 src_ds,
                 filename,
                 repo_type="dataset",
@@ -404,12 +404,25 @@ def _write_v3_repository(
         return local
 
     # Pre-validate all selections and frame rows before creating directories or writing any files
-    raw_corpus_tasks = corpus.get("tasks")
-    if isinstance(raw_corpus_tasks, dict):
-        dataset_tasks: list[str] = [raw_corpus_tasks[k] for k in sorted(raw_corpus_tasks)]
+    registry_task_map = corpus["tasks"] if isinstance(corpus.get("tasks"), dict) else {}
+    if not registry_task_map and corpus.get("cache_dir"):
+        registry_task_map = _read_task_registry(Path(corpus["cache_dir"]) / "meta")
+
+    has_registry = bool(registry_task_map) or (
+        bool(corpus.get("cache_dir"))
+        and (
+            (Path(corpus["cache_dir"]) / "meta" / "tasks.parquet").exists()
+            or (Path(corpus["cache_dir"]) / "meta" / "tasks.jsonl").exists()
+        )
+    )
+
+    if registry_task_map:
+        dataset_tasks: list[str] = [registry_task_map[k] for k in sorted(registry_task_map)]
     else:
-        dataset_tasks = list(raw_corpus_tasks or [])
-    if not dataset_tasks:
+        dataset_tasks = (
+            list(corpus.get("tasks") or []) if not isinstance(corpus.get("tasks"), dict) else []
+        )
+    if not dataset_tasks and not has_registry:
         seen_tasks: set[str] = set()
         for s in selections:
             s_src = src_by_index[s.source_episode_index]
@@ -480,16 +493,16 @@ def _write_v3_repository(
             ep_published_tasks = []
 
         published_task_count = max(len(ep_published_tasks), len(dataset_tasks))
-        registry_task_map = corpus.get("tasks") if isinstance(corpus.get("tasks"), dict) else {}
         if "task_index" in cols:
             task_col_idx = cols.index("task_index")
             for local_frame, row in enumerate(rows):
                 task_idx = row[task_col_idx]
                 if task_idx is not None:
                     t_idx_int = int(task_idx)
-                    is_valid = (0 <= t_idx_int < published_task_count) or (
-                        bool(registry_task_map) and t_idx_int in registry_task_map
-                    )
+                    if has_registry:
+                        is_valid = t_idx_int in registry_task_map
+                    else:
+                        is_valid = 0 <= t_idx_int < published_task_count
                     if not is_valid:
                         raise ValueError(
                             f"source episode {sel.source_episode_index} frame {local_frame}: "
@@ -524,15 +537,27 @@ def _write_v3_repository(
 
     dest_tasks_parquet = meta_dir / "tasks.parquet"
     dest_tasks_jsonl = meta_dir / "tasks.jsonl"
-    if dataset_tasks and not dest_tasks_parquet.exists() and not dest_tasks_jsonl.exists():
-        t_table = pa.Table.from_arrays(
-            [
-                pa.array(range(len(dataset_tasks)), type=pa.int64()),
-                pa.array(dataset_tasks, type=pa.string()),
-            ],
-            names=["task_index", "task"],
-        )
-        pq.write_table(t_table, dest_tasks_parquet)
+    if not dest_tasks_parquet.exists() and not dest_tasks_jsonl.exists():
+        if registry_task_map:
+            t_indices = sorted(registry_task_map.keys())
+            t_names = [registry_task_map[k] for k in t_indices]
+            t_table = pa.Table.from_arrays(
+                [
+                    pa.array(t_indices, type=pa.int64()),
+                    pa.array(t_names, type=pa.string()),
+                ],
+                names=["task_index", "task"],
+            )
+            pq.write_table(t_table, dest_tasks_parquet)
+        elif dataset_tasks:
+            t_table = pa.Table.from_arrays(
+                [
+                    pa.array(range(len(dataset_tasks)), type=pa.int64()),
+                    pa.array(dataset_tasks, type=pa.string()),
+                ],
+                names=["task_index", "task"],
+            )
+            pq.write_table(t_table, dest_tasks_parquet)
 
     # one data parquet per selected episode: windowed rows, renumbered
     ep_rows_out: list[dict] = []
@@ -682,7 +707,10 @@ def _validate_v3(dataset_dir: Path) -> None:
     try:
         registry_tasks = _read_task_registry(dataset_dir / "meta")
         valid_registry_indices = set(registry_tasks.keys())
-        registry_task_count = len(valid_registry_indices)
+        has_registry = bool(valid_registry_indices) or (
+            (dataset_dir / "meta" / "tasks.parquet").exists()
+            or (dataset_dir / "meta" / "tasks.jsonl").exists()
+        )
 
         all_dataset_tasks: set[str] = set()
         for ep_pq in episodes_parquets:
@@ -699,7 +727,7 @@ def _validate_v3(dataset_dir: Path) -> None:
                     elif t_val:
                         all_dataset_tasks.add(str(t_val))
 
-        dataset_task_count = max(registry_task_count, len(all_dataset_tasks))
+        dataset_task_count = len(all_dataset_tasks)
 
         for ep_pq in episodes_parquets:
             quoted = str(ep_pq).replace("'", "''")
@@ -757,9 +785,10 @@ def _validate_v3(dataset_dir: Path) -> None:
                         t_val = drow[t_idx_col]
                         if t_val is not None:
                             t_int = int(t_val)
-                            is_valid = (0 <= t_int < published_task_count) or (
-                                bool(valid_registry_indices) and t_int in valid_registry_indices
-                            )
+                            if has_registry:
+                                is_valid = t_int in valid_registry_indices
+                            else:
+                                is_valid = 0 <= t_int < published_task_count
                             if not is_valid:
                                 raise ValueError(
                                     f"episode {ep} frame {f_idx}: task_index {t_val} "
