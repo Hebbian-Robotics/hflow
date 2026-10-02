@@ -140,6 +140,105 @@ def _is_numeric_sequence(value: Any) -> bool:
     return False
 
 
+def _is_arrow_scalar(value: Any) -> bool:
+    """Primitive Arrow cell: numbers, strings, and bools, including NumPy scalars.
+
+    ``np.bool_`` is not a Python ``bool`` and not an ``np.integer``, so the
+    numeric-scalar check used by ``to_numpy`` would drop it.
+    """
+    if isinstance(value, (bool, np.bool_)):
+        return True
+    return isinstance(value, (int, float, str, np.integer, np.floating))
+
+
+def _is_empty_sequence(value: Any) -> bool:
+    if isinstance(value, np.ndarray):
+        return value.size == 0
+    return isinstance(value, (list, tuple)) and len(value) == 0
+
+
+def _arrow_field_values(messages: Sequence[Any]) -> dict[str, list[Any]]:
+    """Field values in first-seen order, collected in one pass.
+
+    JSON objects can introduce keys at any point, so names must be collected
+    across every message. Values are gathered in the same walk so skipping a
+    nested-only or all-null field does not rescan the channel per key. Every
+    value list ends with one slot per message: a key introduced mid-stream is
+    backfilled with nulls for the earlier rows, and a message that omits a
+    known key appends null in its position.
+    """
+    values_by_name: dict[str, list[Any]] = {}
+    for row_count, message in enumerate(messages, start=1):
+        items: Iterator[tuple[str, Any]]
+        if isinstance(message, dict):
+            items = iter(message.items())
+        else:
+            items = (
+                (name, _message_field(message, name)) for name in _message_field_names(message)
+            )
+        for name, value in items:
+            values = values_by_name.get(name)
+            if values is None:
+                values_by_name[name] = [None] * (row_count - 1) + [value]
+            else:
+                values.append(value)
+        # A message that omits a key still occupies a row in that column.
+        for values in values_by_name.values():
+            while len(values) < row_count:
+                values.append(None)
+    return values_by_name
+
+
+def _arrow_column_values(topic: str, field_name: str, values: Sequence[Any]) -> list[Any] | None:
+    """Normalize one field, or return None when it is not an Arrow column.
+
+    A column is emitted when any sample is a primitive or a numeric list.
+    Nulls and empty lists stay in that column. A field that is only nested,
+    only null, or only an empty list is skipped: an empty list has no element
+    type, and nested messages are not flattened. Mixing those shapes is a
+    property of the recording, so it fails naming the topic and field instead
+    of asking pyarrow to guess.
+    """
+    saw_scalar = False
+    saw_list = False
+    saw_nested = False
+    for value in values:
+        if value is None:
+            continue
+        if _is_arrow_scalar(value):
+            saw_scalar = True
+        elif _is_numeric_sequence(value) or (
+            isinstance(value, np.ndarray) and value.dtype.kind in "iuf"
+        ):
+            # An empty numeric array keeps its dtype, so it types the column.
+            saw_list = True
+        elif _is_empty_sequence(value):
+            # `[]` carries no element type; an empty numeric ndarray above
+            # does. Keep the slot null unless a typed sample arrives.
+            continue
+        else:
+            saw_nested = True
+    if saw_nested and (saw_scalar or saw_list):
+        raise ValueError(
+            f"field {field_name!r} of topic {topic!r} mixes nested values with primitive values"
+        )
+    if saw_scalar and saw_list:
+        raise ValueError(f"field {field_name!r} of topic {topic!r} mixes scalar and list values")
+    if saw_nested or not (saw_scalar or saw_list):
+        return None
+    normalized: list[Any] = []
+    for value in values:
+        if isinstance(value, np.ndarray):
+            normalized.append(value.tolist())
+        elif isinstance(value, np.generic):
+            normalized.append(value.item())
+        elif isinstance(value, tuple):
+            normalized.append(list(value))
+        else:
+            normalized.append(value)
+    return normalized
+
+
 class ChannelData:
     """All messages of one channel: timestamps plus lazily decoded payloads."""
 
@@ -276,7 +375,13 @@ class ChannelData:
     def to_arrow(self) -> "pyarrow.Table":
         """The channel as a ``pyarrow.Table``: ``log_time_ns`` plus one column
         per primitive field (numeric/string/bool scalars and numeric lists;
-        nested fields are skipped). Requires the ``arrow`` extra."""
+        nested fields are skipped). Requires the ``arrow`` extra.
+
+        A field is included when any message carries a primitive or numeric-list
+        value. Samples before the first typed value stay null, and an empty
+        list stays empty. A field that changes between scalar, list, and nested
+        values raises ``ValueError`` naming the topic and field.
+        """
         try:
             import pyarrow
         except ImportError as error:
@@ -288,21 +393,19 @@ class ChannelData:
         }
         if not self._raw:
             return pyarrow.table(columns)
-        for name in _message_field_names(self.messages[0]):
-            values = [_message_field(message, name) for message in self.messages]
-            first = values[0]
-            is_primitive = isinstance(first, (int, float, str, bool, np.integer, np.floating))
-            is_numeric_list = _is_numeric_sequence(first)
-            if not (is_primitive or is_numeric_list):
+        # JSON objects can carry a key on any message, and the first sample of
+        # a field may be null, empty, or nested. Typing the column from message
+        # 0 drops every later value (#656).
+        for name, values in _arrow_field_values(self.messages).items():
+            normalized_values = _arrow_column_values(self.topic, name, values)
+            if normalized_values is None:
                 continue
             if name in columns:
                 raise ValueError(
                     f"field {name!r} of topic {self.topic!r} conflicts with "
                     f"reserved Arrow column {name!r}"
                 )
-            if isinstance(first, np.ndarray):
-                values = [np.asarray(value).tolist() for value in values]
-            columns[name] = pyarrow.array(values)
+            columns[name] = pyarrow.array(normalized_values)
         return pyarrow.table(columns)
 
 
