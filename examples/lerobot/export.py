@@ -59,6 +59,7 @@ class Selection:
     source_episode_index: int
     task: str
     embodiment: str
+    tasks: tuple[str, ...] = ()
 
 
 def _read_selection(manifest: Path | None, sql: str | None) -> list[dict]:
@@ -114,6 +115,13 @@ def _resolve_selection(rows: list[dict]) -> list[Selection]:
                 f"episode {row.get('episode_id', '<unknown>')} has a non-integer "
                 f"source_episode_index {ep_idx!r}"
             ) from None
+        raw_tasks = meta.get("tasks")
+        if isinstance(raw_tasks, list):
+            sel_tasks = tuple(str(t) for t in raw_tasks if t is not None)
+        elif isinstance(raw_tasks, str) and raw_tasks.strip():
+            sel_tasks = (raw_tasks.strip(),)
+        else:
+            sel_tasks = ()
         selections.append(
             Selection(
                 episode_id=str(row.get("episode_id", "")),
@@ -122,6 +130,7 @@ def _resolve_selection(rows: list[dict]) -> list[Selection]:
                 source_episode_index=ep_num,
                 task=str(meta.get("task") or ""),
                 embodiment=str(meta.get("embodiment") or ""),
+                tasks=sel_tasks,
             )
         )
     return selections
@@ -167,6 +176,36 @@ def _format_ref(template: str, **values: int | str | None) -> str:
         raise ValueError(f"template {template!r} cannot format references {values!r}: {e}") from e
 
 
+def _read_task_registry(meta_dir: Path) -> dict[int, str]:
+    """Read task registry from meta/tasks.parquet or meta/tasks.jsonl."""
+    tasks: dict[int, str] = {}
+    tasks_parquet = meta_dir / "tasks.parquet"
+    tasks_jsonl = meta_dir / "tasks.jsonl"
+    if tasks_parquet.exists():
+        table = pq.read_table(str(tasks_parquet))
+        cols = table.column_names
+        if "task_index" in cols:
+            indices = table["task_index"].to_pylist()
+            names = table["task"].to_pylist() if "task" in cols else [""] * len(indices)
+            for idx, name in zip(indices, names, strict=False):
+                if idx is not None:
+                    tasks[int(idx)] = str(name or "")
+        elif "task" in cols:
+            for idx, name in enumerate(table["task"].to_pylist()):
+                tasks[idx] = str(name or "")
+    elif tasks_jsonl.exists():
+        for line_idx, line in enumerate(tasks_jsonl.read_text().splitlines()):
+            if line.strip():
+                item = json.loads(line)
+                idx = item.get("task_index")
+                name = item.get("task", "")
+                if idx is not None:
+                    tasks[int(idx)] = str(name)
+                else:
+                    tasks[line_idx] = str(name)
+    return tasks
+
+
 def _read_corpus_from_cache(cache_dir: Path) -> dict:
     """Reconstruct the source corpus from the importer's materialized archive.
 
@@ -206,13 +245,19 @@ def _read_corpus_from_cache(cache_dir: Path) -> dict:
                 ep_idx = int(d["episode_index"])
                 tasks = d.get("tasks")
                 if isinstance(tasks, list):
-                    task = str(tasks[0]) if tasks else ""
+                    ep_tasks = [str(t) for t in tasks if t is not None]
+                    task = ep_tasks[0] if ep_tasks else ""
+                elif tasks is not None and str(tasks).strip():
+                    ep_tasks = [str(tasks).strip()]
+                    task = str(tasks).strip()
                 else:
-                    task = str(tasks or "")
+                    ep_tasks = []
+                    task = ""
                 rows.append(
                     {
                         "episode_index": ep_idx,
                         "task": task,
+                        "tasks": ep_tasks,
                         "length": int(d["length"]),
                         "data_chunk": str(d["data/chunk_index"]).split("/")[-1],
                         "data_file": str(d["data/file_index"]).split("/")[-1],
@@ -233,13 +278,50 @@ def _read_corpus_from_cache(cache_dir: Path) -> dict:
                             "to_timestamp": float(d.get(f"videos/{cam}/to_timestamp") or 0.0),
                         }
                 windows.setdefault(ep_idx, {}).update(cam_windows)
+
+        registry_tasks = _read_task_registry(cache_dir / "meta")
     finally:
         conn.close()
 
     rows.sort(key=lambda e: e["episode_index"])
     for e in rows:
         e["video_windows"] = dict(windows.get(e["episode_index"], {}))
-    return {"info": info, "episodes": rows, "cache_dir": cache_dir}
+    return {"info": info, "episodes": rows, "cache_dir": cache_dir, "tasks": registry_tasks}
+
+
+def _fetch_task_registry(src_ds: str, src_rev: str, cache_dir: Path) -> None:
+    """Download meta/tasks.parquet or meta/tasks.jsonl if present in source repository."""
+    import huggingface_hub
+    from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError
+
+    for filename in ("meta/tasks.parquet", "meta/tasks.jsonl"):
+        target = cache_dir / filename
+        if target.exists():
+            break
+        if Path(src_ds).is_dir():
+            src_file = Path(src_ds) / filename
+            if src_file.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_file, target)
+                break
+            continue
+        try:
+            downloaded = huggingface_hub.hf_hub_download(
+                src_ds,
+                filename,
+                repo_type="dataset",
+                revision=src_rev,
+                local_dir=cache_dir,
+                library_name="hflow",
+            )
+            downloaded_path = Path(downloaded)
+            if downloaded_path.exists():
+                if downloaded_path != target:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(downloaded_path, target)
+                break
+        except (EntryNotFoundError, RepositoryNotFoundError, FileNotFoundError):
+            continue
 
 
 def _materialize_source_archive(
@@ -271,6 +353,7 @@ def _materialize_source_archive(
             f"unexpected importer cache layout under {cache_dir}: "
             f"expected one revision-namespaced directory, found {len(namespaces)}"
         )
+    _fetch_task_registry(src_ds, src_rev, namespaces[0])
     return _read_corpus_from_cache(namespaces[0])
 
 
@@ -321,6 +404,42 @@ def _write_v3_repository(
         return local
 
     # Pre-validate all selections and frame rows before creating directories or writing any files
+    registry_task_map = corpus["tasks"] if isinstance(corpus.get("tasks"), dict) else {}
+    if not registry_task_map and corpus.get("cache_dir"):
+        registry_task_map = _read_task_registry(Path(corpus["cache_dir"]) / "meta")
+
+    has_registry = bool(registry_task_map) or (
+        bool(corpus.get("cache_dir"))
+        and (
+            (Path(corpus["cache_dir"]) / "meta" / "tasks.parquet").exists()
+            or (Path(corpus["cache_dir"]) / "meta" / "tasks.jsonl").exists()
+        )
+    )
+
+    if registry_task_map:
+        dataset_tasks: list[str] = [registry_task_map[k] for k in sorted(registry_task_map)]
+    else:
+        dataset_tasks = (
+            list(corpus.get("tasks") or []) if not isinstance(corpus.get("tasks"), dict) else []
+        )
+    if not dataset_tasks and not has_registry:
+        seen_tasks: set[str] = set()
+        for s in selections:
+            s_src = src_by_index[s.source_episode_index]
+            s_tasks = (
+                list(s.tasks)
+                if s.tasks
+                else (
+                    list(s_src.get("tasks") or [])
+                    if len(s_src.get("tasks") or []) > 1
+                    else ([s.task] if s.task else list(s_src.get("tasks") or []))
+                )
+            )
+            for t in s_tasks:
+                if t and t not in seen_tasks:
+                    seen_tasks.add(t)
+                    dataset_tasks.append(t)
+
     staged_episodes = []
     for new_idx, sel in enumerate(selections):
         src = src_by_index[sel.source_episode_index]
@@ -362,16 +481,33 @@ def _write_v3_repository(
                 f"found {len(rows)}"
             )
 
-        published_tasks = [sel.task] if sel.task else []
+        if sel.tasks:
+            ep_published_tasks = list(sel.tasks)
+        elif len(src.get("tasks") or []) > 1:
+            ep_published_tasks = list(src["tasks"])
+        elif sel.task:
+            ep_published_tasks = [sel.task]
+        elif src.get("tasks"):
+            ep_published_tasks = list(src["tasks"])
+        else:
+            ep_published_tasks = []
+
+        published_task_count = max(len(ep_published_tasks), len(dataset_tasks))
         if "task_index" in cols:
             task_col_idx = cols.index("task_index")
             for local_frame, row in enumerate(rows):
                 task_idx = row[task_col_idx]
-                if task_idx is not None and not (0 <= int(task_idx) < len(published_tasks)):
-                    raise ValueError(
-                        f"source episode {sel.source_episode_index} frame {local_frame}: "
-                        f"task_index {task_idx} references an unpublished task"
-                    )
+                if task_idx is not None:
+                    t_idx_int = int(task_idx)
+                    if has_registry:
+                        is_valid = t_idx_int in registry_task_map
+                    else:
+                        is_valid = 0 <= t_idx_int < published_task_count
+                    if not is_valid:
+                        raise ValueError(
+                            f"source episode {sel.source_episode_index} frame {local_frame}: "
+                            f"task_index {task_idx} references an unpublished task"
+                        )
 
         for cam in camera_keys:
             vw = (src.get("video_windows") or {}).get(cam)
@@ -382,12 +518,46 @@ def _write_v3_repository(
                 )
             _fetch_video(cam, vw)
 
-        staged_episodes.append((new_idx, sel, src, length, cols, rows, index_col))
+        staged_episodes.append(
+            (new_idx, sel, src, length, cols, rows, index_col, ep_published_tasks)
+        )
 
-    episodes_dir = destination / "meta" / "episodes" / "chunk-000"
+    meta_dir = destination / "meta"
+    episodes_dir = meta_dir / "episodes" / "chunk-000"
     data_dir = destination / "data" / "chunk-000"
     episodes_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
+
+    src_tasks_parquet = corpus["cache_dir"] / "meta" / "tasks.parquet"
+    if src_tasks_parquet.exists():
+        shutil.copy2(src_tasks_parquet, meta_dir / "tasks.parquet")
+    src_tasks_jsonl = corpus["cache_dir"] / "meta" / "tasks.jsonl"
+    if src_tasks_jsonl.exists():
+        shutil.copy2(src_tasks_jsonl, meta_dir / "tasks.jsonl")
+
+    dest_tasks_parquet = meta_dir / "tasks.parquet"
+    dest_tasks_jsonl = meta_dir / "tasks.jsonl"
+    if not dest_tasks_parquet.exists() and not dest_tasks_jsonl.exists():
+        if registry_task_map:
+            t_indices = sorted(registry_task_map.keys())
+            t_names = [registry_task_map[k] for k in t_indices]
+            t_table = pa.Table.from_arrays(
+                [
+                    pa.array(t_indices, type=pa.int64()),
+                    pa.array(t_names, type=pa.string()),
+                ],
+                names=["task_index", "task"],
+            )
+            pq.write_table(t_table, dest_tasks_parquet)
+        elif dataset_tasks:
+            t_table = pa.Table.from_arrays(
+                [
+                    pa.array(range(len(dataset_tasks)), type=pa.int64()),
+                    pa.array(dataset_tasks, type=pa.string()),
+                ],
+                names=["task_index", "task"],
+            )
+            pq.write_table(t_table, dest_tasks_parquet)
 
     # one data parquet per selected episode: windowed rows, renumbered
     ep_rows_out: list[dict] = []
@@ -396,7 +566,16 @@ def _write_v3_repository(
     video_paths: list[Path] = []
     copied_videos: set[tuple[str, int, int]] = set()
 
-    for new_idx, sel, src, length, cols, rows, index_col in staged_episodes:
+    for (
+        new_idx,
+        _sel,
+        src,
+        length,
+        cols,
+        rows,
+        index_col,
+        ep_published_tasks,
+    ) in staged_episodes:
         frame_rows: list[dict] = []
         for local_frame, row in enumerate(rows):
             d = dict(zip(cols, row, strict=True))
@@ -435,7 +614,7 @@ def _write_v3_repository(
         ep_out: dict = {
             "episode_index": new_idx,
             "length": length,
-            "tasks": [sel.task] if sel.task else [],
+            "tasks": ep_published_tasks,
             "data/chunk_index": 0,
             "data/file_index": new_idx,
             "dataset_from_index": (total_frames - length),
@@ -526,6 +705,30 @@ def _validate_v3(dataset_dir: Path) -> None:
         raise ValueError("staged dataset has no episode parquets")
     conn = duckdb.connect()
     try:
+        registry_tasks = _read_task_registry(dataset_dir / "meta")
+        valid_registry_indices = set(registry_tasks.keys())
+        has_registry = bool(valid_registry_indices) or (
+            (dataset_dir / "meta" / "tasks.parquet").exists()
+            or (dataset_dir / "meta" / "tasks.jsonl").exists()
+        )
+
+        all_dataset_tasks: set[str] = set()
+        for ep_pq in episodes_parquets:
+            quoted = str(ep_pq).replace("'", "''")
+            ep_cols = [
+                d[0]
+                for d in conn.execute(f"SELECT * FROM read_parquet('{quoted}') LIMIT 0").description
+            ]
+            if "tasks" in ep_cols:
+                for r in conn.execute(f"SELECT tasks FROM read_parquet('{quoted}')").fetchall():
+                    t_val = r[0]
+                    if isinstance(t_val, list):
+                        all_dataset_tasks.update(str(x) for x in t_val if x)
+                    elif t_val:
+                        all_dataset_tasks.add(str(t_val))
+
+        dataset_task_count = len(all_dataset_tasks)
+
         for ep_pq in episodes_parquets:
             quoted = str(ep_pq).replace("'", "''")
             cols = [
@@ -572,19 +775,25 @@ def _validate_v3(dataset_dir: Path) -> None:
                 ]
                 if "task_index" in dcols:
                     tasks = d.get("tasks") or []
-                    published_task_count = (
-                        len(tasks) if isinstance(tasks, list) else (1 if tasks else 0)
-                    )
+                    ep_task_count = len(tasks) if isinstance(tasks, list) else (1 if tasks else 0)
+                    published_task_count = max(ep_task_count, dataset_task_count)
+
                     t_idx_col = dcols.index("task_index")
                     for f_idx, drow in enumerate(
                         conn.execute(f"SELECT * FROM read_parquet('{dquoted}')").fetchall()
                     ):
                         t_val = drow[t_idx_col]
-                        if t_val is not None and not (0 <= int(t_val) < published_task_count):
-                            raise ValueError(
-                                f"episode {ep} frame {f_idx}: task_index {t_val} "
-                                "references an unpublished task"
-                            )
+                        if t_val is not None:
+                            t_int = int(t_val)
+                            if has_registry:
+                                is_valid = t_int in valid_registry_indices
+                            else:
+                                is_valid = 0 <= t_int < published_task_count
+                            if not is_valid:
+                                raise ValueError(
+                                    f"episode {ep} frame {f_idx}: task_index {t_val} "
+                                    "references an unpublished task"
+                                )
     finally:
         conn.close()
 
