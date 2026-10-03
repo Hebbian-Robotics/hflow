@@ -993,8 +993,7 @@ def verify_dataset_snapshot(
             "1 is refused"
         )
 
-    integrity = format_marker.get("integrity")
-    if not isinstance(integrity, dict):
+    if "integrity" not in format_marker:
         # A valid v1 snapshot from before #401: verifiable nothing, corrupt nothing.
         return VerificationReport(
             status=VerificationStatus.UNVERIFIABLE,
@@ -1008,6 +1007,13 @@ def verify_dataset_snapshot(
                     ),
                 ),
             ],
+        )
+    integrity = format_marker["integrity"]
+    # No exporter writes a non-object integrity, so a present one is a
+    # malformed receipt (exit 2), not a pre-#401 marker (exit 3) (#671).
+    if not isinstance(integrity, dict):
+        raise ValueError(
+            f"format.json integrity must be a JSON object, got {type(integrity).__name__}"
         )
 
     # Boundary parse (#489 / #575): receipt containers and entries arrive from

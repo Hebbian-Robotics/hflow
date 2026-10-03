@@ -260,6 +260,28 @@ def test_null_or_wrong_type_integrity_containers_are_refused_at_the_boundary(
     assert cli_main(["verify", "snapshot", str(output_directory)]) == 2
 
 
+@pytest.mark.parametrize(
+    "replacement",
+    [None, [], "not-a-receipt", 1],
+    ids=["null", "array", "string", "number"],
+)
+def test_present_non_object_integrity_is_refused_not_reported_as_pre_401(
+    tmp_path: Path, exported_snapshot: ExportedSnapshotCopier, replacement: object
+) -> None:
+    """#671: only an absent ``integrity`` key is a pre-#401 marker (exit 3).
+
+    A present key holding anything but an object is a malformed receipt, so it
+    is unreadable input (exit 2) rather than an unverifiable legacy delivery.
+    """
+    output_directory, _ = exported_snapshot(tmp_path, "references")
+    _edit_marker(output_directory, lambda marker: marker.__setitem__("integrity", replacement))
+
+    with pytest.raises(ValueError, match="integrity must be a JSON object"):
+        verify_dataset_snapshot(output_directory)
+
+    assert cli_main(["verify", "snapshot", str(output_directory)]) == 2
+
+
 def test_truncated_file_reports_size_mismatch_and_skips_the_hash(
     tmp_path: Path, exported_snapshot: ExportedSnapshotCopier, monkeypatch: pytest.MonkeyPatch
 ) -> None:
