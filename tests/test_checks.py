@@ -1177,3 +1177,31 @@ def test_camera_threshold_guards_accept_their_defaults_without_cameras(
     with hflow.Episode(camera_less_episode) as episode:
         assert asyncio.run(camera_frame_stats(episode)).measurements == {}
         assert asyncio.run(camera_signal_quality(episode)).measurements == {}
+
+
+@pytest.fixture
+def empty_channel_episode(tmp_path: Path) -> Path:
+    path = tmp_path / "empty_channel.mcap"
+    with path.open("wb") as stream:
+        writer = StockWriter(stream, chunk_size=64 * 1024, compression=CompressionType.NONE)
+        writer.start()
+        writer.register_channel(topic="/joint_states", message_encoding="json", schema_id=0)
+        writer.finish()
+    return path
+
+
+@pytest.mark.parametrize(
+    ("check_fn", "sample_count_key"),
+    [
+        (joint_discontinuity, "/joint_states/velocity_sample_count"),
+        (idle_fraction, "/joint_states/idle_sample_count"),
+        (trajectory_metrics, "/joint_states/trajectory_sample_count"),
+        (trajectory_segments, "/joint_states/segment_sample_count"),
+    ],
+)
+def test_checks_handle_empty_channel(
+    empty_channel_episode: Path, check_fn: Any, sample_count_key: str
+) -> None:
+    with hflow.Episode(empty_channel_episode) as episode:
+        result = asyncio.run(check_fn(episode))
+        assert result.measurements == {sample_count_key: 0}
