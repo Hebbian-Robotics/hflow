@@ -103,6 +103,8 @@ wheels come from the official CPU index; no GPU, paid model API, or Gemini key
 is needed. The first baseline run downloads public weights/tokenizer/processor
 files. Use Python 3.11+ on Linux x86-64 for the validated setup and allow several
 GB of RAM and disk. CUDA serving/training is not validated by this example.
+Keep experiment outputs on a local filesystem supporting hard links, which
+the receipt writer uses for exclusive atomic publication.
 
 ```bash
 uv sync --locked --project examples/build_ai_autoresearch --extra training
@@ -248,7 +250,7 @@ and isolation enforce access. Candidate code must not patch runtime modules,
 forge receipts, alter timers, or inspect development/test images during training.
 
 Selection is written exclusively and blocks further trials. Confirmation
-creates an exclusive directory before loading the model; a failed attempt also
+creates an exclusive directory before opening the test partition; a failed attempt also
 consumes confirmation. It materializes test images there, so keep that directory
 away from the search agent. Do not resume search on the same test set after
 viewing confirmation. A failed or disappointing result is a result.
@@ -277,7 +279,14 @@ a separately provisioned OpenAI-compatible VLM endpoint, then follow the existin
 Endpoint/model support must be checked for your serving stack; this CPU example
 does not validate vLLM deployment. The published evaluation pool overlaps this
 training pool, so a rerun on it is an integration check, not independent quality
-evidence. Teacher agreement and exact-frame separation do not establish
+evidence. The guide also runs a **different input/output contract**: its route
+puts text before the image and requests JSON by default, while this experiment
+puts the image first and scores bare digits. Its serving-side image processing
+can also differ. Exporting weights does not make that route equivalent to this
+experiment. Use this example's confirmation command for its reported metric;
+treat the linked route as a separate integration test with separately recorded
+prompt, message order, processor, and response-format settings.
+Teacher agreement and exact-frame separation do not establish
 production readiness or recording-independent generalization.
 
 ## CPU pilot evidence

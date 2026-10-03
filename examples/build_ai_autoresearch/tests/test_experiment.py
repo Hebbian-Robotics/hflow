@@ -20,6 +20,7 @@ from examples.build_ai_autoresearch.contracts import (
     write_record,
 )
 from examples.build_ai_autoresearch.experiment import (
+    confirm,
     freeze_selection,
     initialize_experiment,
     validate_experiment,
@@ -154,6 +155,9 @@ def test_freeze_selects_improvement_and_keeps_baseline_on_ties(
 ) -> None:
     _baseline(experiment_directory, correct=baseline_correct)
     _trial(experiment_directory, correct=True)
+    interrupted = experiment_directory / "trials/trial-001"
+    interrupted.mkdir()
+    (interrupted / ".report.json.interrupted.tmp").write_text('{"protocol_sha256":')
     selection = freeze_selection(experiment_directory)
     assert isinstance(selection.selected, SelectedBaseline if baseline_correct else SelectedTrial)
     with pytest.raises(FileExistsError):
@@ -194,3 +198,18 @@ def test_duplicate_budget_fields_are_rejected(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="duplicate JSON"):
         read_record(budget, TrialBudget)
+
+
+def test_failure_before_loading_test_frames_consumes_confirmation(
+    experiment_directory: Path,
+) -> None:
+    _baseline(experiment_directory, correct=False)
+    freeze_selection(experiment_directory)
+    prepared = experiment_directory.parent / "prepared"
+    (prepared / "splits/test.parquet").write_bytes(b"changed holdout manifest")
+    with pytest.raises(ValueError, match="test manifest changed"):
+        confirm(experiment_directory, prepared)
+    assert (experiment_directory / "confirmation").is_dir()
+    assert not (experiment_directory / "confirmation/report.json").exists()
+    with pytest.raises(FileExistsError, match="already attempted"):
+        confirm(experiment_directory, prepared)

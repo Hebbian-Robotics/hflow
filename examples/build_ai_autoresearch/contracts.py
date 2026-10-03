@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import uuid
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated, Literal, TypeVar
@@ -254,11 +255,17 @@ def read_record(path: Path, record_type: type[RecordType]) -> RecordType:
 
 
 def write_record(path: Path, record: BaseModel) -> None:
-    with path.open("x") as output:
-        output.write(record.model_dump_json(indent=2))
-        output.write("\n")
-        output.flush()
-        os.fsync(output.fileno())
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x") as output:
+            output.write(record.model_dump_json(indent=2))
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        # A same-directory hard link publishes complete bytes atomically without overwriting a receipt.
+        os.link(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def checkpoint_digests(directory: Path) -> dict[str, str]:

@@ -451,8 +451,6 @@ def freeze(experiment: Path) -> None:
 @app.command("confirm-transformers-reference")
 def confirm(experiment: Path, prepared: Path) -> None:
     """Operator-only: evaluate frozen selection once on previously hidden test data."""
-    from examples.build_ai_autoresearch.model_runtime import CpuReferenceRuntime
-
     protocol = validate_experiment(experiment)
     selection = read_record(experiment / "selection.json", SelectionReceipt)
     selection_sha256 = file_sha256(experiment / "selection.json")
@@ -465,6 +463,8 @@ def confirm(experiment: Path, prepared: Path) -> None:
     if (experiment / "confirmation").exists():
         raise FileExistsError("confirmation was already attempted")
     adapter = selected_adapter(experiment, selection)
+    output = experiment / "confirmation"
+    output.mkdir(exist_ok=False)
     samples = choose_subset(
         _load_partition(prepared, "test", protocol.confirmation_manifest_sha256),
         protocol.budget.confirmation_samples,
@@ -474,9 +474,9 @@ def confirm(experiment: Path, prepared: Path) -> None:
     development_ids = {sample.sample_id for sample in (*protocol.train, *protocol.development)}
     if any(sample.record.sample_id in development_ids for sample in samples):
         raise ValueError("confirmation samples overlap development/training data")
-    output = experiment / "confirmation"
-    output.mkdir(exist_ok=False)
     _copy_images(samples, output / "media")
+    from examples.build_ai_autoresearch.model_runtime import CpuReferenceRuntime
+
     runtime = CpuReferenceRuntime(protocol, adapter)
     baseline_report = _baseline(experiment, protocol)
     if runtime.runtime_identity != baseline_report.runtime:
