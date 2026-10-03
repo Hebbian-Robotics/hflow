@@ -15,6 +15,33 @@ uv run --project examples/path_to_example python examples/path_to_example/main.p
 These projects share the repository lockfile and use the workspace copy of
 HFlow, but their dependencies are not installed by a normal root `uv sync`.
 
+## Build AI tiny-VLM autoresearch
+
+**Use it for:** combining both public Build AI evaluation releases, deduplicating
+identical image pixels, resolving contradictory teacher labels, and freezing
+deduplication evidence and training/development/test manifests with HFlow, then running a bounded tiny-VLM
+fine-tuning code search under a fixed CPU time allowance.
+
+**Prerequisites:** the example's own uv environment and disk for approximately
+12 GB of source Parquet plus retained images. `--download` fetches pinned public
+data. Preparation needs no model; optional CPU training downloads public model
+weights. A GPU, paid model API, and Gemini credentials are not required.
+
+```bash
+uv run --locked --project examples/build_ai_autoresearch \
+  python examples/build_ai_autoresearch/prepare.py \
+  data/build-ai-autoresearch/prepared --download
+```
+
+Writes deduplicated frames, conflict evidence, manifests, and provenance
+receipts. The workflow also includes a baseline, LoRA training, agent-editable
+training file, frozen selection, one-time confirmation, and model export. These are
+frame-level splits, with recording
+independence unavailable from the published files.
+
+Commands, agent instructions, and evaluation limitations:
+[Build AI autoresearch](./build_ai_autoresearch/README.md).
+
 ## Five-minute quickstart
 
 **Use it for:** seeing the complete in-process lifecycle on a small multimodal

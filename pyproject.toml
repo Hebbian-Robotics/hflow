@@ -103,6 +103,7 @@ members = [
     "packages/*",
     "examples/build_ai_evaluation",
     "examples/egosuite_evaluation",
+    "examples/build_ai_autoresearch",
 ]
 
 [tool.uv.sources]
@@ -154,4 +155,5 @@ exclude = [
     "examples/build_ai_evaluation/",
     "examples/egosuite_evaluation/",
     "examples/openai_vision/",
+    "examples/build_ai_autoresearch/",
 ]
