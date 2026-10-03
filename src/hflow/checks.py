@@ -224,7 +224,7 @@ def _timestamp_regularity_keys(
     camera_topics = [
         topic
         for topic in episode.cameras
-        if topic in selected and episode.topics[topic].message_count > 0
+        if topic in selected and episode.channel(topic).timestamps.size > 0
     ]
     if camera_topics and state_topics:
         reference = max(state_topics, key=lambda topic: episode.topics[topic].message_count)
@@ -371,7 +371,9 @@ def _measure_timestamp_regularity(
         ).tolist()
 
     camera_topics = [
-        topic for topic in episode.cameras if topic in selected and infos[topic].message_count > 0
+        topic
+        for topic in episode.cameras
+        if topic in selected and per_topic[topic].stamps_ns.size > 0
     ]
     if camera_topics and state_topics:
         reference = max(state_topics, key=lambda topic: infos[topic].message_count)

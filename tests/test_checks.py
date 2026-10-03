@@ -196,7 +196,9 @@ def test_cross_stream_sync_measurements_exist(jittery_episode: hflow.Episode) ->
         assert "~/joint_states/" in key
 
 
-def test_timestamp_regularity_ignores_empty_camera_for_sync_offsets(tmp_path: Path) -> None:
+def test_timestamp_regularity_ignores_empty_camera_for_sync_offsets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
     from mcap_protobuf.schema import build_file_descriptor_set
 
@@ -212,12 +214,27 @@ def test_timestamp_regularity_ignores_empty_camera_for_sync_offsets(tmp_path: Pa
         camera = writer.register_channel(
             topic="/cam1", schema_id=schema_id, message_encoding="protobuf"
         )
-        writer.register_channel(
+        empty_camera = writer.register_channel(
             topic="/empty_cam", schema_id=schema_id, message_encoding="protobuf"
         )
         joints = writer.register_channel(
             topic="/joint_states", schema_id=0, message_encoding="json"
         )
+
+        # MCAP summary counts can be missing or stale. The camera has real
+        # records even though the summary below reports no messages for it.
+        original_write = Statistics.write
+
+        def write_statistics(statistics: Statistics, builder: RecordBuilder) -> None:
+            original_write(
+                replace(
+                    statistics,
+                    channel_message_counts={empty_camera: 0, joints: 2},
+                ),
+                builder,
+            )
+
+        monkeypatch.setattr(Statistics, "write", write_statistics)
         for timestamp_ns in (1_000_000_000, 2_000_000_000):
             message = CompressedVideo()
             message.timestamp.FromNanoseconds(timestamp_ns)
@@ -228,6 +245,8 @@ def test_timestamp_regularity_ignores_empty_camera_for_sync_offsets(tmp_path: Pa
         writer.finish()
 
     with hflow.Episode(path) as episode:
+        assert episode.topics["/cam1"].message_count == 0
+        assert episode.channel("/cam1").timestamps.size == 2
         result = asyncio.run(
             timestamp_regularity(episode, topics=["/cam1", "/empty_cam", "/joint_states"])
         )
