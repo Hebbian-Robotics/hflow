@@ -7,8 +7,10 @@ no MCAP conversion, catalog, model, API key, or GPU is required.
 ## Prepare your manifest
 
 First combine releases, normalize labels, discover image duplicates, resolve
-label conflicts, and retain source provenance. This API does **not** identify
-or remove duplicates. Callers own that media-specific processing.
+label conflicts, and retain source provenance. Use
+[`hflow.deduplicate_manifest`](./deduplicate-training-manifests.md) to group
+declared identities and inspect conflicting labels. Callers own media-specific
+identity discovery and conflict policy; the splitting API preserves input rows.
 
 Preserve relationships from removed copies: when a retained image appeared in
 two recordings, dropping the second copy must not erase that connection.

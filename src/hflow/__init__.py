@@ -73,6 +73,11 @@ if TYPE_CHECKING:
         StepKind,
         StepManifest,
     )
+    from hflow.manifest_deduplication import (
+        ManifestDeduplicationReport,
+        ManifestDeduplicationSettings,
+        deduplicate_manifest,
+    )
     from hflow.manifest_splits import (
         ManifestPartition,
         ManifestPartitionReport,
@@ -156,6 +161,11 @@ if TYPE_CHECKING:
     from hflow.workspace import Workspace, WorkspaceIdentity
 
 _ATTRIBUTE_NAMES_BY_MODULE: dict[str, tuple[str, ...]] = {
+    "hflow.manifest_deduplication": (
+        "ManifestDeduplicationReport",
+        "ManifestDeduplicationSettings",
+        "deduplicate_manifest",
+    ),
     "hflow.manifest_splits": (
         "ManifestPartition",
         "ManifestPartitionReport",
@@ -419,6 +429,8 @@ __all__ = [
     "KeyframeFallbackReason",
     "LocalStorageRoot",
     "LoopbackVideoSource",
+    "ManifestDeduplicationReport",
+    "ManifestDeduplicationSettings",
     "ManifestPartition",
     "ManifestPartitionReport",
     "ManifestSplitReport",
@@ -476,6 +488,7 @@ __all__ = [
     "build_ai_vlm_checks",
     "checks",
     "curate",
+    "deduplicate_manifest",
     "diagnose",
     "evaluate_gate",
     "export_dataset_snapshot",
