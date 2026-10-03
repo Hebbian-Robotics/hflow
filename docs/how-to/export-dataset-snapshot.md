@@ -92,7 +92,8 @@ as unreadable input (exit `2`) before any file is read — the same family
 storage keys refuse — so a tampered marker cannot hash bytes outside the
 delivery. Exit `0` clean, `1` damaged, `3` unverifiable, `2` unreadable
 input. A pre-#401 `format.json` with no `integrity` key is reported as
-`no-receipt`, unverifiable, not corrupt. Older HFlow overwrite checks
+`no-receipt`, unverifiable, not corrupt; an `integrity` key that is present
+but not an object is a malformed receipt and exits `2`. Older HFlow overwrite checks
 only `format` and `format_version`, and readers that only consume the
 string `tables` map keep working; the `integrity` key is purely additive
 under format version `1`.
