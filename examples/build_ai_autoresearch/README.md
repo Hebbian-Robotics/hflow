@@ -148,6 +148,9 @@ Development/confirmation choose classes in round-robin order; their scores
 reflect those subsets, not the original class prior. A small preparation pilot
 may lack a class; initialization rejects that. For an execution smoke check,
 use smaller frame counts and `--training-seconds 15`; this is not a quality run.
+Fifteen seconds is the minimum accepted allowance: shorter values are rejected
+before creating an experiment because the starter reserves five seconds for
+auditing/saving in addition to setup and optimizer updates.
 
 Run the untouched baseline, then the naive training code copied into the
 experiment directory:

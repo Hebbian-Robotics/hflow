@@ -20,7 +20,7 @@ def test_worker_completion_and_deadline(overrun: bool, tmp_path: Path) -> None:
         f"time.sleep({60 if overrun else 0.1})\n"
         "(output / 'completed').write_text('done')\n"
     )
-    budget = TrialBudget(training_seconds=1.0, reference_reason="real process budget fixture")
+    budget = TrialBudget(training_seconds=15.0, reference_reason="real process budget fixture")
     if overrun:
         with pytest.raises(TimeoutError, match="compute budget"):
             run_worker([sys.executable, str(worker)], tmp_path, budget)

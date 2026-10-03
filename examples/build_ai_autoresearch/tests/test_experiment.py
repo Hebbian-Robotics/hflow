@@ -22,6 +22,7 @@ from examples.build_ai_autoresearch.contracts import (
 from examples.build_ai_autoresearch.experiment import (
     confirm,
     freeze_selection,
+    initialize,
     initialize_experiment,
     validate_experiment,
 )
@@ -69,7 +70,7 @@ def experiment_directory(tmp_path: Path) -> Path:
             train_samples=6,
             development_samples=6,
             confirmation_samples=6,
-            training_seconds=10.0,
+            training_seconds=15.0,
             max_training_steps=1,
             max_trials=2,
             reference_reason="unit outcome fixture",
@@ -213,3 +214,12 @@ def test_failure_before_loading_test_frames_consumes_confirmation(
     assert not (experiment_directory / "confirmation/report.json").exists()
     with pytest.raises(FileExistsError, match="already attempted"):
         confirm(experiment_directory, prepared)
+
+
+def test_unusable_time_allowance_does_not_start_an_experiment(tmp_path: Path) -> None:
+    experiment = tmp_path / "experiment"
+    with pytest.raises(ValueError, match="greater than or equal to 15"):
+        initialize(
+            tmp_path / "prepared", experiment, "CPU too-short allowance check", training_seconds=5.0
+        )
+    assert not experiment.exists()

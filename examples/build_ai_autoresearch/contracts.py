@@ -26,7 +26,7 @@ class TrialBudget(Record):
     train_samples: Annotated[int, Field(ge=3, le=4096)] = 192
     development_samples: Annotated[int, Field(ge=3, le=512)] = 48
     confirmation_samples: Annotated[int, Field(ge=3, le=512)] = 48
-    training_seconds: Annotated[float, Field(ge=1, le=1800, allow_inf_nan=False)] = 300.0
+    training_seconds: Annotated[float, Field(ge=15, le=1800, allow_inf_nan=False)] = 300.0
     max_training_steps: Annotated[int, Field(ge=1, le=4096)] = 1024
     startup_seconds: Literal[120] = 120
     max_trials: Annotated[int, Field(ge=1, le=8)] = 8
