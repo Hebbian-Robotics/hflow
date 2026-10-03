@@ -108,12 +108,12 @@ def _joint_motion_profile(
     """``None`` when the channel has fewer than two messages (no motion to
     profile); callers record the message count and stop."""
     channel = episode.channel(topic)
-    positions = channel.to_numpy(field)
-    if positions.ndim == 1:
-        positions = positions[:, np.newaxis]
     stamps_ns = channel.timestamps
     if len(stamps_ns) < 2:
         return None
+    positions = channel.to_numpy(field)
+    if positions.ndim == 1:
+        positions = positions[:, np.newaxis]
     deltas_s = np.diff(stamps_ns) / 1e9
     position_jumps = np.diff(positions, axis=0)
     finite_jump = np.all(np.isfinite(position_jumps), axis=1)
@@ -1839,11 +1839,11 @@ def _trajectory_profile(
     """``None`` when the stream cannot support a velocity at all."""
     channel = episode.channel(topic)
     stamps_ns = channel.timestamps
+    if len(stamps_ns) < 2:
+        return None
     samples = channel.to_numpy(field)
     if samples.ndim == 1:
         samples = samples[:, np.newaxis]
-    if len(stamps_ns) < 2:
-        return None
 
     # Duplicate and backward log times are common in real recordings. Keeping
     # only strictly-increasing stamps is what stops a zero-length step from
