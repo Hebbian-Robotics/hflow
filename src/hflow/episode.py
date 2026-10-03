@@ -136,7 +136,9 @@ def _is_numeric_sequence(value: Any) -> bool:
     if isinstance(value, np.ndarray):
         return value.size > 0 and value.dtype.kind in "iuf"
     if isinstance(value, (list, tuple)):
-        return len(value) > 0 and _is_numeric_scalar(value[0])
+        for item in value:
+            if item is not None:
+                return _is_numeric_scalar(item)
     return False
 
 
@@ -154,7 +156,9 @@ def _is_arrow_scalar(value: Any) -> bool:
 def _is_empty_sequence(value: Any) -> bool:
     if isinstance(value, np.ndarray):
         return value.size == 0
-    return isinstance(value, (list, tuple)) and len(value) == 0
+    if isinstance(value, (list, tuple)):
+        return len(value) == 0 or all(item is None for item in value)
+    return False
 
 
 def _arrow_field_values(messages: Sequence[Any]) -> dict[str, list[Any]]:
@@ -213,7 +217,7 @@ def _arrow_column_values(topic: str, field_name: str, values: Sequence[Any]) -> 
             # An empty numeric array keeps its dtype, so it types the column.
             saw_list = True
         elif _is_empty_sequence(value):
-            # `[]` carries no element type; an empty numeric ndarray above
+            # `[]` or an all-null sequence carries no element type; an empty numeric ndarray above
             # does. Keep the slot null unless a typed sample arrives.
             continue
         else:
