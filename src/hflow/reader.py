@@ -262,7 +262,6 @@ class PythonMcapEpisodeReader:
             # that would be discarded below. Topic filtering alone is not
             # exact -- several channels may share one topic -- so the
             # channel-id filter in the loop still applies.
-            has_summary = True
             try:
                 known_channels = self.channels()
             except ValueError:
@@ -272,7 +271,6 @@ class PythonMcapEpisodeReader:
                 # case -- channels() raises mcap's RecordLengthLimitExceeded,
                 # and the same error surfaces from iter_messages below with
                 # or without this catch, so damage stays loud.
-                has_summary = False
                 known_channels = {}
             derived_topics = sorted(
                 {
@@ -281,7 +279,11 @@ class PythonMcapEpisodeReader:
                     if channel_id in known_channels
                 }
             )
-            if has_summary and not derived_topics:
+            # Only return early when the summary actually lists channels. A file
+            # written with repeat_channels=False has a summary section but no
+            # repeated channel records in it (known_channels is empty), so fall
+            # back to scanning instead of dropping real channels.
+            if known_channels and not derived_topics:
                 return
             if derived_topics:
                 topics = derived_topics

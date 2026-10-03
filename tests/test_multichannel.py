@@ -387,6 +387,33 @@ def test_unindexed_read_with_unknown_channel_id_falls_back_to_scan(
         reader.close()
 
 
+def test_summary_without_repeated_channels_falls_back_to_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file with a summary section but no repeated channel records (repeat_channels=False)
+    returns {} for channels(); iter_batches falls back to scanning instead of dropping real channels."""
+    path = tmp_path / "summary_no_channels.mcap"
+    target_channel_id, _ = _write_two_topic_mcap(
+        path,
+        [b"t" * 16],
+        [b"c" * 16],
+        use_chunking=False,
+        repeat_channels=False,
+    )
+
+    reader = open_reader(path)
+    try:
+        assert reader.channels() == {}
+        topics_passed, topics_yielded = _trace_mcap_iter_messages(reader, monkeypatch)
+        batches = list(reader.iter_batches(channel_ids=[target_channel_id]))
+        assert len(batches) == 1
+        assert batches[0].channel_id == target_channel_id
+        assert topics_passed == [None]
+        assert set(topics_yielded) == {"/target", "/camera"}
+    finally:
+        reader.close()
+
+
 def test_episode_streams_several_decoded_channels_in_bounded_batches(
     dual_channel_source: Path,
 ) -> None:
