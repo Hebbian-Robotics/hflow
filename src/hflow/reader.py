@@ -251,6 +251,10 @@ class PythonMcapEpisodeReader:
         batch_max_bytes: int = DEFAULT_BATCH_MAX_BYTES,
     ) -> Iterator[MessageBatch]:
         wanted_channel_ids = frozenset(channel_ids) if channel_ids is not None else None
+        if wanted_channel_ids is not None and not wanted_channel_ids:
+            return
+        if topics is not None and not topics:
+            return
         if topics is None and wanted_channel_ids is not None:
             # Constrain the underlying read to the topics the requested
             # channels live on, so the MCAP reader can skip unrelated streams
@@ -258,6 +262,7 @@ class PythonMcapEpisodeReader:
             # that would be discarded below. Topic filtering alone is not
             # exact -- several channels may share one topic -- so the
             # channel-id filter in the loop still applies.
+            has_summary = True
             try:
                 known_channels = self.channels()
             except ValueError:
@@ -267,6 +272,7 @@ class PythonMcapEpisodeReader:
                 # case -- channels() raises mcap's RecordLengthLimitExceeded,
                 # and the same error surfaces from iter_messages below with
                 # or without this catch, so damage stays loud.
+                has_summary = False
                 known_channels = {}
             derived_topics = sorted(
                 {
@@ -275,6 +281,8 @@ class PythonMcapEpisodeReader:
                     if channel_id in known_channels
                 }
             )
+            if has_summary and not derived_topics:
+                return
             if derived_topics:
                 topics = derived_topics
         topics_by_channel_id: dict[int, str] = {}

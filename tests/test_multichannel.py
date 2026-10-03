@@ -303,6 +303,90 @@ def test_channel_id_read_without_a_summary_falls_back_to_a_full_scan(
         reader.close()
 
 
+def test_empty_channel_ids_or_topics_skips_reading_entirely(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty channel_ids or empty topics selection yields nothing immediately
+    without calling the underlying MCAP reader or scanning any messages."""
+    path = tmp_path / "empty_selection.mcap"
+    _write_two_topic_mcap(path, [b"t" * 16], [b"c" * 16])
+
+    reader = open_reader(path)
+    try:
+        topics_passed, topics_yielded = _trace_mcap_iter_messages(reader, monkeypatch)
+
+        assert list(reader.iter_batches(channel_ids=[])) == []
+        assert topics_passed == []
+        assert topics_yielded == []
+
+        assert list(reader.iter_batches(topics=[])) == []
+        assert topics_passed == []
+        assert topics_yielded == []
+    finally:
+        reader.close()
+
+
+def test_indexed_read_with_unknown_channel_id_skips_reading_entirely(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When an indexed file has a summary section and channel_ids names only
+    channels not present in the summary, iter_batches yields nothing immediately
+    without calling the underlying MCAP reader or scanning the file."""
+    path = tmp_path / "unknown_channel.mcap"
+    target_channel_id, camera_channel_id = _write_two_topic_mcap(
+        path, [b"t" * 16 for _ in range(2)], [b"c" * 16 for _ in range(8)]
+    )
+    unknown_channel_id = max(target_channel_id, camera_channel_id) + 9999
+
+    reader = open_reader(path)
+    try:
+        topics_passed, topics_yielded = _trace_mcap_iter_messages(reader, monkeypatch)
+
+        # Querying an unknown channel id on an indexed file does not scan
+        assert list(reader.iter_batches(channel_ids=[unknown_channel_id])) == []
+        assert topics_passed == []
+        assert topics_yielded == []
+
+        # Combining a known channel with an unknown channel still narrows to the known channel's topic
+        topics_passed.clear()
+        topics_yielded.clear()
+        batches = list(reader.iter_batches(channel_ids=[target_channel_id, unknown_channel_id]))
+        assert len(batches) == 1
+        assert batches[0].channel_id == target_channel_id
+        assert topics_passed == [["/target"]]
+        assert topics_yielded == ["/target", "/target"]
+    finally:
+        reader.close()
+
+
+def test_unindexed_read_with_unknown_channel_id_falls_back_to_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unindexed file without a summary section falls back to an unconstrained
+    scan when channel_ids is given, even if the channel id turns out to be absent."""
+    path = tmp_path / "unindexed_absent.mcap"
+    target_channel_id, camera_channel_id = _write_two_topic_mcap(
+        path,
+        [b"t" * 16],
+        [b"c" * 16],
+        use_chunking=False,
+        use_statistics=False,
+        use_summary_offsets=False,
+        repeat_channels=False,
+        repeat_schemas=False,
+    )
+    unknown_channel_id = max(target_channel_id, camera_channel_id) + 9999
+
+    reader = open_reader(path)
+    try:
+        topics_passed, topics_yielded = _trace_mcap_iter_messages(reader, monkeypatch)
+        assert list(reader.iter_batches(channel_ids=[unknown_channel_id])) == []
+        assert topics_passed == [None]
+        assert set(topics_yielded) == {"/target", "/camera"}
+    finally:
+        reader.close()
+
+
 def test_episode_streams_several_decoded_channels_in_bounded_batches(
     dual_channel_source: Path,
 ) -> None:
