@@ -454,6 +454,30 @@ class TestARecordingSyncCouldNotCanonicalize:
             connection.close()
         assert rows == [("sync", "source-unreadable")]
 
+    def test_reingest_of_corrupt_recording_is_not_reported_as_skipped_as_current(
+        self, project: Path, one_second_camera_less_episode: Path
+    ) -> None:
+        """A source that was previously ingested but fails sync on a re-run
+        must not be counted as skipped_as_current by later stages."""
+        ep2 = project / "data" / "episodes-in" / "episode_0002.mcap"
+        ep2.write_bytes(one_second_camera_less_episode.read_bytes())
+
+        # First run: both recordings succeed and settle.
+        first = _ingest(project, EPISODE_URI, "episodes-in/episode_0002.mcap")
+        assert _stage(first, hflow.Stage.SYNC).counts["processed"] == 2
+        assert _stage(first, hflow.Stage.META).counts["processed"] == 2
+
+        # Corrupt the second recording and re-ingest.
+        ep2.write_bytes(b"not an mcap file")
+        second = _ingest(project, EPISODE_URI, "episodes-in/episode_0002.mcap")
+
+        assert _stage(second, hflow.Stage.SYNC).counts["processed"] == 1
+        assert _stage(second, hflow.Stage.SYNC).counts["errors"] == 1
+        assert _stage(second, hflow.Stage.META).counts["errors"] == 0
+        # Only the intact episode is skipped as current; the corrupt recording
+        # failed sync and must not be reported as done.
+        assert _stage(second, hflow.Stage.META).skipped_as_current == 1
+
     def test_the_command_exits_one_even_under_budget(
         self, project: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:

@@ -252,6 +252,7 @@ async def process_stage_batch(
     *,
     step_names: Iterable[str] | None = None,
     _registered_step_selection: RegisteredStepSelection | None = None,
+    _failed_uris: set[str] | None = None,
 ) -> StageBatchCounts:
     """Run one stage over every episode in a batch, counting outcomes.
 
@@ -341,6 +342,8 @@ async def process_stage_batch(
                     orchestrator_run_id=orchestrator_run_id,
                 )
                 counts["errors"] += 1
+                if _failed_uris is not None:
+                    _failed_uris.add(str(uri))
                 continue
             if report.has_errors:
                 # app.process collects per-step diagnostics for the dev loop
@@ -348,6 +351,8 @@ async def process_stage_batch(
                 # rather than escaping exceptions. They still count against
                 # the runtime's infrastructure-error budget.
                 counts["errors"] += 1
+                if _failed_uris is not None:
+                    _failed_uris.add(str(uri))
             elif report.quarantined:
                 counts["quarantined"] += 1
             else:
@@ -432,6 +437,7 @@ async def run_stages_directly(
 
     outcomes: list[StageOutcome] = []
     plans: dict[str, EpisodeStagePlan] | None = None
+    sync_failed_uris: set[str] = set()
     for stage in ordered_stages:
         skipped_as_current = 0
         stage_step_names = selected_names_for_stage(stage)
@@ -448,6 +454,7 @@ async def run_stages_directly(
                     uris,
                     [later for later in ordered_stages if later is not Stage.SYNC],
                     registered_step_selection,
+                    failed_sync_uris=sync_failed_uris,
                 )
             stage_uris = []
             for uri in uris:
@@ -478,6 +485,7 @@ async def run_stages_directly(
                         if stage_step_names is None
                         else SelectedRegisteredSteps(stage_step_names)
                     ),
+                    _failed_uris=sync_failed_uris if stage is Stage.SYNC else None,
                 )
             )
             if stage_uris
@@ -498,6 +506,8 @@ def _plan_after_sync(
     uris: Sequence[str],
     later_stages: Sequence[Stage],
     registered_step_selection: RegisteredStepSelection,
+    *,
+    failed_sync_uris: Iterable[str] = (),
 ) -> "dict[str, EpisodeStagePlan]":
     """The post-sync plan, keyed by the caller's own uri spelling.
 
@@ -509,8 +519,9 @@ def _plan_after_sync(
     that were actually written, and re-keying the answer back to the uri is
     what keeps the caller from having to know any of that.
     """
-    from hflow.stage_planning import plan_outstanding_stages
+    from hflow.stage_planning import NoCanonicalEpisode, plan_outstanding_stages
 
+    failed_sync_uri_set = {str(uri) for uri in failed_sync_uris}
     data_root = str(application.data_root)
     identity_by_uri = {
         str(uri): application.source_identity(
@@ -518,12 +529,18 @@ def _plan_after_sync(
         )
         for uri in uris
     }
+    successful_identities = sorted(
+        {identity for uri, identity in identity_by_uri.items() if uri not in failed_sync_uri_set}
+    )
     plans = plan_outstanding_stages(
         application,
-        sorted(set(identity_by_uri.values())),
+        successful_identities,
         later_stages,
         _registered_step_selection=registered_step_selection,
     )
+    for identity in identity_by_uri.values():
+        if identity not in plans:
+            plans[identity] = NoCanonicalEpisode(source_identity=identity)
     return {uri: plans[identity] for uri, identity in identity_by_uri.items()}
 
 
