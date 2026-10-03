@@ -204,8 +204,9 @@ def _timestamp_regularity_keys(
     than two messages, else the three period keys
     (``median_dt_s``/``period_violation_pct``/``max_gap_s``). Across all
     selected topics: a pair of ``sync/<cam>~<ref>/{start,end}_offset_s``
-    keys per camera when the episode carries both camera and state
-    streams -- the densest non-camera stream is the reference. ``App``'s
+    keys per populated camera when the episode carries both camera and state
+    streams -- the densest non-camera stream is the reference. Empty camera
+    channels retain their per-topic sample count but have no sync offsets. ``App``'s
     pre-decode supersession consults this function through the routing
     map, which only ever sees the automatic bare registration. The
     selection rule mirrors the body's exactly: ``topics=`` is taken as
@@ -220,7 +221,11 @@ def _timestamp_regularity_keys(
         keys.add(f"{topic}/median_dt_s")
         keys.add(f"{topic}/period_violation_pct")
         keys.add(f"{topic}/max_gap_s")
-    camera_topics = [topic for topic in episode.cameras if topic in selected]
+    camera_topics = [
+        topic
+        for topic in episode.cameras
+        if topic in selected and episode.channel(topic).timestamps.size > 0
+    ]
     if camera_topics and state_topics:
         reference = max(state_topics, key=lambda topic: episode.topics[topic].message_count)
         for camera in camera_topics:
@@ -315,7 +320,7 @@ async def timestamp_regularity(
     same way post-hoc with a far tighter default tolerance; raw multi-sensor
     capture needs the looser default here). Deltas beyond ``gap_factor``
     periods become labeled gap intervals. Cross-stream: start/end offsets of
-    every camera stream against the densest non-camera stream.
+    every populated camera stream against the densest non-camera stream.
 
     The emitted key set is owned by :func:`_timestamp_regularity_keys`: this
     body iterates that function's output and routes each key through
@@ -365,7 +370,11 @@ def _measure_timestamp_regularity(
             deltas_s > gap_factor * expected_period_s
         ).tolist()
 
-    camera_topics = [topic for topic in episode.cameras if topic in selected]
+    camera_topics = [
+        topic
+        for topic in episode.cameras
+        if topic in selected and per_topic[topic].stamps_ns.size > 0
+    ]
     if camera_topics and state_topics:
         reference = max(state_topics, key=lambda topic: infos[topic].message_count)
         sync = _TimestampRegularitySync(

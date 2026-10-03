@@ -196,6 +196,67 @@ def test_cross_stream_sync_measurements_exist(jittery_episode: hflow.Episode) ->
         assert "~/joint_states/" in key
 
 
+def test_timestamp_regularity_ignores_empty_camera_for_sync_offsets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
+    from mcap_protobuf.schema import build_file_descriptor_set
+
+    path = tmp_path / "empty_camera.mcap"
+    with path.open("wb") as stream:
+        writer = StockWriter(stream, chunk_size=64 * 1024, compression=CompressionType.NONE)
+        writer.start()
+        schema_id = writer.register_schema(
+            name="foxglove.CompressedVideo",
+            encoding="protobuf",
+            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
+        )
+        camera = writer.register_channel(
+            topic="/cam1", schema_id=schema_id, message_encoding="protobuf"
+        )
+        empty_camera = writer.register_channel(
+            topic="/empty_cam", schema_id=schema_id, message_encoding="protobuf"
+        )
+        joints = writer.register_channel(
+            topic="/joint_states", schema_id=0, message_encoding="json"
+        )
+
+        # MCAP summary counts can be missing or stale. The camera has real
+        # records even though the summary below reports no messages for it.
+        original_write = Statistics.write
+
+        def write_statistics(statistics: Statistics, builder: RecordBuilder) -> None:
+            original_write(
+                replace(
+                    statistics,
+                    channel_message_counts={empty_camera: 0, joints: 2},
+                ),
+                builder,
+            )
+
+        monkeypatch.setattr(Statistics, "write", write_statistics)
+        for timestamp_ns in (1_000_000_000, 2_000_000_000):
+            message = CompressedVideo()
+            message.timestamp.FromNanoseconds(timestamp_ns)
+            message.data = b"x"
+            message.format = "h264"
+            writer.add_message(camera, timestamp_ns, message.SerializeToString(), timestamp_ns)
+            writer.add_message(joints, timestamp_ns, b'{"q": 0}', timestamp_ns)
+        writer.finish()
+
+    with hflow.Episode(path) as episode:
+        assert episode.topics["/cam1"].message_count == 0
+        assert episode.channel("/cam1").timestamps.size == 2
+        result = asyncio.run(
+            timestamp_regularity(episode, topics=["/cam1", "/empty_cam", "/joint_states"])
+        )
+
+    assert result.measurements["/empty_cam/period_sample_count"] == 0
+    assert result.measurements["sync//cam1~/joint_states/start_offset_s"] == 0.0
+    assert result.measurements["sync//cam1~/joint_states/end_offset_s"] == 0.0
+    assert not any("empty_cam" in key for key in result.measurements if key.startswith("sync/"))
+
+
 def test_joint_discontinuity_finds_the_injected_jump(jittery_episode: hflow.Episode) -> None:
     result = asyncio.run(joint_discontinuity(jittery_episode, velocity_limit=3.0))
     violation_count = result.measurements["/joint_states/violation_count"]

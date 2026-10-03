@@ -146,7 +146,7 @@ query later rather than pass/fail decisions baked into your corpus.
 
 | Check | Answers |
 |---|---|
-| `timestamp_regularity` | Are message intervals regular, and are the camera and state streams aligned with each other? |
+| `timestamp_regularity` | Are message intervals regular, and are populated camera streams aligned with the state stream? Empty camera topics still report a sample count of zero. |
 | `camera_frame_stats` | Blackout, freeze, exposure, and stored frame count versus the rate the stream claims -- all from one decode pass. Black runs and freezes also land as `black:<topic>` and `freeze:<topic>` intervals. |
 | `joint_discontinuity` | Does any joint move faster than a limit you set? |
 | `idle_fraction` | How much of the episode had nothing moving? |
