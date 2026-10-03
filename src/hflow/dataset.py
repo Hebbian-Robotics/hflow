@@ -228,7 +228,7 @@ def default_dataset_sql(application: "App") -> str:
         )
         predicates.append(
             "episode_id IN (\n"
-            "        SELECT episode_id FROM check_runs\n"
+            "        SELECT episode_id FROM check_runs_latest\n"
             f"        WHERE status IN ({settled_statuses})\n"
             f"          AND ({identity_clauses})\n"
             "        GROUP BY episode_id\n"
