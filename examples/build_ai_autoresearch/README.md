@@ -1,7 +1,7 @@
 # Build AI tiny-VLM autoresearch
 
 Prepare public data, measure a tiny VLM, fine-tune a LoRA adapter, and let a
-coding agent improve three recipe values under a fixed budget. It builds on the existing
+coding agent improve one training file under a fixed compute budget. It builds on the existing
 [Build AI evaluation](../../docs/how-to/run-build-ai-evaluation.md), using its
 published teacher-labelled frames and HFlow's general manifest splitter.
 
@@ -100,7 +100,7 @@ All generated data belongs under ignored `data/`; do not commit frames.
 
 Training is an optional example dependency stack. Its PyTorch and torchvision
 wheels come from the official CPU index; no GPU, paid model API, or Gemini key
-is needed. The first model run downloads public weights/tokenizer/processor
+is needed. The first baseline run downloads public weights/tokenizer/processor
 files. Use Python 3.11+ on Linux x86-64 for the validated setup and allow several
 GB of RAM and disk. CUDA serving/training is not validated by this example.
 
@@ -111,13 +111,13 @@ uv sync --locked --project examples/build_ai_autoresearch --extra training
 The reference model is
 [SmolVLM2-256M-Video-Instruct](https://huggingface.co/HuggingFaceTB/SmolVLM2-256M-Video-Instruct/tree/067788b187b95ebe7b2e040b3e4299e342e5b8fd),
 pinned to an immutable revision. Although video-capable, it receives one image
-per example. We reuse HFlow's public wearer-hand prompt, EXIF-oriented RGB,
-512-pixel processing with image splitting disabled, greedy decoding, and at
-most four output tokens. Only a stripped `0`, `1`, or `2` is a valid answer;
+per example. Evaluation reuses HFlow's public wearer-hand prompt, EXIF-oriented
+RGB, 512-pixel processing with image splitting disabled, greedy decoding, and
+at most four output tokens. Only a stripped `0`, `1`, or `2` is a valid answer;
 invalid answers stay in the metric denominator. This is an explicitly named
 Transformers CPU reference backend, with a required recorded reason.
 
-Freeze a small protocol. The reason is a positional argument:
+Freeze a protocol. The reason is a positional argument:
 
 ```bash
 uv run --locked --project examples/build_ai_autoresearch --extra training \
@@ -125,17 +125,29 @@ uv run --locked --project examples/build_ai_autoresearch --extra training \
   data/build-ai-autoresearch/prepared data/build-ai-autoresearch/experiment \
   'CPU reference pilot before allocating GPU compute' \
   --train-samples 192 --development-samples 48 --confirmation-samples 48 \
-  --training-steps 256 --max-trials 2
+  --training-seconds 300 --max-trials 2
 ```
 
-The defaults allow eight trials, 256 optimizer steps each, 192 training frames,
-and 48 frames each for development and confirmation. Selection is deterministic
-for seed 42. Training reserves one frame per class, then follows the original
-sample pool. Development/confirmation choose classes in round-robin order;
-their scores describe these balanced subsets, not the original class prior.
-Small preparation pilots may lack a class; initialization rejects those.
+Each trial gets the same **300-second wall-clock allowance on the same host**,
+with the same four CPU threads. Fixed base-model loading and its initial audit
+are outside this allowance and have a separate 120-second startup timeout.
+Training-file import, adapter/optimizer setup, image processing, updates, final
+base-weight auditing, and adapter saving are inside it. Development evaluation
+runs afterwards under the fixed evaluator. Faster algorithms can perform more
+updates within the allowance; a reported-step safety cap defaults to 1,024.
+The trial records actual time and completed-step losses. The default loop leaves
+five seconds for auditing/saving; allow more if a proposed step is expensive.
+The parent watchdog kills an over-budget worker and marks the trial failed.
 
-Run the untouched baseline, then the naive recipe already copied into the
+Defaults permit at most eight trials, 192 training frames, and 48 frames each
+for development and confirmation. Selection is deterministic for seed 42.
+Training reserves one frame per class, then follows the original sample pool.
+Development/confirmation choose classes in round-robin order; their scores
+reflect those subsets, not the original class prior. A small preparation pilot
+may lack a class; initialization rejects that. For an execution smoke check,
+use smaller frame counts and `--training-seconds 15`; this is not a quality run.
+
+Run the untouched baseline, then the naive training code copied into the
 experiment directory:
 
 ```bash
@@ -147,35 +159,73 @@ uv run --locked --project examples/build_ai_autoresearch --extra training \
   data/build-ai-autoresearch/experiment
 ```
 
-Each trial starts from the same base weights. LoRA targets only language-model
-query/value projections, with alpha twice the rank, no dropout, AdamW, batch
-size one, and gradient clipping at 1. Loss covers assistant answer/end tokens;
-the exact tokenized prompt prefix and padding are masked. The naive recipe
-uses learning rate 0.0002, rank 4, and uniform training sampling.
+## One editable training file
+
+The coding agent edits **only `<experiment>/train.py`**, which defines:
+
+```python
+from peft import PeftModel
+from examples.build_ai_autoresearch.training_api import TrainingContext
+
+
+def train(
+    context: TrainingContext,
+) -> PeftModel: ...  # Train LoRA on context.base_model; return the adapted model.
+```
+
+[The initial training file](./train.py) is a naive LoRA loop: language-model
+query/value projections, rank 4, alpha 8, no dropout, AdamW at 0.0002, uniform
+sampling, batch size one, and gradient clipping at 1. It is runnable without an
+agent. A person can also edit it and run experiments manually.
+
+Unlike a JSON parameter sweep, the agent can implement new training behavior:
+
+- Change adapter placement and which adapters receive updates.
+- Design class-aware, curriculum, or difficulty-based training sampling.
+- Add full-frame, count-preserving training augmentations such as brightness.
+- Implement loss weighting, optimizer changes, or learning-rate schedules.
+- Change batching and training-loop efficiency within the same time allowance.
+
+`context.samples`, `context.seed`, `context.max_steps`, and
+`context.remaining_seconds` describe the fixed training inputs and limits.
+`context.batch(sample, transform=...)` verifies image identity, renders the
+fixed prompt/answer, and masks the exact prompt prefix and padding. Report one
+finite loss per optimizer update with `context.record_loss(...)`. Loss weighting
+may change the objective; teacher targets and their identities must stay fixed.
+Augmentations must preserve the count label: avoid crops or edits that remove
+hands. Evaluation always uses the original images and frozen preprocessing.
+
+The base architecture/weights, public model revision, task, prompt, splits,
+scoring, dependencies, and compute allowance are fixed. The worker verifies
+that base parameters remain unchanged and accepts only LoRA adapters with no
+full-module or bias updates. Changes to base architecture/weights are rejected.
+Code changes can therefore explore training algorithms while the exported
+artifact remains an adapter on the pinned base model.
 
 ## Agent search and frozen confirmation
 
 Give your coding agent [program.md](./program.md), the experiment path, and the
-trial command above. It edits **only `<experiment>/candidate.json`**:
+trial command above. It reads development failures, states a hypothesis, edits
+training code, runs a trial, and keeps useful changes. The agent is useful for
+implementing strategies that were not enumerated in a configuration schema;
+no paid model API or particular agent is built into the runner.
 
-```json
-{"learning_rate": 0.0002, "lora_rank": 4, "sampling_balance": "uniform"}
-```
-
-Allowed ranks are 2, 4, and 8; sampling is `uniform` or `class-balanced`;
-learning rate must be positive and at most 0.01. Extra fields are rejected.
-The agent chooses the next recipe from development reports and records its
-hypothesis. This is the autoresearch loop; no model API or particular coding
-agent is built into the runner. First establish measurable headroom with the
-baseline and naive trial before spending the remaining budget.
+Each attempt snapshots `train.py` into its trial directory before execution.
+The worker runs that snapshot in a separate process. The evaluator then loads
+only its saved adapter on fresh pinned base weights: candidate code is never
+imported into the evaluator process. Source hashes, checkpoint hashes, runtime
+identities, losses, and fixed-subset predictions are bound into the report.
+Previous source snapshots remain selectable after the working file changes.
 
 Trials report fixed three-class macro-F1, accuracy, invalid outputs, per-class
 support/F1, and per-corpus agreement. A cross-corpus duplicate appears in each
 source-corpus breakdown, but only once overall. Selection uses strict macro-F1
-improvement; ties keep the earlier selection, including the untouched baseline.
-Failed/interrupted attempts consume the trial budget. Run commands serially.
+improvement; ties keep the earlier result, including the untouched baseline.
+Failed/interrupted/over-budget attempts count. Run commands serially, on the
+same host without competing training jobs, and do not change hardware or threads
+mid-search. Wall-clock comparisons remain subject to ordinary host-load noise.
 
-The operator then ends search and confirms once:
+The operator ends search and confirms once:
 
 ```bash
 uv run --locked --project examples/build_ai_autoresearch --extra training \
@@ -187,23 +237,27 @@ uv run --locked --project examples/build_ai_autoresearch --extra training \
 ```
 
 Initialization copies only training/development images. It records the test
-manifest digest without opening that partition. **The runner is not an agent
-sandbox.** Keep the prepared dataset, original source files, and confirmation
-command inaccessible to the editing agent, for example in a separate operator
-account/container. Receipt checks detect drift; filesystem permissions enforce
-access. Keep evaluator code, the dependency lock, and protocol read-only.
+manifest digest without opening that partition. **The worker is not a security
+sandbox.** Editable Python executes with its process's permissions. For agent
+runs, use an isolated account/container with fixed code, dependencies, protocols,
+receipts, and source snapshots read-only to the editing agent. Allow the agent
+to write only the working `train.py` and research notes, and have the operator
+invoke the runner. Keep prepared/source/test data and the confirmation command
+outside the agent/worker filesystem. Hashes detect accidental drift; permissions
+and isolation enforce access. Candidate code must not patch runtime modules,
+forge receipts, alter timers, or inspect development/test images during training.
 
 Selection is written exclusively and blocks further trials. Confirmation
-creates an exclusive directory before loading the model; a failed attempt
-also consumes confirmation. It materializes test images there, so keep that
-directory away from the search agent. Do not restart search on the same test
-set after viewing confirmation. A failed or disappointing result is a result.
+creates an exclusive directory before loading the model; a failed attempt also
+consumes confirmation. It materializes test images there, so keep that directory
+away from the search agent. Do not resume search on the same test set after
+viewing confirmation. A failed or disappointing result is a result.
 
-Protocol/evaluator/runtime identities, sample hashes, recipes, predictions,
-losses, and adapter-file hashes are recorded in JSON receipts. Changed code,
-lockfiles, images, or selected checkpoints are rejected. Interrupted directories
-without their final receipt are incomplete; use a new experiment for development
-debugging without treating an exposed confirmation set as fresh evidence.
+Changed evaluator code, lockfiles, images, selected source snapshots, and
+checkpoints are rejected. Interrupted directories without final receipts are
+incomplete. Protocol schema 2 uses time-bounded editable code; old JSON-recipe/
+fixed-step experiments must be kept as historical evidence and cannot resume
+under this runner. Initialize a new experiment instead of rewriting receipts.
 
 ## Use the result with HFlow
 
@@ -218,34 +272,31 @@ uv run --locked --project examples/build_ai_autoresearch --extra training \
 
 The output includes `model/` (merged LoRA weights when selected) and a receipt
 binding its files to selection and confirmation. Serve that directory through
-your separately provisioned OpenAI-compatible VLM endpoint, then follow the
-existing [HFlow Build AI evaluation guide](../../docs/how-to/run-build-ai-evaluation.md).
-Endpoint/model support must be checked for your serving stack; the CPU pilot
-does not validate vLLM deployment. That published evaluation pool overlaps the
-training pool here, so a rerun on it is an integration check, not independent
-quality evidence.
-
-This example contributes the reusable experiment workflow. Teacher agreement,
-short training runs, and exact-frame separation do not establish production
-readiness or recording-independent generalization.
+a separately provisioned OpenAI-compatible VLM endpoint, then follow the existing
+[HFlow Build AI evaluation guide](../../docs/how-to/run-build-ai-evaluation.md).
+Endpoint/model support must be checked for your serving stack; this CPU example
+does not validate vLLM deployment. The published evaluation pool overlaps this
+training pool, so a rerun on it is an integration check, not independent quality
+evidence. Teacher agreement and exact-frame separation do not establish
+production readiness or recording-independent generalization.
 
 ## CPU pilot evidence
 
-A local four-thread CPU development pilot used 192 training frames, 48 balanced
-development frames, 256 steps, learning rate 0.0002, rank 8, and class-balanced
-sampling. Baseline macro-F1 was 0.1667; the adapter reached 0.4889 (29/48 teacher
-agreements, no invalid answers). Training took approximately 268 seconds and
-development evaluation 38 seconds on that host. Class F1 was 0.6667/0/0.8:
-the one-hand class still failed. This establishes limited development headroom,
-not a useful production model or fresh confirmation evidence.
+The earlier fixed-step prototype established development headroom: 192 training
+frames, 48 balanced development frames, 256 steps, learning rate 0.0002, rank 8,
+and class-balanced sampling improved macro-F1 from 0.1667 to 0.4889. Training
+took approximately 268 seconds on a four-thread CPU. One-hand class F1 remained
+zero. This is historical development evidence for the public task/model, not
+confirmation or a comparison of the new time-budgeted training strategies.
 
-A separate 32-step pilot stayed at constant answers. Its frozen baseline
-fallback, one-time confirmation, and export completed. Adapter reload preserved
-all development predictions; adapter merge/export also worked. After the final
-runner changes, a tiny two-step run repeated baseline/trial/selection/
-confirmation/export as a control-flow check. These smoke checks establish
-execution, not quality. Generated frames, predictions, and weights remain under
-ignored `data/`; no data or model artifacts are distributed in this example.
+The editable-code runner is checked separately with short public-data CPU
+trials and two distinct source snapshots under the same 15-second allowance
+(10 and 8 updates), plus baseline/selection/one-time-confirmation/export. Both
+short trials stayed at macro-F1 0.1667. A typed training module also loaded
+successfully; a deliberate base-weight mutation was rejected and consumed an
+attempt. Real-process tests cover completion and over-budget termination.
+These establish execution and budget/source contracts; short smoke checks do not establish quality. All frames,
+predictions, source snapshots, and weights remain under ignored `data/`.
 
 Validation:
 

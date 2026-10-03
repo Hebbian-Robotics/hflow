@@ -11,7 +11,6 @@ from examples.build_ai_autoresearch.contracts import (
     SampleRecord,
     SelectedBaseline,
     SelectedTrial,
-    TrainingRecipe,
     TrialBudget,
     TrialReport,
     checkpoint_digests,
@@ -33,6 +32,7 @@ from examples.build_ai_autoresearch.prepare import (
     prepare_dataset,
 )
 from examples.build_ai_autoresearch.tests.test_preparation import _image_bytes, _write_source
+from examples.build_ai_autoresearch.training_runner import snapshot_training_source
 
 
 def _evaluation(samples: tuple[SampleRecord, ...], correct: bool) -> Evaluation:
@@ -68,7 +68,8 @@ def experiment_directory(tmp_path: Path) -> Path:
             train_samples=6,
             development_samples=6,
             confirmation_samples=6,
-            training_steps=1,
+            training_seconds=10.0,
+            max_training_steps=1,
             max_trials=2,
             reference_reason="unit outcome fixture",
         ),
@@ -93,13 +94,13 @@ def _trial(experiment: Path, *, correct: bool) -> Path:
     directory = experiment / "trials/trial-000"
     adapter = directory / "adapter"
     adapter.mkdir(parents=True)
+    source_digest = snapshot_training_source(experiment / "train.py", directory)
     (adapter / "owned-checkpoint.bin").write_bytes(b"checkpoint receipt fixture")
     write_record(
         directory / "report.json",
         TrialReport(
             protocol_sha256=file_sha256(experiment / "protocol.json"),
-            recipe=TrainingRecipe(),
-            candidate_sha256=file_sha256(experiment / "candidate.json"),
+            training_source_sha256=source_digest,
             runtime={"backend": "fixture"},
             checkpoint_files=checkpoint_digests(adapter),
             training_seconds=0.1,
@@ -168,11 +169,28 @@ def test_changed_checkpoint_cannot_be_selected(experiment_directory: Path) -> No
     assert not (experiment_directory / "selection.json").exists()
 
 
-def test_recipe_cannot_change_frozen_budget_or_repeat_json_fields(tmp_path: Path) -> None:
-    candidate = tmp_path / "candidate.json"
-    candidate.write_text('{"learning_rate":0.001,"training_steps":999}')
-    with pytest.raises(ValueError, match="training_steps"):
-        read_record(candidate, TrainingRecipe)
-    candidate.write_text('{"learning_rate":0.001,"learning_rate":0.002}')
+def test_editable_training_code_is_snapshotted_without_changing_the_evaluator(
+    experiment_directory: Path,
+) -> None:
+    protocol = validate_experiment(experiment_directory)
+    _baseline(experiment_directory, correct=False)
+    directory = _trial(experiment_directory, correct=True)
+    original_snapshot = (directory / "train.py").read_bytes()
+    with (experiment_directory / "train.py").open("a") as editable:
+        editable.write("\n# A new hypothesis can edit actual training code.\n")
+    assert validate_experiment(experiment_directory) == protocol
+    selection = freeze_selection(experiment_directory)
+    assert isinstance(selection.selected, SelectedTrial)
+    assert (directory / "train.py").read_bytes() == original_snapshot
+    (directory / "train.py").write_bytes(b"changed snapshot")
+    with pytest.raises(ValueError, match="training source changed"):
+        freeze_selection(experiment_directory)
+
+
+def test_duplicate_budget_fields_are_rejected(tmp_path: Path) -> None:
+    budget = tmp_path / "budget.json"
+    budget.write_text(
+        '{"training_seconds":10,"training_seconds":20,"reference_reason":"fixture check"}'
+    )
     with pytest.raises(ValueError, match="duplicate JSON"):
-        read_record(candidate, TrainingRecipe)
+        read_record(budget, TrialBudget)

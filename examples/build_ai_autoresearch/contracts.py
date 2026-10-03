@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 from collections.abc import Sequence
-from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal, TypeVar
 
@@ -22,22 +21,13 @@ class Record(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
 
-class SamplingBalance(StrEnum):
-    UNIFORM = "uniform"
-    CLASS_BALANCED = "class-balanced"
-
-
-class TrainingRecipe(Record):
-    learning_rate: Annotated[float, Field(gt=0, le=0.01, allow_inf_nan=False)] = 0.0002
-    lora_rank: Literal[2, 4, 8] = 4
-    sampling_balance: SamplingBalance = SamplingBalance.UNIFORM
-
-
 class TrialBudget(Record):
     train_samples: Annotated[int, Field(ge=3, le=4096)] = 192
     development_samples: Annotated[int, Field(ge=3, le=512)] = 48
     confirmation_samples: Annotated[int, Field(ge=3, le=512)] = 48
-    training_steps: Annotated[int, Field(ge=1, le=1024)] = 256
+    training_seconds: Annotated[float, Field(ge=1, le=1800, allow_inf_nan=False)] = 300.0
+    max_training_steps: Annotated[int, Field(ge=1, le=4096)] = 1024
+    startup_seconds: Literal[120] = 120
     max_trials: Annotated[int, Field(ge=1, le=8)] = 8
     cpu_threads: Annotated[int, Field(ge=1, le=16)] = 4
     seed: int = 42
@@ -56,7 +46,7 @@ class SampleRecord(Record):
 
 
 class Protocol(Record):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     model_id: Literal["HuggingFaceTB/SmolVLM2-256M-Video-Instruct"] = (
         "HuggingFaceTB/SmolVLM2-256M-Video-Instruct"
     )
@@ -191,14 +181,26 @@ class BaselineReport(Record):
 
 class TrialReport(Record):
     protocol_sha256: Sha256
-    recipe: TrainingRecipe
-    candidate_sha256: Sha256
+    training_source_sha256: Sha256
     runtime: dict[str, str]
     checkpoint_files: dict[str, Sha256]
     training_seconds: Annotated[float, Field(ge=0, allow_inf_nan=False)]
     training_losses: tuple[FiniteFloat, ...]
     trainable_parameters: int
     evaluation: Evaluation
+
+
+class WorkerStarted(Record):
+    started_monotonic: FiniteFloat
+
+
+class WorkerOutcome(Record):
+    training_source_sha256: Sha256
+    runtime: dict[str, str]
+    checkpoint_files: dict[str, Sha256]
+    training_seconds: Annotated[float, Field(gt=0, allow_inf_nan=False)]
+    training_losses: tuple[FiniteFloat, ...]
+    trainable_parameters: Annotated[int, Field(gt=0)]
 
 
 class SelectedBaseline(Record):

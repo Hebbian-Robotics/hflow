@@ -1,5 +1,0 @@
-{
-  "learning_rate": 0.0002,
-  "lora_rank": 4,
-  "sampling_balance": "uniform"
-}

@@ -4,11 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import io
-import random
 import time
-from collections import Counter
 from collections.abc import Sequence
-from dataclasses import dataclass
 from pathlib import Path
 
 import peft
@@ -19,23 +16,14 @@ from examples.build_ai_autoresearch.contracts import (
     PredictionRecord,
     Protocol,
     SampleRecord,
-    SamplingBalance,
-    TrainingRecipe,
     score_predictions,
 )
 from examples.build_ai_autoresearch.prepare import HandCount
 from hflow.build_ai_vlm_checks import BUILD_AI_HAND_VISIBILITY_PROMPT
-from peft import LoraConfig, PeftModel, get_peft_model
+from peft import PeftModel
 from PIL import Image, ImageOps
 from torch import Tensor
 from transformers import SmolVLMForConditionalGeneration, SmolVLMProcessor
-
-
-@dataclass(frozen=True)
-class TrainingOutcome:
-    losses: tuple[float, ...]
-    elapsed_seconds: float
-    trainable_parameters: int
 
 
 class CpuReferenceRuntime:
@@ -171,70 +159,6 @@ class CpuReferenceRuntime:
                 for corpus in {corpus for sample in samples for corpus in sample.corpora}
             },
             elapsed_seconds=time.perf_counter() - started,
-        )
-
-    def train(
-        self,
-        recipe: TrainingRecipe,
-        samples: Sequence[SampleRecord],
-        media_directory: Path,
-        output_directory: Path,
-    ) -> TrainingOutcome:
-        if not isinstance(self.model, SmolVLMForConditionalGeneration):
-            raise ValueError("each trial must train from fresh base weights")
-        adapted_model = get_peft_model(
-            self.model,
-            LoraConfig(
-                r=recipe.lora_rank,
-                lora_alpha=2 * recipe.lora_rank,
-                target_modules=r".*text_model.*\.(q_proj|v_proj)$",
-                lora_dropout=0.0,
-                bias="none",
-                task_type="CAUSAL_LM",
-            ),
-        )
-        if not isinstance(adapted_model, PeftModel):
-            raise TypeError("LoRA training requires a single PEFT model")
-        self.model = adapted_model
-        self.model.train()
-        trainable = [parameter for parameter in self.model.parameters() if parameter.requires_grad]
-        optimizer = torch.optim.AdamW(trainable, lr=recipe.learning_rate, weight_decay=0.0)
-        class_counts = Counter(sample.hand_count for sample in samples)
-        match recipe.sampling_balance:
-            case SamplingBalance.UNIFORM:
-                sample_weights = [1.0] * len(samples)
-            case SamplingBalance.CLASS_BALANCED:
-                sample_weights = [1 / class_counts[sample.hand_count] for sample in samples]
-        random_source = random.Random(self.protocol.budget.seed)
-        losses: list[float] = []
-        started = time.perf_counter()
-        for _ in range(self.protocol.budget.training_steps):
-            sample = random_source.choices(samples, weights=sample_weights, k=1)[0]
-            image = self._image(sample, media_directory)
-            prompt_inputs = self._inputs(image, self._render())
-            inputs = self._inputs(image, self._render(str(int(sample.hand_count))))
-            prompt_ids = prompt_inputs["input_ids"]
-            if not torch.equal(inputs["input_ids"][:, : prompt_ids.shape[1]], prompt_ids):
-                raise ValueError("assistant-loss masking needs an exact tokenized prompt prefix")
-            labels = inputs["input_ids"].clone()
-            labels[:, : prompt_ids.shape[1]] = -100
-            labels[inputs["attention_mask"] == 0] = -100
-            if not torch.any(labels != -100):
-                raise ValueError("training sample has no assistant target tokens")
-            optimizer.zero_grad(set_to_none=True)
-            output = self.model(**inputs, labels=labels, use_cache=False)
-            loss = output.loss
-            if not isinstance(loss, Tensor) or not torch.isfinite(loss):
-                raise ValueError("training loss must be a finite tensor")
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0, error_if_nonfinite=True)
-            optimizer.step()
-            losses.append(float(loss.detach()))
-        self.model.save_pretrained(str(output_directory), safe_serialization=True)
-        return TrainingOutcome(
-            tuple(losses),
-            time.perf_counter() - started,
-            sum(parameter.numel() for parameter in trainable),
         )
 
     def export(self, output_directory: Path) -> None:

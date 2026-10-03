@@ -1,6 +1,6 @@
 """Frozen data, bounded trials, and explicit one-time confirmation.
 
-The editor proposes JSON recipes. This driver owns data, budgets, scoring,
+The editor changes training code. This driver owns data, budgets, scoring,
 selection, and receipts; it never supplies confirmation images during search.
 """
 
@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,15 +26,16 @@ from examples.build_ai_autoresearch.contracts import (
     SelectedTrial,
     SelectionReceipt,
     Sha256,
-    TrainingRecipe,
     TrialBudget,
     TrialReport,
+    WorkerOutcome,
     checkpoint_digests,
     file_sha256,
     read_record,
     write_record,
 )
 from examples.build_ai_autoresearch.prepare import Corpus, HandCount
+from examples.build_ai_autoresearch.training_runner import run_worker, snapshot_training_source
 from pydantic import BaseModel, ConfigDict
 
 EXAMPLE_DIRECTORY = Path(__file__).resolve().parent
@@ -41,7 +43,15 @@ REPOSITORY_ROOT = EXAMPLE_DIRECTORY.parent.parent
 EVALUATOR_PATHS = (
     *tuple(
         EXAMPLE_DIRECTORY / name
-        for name in ("contracts.py", "experiment.py", "model_runtime.py", "prepare.py")
+        for name in (
+            "contracts.py",
+            "experiment.py",
+            "model_runtime.py",
+            "prepare.py",
+            "training_api.py",
+            "training_runner.py",
+            "training_worker.py",
+        )
     ),
     REPOSITORY_ROOT / "uv.lock",
     REPOSITORY_ROOT / "src/hflow/build_ai_vlm_checks.py",
@@ -216,7 +226,7 @@ def initialize_experiment(prepared: Path, experiment: Path, budget: TrialBudget)
     experiment.mkdir(parents=True, exist_ok=False)
     try:
         _copy_images((*train, *development), experiment / "media")
-        shutil.copyfile(EXAMPLE_DIRECTORY / "candidate.json", experiment / "candidate.json")
+        shutil.copyfile(EXAMPLE_DIRECTORY / "train.py", experiment / "train.py")
         (experiment / "trials").mkdir()
         write_record(experiment / "protocol.json", protocol)
     except Exception:
@@ -258,10 +268,13 @@ def _completed_trials(experiment: Path, protocol: Protocol) -> list[tuple[Path, 
         report = read_record(directory / "report.json", TrialReport)
         if (
             report.protocol_sha256 != file_sha256(experiment / "protocol.json")
-            or len(report.training_losses) != protocol.budget.training_steps
+            or not 1 <= len(report.training_losses) <= protocol.budget.max_training_steps
+            or report.training_seconds > protocol.budget.training_seconds
         ):
             raise ValueError("trial protocol or completed step count differs")
         _validate_evaluation_samples(protocol.development, report)
+        if file_sha256(directory / "train.py") != report.training_source_sha256:
+            raise ValueError("trial training source changed")
         if checkpoint_digests(directory / "adapter") != report.checkpoint_files:
             raise ValueError("trial checkpoint changed")
         result.append((directory, report))
@@ -276,7 +289,8 @@ def initialize(
     train_samples: int = 192,
     development_samples: int = 48,
     confirmation_samples: int = 48,
-    training_steps: int = 256,
+    training_seconds: float = 300.0,
+    max_training_steps: int = 1024,
     max_trials: int = 8,
     cpu_threads: int = 4,
 ) -> None:
@@ -288,7 +302,8 @@ def initialize(
             train_samples=train_samples,
             development_samples=development_samples,
             confirmation_samples=confirmation_samples,
-            training_steps=training_steps,
+            training_seconds=training_seconds,
+            max_training_steps=max_training_steps,
             max_trials=max_trials,
             cpu_threads=cpu_threads,
             reference_reason=reference_reason,
@@ -328,7 +343,7 @@ def baseline(experiment: Path) -> None:
 
 @app.command("trial-transformers-reference")
 def trial(experiment: Path) -> None:
-    """Train from base weights using candidate.json; evaluate development only."""
+    """Execute a train.py snapshot within its time budget; evaluate separately."""
     from examples.build_ai_autoresearch.model_runtime import CpuReferenceRuntime
 
     protocol = validate_experiment(experiment)
@@ -338,44 +353,69 @@ def trial(experiment: Path) -> None:
     attempts = len(list((experiment / "trials").iterdir()))
     if attempts >= protocol.budget.max_trials:
         raise ValueError("trial budget is exhausted; failed attempts count")
-    recipe = read_record(experiment / "candidate.json", TrainingRecipe)
-    candidate_sha256 = file_sha256(experiment / "candidate.json")
     directory = experiment / "trials" / f"trial-{attempts:03}"
     directory.mkdir(exist_ok=False)
     try:
-        runtime = CpuReferenceRuntime(protocol)
-        training = runtime.train(
-            recipe, protocol.train, experiment / "media", directory / "adapter"
+        training_source_digest = snapshot_training_source(experiment / "train.py", directory)
+        run_worker(
+            [
+                sys.executable,
+                "-m",
+                "examples.build_ai_autoresearch.training_worker",
+                str(experiment.resolve()),
+                str(directory.resolve()),
+            ],
+            directory,
+            protocol.budget,
         )
+        training = read_record(directory / "outcome.json", WorkerOutcome)
+        if (
+            training.training_source_sha256 != training_source_digest
+            or training.training_seconds > protocol.budget.training_seconds
+            or not 1 <= len(training.training_losses) <= protocol.budget.max_training_steps
+        ):
+            raise ValueError("worker source or compute-budget receipt differs")
+        if checkpoint_digests(directory / "adapter") != training.checkpoint_files:
+            raise ValueError("worker checkpoint changed")
+        validate_experiment(experiment)
+        if file_sha256(experiment / "protocol.json") != baseline_report.protocol_sha256:
+            raise ValueError("protocol changed during training")
+        # Candidate code never executes in the evaluator process; reload its saved LoRA on fresh base weights.
+        runtime = CpuReferenceRuntime(protocol, directory / "adapter")
         evaluation = runtime.evaluate(protocol.development, experiment / "media")
         validate_experiment(experiment)
         _baseline(experiment, protocol)
         if file_sha256(experiment / "protocol.json") != baseline_report.protocol_sha256:
             raise ValueError("protocol changed during the trial")
-        if file_sha256(experiment / "candidate.json") != candidate_sha256:
-            raise ValueError("candidate changed during the trial")
-        if runtime.runtime_identity != baseline_report.runtime:
+        if (
+            file_sha256(experiment / "train.py") != training_source_digest
+            or file_sha256(directory / "train.py") != training_source_digest
+        ):
+            raise ValueError("training source changed during the trial")
+        if (
+            runtime.runtime_identity != baseline_report.runtime
+            or training.runtime != baseline_report.runtime
+        ):
             raise ValueError("trial runtime differs from the baseline runtime")
         write_record(
             directory / "report.json",
             TrialReport(
-                protocol_sha256=file_sha256(experiment / "protocol.json"),
-                recipe=recipe,
-                candidate_sha256=candidate_sha256,
+                protocol_sha256=baseline_report.protocol_sha256,
+                training_source_sha256=training_source_digest,
                 runtime=runtime.runtime_identity,
-                checkpoint_files=checkpoint_digests(directory / "adapter"),
-                training_seconds=training.elapsed_seconds,
-                training_losses=training.losses,
+                checkpoint_files=training.checkpoint_files,
+                training_seconds=training.training_seconds,
+                training_losses=training.training_losses,
                 trainable_parameters=training.trainable_parameters,
                 evaluation=evaluation,
             ),
         )
         print(
-            f"{directory.name}: macro-F1 {evaluation.metrics.macro_f1:.6f}; baseline {baseline_report.evaluation.metrics.macro_f1:.6f}; training {training.elapsed_seconds:.2f}s"
+            f"{directory.name}: macro-F1 {evaluation.metrics.macro_f1:.6f}; baseline {baseline_report.evaluation.metrics.macro_f1:.6f}; {len(training.training_losses)} steps in {training.training_seconds:.2f}s"
         )
     except Exception as error:
         with (directory / "failure.json").open("x") as output:
-            json.dump({"error": str(error), "candidate_sha256": candidate_sha256}, output, indent=2)
+            json.dump({"error": str(error)}, output, indent=2)
         raise
 
 
@@ -472,6 +512,8 @@ def selected_adapter(experiment: Path, selection: SelectionReceipt) -> Path | No
             if file_sha256(directory / "report.json") != expected_digest:
                 raise ValueError("selected trial report changed")
             report = read_record(directory / "report.json", TrialReport)
+            if file_sha256(directory / "train.py") != report.training_source_sha256:
+                raise ValueError("selected training source changed")
             baseline_report = read_record(experiment / "baseline.json", BaselineReport)
             if (
                 report.protocol_sha256 != selection.protocol_sha256
