@@ -73,6 +73,7 @@ Use these when you already know the outcome you need.
 - [Export a portable dataset snapshot](./how-to/export-dataset-snapshot.md)
 - [Find and reprocess stale episodes](./CATALOG.md#finding-stale-episodes-to-reprocess)
 - [Load a large manifest with memory mapping](./how-to/load-manifest-mmap.md)
+- [Deduplicate a training manifest and preserve provenance](./how-to/deduplicate-training-manifests.md)
 - [Split a training manifest by connected groups](./how-to/split-training-manifests.md)
 - [Inspect episodes in Foxglove](./how-to/inspect-episodes-in-foxglove.md)
 - [Publish browser-playable camera video](./how-to/publish-camera-video.md)

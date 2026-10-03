@@ -19,7 +19,7 @@ HFlow, but their dependencies are not installed by a normal root `uv sync`.
 
 **Use it for:** combining both public Build AI evaluation releases, deduplicating
 identical image pixels, resolving contradictory teacher labels, and freezing
-training/development/test manifests with HFlow, then running a bounded tiny-VLM
+deduplication evidence and training/development/test manifests with HFlow, then running a bounded tiny-VLM
 fine-tuning code search under a fixed CPU time allowance.
 
 **Prerequisites:** the example's own uv environment and disk for approximately

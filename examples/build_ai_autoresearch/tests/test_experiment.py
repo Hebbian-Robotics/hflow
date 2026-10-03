@@ -223,3 +223,24 @@ def test_unusable_time_allowance_does_not_start_an_experiment(tmp_path: Path) ->
             tmp_path / "prepared", experiment, "CPU too-short allowance check", training_seconds=5.0
         )
     assert not experiment.exists()
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "source-samples.parquet",
+        "deduplication/samples.parquet",
+        "deduplication/members.parquet",
+    ],
+)
+def test_changed_deduplication_evidence_cannot_initialize_an_experiment(
+    experiment_directory: Path,
+    relative_path: str,
+) -> None:
+    protocol = validate_experiment(experiment_directory)
+    prepared = experiment_directory.parent / "prepared"
+    (prepared / relative_path).write_bytes(b"changed provenance evidence")
+    new_experiment = experiment_directory.parent / "rejected-experiment"
+    with pytest.raises(ValueError, match="deduplication"):
+        initialize_experiment(prepared, new_experiment, protocol.budget)
+    assert not new_experiment.exists()

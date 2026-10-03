@@ -70,6 +70,15 @@ def test_mix_deduplicate_conflicts_and_freeze_evidence(tmp_path: Path) -> None:
         report.conflicting_images,
     ) == (8, 5, 4, 1)
     receipt = json.loads((output / "preparation.json").read_text())
+    assert receipt["schema_version"] == 2
+    assert (
+        receipt["deduplication_receipt_sha256"]
+        == hashlib.sha256((output / "deduplication/receipt.json").read_bytes()).hexdigest()
+    )
+    assert (
+        receipt["source_manifest_sha256"]
+        == hashlib.sha256((output / "source-samples.parquet").read_bytes()).hexdigest()
+    )
     assert receipt["independence_scope"] == "exact-pixel-frame-only"
     assert receipt["label_source"] == "published-gemini-teacher-labels"
     assert all(
@@ -87,6 +96,19 @@ def test_mix_deduplicate_conflicts_and_freeze_evidence(tmp_path: Path) -> None:
     assert {reference["hand_count"] for reference in conflicts[0]["references"]} == {1, 2}
     assert not (output / "images" / f"{conflicts[0]['pixel_sha256']}.image").exists()
     with duckdb.connect() as connection:
+        members = connection.read_parquet(str(output / "deduplication/members.parquet"))
+        assert members.count("*").fetchall()[0][0] == 8
+        assert (
+            members.project("* EXCLUDE (retained_sample_id)").fetchall()
+            == connection.read_parquet(str(output / "source-samples.parquet")).fetchall()
+        )
+        assert (
+            connection.read_parquet(str(output / "deduplication/samples.parquet"))
+            .filter("len(deduplication_conflicts) > 0")
+            .count("*")
+            .fetchall()[0][0]
+            == 1
+        )
         samples = connection.read_parquet(str(output / "samples.parquet")).fetchall()
         assert len(samples) == 4
         reference_counts = []

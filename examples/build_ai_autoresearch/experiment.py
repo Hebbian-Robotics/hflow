@@ -55,6 +55,8 @@ EVALUATOR_PATHS = (
     ),
     REPOSITORY_ROOT / "uv.lock",
     REPOSITORY_ROOT / "src/hflow/build_ai_vlm_checks.py",
+    REPOSITORY_ROOT / "src/hflow/manifest_deduplication.py",
+    REPOSITORY_ROOT / "src/hflow/manifest_splits.py",
 )
 app = typer.Typer(no_args_is_help=True)
 
@@ -66,6 +68,16 @@ class PreparationEvidence(BaseModel):
     independence_scope: str
     manifest_sha256: Sha256
     split_receipt_sha256: Sha256
+    source_manifest_sha256: Sha256
+    deduplication_receipt_sha256: Sha256
+
+
+class DeduplicationEvidence(BaseModel):
+    model_config = ConfigDict(extra="allow", strict=True, frozen=True)
+    schema_version: int
+    input_sha256: Sha256
+    samples_sha256: Sha256
+    members_sha256: Sha256
 
 
 class PartitionEvidence(BaseModel):
@@ -93,7 +105,7 @@ def _evaluator_digests() -> dict[str, str]:
 def _prepared_evidence(prepared: Path) -> tuple[PreparationEvidence, dict[str, str]]:
     evidence = read_record(prepared / "preparation.json", PreparationEvidence)
     if (
-        evidence.schema_version != 1
+        evidence.schema_version != 2
         or evidence.label_source != "published-gemini-teacher-labels"
         or evidence.independence_scope != "exact-pixel-frame-only"
     ):
@@ -103,6 +115,20 @@ def _prepared_evidence(prepared: Path) -> tuple[PreparationEvidence, dict[str, s
         or file_sha256(prepared / "splits/receipt.json") != evidence.split_receipt_sha256
     ):
         raise ValueError("prepared manifest or split receipt changed")
+    if (
+        file_sha256(prepared / "source-samples.parquet") != evidence.source_manifest_sha256
+        or file_sha256(prepared / "deduplication/receipt.json")
+        != evidence.deduplication_receipt_sha256
+    ):
+        raise ValueError("deduplication input or receipt changed")
+    deduplication = read_record(prepared / "deduplication/receipt.json", DeduplicationEvidence)
+    if (
+        deduplication.schema_version != 1
+        or deduplication.input_sha256 != evidence.source_manifest_sha256
+        or file_sha256(prepared / "deduplication/samples.parquet") != deduplication.samples_sha256
+        or file_sha256(prepared / "deduplication/members.parquet") != deduplication.members_sha256
+    ):
+        raise ValueError("deduplication evidence changed")
     splits = read_record(prepared / "splits/receipt.json", SplitEvidence)
     if splits.input_sha256 != evidence.manifest_sha256:
         raise ValueError("splits refer to another prepared manifest")

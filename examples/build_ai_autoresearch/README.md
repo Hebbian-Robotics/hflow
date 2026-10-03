@@ -3,7 +3,7 @@
 Prepare public data, measure a tiny VLM, fine-tune a LoRA adapter, and let a
 coding agent improve one training file under a fixed compute budget. It builds on the existing
 [Build AI evaluation](../../docs/how-to/run-build-ai-evaluation.md), using its
-published teacher-labelled frames and HFlow's general manifest splitter.
+published teacher-labelled frames and HFlow's manifest deduplication and splitting APIs.
 
 ## Prepare both releases from scratch
 
@@ -62,7 +62,10 @@ omit an expected digest and are explicitly marked revision-unverified.
    same pixels collapse into one sample.
 3. Keep every original release/corpus/row/frame ID, encoded digest, and label
    in the sample's provenance. UUID frame IDs are not recording identities.
-4. Exclude images whose copies have conflicting hand-count labels. Record
+4. Call `hflow.deduplicate_manifest` on the combined source occurrences, using
+   pixel identity and checking for hand-count conflicts. It preserves every
+   source row and reports conflicts. This example explicitly excludes images
+   whose copies have conflicting hand-count labels. Record
    all conflicting references; do not choose a majority label.
 5. Call `hflow.split_manifest` on the deduplicated manifest to freeze
    train/development/test partitions with seed 42 and fractions 0.8/0.1/0.1.
@@ -83,11 +86,19 @@ The output directory must be new. It contains:
 - `samples.parquet`: sample identity, decoded pixel digest, image path relative
   to the prepared dataset root, encoded digest, dimensions, teacher label, and
   all source references as JSON.
+- `source-samples.parquet`: every source occurrence with its pixel identity
+  and teacher-label provenance.
+- `deduplication/`: HFlow representatives (including conflicts), every original
+  member and its representative association, and the deduplication receipt.
+  Paths for excluded conflicting images no longer have local media; their
+  pinned upstream source references remain available for audit.
 - `conflicts.json`: contradictory hand labels and their provenance.
 - `splits/`: partition Parquet files, assignments, and HFlow's split receipt.
 - `preparation.json`: source digests, origin verification scope, selection
   limits, counts, deduplication policy, code/runtime identities, output hashes,
-  and split receipt hash.
+  and deduplication/split receipt hashes. Preparation schema 2 includes the
+  preserved source manifest and HFlow deduplication evidence; schema 1 outputs
+  remain historical and need a new preparation run for this workflow.
 
 Receipts are written last. Ordinary failures remove the new output directory;
 termination can leave incomplete output. Consumers must verify the preparation
@@ -309,6 +320,13 @@ successfully; a deliberate base-weight mutation was rejected and consumed an
 attempt. Real-process tests cover completion and over-budget termination.
 These establish execution and budget/source contracts; short smoke checks do not establish quality. All frames,
 predictions, source snapshots, and weights remain under ignored `data/`.
+
+A preparation-schema-2 integration check selected 200 rows from each pinned
+public source: 1,200 occurrences became 791 unique frames, with no conflicting
+hand labels. HFlow preserved all 1,200 member records before splitting. A CPU
+baseline/trial/selection/confirmation/export cycle completed on those outputs;
+a one-update trial took 2.19 seconds and tied the baseline at macro-F1 0.1667.
+The baseline was retained. This checks integration, not model quality.
 
 Validation:
 

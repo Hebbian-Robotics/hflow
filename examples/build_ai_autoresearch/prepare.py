@@ -11,7 +11,7 @@ import io
 import json
 import shutil
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from enum import IntEnum, StrEnum
 from pathlib import Path
 
@@ -20,7 +20,13 @@ import PIL
 import pyarrow
 import pyarrow.parquet as parquet
 import typer
-from hflow import ManifestSplitSettings, __version__, split_manifest
+from hflow import (
+    ManifestDeduplicationSettings,
+    ManifestSplitSettings,
+    __version__,
+    deduplicate_manifest,
+    split_manifest,
+)
 from huggingface_hub import hf_hub_download
 from PIL import Image, ImageOps
 
@@ -145,18 +151,16 @@ class SourceReference:
     hand_count: HandCount
 
 
-@dataclass
-class DeduplicatedFrame:
+@dataclass(frozen=True)
+class FrameOccurrence:
+    sample_id: str
     pixel_sha256: str
     image_path: str
     image_sha256: str
     width: int
     height: int
-    references: list[SourceReference] = field(default_factory=list)
-
-    @property
-    def labels(self) -> set[HandCount]:
-        return {reference.hand_count for reference in self.references}
+    hand_count: HandCount
+    source_reference_json: str
 
 
 @dataclass(frozen=True)
@@ -255,10 +259,10 @@ def prepare_dataset(
     try:
         images_directory = output_directory / "images"
         images_directory.mkdir()
-        unique_frames: dict[str, DeduplicatedFrame] = {}
+        image_metadata: dict[str, tuple[str, str, int, int]] = {}
+        frame_occurrences: list[FrameOccurrence] = []
         encoded_identities: dict[str, str] = {}
         source_receipts: list[dict[str, object]] = []
-        input_rows = 0
         for source_file in sorted(sources, key=lambda item: str(item.specification.cache_key)):
             source, path = source_file.specification, source_file.path
             original_digest = _file_sha256(path)
@@ -271,25 +275,37 @@ def prepare_dataset(
                 if pixel_digest is None:
                     pixel_digest, width, height = _pixel_identity(frame.image_bytes)
                     encoded_identities[encoded_digest] = pixel_digest
-                    if pixel_digest not in unique_frames:
+                    if pixel_digest not in image_metadata:
                         image_path = f"images/{pixel_digest}.image"
                         (output_directory / image_path).write_bytes(frame.image_bytes)
-                        unique_frames[pixel_digest] = DeduplicatedFrame(
-                            pixel_digest, image_path, encoded_digest, width, height
-                        )
-                unique_frames[pixel_digest].references.append(
-                    SourceReference(
-                        source.release,
-                        source.corpus,
-                        source.filename,
-                        frame.source_row_index,
-                        frame.upstream_frame_id,
-                        encoded_digest,
+                        image_metadata[pixel_digest] = (image_path, encoded_digest, width, height)
+                reference = SourceReference(
+                    source.release,
+                    source.corpus,
+                    source.filename,
+                    frame.source_row_index,
+                    frame.upstream_frame_id,
+                    encoded_digest,
+                    frame.hand_count,
+                )
+                occurrence_identity = json.dumps(
+                    [source.release, source.filename, frame.source_row_index],
+                    separators=(",", ":"),
+                )
+                image_path, image_digest, width, height = image_metadata[pixel_digest]
+                frame_occurrences.append(
+                    FrameOccurrence(
+                        occurrence_identity,
+                        pixel_digest,
+                        image_path,
+                        image_digest,
+                        width,
+                        height,
                         frame.hand_count,
+                        json.dumps(asdict(reference), sort_keys=True),
                     )
                 )
                 selected_rows += 1
-                input_rows += 1
             if _file_sha256(path) != original_digest:
                 raise ValueError(f"source changed while preparing: {source.cache_key}")
             source_receipts.append(
@@ -303,58 +319,66 @@ def prepare_dataset(
                     else SourceVerification.UNVERIFIED,
                 }
             )
-        retained = [frame for frame in unique_frames.values() if len(frame.labels) == 1]
-        conflicts = [frame for frame in unique_frames.values() if len(frame.labels) > 1]
-        for frame in conflicts:
-            (output_directory / frame.image_path).unlink()
         with duckdb.connect() as connection:
             connection.execute(
-                "CREATE TABLE samples (sample_id VARCHAR, pixel_sha256 VARCHAR, image_path VARCHAR, image_sha256 VARCHAR, width INTEGER, height INTEGER, hand_count INTEGER, source_references_json VARCHAR)"
+                "CREATE TABLE occurrences (sample_id VARCHAR, pixel_sha256 VARCHAR, image_path VARCHAR, image_sha256 VARCHAR, width INTEGER, height INTEGER, hand_count INTEGER, source_reference_json VARCHAR)"
             )
-            if retained:
+            if frame_occurrences:
                 connection.executemany(
-                    "INSERT INTO samples VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    [
-                        (
-                            frame.pixel_sha256,
-                            frame.pixel_sha256,
-                            frame.image_path,
-                            frame.image_sha256,
-                            frame.width,
-                            frame.height,
-                            next(iter(frame.labels)),
-                            json.dumps(
-                                [asdict(reference) for reference in frame.references],
-                                sort_keys=True,
-                            ),
-                        )
-                        for frame in retained
-                    ],
+                    "INSERT INTO occurrences VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [tuple(asdict(occurrence).values()) for occurrence in frame_occurrences],
                 )
-            manifest_path = output_directory / "samples.parquet"
-            connection.sql("SELECT * FROM samples ORDER BY sample_id").write_parquet(
-                str(manifest_path)
+            source_manifest = output_directory / "source-samples.parquet"
+            connection.sql("SELECT * FROM occurrences ORDER BY sample_id").write_parquet(
+                str(source_manifest)
             )
-        _write_new_json(
-            output_directory / "conflicts.json",
-            [
-                {
-                    "pixel_sha256": frame.pixel_sha256,
-                    "references": [asdict(reference) for reference in frame.references],
-                }
-                for frame in conflicts
-            ],
+        deduplication_report = deduplicate_manifest(
+            source_manifest,
+            output_directory / "deduplication",
+            settings=ManifestDeduplicationSettings(
+                sample_id_column="sample_id",
+                identity_columns=("pixel_sha256",),
+                conflict_columns=("hand_count",),
+            ),
         )
+        with duckdb.connect() as connection:
+            connection.read_parquet(
+                str(output_directory / "deduplication/samples.parquet")
+            ).create_view("representatives")
+            connection.read_parquet(
+                str(output_directory / "deduplication/members.parquet")
+            ).create_view("members")
+            connection.execute(
+                "CREATE TEMP TABLE provenance AS SELECT retained_sample_id, to_json(list(source_reference_json::JSON ORDER BY sample_id)) AS source_references_json FROM members GROUP BY retained_sample_id"
+            )
+            manifest_path = output_directory / "samples.parquet"
+            # Excluding contradictory teacher labels is this example's policy.
+            connection.sql(
+                "SELECT representatives.pixel_sha256 AS sample_id, representatives.pixel_sha256, image_path, image_sha256, width, height, hand_count, source_references_json FROM representatives JOIN provenance ON representatives.sample_id = provenance.retained_sample_id WHERE len(deduplication_conflicts) = 0 ORDER BY sample_id"
+            ).write_parquet(str(manifest_path))
+            conflicts = [
+                {"pixel_sha256": pixel_digest, "references": json.loads(references_json)}
+                for pixel_digest, references_json in connection.execute(
+                    "SELECT pixel_sha256, source_references_json FROM representatives JOIN provenance ON representatives.sample_id = provenance.retained_sample_id WHERE len(deduplication_conflicts) > 0 ORDER BY pixel_sha256"
+                ).fetchall()
+            ]
+        for conflict in conflicts:
+            (output_directory / f"images/{conflict['pixel_sha256']}.image").unlink()
+        _write_new_json(output_directory / "conflicts.json", conflicts)
         split_report = split_manifest(manifest_path, output_directory / "splits", settings=settings)
         report = PreparedDataset(
-            input_rows, len(unique_frames), len(retained), len(conflicts), output_directory
+            deduplication_report.input_rows,
+            deduplication_report.unique_samples,
+            deduplication_report.unique_samples - deduplication_report.conflicting_samples,
+            deduplication_report.conflicting_samples,
+            output_directory,
         )
         if _file_sha256(Path(__file__)) != preparation_code_sha256:
             raise ValueError("preparation code changed during the run")
         _write_new_json(
             output_directory / "preparation.json",
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "preparation_code_sha256": preparation_code_sha256,
                 "runtime": {
                     "hflow": __version__,
@@ -368,6 +392,10 @@ def prepare_dataset(
                 "deduplication": "sha256-exif-oriented-rgb-v1",
                 "row_limit_per_source": row_limit_per_source,
                 "sources": source_receipts,
+                "source_manifest_sha256": deduplication_report.input_sha256,
+                "deduplication_receipt_sha256": _file_sha256(
+                    output_directory / "deduplication/receipt.json"
+                ),
                 "input_rows": report.input_rows,
                 "unique_images": report.unique_images,
                 "retained_images": report.retained_images,
