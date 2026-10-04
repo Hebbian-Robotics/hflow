@@ -16,6 +16,7 @@ from hflow.dataset import (
     dataset_slug,
     default_dataset_sql,
 )
+from hflow.stage_execution import run_stages_directly
 from hflow.storage import BucketStorageRoot
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.workspace import Workspace
@@ -58,6 +59,38 @@ def _ingest(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestDefaultPolicy:
+    def test_a_check_that_errors_on_replay_excludes_its_episode(
+        self, tmp_path: Path, one_second_camera_less_episode: Path
+    ) -> None:
+        data_root = tmp_path / "data"
+        episode_uri = "episodes-in/episode_0001.mcap"
+        episode_path = data_root / episode_uri
+        episode_path.parent.mkdir(parents=True)
+        episode_path.write_bytes(one_second_camera_less_episode.read_bytes())
+        app = hflow.App("errored-check-dataset", data_root=data_root, default_checks=())
+        should_fail = False
+
+        @app.check(version="1")
+        async def flaky_check(ep: hflow.Episode) -> hflow.CheckResult:
+            if should_fail:
+                raise RuntimeError("simulated check failure")
+            return hflow.CheckResult(verdict=True)
+
+        asyncio.run(run_stages_directly(app, [episode_uri], hflow.RUN_PROFILES["full"]))
+        sql = f"SELECT episode_id FROM ({default_dataset_sql(app)})"
+        with hflow.open_catalog_connection(app.workspace.catalog_root) as connection:
+            assert len(connection.execute(sql).fetchall()) == 1
+
+        should_fail = True
+        with pytest.raises(RuntimeError, match="1 of 1 episodes had processing errors"):
+            asyncio.run(run_stages_directly(app, [episode_uri], {hflow.Stage.META}))
+
+        with hflow.open_catalog_connection(app.workspace.catalog_root) as connection:
+            # A noncritical error leaves the episode ok; the latest-step rule
+            # must withdraw it rather than relying on the critical-check gate.
+            assert connection.execute("SELECT status FROM episodes").fetchall() == [("ok",)]
+            assert connection.execute(sql).fetchall() == []
+
     def test_a_step_that_never_ran_excludes_its_episodes(
         self, ingested_project: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

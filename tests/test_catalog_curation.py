@@ -31,6 +31,7 @@ from hflow.catalog import (
 from hflow.checks import camera_frame_stats
 from hflow.cli import main as cli_main
 from hflow.curation import (
+    CheckCoverage,
     CurationReport,
     NonSingleSelectQueryError,
     curate,
@@ -38,6 +39,7 @@ from hflow.curation import (
     reject_non_single_select,
 )
 from hflow.format import CATALOG_FORMAT_VERSION
+from hflow.stage_execution import run_stages_directly
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import EpisodeStamps
 
@@ -716,6 +718,38 @@ def test_coverage_denominators(recorded_data_root: Path) -> None:
     assert coverage_by_check["camera_blackout"].fraction == 1.0  # failed still ran
     assert coverage_by_check["late_check"].fraction == 0.5  # skipped when quarantined
     assert "late_check: 1/2 (50%)" in report.summary()
+
+
+def test_a_check_that_errors_on_replay_loses_coverage(
+    tmp_path: Path, one_second_camera_less_episode: Path
+) -> None:
+    data_root = tmp_path / "data"
+    episode_uri = "episodes-in/episode_0001.mcap"
+    episode_path = data_root / episode_uri
+    episode_path.parent.mkdir(parents=True)
+    episode_path.write_bytes(one_second_camera_less_episode.read_bytes())
+    app = hflow.App("errored-check-coverage", data_root=data_root, default_checks=())
+    should_fail = False
+
+    @app.check(version="1")
+    async def flaky_check(ep: hflow.Episode) -> hflow.CheckResult:
+        if should_fail:
+            raise RuntimeError("simulated check failure")
+        return hflow.CheckResult(verdict=True)
+
+    asyncio.run(run_stages_directly(app, [episode_uri], hflow.RUN_PROFILES["full"]))
+    before = curate(app.workspace.catalog_root, "SELECT episode_id FROM episodes")
+    assert before.total_episodes == 1
+    assert before.coverage == [CheckCoverage("flaky_check", 1, 1)]
+
+    should_fail = True
+    with pytest.raises(RuntimeError, match="1 of 1 episodes had processing errors"):
+        asyncio.run(run_stages_directly(app, [episode_uri], {hflow.Stage.META}))
+
+    after = curate(app.workspace.catalog_root, "SELECT episode_id FROM episodes")
+    assert after.total_episodes == 1
+    assert after.row_count == 1
+    assert after.coverage == []
 
 
 def test_cli_curate(
