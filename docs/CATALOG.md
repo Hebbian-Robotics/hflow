@@ -449,13 +449,15 @@ hflow dataset create clean --print-sql   # see the policy, change nothing
 
 It selects the current generation of every source recording that is not
 quarantined, was produced by this pipeline's current transform, and has every
-registered step recorded at its current version, then writes two immutable
-files: `manifests/clean-<timestamp>.parquet` (the selection, which
+registered step's latest run settled at its current version, then writes two
+immutable files: `manifests/clean-<timestamp>.parquet` (the selection, which
 `hflow export snapshot --manifest` reads) and `manifests/clean-<timestamp>.json`
 (the effective SQL, the version stamps it required, the row count, and the
 coverage). Nothing is hidden -- `--print-sql` gives you the query to edit into
 a sharper one, and `--sql` runs yours instead while keeping the artifact and
-the provenance record.
+the provenance record. If a check or enrichment errors on replay, its earlier
+settled result no longer qualifies the episode, even when the step is noncritical
+and the episode's status remains `ok`.
 
 Two subtleties worth knowing if you write the equivalent yourself, because
 both of them silently return an empty dataset that reads like a policy
@@ -632,9 +634,10 @@ coverage (episodes each check ran on):
 
 A statistic over half a delivery must not look like a statistic over all of
 it: steps skip when an episode quarantines upstream, so partial coverage is
-normal, and it must be visible, not inferred. "Ran" means a `check_runs`
-status of `passed`, `failed`, or `measured` (a failed verdict still ran;
-`skipped` and `error` did not produce evidence).
+normal, and it must be visible, not inferred. "Ran" means the step's latest
+`check_runs_latest` status is `passed`, `failed`, or `measured` (a failed verdict
+still ran; `skipped` and `error` did not produce evidence). An error on replay
+withdraws the earlier run's coverage; the episode stays in the denominator.
 
 Registration order therefore decides how much evidence a quarantine costs. A
 critical check that quarantines skips every check registered **after** it, and

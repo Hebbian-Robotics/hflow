@@ -749,7 +749,7 @@ def _collect_coverage(connection: duckdb.DuckDBPyConnection) -> tuple[int, list[
     coverage_rows = connection.execute(
         f"""
         SELECT check_name, count(DISTINCT episode_id) AS episodes_ran
-        FROM check_runs WHERE status IN ({status_list})
+        FROM check_runs_latest WHERE status IN ({status_list})
           AND episode_id IN (SELECT episode_id FROM episodes_latest)
         GROUP BY check_name ORDER BY check_name
         """
