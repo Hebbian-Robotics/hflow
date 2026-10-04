@@ -18,7 +18,12 @@ import hflow
 from hflow.cli import main as cli_main
 from hflow.curation import open_catalog_connection
 from hflow.stage_execution import StageOutcome, run_stages_directly
-from hflow.stage_planning import OutstandingStages, StageSelection, plan_outstanding_stages
+from hflow.stage_planning import (
+    NoCanonicalEpisode,
+    OutstandingStages,
+    StageSelection,
+    plan_outstanding_stages,
+)
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
 EPISODE_URI = "episodes-in/episode_0001.mcap"
@@ -453,6 +458,53 @@ class TestARecordingSyncCouldNotCanonicalize:
         finally:
             connection.close()
         assert rows == [("sync", "source-unreadable")]
+
+    def test_reingest_of_corrupt_recording_is_not_reported_as_skipped_as_current(
+        self, project: Path, one_second_camera_less_episode: Path
+    ) -> None:
+        """A source that was previously ingested but fails sync on a re-run
+        must not be counted as skipped_as_current by later stages."""
+        ep2 = project / "data" / "episodes-in" / "episode_0002.mcap"
+        ep2.write_bytes(one_second_camera_less_episode.read_bytes())
+
+        # First run: both recordings succeed and settle.
+        first = _ingest(project, EPISODE_URI, "episodes-in/episode_0002.mcap")
+        assert _stage(first, hflow.Stage.SYNC).counts["processed"] == 2
+        assert _stage(first, hflow.Stage.META).counts["processed"] == 2
+
+        # Corrupt the second recording and re-ingest.
+        ep2.write_bytes(b"not an mcap file")
+        second = _ingest(project, EPISODE_URI, "episodes-in/episode_0002.mcap")
+
+        assert _stage(second, hflow.Stage.SYNC).counts["processed"] == 1
+        assert _stage(second, hflow.Stage.SYNC).counts["errors"] == 1
+        assert _stage(second, hflow.Stage.META).counts["errors"] == 0
+        # Only the intact episode is skipped as current; the corrupt recording
+        # failed sync and must not be reported as done.
+        assert _stage(second, hflow.Stage.META).skipped_as_current == 1
+
+    def test_failed_uri_keeps_no_canonical_episode_even_if_same_identity_succeeds(
+        self, project: Path
+    ) -> None:
+        """When multiple URIs resolve to the same source identity, a URI that failed
+        sync must still receive NoCanonicalEpisode rather than borrowing the success plan."""
+        from hflow.stage_execution import _plan_after_sync
+        from hflow.step_selection import ALL_REGISTERED_STEPS
+
+        _ingest(project, EPISODE_URI)
+        app = hflow.import_pipeline_application(str(project / "pipeline.py"))
+        uri1 = EPISODE_URI
+        uri2 = f"./{EPISODE_URI}"
+
+        plan = _plan_after_sync(
+            app,
+            [uri1, uri2],
+            [hflow.Stage.META],
+            ALL_REGISTERED_STEPS,
+            failed_sync_uris=[uri1],
+        )
+        assert isinstance(plan[uri1], NoCanonicalEpisode)
+        assert isinstance(plan[uri2], OutstandingStages)
 
     def test_the_command_exits_one_even_under_budget(
         self, project: Path, capsys: pytest.CaptureFixture[str]
