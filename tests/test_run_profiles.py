@@ -8,6 +8,7 @@ import duckdb
 import pytest
 
 import hflow
+from hflow.catalog import QuarantineHistory
 from hflow.curation import open_catalog_connection
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
@@ -371,3 +372,94 @@ def test_unknown_profile_errors_with_valid_names(source_episode: Path, tmp_path:
     app = _app_with_check_and_enrichment(tmp_path / "data")
     with pytest.raises(ValueError, match="metadata_backfill"):
         asyncio.run(app.process(source_episode, stages="everything"))
+
+
+def test_full_meta_run_preserves_quarantine_when_critical_check_crashes(
+    source_episode: Path, tmp_path: Path
+) -> None:
+    data_root = tmp_path / "data"
+    failing_app = hflow.App("crashed-gate", data_root=data_root, default_checks=())
+
+    @failing_app.check(version="1", name="safety_gate", critical=True)
+    async def rejecting_safety_gate(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(verdict=False)
+
+    @failing_app.enrich(version="1")
+    def downstream_label(ep: hflow.Episode) -> hflow.EnrichmentResult:
+        return hflow.EnrichmentResult(labels={"status": "ok"})
+
+    initial_report = asyncio.run(failing_app.process(source_episode))
+    assert initial_report.quarantined
+    assert initial_report.quarantine_tags == ["quarantined:safety_gate"]
+    episode_id = initial_report.catalog_entry.episode_id
+
+    with QuarantineHistory(failing_app.workspace.catalog_root) as history:
+        assert history.quarantine_tags(episode_id) == ["quarantined:safety_gate"]
+
+    # Re-running full meta where the critical check crashes with an infrastructure error
+    crashing_app = hflow.App("crashed-gate", data_root=data_root, default_checks=())
+
+    @crashing_app.check(version="2", name="safety_gate", critical=True)
+    async def crashing_safety_gate(ep: hflow.Episode) -> hflow.CheckResult:
+        raise RuntimeError("infrastructure connection failed")
+
+    @crashing_app.enrich(version="1")
+    def downstream_label_v2(ep: hflow.Episode) -> hflow.EnrichmentResult:
+        return hflow.EnrichmentResult(labels={"status": "ok"})
+
+    crashed_report = asyncio.run(crashing_app.process(source_episode, stages="full"))
+    assert crashed_report.checks[0].result is None
+    assert crashed_report.checks[0].status == hflow.CheckStatus.ERROR
+    # The check crashing is infrastructure, not data: prior quarantine is preserved
+    assert crashed_report.quarantined
+    assert crashed_report.quarantine_tags == ["quarantined:safety_gate"]
+    assert crashed_report.enrichments[0].status == hflow.CheckStatus.SKIPPED
+    assert isinstance(crashed_report.enrichments[0].not_run, hflow.SkippedByQuarantine)
+
+    with QuarantineHistory(crashing_app.workspace.catalog_root) as history:
+        assert history.quarantine_tags(episode_id) == ["quarantined:safety_gate"]
+
+    # Re-running full meta where the check actually produces a passing verdict clears it
+    passing_app = hflow.App("crashed-gate", data_root=data_root, default_checks=())
+
+    @passing_app.check(version="3", name="safety_gate", critical=True)
+    async def passing_safety_gate(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(verdict=True)
+
+    passing_report = asyncio.run(passing_app.process(source_episode, stages={hflow.Stage.META}))
+    assert not passing_report.quarantined
+    assert passing_report.quarantine_tags == []
+
+    with QuarantineHistory(passing_app.workspace.catalog_root) as history:
+        assert history.quarantine_tags(episode_id) is None
+
+
+def test_full_meta_run_drops_quarantine_for_unregistered_checks(
+    source_episode: Path, tmp_path: Path
+) -> None:
+    data_root = tmp_path / "data"
+    app_with_gate = hflow.App("drop-gate", data_root=data_root, default_checks=())
+
+    @app_with_gate.check(version="1", name="retired_gate", critical=True)
+    async def retired_gate(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(verdict=False)
+
+    initial_report = asyncio.run(app_with_gate.process(source_episode))
+    assert initial_report.quarantined
+    assert initial_report.quarantine_tags == ["quarantined:retired_gate"]
+    episode_id = initial_report.catalog_entry.episode_id
+
+    # New pipeline version drops `retired_gate` and registers `current_check`
+    app_without_gate = hflow.App("drop-gate", data_root=data_root, default_checks=())
+
+    @app_without_gate.check(version="1", name="current_check")
+    async def current_check(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"x": 1.0})
+
+    full_report = asyncio.run(app_without_gate.process(source_episode, stages={hflow.Stage.META}))
+    # Stale quarantine from the check no longer registered is dropped on full meta run
+    assert not full_report.quarantined
+    assert full_report.quarantine_tags == []
+
+    with QuarantineHistory(app_without_gate.workspace.catalog_root) as history:
+        assert history.quarantine_tags(episode_id) is None
