@@ -538,10 +538,14 @@ def _plan_after_sync(
         later_stages,
         _registered_step_selection=registered_step_selection,
     )
-    for identity in identity_by_uri.values():
-        if identity not in plans:
-            plans[identity] = NoCanonicalEpisode(source_identity=identity)
-    return {uri: plans[identity] for uri, identity in identity_by_uri.items()}
+    return {
+        uri: (
+            NoCanonicalEpisode(source_identity=identity)
+            if uri in failed_sync_uri_set
+            else plans.get(identity, NoCanonicalEpisode(source_identity=identity))
+        )
+        for uri, identity in identity_by_uri.items()
+    }
 
 
 def _record_failure_quietly(

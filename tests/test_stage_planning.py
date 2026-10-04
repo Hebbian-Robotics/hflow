@@ -18,7 +18,12 @@ import hflow
 from hflow.cli import main as cli_main
 from hflow.curation import open_catalog_connection
 from hflow.stage_execution import StageOutcome, run_stages_directly
-from hflow.stage_planning import OutstandingStages, StageSelection, plan_outstanding_stages
+from hflow.stage_planning import (
+    NoCanonicalEpisode,
+    OutstandingStages,
+    StageSelection,
+    plan_outstanding_stages,
+)
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
 EPISODE_URI = "episodes-in/episode_0001.mcap"
@@ -477,6 +482,29 @@ class TestARecordingSyncCouldNotCanonicalize:
         # Only the intact episode is skipped as current; the corrupt recording
         # failed sync and must not be reported as done.
         assert _stage(second, hflow.Stage.META).skipped_as_current == 1
+
+    def test_failed_uri_keeps_no_canonical_episode_even_if_same_identity_succeeds(
+        self, project: Path
+    ) -> None:
+        """When multiple URIs resolve to the same source identity, a URI that failed
+        sync must still receive NoCanonicalEpisode rather than borrowing the success plan."""
+        from hflow.stage_execution import _plan_after_sync
+        from hflow.step_selection import ALL_REGISTERED_STEPS
+
+        _ingest(project, EPISODE_URI)
+        app = hflow.import_pipeline_application(str(project / "pipeline.py"))
+        uri1 = EPISODE_URI
+        uri2 = f"./{EPISODE_URI}"
+
+        plan = _plan_after_sync(
+            app,
+            [uri1, uri2],
+            [hflow.Stage.META],
+            ALL_REGISTERED_STEPS,
+            failed_sync_uris=[uri1],
+        )
+        assert isinstance(plan[uri1], NoCanonicalEpisode)
+        assert isinstance(plan[uri2], OutstandingStages)
 
     def test_the_command_exits_one_even_under_budget(
         self, project: Path, capsys: pytest.CaptureFixture[str]
