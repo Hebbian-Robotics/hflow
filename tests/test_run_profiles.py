@@ -463,3 +463,69 @@ def test_full_meta_run_drops_quarantine_for_unregistered_checks(
 
     with QuarantineHistory(app_without_gate.workspace.catalog_root) as history:
         assert history.quarantine_tags(episode_id) is None
+
+
+def test_full_meta_run_drops_quarantine_when_check_becomes_non_critical_and_crashes(
+    source_episode: Path, tmp_path: Path
+) -> None:
+    data_root = tmp_path / "data"
+    critical_app = hflow.App("un-critical-gate", data_root=data_root, default_checks=())
+
+    @critical_app.check(version="1", name="safety_gate", critical=True)
+    async def rejecting_gate(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(verdict=False)
+
+    initial_report = asyncio.run(critical_app.process(source_episode))
+    assert initial_report.quarantined
+    assert initial_report.quarantine_tags == ["quarantined:safety_gate"]
+    episode_id = initial_report.catalog_entry.episode_id
+
+    # The pipeline changes the check to non-critical (critical=False), and it crashes
+    non_critical_app = hflow.App("un-critical-gate", data_root=data_root, default_checks=())
+
+    @non_critical_app.check(version="2", name="safety_gate", critical=False)
+    async def crashing_gate(ep: hflow.Episode) -> hflow.CheckResult:
+        raise RuntimeError("infrastructure connection failed")
+
+    full_report = asyncio.run(non_critical_app.process(source_episode, stages={hflow.Stage.META}))
+    assert full_report.checks[0].status == hflow.CheckStatus.ERROR
+    # Because safety_gate is no longer critical, the crash does not retain the quarantine tag
+    assert not full_report.quarantined
+    assert full_report.quarantine_tags == []
+
+    with QuarantineHistory(non_critical_app.workspace.catalog_root) as history:
+        assert history.quarantine_tags(episode_id) is None
+
+
+def test_full_meta_run_drops_quarantine_when_check_is_superseded(
+    source_episode: Path, tmp_path: Path
+) -> None:
+    data_root = tmp_path / "data"
+
+    initial_app = hflow.App("superseded-gate", data_root=data_root, default_checks=())
+
+    @initial_app.check(version="1", name="timestamp_regularity", critical=True)
+    async def bad_timestamps(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(verdict=False)
+
+    initial_report = asyncio.run(initial_app.process(source_episode))
+    assert initial_report.quarantined
+    assert initial_report.quarantine_tags == ["quarantined:timestamp_regularity"]
+    episode_id = initial_report.catalog_entry.episode_id
+
+    # Pipeline step supersedes default timestamp_regularity check
+    revised_app = hflow.App("superseded-gate", data_root=data_root)
+
+    @revised_app.check(version="1")
+    async def timestamps(ep: hflow.Episode) -> hflow.CheckResult:
+        return await hflow.checks.timestamp_regularity(ep, tolerance_s=0.001)
+
+    full_report = asyncio.run(revised_app.process(source_episode, stages={hflow.Stage.META}))
+    by_name = {run.check.name: run for run in full_report.checks}
+    assert by_name["timestamp_regularity"].status is hflow.CheckStatus.SUPERSEDED
+    # Superseded default did not error; its prior quarantine tag is not retained
+    assert not full_report.quarantined
+    assert full_report.quarantine_tags == []
+
+    with QuarantineHistory(revised_app.workspace.catalog_root) as history:
+        assert history.quarantine_tags(episode_id) is None

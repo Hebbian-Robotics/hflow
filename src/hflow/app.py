@@ -2741,16 +2741,20 @@ class App:
             # a selected check's prior quarantine only when that check actually
             # produced a result. Unselected and errored gates retain their last
             # known state, so selecting one check cannot silently clear another
-            # gate. On a full run, carry over only the quarantine tags for checks
-            # that ran in this invocation and errored, so an infrastructure crash
-            # does not silently clear an existing quarantine while still dropping
-            # tags for checks no longer registered. No catalog row means no known
-            # quarantine.
-            errored_check_names = {run.check.name for run in report.checks if run.result is None}
+            # gate. On a full run, carry over only the quarantine tags for critical
+            # checks that ran in this invocation and errored, so an infrastructure
+            # crash does not silently clear an existing quarantine while still dropping
+            # tags for checks no longer registered, checks that were superseded, or
+            # checks changed to non-critical. No catalog row means no known quarantine.
+            errored_critical_check_names = {
+                run.check.name
+                for run in report.checks
+                if run.check.critical and run.status is CheckStatus.ERROR
+            }
             if (
                 Stage.META not in enabled_stages
                 or isinstance(registered_step_selection, SelectedRegisteredSteps)
-                or errored_check_names
+                or errored_critical_check_names
             ):
                 if quarantine_history is not None:
                     carried_tags = quarantine_history.quarantine_tags(episode_id)
@@ -2777,7 +2781,7 @@ class App:
                             tag
                             for tag in carried_tags
                             if tag.startswith("quarantined:")
-                            and tag.removeprefix("quarantined:") in errored_check_names
+                            and tag.removeprefix("quarantined:") in errored_critical_check_names
                         ]
                     report.quarantine_tags = list(
                         dict.fromkeys([*retained_tags, *report.quarantine_tags])
