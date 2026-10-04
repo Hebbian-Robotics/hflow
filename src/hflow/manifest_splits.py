@@ -74,8 +74,8 @@ class ManifestSplitSettings:
             raise ValueError("group_columns must be a nonempty tuple")
         if any(not isinstance(column, str) or not column for column in self.group_columns):
             raise ValueError("group columns must be nonempty strings")
-        if len(set(self.group_columns)) != len(self.group_columns):
-            raise ValueError("group_columns must be distinct")
+        if len({column.casefold() for column in self.group_columns}) != len(self.group_columns):
+            raise ValueError("group_columns must be distinct ignoring case")
         if (
             not isinstance(self.partitions, tuple)
             or len(self.partitions) < 2
@@ -142,6 +142,26 @@ def _quoted_identifier(column: str) -> str:
 def _file_sha256(path: Path) -> str:
     with path.open("rb") as source:
         return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+def _reject_ambiguous_column_names(
+    connection: duckdb.DuckDBPyConnection, input_snapshot: Path
+) -> None:
+    # DuckDB renames case-colliding top-level columns when it opens the file, so
+    # inspect the original names before the view exists.
+    source_columns: list[str] = []
+    nested_fields_remaining = 0
+    schema_fields = connection.execute(
+        "SELECT name, num_children FROM parquet_schema(?)", [str(input_snapshot)]
+    ).fetchall()
+    for column_name, child_count in schema_fields[1:]:
+        if nested_fields_remaining:
+            nested_fields_remaining += (child_count or 0) - 1
+        else:
+            source_columns.append(column_name)
+            nested_fields_remaining = child_count or 0
+    if len({column.casefold() for column in source_columns}) != len(source_columns):
+        raise ValueError("manifest column names must be distinct ignoring case")
 
 
 def _read_sample_identities(
@@ -285,6 +305,7 @@ def split_manifest(
         shutil.copyfile(source_manifest, input_snapshot)
         input_sha256 = _file_sha256(input_snapshot)
         with duckdb.connect() as connection:
+            _reject_ambiguous_column_names(connection, input_snapshot)
             connection.read_parquet(str(input_snapshot)).create_view("source_manifest")
             samples = _read_sample_identities(connection, settings)
             assignments, group_quotas = _plan_assignments(samples, settings)

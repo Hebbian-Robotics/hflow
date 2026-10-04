@@ -6,6 +6,8 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import duckdb
+import pyarrow as arrow
+import pyarrow.parquet as parquet
 import pytest
 
 from hflow import ManifestPartition, ManifestSplitSettings, split_manifest
@@ -180,6 +182,8 @@ def test_partition_values_reject_unsafe_names_and_invalid_fractions(
 def test_policy_rejects_ambiguous_relationships_and_fractions() -> None:
     with pytest.raises(ValueError, match="distinct"):
         ManifestSplitSettings("sample_id", ("recording", "recording"))
+    with pytest.raises(ValueError, match="distinct ignoring case"):
+        ManifestSplitSettings("sample_id", ("recording", "RECORDING"))
     with pytest.raises(ValueError, match="sum to one"):
         ManifestSplitSettings(
             "sample_id",
@@ -192,3 +196,25 @@ def test_policy_rejects_ambiguous_relationships_and_fractions() -> None:
             ("recording",),
             (ManifestPartition("train", 0.5), ManifestPartition("train", 0.5)),
         )
+
+
+def test_case_colliding_source_columns_are_refused_not_renamed(tmp_path: Path) -> None:
+    source = tmp_path / "ambiguous.parquet"
+    parquet.write_table(
+        arrow.table(
+            {
+                "sample_id": ["a", "b", "c"],
+                "recording_id": ["r1", "r2", "r3"],
+                "metadata": ["m1", "m2", "m3"],
+                "METADATA": ["M1", "M2", "M3"],
+            }
+        ),
+        source,
+    )
+    with pytest.raises(ValueError, match="distinct ignoring case"):
+        split_manifest(
+            source,
+            tmp_path / "split",
+            settings=ManifestSplitSettings("sample_id", ("recording_id",)),
+        )
+    assert not (tmp_path / "split").exists()
