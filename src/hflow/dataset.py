@@ -179,23 +179,20 @@ def default_dataset_sql(application: "App") -> str:
        transform change does not mix two canonical behaviors in one dataset.
     2. **Status is ``ok``.** Excludes two different things. ``quarantined`` is
        the pipeline's own critical checks rejecting the episode. ``unverified``
-       is a critical check that crashed, so nobody actually checked it, and
-       that is the half rule 3 cannot see: a crash leaves no settled row, but
-       an EARLIER settled run of the same check satisfies rule 3 on its own,
-       and the episode would otherwise land in the dataset on the strength of
-       a result that a later run withdrew.
-    3. **Every registered step settled, at its current version.** A check added
-       last week that has not been backfilled leaves its episodes out rather
-       than silently reporting a dataset with a hole in it.
+       is a critical check that crashed, so nobody actually checked it.
+    3. **Every registered step's latest run settled, at its current version.**
+       A check added last week that has not been backfilled leaves its episodes
+       out rather than silently reporting a dataset with a hole in it. A later
+       error withdraws an earlier settled result, including for noncritical
+       checks and enrichments whose errors leave the episode's status ``ok``.
     4. **One row per source recording**, which the ``episodes`` view already
        guarantees, so a reprocessed recording contributes its current
        generation and not both.
 
-    Rules 2 and 3 overlap without either being redundant. An episode whose
-    critical check ONLY ever crashed is dropped by rule 3, which needs a
-    settled row and never gets one, and rule 2 agrees. An episode that settled
-    once and crashed later is dropped by rule 2 alone. Neither rule subsumes
-    the other, so both stay.
+    Rules 2 and 3 serve different purposes. A critical check that rejects
+    an episode still settled with ``failed``, so rule 2 excludes what rule 3
+    would allow. A noncritical check that errors leaves the episode's status
+    ``ok``, so rule 3 excludes what rule 2 would allow.
 
     Rule 3 has two traps in it, and both of them yield an EMPTY dataset that
     looks like a policy decision:
@@ -204,9 +201,9 @@ def default_dataset_sql(application: "App") -> str:
       built-in library is evidence-only and records ``measured``, so a
       ``status = 'passed'`` reading selects nothing at all.
     - "Settled" is wider than "ran", because a default check the pipeline
-      supersedes records ``skipped`` on every episode forever -- and wrapping
+      supersedes records ``superseded`` on every episode forever -- and wrapping
       a built-in to configure it is the documented way to configure one, so
-      reading ``skipped`` as an unfilled hole empties the dataset of the
+      reading ``superseded`` as an unfilled hole empties the dataset of the
       pipelines most likely to want it. See :data:`hflow.steps.SETTLED_STATUSES`
       for why that is safe here and where the two differ.
     """
