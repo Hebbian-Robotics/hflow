@@ -391,6 +391,7 @@ def test_full_meta_run_preserves_quarantine_when_critical_check_crashes(
     initial_report = asyncio.run(failing_app.process(source_episode))
     assert initial_report.quarantined
     assert initial_report.quarantine_tags == ["quarantined:safety_gate"]
+    assert initial_report.catalog_entry is not None
     episode_id = initial_report.catalog_entry.episode_id
 
     with QuarantineHistory(failing_app.workspace.catalog_root) as history:
@@ -447,6 +448,7 @@ def test_full_meta_run_drops_quarantine_for_unregistered_checks(
     initial_report = asyncio.run(app_with_gate.process(source_episode))
     assert initial_report.quarantined
     assert initial_report.quarantine_tags == ["quarantined:retired_gate"]
+    assert initial_report.catalog_entry is not None
     episode_id = initial_report.catalog_entry.episode_id
 
     # New pipeline version drops `retired_gate` and registers `current_check`
@@ -478,6 +480,7 @@ def test_full_meta_run_drops_quarantine_when_check_becomes_non_critical_and_cras
     initial_report = asyncio.run(critical_app.process(source_episode))
     assert initial_report.quarantined
     assert initial_report.quarantine_tags == ["quarantined:safety_gate"]
+    assert initial_report.catalog_entry is not None
     episode_id = initial_report.catalog_entry.episode_id
 
     # The pipeline changes the check to non-critical (critical=False), and it crashes
@@ -511,6 +514,7 @@ def test_full_meta_run_drops_quarantine_when_check_is_superseded(
     initial_report = asyncio.run(initial_app.process(source_episode))
     assert initial_report.quarantined
     assert initial_report.quarantine_tags == ["quarantined:timestamp_regularity"]
+    assert initial_report.catalog_entry is not None
     episode_id = initial_report.catalog_entry.episode_id
 
     # Pipeline step supersedes default timestamp_regularity check
