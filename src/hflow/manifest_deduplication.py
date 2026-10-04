@@ -11,6 +11,7 @@ from pathlib import Path
 
 import duckdb
 
+from hflow._manifest_parquet_schema import _reject_ambiguous_column_names
 from hflow._version import __version__
 
 _RESERVED_COLUMNS = {"deduplication_conflicts", "retained_sample_id"}
@@ -127,20 +128,7 @@ def deduplicate_manifest(
         shutil.copyfile(source_manifest, input_snapshot)
         input_sha256 = _file_sha256(input_snapshot)
         with duckdb.connect() as connection:
-            # Check original top-level names before DuckDB can rename ambiguous fields.
-            source_columns: list[str] = []
-            nested_fields_remaining = 0
-            schema_fields = connection.execute(
-                "SELECT name, num_children FROM parquet_schema(?)", [str(input_snapshot)]
-            ).fetchall()
-            for column_name, child_count in schema_fields[1:]:
-                if nested_fields_remaining:
-                    nested_fields_remaining += (child_count or 0) - 1
-                else:
-                    source_columns.append(column_name)
-                    nested_fields_remaining = child_count or 0
-            if len({column.casefold() for column in source_columns}) != len(source_columns):
-                raise ValueError("manifest column names must be distinct ignoring case")
+            _reject_ambiguous_column_names(connection, input_snapshot)
             connection.read_parquet(str(input_snapshot)).create_view("source_manifest")
             _validate_manifest(connection, settings)
             sample_id = _quoted_column(settings.sample_id_column)

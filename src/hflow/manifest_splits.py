@@ -19,6 +19,7 @@ from pathlib import Path
 
 import duckdb
 
+from hflow._manifest_parquet_schema import _reject_ambiguous_column_names
 from hflow._version import __version__
 
 MANIFEST_SPLIT_VERSION = 1
@@ -74,8 +75,8 @@ class ManifestSplitSettings:
             raise ValueError("group_columns must be a nonempty tuple")
         if any(not isinstance(column, str) or not column for column in self.group_columns):
             raise ValueError("group columns must be nonempty strings")
-        if len(set(self.group_columns)) != len(self.group_columns):
-            raise ValueError("group_columns must be distinct")
+        if len({column.casefold() for column in self.group_columns}) != len(self.group_columns):
+            raise ValueError("group_columns must be distinct ignoring case")
         if (
             not isinstance(self.partitions, tuple)
             or len(self.partitions) < 2
@@ -285,6 +286,7 @@ def split_manifest(
         shutil.copyfile(source_manifest, input_snapshot)
         input_sha256 = _file_sha256(input_snapshot)
         with duckdb.connect() as connection:
+            _reject_ambiguous_column_names(connection, input_snapshot)
             connection.read_parquet(str(input_snapshot)).create_view("source_manifest")
             samples = _read_sample_identities(connection, settings)
             assignments, group_quotas = _plan_assignments(samples, settings)
