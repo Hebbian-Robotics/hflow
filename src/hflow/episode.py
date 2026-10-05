@@ -421,6 +421,7 @@ class Episode:
         self._explicit_workdir = Path(workdir) if workdir is not None else None
         self._temp_workdir: tempfile.TemporaryDirectory[str] | None = None
         self._channel_data_by_id: dict[int, ChannelData] = {}
+        self._channel_log_times_by_id: dict[int, np.ndarray] = {}
         # Source frame rate per camera topic, recorded by video() for frames().
         self._video_fps: dict[str, float] = {}
 
@@ -587,12 +588,17 @@ class Episode:
         return data
 
     def _channel_log_times(self, channel_id: int) -> np.ndarray:
-        """Collect log times without retaining the channel's encoded payloads."""
+        """Cache log times without retaining the channel's encoded payloads."""
         cached = self._channel_data_by_id.get(channel_id)
         if cached is not None:
             return cached.timestamps
+        cached_log_times = self._channel_log_times_by_id.get(channel_id)
+        if cached_log_times is not None:
+            return cached_log_times
         parts = [batch.log_times for batch in self._reader.iter_batches(channel_ids=[channel_id])]
-        return np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
+        log_times = np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
+        self._channel_log_times_by_id[channel_id] = log_times
+        return log_times
 
     def iter_decoded_batches(
         self,

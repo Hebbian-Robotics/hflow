@@ -442,14 +442,19 @@ def test_canonical_episode_accessors(
         assert abs(frames[1].log_time_ns - frames[0].log_time_ns - 466_666_667) <= 1
         assert episode._channel_data_by_id == cached_channels
 
+        def refuse_cached_read(*args: Any, **kwargs: Any) -> None:
+            pytest.fail("repeated frame extraction must reuse cached timestamps")
+
+        with monkeypatch.context() as cached_patch:
+            cached_patch.setattr(episode._reader, "iter_batches", refuse_cached_read)
+            assert episode.frames("overhead_cam", fps=2.0) == frames
+            assert episode._channel_data_by_id == cached_channels
+
         camera_topic = next(topic for topic in episode.cameras if "overhead_cam" in topic)
         timestamps = episode.channel(camera_topic).timestamps
         assert [frame.log_time_ns for frame in frames] == [
             int(timestamps[int(index * 15 / 2)]) for index in range(len(frames))
         ]
-
-        def refuse_cached_read(*args: Any, **kwargs: Any) -> None:
-            pytest.fail("frame timestamps must reuse an already cached channel")
 
         monkeypatch.setattr(episode._reader, "iter_batches", refuse_cached_read)
         assert episode.frames("overhead_cam", fps=2.0) == frames
@@ -469,13 +474,13 @@ def test_canonical_episode_extracts_exact_source_frame_indices(
         expected_log_times = reference.channel(camera_topic).timestamps[selected_frame_indices]
 
     with hflow.Episode(report.canonical_path) as episode:
+
+        def refuse_cached_read(*args: Any, **kwargs: Any) -> None:
+            pytest.fail("frame extraction must reuse cached timestamps")
+
         if preload_channel:
             episode.channel(camera_topic)
             episode.video(camera_topic)
-
-            def refuse_cached_read(*args: Any, **kwargs: Any) -> None:
-                pytest.fail("frame timestamps must reuse an already cached channel")
-
             monkeypatch.setattr(episode._reader, "iter_batches", refuse_cached_read)
         cached_channels = dict(episode._channel_data_by_id)
 
@@ -483,6 +488,7 @@ def test_canonical_episode_extracts_exact_source_frame_indices(
             camera_topic,
             frame_indices=selected_frame_indices,
         )
+        monkeypatch.setattr(episode._reader, "iter_batches", refuse_cached_read)
 
         numpy_frame_indices = [
             np.int32(0),
