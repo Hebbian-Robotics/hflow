@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
+import numpy as np
+
 from hflow.ffmpeg import ffmpeg_path
 
 
@@ -146,7 +148,7 @@ def estimate_fps_from_streaming_log_times(log_times_ns: Iterable[int], *, topic:
 
 
 def source_log_times_for_sampled_frames(
-    source_timestamps_ns: Sequence[int],
+    source_timestamps_ns: Sequence[int] | np.ndarray,
     *,
     source_fps: float,
     sample_fps: float,
@@ -168,7 +170,7 @@ def source_log_times_for_sampled_frames(
     than raising: ffmpeg may emit one tick beyond it, and a frame it did
     produce must still be attributable.
     """
-    if not source_timestamps_ns:
+    if len(source_timestamps_ns) == 0:
         raise ValueError("cannot map sampled frames onto an empty source stream")
     if source_fps <= 0 or sample_fps <= 0:
         raise ValueError(
