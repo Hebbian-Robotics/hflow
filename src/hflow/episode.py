@@ -421,6 +421,7 @@ class Episode:
         self._explicit_workdir = Path(workdir) if workdir is not None else None
         self._temp_workdir: tempfile.TemporaryDirectory[str] | None = None
         self._channel_data_by_id: dict[int, ChannelData] = {}
+        self._channel_log_times_by_id: dict[int, np.ndarray] = {}
         # Source frame rate per camera topic, recorded by video() for frames().
         self._video_fps: dict[str, float] = {}
 
@@ -585,6 +586,19 @@ class Episode:
         )
         self._channel_data_by_id[info.channel_id] = data
         return data
+
+    def _channel_log_times(self, channel_id: int) -> np.ndarray:
+        """Cache log times without retaining the channel's encoded payloads."""
+        cached = self._channel_data_by_id.get(channel_id)
+        if cached is not None:
+            return cached.timestamps
+        cached_log_times = self._channel_log_times_by_id.get(channel_id)
+        if cached_log_times is not None:
+            return cached_log_times
+        parts = [batch.log_times for batch in self._reader.iter_batches(channel_ids=[channel_id])]
+        log_times = np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
+        self._channel_log_times_by_id[channel_id] = log_times
+        return log_times
 
     def iter_decoded_batches(
         self,
@@ -769,7 +783,7 @@ class Episode:
 
         # Map each extracted frame back to the source message it came from.
         log_times_ns = video_module.source_log_times_for_sampled_frames(
-            self.channel(topic).timestamps.tolist(),
+            self._channel_log_times(self._resolve_channel_info(topic).channel_id),
             source_fps=self._video_fps[topic],
             sample_fps=fps,
             start_s=window_start_s,
@@ -810,12 +824,12 @@ class Episode:
         topic = self._resolve_camera(camera)
         if not selected_frame_indices:
             return []
-        camera_channel = self.channel(topic)
+        camera_log_times = self._channel_log_times(self._resolve_channel_info(topic).channel_id)
         final_frame_index = selected_frame_indices[-1]
-        if final_frame_index >= len(camera_channel):
+        if final_frame_index >= len(camera_log_times):
             raise IndexError(
                 f"frame index {final_frame_index} is outside camera {topic!r}, "
-                f"which contains {len(camera_channel)} frames"
+                f"which contains {len(camera_log_times)} frames"
             )
 
         mp4_path = self.video(topic)
@@ -893,7 +907,7 @@ class Episode:
         return [
             ExtractedFrame(
                 path=frame_path,
-                log_time_ns=int(camera_channel.timestamps[frame_index]),
+                log_time_ns=int(camera_log_times[frame_index]),
             )
             for frame_index, frame_path in zip(
                 selected_frame_indices, expected_frame_paths, strict=True

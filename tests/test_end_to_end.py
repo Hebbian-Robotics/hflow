@@ -415,8 +415,10 @@ def test_builtin_checks_found_the_injected_defects(
     assert 5.0 < black_pct < 25.0
 
 
+@pytest.mark.requires_system_ffmpeg
 def test_canonical_episode_accessors(
     report_and_app: tuple[hflow.TestReport, hflow.App],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     report, _app = report_and_app
     with hflow.Episode(report.canonical_path) as episode:
@@ -430,6 +432,7 @@ def test_canonical_episode_accessors(
         mp4 = episode.video("overhead_cam")
         assert mp4.is_file() and mp4.stat().st_size > 0
 
+        cached_channels = dict(episode._channel_data_by_id)
         frames = episode.frames("overhead_cam", fps=2.0)
         assert 3 <= len(frames) <= 5  # ~2s at 2 fps
         assert frames[0].path.read_bytes()[:2] == b"\xff\xd8"
@@ -437,22 +440,55 @@ def test_canonical_episode_accessors(
         # emits the frame visible then -- source frame floor(0.5 * 15) = 7,
         # i.e. round(7e9/15) ns after the first frame.
         assert abs(frames[1].log_time_ns - frames[0].log_time_ns - 466_666_667) <= 1
+        assert episode._channel_data_by_id == cached_channels
+
+        def refuse_cached_read(*args: Any, **kwargs: Any) -> None:
+            pytest.fail("repeated frame extraction must reuse cached timestamps")
+
+        with monkeypatch.context() as cached_patch:
+            cached_patch.setattr(episode._reader, "iter_batches", refuse_cached_read)
+            assert episode.frames("overhead_cam", fps=2.0) == frames
+            assert episode._channel_data_by_id == cached_channels
+
+        camera_topic = next(topic for topic in episode.cameras if "overhead_cam" in topic)
+        timestamps = episode.channel(camera_topic).timestamps
+        assert [frame.log_time_ns for frame in frames] == [
+            int(timestamps[int(index * 15 / 2)]) for index in range(len(frames))
+        ]
+
+        monkeypatch.setattr(episode._reader, "iter_batches", refuse_cached_read)
+        assert episode.frames("overhead_cam", fps=2.0) == frames
 
 
 @pytest.mark.requires_system_ffmpeg
+@pytest.mark.parametrize("preload_channel", [False, True])
 def test_canonical_episode_extracts_exact_source_frame_indices(
     report_and_app: tuple[hflow.TestReport, hflow.App],
+    preload_channel: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     report, _app = report_and_app
     selected_frame_indices = [0, 1, 2, 7, 8, 29]
+    with hflow.Episode(report.canonical_path) as reference:
+        camera_topic = next(topic for topic in reference.cameras if "overhead_cam" in topic)
+        expected_log_times = reference.channel(camera_topic).timestamps[selected_frame_indices]
+
     with hflow.Episode(report.canonical_path) as episode:
-        camera_topic = next(topic for topic in episode.cameras if "overhead_cam" in topic)
-        expected_log_times = episode.channel(camera_topic).timestamps[selected_frame_indices]
+
+        def refuse_cached_read(*args: Any, **kwargs: Any) -> None:
+            pytest.fail("frame extraction must reuse cached timestamps")
+
+        if preload_channel:
+            episode.channel(camera_topic)
+            episode.video(camera_topic)
+            monkeypatch.setattr(episode._reader, "iter_batches", refuse_cached_read)
+        cached_channels = dict(episode._channel_data_by_id)
 
         selected_frames = episode.frames_at_indices(
             camera_topic,
             frame_indices=selected_frame_indices,
         )
+        monkeypatch.setattr(episode._reader, "iter_batches", refuse_cached_read)
 
         numpy_frame_indices = [
             np.int32(0),
@@ -473,6 +509,7 @@ def test_canonical_episode_extracts_exact_source_frame_indices(
             frame.path.read_bytes() for frame in selected_frames
         ]
         assert numpy_frames == selected_frames
+        assert episode._channel_data_by_id == cached_channels
         assert all(frame.path.read_bytes()[:2] == b"\xff\xd8" for frame in selected_frames)
         assert (
             episode.frames_at_indices(
@@ -500,13 +537,9 @@ def test_canonical_episode_sparse_selection_past_argument_limit_uses_filter_file
     with hflow.Episode(report.canonical_path) as episode:
         camera_topic = next(topic for topic in episode.cameras if "overhead_cam" in topic)
 
-        class MockChannel:
-            timestamps = np.arange(40000, dtype=np.int64)
-
-            def __len__(self) -> int:
-                return len(self.timestamps)
-
-        monkeypatch.setattr(episode, "channel", lambda topic: MockChannel())
+        monkeypatch.setattr(
+            episode, "_channel_log_times", lambda channel_id: np.arange(40000, dtype=np.int64)
+        )
 
         executed_command: list[str] = []
 
