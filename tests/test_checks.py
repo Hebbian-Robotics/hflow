@@ -257,6 +257,77 @@ def test_timestamp_regularity_ignores_empty_camera_for_sync_offsets(
     assert not any("empty_cam" in key for key in result.measurements if key.startswith("sync/"))
 
 
+def test_timestamp_regularity_ignores_empty_reference_for_sync_offsets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
+    from mcap_protobuf.schema import build_file_descriptor_set
+
+    path = tmp_path / "empty_reference.mcap"
+    with path.open("wb") as stream:
+        writer = StockWriter(stream, chunk_size=64 * 1024, compression=CompressionType.NONE)
+        writer.start()
+        schema_id = writer.register_schema(
+            name="foxglove.CompressedVideo",
+            encoding="protobuf",
+            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
+        )
+        camera = writer.register_channel(
+            topic="/cam1", schema_id=schema_id, message_encoding="protobuf"
+        )
+        empty_joints = writer.register_channel(
+            topic="/joint_states", schema_id=0, message_encoding="json"
+        )
+        populated_wrench = writer.register_channel(
+            topic="/wrench", schema_id=0, message_encoding="json"
+        )
+
+        # MCAP summary statistics report message_count >= 2 for the empty state
+        # stream, but 0 actual records were written to disk.
+        original_write = Statistics.write
+
+        def write_statistics(statistics: Statistics, builder: RecordBuilder) -> None:
+            original_write(
+                replace(
+                    statistics,
+                    channel_message_counts={camera: 2, empty_joints: 10, populated_wrench: 2},
+                ),
+                builder,
+            )
+
+        monkeypatch.setattr(Statistics, "write", write_statistics)
+        for timestamp_ns in (1_000_000_000, 2_000_000_000):
+            message = CompressedVideo()
+            message.timestamp.FromNanoseconds(timestamp_ns)
+            message.data = b"x"
+            message.format = "h264"
+            writer.add_message(camera, timestamp_ns, message.SerializeToString(), timestamp_ns)
+            writer.add_message(populated_wrench, timestamp_ns, b'{"fx": 0}', timestamp_ns)
+        writer.finish()
+
+    # Case 1: An empty reference state stream is skipped in favor of a populated one
+    with hflow.Episode(path) as episode:
+        assert episode.topics["/joint_states"].message_count == 10
+        assert episode.channel("/joint_states").timestamps.size == 0
+        result = asyncio.run(
+            timestamp_regularity(episode, topics=["/cam1", "/joint_states", "/wrench"])
+        )
+
+    assert result.measurements["/joint_states/period_sample_count"] == 0
+    assert result.measurements["sync//cam1~/wrench/start_offset_s"] == 0.0
+    assert result.measurements["sync//cam1~/wrench/end_offset_s"] == 0.0
+    assert not any("joint_states" in key for key in result.measurements if key.startswith("sync/"))
+
+    # Case 2: When all state streams are empty, no sync offset keys are produced
+    with hflow.Episode(path) as episode:
+        result_no_state = asyncio.run(
+            timestamp_regularity(episode, topics=["/cam1", "/joint_states"])
+        )
+
+    assert result_no_state.measurements["/joint_states/period_sample_count"] == 0
+    assert not any(key.startswith("sync/") for key in result_no_state.measurements)
+
+
 def test_joint_discontinuity_finds_the_injected_jump(jittery_episode: hflow.Episode) -> None:
     result = asyncio.run(joint_discontinuity(jittery_episode, velocity_limit=3.0))
     violation_count = result.measurements["/joint_states/violation_count"]
