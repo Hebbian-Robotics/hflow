@@ -103,7 +103,11 @@ class TestLanePlanning:
             },
         )
         assert len(batches) == 2
-        batch_by_steps = {tuple(b["step_names"]): b["items"] for b in batches}
+        batch_by_steps: dict[tuple[str, ...], list[str]] = {}
+        for b in batches:
+            step_names = b.get("step_names")
+            assert step_names is not None
+            batch_by_steps[tuple(step_names)] = b["items"]
         assert batch_by_steps[("check_1",)] == ["a.mcap", "b.mcap"]
         assert batch_by_steps[("check_2",)] == ["c.mcap"]
 
