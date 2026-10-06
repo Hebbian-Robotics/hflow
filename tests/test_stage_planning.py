@@ -851,3 +851,112 @@ class TestTheRenderedPlanTask:
             plan([EPISODE_URI], "batch", None, "false")
 
         assert excinfo.value.code == 99
+
+
+class TestGranularStepPlanningForMeta:
+    """Adding one check reruns only that check on already-settled episodes,
+    and a quarantined episode is not rerun."""
+
+    def test_adding_one_check_reruns_only_that_check_and_skips_quarantined_episode(
+        self, project: Path, one_second_camera_less_episode: Path
+    ) -> None:
+        ep2_path = project / "data" / "episodes-in" / "episode_0002.mcap"
+        ep2_path.write_bytes(one_second_camera_less_episode.read_bytes())
+        ep2_uri = "episodes-in/episode_0002.mcap"
+
+        initial_pipeline = """
+import hflow
+
+app = hflow.App("granular-demo", default_checks=())
+
+@app.check(version="1")
+async def initial_check(ep: hflow.Episode) -> hflow.CheckResult:
+    return hflow.CheckResult(measurements={"initial_ran": 1.0})
+
+@app.check(version="1", critical=True)
+async def gate_check(ep: hflow.Episode) -> hflow.CheckResult:
+    verdict = "episode_0002" not in str(ep.path)
+    return hflow.CheckResult(measurements={"gate_ran": 1.0}, verdict=verdict)
+"""
+        (project / "pipeline.py").write_text(initial_pipeline)
+        first = _ingest(project, EPISODE_URI, ep2_uri)
+        assert _stage(first, hflow.Stage.META).counts["processed"] == 1
+        assert _stage(first, hflow.Stage.META).counts["quarantined"] == 1
+
+        updated_pipeline = """
+import hflow
+
+app = hflow.App("granular-demo", default_checks=())
+
+@app.check(version="1")
+async def initial_check(ep: hflow.Episode) -> hflow.CheckResult:
+    return hflow.CheckResult(measurements={"initial_ran": 1.0})
+
+@app.check(version="1", critical=True)
+async def gate_check(ep: hflow.Episode) -> hflow.CheckResult:
+    verdict = "episode_0002" not in str(ep.path)
+    return hflow.CheckResult(measurements={"gate_ran": 1.0}, verdict=verdict)
+
+@app.check(version="1")
+async def newly_added_check(ep: hflow.Episode) -> hflow.CheckResult:
+    return hflow.CheckResult(measurements={"new_ran": 1.0})
+"""
+        (project / "pipeline.py").write_text(updated_pipeline)
+        second = _ingest(project, EPISODE_URI, ep2_uri)
+
+        meta_outcome = _stage(second, hflow.Stage.META)
+        assert meta_outcome.counts["processed"] == 1
+        assert meta_outcome.counts["quarantined"] == 0
+        assert meta_outcome.skipped_as_current == 1
+
+        connection = open_catalog_connection(project / "data" / "catalog")
+        try:
+            measurements = connection.execute(
+                "SELECT check_name, count(*) FROM measurements_latest "
+                "GROUP BY check_name ORDER BY check_name"
+            ).fetchall()
+            counts_by_check = dict(measurements)
+            assert counts_by_check["initial_check"] == 2
+            assert counts_by_check["gate_check"] == 2
+            assert counts_by_check["newly_added_check"] == 1
+        finally:
+            connection.close()
+
+    def test_retuning_critical_check_reruns_quarantined_episode(
+        self, project: Path, one_second_camera_less_episode: Path
+    ) -> None:
+        ep2_path = project / "data" / "episodes-in" / "episode_0002.mcap"
+        ep2_path.write_bytes(one_second_camera_less_episode.read_bytes())
+        ep2_uri = "episodes-in/episode_0002.mcap"
+
+        initial_pipeline = """
+import hflow
+
+app = hflow.App("granular-demo", default_checks=())
+
+@app.check(version="1", critical=True)
+async def gate_check(ep: hflow.Episode) -> hflow.CheckResult:
+    verdict = "episode_0002" not in str(ep.path)
+    return hflow.CheckResult(measurements={"gate_ran": 1.0}, verdict=verdict)
+"""
+        (project / "pipeline.py").write_text(initial_pipeline)
+        first = _ingest(project, EPISODE_URI, ep2_uri)
+        assert _stage(first, hflow.Stage.META).counts["processed"] == 1
+        assert _stage(first, hflow.Stage.META).counts["quarantined"] == 1
+
+        retuned_pipeline = """
+import hflow
+
+app = hflow.App("granular-demo", default_checks=())
+
+@app.check(version="2", critical=True)
+async def gate_check(ep: hflow.Episode) -> hflow.CheckResult:
+    return hflow.CheckResult(measurements={"gate_ran": 2.0}, verdict=True)
+"""
+        (project / "pipeline.py").write_text(retuned_pipeline)
+        second = _ingest(project, EPISODE_URI, ep2_uri)
+
+        meta_outcome = _stage(second, hflow.Stage.META)
+        assert meta_outcome.counts["processed"] == 2
+        assert meta_outcome.counts["quarantined"] == 0
+        assert meta_outcome.skipped_as_current == 0

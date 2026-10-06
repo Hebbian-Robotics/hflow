@@ -35,7 +35,8 @@ directory someone cleaned out costs one transcode, not a ``FileNotFoundError``
 in the middle of the meta stage.
 """
 
-from collections.abc import Iterable, Sequence
+import json
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -318,16 +319,27 @@ def plan_outstanding_stages(
         return {source: NoCanonicalEpisode(source_identity=source) for source in source_identities}
     try:
         source_placeholders = ", ".join("?" for _ in source_identities)
-        episode_by_source = {
-            str(source): str(episode_id)
-            for source, episode_id in connection.execute(
-                f"SELECT source_uri, episode_id FROM episodes_latest "
-                f"WHERE source_uri IN ({source_placeholders})",
-                list(source_identities),
-            ).fetchall()
-        }
+        episode_rows = connection.execute(
+            f"SELECT source_uri, episode_id, quarantined, quarantine_tags_json FROM episodes_latest "
+            f"WHERE source_uri IN ({source_placeholders})",
+            list(source_identities),
+        ).fetchall()
+        episode_by_source = {str(row[0]): str(row[1]) for row in episode_rows}
+        quarantine_info_by_episode: dict[str, tuple[bool, list[str]]] = {}
+        for row in episode_rows:
+            ep_id = str(row[1])
+            is_quarantined = bool(row[2])
+            raw_tags = row[3]
+            tags = [str(tag) for tag in json.loads(str(raw_tags))] if raw_tags else []
+            quarantine_info_by_episode[ep_id] = (is_quarantined, tags)
+
         episode_ids = sorted(set(episode_by_source.values()))
-        identity_pairs = sorted({pair for pairs in required_by_stage.values() for pair in pairs})
+        critical_pairs = sorted(
+            {(check.name, check.version) for check in application.checks if check.critical}
+        )
+        identity_pairs = sorted(
+            {pair for pairs in required_by_stage.values() for pair in pairs} | set(critical_pairs)
+        )
         settled_by_episode = _settled_step_names(connection, episode_ids, identity_pairs)
         camera_presence_by_episode = (
             _camera_presence_by_episode(connection, application, episode_ids)
@@ -337,6 +349,10 @@ def plan_outstanding_stages(
     finally:
         connection.close()
 
+    critical_check_names = {
+        registered.name for registered in application.checks if registered.critical
+    }
+
     plans: dict[str, EpisodeStagePlan] = {}
     for source in source_identities:
         episode_id = episode_by_source.get(source)
@@ -344,21 +360,47 @@ def plan_outstanding_stages(
             plans[source] = NoCanonicalEpisode(source_identity=source)
             continue
         settled = settled_by_episode.get(episode_id, set())
+        is_quarantined, quarantine_tags = quarantine_info_by_episode.get(episode_id, (False, []))
+        quarantined_by_settled_gate = False
+        if is_quarantined and quarantine_tags:
+            quarantine_critical_check_names = [
+                tag.removeprefix("quarantined:")
+                for tag in quarantine_tags
+                if tag.startswith("quarantined:")
+                and tag.removeprefix("quarantined:") in critical_check_names
+            ]
+            if quarantine_critical_check_names and all(
+                name in settled for name in quarantine_critical_check_names
+            ):
+                quarantined_by_settled_gate = True
+
         outstanding_stages: set[Stage] = set()
         outstanding_steps: list[str] = []
-        for stage, pairs in required_by_stage.items():
-            if stage is Stage.MEDIA and camera_presence_by_episode.get(episode_id) is False:
-                continue
-            missing = [name for name, _version in pairs if name not in settled]
-            if missing:
-                outstanding_stages.add(stage)
-                outstanding_steps.extend(missing)
+        if not quarantined_by_settled_gate:
+            for stage, pairs in required_by_stage.items():
+                if stage is Stage.MEDIA and camera_presence_by_episode.get(episode_id) is False:
+                    continue
+                missing = [name for name, _version in pairs if name not in settled]
+                if missing:
+                    outstanding_stages.add(stage)
+                    outstanding_steps.extend(missing)
         plans[source] = OutstandingStages(
             source_identity=source,
             stages=frozenset(outstanding_stages),
             outstanding_steps=tuple(sorted(outstanding_steps)),
         )
     return plans
+
+
+def outstanding_steps_for_stage(
+    plan: OutstandingStages,
+    stage: Stage,
+    stage_by_step_name: Mapping[str, Stage],
+) -> tuple[str, ...]:
+    """Derive the sorted tuple of outstanding step names that belong to stage."""
+    return tuple(
+        sorted(step for step in plan.outstanding_steps if stage_by_step_name.get(step) is stage)
+    )
 
 
 def outstanding_stage_uris(
@@ -368,6 +410,7 @@ def outstanding_stage_uris(
     *,
     data_root: str,
     step_names: Iterable[str] | None = None,
+    _stage_steps_by_uri: dict[str, tuple[str, ...]] | None = None,
 ) -> list[str]:
     """Which of ``uris`` still owe ``stage`` work, in the order given.
 
@@ -425,9 +468,18 @@ def outstanding_stage_uris(
         (stage,),
         step_names=step_names,
     )
-    return [
-        str(uri)
-        for uri in validated_uris
-        if not isinstance(plan := plans.get(identity_by_uri[uri]), OutstandingStages)
-        or stage in plan.stages
-    ]
+    stage_by_step_name = application._registered_step_stages()
+    outstanding: list[str] = []
+    for uri in validated_uris:
+        plan = plans.get(identity_by_uri[uri])
+        if not isinstance(plan, OutstandingStages):
+            outstanding.append(str(uri))
+            if _stage_steps_by_uri is not None:
+                _stage_steps_by_uri[str(uri)] = ()
+        elif stage in plan.stages:
+            outstanding.append(str(uri))
+            if _stage_steps_by_uri is not None:
+                _stage_steps_by_uri[str(uri)] = outstanding_steps_for_stage(
+                    plan, stage, stage_by_step_name
+                )
+    return outstanding
