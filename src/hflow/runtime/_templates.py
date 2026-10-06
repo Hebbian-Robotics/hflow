@@ -577,6 +577,7 @@ $stage_plan_filter        return plan_stage_batches(
             mode=mode,
             batch_count=batch_count,
             data_root=$data_root,
+            step_names_by_uri=locals().get("stage_steps_by_uri"),
         )
 
     @task.external_python(python=$venv_python, expect_airflow=False$task_queue_argument)
@@ -619,6 +620,9 @@ $stage_plan_filter        return plan_stage_batches(
         )
         import asyncio
 
+        batch_step_names = batch.get("step_names")
+        if batch_step_names is not None:
+            stage_step_names = batch_step_names
         return asyncio.run(
             process_stage_batch(
                 app,
@@ -786,12 +790,14 @@ OUTSTANDING_PLAN_FILTER_TEMPLATE = Template(
                 enabled_stage_names,
                 "$stage_name",
             )
+            stage_steps_by_uri = {}
             uris = outstanding_stage_uris(
                 planning_app,
                 [str(uri) for uri in uris],
                 Stage("$stage_name"),
                 data_root=expected_data_root,
                 step_names=stage_step_names,
+                _stage_steps_by_uri=stage_steps_by_uri,
             )
             if not uris:
                 raise SystemExit(99)  # skip_on_exit_code: whole stage SKIPPED

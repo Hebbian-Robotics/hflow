@@ -88,6 +88,25 @@ class TestLanePlanning:
         assert sorted(items_by_batch[1]["items"]) == ["small-1.mcap", "small-2.mcap"]
         assert {batch["start_delay_s"] for batch in batches} == {0.0, 2.0}
 
+    def test_batch_lane_groups_by_step_names(self, tmp_path: Path) -> None:
+        for name in ("a.mcap", "b.mcap", "c.mcap"):
+            (tmp_path / name).write_bytes(b"x" * 100)
+        batches = plan_stage_batches(
+            ["a.mcap", "b.mcap", "c.mcap"],
+            mode="batch",
+            batch_count=1,
+            data_root=str(tmp_path),
+            step_names_by_uri={
+                "a.mcap": ["check_1"],
+                "b.mcap": ["check_1"],
+                "c.mcap": ["check_2"],
+            },
+        )
+        assert len(batches) == 2
+        batch_by_steps = {tuple(b["step_names"]): b["items"] for b in batches}
+        assert batch_by_steps[("check_1",)] == ["a.mcap", "b.mcap"]
+        assert batch_by_steps[("check_2",)] == ["c.mcap"]
+
     def test_batch_lane_trims_uri_and_sizes_safe_internal_segments(self, tmp_path: Path) -> None:
         (tmp_path / "b.mcap").write_bytes(b"episode")
 

@@ -19,13 +19,13 @@ EVERY episode errored always fails regardless of budget.
 import math
 import os
 import traceback
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from posixpath import normpath
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 from hflow.asyncio_utils import blocking_context, run_blocking
 from hflow.batching import plan_batches
@@ -56,6 +56,7 @@ class PlannedStageBatch(TypedDict):
 
     items: list[str]
     start_delay_s: float
+    step_names: NotRequired[list[str] | None]
 
 
 class StageBatchCounts(TypedDict):
@@ -201,12 +202,17 @@ def plan_stage_batches(
     mode: str,
     batch_count: int | None,
     data_root: str,
+    step_names_by_uri: Mapping[str, Sequence[str]] | None = None,
 ) -> list[PlannedStageBatch]:
     """Bin-pack uris into staggered batches; ``online`` is one immediate batch.
 
     The online lane is latency-first: one run per episode as it lands -- no
     batching, no stagger, ``batch_count`` ignored. Returns plain JSON-able
     dicts because the result crosses task (XCom) boundaries.
+
+    ``step_names_by_uri`` optionally specifies the steps owed by each URI.
+    Episodes that owe the same steps are grouped together into separate
+    batches tagged with ``step_names``.
     """
     try:
         # Parse the conf string at this boundary; steps.IngestMode owns the
@@ -217,6 +223,58 @@ def plan_stage_batches(
     validated_uris = [parse_data_root_relative_uri(str(uri)) for uri in uris]
     if not validated_uris:
         return []
+
+    if step_names_by_uri is not None:
+        uris_by_steps: dict[tuple[str, ...], list[str]] = {}
+        for uri in validated_uris:
+            steps = tuple(sorted(step_names_by_uri.get(str(uri), ())))
+            uris_by_steps.setdefault(steps, []).append(str(uri))
+
+        if ingest_mode is IngestMode.ONLINE:
+            return [
+                {
+                    "items": list(group_uris),
+                    "start_delay_s": 0.0,
+                    **({"step_names": list(steps)} if steps else {}),
+                }
+                for steps, group_uris in uris_by_steps.items()
+            ]
+
+        data_root_storage = parse_storage_root(data_root)
+        workers = min(STAGE_PLAN_FILE_SIZE_WORKERS, len(validated_uris))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            item_sizes = dict(
+                executor.map(
+                    lambda uri: (str(uri), data_root_storage.file_size(normpath(str(uri)))),
+                    validated_uris,
+                )
+            )
+
+        all_planned: list[PlannedStageBatch] = []
+        current_delay_s = 0.0
+        for steps, group_uris in uris_by_steps.items():
+            group_item_sizes = {u: item_sizes[u] for u in group_uris}
+            group_batch_count = (
+                int(batch_count)
+                if batch_count is not None
+                else min(DEFAULT_BATCH_COUNT_LIMIT, len(group_item_sizes))
+            )
+            planned = plan_batches(
+                group_item_sizes,
+                batch_count=group_batch_count,
+                stagger_interval_s=DEFAULT_STAGGER_INTERVAL_S,
+            )
+            for batch in planned:
+                batch_dict: PlannedStageBatch = {
+                    "items": list(batch.items),
+                    "start_delay_s": current_delay_s,
+                }
+                if steps:
+                    batch_dict["step_names"] = list(steps)
+                all_planned.append(batch_dict)
+                current_delay_s += DEFAULT_STAGGER_INTERVAL_S
+        return all_planned
+
     if ingest_mode is IngestMode.ONLINE:
         return [{"items": [str(uri) for uri in validated_uris], "start_delay_s": 0.0}]
     data_root_storage = parse_storage_root(data_root)
@@ -473,9 +531,47 @@ async def run_stages_directly(
         # empty batch: the batch path opens a catalog reader for its quarantine
         # gate, which on a bucket workspace means syncing the catalog mirror to
         # answer a question about no episodes.
-        counts: StageBatchCounts = (
-            (
-                await process_stage_batch(
+        counts: StageBatchCounts = {"processed": 0, "quarantined": 0, "errors": 0}
+        if stage_uris:
+            if stage is not Stage.SYNC and plan_against_catalog and plans is not None:
+                uris_by_steps: dict[tuple[str, ...], list[str]] = {}
+                for uri in stage_uris:
+                    plan = plans[str(uri)]
+                    if isinstance(plan, OutstandingStages):
+                        steps_for_stage = tuple(
+                            sorted(
+                                step
+                                for step in plan.outstanding_steps
+                                if stage_by_step_name.get(step) is stage
+                            )
+                        )
+                    else:
+                        steps_for_stage = ()
+                    uris_by_steps.setdefault(steps_for_stage, []).append(str(uri))
+
+                for steps, group_uris in uris_by_steps.items():
+                    group_selection = (
+                        SelectedRegisteredSteps(frozenset(steps))
+                        if steps
+                        else (
+                            ALL_REGISTERED_STEPS
+                            if stage_step_names is None
+                            else SelectedRegisteredSteps(stage_step_names)
+                        )
+                    )
+                    batch_counts = await process_stage_batch(
+                        application,
+                        group_uris,
+                        stage.value,
+                        orchestrator_run_id=orchestrator_run_id,
+                        _registered_step_selection=group_selection,
+                        _failed_uris=sync_failed_uris if stage is Stage.SYNC else None,
+                    )
+                    counts["processed"] += batch_counts["processed"]
+                    counts["quarantined"] += batch_counts["quarantined"]
+                    counts["errors"] += batch_counts["errors"]
+            else:
+                counts = await process_stage_batch(
                     application,
                     stage_uris,
                     stage.value,
@@ -487,10 +583,6 @@ async def run_stages_directly(
                     ),
                     _failed_uris=sync_failed_uris if stage is Stage.SYNC else None,
                 )
-            )
-            if stage_uris
-            else {"processed": 0, "quarantined": 0, "errors": 0}
-        )
         outcomes.append(
             StageOutcome(stage=stage, counts=counts, skipped_as_current=skipped_as_current)
         )
