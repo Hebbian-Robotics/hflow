@@ -35,6 +35,7 @@ from hflow.stage_planning import (
     NoCanonicalEpisode,
     OutstandingStages,
     StageSelection,
+    outstanding_steps_for_stage,
 )
 from hflow.step_selection import (
     ALL_REGISTERED_STEPS,
@@ -224,59 +225,24 @@ def plan_stage_batches(
     if not validated_uris:
         return []
 
-    if step_names_by_uri is not None:
-        uris_by_steps: dict[tuple[str, ...], list[str]] = {}
+    if step_names_by_uri is None:
+        uris_by_steps: dict[tuple[str, ...], list[str]] = {(): [str(uri) for uri in validated_uris]}
+    else:
+        uris_by_steps = {}
         for uri in validated_uris:
             steps = tuple(sorted(step_names_by_uri.get(str(uri), ())))
             uris_by_steps.setdefault(steps, []).append(str(uri))
 
-        if ingest_mode is IngestMode.ONLINE:
-            return [
-                {
-                    "items": list(group_uris),
-                    "start_delay_s": 0.0,
-                    **({"step_names": list(steps)} if steps else {}),
-                }
-                for steps, group_uris in uris_by_steps.items()
-            ]
-
-        data_root_storage = parse_storage_root(data_root)
-        workers = min(STAGE_PLAN_FILE_SIZE_WORKERS, len(validated_uris))
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            item_sizes = dict(
-                executor.map(
-                    lambda uri: (str(uri), data_root_storage.file_size(normpath(str(uri)))),
-                    validated_uris,
-                )
-            )
-
-        all_planned: list[PlannedStageBatch] = []
-        current_delay_s = 0.0
-        for steps, group_uris in uris_by_steps.items():
-            group_item_sizes = {u: item_sizes[u] for u in group_uris}
-            group_batch_count = (
-                int(batch_count)
-                if batch_count is not None
-                else min(DEFAULT_BATCH_COUNT_LIMIT, len(group_item_sizes))
-            )
-            planned = plan_batches(
-                group_item_sizes,
-                batch_count=group_batch_count,
-                stagger_interval_s=DEFAULT_STAGGER_INTERVAL_S,
-            )
-            for batch in planned:
-                batch_dict: PlannedStageBatch = {
-                    "items": list(batch.items),
-                    "start_delay_s": current_delay_s,
-                }
-                if steps:
-                    batch_dict["step_names"] = list(steps)
-                all_planned.append(batch_dict)
-                current_delay_s += DEFAULT_STAGGER_INTERVAL_S
-        return all_planned
-
     if ingest_mode is IngestMode.ONLINE:
-        return [{"items": [str(uri) for uri in validated_uris], "start_delay_s": 0.0}]
+        return [
+            {
+                "items": list(group_uris),
+                "start_delay_s": 0.0,
+                **({"step_names": list(steps)} if steps else {}),
+            }
+            for steps, group_uris in uris_by_steps.items()
+        ]
+
     data_root_storage = parse_storage_root(data_root)
     # The conf keeps the URI's own spelling, so `a/../b.mcap` stays the
     # identity; only the size lookup normalizes, because a storage key is
@@ -289,17 +255,31 @@ def plan_stage_batches(
                 validated_uris,
             )
         )
-    resolved_batch_count = (
-        int(batch_count)
-        if batch_count is not None
-        else min(DEFAULT_BATCH_COUNT_LIMIT, len(item_sizes))
-    )
-    planned = plan_batches(
-        item_sizes,
-        batch_count=resolved_batch_count,
-        stagger_interval_s=DEFAULT_STAGGER_INTERVAL_S,
-    )
-    return [{"items": list(batch.items), "start_delay_s": batch.start_delay_s} for batch in planned]
+
+    all_planned: list[PlannedStageBatch] = []
+    current_delay_s = 0.0
+    for steps, group_uris in uris_by_steps.items():
+        group_item_sizes = {u: item_sizes[u] for u in group_uris}
+        group_batch_count = (
+            int(batch_count)
+            if batch_count is not None
+            else min(DEFAULT_BATCH_COUNT_LIMIT, len(group_item_sizes))
+        )
+        planned = plan_batches(
+            group_item_sizes,
+            batch_count=group_batch_count,
+            stagger_interval_s=DEFAULT_STAGGER_INTERVAL_S,
+        )
+        for batch in planned:
+            batch_dict: PlannedStageBatch = {
+                "items": list(batch.items),
+                "start_delay_s": current_delay_s,
+            }
+            if steps:
+                batch_dict["step_names"] = list(steps)
+            all_planned.append(batch_dict)
+            current_delay_s += DEFAULT_STAGGER_INTERVAL_S
+    return all_planned
 
 
 async def process_stage_batch(
@@ -538,12 +518,8 @@ async def run_stages_directly(
                 for uri in stage_uris:
                     plan = plans[str(uri)]
                     if isinstance(plan, OutstandingStages):
-                        steps_for_stage = tuple(
-                            sorted(
-                                step
-                                for step in plan.outstanding_steps
-                                if stage_by_step_name.get(step) is stage
-                            )
+                        steps_for_stage = outstanding_steps_for_stage(
+                            plan, stage, stage_by_step_name
                         )
                     else:
                         steps_for_stage = ()

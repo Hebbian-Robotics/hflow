@@ -548,6 +548,7 @@ def ingest_stage():
 
         if not uris:
             return []
+        stage_steps_by_uri = None
         # The conf vocabulary is parsed at the library boundary, like mode.
         # This task only feeds it what Airflow rendered.
         all_stages = parse_conf_flag(all_stages)
@@ -577,7 +578,7 @@ $stage_plan_filter        return plan_stage_batches(
             mode=mode,
             batch_count=batch_count,
             data_root=$data_root,
-            step_names_by_uri=locals().get("stage_steps_by_uri"),
+            step_names_by_uri=stage_steps_by_uri,
         )
 
     @task.external_python(python=$venv_python, expect_airflow=False$task_queue_argument)

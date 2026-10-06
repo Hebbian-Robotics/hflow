@@ -36,7 +36,7 @@ in the middle of the meta stage.
 """
 
 import json
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -392,6 +392,17 @@ def plan_outstanding_stages(
     return plans
 
 
+def outstanding_steps_for_stage(
+    plan: OutstandingStages,
+    stage: Stage,
+    stage_by_step_name: Mapping[str, Stage],
+) -> tuple[str, ...]:
+    """Derive the sorted tuple of outstanding step names that belong to stage."""
+    return tuple(
+        sorted(step for step in plan.outstanding_steps if stage_by_step_name.get(step) is stage)
+    )
+
+
 def outstanding_stage_uris(
     application: "App",
     uris: Sequence[str],
@@ -468,12 +479,7 @@ def outstanding_stage_uris(
         elif stage in plan.stages:
             outstanding.append(str(uri))
             if _stage_steps_by_uri is not None:
-                steps_for_stage = tuple(
-                    sorted(
-                        step
-                        for step in plan.outstanding_steps
-                        if stage_by_step_name.get(step) is stage
-                    )
+                _stage_steps_by_uri[str(uri)] = outstanding_steps_for_stage(
+                    plan, stage, stage_by_step_name
                 )
-                _stage_steps_by_uri[str(uri)] = steps_for_stage
     return outstanding
