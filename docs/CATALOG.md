@@ -301,8 +301,11 @@ these views registered (it is what `curate()` uses; take it and explore):
   column per measurement key** (latest value; booleans as 0/1).
 - `episodes_raw`, `check_runs`, `measurements`, `observations`, `tags`, `intervals`,
   `ingest_failures`: the long tables, exactly as stored.
-- `episodes_latest`, `measurements_latest`: one row per episode / per
-  (episode, key), most recent append wins.
+- `episodes_latest`: one row per episode, most recent append wins.
+- `measurements_latest`: one row per `(episode_id, key)`, taken only from the
+  latest run of each `(episode_id, check_name)`. A key that the latest run of
+  its check did not record (a newer version omitted it, or the run errored) is
+  withdrawn: the wide `episodes` view keeps the column and reads `NULL`.
 - `observations_latest`: all observation fields from the latest run of each
   `(episode_id, check_name)`; it switches the repeated result as a unit, so
   fields omitted by a newer check version do not leak in from an older one.
