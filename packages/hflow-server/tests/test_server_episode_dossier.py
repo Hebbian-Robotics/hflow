@@ -189,3 +189,103 @@ def test_dossier_reports_unverified_when_a_critical_check_crashed(
     episode = _dossier(api, append.episode_id)["episode"]
     assert episode["status"] == "unverified"
     assert episode["quarantine_tags"] == []
+
+
+def test_dossier_intervals_and_tags_survive_subsequent_stage_append(
+    tmp_path: Path, unbuilt_assets_dir: Path
+) -> None:
+    """An earlier stage's intervals and tags remain visible after a subsequent stage appends."""
+    data_root = tmp_path / "data"
+    catalog_root = data_root / "catalog"
+    episodes_directory = data_root / "episodes"
+    episodes_directory.mkdir(parents=True)
+    canonical = episodes_directory / "multi_stage.canonical.mcap"
+    canonical.write_bytes(b"canonical for multi-stage episode")
+
+    catalog = Catalog(catalog_root)
+    # Stage 1: META records intervals and tags
+    meta_append = catalog.append_episode(
+        canonical_path=canonical,
+        stamps=STAMPS,
+        episode_metadata={"task": "fold_napkin"},
+        check_rows=[
+            CheckRunRow(
+                check_name="camera_freeze",
+                check_version="v1",
+                critical=False,
+                status=hflow.CheckStatus.MEASURED,
+                duration_s=0.01,
+                intervals=[hflow.Interval(start_ns=100, end_ns=500, label="frozen:front_camera")],
+                tags=["frozen:front_camera"],
+            )
+        ],
+    )
+    assert meta_append.written
+
+    # Stage 2: LABELS appends another check to the same episode
+    labels_append = catalog.append_episode(
+        canonical_path=canonical,
+        stamps=STAMPS,
+        episode_metadata={"task": "fold_napkin"},
+        check_rows=[
+            CheckRunRow(
+                check_name="action_chunking",
+                check_version="v1",
+                critical=False,
+                status=hflow.CheckStatus.MEASURED,
+                duration_s=0.02,
+            )
+        ],
+    )
+    assert labels_append.written
+    assert labels_append.episode_id == meta_append.episode_id
+    assert labels_append.run_fingerprint != meta_append.run_fingerprint
+
+    api = TestClient(
+        create_app(ServerSettings(data_root=str(data_root), assets_dir=unbuilt_assets_dir))
+    )
+    dossier = _dossier(api, meta_append.episode_id)
+    assert dossier["intervals"] == [
+        {
+            "label": "frozen:front_camera",
+            "start_ns": 100,
+            "end_ns": 500,
+            "check_name": "camera_freeze",
+            "check_version": "v1",
+        }
+    ]
+    assert len(dossier["tags"]) == 1
+    assert dossier["tags"][0]["tag"] == "frozen:front_camera"
+    assert dossier["tags"][0]["check_name"] == "camera_freeze"
+
+    timeline_response = api.get(f"/api/v1/episodes/{meta_append.episode_id}/timeline")
+    assert timeline_response.status_code == 200
+    timeline = timeline_response.json()
+    assert len(timeline["intervals"]) == 1
+    assert timeline["intervals"][0]["label"] == "frozen:front_camera"
+    assert timeline["intervals"][0]["check_name"] == "camera_freeze"
+    assert timeline["intervals"][0]["kind"] == "frozen"
+
+    # Stage 3: camera_freeze re-runs with a new version that omits intervals and tags
+    rerun_append = catalog.append_episode(
+        canonical_path=canonical,
+        stamps=STAMPS,
+        episode_metadata={"task": "fold_napkin"},
+        check_rows=[
+            CheckRunRow(
+                check_name="camera_freeze",
+                check_version="v2",
+                critical=False,
+                status=hflow.CheckStatus.MEASURED,
+                duration_s=0.01,
+                intervals=[],
+                tags=[],
+            )
+        ],
+    )
+    assert rerun_append.written
+    dossier_after_rerun = _dossier(api, meta_append.episode_id)
+    assert dossier_after_rerun["intervals"] == []
+    assert dossier_after_rerun["tags"] == []
+    timeline_after_rerun = api.get(f"/api/v1/episodes/{meta_append.episode_id}/timeline").json()
+    assert timeline_after_rerun["intervals"] == []
