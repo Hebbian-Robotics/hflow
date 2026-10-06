@@ -547,6 +547,92 @@ def test_rerunning_a_changed_check_appends_new_version_rows(tmp_path: Path) -> N
         assert wide_row == (2.0,)
 
 
+def _measured_row(
+    check_name: str, version: str, measurements: dict[str, hflow.MeasurementValue]
+) -> CheckRunRow:
+    return CheckRunRow(
+        check_name=check_name,
+        check_version=version,
+        critical=False,
+        status=hflow.CheckStatus.MEASURED,
+        duration_s=0.01,
+        measurements=measurements,
+    )
+
+
+def _append_runs(tmp_path: Path, *runs: list[CheckRunRow]) -> Path:
+    catalog = Catalog(tmp_path / "catalog")
+    canonical = write_fake_canonical(tmp_path)
+    for check_rows in runs:
+        assert catalog.append_episode(
+            canonical_path=canonical,
+            stamps=FAKE_STAMPS,
+            episode_metadata={},
+            check_rows=check_rows,
+        ).written
+    return catalog.root
+
+
+def test_a_key_a_newer_check_version_omits_is_withdrawn(tmp_path: Path) -> None:
+    catalog_root = _append_runs(
+        tmp_path,
+        [
+            _measured_row("blur", "v1", {"blur_score": 0.9, "frames": 100.0}),
+            _measured_row("steady", "v1", {"steady/score": 0.5}),
+        ],
+        [_measured_row("blur", "v2", {"frames": 100.0})],
+    )
+
+    with open_catalog_connection(catalog_root) as connection:
+        assert connection.execute(
+            "SELECT check_name, check_version, key, value_double "
+            "FROM measurements_latest ORDER BY key"
+        ).fetchall() == [
+            ("blur", "v2", "frames", 100.0),
+            ("steady", "v1", "steady/score", 0.5),
+        ]
+        assert connection.execute(
+            'SELECT blur_score, frames, "steady/score" FROM episodes'
+        ).fetchall() == [(None, 100.0, 0.5)]
+    report = curate(catalog_root, "SELECT episode_id FROM episodes WHERE blur_score > 0.8")
+    assert report.row_count == 0
+
+
+def test_an_errored_latest_run_withdraws_that_checks_measurements(tmp_path: Path) -> None:
+    catalog_root = _append_runs(
+        tmp_path,
+        [_measured_row("remote_check", "v1", {"score": 1.0})],
+        [
+            CheckRunRow(
+                check_name="remote_check",
+                check_version="v1",
+                critical=False,
+                status=hflow.CheckStatus.ERROR,
+                duration_s=0.1,
+                error="temporary timeout",
+            )
+        ],
+    )
+
+    with open_catalog_connection(catalog_root) as connection:
+        assert connection.execute("SELECT key FROM measurements_latest").fetchall() == []
+        assert connection.execute("SELECT score FROM episodes").fetchall() == [(None,)]
+
+
+def test_a_key_moved_to_another_check_keeps_one_latest_row(tmp_path: Path) -> None:
+    catalog_root = _append_runs(
+        tmp_path,
+        [_measured_row("old_check", "v1", {"score": 1.0})],
+        [_measured_row("new_check", "v1", {"score": 2.0})],
+    )
+
+    with open_catalog_connection(catalog_root) as connection:
+        assert connection.execute(
+            "SELECT check_name, value_double FROM measurements_latest"
+        ).fetchall() == [("new_check", 2.0)]
+        assert connection.execute("SELECT score FROM episodes").fetchall() == [(2.0,)]
+
+
 def test_successful_retry_after_error_appends_repaired_outcome(tmp_path: Path) -> None:
     catalog = Catalog(tmp_path / "catalog")
     canonical = write_fake_canonical(tmp_path)

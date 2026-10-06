@@ -26,9 +26,12 @@ Views registered on the connection:
   own source. This view is the only place that expression lives -- every
   consumer, ``stale_episodes`` included, reads it rather than re-deriving
   the window.
-- ``measurements_latest`` -- one row per (episode_id, key), most recent by
-  the OWNING episode's recorded_at (joined in), not the measurement row's
-  own -- the latter can go stale independently of the episode it belongs to.
+- ``measurements_latest`` -- one row per (episode_id, key), drawn only from
+  the latest run of each (episode, check) in ``check_runs_latest``, so a key a
+  newer check version omits is withdrawn rather than left at its old value.
+  Ranked by the OWNING episode's recorded_at (joined in), not the measurement
+  row's own -- the latter can go stale independently of the episode it
+  belongs to.
 - ``observations_latest`` -- every timestamped observation field from the
   latest run of each (episode, check), switched as one coherent result.
 - ``episodes`` -- the wide view for everyday queries: latest episode rows,
@@ -364,16 +367,16 @@ def _register_catalog_relations(
     )
     connection.execute(
         """
-        CREATE VIEW measurements_latest AS
+        CREATE VIEW check_runs_latest AS
         SELECT * EXCLUDE (row_rank) FROM (
             SELECT
-                m.* EXCLUDE (recorded_at),
+                c.* EXCLUDE (recorded_at),
                 -- Rank (and report) by the EPISODE's recorded_at, not this
                 -- table's own: episodes/<file_stem>.parquet is the only file
                 -- create-if-absent guarantees a single writer for, so it is
                 -- the sole trustworthy recorded_at once episodes_latest has
                 -- already picked a winner. A repair pass that wins the
-                -- episodes race can still crash before reaching measurements
+                -- episodes race can still crash before reaching dependents
                 -- (see #51); replayed appends now reconcile stale dependents
                 -- (catalog._reconcile_replayed_append), but until a replay
                 -- happens -- and on mirrors synced before it -- this table's
@@ -387,32 +390,33 @@ def _register_catalog_relations(
                 -- proves an append complete" idiom.
                 e.recorded_at,
                 row_number() OVER (
-                    PARTITION BY m.episode_id, m.key
-                    ORDER BY e.recorded_at DESC, m.run_fingerprint DESC
+                    PARTITION BY c.episode_id, c.check_name
+                    ORDER BY e.recorded_at DESC, c.run_fingerprint DESC
                 ) AS row_rank
-            FROM measurements m
+            FROM check_runs c
             JOIN episodes_raw e USING (episode_id, run_fingerprint)
         ) WHERE row_rank = 1
         """
     )
     connection.execute(
         """
-        CREATE VIEW check_runs_latest AS
+        CREATE VIEW measurements_latest AS
         SELECT * EXCLUDE (row_rank) FROM (
             SELECT
-                c.* EXCLUDE (recorded_at),
-                -- Ranked by the EPISODE's recorded_at for the same reason
-                -- measurements_latest is: episodes is the only table whose
-                -- single writer is guaranteed, so ranking off this table's own
-                -- recorded_at could pick a different run_fingerprint than
-                -- episodes_latest did and stitch two runs together.
-                e.recorded_at,
+                m.* EXCLUDE (recorded_at),
+                latest_check_run.recorded_at,
                 row_number() OVER (
-                    PARTITION BY c.episode_id, c.check_name
-                    ORDER BY e.recorded_at DESC, c.run_fingerprint DESC
+                    PARTITION BY m.episode_id, m.key
+                    ORDER BY latest_check_run.recorded_at DESC, m.run_fingerprint DESC
                 ) AS row_rank
-            FROM check_runs c
-            JOIN episodes_raw e USING (episode_id, run_fingerprint)
+            FROM measurements m
+            -- Only the latest run of each check speaks for it, as in
+            -- observations_latest: ranking every row per key alone would let
+            -- a key a newer version stopped emitting keep its old value.
+            -- The per-key rank then still yields one row per key when a key
+            -- moved between checks.
+            JOIN check_runs_latest latest_check_run
+              USING (episode_id, run_fingerprint, check_name, check_version)
         ) WHERE row_rank = 1
         """
     )
@@ -425,10 +429,19 @@ def _register_catalog_relations(
           USING (episode_id, run_fingerprint, check_name, check_version)
         """
     )
+    # Every key any completed run recorded, not only the current ones: a key
+    # withdrawn by a newer check version stays a (NULL) column so queries
+    # naming it still bind, and the case-collision guard keeps covering every
+    # append, as docs/CATALOG.md promises.
     measurement_keys = [
         str(row[0])
         for row in connection.execute(
-            "SELECT DISTINCT key FROM measurements_latest ORDER BY key"
+            """
+            SELECT DISTINCT m.key
+            FROM measurements m
+            JOIN episodes_raw e USING (episode_id, run_fingerprint)
+            ORDER BY m.key
+            """
         ).fetchall()
     ]
     _raise_if_measurement_keys_case_collide(measurement_keys)
@@ -544,8 +557,8 @@ def _refresh_local_catalog_connection(
     derived_view_names = (
         "episodes",
         "observations_latest",
-        "check_runs_latest",
         "measurements_latest",
+        "check_runs_latest",
         "episodes_latest",
     )
     try:
