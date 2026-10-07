@@ -1218,6 +1218,46 @@ def test_trajectory_metrics_emits_unsettled_ratio_for_a_moving_episode(
     assert isinstance(ratio, float)
 
 
+def test_trajectory_metrics_emits_final_pose_speed_for_low_frequency_stream(
+    tmp_path: Path,
+) -> None:
+    source = synthesize_episode(
+        tmp_path / "low-frequency.mcap",
+        SyntheticEpisodeSpec(
+            duration_s=5.0,
+            cameras=(),
+            joint_hz=1.0,
+            joint_jump_at_s=None,
+        ),
+    )
+    with hflow.Episode(source) as episode:
+        result = asyncio.run(trajectory_metrics(episode))
+
+    assert "/joint_states/final_pose_speed" in result.measurements
+
+
+def test_trajectory_metrics_duration_weights_final_pose_speed(monkeypatch: pytest.MonkeyPatch) -> None:
+    import hflow.checks as checks_module
+
+    profile = checks_module._TrajectoryProfile(
+        stamps_ns=np.array([0, 1_700_000_000, 1_900_000_000, 2_000_000_000]),
+        step_durations_s=np.array([1.7, 0.2, 0.1]),
+        speeds=np.array([1.0, 10.0, 100.0]),
+        curvatures=np.empty(0),
+        non_finite_sample_count=0,
+        scale_source="raw",
+    )
+    monkeypatch.setattr(
+        checks_module,
+        "_trajectory_profile",
+        lambda episode, topic, field, dimension_scales: profile,
+    )
+
+    result = checks_module._measure_trajectory_metrics(object(), final_pose_window_s=0.5)
+
+    assert result.measurements["/joint_states/final_pose_speed"] == pytest.approx(24.4)
+
+
 def test_trajectory_metrics_omits_unsettled_ratio_for_a_motionless_episode(
     tmp_path: Path,
 ) -> None:
