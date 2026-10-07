@@ -71,7 +71,9 @@ CATALOG_TABLE_BROWSING_ORDER = (
     "observations",
     "observations_latest",
     "tags",
+    "tags_latest",
     "intervals",
+    "intervals_latest",
     "ingest_failures",
 )
 
