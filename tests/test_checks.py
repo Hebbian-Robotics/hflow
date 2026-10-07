@@ -1240,6 +1240,50 @@ def test_trajectory_metrics_omits_unsettled_ratio_for_a_motionless_episode(
     assert "/joint_states/final_pose_unsettled_ratio" not in result.measurements
 
 
+def test_trajectory_metrics_emits_final_pose_speed_for_low_frequency_stream(
+    tmp_path: Path,
+) -> None:
+    """A stream with sample period exceeding final_pose_window_s (e.g. 1 Hz)
+    must still emit final_pose_speed and final_pose_unsettled_ratio for the final step.
+    """
+    source = synthesize_episode(
+        tmp_path / "low_freq.mcap",
+        SyntheticEpisodeSpec(
+            duration_s=5.0,
+            cameras=(),
+            joint_hz=1.0,
+            joint_jump_at_s=None,
+        ),
+    )
+    with hflow.Episode(source) as episode:
+        result = asyncio.run(trajectory_metrics(episode))
+
+    speed = result.measurements.get("/joint_states/final_pose_speed")
+    assert isinstance(speed, float) and speed > 0
+    ratio = result.measurements.get("/joint_states/final_pose_unsettled_ratio")
+    assert isinstance(ratio, float) and ratio > 0
+
+
+def test_trajectory_metrics_time_weights_final_pose_speed_identically_to_mean_velocity(
+    tmp_path: Path,
+) -> None:
+    """When the final window spans the full episode, duration-weighting guarantees
+    final_pose_speed matches mean_velocity identically, so unsettled ratio is 1.0.
+    """
+    source = synthesize_episode(
+        tmp_path / "short.mcap",
+        SyntheticEpisodeSpec(
+            duration_s=0.4,
+            cameras=(),
+            joint_jump_at_s=None,
+        ),
+    )
+    with hflow.Episode(source) as episode:
+        result = asyncio.run(trajectory_metrics(episode, final_pose_window_s=0.5))
+
+    assert result.measurements["/joint_states/final_pose_unsettled_ratio"] == pytest.approx(1.0)
+
+
 @pytest.fixture(scope="module")
 def camera_less_episode(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """An episode with no camera topics.
