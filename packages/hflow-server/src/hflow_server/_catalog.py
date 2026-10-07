@@ -607,12 +607,13 @@ def find_canonical_uri(connection: duckdb.DuckDBPyConnection, episode_id: str) -
 def query_latest_run_intervals(
     connection: duckdb.DuckDBPyConnection, episode_id: str
 ) -> list[EpisodeIntervalRecord]:
-    """One episode's intervals from its LATEST run -- the current evidence.
+    """One episode's intervals from each check's LATEST run -- the current evidence.
 
-    ``check_version`` rides in from that run's ``check_runs`` row because the
+    ``check_version`` rides in from that run's ``check_runs_latest`` row because the
     intervals table does not carry one itself. One owner for this join: the
     dossier and the timeline must never disagree about which run's intervals
-    an episode "has".
+    an episode "has", and an earlier stage's intervals remain visible after
+    subsequent stages append.
     """
     return _validated_records(
         EpisodeIntervalRecord,
@@ -620,11 +621,8 @@ def query_latest_run_intervals(
             """
             SELECT i.label, i.start_ns, i.end_ns, i.check_name, r.check_version
             FROM intervals AS i
-            JOIN episodes_latest AS e
-              ON i.episode_id = e.episode_id AND i.run_fingerprint = e.run_fingerprint
-            LEFT JOIN check_runs AS r
-              ON r.episode_id = i.episode_id AND r.run_fingerprint = i.run_fingerprint
-                 AND r.check_name = i.check_name
+            JOIN check_runs_latest AS r
+              USING (episode_id, run_fingerprint, check_name)
             WHERE i.episode_id = ?
             ORDER BY i.start_ns, i.label
             """,
@@ -680,16 +678,16 @@ def query_episode_dossier(
             [episode_id],
         ),
     )
-    # Intervals and tags are the episode's LATEST run only -- the current
-    # evidence.
+    # Intervals and tags are each check's LATEST run only -- the current
+    # evidence, matching check_runs_latest.
     intervals = query_latest_run_intervals(connection, episode_id)
     tags = _validated_records(
         EpisodeTagRecord,
         connection.execute(
-            f"SELECT t.tag, t.check_name, {_recorded_at_as_iso_text('t.recorded_at')} "
+            f"SELECT t.tag, t.check_name, {_recorded_at_as_iso_text('r.recorded_at')} "
             "FROM tags AS t "
-            "JOIN episodes_latest AS e "
-            "  ON t.episode_id = e.episode_id AND t.run_fingerprint = e.run_fingerprint "
+            "JOIN check_runs_latest AS r "
+            "  USING (episode_id, run_fingerprint, check_name) "
             "WHERE t.episode_id = ? ORDER BY t.tag",
             [episode_id],
         ),
