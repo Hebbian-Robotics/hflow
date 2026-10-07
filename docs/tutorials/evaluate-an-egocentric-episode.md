@@ -89,6 +89,7 @@ one camera, or pass the desired camera topic when it contains several:
 
 ```bash
 uv run python examples/evaluate_episode.py path/to/episode.mcap \
+    --hosted-base-url "$HFLOW_HOSTED_BASE_URL" \
     --camera /your/egocentric/camera
 ```
 
