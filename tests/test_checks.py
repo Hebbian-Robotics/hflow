@@ -1240,6 +1240,115 @@ def test_trajectory_metrics_omits_unsettled_ratio_for_a_motionless_episode(
     assert "/joint_states/final_pose_unsettled_ratio" not in result.measurements
 
 
+def test_trajectory_metrics_emits_final_pose_speed_for_low_frequency_stream(
+    tmp_path: Path,
+) -> None:
+    """A stream with sample period exceeding final_pose_window_s (e.g. 1 Hz)
+    must still emit final_pose_speed and final_pose_unsettled_ratio for the final step.
+    """
+    source = synthesize_episode(
+        tmp_path / "low_freq.mcap",
+        SyntheticEpisodeSpec(
+            duration_s=5.0,
+            cameras=(),
+            joint_hz=1.0,
+            joint_jump_at_s=None,
+        ),
+    )
+    with hflow.Episode(source) as episode:
+        result = asyncio.run(trajectory_metrics(episode))
+
+    speed = result.measurements.get("/joint_states/final_pose_speed")
+    assert isinstance(speed, float) and speed > 0
+    ratio = result.measurements.get("/joint_states/final_pose_unsettled_ratio")
+    assert isinstance(ratio, float) and ratio > 0
+
+
+def test_trajectory_metrics_time_weights_final_pose_speed_identically_to_mean_velocity(
+    tmp_path: Path,
+) -> None:
+    """When the final window spans the full episode, duration-weighting guarantees
+    final_pose_speed matches mean_velocity identically, so unsettled ratio is 1.0.
+    """
+    source = synthesize_episode(
+        tmp_path / "short.mcap",
+        SyntheticEpisodeSpec(
+            duration_s=0.4,
+            cameras=(),
+            joint_jump_at_s=None,
+        ),
+    )
+    with hflow.Episode(source) as episode:
+        result = asyncio.run(trajectory_metrics(episode, final_pose_window_s=0.5))
+
+    assert result.measurements["/joint_states/final_pose_unsettled_ratio"] == pytest.approx(1.0)
+
+
+def test_trajectory_metrics_weights_by_window_overlap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Steps crossing the window boundary are weighted by their overlap with the window."""
+    from unittest.mock import MagicMock
+
+    import hflow.checks as checks_module
+
+    # Window is 0.5s (t in [1.5s, 2.0s]).
+    # Step 0: [0.0s, 1.7s], speed 1.0 -> overlaps [1.5s, 1.7s] for 0.2s
+    # Step 1: [1.7s, 1.9s], speed 10.0 -> overlaps [1.7s, 1.9s] for 0.2s
+    # Step 2: [1.9s, 2.0s], speed 100.0 -> overlaps [1.9s, 2.0s] for 0.1s
+    # Total overlap: 0.2 + 0.2 + 0.1 = 0.5s.
+    # Weighted speed: (1.0*0.2 + 10.0*0.2 + 100.0*0.1) / 0.5 = 24.4
+    profile = checks_module._TrajectoryProfile(
+        stamps_ns=np.array([0, 1_700_000_000, 1_900_000_000, 2_000_000_000]),
+        step_durations_s=np.array([1.7, 0.2, 0.1]),
+        speeds=np.array([1.0, 10.0, 100.0]),
+        curvatures=np.empty(0),
+        non_finite_sample_count=0,
+        scale_source="raw",
+    )
+    monkeypatch.setattr(
+        checks_module,
+        "_trajectory_profile",
+        lambda episode, topic, field, dimension_scales: profile,
+    )
+    mock_ep = MagicMock(spec=hflow.Episode)
+    result = checks_module._measure_trajectory_metrics(mock_ep, final_pose_window_s=0.5)
+    assert result.measurements["/joint_states/final_pose_speed"] == pytest.approx(24.4)
+
+
+def test_trajectory_metrics_omits_final_pose_speed_when_final_window_is_unmeasurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When all steps overlapping the final window are non-finite (unmeasurable),
+    final_pose_speed and final_pose_unsettled_ratio must be omitted rather than
+    falling back to earlier steps in the episode.
+    """
+    from unittest.mock import MagicMock
+
+    import hflow.checks as checks_module
+
+    # Window is 0.5s (t in [1.5s, 2.0s]).
+    # Step 0: [0.0s, 1.4s], speed 1.0 (measurable, ends before window starts at 1.5s)
+    # Step 1: [1.4s, 2.0s], speed NaN (overlaps window [1.5s, 2.0s], but non-finite)
+    profile = checks_module._TrajectoryProfile(
+        stamps_ns=np.array([0, 1_400_000_000, 2_000_000_000]),
+        step_durations_s=np.array([1.4, 0.6]),
+        speeds=np.array([1.0, np.nan]),
+        curvatures=np.empty(0),
+        non_finite_sample_count=1,
+        scale_source="raw",
+    )
+    monkeypatch.setattr(
+        checks_module,
+        "_trajectory_profile",
+        lambda episode, topic, field, dimension_scales: profile,
+    )
+    mock_ep = MagicMock(spec=hflow.Episode)
+    result = checks_module._measure_trajectory_metrics(mock_ep, final_pose_window_s=0.5)
+    assert "/joint_states/final_pose_speed" not in result.measurements
+    assert "/joint_states/final_pose_unsettled_ratio" not in result.measurements
+    mean = result.measurements.get("/joint_states/mean_velocity")
+    assert isinstance(mean, float) and mean > 0
+
+
 @pytest.fixture(scope="module")
 def camera_less_episode(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """An episode with no camera topics.
