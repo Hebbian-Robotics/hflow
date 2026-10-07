@@ -1421,11 +1421,18 @@ def _measure_trajectory_metrics(
     # Was the arm still moving when recording stopped? A high ratio means the
     # episode was cut mid-motion, which matters for anything learning an
     # end-of-task pose.
-    final_window_mask = measured & (
-        (profile.stamps_ns[-1] - profile.stamps_ns[:-1]) / 1e9 <= final_pose_window_s
-    )
+    final_window_start_ns = profile.stamps_ns[-1] - int(final_pose_window_s * 1e9)
+    final_overlap_s = (
+        np.minimum(profile.stamps_ns[1:], profile.stamps_ns[-1])
+        - np.maximum(profile.stamps_ns[:-1], final_window_start_ns)
+    ) / 1e9
+    final_window_mask = measured & (final_overlap_s > 0)
     if np.any(final_window_mask):
-        final_speed = float(np.mean(profile.speeds[final_window_mask]))
+        final_weights_s = final_overlap_s[final_window_mask]
+        final_speed = float(
+            np.sum(profile.speeds[final_window_mask] * final_weights_s)
+            / np.sum(final_weights_s)
+        )
         measurements[f"{topic}/final_pose_speed"] = final_speed
         if mean_velocity > 0:
             # Omitted when mean_velocity == 0.0: the ratio is undefined for a
