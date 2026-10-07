@@ -309,6 +309,9 @@ these views registered (it is what `curate()` uses; take it and explore):
 - `observations_latest`: all observation fields from the latest run of each
   `(episode_id, check_name)`; it switches the repeated result as a unit, so
   fields omitted by a newer check version do not leak in from an older one.
+- `tags_latest`: tags from the latest run of each `(episode_id, check_name)`.
+- `intervals_latest`: intervals from the latest run of each
+  `(episode_id, check_name)`.
 
 ### Timestamped observations
 
@@ -545,7 +548,7 @@ Tags: e.g. every episode a non-critical check failed (`failed:<check>` is
 recorded automatically; quarantine tags live on the episode row instead):
 
 ```sql
-SELECT episode_id, check_name, tag FROM tags WHERE tag LIKE 'failed:%'
+SELECT episode_id, check_name, tag FROM tags_latest WHERE tag LIKE 'failed:%'
 ```
 
 Intervals: total recording-gap time per episode from the built-in timestamp
@@ -553,7 +556,7 @@ check (`gap:<topic>` labels; `joint_discontinuity:<topic>` works the same):
 
 ```sql
 SELECT episode_id, sum(end_ns - start_ns) / 1e9 AS gap_seconds
-FROM intervals WHERE label LIKE 'gap:%'
+FROM intervals_latest WHERE label LIKE 'gap:%'
 GROUP BY episode_id ORDER BY gap_seconds DESC
 ```
 

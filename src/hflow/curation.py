@@ -34,6 +34,8 @@ Views registered on the connection:
   belongs to.
 - ``observations_latest`` -- every timestamped observation field from the
   latest run of each (episode, check), switched as one coherent result.
+- ``tags_latest`` -- tags from the latest run of each (episode, check).
+- ``intervals_latest`` -- intervals from the latest run of each (episode, check).
 - ``episodes`` -- the wide view for everyday queries: latest episode rows,
   a ``status`` column (``'quarantined'``/``'unverified'``/``'ok'``), and one numeric column
   per measurement key (booleans as 0/1; text-valued measurements stay in the
@@ -429,6 +431,24 @@ def _register_catalog_relations(
           USING (episode_id, run_fingerprint, check_name, check_version)
         """
     )
+    connection.execute(
+        """
+        CREATE VIEW tags_latest AS
+        SELECT tags.* REPLACE (latest_check_run.recorded_at AS recorded_at)
+        FROM tags
+        JOIN check_runs_latest latest_check_run
+          USING (episode_id, run_fingerprint, check_name)
+        """
+    )
+    connection.execute(
+        """
+        CREATE VIEW intervals_latest AS
+        SELECT intervals.* REPLACE (latest_check_run.recorded_at AS recorded_at)
+        FROM intervals
+        JOIN check_runs_latest latest_check_run
+          USING (episode_id, run_fingerprint, check_name)
+        """
+    )
     # Every key any completed run recorded, not only the current ones: a key
     # withdrawn by a newer check version stays a (NULL) column so queries
     # naming it still bind, and the case-collision guard keeps covering every
@@ -557,6 +577,8 @@ def _refresh_local_catalog_connection(
     derived_view_names = (
         "episodes",
         "observations_latest",
+        "tags_latest",
+        "intervals_latest",
         "measurements_latest",
         "check_runs_latest",
         "episodes_latest",

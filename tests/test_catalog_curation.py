@@ -633,6 +633,74 @@ def test_a_key_moved_to_another_check_keeps_one_latest_row(tmp_path: Path) -> No
         assert connection.execute("SELECT score FROM episodes").fetchall() == [(2.0,)]
 
 
+def test_a_tag_or_interval_omitted_by_a_rerun_is_withdrawn(tmp_path: Path) -> None:
+    catalog_root = _append_runs(
+        tmp_path,
+        [
+            CheckRunRow(
+                check_name="sensor_check",
+                check_version="v1",
+                critical=False,
+                status=hflow.CheckStatus.FAILED,
+                duration_s=0.01,
+                tags=["faulty_sensor"],
+                intervals=[hflow.Interval(label="gap:cam", start_ns=1000, end_ns=2000)],
+            )
+        ],
+        [
+            CheckRunRow(
+                check_name="sensor_check",
+                check_version="v2",
+                critical=False,
+                status=hflow.CheckStatus.PASSED,
+                duration_s=0.01,
+            )
+        ],
+    )
+
+    with open_catalog_connection(catalog_root) as connection:
+        assert connection.execute("SELECT tag FROM tags").fetchall() == [("faulty_sensor",)]
+        assert connection.execute("SELECT label FROM intervals").fetchall() == [("gap:cam",)]
+        assert connection.execute("SELECT tag FROM tags_latest").fetchall() == []
+        assert connection.execute("SELECT label FROM intervals_latest").fetchall() == []
+
+
+def test_tags_and_intervals_latest_reflect_latest_check_run(tmp_path: Path) -> None:
+    catalog_root = _append_runs(
+        tmp_path,
+        [
+            CheckRunRow(
+                check_name="sensor_check",
+                check_version="v1",
+                critical=False,
+                status=hflow.CheckStatus.FAILED,
+                duration_s=0.01,
+                tags=["faulty_sensor"],
+                intervals=[hflow.Interval(label="gap:cam", start_ns=1000, end_ns=2000)],
+            )
+        ],
+        [
+            CheckRunRow(
+                check_name="sensor_check",
+                check_version="v2",
+                critical=False,
+                status=hflow.CheckStatus.FAILED,
+                duration_s=0.01,
+                tags=["new_sensor_fault"],
+                intervals=[hflow.Interval(label="gap:cam_v2", start_ns=3000, end_ns=4000)],
+            )
+        ],
+    )
+
+    with open_catalog_connection(catalog_root) as connection:
+        assert connection.execute("SELECT tag FROM tags_latest").fetchall() == [
+            ("new_sensor_fault",)
+        ]
+        assert connection.execute(
+            "SELECT label, start_ns, end_ns FROM intervals_latest"
+        ).fetchall() == [("gap:cam_v2", 3000, 4000)]
+
+
 def test_successful_retry_after_error_appends_repaired_outcome(tmp_path: Path) -> None:
     catalog = Catalog(tmp_path / "catalog")
     canonical = write_fake_canonical(tmp_path)
