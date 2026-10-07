@@ -23,6 +23,7 @@ from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
 NANOSECONDS_PER_SECOND = 1_000_000_000
 CAMERA_TOPIC = "/head_camera/compressed"
+HOSTED_BASE_URL = "https://api.hflow.dev"
 
 
 def _scripted_hosted_answers(
@@ -67,7 +68,9 @@ def test_sampled_hand_visibility_folds_no_hand_frames_into_intervals(
     served = _scripted_hosted_answers(monkeypatch, [2, 0, 0, 1])
     application = hflow.App("sampled", data_root=tmp_path / "data", default_checks=())
     register_hand_visibility(
-        application, execution=HFlowHostedExecution(), sampling=FrameSampling(fps=1.0)
+        application,
+        execution=HFlowHostedExecution(base_url=HOSTED_BASE_URL),
+        sampling=FrameSampling(fps=1.0),
     )
 
     report = asyncio.run(application.test(_episode(tmp_path, duration_s=4.0), verbose=False))
@@ -106,7 +109,9 @@ def test_sampled_run_reaching_the_end_closes_one_period_after_the_last_frame(
     _scripted_hosted_answers(monkeypatch, ["yes", "no", "no"])
     application = hflow.App("sampled-end", data_root=tmp_path / "data", default_checks=())
     register_active_manipulation(
-        application, execution=HFlowHostedExecution(), sampling=FrameSampling(fps=1.0)
+        application,
+        execution=HFlowHostedExecution(base_url=HOSTED_BASE_URL),
+        sampling=FrameSampling(fps=1.0),
     )
 
     report = asyncio.run(application.test(_episode(tmp_path, duration_s=3.0), verbose=False))
@@ -129,7 +134,9 @@ def test_an_unparsed_answer_ends_a_run_without_counting_as_absence(
     _scripted_hosted_answers(monkeypatch, [0, "unparsed: three", 0, 2])
     application = hflow.App("sampled-unparsed", data_root=tmp_path / "data", default_checks=())
     register_hand_visibility(
-        application, execution=HFlowHostedExecution(), sampling=FrameSampling(fps=1.0)
+        application,
+        execution=HFlowHostedExecution(base_url=HOSTED_BASE_URL),
+        sampling=FrameSampling(fps=1.0),
     )
 
     report = asyncio.run(application.test(_episode(tmp_path, duration_s=4.0), verbose=False))
@@ -177,7 +184,9 @@ def test_a_transient_hosted_failure_is_retried_within_the_sampled_run(
     monkeypatch.setattr(httpx2.AsyncClient, "stream", staticmethod(hosted_response))
     application = hflow.App("sampled-retry", data_root=tmp_path / "data", default_checks=())
     register_hand_visibility(
-        application, execution=HFlowHostedExecution(), sampling=FrameSampling(fps=1.0)
+        application,
+        execution=HFlowHostedExecution(base_url=HOSTED_BASE_URL),
+        sampling=FrameSampling(fps=1.0),
     )
 
     report = asyncio.run(application.test(_episode(tmp_path, duration_s=3.0), verbose=False))
@@ -218,7 +227,7 @@ def test_hosted_retries_are_bounded_and_the_last_status_is_reported(
     application = hflow.App("sampled-busy", data_root=tmp_path / "data", default_checks=())
     register_hand_visibility(
         application,
-        execution=HFlowHostedExecution(max_retries=2),
+        execution=HFlowHostedExecution(base_url=HOSTED_BASE_URL, max_retries=2),
         sampling=FrameSampling(fps=1.0),
     )
 
@@ -241,7 +250,9 @@ def test_black_frames_are_skipped_and_never_read_as_absence(
     served = _scripted_hosted_answers(monkeypatch, [0, 0, 2])
     application = hflow.App("sampled-black", data_root=tmp_path / "data", default_checks=())
     register_hand_visibility(
-        application, execution=HFlowHostedExecution(), sampling=FrameSampling(fps=1.0)
+        application,
+        execution=HFlowHostedExecution(base_url=HOSTED_BASE_URL),
+        sampling=FrameSampling(fps=1.0),
     )
     source = synthesize_episode(
         tmp_path / "episode.mcap",
@@ -287,6 +298,8 @@ def test_sampling_is_part_of_the_check_version(tmp_path: Path) -> None:
     versions: list[str] = []
     for sampling in (None, FrameSampling(fps=1.0), FrameSampling(fps=2.0)):
         application = hflow.App("versions", data_root=tmp_path / "data", default_checks=())
-        register_hand_visibility(application, execution=HFlowHostedExecution(), sampling=sampling)
+        register_hand_visibility(
+            application, execution=HFlowHostedExecution(base_url=HOSTED_BASE_URL), sampling=sampling
+        )
         versions.append(application.checks[0].version)
     assert len(set(versions)) == 3

@@ -5,8 +5,8 @@ point for egocentric video: the default deterministic quality checks plus two
 hosted model checks. It demonstrates the useful split in one command:
 
 - HFlow measures recording integrity locally and deterministically.
-- HFlow's hosted checks add semantic evidence without requiring an account,
-  API key, or model server.
+- HFlow's hosted checks add semantic evidence without a model server of your
+  own. Contact us to get access to the hosted API.
 - Both kinds of evidence are versioned and recorded through the same pipeline.
 
 The hosted checks are registered explicitly rather than included in
@@ -50,11 +50,13 @@ The sample has two camera streams, so select its left head camera explicitly:
 ```bash
 uv run python examples/evaluate_episode.py \
     data/episode-evaluation/sample.mcap \
+    --hosted-base-url "$HFLOW_HOSTED_BASE_URL" \
     --camera /sensor/camera/head_left/video
 ```
 
-No model endpoint or API key is required. HFlow processes the episode locally;
-the two model checks send only the selected JPEG frame to `api.hflow.dev`.
+Set `HFLOW_HOSTED_BASE_URL` to the hosted API URL you received. HFlow
+processes the episode locally; the two model checks send only the selected
+JPEG frame to that URL.
 
 The first sample frame visibly contains two wearer hands manipulating material.
 The hosted results should therefore include:

@@ -68,10 +68,10 @@ where in the recording each problem occurred.
 
 By default nothing leaves your infrastructure: the SDK, the catalog, and every
 built-in check run where you run them. The hosted checks are the exception and
-are opt-in. When you register one with `HFlowHostedExecution`, the SDK sends
-the sampled JPEG frames that check needs to `https://api.hflow.dev` and records
-the answers in your catalog alongside every other check. No API key is needed.
-Each hosted check version is frozen, so results stay comparable over time, and
+are opt-in. Contact us to get access to the hosted API. When you register a
+check with `HFlowHostedExecution(base_url=...)`, the SDK sends the sampled JPEG
+frames that check needs to that URL and records the answers in your catalog
+alongside every other check. Each hosted check version is frozen, so results stay comparable over time, and
 the service admits one request at a time per client.
 
 ## What does a run produce?

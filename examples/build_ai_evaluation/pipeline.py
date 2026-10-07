@@ -1,8 +1,9 @@
 """Run Build AI's published single-frame checks on HFlow episodes.
 
-The example uses HFlow's fixed hosted checks by default, without an API key.
-Set ``BUILD_AI_EXECUTION=openai-compatible`` to use a local or third-party
-OpenAI-compatible vision endpoint instead.
+The example sends each frame to an OpenAI-compatible vision endpoint, local or
+third-party. Set ``BUILD_AI_EXECUTION=hflow-hosted`` and
+``BUILD_AI_HOSTED_BASE_URL`` to use HFlow's hosted checks instead; contact us to
+get access to the hosted API.
 """
 
 from __future__ import annotations
@@ -18,8 +19,9 @@ import hflow
 DEFAULT_HFLOW_DATA_ROOT = Path("data/build-ai-evaluation/hflow")
 DEFAULT_OPENAI_COMPATIBLE_BASE_URL = "http://localhost:8000/v1"
 DEFAULT_MODEL_NAME = "model-not-configured"
-DEFAULT_EXECUTION_NAME = "hflow-hosted"
+HFLOW_HOSTED_EXECUTION_NAME = "hflow-hosted"
 OPENAI_COMPATIBLE_EXECUTION_NAME = "openai-compatible"
+DEFAULT_EXECUTION_NAME = OPENAI_COMPATIBLE_EXECUTION_NAME
 
 
 def _optional_float_environment_variable(name: str, environment: Mapping[str, str]) -> float | None:
@@ -41,8 +43,10 @@ def _execution_from_environment(
         check_execution_environment_variable,
         environment.get("BUILD_AI_EXECUTION", DEFAULT_EXECUTION_NAME),
     )
-    if execution_name == DEFAULT_EXECUTION_NAME:
-        return hflow.build_ai_vlm_checks.HFlowHostedExecution()
+    if execution_name == HFLOW_HOSTED_EXECUTION_NAME:
+        return hflow.build_ai_vlm_checks.HFlowHostedExecution(
+            base_url=environment.get("BUILD_AI_HOSTED_BASE_URL")
+        )
     if execution_name == OPENAI_COMPATIBLE_EXECUTION_NAME:
         return hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
             endpoint=environment.get(
@@ -69,7 +73,7 @@ def _execution_from_environment(
         )
     raise ValueError(
         f"{check_execution_environment_variable} (or BUILD_AI_EXECUTION) must be "
-        f"{DEFAULT_EXECUTION_NAME!r} or {OPENAI_COMPATIBLE_EXECUTION_NAME!r}, "
+        f"{HFLOW_HOSTED_EXECUTION_NAME!r} or {OPENAI_COMPATIBLE_EXECUTION_NAME!r}, "
         f"got {execution_name!r}"
     )
 

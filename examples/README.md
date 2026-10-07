@@ -172,8 +172,9 @@ Code: [`measurement_distribution.py`](./measurement_distribution.py)
 **Use it for:** seeing HFlow's default deterministic checks and hosted semantic
 checks work together on real egocentric footage.
 
-**Prerequisites:** the normal development environment, the `hf` CLI, and
-network access. The hosted checks require no account, API key, or model server.
+**Prerequisites:** the normal development environment, the `hf` CLI, network
+access, and a hosted API URL in `HFLOW_HOSTED_BASE_URL`. Contact us to get
+access to the hosted API.
 
 ```bash
 mkdir -p data/episode-evaluation
@@ -187,6 +188,7 @@ cp "$downloaded_sample_mcap_path" data/episode-evaluation/sample.mcap
 
 uv run python examples/evaluate_episode.py \
     data/episode-evaluation/sample.mcap \
+    --hosted-base-url "$HFLOW_HOSTED_BASE_URL" \
     --camera /sensor/camera/head_left/video
 ```
 
@@ -229,9 +231,9 @@ Code: [`openai_vision/pipeline.py`](./openai_vision/pipeline.py)
 active-manipulation methodology as HFlow checks, then replaying their
 Egocentric-10K or Egocentric-100K inputs to compare models and prompts.
 
-**Prerequisites:** network access and the `hf` CLI for the sample recording.
-The default pipeline route uses HFlow's hosted checks without an account or API
-key. The pinned evaluation replay additionally needs sufficient disk for the
+**Prerequisites:** network access, the `hf` CLI for the sample recording, and an
+OpenAI-compatible vision endpoint (or access to HFlow's hosted API; contact us).
+The pinned evaluation replay additionally needs sufficient disk for the
 selected Parquet files. Each frame makes two external check calls; a configured
 model provider may charge for them.
 
@@ -245,6 +247,9 @@ downloaded_sample_mcap_path="$(
 )"
 cp "$downloaded_sample_mcap_path" data/build-ai-evaluation/sample.mcap
 
+export OPENAI_BASE_URL="http://localhost:8000/v1"
+export OPENAI_MODEL="Qwen/Qwen3-VL-8B-Instruct"
+
 uv run --project examples/build_ai_evaluation \
     python -m examples.build_ai_evaluation.pipeline \
     data/build-ai-evaluation/sample.mcap
@@ -256,12 +261,12 @@ identity, and any available model usage as `hflow.CheckResult`
 measurements. An episode path is required because generated test-pattern
 footage cannot meaningfully demonstrate either judgment.
 
-To use a local OpenAI-compatible model server instead of HFlow's hosted checks:
+To use HFlow's hosted checks instead (contact us to get access to the hosted
+API):
 
 ```bash
-export BUILD_AI_EXECUTION="openai-compatible"
-export OPENAI_BASE_URL="http://localhost:8000/v1"
-export OPENAI_MODEL="Qwen/Qwen3-VL-8B-Instruct"
+export BUILD_AI_EXECUTION="hflow-hosted"
+export BUILD_AI_HOSTED_BASE_URL="$HFLOW_HOSTED_BASE_URL"
 
 uv run --project examples/build_ai_evaluation \
     python -m examples.build_ai_evaluation.pipeline \

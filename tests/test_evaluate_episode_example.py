@@ -11,6 +11,7 @@ def test_recommended_episode_evaluation_combines_default_and_hosted_checks(
 ) -> None:
     application = build_application(
         data_root=tmp_path,
+        hosted_base_url="https://hosted.example",
         camera="/head_camera",
         frame_time_seconds=0.0,
     )

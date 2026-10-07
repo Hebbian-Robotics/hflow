@@ -267,23 +267,36 @@ def test_build_ai_pipeline_registers_both_judgments_as_hflow_checks() -> None:
     assert all(check.requires == frozenset({"vision-model"}) for check in checks_by_name.values())
 
 
-def test_build_ai_pipeline_defaults_to_hosted_and_can_select_openai_compatible_execution() -> None:
-    hosted_execution = _execution_from_environment("BUILD_AI_HAND_VISIBILITY", {})
+def test_build_ai_pipeline_defaults_to_openai_compatible_and_can_select_hosted_execution() -> None:
     openai_compatible_execution = _execution_from_environment(
         "BUILD_AI_HAND_VISIBILITY",
         {
-            "BUILD_AI_EXECUTION": "hflow-hosted",
-            "BUILD_AI_HAND_VISIBILITY_EXECUTION": "openai-compatible",
             "BUILD_AI_HAND_VISIBILITY_BASE_URL": "http://localhost:8000/v1",
             "BUILD_AI_HAND_VISIBILITY_MODEL": "local-vision-model",
         },
     )
+    hosted_execution = _execution_from_environment(
+        "BUILD_AI_HAND_VISIBILITY",
+        {
+            "BUILD_AI_HAND_VISIBILITY_EXECUTION": "hflow-hosted",
+            "BUILD_AI_HOSTED_BASE_URL": "https://hosted.example",
+        },
+    )
 
-    assert hosted_execution == hflow.build_ai_vlm_checks.HFlowHostedExecution()
     assert openai_compatible_execution == hflow.build_ai_vlm_checks.OpenAICompatibleExecution(
         endpoint="http://localhost:8000/v1",
         model="local-vision-model",
     )
+    assert hosted_execution == hflow.build_ai_vlm_checks.HFlowHostedExecution(
+        base_url="https://hosted.example"
+    )
+
+
+def test_build_ai_pipeline_hosted_execution_without_a_url_asks_the_user_to_contact_us() -> None:
+    with pytest.raises(ValueError, match="contact us"):
+        _execution_from_environment(
+            "BUILD_AI_HAND_VISIBILITY", {"BUILD_AI_EXECUTION": "hflow-hosted"}
+        )
 
 
 def test_build_ai_pipeline_requires_an_episode_with_meaningful_footage() -> None:
