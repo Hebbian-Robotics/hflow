@@ -2,10 +2,12 @@
 
 The normal ``hflow.App`` baseline stays enabled. Two explicitly registered
 hosted checks add Build AI's hand-visibility and active-manipulation judgments.
+Contact us to get access to the hosted API.
 
 Run from the repository root::
 
-    uv run python examples/evaluate_episode.py episode.mcap [--camera TOPIC]
+    uv run python examples/evaluate_episode.py episode.mcap \\
+        --hosted-base-url URL [--camera TOPIC]
 """
 
 from __future__ import annotations
@@ -22,11 +24,12 @@ DEFAULT_DATA_ROOT = Path("data/episode-evaluation")
 def build_application(
     *,
     data_root: Path,
+    hosted_base_url: str,
     camera: str | None,
     frame_time_seconds: float,
 ) -> hflow.App:
     application = hflow.App("episode-evaluation", data_root=data_root)
-    hosted_execution = hflow.build_ai_vlm_checks.HFlowHostedExecution()
+    hosted_execution = hflow.build_ai_vlm_checks.HFlowHostedExecution(base_url=hosted_base_url)
     hflow.build_ai_vlm_checks.register_hand_visibility(
         application,
         execution=hosted_execution,
@@ -45,6 +48,11 @@ def build_application(
 def argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("episode", type=Path, help="MCAP episode with egocentric video")
+    parser.add_argument(
+        "--hosted-base-url",
+        required=True,
+        help="HFlow hosted API URL; contact us to get access",
+    )
     parser.add_argument(
         "--camera",
         help="camera topic to evaluate; required when the episode has multiple cameras",
@@ -68,6 +76,7 @@ def main() -> None:
     arguments = argument_parser().parse_args()
     application = build_application(
         data_root=arguments.data_root,
+        hosted_base_url=arguments.hosted_base_url,
         camera=arguments.camera,
         frame_time_seconds=arguments.frame_time_seconds,
     )

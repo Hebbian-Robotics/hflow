@@ -125,7 +125,6 @@ Rules:
 
 BUILD_AI_HAND_VISIBILITY_CHECK_NAME = "build_ai_hand_visibility"
 BUILD_AI_ACTIVE_MANIPULATION_CHECK_NAME = "build_ai_active_manipulation"
-DEFAULT_HFLOW_HOSTED_BASE_URL = "https://api.hflow.dev"
 
 _HFLOW_HOSTED_TRANSPORT_VERSION = 1
 _DEFAULT_HFLOW_HOSTED_CHECK_VERSION = 1
@@ -301,7 +300,8 @@ class HFlowHostedExecution:
     Build AI's prompts or results.
     """
 
-    base_url: str = DEFAULT_HFLOW_HOSTED_BASE_URL
+    # No default: access to the hosted service is granted on request.
+    base_url: str | None = None
     check_version: int = _DEFAULT_HFLOW_HOSTED_CHECK_VERSION
     request_timeout_seconds: float = 60.0
     total_timeout_seconds: float = 360.0
@@ -312,6 +312,10 @@ class HFlowHostedExecution:
     max_retries: int = 5
 
     def __post_init__(self) -> None:
+        if self.base_url is None:
+            raise ValueError(
+                "HFlowHostedExecution needs base_url: contact us to get access to the hosted API"
+            )
         _require_absolute_http_url(self.base_url, name="base_url")
         require_non_negative_int(self.max_retries, "max_retries")
         parsed_base_url = urlsplit(self.base_url)
@@ -806,6 +810,8 @@ def _check_name_for_task(task: EvaluationTask) -> str:
 
 def _hosted_check_endpoint(execution: HFlowHostedExecution, task: EvaluationTask) -> str:
     check_name = _check_name_for_task(task)
+    # __post_init__ refuses a missing base_url.
+    assert execution.base_url is not None
     return (
         f"{execution.base_url.rstrip('/')}/v{_HFLOW_HOSTED_TRANSPORT_VERSION}/checks/"
         f"{check_name}/versions/{execution.check_version}/evaluate"

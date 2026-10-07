@@ -21,6 +21,8 @@ from build_ai_test_stubs import (
 import hflow
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
+HOSTED_BASE_URL = "https://api.hflow.dev"
+
 
 def test_build_ai_vlm_checks_register_independent_execution_contracts(tmp_path: Path) -> None:
     application = hflow.App("model-checks", data_root=tmp_path, default_checks=())
@@ -260,9 +262,14 @@ def test_hosted_execution_refuses_custom_prompt(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="does not support prompt overrides"):
         hflow.build_ai_vlm_checks.register_hand_visibility(
             application,
-            execution=hflow.build_ai_vlm_checks.HFlowHostedExecution(),
+            execution=hflow.build_ai_vlm_checks.HFlowHostedExecution(base_url=HOSTED_BASE_URL),
             prompt="Use a different definition of visibility.",
         )
+
+
+def test_hosted_execution_requires_a_base_url() -> None:
+    with pytest.raises(ValueError, match="contact us to get access to the hosted API"):
+        hflow.build_ai_vlm_checks.HFlowHostedExecution()
 
 
 def test_hosted_execution_refuses_a_base_url_that_cannot_accept_check_paths() -> None:
@@ -410,10 +417,30 @@ def test_hosted_response_refuses_a_prediction_outside_the_check_contract(
             -1,
             0,
         ),
-        (hflow.build_ai_vlm_checks.HFlowHostedExecution, "max_retries", -1, 0),
-        (hflow.build_ai_vlm_checks.HFlowHostedExecution, "check_version", 0, 1),
-        (hflow.build_ai_vlm_checks.HFlowHostedExecution, "request_timeout_seconds", 0, 0.5),
-        (hflow.build_ai_vlm_checks.HFlowHostedExecution, "total_timeout_seconds", 0, 0.5),
+        (
+            partial(hflow.build_ai_vlm_checks.HFlowHostedExecution, base_url=HOSTED_BASE_URL),
+            "max_retries",
+            -1,
+            0,
+        ),
+        (
+            partial(hflow.build_ai_vlm_checks.HFlowHostedExecution, base_url=HOSTED_BASE_URL),
+            "check_version",
+            0,
+            1,
+        ),
+        (
+            partial(hflow.build_ai_vlm_checks.HFlowHostedExecution, base_url=HOSTED_BASE_URL),
+            "request_timeout_seconds",
+            0,
+            0.5,
+        ),
+        (
+            partial(hflow.build_ai_vlm_checks.HFlowHostedExecution, base_url=HOSTED_BASE_URL),
+            "total_timeout_seconds",
+            0,
+            0.5,
+        ),
         (hflow.build_ai_vlm_checks.FrameSampling, "fps", 0, 0.5),
         (hflow.build_ai_vlm_checks.FrameSampling, "start_s", -1, 0),
         (partial(hflow.build_ai_vlm_checks.FrameSampling, start_s=2), "end_s", 2, 3),
@@ -477,7 +504,7 @@ def test_registration_refuses_invalid_frame_times(tmp_path: Path, value: Any) ->
     with pytest.raises(ValueError, match="frame_time_seconds"):
         hflow.build_ai_vlm_checks.register_hand_visibility(
             application,
-            execution=hflow.build_ai_vlm_checks.HFlowHostedExecution(),
+            execution=hflow.build_ai_vlm_checks.HFlowHostedExecution(base_url=HOSTED_BASE_URL),
             frame_time_seconds=value,
         )
 
@@ -568,6 +595,7 @@ def test_check_version_is_pinned_for_a_fixed_hosted_configuration(tmp_path: Path
     hflow.build_ai_vlm_checks.register_hand_visibility(
         application,
         execution=hflow.build_ai_vlm_checks.HFlowHostedExecution(
+            base_url=HOSTED_BASE_URL,
             check_version=1,
             request_timeout_seconds=30.0,
         ),
@@ -598,7 +626,10 @@ def _openai_execution(**overrides: Any) -> hflow.build_ai_vlm_checks.OpenAICompa
 
 
 def _hosted_execution(**overrides: Any) -> hflow.build_ai_vlm_checks.HFlowHostedExecution:
-    return replace(hflow.build_ai_vlm_checks.HFlowHostedExecution(check_version=1), **overrides)
+    return replace(
+        hflow.build_ai_vlm_checks.HFlowHostedExecution(base_url=HOSTED_BASE_URL, check_version=1),
+        **overrides,
+    )
 
 
 @pytest.mark.parametrize(
@@ -770,6 +801,7 @@ def _evaluate_hosted_hand_count(
     **configuration: Any,
 ) -> hflow.build_ai_vlm_checks.VisionModelOutcome:
     checks = hflow.build_ai_vlm_checks
+    configuration.setdefault("base_url", HOSTED_BASE_URL)
     return asyncio.run(
         checks._evaluate_image_with_hflow_hosted_service(
             execution=checks.HFlowHostedExecution(**configuration),

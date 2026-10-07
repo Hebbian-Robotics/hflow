@@ -24,8 +24,9 @@ deterministic quality checks, start with
 
 ## Run the methodology on an HFlow episode
 
-The example uses HFlow's fixed hosted implementation for both checks by
-default. It needs no model configuration, account, or API key.
+The example sends both checks to an OpenAI-compatible vision endpoint by
+default. HFlow's fixed hosted implementation is also available; contact us to
+get access to the hosted API.
 
 To try the checks without supplying your own recording, download a small
 egocentric MCAP from Lightwheel's
@@ -46,9 +47,12 @@ cp "$downloaded_sample_mcap_path" data/build-ai-evaluation/sample.mcap
 
 If Hugging Face requests access, accept the dataset's terms and run
 `hf auth login` before downloading. You can then run the pipeline against the
-sample:
+sample with an unauthenticated local OpenAI-compatible vision server:
 
 ```bash
+export OPENAI_BASE_URL="http://localhost:8000/v1"
+export OPENAI_MODEL="Qwen/Qwen3-VL-8B-Instruct"
+
 uv run --project examples/build_ai_evaluation \
     python -m examples.build_ai_evaluation.pipeline \
     data/build-ai-evaluation/sample.mcap
@@ -57,13 +61,12 @@ uv run --project examples/build_ai_evaluation \
 Replace that path with any MCAP containing meaningful egocentric footage to
 evaluate your own recording.
 
-To use an unauthenticated local OpenAI-compatible vision server instead, select
-that execution route and identify its model:
+To use HFlow's hosted checks instead, select that execution route and pass the
+hosted API URL you received:
 
 ```bash
-export BUILD_AI_EXECUTION="openai-compatible"
-export OPENAI_BASE_URL="http://localhost:8000/v1"
-export OPENAI_MODEL="Qwen/Qwen3-VL-8B-Instruct"
+export BUILD_AI_EXECUTION="hflow-hosted"
+export BUILD_AI_HOSTED_BASE_URL="$HFLOW_HOSTED_BASE_URL"
 
 uv run --project examples/build_ai_evaluation \
     python -m examples.build_ai_evaluation.pipeline \
@@ -107,8 +110,8 @@ different configurations do not claim comparable step versions.
 Each check can select its execution independently with
 `BUILD_AI_HAND_VISIBILITY_EXECUTION` and
 `BUILD_AI_ACTIVE_MANIPULATION_EXECUTION`; each defaults to `BUILD_AI_EXECUTION`
-and then to `hflow-hosted`. For example, one check can remain hosted while the
-other uses your model:
+and then to `openai-compatible`. For example, one check can use the hosted API
+while the other uses your model:
 
 ```bash
 export BUILD_AI_HAND_VISIBILITY_EXECUTION="hflow-hosted"
@@ -121,7 +124,8 @@ OpenAI-compatible checks can use different services through the
 `BUILD_AI_ACTIVE_MANIPULATION_*` overrides.
 
 `HFlowHostedExecution` owns the hosted base URL, check version, and request policy;
-its server owns every model setting. `request_timeout_seconds` defaults to 60,
+its server owns every model setting. `base_url` has no default: contact us to
+get access to the hosted API. `request_timeout_seconds` defaults to 60,
 `total_timeout_seconds` to 360, and `max_retries` to five additional attempts.
 Tenacity retries transport failures and HTTP 429/502/503/504, respecting numeric
 `Retry-After` delays (capped at 120 seconds) or exponential backoff. Authorization
@@ -165,7 +169,7 @@ per check, so the two checks may use different executions:
 ```python
 hflow.build_ai_vlm_checks.register_hand_visibility(
     app,
-    execution=hflow.build_ai_vlm_checks.HFlowHostedExecution(),
+    execution=hflow.build_ai_vlm_checks.HFlowHostedExecution(base_url=hosted_api_url),
 )
 hflow.build_ai_vlm_checks.register_active_manipulation(
     app,
@@ -191,7 +195,7 @@ the same prompt to every frame at that rate instead:
 ```python
 hflow.build_ai_vlm_checks.register_hand_visibility(
     app,
-    execution=hflow.build_ai_vlm_checks.HFlowHostedExecution(),
+    execution=hflow.build_ai_vlm_checks.HFlowHostedExecution(base_url=hosted_api_url),
     sampling=hflow.build_ai_vlm_checks.FrameSampling(fps=1.0, start_s=0.0, end_s=None),
 )
 ```
