@@ -1428,15 +1428,8 @@ def _measure_trajectory_metrics(
         - np.maximum(profile.stamps_ns[:-1], final_window_start_ns)
     ) / 1e9
     final_window_mask = measured & (final_overlap_s > 0)
-    if not np.any(final_window_mask) and np.any(measured):
-        last_measured = int(np.flatnonzero(measured)[-1])
-        final_window_mask = np.zeros_like(measured)
-        final_window_mask[last_measured] = True
-        final_weights_s = profile.step_durations_s[final_window_mask]
-    else:
-        final_weights_s = final_overlap_s[final_window_mask]
-
     if np.any(final_window_mask):
+        final_weights_s = final_overlap_s[final_window_mask]
         final_valid_s = float(np.sum(final_weights_s))
         if final_valid_s > 0:
             final_speed = float(
