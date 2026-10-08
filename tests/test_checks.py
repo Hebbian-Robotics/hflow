@@ -675,6 +675,43 @@ def test_action_rate_reports_each_topic_at_its_own_rate(
     assert pooled_rate_hz > joint_rate_hz
 
 
+def test_action_rate_reports_zero_for_registered_empty_topic(empty_channel_episode: Path) -> None:
+    with hflow.Episode(empty_channel_episode) as episode:
+        result = asyncio.run(action_rate(episode, topics=["/joint_states"]))
+
+    assert result.measurements == {
+        "/joint_states/message_rate_hz": 0.0,
+        "pooled_message_rate_hz": 0.0,
+    }
+
+
+def test_action_rate_empty_topic_does_not_change_populated_or_pooled_rate(tmp_path: Path) -> None:
+    source = tmp_path / "populated-and-empty.mcap"
+    with source.open("wb") as stream:
+        writer = StockWriter(stream, chunk_size=64 * 1024, compression=CompressionType.NONE)
+        writer.start()
+        populated_channel = writer.register_channel(
+            topic="/joint_states", message_encoding="json", schema_id=0
+        )
+        writer.register_channel(topic="/wrench", message_encoding="json", schema_id=0)
+        for index in range(10):
+            timestamp_ns = index * 10_000_000
+            writer.add_message(
+                populated_channel,
+                log_time=timestamp_ns,
+                publish_time=timestamp_ns,
+                data=b"{}",
+            )
+        writer.finish()
+
+    with hflow.Episode(source) as episode:
+        result = asyncio.run(action_rate(episode, topics=["/joint_states", "/wrench"]))
+
+    assert result.measurements["/joint_states/message_rate_hz"] == pytest.approx(100.0)
+    assert result.measurements["/wrench/message_rate_hz"] == 0.0
+    assert result.measurements["pooled_message_rate_hz"] == pytest.approx(100.0)
+
+
 def test_content_digest_identifies_duplicate_content(tmp_path: Path) -> None:
     # Digest behavior is independent of camera encoding. A tiny state stream
     # keeps this contract focused on message content instead of fixture cost.
