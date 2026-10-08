@@ -756,8 +756,14 @@ def _ensure_source_archive(dataset_source: DatasetSource, cache_dir: Path) -> _S
                 # next.success frames: any success frame makes the episode a
                 # success. An empty aggregate carries no label either way.
                 outcome_frames = parquet_episode_row[7]
-                if outcome_frames is not None and len(outcome_frames) > 0:
-                    success_outcome = any(bool(value) for value in outcome_frames)
+                if outcome_frames is not None:
+                    if hasattr(outcome_frames, "__iter__") and not isinstance(
+                        outcome_frames, str | bytes
+                    ):
+                        if len(outcome_frames) > 0:
+                            success_outcome = any(bool(value) for value in outcome_frames)
+                    else:
+                        success_outcome = bool(outcome_frames)
             episode_rows.append(
                 _EpisodeRow(
                     episode_index=int(parquet_episode_row[0]),

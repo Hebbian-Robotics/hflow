@@ -1704,6 +1704,10 @@ def _build_success_label_corpus(
             # The column exists but carries no value for this episode, which
             # is a declared feature with nothing recorded rather than a label.
             stats_min, stats_max = [], []
+        elif outcome_mode == "scalar-true":
+            stats_min, stats_max = False, True
+        elif outcome_mode == "scalar-false":
+            stats_min, stats_max = False, False
         else:
             stats_min, stats_max = [False], [False]
         ep_cols += ["stats/next.success/min", "stats/next.success/max"]
@@ -1803,6 +1807,8 @@ def _import_success_label_corpus(
         # ``"true"`` was, one value over, so the empty aggregate needs its own
         # case rather than riding on the no-feature one.
         pytest.param("empty-aggregate", None, id="empty-aggregate-omits-the-label"),
+        pytest.param("scalar-true", "true", id="scalar-true-is-success"),
+        pytest.param("scalar-false", "false", id="scalar-false-is-reported-verbatim"),
     ],
 )
 def test_success_label_derives_from_the_outcome_aggregate(
