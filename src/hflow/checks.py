@@ -155,6 +155,7 @@ def _mask_run_intervals(
     def append_run(run_start_index: int, run_end_index: int) -> None:
         start_ns = int(stamps_ns[run_start_index])
         end_ns = int(stamps_ns[run_end_index])
+        start_ns, end_ns = min(start_ns, end_ns), max(start_ns, end_ns)
         if (end_ns - start_ns) / 1e9 >= min_duration_s:
             intervals.append(Interval(start_ns=start_ns, end_ns=end_ns, label=label))
 
