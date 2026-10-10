@@ -1091,6 +1091,7 @@ def _measure_action_rate(episode: Episode, *, topics: Sequence[str]) -> CheckRes
     for topic in topics:
         stamps_ns = episode.channel(topic).timestamps
         if len(stamps_ns) == 0:
+            measurements[f"{topic}/message_rate_hz"] = 0.0
             continue
         start_candidates_ns.append(int(stamps_ns[0]))
         end_candidates_ns.append(int(stamps_ns[-1]))
