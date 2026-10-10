@@ -1003,6 +1003,28 @@ def test_action_integrity_reports_a_clean_stream_as_clean(moving_joints_episode:
     assert result.intervals == []
 
 
+def test_action_integrity_handles_non_monotonic_timestamps_with_frozen_run() -> None:
+    """Non-monotonic or backward timestamps during a frozen run must not cause
+    interval count and run length count mismatch in zip(..., strict=True).
+    """
+    from unittest.mock import MagicMock
+
+    mock_channel = MagicMock()
+    # Backward timestamps across frozen steps: t[1] < t[0]
+    mock_channel.timestamps = np.array([2_000_000_000, 1_000_000_000, 3_000_000_000, 4_000_000_000])
+    mock_channel.to_numpy.return_value = np.array([[1.0], [1.0], [2.0], [2.0]])
+
+    mock_episode = MagicMock(spec=hflow.Episode)
+    mock_episode.channel.return_value = mock_channel
+
+    result = hflow.checks._measure_action_integrity(mock_episode, topic="/joint_states")
+    assert result.measurements["/joint_states/frozen_run_count"] == 2
+    assert len(result.intervals) == 2
+    for interval in result.intervals:
+        assert interval.start_ns <= interval.end_ns
+        assert interval.label == "frozen:/joint_states"
+
+
 def test_camera_signal_quality_measures_range_exposure_and_stillness(tmp_path: Path) -> None:
     canonical = synthesize_canonical_episode(
         tmp_path,
