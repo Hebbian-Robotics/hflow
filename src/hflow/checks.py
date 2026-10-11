@@ -503,11 +503,11 @@ def _camera_frame_stats_keys(episode: Episode, *, cameras: Sequence[str] | None 
     default parameters.
 
     Per topic: ``message_count`` always; ``expected_frame_count`` and
-    ``frame_deficit_pct`` only when the topic carries at least two messages;
-    the eight decoded-evidence keys always. ``camera_instrument`` and
-    ``camera_measurement_definition`` are the two non-topic keys; they ride
-    inside the per-topic selection, so an episode with no cameras emits
-    nothing at all.
+    ``frame_deficit_pct`` only when the topic carries at least two messages
+    and advancing timestamps; the eight decoded-evidence keys always.
+    ``camera_instrument`` and ``camera_measurement_definition`` are the two
+    non-topic keys; they ride inside the per-topic selection, so an episode
+    with no cameras emits nothing at all.
     """
     selected = _resolve_selected_cameras(episode, cameras)
     keys: set[str] = set()
@@ -547,7 +547,7 @@ class _CameraIntermediates:
 
     stamps_ns: np.ndarray
     stats: VideoFrameStatistics
-    # None below two messages, mirroring the branches that need a rate.
+    # None below two messages or on non-advancing timestamps, mirroring the branches that need a rate.
     expected_frame_count: int | None
 
 
