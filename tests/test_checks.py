@@ -759,6 +759,81 @@ def test_camera_frame_stats_sees_the_injected_black_segment(tmp_path: Path) -> N
     assert isinstance(instrument, str) and "ffmpeg version" in instrument
 
 
+def test_camera_frame_stats_handles_duplicate_and_stationary_timestamps_without_zero_division(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #717: when camera timestamp deltas have median 0.0 (e.g. duplicate or
+    batch-stamped timestamps), camera_frame_stats must use advancing intervals
+    rather than raising ZeroDivisionError, and omit rate keys if the clock never advances.
+    """
+    from unittest.mock import MagicMock
+
+    fake_stats = MagicMock(
+        decoded_frame_count=6,
+        black_frame_percent=0.0,
+        overexposed_frame_percent=0.0,
+        freeze_total_seconds=0.0,
+        average_luma_mean=128.0,
+        average_luma_minimum=100.0,
+        average_luma_maximum=150.0,
+        black_intervals=(),
+        freeze_intervals=(),
+        provenance=MagicMock(ffmpeg_version="fake-ffmpeg"),
+    )
+    monkeypatch.setattr(
+        hflow.checks,
+        "measure_video_frame_statistics_for_hflow",
+        lambda *args, **kwargs: fake_stats,
+    )
+
+    # 1. Stream with duplicate timestamps where >50% of intervals are 0 ns:
+    # deltas: [0, 0, 1s, 0, 0] -> median is 0.0 without advancing filter.
+    channel_duplicate = MagicMock()
+    channel_duplicate.timestamps = np.array(
+        [
+            1_000_000_000,
+            1_000_000_000,
+            1_000_000_000,
+            2_000_000_000,
+            2_000_000_000,
+            2_000_000_000,
+        ]
+    )
+
+    ep = MagicMock(spec=hflow.Episode)
+    ep.cameras = ["/wrist_cam"]
+    ep.channel.return_value = channel_duplicate
+    ep.video.return_value = Path("/fake/video.mp4")
+
+    # Keys must predict expected_frame_count since clock advances between 1s and 2s
+    keys = hflow.checks._camera_frame_stats_keys(ep)
+    assert "/wrist_cam/expected_frame_count" in keys
+    assert "/wrist_cam/frame_deficit_pct" in keys
+
+    result = hflow.checks._measure_camera_frame_stats(ep)
+    assert result.measurements["/wrist_cam/message_count"] == 6
+    assert result.measurements["/wrist_cam/expected_frame_count"] == 2
+    assert result.measurements["/wrist_cam/frame_deficit_pct"] == pytest.approx(-200.0)
+
+    # 2. Stationary stream where timestamps never advance at all:
+    channel_stationary = MagicMock()
+    channel_stationary.timestamps = np.array([1_000_000_000, 1_000_000_000, 1_000_000_000])
+    ep_stationary = MagicMock(spec=hflow.Episode)
+    ep_stationary.cameras = ["/wrist_cam"]
+    ep_stationary.channel.return_value = channel_stationary
+    ep_stationary.video.return_value = Path("/fake/video.mp4")
+
+    # Keys must omit expected_frame_count because stream does not carry an advancing rate
+    keys_stationary = hflow.checks._camera_frame_stats_keys(ep_stationary)
+    assert "/wrist_cam/expected_frame_count" not in keys_stationary
+    assert "/wrist_cam/frame_deficit_pct" not in keys_stationary
+
+    result_stationary = hflow.checks._measure_camera_frame_stats(ep_stationary)
+    assert "/wrist_cam/expected_frame_count" not in result_stationary.measurements
+    assert "/wrist_cam/frame_deficit_pct" not in result_stationary.measurements
+    assert result_stationary.measurements["/wrist_cam/message_count"] == 3
+
+
 def test_media_digest_matches_the_same_footage_under_different_telemetry(
     tmp_path: Path,
 ) -> None:
