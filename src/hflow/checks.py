@@ -1872,7 +1872,7 @@ def _trajectory_profile(
     # only strictly-increasing stamps is what stops a zero-length step from
     # dividing into an infinite speed.
     advancing = np.ones(len(stamps_ns), dtype=bool)
-    advancing[1:] = np.diff(stamps_ns) > 0
+    advancing[1:] = stamps_ns[1:] > np.maximum.accumulate(stamps_ns[:-1])
     stamps_ns = stamps_ns[advancing]
     samples = samples[advancing]
     if len(stamps_ns) < 2:

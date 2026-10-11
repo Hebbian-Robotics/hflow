@@ -1261,6 +1261,97 @@ def test_trajectory_change_threshold_uses_a_true_weighted_median() -> None:
     assert _duration_weighted_median(values, np.array([10.0, 1.0, 1.0])) == 1.0
 
 
+def test_trajectory_profile_rejects_backward_and_duplicate_timestamps_against_accepted_history() -> (
+    None
+):
+    """_trajectory_profile must only accept timestamps strictly newer than the
+    running accepted maximum, preventing negative durations and IndexErrors from
+    interspersed backward steps.
+    """
+    from unittest.mock import MagicMock
+
+    from hflow.checks import (
+        _measure_trajectory_metrics,
+        _measure_trajectory_segments,
+        _trajectory_profile,
+    )
+
+    mock_channel = MagicMock()
+    mock_channel.timestamps = np.array(
+        [
+            1_000_000_000,
+            2_000_000_000,
+            4_000_000_000,
+            3_000_000_000,  # backward jump relative to accepted 4s -> rejected
+            4_000_000_000,  # duplicate of accepted 4s -> rejected
+            5_000_000_000,  # forward relative to 4s -> accepted
+        ]
+    )
+    mock_channel.to_numpy.return_value = np.array([[1.0], [2.0], [4.0], [3.0], [4.0], [5.0]])
+
+    mock_episode = MagicMock(spec=hflow.Episode)
+    mock_episode.channel.return_value = mock_channel
+
+    profile = _trajectory_profile(
+        mock_episode, topic="/joint_states", field=None, dimension_scales=None
+    )
+    assert profile is not None
+    np.testing.assert_array_equal(
+        profile.stamps_ns, [1_000_000_000, 2_000_000_000, 4_000_000_000, 5_000_000_000]
+    )
+    np.testing.assert_allclose(profile.speeds, [1.0, 1.0, 1.0])
+    assert np.all(profile.step_durations_s > 0)
+
+    # Both public measurement functions execute cleanly without error
+    seg_res = _measure_trajectory_segments(mock_episode, topic="/joint_states")
+    assert seg_res.measurements["/joint_states/segment_sample_count"] == 4
+
+    met_res = _measure_trajectory_metrics(mock_episode, topic="/joint_states")
+    assert met_res.measurements["/joint_states/trajectory_sample_count"] == 4
+    assert met_res.measurements["/joint_states/trajectory_span_s"] == 4.0
+
+
+def test_trajectory_profile_handles_retrograde_series_retaining_fewer_than_two_samples() -> None:
+    """When a backward timestamp leaves fewer than two strictly-increasing samples,
+    _trajectory_profile returns None and checks report raw sample counts without crashing (#714).
+    """
+    from unittest.mock import MagicMock
+
+    from hflow.checks import (
+        _measure_trajectory_metrics,
+        _measure_trajectory_segments,
+        _trajectory_profile,
+    )
+
+    # Exact reproduction from issue #714
+    mock_channel = MagicMock()
+    mock_channel.timestamps = np.array(
+        [
+            10_000_000_000,
+            1_000_000_000,
+            2_000_000_000,
+            3_000_000_000,
+            4_000_000_000,
+            5_000_000_000,
+        ]
+    )
+    mock_channel.to_numpy.return_value = np.array([[1.0], [2.0], [5.0], [1.0], [7.0], [3.0]])
+
+    mock_episode = MagicMock(spec=hflow.Episode)
+    mock_episode.channel.return_value = mock_channel
+
+    assert (
+        _trajectory_profile(mock_episode, topic="/joint_states", field=None, dimension_scales=None)
+        is None
+    )
+
+    seg_res = _measure_trajectory_segments(mock_episode, topic="/joint_states")
+    assert seg_res.measurements["/joint_states/segment_sample_count"] == 6
+
+    met_res = _measure_trajectory_metrics(mock_episode, topic="/joint_states")
+    assert met_res.measurements["/joint_states/trajectory_sample_count"] == 6
+
+
 def test_trajectory_metrics_emits_unsettled_ratio_for_a_moving_episode(
     moving_joints_episode: Path,
 ) -> None:

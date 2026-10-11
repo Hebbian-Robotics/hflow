@@ -221,6 +221,9 @@ range: a near-still episode has a tiny range, so dividing by it would inflate
 that episode's sensor jitter into apparent motion, inverting the metric on
 exactly the episodes worth catching.
 
+Both trajectory checks discard duplicate and backward timestamps relative to
+the last accepted timestamp, keeping samples aligned in their original order.
+
 ## Gate on one
 
 Recording evidence is the default because the same measurements should support
