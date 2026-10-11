@@ -1180,6 +1180,115 @@ def test_trajectory_metrics_finds_the_injected_hold(held_joints_episode: Path) -
     assert result.verdict is None
 
 
+def _trajectory_episode_with_timestamps(timestamps_s: list[int], values: list[float]) -> Any:
+    """A channel with samples in the supplied timestamp order."""
+    from unittest.mock import MagicMock
+
+    channel = MagicMock()
+    channel.timestamps = np.asarray(timestamps_s, dtype=np.int64) * 1_000_000_000
+    channel.to_numpy.return_value = np.asarray(values, dtype=float)[:, np.newaxis]
+    episode = MagicMock(spec=hflow.Episode)
+    episode.channel.return_value = channel
+    return episode
+
+
+def test_trajectory_checks_ignore_backward_and_duplicate_stamps_without_shifting_samples() -> None:
+    from hflow.checks import _trajectory_profile
+
+    episode = _trajectory_episode_with_timestamps(
+        [0, 2, 1, 3, 3, 4], [0.0, 2.0, 999.0, 3.0, 888.0, 4.0]
+    )
+    profile = _trajectory_profile(episode, "/joint_states", None, None)
+    assert profile is not None
+    np.testing.assert_array_equal(profile.stamps_ns, np.array([0, 2, 3, 4]) * 1_000_000_000)
+    np.testing.assert_allclose(profile.step_durations_s, [2.0, 1.0, 1.0])
+    np.testing.assert_allclose(profile.speeds, [1.0, 1.0, 1.0])
+    assert np.all(np.diff(profile.stamps_ns) > 0)
+    assert np.all(profile.step_durations_s > 0)
+
+    metrics = asyncio.run(trajectory_metrics(episode))
+    segments = asyncio.run(trajectory_segments(episode))
+    assert metrics.measurements["/joint_states/trajectory_sample_count"] == 4
+    assert metrics.measurements["/joint_states/trajectory_span_s"] == pytest.approx(4.0)
+    assert metrics.measurements["/joint_states/valid_velocity_s"] == pytest.approx(4.0)
+    assert metrics.measurements["/joint_states/mean_velocity"] == pytest.approx(1.0)
+    assert segments.measurements["/joint_states/segment_sample_count"] == 4
+    assert np.isfinite(segments.measurements["/joint_states/trajectory_change_threshold"])
+    assert all(
+        0 <= interval.start_ns < interval.end_ns <= 4_000_000_000 for interval in segments.intervals
+    )
+
+
+def test_trajectory_checks_skip_steps_when_backward_timestamps_never_recover() -> None:
+    from hflow.checks import _trajectory_profile
+
+    episode = _trajectory_episode_with_timestamps(
+        [10, 1, 2, 3, 4, 5], [1.0, 2.0, 5.0, 1.0, 7.0, 3.0]
+    )
+    assert _trajectory_profile(episode, "/joint_states", None, None) is None
+    metrics = asyncio.run(trajectory_metrics(episode))
+    segments = asyncio.run(trajectory_segments(episode))
+    assert metrics.measurements == {"/joint_states/trajectory_sample_count": 6}
+    assert segments.measurements == {"/joint_states/segment_sample_count": 6}
+    assert metrics.intervals == []
+    assert segments.intervals == []
+
+
+def test_trajectory_checks_resume_only_after_last_accepted_timestamp() -> None:
+    from hflow.checks import _trajectory_profile
+
+    episode = _trajectory_episode_with_timestamps(
+        [10, 11, 9, 10, 12], [1.0, 4.0, 999.0, 888.0, 7.0]
+    )
+    profile = _trajectory_profile(episode, "/joint_states", None, None)
+    assert profile is not None
+    np.testing.assert_array_equal(profile.stamps_ns, np.array([10, 11, 12]) * 1_000_000_000)
+    np.testing.assert_allclose(profile.step_durations_s, [1.0, 1.0])
+    np.testing.assert_allclose(profile.speeds, [3.0, 3.0])
+    metrics = asyncio.run(trajectory_metrics(episode))
+    segments = asyncio.run(trajectory_segments(episode))
+    assert metrics.measurements["/joint_states/trajectory_sample_count"] == 3
+    assert metrics.measurements["/joint_states/trajectory_span_s"] == pytest.approx(2.0)
+    assert metrics.measurements["/joint_states/mean_velocity"] == pytest.approx(3.0)
+    assert segments.measurements["/joint_states/segment_sample_count"] == 3
+    assert all(
+        10_000_000_000 <= i.start_ns < i.end_ns <= 12_000_000_000 for i in segments.intervals
+    )
+
+
+def test_trajectory_checks_keep_non_finite_measurement_policy_for_ordered_stream() -> None:
+    from hflow.checks import _trajectory_profile
+
+    episode = _trajectory_episode_with_timestamps([0, 1, 2, 3], [0.0, 1.0, float("nan"), 3.0])
+    profile = _trajectory_profile(episode, "/joint_states", None, None)
+    assert profile is not None
+    np.testing.assert_array_equal(profile.stamps_ns, np.arange(4) * 1_000_000_000)
+    np.testing.assert_allclose(profile.step_durations_s, [1.0, 1.0, 1.0])
+    np.testing.assert_allclose(profile.speeds, [1.0, np.nan, np.nan])
+    assert profile.non_finite_sample_count == 1
+
+    metrics = asyncio.run(trajectory_metrics(episode))
+    segments = asyncio.run(trajectory_segments(episode))
+    assert metrics.measurements["/joint_states/non_finite_sample_count"] == 1
+    assert metrics.measurements["/joint_states/trajectory_span_s"] == pytest.approx(3.0)
+    assert metrics.measurements["/joint_states/valid_velocity_s"] == pytest.approx(1.0)
+    assert segments.measurements["/joint_states/segment_sample_count"] == 4
+    assert all(interval.end_ns > interval.start_ns for interval in segments.intervals)
+
+
+@pytest.mark.parametrize("sample_count", [0, 1])
+def test_trajectory_checks_keep_sample_count_for_short_streams(sample_count: int) -> None:
+    episode = _trajectory_episode_with_timestamps(
+        list(range(sample_count)), [float(index) for index in range(sample_count)]
+    )
+    assert asyncio.run(trajectory_metrics(episode)).measurements == {
+        "/joint_states/trajectory_sample_count": sample_count
+    }
+    segments = asyncio.run(trajectory_segments(episode))
+    assert segments.measurements == {"/joint_states/segment_sample_count": sample_count}
+    assert segments.intervals == []
+
+
 def test_trajectory_metrics_dimension_scales_are_recorded_and_validated(
     tmp_path: Path,
 ) -> None:
