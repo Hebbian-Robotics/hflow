@@ -853,14 +853,13 @@ def curate(
     uses for tenant-supplied SQL. File locking alone does not replace the
     statement gate.
     """
-    # file:// output URLs mean a local file, matching parse_storage_root's
-    # convention for roots -- without this, the Path() branch below would
-    # treat "file:///x" as a literal relative directory name.
-    if isinstance(output, str) and output.startswith("file://"):
-        file_url_path = output.removeprefix("file://")
-        if not file_url_path.startswith("/"):
-            raise ValueError(f"manifest output URL {output!r} must be absolute (file:///abs/path)")
-        output = Path(file_url_path)
+    # A non-bucket string output follows parse_storage_root's scheme rules, so
+    # file:///abs (any case) is a local file and a typo'd scheme is refused
+    # before the query runs instead of becoming a literal directory name.
+    if isinstance(output, str) and not is_bucket_url(output):
+        match parse_storage_root(output):
+            case LocalStorageRoot(path=local_output):
+                output = local_output
 
     location = parse_storage_root(catalog_root)
     _verify_catalog_format(location)

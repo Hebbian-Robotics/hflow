@@ -2685,6 +2685,42 @@ def test_curate_accepts_file_url_output(tmp_path: Path) -> None:
     assert not manifest_target.with_name(manifest_target.name + ".tmp").exists()
 
 
+def test_curate_accepts_uppercase_file_url_output(tmp_path: Path) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    canonical = tmp_path / "e.canonical.mcap"
+    canonical.write_bytes(b"episode-bytes")
+    catalog.append_episode(
+        canonical_path=canonical, stamps=FAKE_STAMPS, episode_metadata={}, check_rows=[]
+    )
+    manifest_target = tmp_path / "out" / "manifest.parquet"
+    report = curate(
+        tmp_path / "catalog",
+        "SELECT episode_id FROM episodes",
+        output=f"FILE://{manifest_target}",
+    )
+    assert report.manifest_path == manifest_target
+    assert manifest_target.is_file()
+
+
+def test_curate_refuses_unsupported_output_scheme(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    canonical = tmp_path / "e.canonical.mcap"
+    canonical.write_bytes(b"episode-bytes")
+    catalog.append_episode(
+        canonical_path=canonical, stamps=FAKE_STAMPS, episode_metadata={}, check_rows=[]
+    )
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError, match="unsupported storage scheme 'gcs'"):
+        curate(
+            tmp_path / "catalog",
+            "SELECT episode_id FROM episodes",
+            output="gcs://my-bucket/manifest.parquet",
+        )
+    assert not (tmp_path / "gcs:").exists()
+
+
 def _episode_with_check(
     tmp_path: Path,
     *,
