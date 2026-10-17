@@ -8,6 +8,7 @@ from episode_test_helpers import synthesize_canonical_episode
 from pytest import CaptureFixture
 
 from hflow import __version__
+from hflow.catalog import Catalog
 from hflow.cli import main
 from hflow.testing import SyntheticEpisodeSpec
 
@@ -363,3 +364,45 @@ def test_import_lerobot_cli_accepts_bucket_output_dir_strings(
 
     assert exit_code == 0
     assert received == ["s3://robot-data/production"]
+
+
+def test_cli_curate_unknown_output_scheme(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    """Report the unsupported scheme without writing a partial manifest."""
+    catalog_root = tmp_path / "catalog"
+    Catalog(catalog_root)
+
+    result = main(
+        [
+            "curate",
+            "SELECT 1 AS one",
+            "--catalog",
+            str(catalog_root),
+            "--output",
+            "gcs://bucket/manifest.parquet",
+        ]
+    )
+
+    assert result == 2
+    assert "gcs" in capsys.readouterr().err
+    assert not list(tmp_path.rglob("manifest.parquet"))
+
+
+def test_cli_curate_file_output_scheme_is_case_insensitive(tmp_path: Path) -> None:
+    """The CLI accepts both local file scheme spellings."""
+    catalog_root = tmp_path / "catalog"
+    Catalog(catalog_root)
+    manifest = tmp_path / "output" / "manifest.parquet"
+
+    for scheme in ("file", "FILE"):
+        result = main(
+            [
+                "curate",
+                "SELECT 1 AS one",
+                "--catalog",
+                str(catalog_root),
+                "--output",
+                f"{scheme}://{manifest}",
+            ]
+        )
+        assert result == 0
+        assert manifest.is_file()

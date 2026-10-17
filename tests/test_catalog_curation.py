@@ -2892,3 +2892,26 @@ def test_status_builder_refuses_an_unqualified_column() -> None:
         episode_status_case_sql(
             quarantined_column="quarantined", check_runs_relation="check_runs_latest"
         )
+
+
+def test_curate_rejects_unknown_output_scheme(tmp_path: Path) -> None:
+    """Reject unsupported output schemes before opening the query connection."""
+    catalog_root = tmp_path / "catalog"
+    Catalog(catalog_root)
+
+    with pytest.raises(ValueError, match="gcs"):
+        curate(catalog_root, "SELECT 1 AS one", output="gcs://bucket/manifest.parquet")
+
+    assert not list(tmp_path.rglob("manifest.parquet"))
+
+
+def test_curate_file_output_scheme_is_case_insensitive(tmp_path: Path) -> None:
+    """Both spellings target the same absolute local manifest path."""
+    catalog_root = tmp_path / "catalog"
+    Catalog(catalog_root)
+    manifest = tmp_path / "output" / "manifest.parquet"
+
+    for scheme in ("file", "FILE"):
+        report = curate(catalog_root, "SELECT 1 AS one", output=f"{scheme}://{manifest}")
+        assert report.manifest_path == manifest
+        assert manifest.is_file()

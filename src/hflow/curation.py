@@ -72,7 +72,6 @@ from hflow.storage import (
     BucketStorageRoot,
     LocalStorageRoot,
     StorageRoot,
-    is_bucket_url,
     parse_storage_root,
 )
 
@@ -853,14 +852,7 @@ def curate(
     uses for tenant-supplied SQL. File locking alone does not replace the
     statement gate.
     """
-    # file:// output URLs mean a local file, matching parse_storage_root's
-    # convention for roots -- without this, the Path() branch below would
-    # treat "file:///x" as a literal relative directory name.
-    if isinstance(output, str) and output.startswith("file://"):
-        file_url_path = output.removeprefix("file://")
-        if not file_url_path.startswith("/"):
-            raise ValueError(f"manifest output URL {output!r} must be absolute (file:///abs/path)")
-        output = Path(file_url_path)
+    output_location = None if output is None else parse_storage_root(output)
 
     location = parse_storage_root(catalog_root)
     _verify_catalog_format(location)
@@ -873,8 +865,8 @@ def curate(
         # per destination shape, so a half-resolved state (a bucket target
         # with no staging directory) is unrepresentable.
         destination: _ManifestDestination = None
-        if isinstance(output, str) and is_bucket_url(output):
-            manifest_parent_url, _, manifest_name = output.rpartition("/")
+        if isinstance(output_location, BucketStorageRoot):
+            manifest_parent_url, _, manifest_name = str(output).rpartition("/")
             if not manifest_name:
                 raise ValueError(f"manifest output URL {output!r} names no object")
             destination = _BucketManifestDestination(
@@ -884,8 +876,8 @@ def curate(
                     cleanup.enter_context(tempfile.TemporaryDirectory(prefix="hflow-manifest-"))
                 ),
             )
-        elif output is not None:
-            local_manifest = Path(output)
+        elif isinstance(output_location, LocalStorageRoot):
+            local_manifest = output_location.path
             local_manifest.parent.mkdir(parents=True, exist_ok=True)
             # A PRIVATE staging subdirectory, never the output's parent: the
             # constrained allowlist is recursive and covers reads too, so
