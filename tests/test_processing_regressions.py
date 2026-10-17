@@ -29,8 +29,15 @@ from mcap_test_helpers import (
 import hflow
 from hflow import transform
 from hflow._grouped_mcap_writer import NO_SCHEMA_ID, GroupedMcapWriter
+from hflow.catalog import content_episode_id
+from hflow.checks import required_topics
 from hflow.doctor import diagnose
-from hflow.format import METADATA_RECORD_EPISODE, METADATA_RECORD_PROVENANCE
+from hflow.format import (
+    FFMPEG_VERSION_NOT_USED,
+    METADATA_RECORD_EPISODE,
+    METADATA_RECORD_PROVENANCE,
+    PROVENANCE_KEY_TOPIC_GROUP_PREFIX,
+)
 from hflow.reader import TopicInfo
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import SourceNotConforming, write_canonical_episode
@@ -94,6 +101,89 @@ def test_transform_preserves_no_schema_sentinel_and_empty_episode_record(
         assert channel.schema_id == 0
         record_names = [record.name for record in reader.iter_metadata()]
     assert METADATA_RECORD_EPISODE in record_names
+
+
+def _write_status_source(path: Path, *, declare_empty_camera: bool) -> Path:
+    from foxglove_schemas_protobuf.CompressedImage_pb2 import CompressedImage
+    from mcap_protobuf.schema import build_file_descriptor_set
+
+    with path.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        if declare_empty_camera:
+            image_schema_id = writer.register_schema(
+                name="foxglove.CompressedImage",
+                encoding="protobuf",
+                data=build_file_descriptor_set(CompressedImage).SerializeToString(),
+            )
+            writer.register_channel(
+                topic="/cam", message_encoding="protobuf", schema_id=image_schema_id
+            )
+        status_channel_id = writer.register_channel(
+            topic="/status", message_encoding="json", schema_id=0
+        )
+        for index in range(3):
+            writer.add_message(
+                status_channel_id,
+                log_time=index * 10**9,
+                data=json.dumps({"index": index}).encode(),
+                publish_time=index * 10**9,
+            )
+        writer.finish()
+    return path
+
+
+def test_transform_keeps_a_declared_camera_channel_with_no_messages(tmp_path: Path) -> None:
+    """A camera that recorded nothing is still a declared channel (#528).
+
+    Dropping it made the canonical byte-identical to a source that never
+    declared the camera, so both got one episode_id, and provenance still
+    named the camera's topic group with no channel behind it.
+    """
+    with_camera = tmp_path / "with-camera.mcap"
+    without_camera = tmp_path / "without-camera.mcap"
+    write_canonical_episode(
+        _write_status_source(tmp_path / "with-camera-source.mcap", declare_empty_camera=True),
+        with_camera,
+    )
+    write_canonical_episode(
+        _write_status_source(tmp_path / "without-camera-source.mcap", declare_empty_camera=False),
+        without_camera,
+    )
+
+    assert content_episode_id(with_camera) != content_episode_id(without_camera)
+
+    with with_camera.open("rb") as stream:
+        reader = make_reader(stream)
+        summary = reader.get_summary()
+        assert summary is not None
+        assert summary.statistics is not None
+        channels_by_topic = {channel.topic: channel for channel in summary.channels.values()}
+        assert set(channels_by_topic) == {"/cam", "/status"}
+        camera_channel = channels_by_topic["/cam"]
+        assert summary.schemas[camera_channel.schema_id].name == "foxglove.CompressedVideo"
+        assert summary.statistics.channel_message_counts.get(camera_channel.id, 0) == 0
+        provenance = next(
+            record.metadata
+            for record in reader.iter_metadata()
+            if record.name == METADATA_RECORD_PROVENANCE
+        )
+    grouped_topics = {
+        key.removeprefix(PROVENANCE_KEY_TOPIC_GROUP_PREFIX)
+        for key in provenance
+        if key.startswith(PROVENANCE_KEY_TOPIC_GROUP_PREFIX)
+    }
+    assert grouped_topics == set(channels_by_topic)
+    # Nothing was transcoded, so ffmpeg is still not an instrument here.
+    assert provenance["ffmpeg_version"] == FFMPEG_VERSION_NOT_USED
+
+    with hflow.Episode(with_camera) as episode:
+        result = asyncio.run(required_topics(episode, topics=["/cam"]))
+    assert result.measurements == {
+        "/cam/present": True,
+        "/cam/message_count": 0,
+        "missing_topic_count": 0,
+    }
 
 
 def test_transform_rejects_nonconforming_passthrough_video(tmp_path: Path) -> None:

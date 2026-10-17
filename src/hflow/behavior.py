@@ -97,4 +97,10 @@ across these changes.
 # previously produced canonical bytes the topic-keyed checks cannot read, so
 # they must not share a pipeline identity with a transform that will not write
 # them. Unique-topic episodes change bytes only because this constant moved.
-TRANSFORM_BEHAVIOR_VERSION: str = "10"
+#
+# "11": a declared camera channel with no messages is written as an empty
+# canonical video channel instead of being dropped with a warning (#528). The
+# canonical used to lose the declaration while provenance still named its
+# topic group, so required_topics reported the camera absent. Episodes with
+# no empty camera channel change bytes only because this constant moved.
+TRANSFORM_BEHAVIOR_VERSION: str = "11"

@@ -55,7 +55,6 @@ v1 behavior:
 
 import hashlib
 import json
-import logging
 from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 from dataclasses import dataclass, field
@@ -109,8 +108,6 @@ from hflow.format import (
 )
 from hflow.reader import TopicInfo, open_reader
 from hflow.resample import DerivedSeries
-
-logger = logging.getLogger(__name__)
 
 # Image-carrying schemas the v1 transform can transcode to in-band H.264.
 _TRANSCODABLE_IMAGE_SCHEMAS = frozenset(
@@ -756,7 +753,8 @@ def write_canonical_episode(
             payloads = camera_payloads[channel_id]
             topic = infos[channel_id].topic
             if not payloads:
-                logger.warning("camera topic %r has no messages; dropping it", topic)
+                # Nothing to encode. The declared channel is still written
+                # below with no messages, like any other empty channel (#528).
                 continue
             images, frame_ids, input_codec = _decode_compressed_images(
                 topic, infos[channel_id], payloads
@@ -895,8 +893,6 @@ def write_canonical_episode(
             for source_channel_id in sorted(infos, key=lambda cid: (infos[cid].topic, cid)):
                 info = infos[source_channel_id]
                 if source_channel_id in camera_payloads:
-                    if not camera_payloads[source_channel_id]:
-                        continue
                     if video_schema_id is None:
                         video_schema_id = writer.register_schema(
                             name=CANONICAL_VIDEO_SCHEMA_NAME,
