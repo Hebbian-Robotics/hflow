@@ -163,6 +163,10 @@ query later rather than pass/fail decisions baked into your corpus.
 | `content_digest` | Did this same recording arrive twice? |
 | `media_digest` | Did this same *footage* arrive twice, even re-stamped or with different telemetry? |
 
+For `camera_frame_stats`, an empty camera topic reports only
+`{topic}/message_count=0`; no video statistics or instrument provenance are
+emitted unless a selected camera has messages.
+
 Three need a topic or a rate you have to supply: `required_topics` and
 `action_rate` take `topics=`, and `camera_fps_conformance` needs `nominal_fps=`
 to compare against. The joint-stream checks default to `/joint_states`; pass

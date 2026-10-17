@@ -725,6 +725,99 @@ def test_a_single_stamp_camera_topic_errors_before_any_measurement(
     }
 
 
+def test_empty_camera_default_records_only_its_message_count(tmp_path: Path) -> None:
+    """A declared camera with no messages must not require a video or a denominator."""
+    topic = "/empty/compressed"
+    source = tmp_path / "empty-camera.mcap"
+    write_compressed_video_mcap(source, [], empty_topics=[topic])
+
+    app = hflow.App(
+        "empty-camera", data_root=tmp_path / "data", default_checks=(camera_frame_stats,)
+    )
+    report = asyncio.run(app.test(source, verbose=False))
+    run = report.check("camera_frame_stats")
+    assert run.result is not None, run.error
+    assert dict(run.result.measurements) == {f"{topic}/message_count": 0}
+    assert run.result.intervals == []
+
+    with hflow.Episode(report.canonical_path) as episode:
+        assert episode.cameras == [topic]
+        assert episode.channel(topic).timestamps.size == 0
+        assert _DEFAULT_KEY_FACTS[camera_frame_stats](episode) == set(run.result.measurements)
+        assert _camera_frame_stats_keys(episode, cameras=[]) == set()
+        assert asyncio.run(camera_frame_stats(episode, cameras=[])).measurements == {}
+
+
+def test_empty_camera_does_not_supersede_a_disjoint_default(tmp_path: Path) -> None:
+    """The default's key fact must not claim decoder measurements for empty topics."""
+    topic = "/empty/compressed"
+    source = tmp_path / "empty-camera.mcap"
+    write_compressed_video_mcap(source, [], empty_topics=[topic])
+    app = hflow.App(
+        "empty-camera-no-overlap",
+        data_root=tmp_path / "data",
+        default_checks=(camera_frame_stats,),
+    )
+
+    @app.check(version="1")
+    async def external_decoder(episode: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={f"{topic}/decoded_frame_count": 0})
+
+    report = asyncio.run(app.test(source, verbose=False))
+    default = report.check("camera_frame_stats")
+    assert default.result is not None, default.error
+    assert dict(default.result.measurements) == {f"{topic}/message_count": 0}
+    assert report.check("external_decoder").result is not None
+
+
+def test_empty_camera_does_not_prevent_measuring_populated_camera(
+    default_checks_report_for: DefaultChecksReportFor,
+) -> None:
+    """The empty topic adds only a count, without losing the real decoder's results."""
+    from unittest.mock import MagicMock
+
+    canonical = default_checks_report_for(
+        SyntheticEpisodeSpec(duration_s=1.0, cameras=("wrist_cam",))
+    ).canonical_path
+    with hflow.Episode(canonical) as episode:
+        (populated_topic,) = episode.cameras
+        baseline = asyncio.run(camera_frame_stats(episode))
+        empty_topic = "/empty/compressed"
+        empty_channel = MagicMock()
+        empty_channel.timestamps = np.empty(0, dtype=np.int64)
+        mixed = MagicMock(spec=hflow.Episode)
+        mixed.cameras = [empty_topic, populated_topic]
+        mixed.channel.side_effect = lambda topic: (
+            empty_channel if topic == empty_topic else episode.channel(topic)
+        )
+
+        def video_for(topic: str) -> Path:
+            assert topic == populated_topic, "the empty topic must not invoke Episode.video"
+            return episode.video(topic)
+
+        mixed.video.side_effect = video_for
+        result = asyncio.run(camera_frame_stats(mixed))
+        expected = {**baseline.measurements, f"{empty_topic}/message_count": 0}
+        assert dict(result.measurements) == expected
+        assert result.intervals == baseline.intervals
+        assert _DEFAULT_KEY_FACTS[camera_frame_stats](mixed) == set(expected)
+        assert "camera_instrument" in result.measurements
+        assert "camera_measurement_definition" in result.measurements
+        assert not any(
+            key.startswith(f"{empty_topic}/") and key != f"{empty_topic}/message_count"
+            for key in result.measurements
+        )
+        mixed.video.assert_called_once_with(populated_topic)
+
+        empty_only = asyncio.run(camera_frame_stats(mixed, cameras=[empty_topic]))
+        assert dict(empty_only.measurements) == {f"{empty_topic}/message_count": 0}
+        assert empty_only.intervals == []
+        assert _camera_frame_stats_keys(mixed, cameras=[empty_topic]) == set(
+            empty_only.measurements
+        )
+        mixed.video.assert_called_once_with(populated_topic)
+
+
 def test_declared_expected_hz_wins_and_median_delta_fills_in(tmp_path: Path) -> None:
     """The precedence the intermediates copy verbatim: the parameter wins per
     topic; the median inter-message delta is the only fallback; two-way, no

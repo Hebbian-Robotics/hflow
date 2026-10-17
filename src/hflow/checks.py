@@ -502,18 +502,21 @@ def _camera_frame_stats_keys(episode: Episode, *, cameras: Sequence[str] | None 
     takes the post-execution path), so the fact is always called with
     default parameters.
 
-    Per topic: ``message_count`` always; ``expected_frame_count`` and
-    ``frame_deficit_pct`` only when the topic carries at least two messages
-    and advancing timestamps; the eight decoded-evidence keys always.
-    ``camera_instrument`` and ``camera_measurement_definition`` are the two
-    non-topic keys; they ride inside the per-topic selection, so an episode
-    with no cameras emits nothing at all.
+    Per topic: ``message_count`` always; the eight decoded-evidence keys only
+    for nonempty topics; ``expected_frame_count`` and ``frame_deficit_pct``
+    only with at least two timestamps and an increasing step. The two non-topic
+    keys, ``camera_instrument`` and ``camera_measurement_definition``, are
+    emitted only when at least one selected camera has messages to decode.
     """
     selected = _resolve_selected_cameras(episode, cameras)
     keys: set[str] = set()
+    has_nonempty_camera = False
     for topic in selected:
         stamps_ns = episode.channel(topic).timestamps
         keys.add(f"{topic}/message_count")
+        if stamps_ns.size == 0:
+            continue
+        has_nonempty_camera = True
         if stamps_ns.size >= 2 and np.any(np.diff(stamps_ns) > 0):
             keys.add(f"{topic}/expected_frame_count")
             keys.add(f"{topic}/frame_deficit_pct")
@@ -530,7 +533,7 @@ def _camera_frame_stats_keys(episode: Episode, *, cameras: Sequence[str] | None 
                 "luma_avg_max",
             )
         )
-    if selected:
+    if has_nonempty_camera:
         keys.add("camera_instrument")
         keys.add("camera_measurement_definition")
     return keys
@@ -745,6 +748,9 @@ def _measure_camera_frame_stats(
         raise ValueError(f"bright_luma_threshold must be in [0, 255], got {bright_luma_threshold}")
 
     selected_cameras = _resolve_selected_cameras(episode, cameras)
+    empty_cameras = {
+        topic for topic in selected_cameras if episode.channel(topic).timestamps.size == 0
+    }
     intermediates_by_topic = {
         topic: _camera_intermediates(
             episode,
@@ -757,14 +763,15 @@ def _measure_camera_frame_stats(
             bright_luma_threshold=bright_luma_threshold,
         )
         for topic in selected_cameras
+        if topic not in empty_cameras
     }
+    empty_count_keys = {f"{topic}/message_count" for topic in empty_cameras}
     measurements: dict[str, MeasurementValue] = {
-        key: _camera_value(key, intermediates_by_topic)
+        key: 0 if key in empty_count_keys else _camera_value(key, intermediates_by_topic)
         for key in sorted(_camera_frame_stats_keys(episode, cameras=selected_cameras))
     }
     intervals: list[Interval] = []
-    for topic in selected_cameras:
-        inter = intermediates_by_topic[topic]
+    for topic, inter in intermediates_by_topic.items():
         if inter.stamps_ns.size:
             # Instrument times are seconds from the MP4 start, which is the
             # camera's first message; map spans back onto the log clock.
