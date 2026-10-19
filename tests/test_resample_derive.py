@@ -208,9 +208,19 @@ def test_to_grid_rejects_span_shorter_than_one_step() -> None:
         to_grid(ramp_channel(), 0.01, policy="interpolate")
 
 
-def test_to_grid_rejects_nonpositive_rate() -> None:
-    with pytest.raises(ValueError, match="rate_hz must be positive"):
-        to_grid(ramp_channel(), 0.0, policy="interpolate")
+@pytest.mark.parametrize(
+    ("rate_hz", "message"),
+    [
+        (0.0, "rate_hz must be positive"),
+        (-1.0, "rate_hz must be positive"),
+        (float("nan"), "rate_hz must be finite"),
+        (float("inf"), "rate_hz must be finite"),
+        (float("-inf"), "rate_hz must be finite"),
+    ],
+)
+def test_to_grid_requires_a_finite_positive_rate(rate_hz: float, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        to_grid(ramp_channel(), rate_hz, policy="interpolate")
 
 
 def test_derived_series_validates_column_lengths() -> None:
