@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Literal, assert_never
 
 import numpy as np
 
+from hflow._field_guards import require_positive_float
 from hflow.format import NANOSECONDS_PER_SECOND
 
 if TYPE_CHECKING:
@@ -238,8 +239,7 @@ def to_grid(
     pinned by ``hflow.format.RESAMPLE_POLICY_VERSION`` (see the module
     docstring).
     """
-    if rate_hz <= 0.0:
-        raise ValueError(f"rate_hz must be positive, got {rate_hz}")
+    require_positive_float(rate_hz, "rate_hz")
     source_columns = _source_columns(channel, field)
     source_timestamps_ns = channel.timestamps
     grid_timestamps_ns = _grid_timestamps_ns(

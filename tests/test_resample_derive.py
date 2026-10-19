@@ -84,8 +84,9 @@ def ramp_channel() -> ChannelData:
     )
 
 
-def test_to_grid_interpolate_linear_ramp() -> None:
-    series = to_grid(ramp_channel(), 1.0, policy="interpolate")
+@pytest.mark.parametrize("rate_hz", [1, 1.0], ids=["int", "float"])
+def test_to_grid_interpolate_linear_ramp(rate_hz: float) -> None:
+    series = to_grid(ramp_channel(), rate_hz, policy="interpolate")
     assert series.timestamps_ns.tolist() == [2_000_000_000, 3_000_000_000]
     np.testing.assert_allclose(series.values["value"], [7.5, 17.5])
 
@@ -208,9 +209,21 @@ def test_to_grid_rejects_span_shorter_than_one_step() -> None:
         to_grid(ramp_channel(), 0.01, policy="interpolate")
 
 
-def test_to_grid_rejects_nonpositive_rate() -> None:
-    with pytest.raises(ValueError, match="rate_hz must be positive"):
-        to_grid(ramp_channel(), 0.0, policy="interpolate")
+@pytest.mark.parametrize(
+    ("rate_hz", "error"),
+    [
+        (0, "rate_hz must be > 0"),
+        (0.0, "rate_hz must be > 0"),
+        (-1, "rate_hz must be > 0"),
+        (-1.0, "rate_hz must be > 0"),
+        (float("nan"), "rate_hz must be finite"),
+        (float("inf"), "rate_hz must be finite"),
+        (float("-inf"), "rate_hz must be finite"),
+    ],
+)
+def test_to_grid_rejects_invalid_rate(rate_hz: float, error: str) -> None:
+    with pytest.raises(ValueError, match=error):
+        to_grid(ramp_channel(), rate_hz, policy="interpolate")
 
 
 def test_derived_series_validates_column_lengths() -> None:
