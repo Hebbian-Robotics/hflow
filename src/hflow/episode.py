@@ -118,10 +118,10 @@ def _frame_selection_expression(frame_indices: Sequence[int], *, fps: float) -> 
     consecutive_ranges.append((range_start, range_end))
 
     def half_frame_before(index: int) -> str:
-        return f"{(index - 0.5) / fps:g}"
+        return f"{(index - 0.5) / fps:.17g}"
 
     def half_frame_after(index: int) -> str:
-        return f"{(index + 0.5) / fps:g}"
+        return f"{(index + 0.5) / fps:.17g}"
 
     return "+".join(
         f"between(t\\,{half_frame_before(range_start)}\\,{half_frame_after(range_end)})"
