@@ -793,6 +793,81 @@ def test_rgb_frames_reject_a_non_positive_rate(black_tail_video: Path) -> None:
         pass
 
 
+@pytest.fixture(scope="module")
+def numbered_30fps_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """3s video at 30 fps (90 frames) with each frame's index encoded as a binary barcode."""
+    width, height, source_fps, frame_count, bits = 160, 120, 30, 90, 8
+
+    def draw_frame(index: int) -> np.ndarray:
+        plane = np.full((height, width), 128, dtype=np.uint8)
+        plane[:30] = 16
+        for bit in range(bits):
+            if (index >> (bits - 1 - bit)) & 1:
+                plane[:30, bit * (width // bits) : (bit + 1) * (width // bits)] = 235
+        return np.stack([plane, plane, plane], axis=-1)
+
+    video_path = tmp_path_factory.mktemp("videos") / "numbered_30fps.mp4"
+    raw_bytes = b"".join(draw_frame(i).tobytes() for i in range(frame_count))
+    run_ffmpeg(
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(source_fps),
+        "-i",
+        "-",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-g",
+        "10",
+        "-preset",
+        "ultrafast",
+        str(video_path),
+        stdin=raw_bytes,
+    )
+    return video_path
+
+
+@pytest.mark.parametrize("sample_fps", [1.0, 3.0, 10.0, 30.0])
+def test_rgb_frames_sampling_aligns_with_output_ticks(
+    numbered_30fps_video: Path, sample_fps: float
+) -> None:
+    """rgb_frames must emit the frame visible at-or-before each output tick (round=up),
+    matching source_log_times_for_sampled_frames attribution (#733).
+    """
+    width, bits = 160, 8
+
+    def read_frame_index(rgb: np.ndarray) -> int:
+        luma = rgb[:30].astype(np.float32).mean(axis=2)
+        bit_width = width // bits
+        return int(
+            "".join(
+                str(int(luma[:, bit * bit_width + 4 : (bit + 1) * bit_width - 4].mean() > 128))
+                for bit in range(bits)
+            ),
+            2,
+        )
+
+    with rgb_frames(
+        numbered_30fps_video,
+        toolchain=resolved_video_measurement_toolchain(),
+        frames_per_second=sample_fps,
+    ) as frames:
+        shown = [read_frame_index(f) for f in frames]
+
+    expected = [round(i * 30 / sample_fps) for i in range(len(shown))]
+    assert shown == expected
+
+
 @pytest.mark.parametrize(
     ("source_shape", "long_edge_pixels", "expected"),
     [
