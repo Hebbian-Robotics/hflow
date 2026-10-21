@@ -105,13 +105,15 @@ class _JointMotionProfile:
 def _joint_motion_profile(
     episode: Episode, topic: str, field: str | None
 ) -> _JointMotionProfile | None:
-    """``None`` when the channel has fewer than two messages (no motion to
-    profile); callers record the message count and stop."""
+    """``None`` when there are fewer than two messages or no selected
+    components; callers record the message count and stop."""
     channel = episode.channel(topic)
     stamps_ns = channel.timestamps
     if len(stamps_ns) < 2:
         return None
     positions = channel.to_numpy(field)
+    if positions.size == 0:
+        return None
     if positions.ndim == 1:
         positions = positions[:, np.newaxis]
     deltas_s = np.diff(stamps_ns) / 1e9
@@ -437,7 +439,8 @@ async def joint_discontinuity(
     them dilute the percentage denominator) fails the gate open (#546).
     Every percentage and maximum here covers measurable steps only, and a
     stream with nothing measurable reports its counts and withholds the
-    verdict-shaped keys rather than emitting 0% or NaN.
+    verdict-shaped keys rather than emitting 0% or NaN. An empty selected
+    field records only ``velocity_sample_count``, without motion evidence.
     """
     return await run_blocking(
         _measure_joint_discontinuity,
@@ -812,7 +815,8 @@ async def idle_fraction(
     numerator nor the denominator: they had no velocity to be idle under, and
     counting their time as "moving" understates the fraction (#546). A stream
     with nothing measurable reports its counts and withholds
-    ``idle_fraction`` rather than storing 0.0 for a dead channel.
+    ``idle_fraction`` rather than storing 0.0 for a dead channel. An empty
+    selected field records only ``idle_sample_count``.
     """
     return await run_blocking(
         _measure_idle_fraction,
@@ -1373,7 +1377,8 @@ async def trajectory_metrics(
     ratio is undefined (zero denominator), so only ``{topic}/final_pose_speed``
     appears. Curation queries joining on ``final_pose_unsettled_ratio`` will
     silently exclude motionless episodes; use ``final_pose_speed`` when you need
-    all episodes regardless of mean motion.
+    all episodes regardless of mean motion. An empty selected field records
+    only ``trajectory_sample_count``; it is not a stationary trajectory.
 
     Evidence only, and this one ships no recommended gate at all: these are
     motion-smoothness metrics, which are known to invert on real defects
@@ -1485,7 +1490,8 @@ async def trajectory_segments(
     episode compare", this one answers "when, inside it, did things happen".
     Emits ``motionless:<topic>``, ``trajectory_change:<topic>``, and
     ``peak_velocity:<topic>`` intervals in log time, which is what a timeline
-    view renders and what an operator scrubs to.
+    view renders and what an operator scrubs to. An empty selected field
+    records only ``segment_sample_count`` and produces no intervals.
 
     The change threshold is derived from the episode's own curvature
     distribution -- a duration-weighted median plus two robust sigmas, sigma
@@ -1779,7 +1785,8 @@ async def action_integrity(
     runs this looks for, and NaN != NaN correctly breaks a run rather than
     extending it. Run this on raw channels only -- a resampled channel carrying
     a hold policy manufactures exactly-repeated samples, which is a fabricated
-    frozen run rather than a recorded one.
+    frozen run rather than a recorded one. An empty selected field records
+    only ``integrity_sample_count``; absent components are not frozen values.
     """
     return await run_blocking(
         _measure_action_integrity,
@@ -1805,6 +1812,8 @@ def _measure_action_integrity(
         return CheckResult(measurements={f"{topic}/integrity_sample_count": len(stamps_ns)})
 
     samples = channel.to_numpy(field)
+    if samples.size == 0:
+        return CheckResult(measurements={f"{topic}/integrity_sample_count": len(stamps_ns)})
     if samples.ndim == 1:
         samples = samples[:, np.newaxis]
     sample_count, dimension_count = samples.shape
@@ -1895,6 +1904,8 @@ def _trajectory_profile(
     if len(stamps_ns) < 2:
         return None
     samples = channel.to_numpy(field)
+    if samples.size == 0:
+        return None
     if samples.ndim == 1:
         samples = samples[:, np.newaxis]
 
