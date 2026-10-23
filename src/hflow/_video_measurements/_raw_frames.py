@@ -170,7 +170,7 @@ def rgb_frames(
     )
     filters: list[str] = []
     if frames_per_second is not None:
-        filters.append(f"fps={frames_per_second:g}")
+        filters.append(f"fps={frames_per_second:g}:round=up")
     if long_edge_pixels is not None:
         filters.append(f"scale={frame_width}:{frame_height}:flags=bilinear")
     filters.append("format=pix_fmts=rgb24")
