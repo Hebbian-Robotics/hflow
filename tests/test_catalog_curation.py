@@ -931,18 +931,27 @@ def test_cli_curate_requires_exactly_one_sql_source(tmp_path: Path) -> None:
     assert cli_main(["curate", "--catalog", str(tmp_path)]) == 2
 
 
+@pytest.mark.parametrize("sql_file", [False, True], ids=["inline-sql", "sql-file"])
 def test_cli_curate_dry_run_reports_without_writing_a_manifest(
     recorded_data_root: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    sql_file: bool,
 ) -> None:
     data_root = tmp_path / "data-root"
     monkeypatch.setenv("HFLOW_DATA_ROOT", str(data_root))
+    sql = "SELECT episode_id, task FROM episodes WHERE status != 'quarantined'; -- selection"
+    if sql_file:
+        query_file = tmp_path / "selection.sql"
+        query_file.write_text(sql)
+        sql_args = ["--sql-file", str(query_file)]
+    else:
+        sql_args = [sql]
     exit_code = cli_main(
         [
             "curate",
-            "SELECT episode_id, task FROM episodes WHERE status != 'quarantined'",
+            *sql_args,
             "--catalog",
             str(recorded_data_root / "catalog"),
             "--dry-run",
@@ -1346,6 +1355,19 @@ _SQL_SURFACE_PAYLOADS = [
     # Accepted. The catalog holds exactly one episode, so a query selecting
     # from it yields one row.
     pytest.param("SELECT episode_id FROM episodes", False, 1, id="legitimate-single-select"),
+    pytest.param("SELECT episode_id FROM episodes;", False, 1, id="terminated-select"),
+    pytest.param(
+        "SELECT episode_id FROM episodes -- selected episodes",
+        False,
+        1,
+        id="trailing-line-comment",
+    ),
+    pytest.param(
+        "SELECT episode_id FROM episodes; -- selected episodes",
+        False,
+        1,
+        id="terminated-select-with-comment",
+    ),
     pytest.param("TABLE episodes", False, 1, id="table-episodes"),
     pytest.param(
         "WITH picked AS (SELECT episode_id FROM episodes) SELECT * FROM picked",
@@ -1443,11 +1465,10 @@ def test_curate_output_none_sql_surface_matches_manifest_gate(
 ) -> None:
     """``curate(..., output=None)`` must refuse the same SQL surface as manifest write.
 
-    Dry-run wraps tenant SQL in ``SELECT count(*) FROM ({sql})``, which can
-    turn a multi-statement injection into a parser error — but DESCRIBE,
-    SHOW, SUMMARIZE, and PIVOT still execute cleanly inside that wrapper.
-    Without ``reject_non_single_select`` on the ``output=None`` branch those
-    shapes return a row count instead of ``NonSingleSelectQueryError``.
+    Both paths validate the statement before building a DuckDB relation.
+    Counting that relation must accept the same SELECT syntax as writing it,
+    including a statement terminator or a final line comment. The shared gate
+    must still refuse every non-single-SELECT payload before execution.
     """
     catalog_dir = tmp_path / "catalog"
     catalog = Catalog(catalog_dir)
