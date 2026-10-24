@@ -88,6 +88,12 @@ def _sanitize_topic(topic: str) -> str:
     return f"{readable}-{digest}"
 
 
+# The cache directory name is the cache key, so the layout tag retires every
+# directory written before the selection moved to timestamps (#727): those hold
+# the decoded-counter pictures, which are shifted after a lost keyframe.
+_FRAMES_AT_INDICES_CACHE_LAYOUT = "v2-time"
+
+
 def _frame_selection_expression(frame_indices: Sequence[int], *, fps: float) -> str:
     """Build a compact ffmpeg select expression for sorted, unique indices.
 
@@ -856,7 +862,7 @@ class Episode:
         selection_digest = hashlib.sha256(serialized_indices.encode()).hexdigest()[:16]
         output_directory = self.workdir / (
             f"frames_{_sanitize_topic(topic)}_indices_{selection_digest}_"
-            f"count_{len(selected_frame_indices)}"
+            f"count_{len(selected_frame_indices)}_{_FRAMES_AT_INDICES_CACHE_LAYOUT}"
         )
         expected_frame_paths = [
             output_directory / f"frame_{output_index:06d}.jpg"

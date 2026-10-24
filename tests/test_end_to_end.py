@@ -2,6 +2,7 @@
 infrastructure. Mirrors the README design-target example."""
 
 import asyncio
+import hashlib
 import logging
 import subprocess
 from fractions import Fraction
@@ -569,6 +570,82 @@ def test_frames_at_indices_pairs_pictures_by_time_when_a_keyframe_is_missing(
         inside_the_gap = [33, 34]
         with pytest.raises(RuntimeError, match="extracted"):
             episode.frames_at_indices(topic, frame_indices=inside_the_gap)
+
+
+@pytest.mark.requires_system_ffmpeg
+def test_frames_at_indices_re_extracts_a_cache_written_by_the_counter_selection(
+    tmp_path: Path,
+) -> None:
+    """#727 upgrade: a workdir populated before the fix must not be reused.
+
+    ``main`` cached its counter selection under
+    ``frames_<topic>_indices_<digest>_count_<n>``, so a workdir built there
+    holds the shifted pictures. Reopening it on this head has to extract again
+    instead of serving them.
+    """
+
+    frame_count, frame_rate, gop_frames = 60, 30, 10
+    lost_source_frame = 30
+    topic = "/camera/cam0/video"
+    first_log_time_ns = 1_760_000_000_000_000_000
+    access_units = _encode_index_pattern_stream(
+        frame_count=frame_count, frame_rate=frame_rate, gop_frames=gop_frames
+    )
+    kept_source_frames = [index for index in range(frame_count) if index != lost_source_frame]
+    raw_path = tmp_path / "raw.mcap"
+    write_compressed_video_mcap(
+        raw_path,
+        [
+            (
+                topic,
+                first_log_time_ns + source_frame * 1_000_000_000 // frame_rate,
+                access_units[source_frame],
+            )
+            for source_frame in kept_source_frames
+        ],
+    )
+    canonical_path = tmp_path / "canonical.mcap"
+    write_canonical_episode(str(raw_path), str(canonical_path), TransformConfig())
+
+    requested = [41, 50]
+    workdir = tmp_path / "workdir"
+    stale_cache = workdir / _counter_selection_cache_directory(topic, requested)
+    stale_cache.mkdir(parents=True)
+    for output_index, shifted_source_frame in enumerate((50, 59)):
+        _write_pattern_jpeg(stale_cache / f"frame_{output_index:06d}.jpg", shifted_source_frame)
+
+    with hflow.Episode(str(canonical_path), workdir=workdir) as episode:
+        extracted = episode.frames_at_indices(topic, frame_indices=requested)
+
+    assert [_read_frame_number(frame.path) for frame in extracted] == [
+        kept_source_frames[index] for index in requested
+    ]
+    assert not any(frame.path.parent == stale_cache for frame in extracted)
+
+
+def _counter_selection_cache_directory(topic: str, frame_indices: list[int]) -> str:
+    """The frame-cache directory ``main`` wrote while it selected by decoded picture."""
+
+    serialized = ",".join(str(frame_index) for frame_index in frame_indices)
+    digest = hashlib.sha256(serialized.encode()).hexdigest()[:16]
+    return (
+        f"frames_{hflow.episode._sanitize_topic(topic)}_indices_{digest}_count_{len(frame_indices)}"
+    )
+
+
+def _write_pattern_jpeg(jpeg_path: Path, source_frame: int) -> None:
+    """Write one frame-number picture as a JPEG, the shape a frame cache holds."""
+
+    with av.open(str(jpeg_path), mode="w", format="image2") as container:
+        stream = container.add_stream("mjpeg", rate=1)
+        stream.width, stream.height = _PATTERN_WIDTH, _PATTERN_HEIGHT
+        stream.pix_fmt = "yuvj420p"
+        for packet in stream.encode(
+            av.VideoFrame.from_ndarray(_index_pattern_picture(source_frame), format="rgb24")
+        ):
+            container.mux(packet)
+        for packet in stream.encode(None):
+            container.mux(packet)
 
 
 _PATTERN_BITS = 10
