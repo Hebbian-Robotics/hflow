@@ -9,19 +9,35 @@ import pytest
 from hflow.batching import PlannedBatch, plan_batches, plan_batches_from_files
 
 
-def test_fixed_count_batches_are_near_equal_bytes() -> None:
+@pytest.mark.parametrize(
+    ("sizes", "item_cap"),
+    [
+        pytest.param([900, 850, 500, 400, 300, 250, 200, 150, 100, 50], None, id="positive"),
+        pytest.param([0] * 7, None, id="all-zero"),
+        pytest.param([0] * 4, 3, id="all-zero-with-cap"),
+        pytest.param([900, 0, 0, 0], None, id="mixed-zero"),
+        pytest.param([0, 0], None, id="fewer-items-than-batches"),
+    ],
+)
+def test_fixed_count_batches_are_near_equal_bytes(sizes: list[int], item_cap: int | None) -> None:
     # A naive round-robin unbalances these widely varying sizes; least-loaded
-    # keeps the spread within one item.
-    item_sizes = {
-        f"ep{index:02d}": size
-        for index, size in enumerate([900, 850, 500, 400, 300, 250, 200, 150, 100, 50])
-    }
-    batches = plan_batches(item_sizes, batch_count=3)
-    assert len(batches) == 3
+    # keeps the spread within one item. Zero bytes must not erase requested batches.
+    item_sizes = {f"ep{index:02d}": size for index, size in enumerate(sizes)}
+    batches = plan_batches(item_sizes, batch_count=3, maximum_items_per_batch=item_cap)
+    assert len(batches) == min(3, len(item_sizes))
     totals = [batch.total_bytes for batch in batches]
     assert sum(totals) == sum(item_sizes.values())
     assert max(totals) - min(totals) <= max(item_sizes.values())
-    assert {item for batch in batches for item in batch.items} == set(item_sizes)
+    assigned = [item for batch in batches for item in batch.items]
+    assert sorted(assigned) == sorted(item_sizes)
+    assert all(batch.items for batch in batches)
+    if item_cap is not None:
+        assert all(len(batch.items) <= item_cap for batch in batches)
+    assert batches == plan_batches(
+        dict(reversed(list(item_sizes.items()))),
+        batch_count=3,
+        maximum_items_per_batch=item_cap,
+    )
 
 
 def test_plan_is_deterministic() -> None:
@@ -154,13 +170,15 @@ def test_plan_from_files_forwards_stagger_validation(tmp_path: Path) -> None:
         plan_batches_from_files([item], batch_count=1, stagger_interval_s=float("nan"))
 
 
-def test_plan_from_real_files(tmp_path: Path) -> None:
+@pytest.mark.parametrize("sizes", [(100, 10_000), (0, 0)], ids=["positive", "zero-byte"])
+def test_plan_from_real_files(tmp_path: Path, sizes: tuple[int, int]) -> None:
     small = tmp_path / "small.mcap"
-    small.write_bytes(b"x" * 100)
+    small.write_bytes(b"x" * sizes[0])
     large = tmp_path / "large.mcap"
-    large.write_bytes(b"x" * 10_000)
+    large.write_bytes(b"x" * sizes[1])
     batches = plan_batches_from_files([small, large], batch_count=2)
-    assert batches[0].total_bytes == 10_000
+    assert len(batches) == 2
+    assert batches[0].total_bytes == sizes[1]
     assert batches[0].items == (str(large),)
 
 

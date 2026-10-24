@@ -53,6 +53,8 @@ def plan_batches(
     """Pack ``item_sizes`` (uri -> size in bytes) into near-equal-byte batches.
 
     Pass exactly one of ``batch_count`` or ``target_batch_bytes``.
+    Zero-byte inputs still occupy a batch: fixed-count plans return
+    ``min(batch_count, len(item_sizes))`` nonempty batches.
     An optional item cap keeps each input whole. Fixed-count plans that cannot
     fit every item under that cap fail; capacity plans open additional batches.
     Batches come back largest-first; ``start_delay_s`` is ``index *
@@ -84,17 +86,18 @@ def plan_batches(
     batches: list[tuple[list[str], int]]
     if batch_count is not None:
         # Least-loaded assignment: push each item onto the currently-lightest
-        # batch. Heap entries are (total_bytes, batch_index) so byte ties
-        # break on index, deterministically.
+        # batch. Empty batches win zero-byte ties, so every requested
+        # batch receives an item before a zero-byte batch receives another.
+        # Remaining ties break on index, deterministically.
         batches = [([], 0) for _ in range(min(batch_count, len(descending_items)))]
-        heap = [(0, index) for index in range(len(batches))]
+        heap = [(0, False, index) for index in range(len(batches))]
         heapq.heapify(heap)
         for uri, size_bytes in descending_items:
-            total, index = heapq.heappop(heap)
+            total, _, index = heapq.heappop(heap)
             batches[index][0].append(uri)
             batches[index] = (batches[index][0], total + size_bytes)
             if maximum_items_per_batch is None or len(batches[index][0]) < maximum_items_per_batch:
-                heapq.heappush(heap, (total + size_bytes, index))
+                heapq.heappush(heap, (total + size_bytes, True, index))
     else:
         assert target_batch_bytes is not None
         # First-fit-decreasing: first open batch with room, else a new one.
