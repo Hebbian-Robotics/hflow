@@ -2,20 +2,25 @@
 infrastructure. Mirrors the README design-target example."""
 
 import asyncio
+import hashlib
 import logging
 import subprocess
+from fractions import Fraction
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
+import av
 import numpy as np
 import pytest
+from mcap_test_helpers import write_compressed_video_mcap
 
 import hflow
 from hflow.checks import camera_frame_stats
 from hflow.curation import open_catalog_connection
 from hflow.ffmpeg._binary import _ffmpeg_filter_script_flag
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
+from hflow.transform import TransformConfig, write_canonical_episode
 
 
 def check_joint_smoothness(joints: np.ndarray, rate_hz: float) -> dict[str, float]:
@@ -520,6 +525,192 @@ def test_canonical_episode_extracts_exact_source_frame_indices(
         )
 
 
+@pytest.mark.requires_system_ffmpeg
+def test_frames_at_indices_pairs_pictures_by_time_when_a_keyframe_is_missing(
+    tmp_path: Path,
+) -> None:
+    """#727: a lost keyframe must not shift the picture of every later index.
+
+    The picture carries its own source frame number, so a returned JPEG is
+    checked against the message that was asked for instead of against a count.
+    """
+
+    frame_count, frame_rate, gop_frames = 60, 30, 10
+    lost_source_frame = 30
+    topic = "/camera/cam0/video"
+    first_log_time_ns = 1_760_000_000_000_000_000
+    access_units = _encode_index_pattern_stream(
+        frame_count=frame_count, frame_rate=frame_rate, gop_frames=gop_frames
+    )
+    assert len(access_units) == frame_count
+
+    kept_source_frames = [index for index in range(frame_count) if index != lost_source_frame]
+    raw_path = tmp_path / "raw.mcap"
+    write_compressed_video_mcap(
+        raw_path,
+        [
+            (
+                topic,
+                first_log_time_ns + source_frame * 1_000_000_000 // frame_rate,
+                access_units[source_frame],
+            )
+            for source_frame in kept_source_frames
+        ],
+    )
+    canonical_path = tmp_path / "canonical.mcap"
+    write_canonical_episode(str(raw_path), str(canonical_path), TransformConfig())
+
+    with hflow.Episode(str(canonical_path)) as episode:
+        after_the_gap = [41, 50]
+        extracted = episode.frames_at_indices(topic, frame_indices=after_the_gap)
+        assert [_read_frame_number(frame.path) for frame in extracted] == [
+            kept_source_frames[index] for index in after_the_gap
+        ]
+
+        inside_the_gap = [33, 34]
+        with pytest.raises(RuntimeError, match="extracted"):
+            episode.frames_at_indices(topic, frame_indices=inside_the_gap)
+
+
+@pytest.mark.requires_system_ffmpeg
+def test_frames_at_indices_re_extracts_a_cache_written_by_the_counter_selection(
+    tmp_path: Path,
+) -> None:
+    """#727 upgrade: a workdir populated before the fix must not be reused.
+
+    ``main`` cached its counter selection under
+    ``frames_<topic>_indices_<digest>_count_<n>``, so a workdir built there
+    holds the shifted pictures. Reopening it on this head has to extract again
+    instead of serving them.
+    """
+
+    frame_count, frame_rate, gop_frames = 60, 30, 10
+    lost_source_frame = 30
+    topic = "/camera/cam0/video"
+    first_log_time_ns = 1_760_000_000_000_000_000
+    access_units = _encode_index_pattern_stream(
+        frame_count=frame_count, frame_rate=frame_rate, gop_frames=gop_frames
+    )
+    kept_source_frames = [index for index in range(frame_count) if index != lost_source_frame]
+    raw_path = tmp_path / "raw.mcap"
+    write_compressed_video_mcap(
+        raw_path,
+        [
+            (
+                topic,
+                first_log_time_ns + source_frame * 1_000_000_000 // frame_rate,
+                access_units[source_frame],
+            )
+            for source_frame in kept_source_frames
+        ],
+    )
+    canonical_path = tmp_path / "canonical.mcap"
+    write_canonical_episode(str(raw_path), str(canonical_path), TransformConfig())
+
+    requested = [41, 50]
+    workdir = tmp_path / "workdir"
+    stale_cache = workdir / _counter_selection_cache_directory(topic, requested)
+    stale_cache.mkdir(parents=True)
+    for output_index, shifted_source_frame in enumerate((50, 59)):
+        _write_pattern_jpeg(stale_cache / f"frame_{output_index:06d}.jpg", shifted_source_frame)
+
+    with hflow.Episode(str(canonical_path), workdir=workdir) as episode:
+        extracted = episode.frames_at_indices(topic, frame_indices=requested)
+
+    assert [_read_frame_number(frame.path) for frame in extracted] == [
+        kept_source_frames[index] for index in requested
+    ]
+    assert not any(frame.path.parent == stale_cache for frame in extracted)
+
+
+def _counter_selection_cache_directory(topic: str, frame_indices: list[int]) -> str:
+    """The frame-cache directory ``main`` wrote while it selected by decoded picture."""
+
+    serialized = ",".join(str(frame_index) for frame_index in frame_indices)
+    digest = hashlib.sha256(serialized.encode()).hexdigest()[:16]
+    return (
+        f"frames_{hflow.episode._sanitize_topic(topic)}_indices_{digest}_count_{len(frame_indices)}"
+    )
+
+
+def _write_pattern_jpeg(jpeg_path: Path, source_frame: int) -> None:
+    """Write one frame-number picture as a JPEG, the shape a frame cache holds."""
+
+    with av.open(str(jpeg_path), mode="w", format="image2") as container:
+        stream = container.add_stream("mjpeg", rate=1)
+        stream.width, stream.height = _PATTERN_WIDTH, _PATTERN_HEIGHT
+        stream.pix_fmt = "yuvj420p"
+        for packet in stream.encode(
+            av.VideoFrame.from_ndarray(_index_pattern_picture(source_frame), format="rgb24")
+        ):
+            container.mux(packet)
+        for packet in stream.encode(None):
+            container.mux(packet)
+
+
+_PATTERN_BITS = 10
+_PATTERN_WIDTH = 320
+_PATTERN_HEIGHT = 180
+_PATTERN_BAND_ROWS = 32
+
+
+def _index_pattern_picture(source_frame: int) -> np.ndarray:
+    """A gray picture whose top band is the source frame number in black/white blocks."""
+
+    picture = np.full((_PATTERN_HEIGHT, _PATTERN_WIDTH, 3), 128, np.uint8)
+    block_width = _PATTERN_WIDTH // _PATTERN_BITS
+    picture[:_PATTERN_BAND_ROWS] = 16
+    for bit in range(_PATTERN_BITS):
+        if (source_frame >> (_PATTERN_BITS - 1 - bit)) & 1:
+            left = bit * block_width
+            picture[:_PATTERN_BAND_ROWS, left : left + block_width] = 235
+    return picture
+
+
+def _encode_index_pattern_stream(
+    *, frame_count: int, frame_rate: int, gop_frames: int
+) -> list[bytes]:
+    """Encode one access unit per frame, each carrying its own source frame number."""
+
+    context = av.CodecContext.create("libx264", "w")
+    context.width, context.height, context.pix_fmt = (
+        _PATTERN_WIDTH,
+        _PATTERN_HEIGHT,
+        "yuv420p",
+    )
+    context.framerate, context.time_base = Fraction(frame_rate), Fraction(1, frame_rate)
+    context.gop_size, context.max_b_frames = gop_frames, 0
+    context.options = {
+        "profile": "baseline",
+        "tune": "zerolatency",
+        "keyint_min": str(gop_frames),
+        "sc_threshold": "0",
+    }
+    access_units: list[bytes] = []
+    for source_frame in range(frame_count):
+        picture = av.VideoFrame.from_ndarray(
+            _index_pattern_picture(source_frame), format="rgb24"
+        ).reformat(format="yuv420p")
+        picture.pts = source_frame
+        access_units.extend(bytes(packet) for packet in context.encode(picture))
+    access_units.extend(bytes(packet) for packet in context.encode(None))
+    return access_units
+
+
+def _read_frame_number(jpeg_path: Path) -> int:
+    """Read the source frame number back out of an extracted JPEG."""
+
+    with av.open(str(jpeg_path)) as container:
+        picture = next(container.decode(video=0)).to_ndarray(format="gray")
+    band = picture[:_PATTERN_BAND_ROWS]
+    block_width = _PATTERN_WIDTH // _PATTERN_BITS
+    bits = "".join(
+        "1" if band[:, bit * block_width : (bit + 1) * block_width].mean() > 128 else "0"
+        for bit in range(_PATTERN_BITS)
+    )
+    return int(bits, 2)
+
+
 def test_canonical_episode_sparse_selection_past_argument_limit_uses_filter_file(
     report_and_app: tuple[hflow.TestReport, hflow.App],
     monkeypatch: pytest.MonkeyPatch,
@@ -531,7 +722,12 @@ def test_canonical_episode_sparse_selection_past_argument_limit_uses_filter_file
     """
     report, _app = report_and_app
     sparse_indices = list(range(0, 40000, 2))
-    expression = hflow.episode._frame_selection_expression(sparse_indices)
+    with hflow.Episode(report.canonical_path) as fps_source:
+        fps_source.video(next(topic for topic in fps_source.cameras if "overhead_cam" in topic))
+        source_fps = fps_source._video_fps[
+            next(topic for topic in fps_source.cameras if "overhead_cam" in topic)
+        ]
+    expression = hflow.episode._frame_selection_expression(sparse_indices, fps=source_fps)
     assert len(expression) > 131072  # Exceeds Linux 128 KiB limit
 
     with hflow.Episode(report.canonical_path) as episode:

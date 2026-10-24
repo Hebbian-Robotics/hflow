@@ -88,8 +88,28 @@ def _sanitize_topic(topic: str) -> str:
     return f"{readable}-{digest}"
 
 
-def _frame_selection_expression(frame_indices: Sequence[int]) -> str:
-    """Build a compact ffmpeg select expression for sorted, unique indices."""
+# The cache directory name is the cache key, so the layout tag retires every
+# directory written before the selection moved to timestamps (#727): those hold
+# the decoded-counter pictures, which are shifted after a lost keyframe.
+_FRAMES_AT_INDICES_CACHE_LAYOUT = "v2-time"
+
+
+def _frame_selection_expression(frame_indices: Sequence[int], *, fps: float) -> str:
+    """Build a compact ffmpeg select expression for sorted, unique indices.
+
+    Pictures are selected by time, not by ffmpeg's decoded-picture counter
+    ``n``: a decoder that loses a reference frame drops every picture that
+    depends on it, so decoded picture *n* stops being message *n* after a
+    missing keyframe and each later index returns a picture shifted by the
+    shortfall, labelled with the requested message's log time (#727). The MP4
+    is constant rate, so message *k* is the picture nearest ``k / fps``, and a
+    picture the decoder never produced matches nothing -- the caller's
+    extracted-count check then reports the request instead of returning a
+    shifted frame.
+    """
+
+    if fps <= 0:
+        raise ValueError(f"fps must be positive, got {fps}")
 
     consecutive_ranges: list[tuple[int, int]] = []
     range_start = frame_indices[0]
@@ -102,10 +122,15 @@ def _frame_selection_expression(frame_indices: Sequence[int]) -> str:
         range_start = frame_index
         range_end = frame_index
     consecutive_ranges.append((range_start, range_end))
+
+    def half_frame_before(index: int) -> str:
+        return f"{(index - 0.5) / fps:.17g}"
+
+    def half_frame_after(index: int) -> str:
+        return f"{(index + 0.5) / fps:.17g}"
+
     return "+".join(
-        f"eq(n\\,{range_start})"
-        if range_start == range_end
-        else f"between(n\\,{range_start}\\,{range_end})"
+        f"between(t\\,{half_frame_before(range_start)}\\,{half_frame_after(range_end)})"
         for range_start, range_end in consecutive_ranges
     )
 
@@ -837,7 +862,7 @@ class Episode:
         selection_digest = hashlib.sha256(serialized_indices.encode()).hexdigest()[:16]
         output_directory = self.workdir / (
             f"frames_{_sanitize_topic(topic)}_indices_{selection_digest}_"
-            f"count_{len(selected_frame_indices)}"
+            f"count_{len(selected_frame_indices)}_{_FRAMES_AT_INDICES_CACHE_LAYOUT}"
         )
         expected_frame_paths = [
             output_directory / f"frame_{output_index:06d}.jpg"
@@ -852,7 +877,9 @@ class Episode:
             )
             try:
                 filter_script_path = staging_directory / "select.filter"
-                selection_expression = _frame_selection_expression(selected_frame_indices)
+                selection_expression = _frame_selection_expression(
+                    selected_frame_indices, fps=self._video_fps[topic]
+                )
                 filter_script_path.write_text(f"select={selection_expression}")
                 command = [
                     str(ffmpeg_path()),
