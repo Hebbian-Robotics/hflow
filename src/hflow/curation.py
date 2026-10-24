@@ -841,7 +841,8 @@ def curate(
     is unreachable. ``catalog_root`` and ``output`` each accept a local path
     or a bucket URL (``gs://.../manifest.parquet`` uploads the manifest).
     With ``output=None`` the query still runs (row count + coverage
-    reporting) but nothing is written. Every path that executes ``sql`` —
+    reporting) but nothing is written. Both paths accept a trailing statement
+    terminator or line comment. Every path that executes ``sql`` —
     including ``output=None`` — runs :func:`reject_non_single_select` first
     so dry-run cannot accept DESCRIBE/SHOW/PIVOT (or other non-single-SELECT
     shapes) that the manifest-write path already refuses.
@@ -918,9 +919,7 @@ def curate(
                 manifest_path = final_path
             case None:
                 _reject_tenant_sql(sql)
-                (row_count,) = connection.execute(f"SELECT count(*) FROM ({sql})").fetchone() or (
-                    0,
-                )
+                (row_count,) = connection.sql(sql).aggregate("count(*)").fetchone() or (0,)
                 manifest_path = None
 
         return CurationReport(
