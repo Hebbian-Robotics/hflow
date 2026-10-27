@@ -477,6 +477,25 @@ def test_cli_doctor_continues_past_unreadable_file(
     assert "Traceback" not in out
 
 
+def test_empty_file_is_reported_as_empty(tmp_path: Path) -> None:
+    empty = tmp_path / "empty.mcap"
+    empty.write_bytes(b"")
+    report = diagnose(empty)
+    assert [f.code for f in report.findings] == ["unreadable"]
+    message = report.findings[0].message
+    assert "empty" in message
+    assert not message.rstrip().endswith(":")
+
+
+def test_truncated_file_is_reported_as_truncated(canonical_episode: Path, tmp_path: Path) -> None:
+    data = canonical_episode.read_bytes()
+    truncated = tmp_path / "truncated.mcap"
+    truncated.write_bytes(data[: len(data) // 2])
+    report = diagnose(truncated)
+    assert [f.code for f in report.findings] == ["unreadable"]
+    assert "truncated" in report.findings[0].message
+
+
 @pytest.mark.parametrize("unreadable_file_count", [1, 2])
 def test_cli_doctor_all_unreadable_prints_one_line_each_and_exits_2(
     capsys: pytest.CaptureFixture[str], unreadable_file_count: int
