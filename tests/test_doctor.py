@@ -1,5 +1,6 @@
 """The canonical episode format as an executable conformance check."""
 
+import io
 import logging
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from mcap_test_helpers import (
 )
 
 from hflow.cli import main as cli_main
-from hflow.doctor import DiagnosticLevel, diagnose
+from hflow.doctor import DiagnosticLevel, _unreadable_message, diagnose
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
 
@@ -494,6 +495,27 @@ def test_truncated_file_is_reported_as_truncated(canonical_episode: Path, tmp_pa
     report = diagnose(truncated)
     assert [f.code for f in report.findings] == ["unreadable"]
     assert "truncated" in report.findings[0].message
+
+
+@pytest.mark.parametrize("extra", [b"", b"\x01" * 7])
+def test_file_cut_off_after_the_opening_marker_is_reported_as_truncated(
+    canonical_episode: Path, tmp_path: Path, extra: bytes
+) -> None:
+    data = canonical_episode.read_bytes()
+    truncated = tmp_path / "truncated.mcap"
+    truncated.write_bytes(data[:8] + extra)
+    report = diagnose(truncated)
+    assert [f.code for f in report.findings] == ["unreadable"]
+    assert "truncated" in report.findings[0].message
+
+
+def test_read_error_while_explaining_falls_back_to_the_reader_message() -> None:
+    class FailingStream(io.BytesIO):
+        def seek(self, *args: object) -> int:
+            raise OSError("device not ready")
+
+    message = _unreadable_message(FailingStream(b"\x89MCAP0\r\n"), ValueError("bad footer"))
+    assert message == "not readable as MCAP: bad footer"
 
 
 @pytest.mark.parametrize("unreadable_file_count", [1, 2])

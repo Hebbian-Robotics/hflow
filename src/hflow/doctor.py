@@ -223,14 +223,21 @@ def _unreadable_message(stream: Any, error: Exception) -> str:
     be, so name those two cases before falling back to the reader's text.
     """
     detail = str(error) or type(error).__name__
-    stream.seek(0, 2)
-    size = stream.tell()
-    if size == 0:
-        return "not readable as MCAP: the file is empty (0 bytes)"
-    stream.seek(0)
-    starts_as_mcap = stream.read(len(_MCAP_MAGIC)) == _MCAP_MAGIC
-    stream.seek(max(size - len(_MCAP_MAGIC), 0))
-    ends_as_mcap = stream.read(len(_MCAP_MAGIC)) == _MCAP_MAGIC
+    try:
+        stream.seek(0, 2)
+        size = stream.tell()
+        if size == 0:
+            return "not readable as MCAP: the file is empty (0 bytes)"
+        stream.seek(0)
+        starts_as_mcap = stream.read(len(_MCAP_MAGIC)) == _MCAP_MAGIC
+        # The end marker is a second copy of the magic, so a file too short to
+        # hold both cannot have one, even though its last bytes match the first.
+        ends_as_mcap = False
+        if size >= 2 * len(_MCAP_MAGIC):
+            stream.seek(size - len(_MCAP_MAGIC))
+            ends_as_mcap = stream.read(len(_MCAP_MAGIC)) == _MCAP_MAGIC
+    except OSError:
+        return f"not readable as MCAP: {detail}"
     if starts_as_mcap and not ends_as_mcap:
         return (
             "not readable as MCAP: the file is truncated (it starts like an MCAP file but its "
