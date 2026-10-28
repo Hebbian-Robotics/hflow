@@ -39,6 +39,7 @@ from hflow.format import METADATA_RECORD_EPISODE, METADATA_RECORD_PROVENANCE
 from hflow.reader import open_reader
 from hflow.storage import LocalStorageRoot, StorageRoot, parse_storage_root
 from hflow.transform import TransformConfig, write_canonical_episode
+from hflow.video import split_annex_b_stream
 
 logger = logging.getLogger(__name__)
 
@@ -388,24 +389,7 @@ def _transcode_mp4_to_h264(
         raise RuntimeError(
             "ffmpeg transcode failed: " + completed_process.stderr.decode(errors="ignore")
         )
-    return _split_h264_by_aud(completed_process.stdout)
-
-
-def _split_h264_by_aud(h264_data: bytes) -> list[bytes]:
-    """Split H.264 stream on AUD (0x00000109) boundaries."""
-    units: list[bytes] = []
-    pattern = b"\x00\x00\x00\x01\x09"
-    offset = 0
-    while True:
-        boundary_index = h264_data.find(pattern, offset)
-        if boundary_index == -1:
-            break
-        if boundary_index > offset:
-            units.append(h264_data[offset:boundary_index])
-        offset = boundary_index + 5
-    if offset < len(h264_data):
-        units.append(h264_data[offset:])
-    return units
+    return [unit.data for unit in split_annex_b_stream(completed_process.stdout)]
 
 
 def _get_video_pts_times(mp4_path: Path) -> list[float]:

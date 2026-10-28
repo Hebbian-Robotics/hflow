@@ -2177,3 +2177,37 @@ def test_source_download_refuses_symlink_outside_its_cache(tmp_path: Path) -> No
     with pytest.raises(ValueError, match="inside the source cache"):
         prep._download_file("fake/repo", "a" * 40, "data/file.parquet", cache_directory)
     assert list(outside_directory.iterdir()) == []
+
+
+@_requires_system_ffmpeg
+@pytest.mark.requires_system_ffmpeg
+def test_transcode_mp4_to_h264_preserves_aud_and_annex_b_structure(tmp_path: Path) -> None:
+    from hflow.ffmpeg import ffmpeg_path
+    from hflow.video import split_annex_b_stream
+
+    mp4_path = tmp_path / "synthetic.mp4"
+    subprocess.run(
+        [
+            str(ffmpeg_path()),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=0.5:size=64x64:rate=10",
+            "-c:v",
+            "libx264",
+            str(mp4_path),
+        ],
+        check=True,
+    )
+
+    access_units = prep._transcode_mp4_to_h264(mp4_path, gop_seconds=1.0, frames_per_second=10.0)
+    assert len(access_units) == 5
+    for unit in access_units:
+        parsed = split_annex_b_stream(unit)
+        assert len(parsed) == 1
+        assert parsed[0].data == unit
+        assert unit.startswith(b"\x00\x00\x00\x01\x09") or unit.startswith(b"\x00\x00\x01\x09")
