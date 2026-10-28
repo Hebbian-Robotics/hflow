@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import json
 import sys
 from collections.abc import Callable
@@ -522,7 +523,10 @@ def test_run_fingerprint_changes_with_max_retries_but_not_worker_count(tmp_path:
     assert missing_key_policy_changed["fingerprint"] == original["fingerprint"]
 
 
-def test_run_fingerprint_for_unchanged_methodology_is_stable(tmp_path: Path) -> None:
+def test_run_fingerprint_for_unchanged_methodology_is_stable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(importlib.metadata, "version", lambda _package: "0.3.260")
     configuration = _evaluation_configuration(tmp_path / "run")
     document = _run_metadata_document(configuration)
 

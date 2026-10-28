@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from functools import partial
 from types import TracebackType
@@ -54,7 +54,7 @@ def stub_hosted_stream(
     @asynccontextmanager
     async def respond(
         *_arguments: object, **_keyword_arguments: object
-    ) -> AsyncIterator[httpx2.Response]:
+    ) -> AsyncGenerator[httpx2.Response, None]:
         response = next_response()
         try:
             yield response

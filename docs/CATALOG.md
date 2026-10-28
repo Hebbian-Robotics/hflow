@@ -157,6 +157,16 @@ for meaningful cross-worker time ordering.
 
 ## Querying
 
+HFlow uses DuckDB 2.0. When upgrading from DuckDB 1.x, review saved SQL:
+`~` and `!~` now match anywhere in a string, and list lambdas use
+`lambda value: expression` syntax. Some expressions can return different
+results without an error. See the [DuckDB migration guide](https://duckdb.org/docs/2.0/operations_manual/migration.html)
+for the full list. Existing DuckDB database files open in 2.0, but databases
+created with its default format cannot be opened by older DuckDB versions.
+HFlow's catalog is stored as Parquet files.
+Python callers using DuckDB relations must also replace relation `fetchone()`
+calls. See the [DuckDB Python migration guide](https://duckdb.org/docs/2.0/clients/python/migration.html).
+
 ### Explore in DuckDB UI
 
 Start DuckDB's browser UI over the default local catalog:

@@ -15,7 +15,7 @@ request: they own the ``open -> use -> close`` shape too, so no endpoint
 hand-writes another ``try/finally``.
 """
 
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 
 import duckdb
@@ -34,7 +34,9 @@ def catalog_unavailable_refusal(error: FileNotFoundError | ValueError) -> HTTPEx
 
 
 @contextmanager
-def opened_workspace_connection_or_refuse(data_root: str) -> Iterator[duckdb.DuckDBPyConnection]:
+def opened_workspace_connection_or_refuse(
+    data_root: str,
+) -> Generator[duckdb.DuckDBPyConnection, None, None]:
     """A live (UTC-pinned) connection for the server's OWN queries."""
     try:
         connection = _catalog.open_workspace_connection(data_root)
@@ -49,7 +51,7 @@ def opened_workspace_connection_or_refuse(data_root: str) -> Iterator[duckdb.Duc
 @contextmanager
 def opened_workspace_connection_or_none(
     data_root: str,
-) -> Iterator[duckdb.DuckDBPyConnection | None]:
+) -> Generator[duckdb.DuckDBPyConnection | None, None, None]:
     """The same connection, but a workspace with NO catalog yields ``None``.
 
     For the endpoints where "nothing has been recorded yet" is an answer
@@ -70,7 +72,9 @@ def opened_workspace_connection_or_none(
 
 
 @contextmanager
-def opened_constrained_connection_or_refuse(data_root: str) -> Iterator[duckdb.DuckDBPyConnection]:
+def opened_constrained_connection_or_refuse(
+    data_root: str,
+) -> Generator[duckdb.DuckDBPyConnection, None, None]:
     """The connection USER SQL runs on: catalog materialized in memory, file
     access and extension loading locked out.
 

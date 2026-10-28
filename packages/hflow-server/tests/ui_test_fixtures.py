@@ -6,7 +6,7 @@ repository's root test conftest.
 """
 
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,7 +35,7 @@ STAMPS = EpisodeStamps(
 
 
 @contextmanager
-def _appending_like_an_older_hflow() -> "Iterator[None]":
+def _appending_like_an_older_hflow() -> "Generator[None, None, None]":
     """Let one append write the JSON-illegal doubles a legacy catalog holds.
 
     ``_normalized_measurements`` refuses a non-finite float at append time, so

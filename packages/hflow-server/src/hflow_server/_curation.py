@@ -193,7 +193,7 @@ def _wrapper_execution_refusal(error: duckdb.Error) -> HTTPException:
         if _LOCATION_ECHO_PATTERN.match(line):
             dropping_caret = True
             continue
-        if dropping_caret and line.strip() == "^":
+        if dropping_caret and line.strip() and set(line.strip()) == {"^"}:
             dropping_caret = False
             continue
         dropping_caret = False

@@ -1854,9 +1854,11 @@ def test_success_label_omitted_when_source_has_no_outcome_feature(
             check_rows=[],
         )
 
-    rows = duckdb.sql(
+    relation = duckdb.sql(
         f"SELECT success FROM read_parquet('{catalog_root / 'episodes' / '*.parquet'}')"
-    ).fetchall()
+    )
+    assert relation is not None
+    rows = relation.fetchall()
     assert len(rows) == 1
     assert rows[0][0] is None
 

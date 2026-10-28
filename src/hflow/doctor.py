@@ -37,6 +37,9 @@ from hflow.format import (
 )
 from hflow.storage import fetch_uri
 
+# Every complete MCAP file starts and ends with these bytes (references/mcap-spec.md, "Magic").
+_MCAP_MAGIC = b"\x89MCAP0\r\n"
+
 # Cap repeated per-message findings so a broken 10k-frame stream reports a
 # handful of examples plus a count, not 10k lines.
 _MAX_FINDINGS_PER_CODE = 3
@@ -212,6 +215,37 @@ def _resolve_video_decoder(topic: str, channel: Channel, schema: Schema) -> Call
     )
 
 
+def _unreadable_message(stream: Any, error: Exception) -> str:
+    """Explain why a file could not be opened as MCAP.
+
+    The reader's own message is blank for an empty file, and for a file cut off
+    mid-write it describes whatever bytes happen to sit where the footer should
+    be, so name those two cases before falling back to the reader's text.
+    """
+    detail = str(error) or type(error).__name__
+    try:
+        stream.seek(0, 2)
+        size = stream.tell()
+        if size == 0:
+            return "not readable as MCAP: the file is empty (0 bytes)"
+        stream.seek(0)
+        starts_as_mcap = stream.read(len(_MCAP_MAGIC)) == _MCAP_MAGIC
+        # The end marker is a second copy of the magic, so a file too short to
+        # hold both cannot have one, even though its last bytes match the first.
+        ends_as_mcap = False
+        if size >= 2 * len(_MCAP_MAGIC):
+            stream.seek(size - len(_MCAP_MAGIC))
+            ends_as_mcap = stream.read(len(_MCAP_MAGIC)) == _MCAP_MAGIC
+    except OSError:
+        return f"not readable as MCAP: {detail}"
+    if starts_as_mcap and not ends_as_mcap:
+        return (
+            "not readable as MCAP: the file is truncated (it starts like an MCAP file but its "
+            f"end marker is missing, so the recording or copy may be incomplete): {detail}"
+        )
+    return f"not readable as MCAP: {detail}"
+
+
 def diagnose(path: Path | str) -> DoctorReport:
     """Check one file against the canonical-episode convention."""
     file_path = fetch_uri(path)
@@ -223,7 +257,7 @@ def diagnose(path: Path | str) -> DoctorReport:
             reader = make_reader(stream, validate_crcs=True)
             summary = reader.get_summary()
         except Exception as error:
-            collector.add(DiagnosticLevel.ERROR, "unreadable", f"not readable as MCAP: {error}")
+            collector.add(DiagnosticLevel.ERROR, "unreadable", _unreadable_message(stream, error))
             report.findings = collector.findings
             return report
 

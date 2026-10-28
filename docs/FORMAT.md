@@ -222,7 +222,9 @@ is reported as `video-invalid-slice-header` instead. The doctor does not reject
 non-VCL NAL units before the first AUD, so a clean report does not prove the
 canonical AUD-first constraint. An unreadable or unparseable path is reported
 in place, in the same per-file shape (`[error] unreadable: ...`), and the run
-continues with the remaining files.
+continues with the remaining files. The message names an empty (0-byte) file,
+and a file that starts with the MCAP magic but lacks the closing magic as
+truncated, since a cut-off recording or copy is the usual cause.
 
 ### Doctor finding codes
 

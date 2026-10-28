@@ -1,10 +1,11 @@
+import re
 from pathlib import Path
 from typing import Any
 
 import pytest
 from mcap.writer import CompressionType, Writer
 
-from hflow.episode import Episode
+from hflow.episode import Episode, _frame_selection_expression
 
 _NUMBERED_VIDEO_TOPIC = "/camera/cam0/video"
 _NUMBERED_VIDEO_START_NS = 1_760_000_000_000_000_000
@@ -579,3 +580,22 @@ def test_channel_to_arrow_numeric_list_with_null_elements() -> None:
         [None, None, None],
         [1.0, 2.0, 3.0],
     ]
+
+
+def test_frame_selection_expression_keeps_large_index_windows_one_frame_wide() -> None:
+    """Six-digit time windows must not swallow the neighbouring picture.
+
+    ``%g`` prints six significant digits, so index 250001 at 25 fps collapsed to
+    ``between(t,10000,10000.1)`` -- a window covering indices 250000-250002. The
+    boundaries must carry round-trip precision instead (#730 review).
+    """
+    fps = 25.0
+    frame_indices = [250001, 250010]
+    expression = _frame_selection_expression(frame_indices, fps=fps)
+
+    windows = re.findall(r"between\(t\\,([^,\\]+)\\,([^)\\]+)\)", expression)
+    assert len(windows) == len(frame_indices)
+    for frame_index, (start, end) in zip(frame_indices, windows, strict=True):
+        start_time, end_time = float(start), float(end)
+        assert start_time < frame_index / fps < end_time
+        assert end_time - start_time == pytest.approx(1 / fps)

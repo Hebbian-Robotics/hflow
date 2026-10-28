@@ -14,13 +14,21 @@ from __future__ import annotations
 
 import asyncio
 import math
+from collections.abc import Callable, Coroutine
 from pathlib import Path
+from typing import Any
 
 import pytest
 from mcap.writer import Writer
 
 from hflow import Episode
-from hflow.checks import idle_fraction, joint_discontinuity
+from hflow.checks import (
+    action_integrity,
+    idle_fraction,
+    joint_discontinuity,
+    trajectory_metrics,
+    trajectory_segments,
+)
 from hflow.format import METADATA_RECORD_EPISODE
 from hflow.steps import CheckResult
 from hflow.testing import (
@@ -33,7 +41,13 @@ TOPIC = "/joint_states"
 NS_PER_S = 1_000_000_000
 
 
-def _joint_states_episode(path: Path, stamps_ns: list[int], positions: list[float]) -> Episode:
+def _joint_states_episode(
+    path: Path,
+    stamps_ns: list[int],
+    positions: list[float],
+    *,
+    omit_positions: bool = False,
+) -> Episode:
     with path.open("wb") as stream:
         writer = Writer(stream)
         writer.start(profile="ros2", library="test-546")
@@ -53,7 +67,7 @@ def _joint_states_episode(path: Path, stamps_ns: list[int], positions: list[floa
                 stamp_ns,
                 "probe",
                 ["j0"],
-                [position],
+                [] if omit_positions else [position],
                 [],
                 [],
             )
@@ -167,3 +181,30 @@ def test_every_percentage_names_the_time_it_could_not_measure(
         assert idle.measurements[f"{TOPIC}/idle_nonpositive_dt_count"] == 1
         assert f"{TOPIC}/idle_fraction" in idle.measurements
         _assert_all_measurements_finite(velocity, idle)
+
+
+@pytest.mark.parametrize(
+    ("check", "sample_count_key"),
+    [
+        (action_integrity, "integrity_sample_count"),
+        (joint_discontinuity, "velocity_sample_count"),
+        (idle_fraction, "idle_sample_count"),
+        (trajectory_metrics, "trajectory_sample_count"),
+        (trajectory_segments, "segment_sample_count"),
+    ],
+)
+def test_empty_position_vectors_withhold_motion_measurements(
+    tmp_path: Path,
+    check: Callable[..., Coroutine[Any, Any, CheckResult]],
+    sample_count_key: str,
+) -> None:
+    with _joint_states_episode(
+        tmp_path / "empty-positions.mcap",
+        [i * NS_PER_S for i in range(4)],
+        [0.0] * 4,
+        omit_positions=True,
+    ) as episode:
+        result = asyncio.run(check(episode, field="position"))
+
+    assert result.measurements == {f"{TOPIC}/{sample_count_key}": 4}
+    assert result.intervals == []

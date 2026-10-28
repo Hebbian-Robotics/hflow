@@ -4,7 +4,7 @@ import asyncio
 import shutil
 import tempfile
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, asynccontextmanager, suppress
 from contextvars import copy_context
 from dataclasses import dataclass
@@ -277,7 +277,9 @@ def _remove_directory(directory: Path) -> None:
 
 
 @asynccontextmanager
-async def blocking_context(manager: AbstractContextManager[_Result]) -> AsyncIterator[_Result]:
+async def blocking_context(
+    manager: AbstractContextManager[_Result],
+) -> AsyncGenerator[_Result, None]:
     """Enter and close a blocking resource without releasing it during acquisition."""
     entered = False
 

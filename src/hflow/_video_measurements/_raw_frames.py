@@ -2,7 +2,7 @@
 
 import json
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -80,7 +80,7 @@ def _raw_frame_stream(
     toolchain: VideoMeasurementToolchain,
     filter_graph: str,
     frame_shape: tuple[int, ...],
-) -> Iterator[Iterator[np.ndarray]]:
+) -> Generator[Iterator[np.ndarray], None, None]:
     """Yield complete ``uint8`` frames from one owned FFmpeg process."""
     frame_byte_count = int(np.prod(frame_shape))
     command = [
@@ -142,7 +142,7 @@ def _raw_frame_stream(
 @contextmanager
 def luma_frames(
     video: Path, *, toolchain: VideoMeasurementToolchain
-) -> Iterator[Iterator[np.ndarray]]:
+) -> Generator[Iterator[np.ndarray], None, None]:
     """Yield coded-size ``(height, width)`` 8-bit luma frames in order."""
     frame_shape = _probe_frame_shape(video, toolchain)
     with _raw_frame_stream(
@@ -161,7 +161,7 @@ def rgb_frames(
     toolchain: VideoMeasurementToolchain,
     frames_per_second: float | None = None,
     long_edge_pixels: int | None = None,
-) -> Iterator[Iterator[np.ndarray]]:
+) -> Generator[Iterator[np.ndarray], None, None]:
     """Yield contiguous ``(height, width, 3)`` 8-bit RGB frames."""
     if frames_per_second is not None and frames_per_second <= 0:
         raise ValueError(f"frames_per_second must be positive, got {frames_per_second}")
