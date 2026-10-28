@@ -154,6 +154,26 @@ def _stripped_sql_or_refuse(raw_sql: str) -> str:
     return stripped_sql
 
 
+def _subquery_body(user_sql: str) -> str:
+    """The SQL as the body of ``(...)``: no statement terminator, and a
+    trailing comment ends on its own line, so a line comment cannot swallow
+    the wrapper's closing parenthesis. SQL without either is unchanged.
+
+    The terminator is found the way the SDK finds it (``hflow.curation``):
+    the last token DuckDB does not classify as a comment, so ``; -- end``
+    and ``; /* end */`` lose their semicolon too, while semicolons and
+    comment markers inside string literals are left alone. Positions are
+    UTF-8 byte offsets, hence the encode/decode.
+    """
+    sql_bytes = user_sql.encode("utf-8")
+    tokens = duckdb.tokenize(user_sql)
+    code_tokens = [position for position, kind in tokens if kind != duckdb.token_type.comment]
+    if code_tokens and sql_bytes[code_tokens[-1] : code_tokens[-1] + 1] == b";":
+        sql_bytes = sql_bytes[: code_tokens[-1]] + sql_bytes[code_tokens[-1] + 1 :]
+    ends_in_comment = bool(tokens) and tokens[-1][1] == duckdb.token_type.comment
+    return sql_bytes.decode("utf-8") + ("\n" if ends_in_comment else "")
+
+
 def _bad_sql_refusal(error: duckdb.Error) -> HTTPException:
     # DuckDB's parser/binder message IS the useful diagnostic; bad SQL is the
     # caller's mistake, never a server fault (so 400, never 500).
@@ -286,6 +306,7 @@ def run_preview(
     connection: duckdb.DuckDBPyConnection, user_sql: str, *, limit: int, include_stats: bool
 ) -> CurationPreviewResponse:
     """Preview rows, the full count, and (optionally) SUMMARIZE column stats."""
+    user_sql = _subquery_body(user_sql)
     columns = _described_columns(connection, user_sql)
     replace_clause = _timestamp_replace_clause(columns)
     select_head = f"SELECT * {replace_clause}" if replace_clause else "SELECT *"
