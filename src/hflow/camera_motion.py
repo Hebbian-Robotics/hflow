@@ -6,7 +6,7 @@ episodes, catalogs, or orchestration. See docs/how-to/stream-camera-motion.md.
 """
 
 import math
-from collections.abc import Iterable, Iterator
+from collections.abc import Generator, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,7 +66,7 @@ def stream_camera_motion(
     *,
     settings: CameraMotionStreamSettings,
     toolchain: VideoMeasurementToolchain | None = None,
-) -> Iterator[Iterator[CameraMotionObservation]]:
+) -> Generator[Iterator[CameraMotionObservation], None, None]:
     """Decode a fixed-frame-rate file incrementally at the caller-supplied rate.
 
     Times are relative to the first decoded frame, not container presentation

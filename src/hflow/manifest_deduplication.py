@@ -141,7 +141,7 @@ def deduplicate_manifest(
                 for column in settings.conflict_columns
             ]
             conflicts_sql = (
-                f"list_filter([{', '.join(conflict_expressions)}], value -> value IS NOT NULL)"
+                f"list_filter([{', '.join(conflict_expressions)}], lambda value: value IS NOT NULL)"
                 if conflict_expressions
                 else "[]::VARCHAR[]"
             )

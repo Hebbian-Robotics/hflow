@@ -1,7 +1,7 @@
 """The local DuckDB catalog browser lifecycle."""
 
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
@@ -97,7 +97,7 @@ class _CatalogUiSession:
 @contextmanager
 def _running_catalog_ui(
     catalog_root: Path | str | StorageRoot, monkeypatch: pytest.MonkeyPatch
-) -> Iterator[_CatalogUiSession]:
+) -> Generator[_CatalogUiSession, None, None]:
     """Serve the catalog UI on a thread, recording its seams, and stop it on exit.
 
     Leaving the block shuts the UI down and asserts the thread stopped
@@ -458,10 +458,16 @@ def test_catalog_ui_waits_for_the_first_remote_append(
 
         _append_remote_episode(tmp_path, writer_catalog_root, task="remote-first")
 
-        assert session.wait_for_refreshes(1)
-        assert catalog_connection.execute(
-            "SELECT count(*), min(task) FROM episodes"
-        ).fetchone() == (1, "remote-first")
+        with session.refreshed:
+            assert session.refreshed.wait_for(
+                lambda: (
+                    catalog_connection.execute(
+                        "SELECT count(*), min(task) FROM episodes"
+                    ).fetchone()
+                    == (1, "remote-first")
+                ),
+                timeout=2,
+            )
 
 
 def test_catalog_ui_sees_a_later_remote_append_without_restart(

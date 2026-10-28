@@ -29,11 +29,11 @@ import secrets
 import socket
 import threading
 from collections import OrderedDict
-from collections.abc import Iterator, Mapping
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 from hflow._field_guards import require_positive_int
 
@@ -101,7 +101,6 @@ class _BlockCache:
 
 
 class _RangeRequestHandler(http.server.BaseHTTPRequestHandler):
-    server: _LoopbackServer
     timeout = _REQUEST_TIMEOUT_SECONDS
 
     def setup(self) -> None:
@@ -119,10 +118,11 @@ class _RangeRequestHandler(http.server.BaseHTTPRequestHandler):
         self._respond(send_body=True)
 
     def _respond(self, *, send_body: bool) -> None:
-        if self.path != self.server.object_path:
+        server = cast("_LoopbackServer", self.server)
+        if self.path != server.object_path:
             self.send_error(404)
             return
-        cache = self.server.cache
+        cache = server.cache
         start, stop = 0, cache.size_bytes
         range_header = self.headers.get("Range")
         if range_header is not None:
@@ -225,7 +225,7 @@ def serve_byte_ranges(
     *,
     block_bytes: int = 256 * 1024,
     maximum_cached_bytes: int = 64 * 1024 * 1024,
-) -> Iterator[LoopbackVideoSource]:
+) -> Generator[LoopbackVideoSource, None, None]:
     """Serve ``reader`` to FFmpeg on loopback until the ``with`` block exits.
 
     ``block_bytes`` is the upstream read size; ``maximum_cached_bytes`` bounds

@@ -42,7 +42,7 @@ import os
 import shutil
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -202,7 +202,7 @@ def _apply_default_permissions(path: Path) -> None:
 
 
 @contextmanager
-def _mirror_entry_lock(entry_file: Path) -> Iterator[None]:
+def _mirror_entry_lock(entry_file: Path) -> Generator[None, None, None]:
     """Serialize same-machine mutations of one mirror entry.
 
     A mirror entry is TWO files (payload + etag sidecar) written by two

@@ -19,7 +19,7 @@ EVERY episode errored always fails regardless of budget.
 import math
 import os
 import traceback
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Generator, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -652,7 +652,7 @@ def _batch_quarantine_history(
     stage: Stage,
     *,
     preserve_existing_quarantine: bool = False,
-) -> Iterator[QuarantineHistory | None]:
+) -> Generator[QuarantineHistory | None, None, None]:
     """One catalog reader for a whole batch, or ``None`` when none is needed.
 
     A complete meta stage decides quarantine entirely in memory. A selected

@@ -283,3 +283,40 @@ def test_preview_accepts_from_first_and_parenthesized_selects(api: TestClient) -
     ):
         response = api.post("/api/v1/curation/preview", json={"sql": sql})
         assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT 1 AS value -- end",
+        "SELECT 1 AS value; -- end",
+        "SELECT 1 AS value; /* end */",
+        "SELECT 1 AS value -- end\n",
+    ],
+)
+@pytest.mark.parametrize("stats", [False, True])
+def test_preview_accepts_sql_ending_in_a_comment(api: TestClient, sql: str, stats: bool) -> None:
+    plain = _preview(api, sql="SELECT 1 AS value", stats=stats)
+    payload = _preview(api, sql=sql, stats=stats)
+    assert payload["rows"] == plain["rows"] == [{"value": 1}]
+    assert payload["row_count"] == plain["row_count"] == 1
+    assert (payload["column_stats"] is None) is (not stats)
+
+
+def test_preview_keeps_semicolons_and_comment_markers_inside_strings(api: TestClient) -> None:
+    text = "a; -- not a comment /* nor this */ tiếng Việt;"
+    payload = _preview(api, sql=f"SELECT '{text}' AS value; -- end")
+    assert payload["rows"] == [{"value": text}]
+
+
+def test_preview_still_refuses_two_statements_hidden_behind_a_comment(api: TestClient) -> None:
+    response = api.post(
+        "/api/v1/curation/preview", json={"sql": "SELECT 1 AS value; SELECT 2 -- end"}
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "sql must be exactly one read-only SELECT statement"
+
+
+def test_preview_sql_is_unchanged_when_it_has_no_trailing_comment(api: TestClient) -> None:
+    payload = _preview(api, sql="SELECT 1 AS value", limit=5)
+    assert payload["sql"] == "SELECT * FROM (SELECT 1 AS value) LIMIT 5"

@@ -13,12 +13,14 @@ standard library.
 
 import hashlib
 import json
+import math
 import re
 import shutil
 import subprocess
 import tempfile
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from fractions import Fraction
 from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -88,8 +90,28 @@ def _sanitize_topic(topic: str) -> str:
     return f"{readable}-{digest}"
 
 
-def _frame_selection_expression(frame_indices: Sequence[int]) -> str:
-    """Build a compact ffmpeg select expression for sorted, unique indices."""
+# The cache directory name is the cache key, so the layout tag retires every
+# directory written before the selection moved to timestamps (#727): those hold
+# the decoded-counter pictures, which are shifted after a lost keyframe.
+_FRAMES_AT_INDICES_CACHE_LAYOUT = "v2-time"
+
+
+def _frame_selection_expression(frame_indices: Sequence[int], *, fps: float) -> str:
+    """Build a compact ffmpeg select expression for sorted, unique indices.
+
+    Pictures are selected by time, not by ffmpeg's decoded-picture counter
+    ``n``: a decoder that loses a reference frame drops every picture that
+    depends on it, so decoded picture *n* stops being message *n* after a
+    missing keyframe and each later index returns a picture shifted by the
+    shortfall, labelled with the requested message's log time (#727). The MP4
+    is constant rate, so message *k* is the picture nearest ``k / fps``, and a
+    picture the decoder never produced matches nothing -- the caller's
+    extracted-count check then reports the request instead of returning a
+    shifted frame.
+    """
+
+    if fps <= 0:
+        raise ValueError(f"fps must be positive, got {fps}")
 
     consecutive_ranges: list[tuple[int, int]] = []
     range_start = frame_indices[0]
@@ -102,12 +124,43 @@ def _frame_selection_expression(frame_indices: Sequence[int]) -> str:
         range_start = frame_index
         range_end = frame_index
     consecutive_ranges.append((range_start, range_end))
+
+    def half_frame_before(index: int) -> str:
+        return f"{(index - 0.5) / fps:.17g}"
+
+    def half_frame_after(index: int) -> str:
+        return f"{(index + 0.5) / fps:.17g}"
+
     return "+".join(
-        f"eq(n\\,{range_start})"
-        if range_start == range_end
-        else f"between(n\\,{range_start}\\,{range_end})"
+        f"between(t\\,{half_frame_before(range_start)}\\,{half_frame_after(range_end)})"
         for range_start, range_end in consecutive_ranges
     )
+
+
+def _decoded_frame_indices(framecrc_path: Path, *, source_fps: float) -> set[int]:
+    """Recover remuxed source-frame positions from decoded PTS, not decoder output order.
+
+    The remux is constant-rate and index-preserving, but damaged GOPs can leave
+    holes in its decoded PTS sequence. The trace preserves timestamps at
+    microsecond precision, independently of the decoder's nominal frame rate.
+    """
+    time_base: Fraction | None = None
+    timestamps: list[Fraction] = []
+    try:
+        with framecrc_path.open(encoding="utf-8") as source:
+            for line in source:
+                if line.startswith("#tb 0:"):
+                    time_base = Fraction(line.partition(":")[2].strip())
+                elif not line.startswith("#") and line.strip():
+                    fields = line.split(",", 4)
+                    if time_base is None or len(fields) < 3 or fields[0].strip() != "0":
+                        raise RuntimeError(f"Invalid decoded frame timestamps in {framecrc_path}")
+                    timestamps.append(int(fields[2]) * time_base)
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"Invalid decoded frame timestamps in {framecrc_path}") from error
+    if not timestamps:
+        raise RuntimeError(f"No decoded frame timestamps in {framecrc_path}")
+    return {round(timestamp * Fraction(str(source_fps))) for timestamp in timestamps}
 
 
 def _message_field_names(message: Any) -> list[str]:
@@ -735,7 +788,9 @@ class Episode:
         ``start_s``/``end_s`` are seconds from the start of the camera
         stream. Each frame's ``log_time_ns`` is the log time of the source
         message it was extracted from, exact to within one source frame
-        interval even across recording gaps.
+        interval even across recording gaps. Samples whose source frames could
+        not be decoded are omitted, so damaged recordings may return fewer
+        frames than the requested sampling ticks.
         """
         topic = self._resolve_camera(camera)
         mp4 = self.video(topic)
@@ -745,7 +800,7 @@ class Episode:
         # requests would share one cache directory.
         end_label = f"{end_s:.6f}" if end_s is not None else "end"
         label = f"{_sanitize_topic(topic)}_f{fps:.6f}_s{window_start_s:.6f}_e{end_label}"
-        output_dir = self.workdir / f"frames_{label}"
+        output_dir = self.workdir / f"frames_v2_{label}"
         if not output_dir.exists():
             # Extract into a unique temp dir and rename on success: a bare directory
             # is the cache key, so a failed run must never leave one behind.
@@ -759,13 +814,59 @@ class Episode:
                     command += ["-ss", f"{start_s:.6f}"]
                 if end_s is not None:
                     command += ["-to", f"{end_s:.6f}"]
-                command += ["-vf", f"fps={fps:g}", "-q:v", "2", str(staging_dir / "frame_%06d.jpg")]
+                command += [
+                    "-filter_complex",
+                    f"[0:v]split=2[decoded][candidate];[candidate]fps={fps:g}:round=up[sampled]",
+                    "-map",
+                    "[sampled]",
+                    "-fps_mode",
+                    "passthrough",
+                    "-q:v",
+                    "2",
+                    str(staging_dir / "frame_%06d.jpg"),
+                    "-map",
+                    "[decoded]",
+                    "-c:v",
+                    "rawvideo",
+                    "-enc_time_base",
+                    "1:1000000",
+                    "-fps_mode",
+                    "passthrough",
+                    "-f",
+                    "framecrc",
+                ]
+                if end_s is not None:
+                    command += ["-to", f"{end_s:.6f}"]
+                command.append(str(staging_dir / "decoded.framecrc"))
                 completed = subprocess.run(command, capture_output=True, text=True, check=False)
-                if completed.returncode != 0 or not any(staging_dir.glob("frame_*.jpg")):
+                staged_frames = sorted(staging_dir.glob("frame_*.jpg"))
+                if completed.returncode != 0 or not staged_frames:
                     stderr_tail = completed.stderr.strip().splitlines()[-5:]
                     raise RuntimeError(
                         f"ffmpeg frame extraction produced no frames for {topic!r} "
                         f"(exit {completed.returncode}): {stderr_tail}"
+                    )
+                decoded_indices = _decoded_frame_indices(
+                    staging_dir / "decoded.framecrc", source_fps=self._video_fps[topic]
+                )
+                source_count = len(
+                    self._channel_log_times(self._resolve_channel_info(topic).channel_id)
+                )
+                sample_rate = Fraction(f"{fps:g}")
+                first_tick = math.ceil(Fraction(f"{window_start_s:.6f}") * sample_rate)
+                for frame_path in staged_frames:
+                    sample_index = int(frame_path.stem.removeprefix("frame_")) - 1
+                    sample_time = (first_tick + sample_index) / sample_rate
+                    source_index = min(
+                        int(float(sample_time) * self._video_fps[topic] + 1e-6),
+                        source_count - 1,
+                    )
+                    if source_index not in decoded_indices:
+                        frame_path.unlink()
+                (staging_dir / "decoded.framecrc").unlink()
+                if not any(staging_dir.glob("frame_*.jpg")):
+                    raise RuntimeError(
+                        f"ffmpeg frame extraction produced no decodable frames for {topic!r}"
                     )
                 try:
                     staging_dir.rename(output_dir)
@@ -781,17 +882,23 @@ class Episode:
         if not frame_paths:
             raise RuntimeError(f"Incomplete frame cache at {output_dir}")
 
-        # Map each extracted frame back to the source message it came from.
+        # Numbering starts at 1 and retains gaps for undecodable sample ticks.
+        # Output seeking starts at the first absolute fps tick >= start_s.
+        sample_rate = Fraction(f"{fps:g}")
+        first_tick = math.ceil(Fraction(f"{window_start_s:.6f}") * sample_rate)
         log_times_ns = video_module.source_log_times_for_sampled_frames(
             self._channel_log_times(self._resolve_channel_info(topic).channel_id),
             source_fps=self._video_fps[topic],
             sample_fps=fps,
-            start_s=window_start_s,
-            frame_count=len(frame_paths),
+            start_s=float(first_tick / sample_rate),
+            frame_count=int(frame_paths[-1].stem.removeprefix("frame_")),
         )
         return [
-            ExtractedFrame(path=frame_path, log_time_ns=log_time_ns)
-            for frame_path, log_time_ns in zip(frame_paths, log_times_ns, strict=True)
+            ExtractedFrame(
+                path=frame_path,
+                log_time_ns=log_times_ns[int(frame_path.stem.removeprefix("frame_")) - 1],
+            )
+            for frame_path in frame_paths
         ]
 
     def frames_at_indices(
@@ -837,7 +944,7 @@ class Episode:
         selection_digest = hashlib.sha256(serialized_indices.encode()).hexdigest()[:16]
         output_directory = self.workdir / (
             f"frames_{_sanitize_topic(topic)}_indices_{selection_digest}_"
-            f"count_{len(selected_frame_indices)}"
+            f"count_{len(selected_frame_indices)}_{_FRAMES_AT_INDICES_CACHE_LAYOUT}"
         )
         expected_frame_paths = [
             output_directory / f"frame_{output_index:06d}.jpg"
@@ -852,7 +959,9 @@ class Episode:
             )
             try:
                 filter_script_path = staging_directory / "select.filter"
-                selection_expression = _frame_selection_expression(selected_frame_indices)
+                selection_expression = _frame_selection_expression(
+                    selected_frame_indices, fps=self._video_fps[topic]
+                )
                 filter_script_path.write_text(f"select={selection_expression}")
                 command = [
                     str(ffmpeg_path()),

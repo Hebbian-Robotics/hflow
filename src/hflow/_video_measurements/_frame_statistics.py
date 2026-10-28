@@ -5,7 +5,7 @@ import re
 import statistics
 import subprocess
 import tempfile
-from collections.abc import Iterable, Iterator
+from collections.abc import Generator, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -586,7 +586,7 @@ def _copy_instrument_output_lines(
 @contextmanager
 def _temporary_instrument_cache_output(
     cache_path: Path | None,
-) -> Iterator[tuple[_TextWriter | None, Path | None]]:
+) -> Generator[tuple[_TextWriter | None, Path | None], None, None]:
     """Open a unique cache candidate and close it before atomic publication."""
     if cache_path is None:
         yield None, None

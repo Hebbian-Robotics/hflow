@@ -1,10 +1,281 @@
+import re
 from pathlib import Path
 from typing import Any
 
 import pytest
 from mcap.writer import CompressionType, Writer
 
-from hflow.episode import Episode
+from hflow.episode import Episode, _frame_selection_expression
+
+_NUMBERED_VIDEO_TOPIC = "/camera/cam0/video"
+_NUMBERED_VIDEO_START_NS = 1_760_000_000_000_000_000
+
+
+def test_sparse_decoded_timestamps_keep_original_source_positions(tmp_path: Path) -> None:
+    from hflow.episode import _decoded_frame_indices
+
+    decoded_trace = tmp_path / "decoded.framecrc"
+    decoded_trace.write_text(
+        "#tb 0: 1/1000000\n"
+        "0, 0, 0, 33333, 1, 0\n"
+        "0, 1000000, 1000000, 33333, 1, 0\n"
+        "0, 2000000, 2000000, 33333, 1, 0\n",
+        encoding="utf-8",
+    )
+    assert _decoded_frame_indices(decoded_trace, source_fps=30.0) == {0, 30, 60}
+
+
+@pytest.fixture(scope="module")
+def numbered_h264_episodes(tmp_path_factory: pytest.TempPathFactory) -> dict[int | None, Path]:
+    """Canonical MP4 inputs with pixels identifying their original source index."""
+    from fractions import Fraction
+
+    import av
+    import numpy as np
+    from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
+    from mcap_protobuf.writer import Writer as ProtobufWriter
+
+    from hflow.transform import TransformConfig, write_canonical_episode
+
+    directory = tmp_path_factory.mktemp("numbered-video")
+    width, height, source_fps, frame_count, gop, bit_count = 320, 180, 30, 150, 10, 8
+    encoder = av.CodecContext.create("libx264", "w")
+    encoder.width, encoder.height, encoder.pix_fmt = width, height, "yuv420p"
+    encoder.framerate, encoder.time_base = Fraction(source_fps, 1), Fraction(1, source_fps)
+    encoder.gop_size, encoder.max_b_frames = gop, 0
+    encoder.options = {
+        "profile": "baseline",
+        "tune": "zerolatency",
+        "keyint_min": str(gop),
+        "sc_threshold": "0",
+    }
+    packets: list[bytes] = []
+    for index in range(frame_count):
+        pixels = np.full((height, width, 3), 128, dtype=np.uint8)
+        pixels[:48] = 16
+        for bit in range(bit_count):
+            if index & (1 << (bit_count - bit - 1)):
+                pixels[:48, bit * width // bit_count : (bit + 1) * width // bit_count] = 235
+        frame = av.VideoFrame.from_ndarray(pixels, format="rgb24").reformat(format="yuv420p")
+        frame.pts = index
+        packets.extend(bytes(packet) for packet in encoder.encode(frame))
+    packets.extend(bytes(packet) for packet in encoder.encode(None))
+    assert len(packets) == frame_count
+
+    episodes: dict[int | None, Path] = {}
+    for lost_idr in (None, 100):
+        raw_path = directory / f"raw_{lost_idr}.mcap"
+        canonical_path = directory / f"canonical_{lost_idr}.mcap"
+        with ProtobufWriter(str(raw_path)) as writer:
+            for index, packet in enumerate(packets):
+                if index == lost_idr:
+                    continue
+                log_time_ns = _NUMBERED_VIDEO_START_NS + index * 1_000_000_000 // source_fps
+                message = CompressedVideo(frame_id="cam0", format="h264", data=packet)
+                message.timestamp.FromNanoseconds(log_time_ns)
+                writer.write_message(
+                    _NUMBERED_VIDEO_TOPIC,
+                    message,
+                    log_time=log_time_ns,
+                    publish_time=log_time_ns,
+                )
+        write_canonical_episode(raw_path, canonical_path, TransformConfig())
+        episodes[lost_idr] = canonical_path
+    return episodes
+
+
+def _number_in_frame(path: Path) -> int:
+    import cv2
+
+    pixels = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    assert pixels is not None
+    return int(
+        "".join(
+            str(int(pixels[:48, bit * 40 + 6 : (bit + 1) * 40 - 6].mean() > 128))
+            for bit in range(8)
+        ),
+        2,
+    )
+
+
+def _source_frame_number(log_time_ns: int) -> int:
+    return round((log_time_ns - _NUMBERED_VIDEO_START_NS) * 30 / 1_000_000_000)
+
+
+@pytest.mark.requires_system_ffmpeg
+@pytest.mark.parametrize(
+    ("fps", "start_s", "end_s"),
+    [
+        (30.0, None, None),
+        (10.0, None, None),
+        (3.0, None, None),
+        (1.0, None, None),
+        (3.0, 0.0, 1.7),
+        (3.0, 0.2, 1.7),
+        (10.0, 0.37, 2.3),
+        (1.0, 0.5, 4.2),
+        (40.0, None, 0.5),
+    ],
+)
+def test_frames_label_the_pixels_that_were_sampled(
+    numbered_h264_episodes: dict[int | None, Path],
+    tmp_path: Path,
+    fps: float,
+    start_s: float | None,
+    end_s: float | None,
+) -> None:
+    with Episode(numbered_h264_episodes[None], workdir=tmp_path) as episode:
+        frames = episode.frames(_NUMBERED_VIDEO_TOPIC, fps=fps, start_s=start_s, end_s=end_s)
+    assert frames
+    for frame in frames:
+        named = _source_frame_number(frame.log_time_ns)
+        shown = _number_in_frame(frame.path)
+        assert abs(shown - named) <= 1, (fps, start_s, end_s, frame.path.name, named, shown)
+
+
+@pytest.mark.requires_system_ffmpeg
+def test_short_frame_request_bounds_decoded_trace(
+    numbered_h264_episodes: dict[int | None, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hflow import episode as episode_module
+
+    original_decoded_frame_indices = episode_module._decoded_frame_indices
+    decoded_source_indices: set[int] = set()
+
+    def capture_decoded_indices(framecrc_path: Path, *, source_fps: float) -> set[int]:
+        source_indices = original_decoded_frame_indices(framecrc_path, source_fps=source_fps)
+        decoded_source_indices.update(source_indices)
+        return source_indices
+
+    monkeypatch.setattr(episode_module, "_decoded_frame_indices", capture_decoded_indices)
+    with Episode(numbered_h264_episodes[None], workdir=tmp_path) as episode:
+        frames = episode.frames(_NUMBERED_VIDEO_TOPIC, fps=10.0, end_s=0.5)
+    assert len(frames) == 5
+    assert [_number_in_frame(frame.path) for frame in frames] == [0, 3, 6, 9, 12]
+    assert decoded_source_indices == set(range(15))
+
+
+@pytest.mark.requires_system_ffmpeg
+@pytest.mark.parametrize("fps", [30.0, 10.0, 3.0, 1.0])
+def test_frames_omit_undecoded_ticks_without_shifting_later_samples(
+    numbered_h264_episodes: dict[int | None, Path], tmp_path: Path, fps: float
+) -> None:
+    with Episode(numbered_h264_episodes[100], workdir=tmp_path) as episode:
+        frames = episode.frames(_NUMBERED_VIDEO_TOPIC, fps=fps)
+    assert frames
+    sampled_ticks = {int(frame.path.stem.removeprefix("frame_")) - 1 for frame in frames}
+    # Original MP4 PTS 100..107 are absent after dropping IDR 100; filter
+    # duplication of frame 99 must not create samples at those tick positions.
+    for tick in range(100, 108):
+        if tick % (30 / fps) == 0:
+            assert int(tick * fps / 30) not in sampled_ticks
+    assert max(sampled_ticks) >= int(120 * fps / 30)
+    for frame in frames:
+        if _source_frame_number(frame.log_time_ns) >= 120:
+            assert abs(_number_in_frame(frame.path) - _source_frame_number(frame.log_time_ns)) <= 1
+
+
+@pytest.mark.requires_system_ffmpeg
+def test_frames_reextract_old_cache_and_reuse_new_cache(
+    numbered_h264_episodes: dict[int | None, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    from hflow.episode import _sanitize_topic
+
+    old_cache = (
+        tmp_path / f"frames_{_sanitize_topic(_NUMBERED_VIDEO_TOPIC)}_f1.000000_s0.000000_eend"
+    )
+    old_cache.mkdir()
+    (old_cache / "frame_000001.jpg").write_bytes(b"old cached pixels")
+
+    with Episode(numbered_h264_episodes[None], workdir=tmp_path) as episode:
+        first = episode.frames(_NUMBERED_VIDEO_TOPIC, fps=1.0)
+        assert len(first) == 5
+        assert first[0].path.parent.name.startswith("frames_v2_")
+        assert _number_in_frame(first[0].path) == 0
+        assert {path.suffix for path in first[0].path.parent.iterdir()} == {".jpg"}
+
+        def forbid_second_extraction(*args: Any, **kwargs: Any) -> None:
+            pytest.fail("cache hit must not rerun ffmpeg")
+
+        with monkeypatch.context() as patched:
+            patched.setattr(subprocess, "run", forbid_second_extraction)
+            assert episode.frames(_NUMBERED_VIDEO_TOPIC, fps=1.0) == first
+    with (
+        Episode(numbered_h264_episodes[None], workdir=tmp_path) as episode,
+        monkeypatch.context() as patched,
+    ):
+        patched.setattr(subprocess, "run", forbid_second_extraction)
+        assert episode.frames(_NUMBERED_VIDEO_TOPIC, fps=1.0) == first
+
+
+@pytest.mark.requires_system_ffmpeg
+def test_missing_decoded_frame_trace_does_not_publish_frame_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
+    from hflow.transform import write_canonical_episode
+
+    source = tmp_path / "source.mcap"
+    canonical = tmp_path / "canonical.mcap"
+    workdir = tmp_path / "cache"
+    synthesize_episode(source, SyntheticEpisodeSpec(duration_s=1.0, cameras=("cam",), image_hz=5.0))
+    write_canonical_episode(source, canonical)
+
+    def missing_sidecar(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        frame_pattern = next(value for value in command if value.endswith("frame_%06d.jpg"))
+        Path(frame_pattern.replace("%06d", "000001")).write_bytes(b"partial JPEG")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    with Episode(canonical, workdir=workdir) as episode:
+        with monkeypatch.context() as patched:
+            patched.setattr(subprocess, "run", missing_sidecar)
+            with pytest.raises(RuntimeError, match="Invalid decoded frame timestamps"):
+                episode.frames(fps=2.0)
+        assert not [path for path in workdir.iterdir() if path.is_dir()]
+        frames = episode.frames(fps=2.0)
+        assert len(frames) == 2
+        assert all(frame.path.is_file() for frame in frames)
+
+
+@pytest.mark.requires_system_ffmpeg
+@pytest.mark.parametrize("source_fps", [29.87, 29.97])
+def test_frames_preserve_sample_ticks_with_fractional_source_rates(
+    tmp_path: Path, source_fps: float
+) -> None:
+    from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
+    from hflow.transform import write_canonical_episode
+
+    source = tmp_path / "source.mcap"
+    canonical = tmp_path / "canonical.mcap"
+    synthesize_episode(
+        source,
+        SyntheticEpisodeSpec(
+            duration_s=3.4,
+            cameras=("cam",),
+            image_hz=source_fps,
+            black_segment=None,
+            timestamp_offset_segment=None,
+        ),
+    )
+    write_canonical_episode(source, canonical)
+    with Episode(canonical, workdir=tmp_path / "cache") as episode:
+        for sample_fps in (0.5, 3.0, 40.0):
+            frames = episode.frames(fps=sample_fps, start_s=0.27, end_s=2.7)
+            assert frames
+            indices = [int(frame.path.stem.removeprefix("frame_")) for frame in frames]
+            assert indices == list(range(1, len(indices) + 1))
+            assert all(frame.path.is_file() for frame in frames)
+            assert [frame.log_time_ns for frame in frames] == sorted(
+                frame.log_time_ns for frame in frames
+            )
 
 
 def _write_two_json_channels(
@@ -309,3 +580,22 @@ def test_channel_to_arrow_numeric_list_with_null_elements() -> None:
         [None, None, None],
         [1.0, 2.0, 3.0],
     ]
+
+
+def test_frame_selection_expression_keeps_large_index_windows_one_frame_wide() -> None:
+    """Six-digit time windows must not swallow the neighbouring picture.
+
+    ``%g`` prints six significant digits, so index 250001 at 25 fps collapsed to
+    ``between(t,10000,10000.1)`` -- a window covering indices 250000-250002. The
+    boundaries must carry round-trip precision instead (#730 review).
+    """
+    fps = 25.0
+    frame_indices = [250001, 250010]
+    expression = _frame_selection_expression(frame_indices, fps=fps)
+
+    windows = re.findall(r"between\(t\\,([^,\\]+)\\,([^)\\]+)\)", expression)
+    assert len(windows) == len(frame_indices)
+    for frame_index, (start, end) in zip(frame_indices, windows, strict=True):
+        start_time, end_time = float(start), float(end)
+        assert start_time < frame_index / fps < end_time
+        assert end_time - start_time == pytest.approx(1 / fps)

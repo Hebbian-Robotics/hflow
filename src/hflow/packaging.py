@@ -28,7 +28,7 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Generator, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
@@ -824,7 +824,7 @@ def _compile_cython_modules(
 
 
 @contextlib.contextmanager
-def _reproducible_build_environment() -> Iterator[None]:
+def _reproducible_build_environment() -> Generator[None, None, None]:
     """Keep compiler date/time macros stable without leaking process state."""
 
     previous_source_date_epoch = os.environ.get("SOURCE_DATE_EPOCH")
