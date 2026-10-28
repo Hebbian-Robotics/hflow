@@ -22,7 +22,6 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from functools import cached_property
-from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -117,9 +116,8 @@ def _decoded_frame_indices(framecrc_path: Path, *, source_fps: float) -> set[int
     """Recover remuxed source-frame positions from decoded PTS, not decoder output order.
 
     The remux is constant-rate and index-preserving, but damaged GOPs can leave
-    holes in its decoded PTS sequence. Use framecrc's *actual* time base and the
-    observed frame interval: the MP4's nominal frame rate need not equal the
-    source log's estimated rate.
+    holes in its decoded PTS sequence. The trace preserves timestamps at
+    microsecond precision, independently of the decoder's nominal frame rate.
     """
     time_base: Fraction | None = None
     timestamps: list[Fraction] = []
@@ -137,16 +135,7 @@ def _decoded_frame_indices(framecrc_path: Path, *, source_fps: float) -> set[int
         raise RuntimeError(f"Invalid decoded frame timestamps in {framecrc_path}") from error
     if not timestamps:
         raise RuntimeError(f"No decoded frame timestamps in {framecrc_path}")
-    intervals = sorted(
-        later - earlier for earlier, later in pairwise(timestamps) if later > earlier
-    )
-    interval = intervals[len(intervals) // 2] if intervals else 1 / Fraction(str(source_fps))
-    if intervals:
-        # Estimate missing frame slots from gaps, then use the full PTS span
-        # to avoid accumulating one-time-base-tick rounding drift on long videos.
-        slots = sum(max(1, round(delta / interval)) for delta in intervals)
-        interval = (timestamps[-1] - timestamps[0]) / slots
-    return {round(timestamp / interval) for timestamp in timestamps}
+    return {round(timestamp * Fraction(str(source_fps))) for timestamp in timestamps}
 
 
 def _message_field_names(message: Any) -> list[str]:
@@ -814,12 +803,16 @@ class Episode:
                     "[decoded]",
                     "-c:v",
                     "rawvideo",
+                    "-enc_time_base",
+                    "1:1000000",
                     "-fps_mode",
                     "passthrough",
                     "-f",
                     "framecrc",
-                    str(staging_dir / "decoded.framecrc"),
                 ]
+                if end_s is not None:
+                    command += ["-to", f"{end_s:.6f}"]
+                command.append(str(staging_dir / "decoded.framecrc"))
                 completed = subprocess.run(command, capture_output=True, text=True, check=False)
                 staged_frames = sorted(staging_dir.glob("frame_*.jpg"))
                 if completed.returncode != 0 or not staged_frames:

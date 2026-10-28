@@ -10,6 +10,20 @@ _NUMBERED_VIDEO_TOPIC = "/camera/cam0/video"
 _NUMBERED_VIDEO_START_NS = 1_760_000_000_000_000_000
 
 
+def test_sparse_decoded_timestamps_keep_original_source_positions(tmp_path: Path) -> None:
+    from hflow.episode import _decoded_frame_indices
+
+    decoded_trace = tmp_path / "decoded.framecrc"
+    decoded_trace.write_text(
+        "#tb 0: 1/1000000\n"
+        "0, 0, 0, 33333, 1, 0\n"
+        "0, 1000000, 1000000, 33333, 1, 0\n"
+        "0, 2000000, 2000000, 33333, 1, 0\n",
+        encoding="utf-8",
+    )
+    assert _decoded_frame_indices(decoded_trace, source_fps=30.0) == {0, 30, 60}
+
+
 @pytest.fixture(scope="module")
 def numbered_h264_episodes(tmp_path_factory: pytest.TempPathFactory) -> dict[int | None, Path]:
     """Canonical MP4 inputs with pixels identifying their original source index."""
@@ -116,6 +130,30 @@ def test_frames_label_the_pixels_that_were_sampled(
         named = _source_frame_number(frame.log_time_ns)
         shown = _number_in_frame(frame.path)
         assert abs(shown - named) <= 1, (fps, start_s, end_s, frame.path.name, named, shown)
+
+
+@pytest.mark.requires_system_ffmpeg
+def test_short_frame_request_bounds_decoded_trace(
+    numbered_h264_episodes: dict[int | None, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hflow import episode as episode_module
+
+    original_decoded_frame_indices = episode_module._decoded_frame_indices
+    decoded_source_indices: set[int] = set()
+
+    def capture_decoded_indices(framecrc_path: Path, *, source_fps: float) -> set[int]:
+        source_indices = original_decoded_frame_indices(framecrc_path, source_fps=source_fps)
+        decoded_source_indices.update(source_indices)
+        return source_indices
+
+    monkeypatch.setattr(episode_module, "_decoded_frame_indices", capture_decoded_indices)
+    with Episode(numbered_h264_episodes[None], workdir=tmp_path) as episode:
+        frames = episode.frames(_NUMBERED_VIDEO_TOPIC, fps=10.0, end_s=0.5)
+    assert len(frames) == 5
+    assert [_number_in_frame(frame.path) for frame in frames] == [0, 3, 6, 9, 12]
+    assert decoded_source_indices == set(range(15))
 
 
 @pytest.mark.requires_system_ffmpeg
