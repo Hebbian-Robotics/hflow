@@ -809,6 +809,99 @@ def test_window_times_are_count_anchored_not_boundary_filtered(
             Path("chunk.mp4"), start_seconds, end_seconds, frame_count, fps
         )
 
+    # At 15 fps, container quantization can put the previous episode's last
+    # frame just above the one-frame threshold. Both reported offsets must be
+    # excluded while the current episode's -0.0/0.0 start remains eligible.
+    fps = 15.0
+    frame_period = 1.0 / fps
+    start_seconds = 10.0
+    frame_count = 4
+    end_seconds = start_seconds + frame_count / fps
+    for previous_offset in (-0.066666, -0.066667):
+        packets = [
+            start_seconds - 2 * frame_period,
+            start_seconds + previous_offset,
+            start_seconds,
+            start_seconds + frame_period,
+            start_seconds + 2 * frame_period,
+            start_seconds + 3 * frame_period,
+            start_seconds + 4 * frame_period,
+        ]
+        monkeypatch.setattr(prep, "_get_video_pts_times", lambda _path, packets=packets: packets)
+        rebased = prep._relative_video_pts_times(
+            Path("chunk.mp4"), start_seconds, end_seconds, frame_count, fps
+        )
+        assert rebased == [time - start_seconds for time in packets[2:6]]
+
+    start_seconds = 0.0
+    end_seconds = frame_count / fps
+    packets = [
+        -2 * frame_period,
+        -0.066666,
+        -0.0,
+        frame_period,
+        2 * frame_period,
+        3 * frame_period,
+    ]
+    monkeypatch.setattr(prep, "_get_video_pts_times", lambda _path: packets)
+    rebased = prep._relative_video_pts_times(
+        Path("chunk.mp4"), start_seconds, end_seconds, frame_count, fps
+    )
+    assert rebased == [-0.0, frame_period, 2 * frame_period, 3 * frame_period]
+
+
+def test_short_video_window_error_identifies_episode_and_camera(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A truncated camera window identifies the episode and metadata bounds."""
+    camera_key = "observation.images.up"
+    info = two_camera_v3_info(frames_per_second=50)
+    dataset_source = prep.DatasetSource(repo_id="fake/repo", revision="abc", license="apache-2.0")
+    source_archive = _source_archive(
+        dataset_source,
+        tmp_path,
+        info=info,
+        episodes=tuple(
+            _single_camera_episode_row(
+                index,
+                camera_key=camera_key,
+                length=2,
+                data_from=0,
+                from_timestamp=370.0 if index == 37 else 0.0,
+                to_timestamp=380.0 if index == 37 else 0.04,
+            )
+            for index in range(38)
+        ),
+        video_keys=(camera_key,),
+    )
+    data_path = tmp_path / "data" / "chunk-000" / "file-000.parquet"
+    write_v3_data_parquet(
+        data_path, episode_lengths=[2], frames_per_second=50, timestamps_as_double=True
+    )
+    monkeypatch.setattr(
+        prep,
+        "_download_file",
+        lambda _repo, _rev, filename, _cache: (
+            data_path if filename.startswith("data/") else tmp_path / "truncated.mp4"
+        ),
+    )
+    monkeypatch.setattr(prep, "_transcode_mp4_to_h264", lambda *_args, **_kwargs: [b"frame"] * 2)
+    monkeypatch.setattr(prep, "_get_video_pts_times", lambda _path: [370.0])
+
+    with pytest.raises(
+        ValueError,
+        match=r"episode 37: camera observation\.images\.up video window 370\.0-380\.0s: video has 1 packets",
+    ):
+        prep._convert_single_episode(
+            source_archive=source_archive,
+            dataset_source=dataset_source,
+            storage=LocalStorageRoot(tmp_path / "output"),
+            episode_index=37,
+            camera_keys=(camera_key,),
+            numeric_schemas=_SIX_DIMENSION_NUMERIC_SCHEMAS,
+            frames_per_second=50,
+        )
+
 
 @pytest.mark.parametrize(
     "bad_fps",

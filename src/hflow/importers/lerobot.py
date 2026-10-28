@@ -445,17 +445,16 @@ def _relative_video_pts_times(
 ) -> list[float]:
     """Packet times of an episode window, rebased to the window start.
 
-    The window anchors on the left: the first ``frame_count`` packets at or
-    within one frame period of ``start_seconds`` are the episode's frames.
-    Container timestamps are quantized while the metadata window is exact,
-    so a half-open ``[start, end)`` filter over the raw times drags the next
-    episode's first frame in or drops this episode's last frame by one; the
-    data row count is the window's true extent on both edges, and the
-    per-frame timestamp check downstream still validates the alignment.
+    The window anchors on the left: the first ``frame_count`` packets no
+    earlier than half a frame period before ``start_seconds`` are the episode's
+    frames. Container timestamps are quantized while the metadata window is
+    exact, so a wider lower-bound tolerance can admit the previous episode's
+    last frame. The data row count is the window's true extent on both edges,
+    and the per-frame timestamp check downstream still validates the alignment.
     """
     frame_period = 1.0 / frames_per_second
     times = _get_video_pts_times(mp4_path)
-    windowed = [time for time in times if time >= start_seconds - frame_period]
+    windowed = [time for time in times if time >= start_seconds - frame_period / 2]
     if len(windowed) < frame_count:
         raise ValueError(
             f"video has {len(windowed)} packets at or after the window start "
@@ -1212,13 +1211,21 @@ def _convert_single_episode(
                 frame_count=frame_count,
                 seek_seconds=video_start_seconds,
             )
-            presentation_timestamps = _relative_video_pts_times(
-                local_video_path,
-                video_start_seconds,
-                video_end_seconds,
-                frame_count,
-                float(frames_per_second),
-            )
+            try:
+                presentation_timestamps = _relative_video_pts_times(
+                    local_video_path,
+                    video_start_seconds,
+                    video_end_seconds,
+                    frame_count,
+                    float(frames_per_second),
+                )
+            except ValueError as error:
+                if "packets at or after the window start" not in str(error):
+                    raise
+                raise ValueError(
+                    f"episode {episode_index}: camera {camera_key} video window "
+                    f"{video_start_seconds:.1f}-{video_end_seconds:.1f}s: {error}"
+                ) from error
         else:
             access_units = _transcode_mp4_to_h264(
                 local_video_path, IMPORT_GOP_SECONDS, float(frames_per_second)
