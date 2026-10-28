@@ -975,6 +975,8 @@ def verify_dataset_snapshot(
         format_marker = json.loads(marker_path.read_text())
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise ValueError(f"format.json is unreadable: {error}") from error
+    if not isinstance(format_marker, dict):
+        raise ValueError(f"format.json must be a JSON object, got {type(format_marker).__name__}")
 
     # Format identity gate (#472), sharing the exporter's predicate so the two
     # can never drift apart. Exit 0 then means "this is an HFlow snapshot and

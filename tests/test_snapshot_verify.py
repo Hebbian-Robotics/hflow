@@ -282,6 +282,30 @@ def test_present_non_object_integrity_is_refused_not_reported_as_pre_401(
     assert cli_main(["verify", "snapshot", str(output_directory)]) == 2
 
 
+@pytest.mark.parametrize(
+    "replacement",
+    [None, [], "not-a-marker", 1],
+    ids=["null", "array", "string", "number"],
+)
+def test_non_object_format_marker_is_refused_without_a_traceback(
+    tmp_path: Path,
+    exported_snapshot: ExportedSnapshotCopier,
+    replacement: object,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A valid JSON value still needs to be an object before field access."""
+    output_directory, _ = exported_snapshot(tmp_path, "references")
+    (output_directory / "format.json").write_text(json.dumps(replacement))
+
+    with pytest.raises(ValueError, match=r"format\.json must be a JSON object"):
+        verify_dataset_snapshot(output_directory)
+
+    assert cli_main(["verify", "snapshot", str(output_directory)]) == 2
+    captured = capsys.readouterr()
+    assert "verify snapshot: format.json must be a JSON object" in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_truncated_file_reports_size_mismatch_and_skips_the_hash(
     tmp_path: Path, exported_snapshot: ExportedSnapshotCopier, monkeypatch: pytest.MonkeyPatch
 ) -> None:
