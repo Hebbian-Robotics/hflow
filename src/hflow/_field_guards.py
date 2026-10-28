@@ -67,7 +67,11 @@ def require_int_in_range(value: object, name: str, *, minimum: int, maximum: int
 def require_finite_float(value: object, name: str) -> int | float:
     """Refuse anything but a finite int or float, excluding bool."""
     number = require_float(value, name)
-    if not math.isfinite(number):
+    try:
+        finite = math.isfinite(number)
+    except OverflowError:
+        raise ValueError(f"{name} must be finite, got {number}") from None
+    if not finite:
         raise ValueError(f"{name} must be finite, got {number}")
     return number
 
@@ -92,7 +96,11 @@ def require_non_negative_real(value: object, name: str) -> Real:
     """Preserve batching's finite, non-negative Real contract, excluding bool."""
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{name} must be a real number, got {type(value).__name__}")
-    if not math.isfinite(value):
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:
+        raise ValueError(f"{name} must be finite, got {value}") from None
+    if not finite:
         raise ValueError(f"{name} must be finite, got {value}")
     if value < 0:
         raise ValueError(f"{name} must be >= 0, got {value}")

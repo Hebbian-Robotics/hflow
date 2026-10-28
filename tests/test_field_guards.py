@@ -67,3 +67,17 @@ def test_numeric_guard_contract(
     ]:
         with pytest.raises(ValueError, match=r"^setting must be "):
             guard(value, "setting")
+
+
+def test_float_guards_reject_overflowing_int() -> None:
+    """Ints too large for float conversion raise field-named ValueError, not OverflowError."""
+    for guard in (require_finite_float, require_positive_float, require_non_negative_float):
+        with pytest.raises(ValueError, match=r"^setting must be finite"):
+            guard(10**400, "setting")
+
+
+def test_real_guard_rejects_overflowing_values() -> None:
+    """Values too large for float conversion raise field-named ValueError, not OverflowError."""
+    for value in (10**400, Fraction(10**400, 1)):
+        with pytest.raises(ValueError, match=r"^setting must be finite"):
+            require_non_negative_real(value, "setting")
