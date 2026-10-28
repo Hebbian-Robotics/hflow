@@ -134,6 +134,8 @@ def test_item_sizes_require_real_integers(size: Any, message: str) -> None:
         (-1.0, "stagger_interval_s must be >= 0, got -1.0"),
         (float("nan"), "stagger_interval_s must be finite, got nan"),
         (float("inf"), "stagger_interval_s must be finite, got inf"),
+        (10**400, "stagger_interval_s value is too large"),
+        (Fraction(10**400, 1), "stagger_interval_s value is too large"),
     ],
 )
 def test_stagger_interval_requires_a_finite_nonnegative_number(stagger: Any, message: str) -> None:

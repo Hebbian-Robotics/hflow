@@ -68,6 +68,10 @@ def test_pipeline_version_is_a_content_hash() -> None:
             r"^gop_seconds must be finite, got inf$",
         ),
         (
+            lambda: TransformConfig(gop_seconds=10**400),
+            r"^gop_seconds value is too large$",
+        ),
+        (
             lambda: TransformConfig(chunk_size_bytes=True),
             r"^chunk_size_bytes must be an int, got bool$",
         ),

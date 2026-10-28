@@ -20,6 +20,7 @@ Each guard returns the validated value with its refined type, without coercion.
 
 import math
 from numbers import Real
+from typing import SupportsFloat
 
 
 def require_int(value: object, name: str) -> int:
@@ -64,11 +65,19 @@ def require_int_in_range(value: object, name: str, *, minimum: int, maximum: int
     return number
 
 
+def _require_finite(value: SupportsFloat, name: str) -> None:
+    """Refuse inf, nan and too large values, Raise ValueError instead of OverflowError"""
+    try:
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be finite, got {value}")
+    except OverflowError:
+        raise ValueError(f"{name} value is too large") from None
+
+
 def require_finite_float(value: object, name: str) -> int | float:
     """Refuse anything but a finite int or float, excluding bool."""
     number = require_float(value, name)
-    if not math.isfinite(number):
-        raise ValueError(f"{name} must be finite, got {number}")
+    _require_finite(number, name)
     return number
 
 
@@ -92,8 +101,7 @@ def require_non_negative_real(value: object, name: str) -> Real:
     """Preserve batching's finite, non-negative Real contract, excluding bool."""
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{name} must be a real number, got {type(value).__name__}")
-    if not math.isfinite(value):
-        raise ValueError(f"{name} must be finite, got {value}")
+    _require_finite(value, name)
     if value < 0:
         raise ValueError(f"{name} must be >= 0, got {value}")
     return value
