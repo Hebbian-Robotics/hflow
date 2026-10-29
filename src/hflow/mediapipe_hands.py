@@ -429,7 +429,7 @@ def _validated_sampled_frames(
     *,
     source_frame_count: int,
     topic: str,
-    collected_frames: list[SampledRGBFrame],
+    collected_source_frame_indices: list[int],
 ) -> Iterator[SampledRGBFrame]:
     for sampled_frame in frames:
         if not 0 <= sampled_frame.source_frame_index < source_frame_count:
@@ -437,7 +437,7 @@ def _validated_sampled_frames(
                 f"decoded frame index {sampled_frame.source_frame_index} is outside "
                 f"camera {topic!r}'s {source_frame_count} source messages"
             )
-        collected_frames.append(sampled_frame)
+        collected_source_frame_indices.append(sampled_frame.source_frame_index)
         yield sampled_frame
 
 
@@ -498,13 +498,13 @@ def _measure_mediapipe_hands(
             long_edge_pixels=inference_long_edge_pixels,
             source_fps=1.0 / median_interval_s,
         ) as frames:
-            sampled_frames: list[SampledRGBFrame] = []
+            sampled_source_frame_indices: list[int] = []
             detections = detect_hands_in_frames(
                 _validated_sampled_frames(
                     frames,
                     source_frame_count=len(stamps_ns),
                     topic=topic,
-                    collected_frames=sampled_frames,
+                    collected_source_frame_indices=sampled_source_frame_indices,
                 ),
                 sample_fps=sample_fps,
                 minimum_hand_detection_confidence=minimum_hand_detection_confidence,
@@ -536,7 +536,7 @@ def _measure_mediapipe_hands(
                 f"{topic}/hand_model_digest": _resolved_hand_model_digest(),
             }
         )
-        log_times_ns = [int(stamps_ns[frame.source_frame_index]) for frame in sampled_frames]
+        log_times_ns = [int(stamps_ns[index]) for index in sampled_source_frame_indices]
         intervals.extend(
             _no_detection_intervals(log_times_ns, detections, f"no_hand_detected:{topic}")
         )

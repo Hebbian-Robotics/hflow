@@ -3,7 +3,6 @@
 import hashlib
 import json
 import subprocess
-import tempfile
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -111,35 +110,95 @@ def _probe_frame_rate(video: Path, toolchain: VideoMeasurementToolchain) -> floa
     return float(rate)
 
 
-def _decoded_frame_hashes(
-    frame_md5_path: Path, *, source_fps: float
-) -> tuple[list[int], dict[int, set[str]]]:
-    """Associate each decoded RGB frame digest with its original CFR position."""
-    time_base: Fraction | None = None
-    frames: list[tuple[Fraction, str]] = []
-    try:
-        with frame_md5_path.open(encoding="utf-8") as source:
-            for line in source:
-                if line.startswith("#tb 0:"):
-                    time_base = Fraction(line.partition(":")[2].strip())
-                elif not line.startswith("#") and line.strip():
-                    fields = line.split(",")
-                    if time_base is None or len(fields) < 6 or fields[0].strip() != "0":
-                        raise ValueError("invalid frame hash record")
-                    frames.append((int(fields[2].strip()) * time_base, fields[5].strip()))
-    except (OSError, ValueError, ZeroDivisionError) as error:
-        raise RawFrameError(
-            f"Invalid decoded frame hash trace at {frame_md5_path}: {error}"
-        ) from error
-    if not frames:
-        raise RawFrameError(f"No decoded frame timestamps in {frame_md5_path}")
+def _sample_source_frame_index(sample_index: int, source_fps: float, sample_fps: float) -> int:
+    """Map an output tick to the source frame visible at that tick."""
+    return int(sample_index * source_fps / sample_fps + 1e-6)
 
-    origin = frames[0][0]
-    indices = [round((timestamp - origin) * Fraction(str(source_fps))) for timestamp, _ in frames]
+
+def _decoded_frame_hashes(
+    video: Path,
+    *,
+    toolchain: VideoMeasurementToolchain,
+    filter_graph: str,
+    source_fps: float,
+    sample_fps: float | None,
+) -> tuple[list[int], dict[int, set[str]]]:
+    """Trace decoded RGB digests without writing frame data or a sidecar file."""
+    command = [
+        str(toolchain.ffmpeg_executable),
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-noautorotate",
+        "-i",
+        str(video),
+        "-map",
+        "0:v:0",
+        "-vf",
+        filter_graph,
+        "-c:v",
+        "rawvideo",
+        "-enc_time_base",
+        "1:1000000",
+        "-hash",
+        "sha256",
+        "-fps_mode",
+        "passthrough",
+        "-f",
+        "framemd5",
+        "-",
+    ]
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+    )
+    time_base: Fraction | None = None
+    origin: Fraction | None = None
+    decoded_indices: list[int] = []
     hashes: dict[int, set[str]] = {}
-    for source_index, (_, digest) in zip(indices, frames, strict=True):
-        hashes.setdefault(source_index, set()).add(digest)
-    return indices, hashes
+    try:
+        if process.stdout is None:
+            raise RawFrameError(f"ffmpeg did not provide a frame hash stream for {video}")
+        for line in process.stdout:
+            if line.startswith("#tb 0:"):
+                time_base = Fraction(line.partition(":")[2].strip())
+            elif not line.startswith("#") and line.strip():
+                fields = line.split(",")
+                if time_base is None or len(fields) < 6 or fields[0].strip() != "0":
+                    raise ValueError("invalid frame hash record")
+                timestamp = int(fields[2].strip()) * time_base
+                if origin is None:
+                    origin = timestamp
+                source_index = round((timestamp - origin) * Fraction(str(source_fps)))
+                digest = fields[5].strip()
+                if sample_fps is None:
+                    decoded_indices.append(source_index)
+                elif sample_fps >= source_fps:
+                    hashes.setdefault(source_index, set()).add(digest)
+                else:
+                    center = int(source_index * sample_fps / source_fps)
+                    for sample_index in range(max(0, center - 1), center + 2):
+                        if (
+                            _sample_source_frame_index(sample_index, source_fps, sample_fps)
+                            == source_index
+                        ):
+                            hashes.setdefault(source_index, set()).add(digest)
+    except (OSError, ValueError, ZeroDivisionError) as error:
+        if process.poll() is None:
+            process.terminate()
+        raise RawFrameError(f"Invalid decoded frame hash trace for {video}: {error}") from error
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.poll() is None:
+            process.terminate()
+        return_code = process.wait()
+
+    if return_code != 0:
+        raise RawFrameError(f"ffmpeg failed to trace decoded frames for {video}")
+    if origin is None:
+        raise RawFrameError(f"No decoded frame timestamps for {video}")
+    return decoded_indices, hashes
 
 
 def _scaled_frame_shape(
@@ -250,12 +309,12 @@ def rgb_frames(
 ) -> Generator[Iterator[SampledRGBFrame], None, None]:
     """Yield sampled RGB frames with their original sample and source positions.
 
-    The input video is decoded once. A parallel FFmpeg output records a SHA-256
-    for each decoded RGB picture. Sampled pixels are spooled to a temporary
-    file until that trace is complete; comparing the pixels with it filters
-    out frames the ``fps`` filter repeated to fill decoder gaps. The spool is
-    disk-backed to keep memory bounded. ``sample_index`` preserves the
-    original tick so callers can keep labels aligned when a tick is omitted.
+    A first decode records picture digests for the source frames requested by
+    the sampling ticks. A second, streaming decode emits candidate samples;
+    comparing their digests filters out frames the ``fps`` filter repeated to
+    fill decoder gaps. No full-video pixel buffer or temporary file is needed.
+    ``sample_index`` preserves the original tick so callers can keep labels
+    aligned when a tick is omitted.
     """
     if frames_per_second is not None and frames_per_second <= 0:
         raise ValueError(f"frames_per_second must be positive, got {frames_per_second}")
@@ -276,97 +335,55 @@ def rgb_frames(
         sampled_filters.append(resize_filter)
     decoded_filters.append("format=pix_fmts=rgb24")
     sampled_filters.append("format=pix_fmts=rgb24")
-    filter_graph = (
-        f"[0:v]split=2[decoded][candidate];"
-        f"[decoded]{','.join(decoded_filters)}[decoded_rgb];"
-        f"[candidate]{','.join(sampled_filters)}[sampled]"
-    )
+    decoded_filter_graph = ",".join(decoded_filters)
+    sampled_filter_graph = ",".join(sampled_filters)
     frame_shape = (frame_height, frame_width, 3)
-    frame_byte_count = int(np.prod(frame_shape))
-    with tempfile.TemporaryDirectory(prefix="hflow-rgb-frames-") as directory:
-        sample_path = Path(directory) / "sampled.rgb"
-        frame_md5_path = Path(directory) / "decoded.framemd5"
-        command = [
-            str(toolchain.ffmpeg_executable),
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-noautorotate",
-            "-i",
-            str(video),
-            "-filter_complex",
-            filter_graph,
-            "-map",
-            "[sampled]",
-            "-fps_mode",
-            "passthrough",
-            "-f",
-            "rawvideo",
-            str(sample_path),
-            "-map",
-            "[decoded_rgb]",
-            "-c:v",
-            "rawvideo",
-            "-enc_time_base",
-            "1:1000000",
-            "-hash",
-            "sha256",
-            "-fps_mode",
-            "passthrough",
-            "-f",
-            "framemd5",
-            str(frame_md5_path),
-        ]
-        completed_process = subprocess.run(command, capture_output=True, text=True, check=False)
-        if completed_process.returncode != 0:
-            raise RawFrameError(
-                f"ffmpeg failed to sample {video} (exit {completed_process.returncode}): "
-                f"{completed_process.stderr.strip()}"
-            )
-        if not sample_path.is_file() or sample_path.stat().st_size % frame_byte_count:
-            raise RawFrameError(f"ffmpeg produced incomplete RGB frames for {video}")
+    decoded_indices, decoded_hashes = _decoded_frame_hashes(
+        video,
+        toolchain=toolchain,
+        filter_graph=decoded_filter_graph,
+        source_fps=source_fps,
+        sample_fps=frames_per_second,
+    )
 
-        decoded_indices, decoded_hashes = _decoded_frame_hashes(
-            frame_md5_path, source_fps=source_fps
-        )
-        sample_count = sample_path.stat().st_size // frame_byte_count
+    with _raw_frame_stream(
+        video,
+        toolchain=toolchain,
+        filter_graph=sampled_filter_graph,
+        frame_shape=frame_shape,
+    ) as candidate_frames:
 
         def read_frames() -> Iterator[SampledRGBFrame]:
-            with sample_path.open("rb") as source:
-                if frames_per_second is None:
-                    if sample_count != len(decoded_indices):
-                        raise RawFrameError(
-                            f"ffmpeg produced {sample_count} RGB frames but recorded "
-                            f"{len(decoded_indices)} decoded frame timestamps for {video}"
-                        )
-                    sample_positions = enumerate(decoded_indices)
-                    for sample_index, source_frame_index in sample_positions:
-                        frame_payload = source.read(frame_byte_count)
-                        if hashlib.sha256(frame_payload).hexdigest() not in decoded_hashes.get(
-                            source_frame_index, set()
-                        ):
-                            raise RawFrameError(f"decoded RGB frame order changed for {video}")
-                        yield SampledRGBFrame(
-                            sample_index=sample_index,
-                            source_frame_index=source_frame_index,
-                            pixels=np.frombuffer(frame_payload, dtype=np.uint8).reshape(
-                                frame_shape
-                            ),
-                        )
-                    return
-
-                for sample_index in range(sample_count):
-                    frame_payload = source.read(frame_byte_count)
-                    source_frame_index = int(sample_index * source_fps / frames_per_second + 1e-6)
-                    if hashlib.sha256(frame_payload).hexdigest() not in decoded_hashes.get(
-                        source_frame_index, set()
-                    ):
-                        continue
+            if frames_per_second is None:
+                sample_count = 0
+                for sample_index, pixels in enumerate(candidate_frames):
+                    if sample_index >= len(decoded_indices):
+                        raise RawFrameError(f"ffmpeg produced extra RGB frames for {video}")
+                    sample_count += 1
                     yield SampledRGBFrame(
                         sample_index=sample_index,
-                        source_frame_index=source_frame_index,
-                        pixels=np.frombuffer(frame_payload, dtype=np.uint8).reshape(frame_shape),
+                        source_frame_index=decoded_indices[sample_index],
+                        pixels=pixels,
                     )
+                if len(decoded_indices) != sample_count:
+                    raise RawFrameError(
+                        f"ffmpeg produced {sample_count} RGB frames but recorded "
+                        f"{len(decoded_indices)} decoded frame timestamps for {video}"
+                    )
+                return
+
+            for sample_index, pixels in enumerate(candidate_frames):
+                source_frame_index = _sample_source_frame_index(
+                    sample_index, source_fps, frames_per_second
+                )
+                if hashlib.sha256(memoryview(pixels)).hexdigest() not in decoded_hashes.get(
+                    source_frame_index, set()
+                ):
+                    continue
+                yield SampledRGBFrame(
+                    sample_index=sample_index,
+                    source_frame_index=source_frame_index,
+                    pixels=pixels,
+                )
 
         yield read_frames()
