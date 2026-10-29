@@ -968,6 +968,7 @@ def verify_dataset_snapshot(
 
     if not resolved_directory.is_dir():
         raise NotADirectoryError(f"snapshot directory does not exist: {resolved_directory}")
+    resolved_snapshot_root = resolved_directory.resolve()
     marker_path = resolved_directory / "format.json"
     if not marker_path.is_file():
         raise FileNotFoundError(f"no format.json in {resolved_directory}; not a dataset snapshot")
@@ -1065,6 +1066,18 @@ def verify_dataset_snapshot(
                 "no Windows drive letter); refused before any file read"
             ) from error
         delivered_path = resolved_directory / relative_path
+        try:
+            resolved_delivered_path = delivered_path.resolve()
+        except (OSError, RuntimeError) as error:
+            raise ValueError(
+                f"format.json integrity receipt path {relative_path!r} cannot be resolved "
+                "inside the handed snapshot directory"
+            ) from error
+        if not resolved_delivered_path.is_relative_to(resolved_snapshot_root):
+            raise ValueError(
+                f"format.json integrity receipt path {relative_path!r} must resolve "
+                "under the handed snapshot directory; refused before any file read"
+            )
         if not delivered_path.is_file():
             findings.append(
                 VerificationFinding(
