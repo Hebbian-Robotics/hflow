@@ -40,6 +40,12 @@ its `format.json` identifies a supported HFlow dataset snapshot, and only
 after the new export has been staged completely. Unmarked directories and
 snapshots with unknown format versions are never removed.
 
+If an exception or cancellation such as Ctrl-C interrupts activation before
+the replacement is live, the previous snapshot is restored at its original
+path. Once the replacement is live, it stays in place even if an interruption
+follows; the previous snapshot may remain in a hidden `.previous-*` directory.
+Abrupt termination such as SIGKILL or power loss cannot run this rollback.
+
 The observable result is:
 
 ```text
