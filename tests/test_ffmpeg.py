@@ -646,7 +646,7 @@ def test_raw_frames_stream_every_frame_at_the_coded_size(
     needs and what ``Episode.frames()`` deliberately does not give.
     """
     with frame_reader(black_tail_video, toolchain=resolved_video_measurement_toolchain()) as frames:
-        shapes = [frame.shape for frame in frames]
+        shapes = [getattr(frame, "pixels", frame).shape for frame in frames]
     assert len(shapes) == 60
     assert set(shapes) == {expected_shape}
 
@@ -765,7 +765,7 @@ def test_rgb_frames_resamples_and_resizes_in_one_decode(black_tail_video: Path) 
         frames_per_second=1.0,
         long_edge_pixels=80,
     ) as frames:
-        shapes = [frame.shape for frame in frames]
+        shapes = [frame.pixels.shape for frame in frames]
     # 6 seconds at 10 fps sampled to 1 fps, and 160x120 scaled to an 80 long edge.
     assert len(shapes) == 6
     assert set(shapes) == {(60, 80, 3)}
@@ -777,8 +777,8 @@ def test_rgb_frames_are_contiguous_uint8(black_tail_video: Path) -> None:
     """
     with rgb_frames(black_tail_video, toolchain=resolved_video_measurement_toolchain()) as frames:
         frame = next(iter(frames))
-    assert frame.dtype == np.uint8
-    assert frame.flags["C_CONTIGUOUS"]
+    assert frame.pixels.dtype == np.uint8
+    assert frame.pixels.flags["C_CONTIGUOUS"]
 
 
 def test_rgb_frames_reject_a_non_positive_rate(black_tail_video: Path) -> None:
@@ -862,10 +862,13 @@ def test_rgb_frames_sampling_aligns_with_output_ticks(
         toolchain=resolved_video_measurement_toolchain(),
         frames_per_second=sample_fps,
     ) as frames:
-        shown = [read_frame_index(f) for f in frames]
+        samples = list(frames)
+        shown = [read_frame_index(sample.pixels) for sample in samples]
 
     expected = [int(i * 30 / sample_fps) for i in range(int(3 * sample_fps))]
     assert shown == expected
+    assert [sample.sample_index for sample in samples] == list(range(len(expected)))
+    assert [sample.source_frame_index for sample in samples] == expected
 
 
 @pytest.mark.parametrize(
