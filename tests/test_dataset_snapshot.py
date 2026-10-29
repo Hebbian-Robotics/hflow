@@ -557,9 +557,9 @@ def test_snapshot_overwrite_keeps_a_valid_delivery_when_activation_is_interrupte
     if activated:
         assert len(backups) == 1
         previous = backups[0]
-        assert duckdb.read_parquet(str(destination / "samples.parquet")).count("*").fetchone() == (
-            2,
-        )
+        assert duckdb.read_parquet(str(destination / "samples.parquet")).count("*").fetchall() == [
+            (2,)
+        ]
     else:
         assert not backups
         previous = destination
