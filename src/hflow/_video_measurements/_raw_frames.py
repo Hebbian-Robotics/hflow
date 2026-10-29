@@ -156,6 +156,7 @@ def _decoded_frame_hashes(
     origin: Fraction | None = None
     decoded_indices: list[int] = []
     hashes: dict[int, set[str]] = {}
+    reached_end_of_stream = False
     try:
         if process.stdout is None:
             raise RawFrameError(f"ffmpeg did not provide a frame hash stream for {video}")
@@ -183,6 +184,7 @@ def _decoded_frame_hashes(
                             == source_index
                         ):
                             hashes.setdefault(source_index, set()).add(digest)
+        reached_end_of_stream = True
     except (OSError, ValueError, ZeroDivisionError) as error:
         if process.poll() is None:
             process.terminate()
@@ -190,7 +192,7 @@ def _decoded_frame_hashes(
     finally:
         if process.stdout is not None:
             process.stdout.close()
-        if process.poll() is None:
+        if not reached_end_of_stream and process.poll() is None:
             process.terminate()
         return_code = process.wait()
 

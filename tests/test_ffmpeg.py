@@ -7,6 +7,7 @@ mutation. Remote availability and real-download tests are opt-in via
 """
 
 import hashlib
+import io
 import logging
 import os
 import platform
@@ -15,7 +16,8 @@ import subprocess
 import tarfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import httpx2
 import numpy as np
@@ -48,6 +50,7 @@ from hflow._video_measurements._frame_statistics import (
 )
 from hflow._video_measurements._raw_frames import (
     RawFrameError,
+    _decoded_frame_hashes,
     _scaled_frame_shape,
     luma_frames,
     rgb_frames,
@@ -83,6 +86,45 @@ from hflow.ffmpeg._contact_sheet import (
     _find_usable_font_file,
     contact_sheet,
 )
+
+
+def test_rgb_frame_hash_trace_waits_after_successful_eof(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FinishedAfterEofProcess:
+        def __init__(self) -> None:
+            self.stdout = io.StringIO("#tb 0: 1/1000000\n0, 1, 0, 1, 1, digest\n")
+            self.returncode: int | None = None
+            self.terminated = False
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = -15
+
+        def wait(self) -> int:
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+    process = FinishedAfterEofProcess()
+    monkeypatch.setattr(
+        "hflow._video_measurements._raw_frames.subprocess.Popen",
+        lambda *args, **kwargs: process,
+    )
+    toolchain = cast(VideoMeasurementToolchain, SimpleNamespace(ffmpeg_executable=Path("ffmpeg")))
+
+    decoded_indices, hashes = _decoded_frame_hashes(
+        Path("video.mp4"),
+        toolchain=toolchain,
+        filter_graph="format=pix_fmts=rgb24",
+        source_fps=30.0,
+        sample_fps=30.0,
+    )
+
+    assert decoded_indices == []
+    assert hashes == {0: {"digest"}}
+    assert not process.terminated
 
 
 def _measure_frame_statistics(
