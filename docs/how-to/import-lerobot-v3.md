@@ -111,7 +111,8 @@ uv run hflow import lerobot \
   --output-dir ./data/lerobot_svla
 ```
 
-Omit `--episode-index` to import every episode. Each selected camera becomes
+Omit `--episode-index` to import every episode, or repeat it to import several
+(`--episode-index 0 --episode-index 3`). Each selected camera becomes
 one `foxglove.CompressedVideo` channel; state and action become ROS 2 CDR
 channels named `/observation.state` and `/action`.
 

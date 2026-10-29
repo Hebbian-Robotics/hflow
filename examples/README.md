@@ -451,7 +451,7 @@ uv run hflow import lerobot \
 Repeat `--camera` for each selected camera; each becomes its own
 `foxglove.CompressedVideo` channel. A comma-separated `--camera-key` remains
 accepted by the compatibility wrapper. Omit `--episode-index` to import every
-episode.
+episode, or repeat it to import several.
 
 Output: one canonical MCAP per episode at
 `./data/<corpus>/landing/lerobot_episode_0001.mcap`, a
