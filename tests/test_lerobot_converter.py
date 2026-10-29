@@ -461,6 +461,25 @@ def test_import_refuses_invalid_arguments_before_network(tmp_path: Path) -> None
         prep.import_lerobot_dataset(
             dataset_repo="lerobot/pusht", episode_index=-1, output_dir=tmp_path
         )
+    with pytest.raises(ValueError, match="episode_index must be zero or greater"):
+        prep.import_lerobot_dataset(
+            dataset_repo="lerobot/pusht", episode_index=[0, -1], output_dir=tmp_path
+        )
+    for not_an_index in (1.5, "0"):
+        with pytest.raises(ValueError, match="episode_index must be zero or greater"):
+            prep.import_lerobot_dataset(
+                dataset_repo="lerobot/pusht",
+                episode_index=not_an_index,  # ty: ignore[invalid-argument-type]
+                output_dir=tmp_path,
+            )
+    with pytest.raises(ValueError, match="episode_index must not contain duplicates"):
+        prep.import_lerobot_dataset(
+            dataset_repo="lerobot/pusht", episode_index=[3, 3], output_dir=tmp_path
+        )
+    with pytest.raises(ValueError, match="episode_index must name at least one"):
+        prep.import_lerobot_dataset(
+            dataset_repo="lerobot/pusht", episode_index=[], output_dir=tmp_path
+        )
     with pytest.raises(ValueError, match="camera_keys must name at least one"):
         prep.import_lerobot_dataset(
             dataset_repo="lerobot/pusht", camera_keys=(), output_dir=tmp_path
@@ -2211,3 +2230,60 @@ def test_transcode_mp4_to_h264_preserves_aud_and_annex_b_structure(tmp_path: Pat
         assert len(parsed) == 1
         assert parsed[0].data == unit
         assert unit.startswith(b"\x00\x00\x00\x01\x09") or unit.startswith(b"\x00\x00\x01\x09")
+
+
+def test_import_converts_every_requested_episode_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_dir = tmp_path / "out"
+    camera_keys = (prep.DEFAULT_CAMERA_KEY,)
+    convert_calls: list[int] = []
+
+    def convert(
+        *,
+        source_archive: object,
+        dataset_source: prep.DatasetSource,
+        storage: StorageRoot,
+        episode_index: int,
+        camera_keys: tuple[str, ...],
+        numeric_schemas: object,
+        frames_per_second: object,
+    ) -> prep._PublishedEpisode:
+        del source_archive, numeric_schemas, frames_per_second
+        convert_calls.append(episode_index)
+        staged = tmp_path / f"staged-{episode_index}.mcap"
+        _write_identity_matching_landing_mcap(
+            staged,
+            dataset_source=dataset_source,
+            episode_index=episode_index,
+            camera_keys=camera_keys,
+            marker=f"episode-{episode_index}-bytes",
+        )
+        return publish_staged_episode(storage, staged, episode_index)
+
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc")
+    monkeypatch.setattr(prep, "_ensure_source_archive", _ensure_two_episode_archive)
+    monkeypatch.setattr(prep, "_convert_single_episode", convert)
+
+    episode_uris = prep.import_lerobot_dataset(
+        dataset_repo="fake/repo",
+        revision="main",
+        output_dir=output_dir,
+        episode_index=[1, 0],
+        camera_keys=camera_keys,
+    )
+
+    assert convert_calls == [1, 0]
+    assert [Path(uri).name for uri in episode_uris] == [
+        "lerobot_episode_0002.mcap",
+        "lerobot_episode_0001.mcap",
+    ]
+
+    with pytest.raises(ValueError, match="episode_index 2 is out of range for 2 episode"):
+        prep.import_lerobot_dataset(
+            dataset_repo="fake/repo",
+            revision="main",
+            output_dir=output_dir,
+            episode_index=[0, 2],
+            camera_keys=camera_keys,
+        )

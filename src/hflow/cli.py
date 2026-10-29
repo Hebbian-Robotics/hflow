@@ -245,7 +245,7 @@ def _command_import_lerobot(
     revision: str,
     output_dir: str,
     camera_keys: list[str] | None,
-    episode_index: int | None,
+    episode_indexes: list[int] | None,
 ) -> int:
     from hflow.importers.lerobot import DEFAULT_CAMERA_KEY, import_lerobot_dataset
 
@@ -268,7 +268,7 @@ def _command_import_lerobot(
             dataset_repo=repo,
             revision=revision,
             output_dir=output_dir,
-            episode_index=episode_index,
+            episode_index=episode_indexes or None,
             camera_keys=resolved_camera_keys,
         )
     except (ValueError, RuntimeError, OSError, ModuleNotFoundError) as error:
@@ -1234,13 +1234,16 @@ def _register_import_group(app: typer.Typer, result_holder: list[int]) -> None:
                 "observation.image; comma-separated values are also accepted)"
             ),
         ),
-        episode_index: int | None = typer.Option(
+        episode_indexes: list[int] | None = typer.Option(
             None,
             "--episode-index",
-            help="zero-based episode index to import (default: every episode)",
+            help=(
+                "zero-based episode index to import; repeat for multiple episodes "
+                "(default: every episode)"
+            ),
         ),
     ) -> int:
-        code = _command_import_lerobot(repo, revision, output_dir, camera_keys, episode_index)
+        code = _command_import_lerobot(repo, revision, output_dir, camera_keys, episode_indexes)
         result_holder.append(code)
         return code
 
