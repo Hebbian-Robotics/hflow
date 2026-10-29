@@ -713,6 +713,19 @@ def test_receipt_path_escaping_the_handed_directory_is_refused(tmp_path: Path) -
         assert cli_main(["verify", "snapshot", str(snap)]) == 2
 
 
+def test_receipted_symlink_resolving_outside_snapshot_is_refused(tmp_path: Path) -> None:
+    snapshot, marker = _export_two_episode_snapshot(tmp_path, "references")
+    relative_path = marker["integrity"]["tables"]["samples"]["path"]
+    table_path = snapshot / relative_path
+    outside_path = snapshot.parent / "external-samples.parquet"
+    shutil.move(table_path, outside_path)
+    table_path.symlink_to(outside_path)
+
+    with pytest.raises(ValueError, match="must resolve under the handed snapshot directory"):
+        verify_dataset_snapshot(snapshot)
+    assert cli_main(["verify", "snapshot", str(snapshot)]) == 2
+
+
 def test_normalized_parent_escape_through_an_existing_subdir_is_refused(
     tmp_path: Path,
 ) -> None:
