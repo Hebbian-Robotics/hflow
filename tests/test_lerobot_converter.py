@@ -465,6 +465,13 @@ def test_import_refuses_invalid_arguments_before_network(tmp_path: Path) -> None
         prep.import_lerobot_dataset(
             dataset_repo="lerobot/pusht", episode_index=[0, -1], output_dir=tmp_path
         )
+    for not_an_index in (1.5, "0"):
+        with pytest.raises(ValueError, match="episode_index must be zero or greater"):
+            prep.import_lerobot_dataset(
+                dataset_repo="lerobot/pusht",
+                episode_index=not_an_index,  # ty: ignore[invalid-argument-type]
+                output_dir=tmp_path,
+            )
     with pytest.raises(ValueError, match="episode_index must not contain duplicates"):
         prep.import_lerobot_dataset(
             dataset_repo="lerobot/pusht", episode_index=[3, 3], output_dir=tmp_path

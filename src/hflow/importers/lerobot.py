@@ -948,9 +948,12 @@ def import_lerobot_dataset(
         raise ValueError("revision must not be empty")
     requested_episode_indexes: tuple[int, ...] | None = None
     if episode_index is not None:
-        requested_episode_indexes = (
-            (episode_index,) if isinstance(episode_index, int) else tuple(episode_index)
-        )
+        if isinstance(episode_index, int):
+            requested_episode_indexes = (episode_index,)
+        elif isinstance(episode_index, Sequence) and not isinstance(episode_index, str):
+            requested_episode_indexes = tuple(episode_index)
+        else:
+            raise ValueError("episode_index must be zero or greater")
         if not requested_episode_indexes:
             raise ValueError("episode_index must name at least one episode")
         for requested_index in requested_episode_indexes:
