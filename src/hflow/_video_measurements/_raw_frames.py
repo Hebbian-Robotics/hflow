@@ -326,11 +326,13 @@ def rgb_frames(
         source_fps = _probe_frame_rate(video, toolchain)
     if source_fps <= 0:
         raise ValueError(f"source_fps must be positive, got {source_fps}")
+    sample_rate = f"{frames_per_second:g}" if frames_per_second is not None else None
+    effective_sample_fps = float(sample_rate) if sample_rate is not None else None
 
     decoded_filters: list[str] = []
     sampled_filters: list[str] = []
-    if frames_per_second is not None:
-        sampled_filters.append(f"fps={frames_per_second:g}:round=up")
+    if sample_rate is not None:
+        sampled_filters.append(f"fps={sample_rate}:round=up")
     if long_edge_pixels is not None:
         resize_filter = f"scale={frame_width}:{frame_height}:flags=bilinear"
         decoded_filters.append(resize_filter)
@@ -345,7 +347,7 @@ def rgb_frames(
         toolchain=toolchain,
         filter_graph=decoded_filter_graph,
         source_fps=source_fps,
-        sample_fps=frames_per_second,
+        sample_fps=effective_sample_fps,
     )
 
     with _raw_frame_stream(
@@ -356,7 +358,7 @@ def rgb_frames(
     ) as candidate_frames:
 
         def read_frames() -> Iterator[SampledRGBFrame]:
-            if frames_per_second is None:
+            if effective_sample_fps is None:
                 sample_count = 0
                 for sample_index, pixels in enumerate(candidate_frames):
                     if sample_index >= len(decoded_indices):
@@ -376,7 +378,7 @@ def rgb_frames(
 
             for sample_index, pixels in enumerate(candidate_frames):
                 source_frame_index = _sample_source_frame_index(
-                    sample_index, source_fps, frames_per_second
+                    sample_index, source_fps, effective_sample_fps
                 )
                 if hashlib.sha256(memoryview(pixels)).hexdigest() not in decoded_hashes.get(
                     source_frame_index, set()

@@ -879,7 +879,7 @@ def numbered_30fps_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return video_path
 
 
-@pytest.mark.parametrize("sample_fps", [1.0, 3.0, 4.0, 10.0, 30.0])
+@pytest.mark.parametrize("sample_fps", [1.0, 3.0, 3.0000049, 4.0, 10.0, 30.0])
 def test_rgb_frames_sampling_aligns_with_output_ticks(
     numbered_30fps_video: Path, sample_fps: float
 ) -> None:
@@ -907,7 +907,8 @@ def test_rgb_frames_sampling_aligns_with_output_ticks(
         samples = list(frames)
         shown = [read_frame_index(sample.pixels) for sample in samples]
 
-    expected = [int(i * 30 / sample_fps) for i in range(int(3 * sample_fps))]
+    effective_sample_fps = float(f"{sample_fps:g}")
+    expected = [int(i * 30 / effective_sample_fps) for i in range(int(3 * effective_sample_fps))]
     assert shown == expected
     assert [sample.sample_index for sample in samples] == list(range(len(expected)))
     assert [sample.source_frame_index for sample in samples] == expected
