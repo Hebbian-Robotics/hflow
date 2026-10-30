@@ -1423,7 +1423,17 @@ class App:
             superseded_keys = sorted(set(run.result.measurements) & pipeline_measurement_keys)
             if not superseded_keys:
                 continue
-            run.outcome = NotRun(SupersededByPipeline(superseded_keys=tuple(superseded_keys)))
+            # The default already ran and computed its measurements. Dropping
+            # the superseded keys avoids a duplicate-key collision with the
+            # pipeline step that already measured them, while keeping the
+            # check recorded as MEASURED so its remaining evidence survives.
+            superseded_set = set(superseded_keys)
+            run.result.measurements = {
+                key: value
+                for key, value in run.result.measurements.items()
+                if key not in superseded_set
+            }
+            run.result.tags.extend(f"superseded:{key}" for key in superseded_keys)
 
     def _canonical_integrity_verdict(self, canonical_path: Path) -> "tuple[bool, str | None]":
         """The check lane's front-door verdict for one canonical file.

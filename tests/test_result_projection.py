@@ -8,7 +8,13 @@ import pytest
 
 import hflow
 from hflow.evidence import CameraQualityEvidence
-from hflow.results import CheckSelection, MeasuredCheck, ResultProjection, project_results
+from hflow.results import (
+    CheckSelection,
+    MeasuredCheck,
+    ResultProjection,
+    UnavailableCheck,
+    project_results,
+)
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
 
@@ -64,10 +70,72 @@ def test_result_projection_preserves_verdicts_without_disclosing_internal_detail
         projection.to_json(maximum_bytes=len(encoded) - 1)
     with pytest.raises(KeyError):
         project_results(report, (CheckSelection("unknown", "quality", {}),))
-    with pytest.raises(KeyError):
-        project_results(
-            report, (CheckSelection("private_measurement", "quality", {"score": "missing"}),)
-        )
+    projection = project_results(
+        report, (CheckSelection("private_measurement", "quality", {"score": "missing"}),)
+    )
+    match projection.checks[0]:
+        case MeasuredCheck():
+            raise AssertionError("expected superseded, got measured")
+        case UnavailableCheck(status="superseded"):
+            pass
+
+
+def test_project_results_handles_superseded_default_without_keyerror(
+    tmp_path: Path,
+) -> None:
+    """A default check runs in full, then a later user step with ``requires``
+    overlaps one of its keys. ``_yield_defaults_superseded_by_the_pipeline``
+    filters the overlapping key post-execution; project_results reports
+    ``superseded`` for the filtered key instead of raising KeyError, and
+    ``measured`` for the keys that survive.
+    """
+    source = synthesize_episode(
+        tmp_path / "source.mcap", SyntheticEpisodeSpec(duration_s=1.0, cameras=())
+    )
+    application = hflow.App("superseded-default", data_root=tmp_path / "workspace")
+
+    @application.check(version="1", requires={"pod"})
+    async def my_duration(_episode: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements={"duration_s": 1.0})
+
+    report = asyncio.run(application.process(source, record=False))
+    by_name = {run.check.name: run for run in report.checks}
+
+    # The default ran in full, then had duration_s filtered out post-execution.
+    default = by_name["episode_duration"]
+    assert default.result is not None
+    assert default.status is hflow.CheckStatus.MEASURED
+    assert "duration_s" not in default.result.measurements
+    assert "message_count_total" in default.result.measurements
+    assert any(tag == "superseded:duration_s" for tag in default.result.tags)
+
+    # project_results reports superseded for the filtered key, not KeyError.
+    projection = project_results(
+        report,
+        (CheckSelection("episode_duration", "duration", {"value": "duration_s"}),),
+    )
+    match projection.checks[0]:
+        case MeasuredCheck():
+            raise AssertionError("expected superseded, got measured")
+        case UnavailableCheck(status="superseded"):
+            pass
+
+    # project_results reports measured for a surviving key.
+    projection = project_results(
+        report,
+        (
+            CheckSelection(
+                "episode_duration",
+                "count",
+                {"count": "message_count_total"},
+            ),
+        ),
+    )
+    match projection.checks[0]:
+        case MeasuredCheck(measurements=measurements):
+            assert measurements == {"count": default.result.measurements["message_count_total"]}
+        case UnavailableCheck():
+            raise AssertionError("expected measured, got superseded")
 
 
 def test_result_domain_refuses_nonfinite_measurements_and_duplicate_names() -> None:

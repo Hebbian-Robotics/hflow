@@ -149,11 +149,24 @@ def project_results(
         check_run = report.check(selection.check_name)
         match check_run.outcome:
             case Measured(result):
-                measurements = {
-                    public_name: result.measurements[measurement_name]
-                    for public_name, measurement_name in selection.measurements.items()
-                }
-                checks.append(MeasuredCheck(selection.public_name, measurements, result.verdict))
+                # A default check that ran but had some of its measurements
+                # filtered out as superseded by the pipeline: report it as
+                # superseded rather than raising KeyError on the missing keys.
+                missing = [
+                    name
+                    for name in selection.measurements.values()
+                    if name not in result.measurements
+                ]
+                if missing:
+                    checks.append(UnavailableCheck(selection.public_name, "superseded"))
+                else:
+                    measurements = {
+                        public_name: result.measurements[measurement_name]
+                        for public_name, measurement_name in selection.measurements.items()
+                    }
+                    checks.append(
+                        MeasuredCheck(selection.public_name, measurements, result.verdict)
+                    )
             case Errored():
                 checks.append(UnavailableCheck(selection.public_name, "error"))
             case NotRun(not_run):
