@@ -19,10 +19,9 @@ selection.
 
 Prerequisites: network access to the Hugging Face Hub, enough disk for the
 pinned corpus and generated artifacts (~1 GB), and the repository's normal
-development environment (managed FFmpeg included). The import step converts
-only the listed episodes; the export step additionally materializes the
-full pinned source archive through the public importer, so the first run
-takes roughly 30-60 minutes of video conversion on a laptop.
+development environment (managed FFmpeg included). Both import and export
+convert only their selected episodes. Dataset v3 may still require downloading
+whole shared video chunks, even when only a few episodes are selected.
 """
 
 from __future__ import annotations
