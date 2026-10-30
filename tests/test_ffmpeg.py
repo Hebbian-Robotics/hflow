@@ -7,6 +7,7 @@ mutation. Remote availability and real-download tests are opt-in via
 """
 
 import hashlib
+import io
 import logging
 import os
 import platform
@@ -15,7 +16,8 @@ import subprocess
 import tarfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import httpx2
 import numpy as np
@@ -48,6 +50,7 @@ from hflow._video_measurements._frame_statistics import (
 )
 from hflow._video_measurements._raw_frames import (
     RawFrameError,
+    _decoded_frame_hashes,
     _scaled_frame_shape,
     luma_frames,
     rgb_frames,
@@ -83,6 +86,45 @@ from hflow.ffmpeg._contact_sheet import (
     _find_usable_font_file,
     contact_sheet,
 )
+
+
+def test_rgb_frame_hash_trace_waits_after_successful_eof(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FinishedAfterEofProcess:
+        def __init__(self) -> None:
+            self.stdout = io.StringIO("#tb 0: 1/1000000\n0, 1, 0, 1, 1, digest\n")
+            self.returncode: int | None = None
+            self.terminated = False
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = -15
+
+        def wait(self) -> int:
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+    process = FinishedAfterEofProcess()
+    monkeypatch.setattr(
+        "hflow._video_measurements._raw_frames.subprocess.Popen",
+        lambda *args, **kwargs: process,
+    )
+    toolchain = cast(VideoMeasurementToolchain, SimpleNamespace(ffmpeg_executable=Path("ffmpeg")))
+
+    decoded_indices, hashes = _decoded_frame_hashes(
+        Path("video.mp4"),
+        toolchain=toolchain,
+        filter_graph="format=pix_fmts=rgb24",
+        source_fps=30.0,
+        sample_fps=30.0,
+    )
+
+    assert decoded_indices == []
+    assert hashes == {0: {"digest"}}
+    assert not process.terminated
 
 
 def _measure_frame_statistics(
@@ -646,7 +688,7 @@ def test_raw_frames_stream_every_frame_at_the_coded_size(
     needs and what ``Episode.frames()`` deliberately does not give.
     """
     with frame_reader(black_tail_video, toolchain=resolved_video_measurement_toolchain()) as frames:
-        shapes = [frame.shape for frame in frames]
+        shapes = [getattr(frame, "pixels", frame).shape for frame in frames]
     assert len(shapes) == 60
     assert set(shapes) == {expected_shape}
 
@@ -765,7 +807,7 @@ def test_rgb_frames_resamples_and_resizes_in_one_decode(black_tail_video: Path) 
         frames_per_second=1.0,
         long_edge_pixels=80,
     ) as frames:
-        shapes = [frame.shape for frame in frames]
+        shapes = [frame.pixels.shape for frame in frames]
     # 6 seconds at 10 fps sampled to 1 fps, and 160x120 scaled to an 80 long edge.
     assert len(shapes) == 6
     assert set(shapes) == {(60, 80, 3)}
@@ -777,8 +819,8 @@ def test_rgb_frames_are_contiguous_uint8(black_tail_video: Path) -> None:
     """
     with rgb_frames(black_tail_video, toolchain=resolved_video_measurement_toolchain()) as frames:
         frame = next(iter(frames))
-    assert frame.dtype == np.uint8
-    assert frame.flags["C_CONTIGUOUS"]
+    assert frame.pixels.dtype == np.uint8
+    assert frame.pixels.flags["C_CONTIGUOUS"]
 
 
 def test_rgb_frames_reject_a_non_positive_rate(black_tail_video: Path) -> None:
@@ -837,7 +879,7 @@ def numbered_30fps_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return video_path
 
 
-@pytest.mark.parametrize("sample_fps", [1.0, 3.0, 4.0, 10.0, 30.0])
+@pytest.mark.parametrize("sample_fps", [1.0, 3.0, 3.0000049, 4.0, 10.0, 30.0])
 def test_rgb_frames_sampling_aligns_with_output_ticks(
     numbered_30fps_video: Path, sample_fps: float
 ) -> None:
@@ -862,10 +904,14 @@ def test_rgb_frames_sampling_aligns_with_output_ticks(
         toolchain=resolved_video_measurement_toolchain(),
         frames_per_second=sample_fps,
     ) as frames:
-        shown = [read_frame_index(f) for f in frames]
+        samples = list(frames)
+        shown = [read_frame_index(sample.pixels) for sample in samples]
 
-    expected = [int(i * 30 / sample_fps) for i in range(int(3 * sample_fps))]
+    effective_sample_fps = float(f"{sample_fps:g}")
+    expected = [int(i * 30 / effective_sample_fps) for i in range(int(3 * effective_sample_fps))]
     assert shown == expected
+    assert [sample.sample_index for sample in samples] == list(range(len(expected)))
+    assert [sample.source_frame_index for sample in samples] == expected
 
 
 @pytest.mark.parametrize(

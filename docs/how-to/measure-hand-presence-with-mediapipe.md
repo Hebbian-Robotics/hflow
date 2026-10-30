@@ -101,10 +101,16 @@ inference per frame. `inference_long_edge_pixels` resizes each frame before
 inference; it changes which hands are found at all on small footage, so it is
 part of the question rather than a performance knob.
 
+If a sampled tick resolves to a repeated picture from an earlier timestamp,
+HFlow omits that sample. Later detections keep their original sample and
+source-message timestamps, so a dropped sample cannot shift their labels.
+
 When re-tuning either setting or changing model weights, bump the explicit
-version so the new rows aren't mixed with incompatible old results. Do the
-same after a MediaPipe upgrade if its outputs are no longer comparable. Every
-row also records `mediapipe_version` so you can audit that decision later.
+version so the new rows aren't mixed with incompatible old results. The same
+applies when comparing results produced before and after this lost-frame
+handling change. Do the same after a MediaPipe upgrade if its outputs are no
+longer comparable. Every row also records `mediapipe_version` so you can audit
+that decision later.
 
 ## Limitations you are accepting
 

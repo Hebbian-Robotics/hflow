@@ -102,6 +102,19 @@ def _source_frame_number(log_time_ns: int) -> int:
     return round((log_time_ns - _NUMBERED_VIDEO_START_NS) * 30 / 1_000_000_000)
 
 
+def _number_in_rgb_frame(frame: Any) -> int:
+    pixels = frame.pixels.astype("float32").mean(axis=2)
+    width, bits = frame.pixels.shape[1], 8
+    bit_width = width // bits
+    return int(
+        "".join(
+            str(int(pixels[:48, bit * bit_width + 6 : (bit + 1) * bit_width - 6].mean() > 128))
+            for bit in range(bits)
+        ),
+        2,
+    )
+
+
 @pytest.mark.requires_system_ffmpeg
 @pytest.mark.parametrize(
     ("fps", "start_s", "end_s"),
@@ -175,6 +188,42 @@ def test_frames_omit_undecoded_ticks_without_shifting_later_samples(
     for frame in frames:
         if _source_frame_number(frame.log_time_ns) >= 120:
             assert abs(_number_in_frame(frame.path) - _source_frame_number(frame.log_time_ns)) <= 1
+
+
+@pytest.mark.requires_system_ffmpeg
+def test_rgb_frames_omit_repeats_and_keep_sample_positions_after_lost_keyframe(
+    numbered_h264_episodes: dict[int | None, Path], tmp_path: Path
+) -> None:
+    from hflow._video_measurement_toolchain import resolved_video_measurement_toolchain
+    from hflow._video_measurements._raw_frames import rgb_frames
+
+    with Episode(numbered_h264_episodes[100], workdir=tmp_path) as episode:
+        source_times = episode.channel(_NUMBERED_VIDEO_TOPIC).timestamps
+        with rgb_frames(
+            episode.video(_NUMBERED_VIDEO_TOPIC),
+            toolchain=resolved_video_measurement_toolchain(),
+            frames_per_second=30.0,
+            source_fps=30.0,
+        ) as frames:
+            samples = list(frames)
+
+    by_sample_index = {sample.sample_index: sample for sample in samples}
+    # The missing IDR leaves these requested messages undecodable. FFmpeg's
+    # fps filter repeats the last good image there; do not return it as a new
+    # sample. The concealed picture at the next timestamp is a separate H.264
+    # validation problem tracked by #727.
+    assert set(range(100, 108)).isdisjoint(by_sample_index)
+    assert 120 in by_sample_index
+    assert all(sample.source_frame_index == sample.sample_index for sample in samples)
+    for sample in samples:
+        if sample.source_frame_index >= 120:
+            assert (
+                abs(
+                    _number_in_rgb_frame(sample)
+                    - _source_frame_number(source_times[sample.source_frame_index])
+                )
+                <= 1
+            )
 
 
 @pytest.mark.requires_system_ffmpeg
