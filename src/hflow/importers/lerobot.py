@@ -990,6 +990,13 @@ def import_lerobot_dataset(
     )
 
     dataset_information = source_archive.dataset_information
+    if not source_archive.video_keys:
+        # -- an image-only dataset used to be refused by camera key, naming the default the user
+        # -- never passed; the missing capability is the video features, not that key --
+        raise ValueError(
+            f"dataset '{normalized_dataset_repo}' has no video features: image-only LeRobot "
+            "datasets are not supported (camera keys are the dataset's video features)"
+        )
     for camera_key in resolved_camera_keys:
         if camera_key not in source_archive.video_keys:
             raise ValueError(

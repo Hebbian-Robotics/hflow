@@ -13,8 +13,11 @@ from huggingface_hub.errors import RemoteEntryNotFoundError
 from lerobot_test_helpers import (
     V3_DATA_PATH_TEMPLATE,
     V3_VIDEO_PATH_TEMPLATE,
+    CorpusEpisodeRow,
     exactly,
     stub_hub_repo_info,
+    stub_single_shard_hub_corpus,
+    write_v3_corpus,
 )
 
 import hflow.importers.lerobot as prep
@@ -213,6 +216,53 @@ def test_import_refuses_info_json_without_features_before_listing_episodes(
         _import(output_dir)
 
     assert listed_repositories == []
+    _assert_no_dataset_output(output_dir)
+
+
+def test_import_refuses_a_dataset_that_declares_no_video_features(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An image-only dataset is refused for what it lacks, not for a camera key.
+
+    The refusal used to name the key the caller never passed --
+    ``camera key 'observation.image' not found in dataset. Available: []`` --
+    which reads as a bad argument rather than a corpus HFlow cannot convert.
+    """
+    info = _info(
+        features={
+            "action": {"dtype": "float32", "shape": [6]},
+            "observation.state": {"dtype": "float32", "shape": [6]},
+            "observation.image": {"dtype": "image", "shape": [480, 640, 3]},
+        }
+    )
+    corpus_root = tmp_path / "corpus"
+    write_v3_corpus(
+        corpus_root,
+        info=info,
+        episode_rows=[
+            CorpusEpisodeRow(
+                episode_index=0,
+                length=60,
+                dataset_from_index=0,
+                video_to_timestamp=2.0,
+                tasks=("task-0",),
+            )
+        ],
+        camera_keys=(),
+    )
+    stub_hub_repo_info(monkeypatch, resolved_sha=_SHA)
+    stub_single_shard_hub_corpus(monkeypatch, corpus_root, info)
+    output_dir = tmp_path / "out"
+
+    with pytest.raises(
+        ValueError,
+        match=exactly(
+            f"dataset '{_REPO}' has no video features: image-only LeRobot datasets are not "
+            "supported (camera keys are the dataset's video features)"
+        ),
+    ):
+        _import(output_dir)
+
     _assert_no_dataset_output(output_dir)
 
 
