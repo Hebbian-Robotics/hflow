@@ -11,7 +11,8 @@ export in a clean process.
 
 The pinned corpus and the bounded episode subset live in
 ``source-manifest.json`` next to this file; pass ``--source-manifest`` to run
-the same steps on another corpus with a manifest of the same shape. All
+the same steps on another corpus with a manifest of the same shape (its
+``revision`` must be a full commit SHA, not a branch or tag). All
 downloaded media and generated artifacts stay under the gitignored data
 directory, so re-running without source or configuration changes is safe and
 reproduces the same selection.
@@ -221,8 +222,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--source-manifest",
         type=Path,
         default=Path(__file__).with_name("source-manifest.json"),
-        help="corpus to run: repository, revision, cameras and episodes "
-        "(default: the pinned source-manifest.json next to this script)",
+        help="corpus to run: repository, revision (a full commit SHA), cameras and "
+        "episodes (default: the pinned source-manifest.json next to this script)",
     )
     args = parser.parse_args(argv)
 

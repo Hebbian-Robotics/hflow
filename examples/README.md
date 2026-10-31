@@ -517,7 +517,8 @@ LeRobot Dataset v3 selection -- twice from a clean checkout, with the same
 selection. The pinned repository, revision, cameras, and episode subset
 live in [`lerobot/source-manifest.json`](./lerobot/source-manifest.json);
 edit that file to change the run, or pass `--source-manifest PATH` to run the
-same steps on another corpus with a manifest of the same shape.
+same steps on another corpus with a manifest of the same shape. The manifest's
+`revision` must be a full commit SHA, not a branch or tag.
 
 **Prerequisites:** the normal development environment, network access to
 the Hugging Face Hub, and about 1 GB of free disk. The pinned corpus
