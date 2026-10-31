@@ -501,6 +501,7 @@ class Episode:
         # Source frame rate per camera topic, recorded by video() for frames().
         self._video_fps: dict[str, float] = {}
         self._keyframe_indices: dict[str, frozenset[int]] = {}
+        self._clean_message_indices: dict[str, frozenset[int]] = {}
 
     @property
     def workdir(self) -> Path:
@@ -845,6 +846,54 @@ class Episode:
             keyframe_indices=self._keyframe_message_indices(topic),
             frame_count=frame_count,
         )
+
+    def _cleanly_decoded_message_indices(self, topic: str) -> frozenset[int]:
+        """Message positions whose picture the camera's video decodes cleanly.
+
+        For consumers that sample the video themselves instead of through
+        :meth:`frames`: a picture outside this set is missing or concealed
+        (#727), and must not be attributed to its message.
+        """
+        cached = self._clean_message_indices.get(topic)
+        if cached is not None:
+            return cached
+        mp4 = self.video(topic)
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=self.workdir) as trace_dir:
+            decoded_trace_path = Path(trace_dir) / "decoded.framecrc"
+            command = [
+                str(ffmpeg_path()),
+                "-hide_banner",
+                "-y",
+                "-i",
+                str(mp4),
+                "-map",
+                "0:v:0",
+                "-c:v",
+                "rawvideo",
+                "-enc_time_base",
+                "1:1000000",
+                "-fps_mode",
+                "passthrough",
+                "-f",
+                "framecrc",
+                str(decoded_trace_path),
+            ]
+            completed = subprocess.run(command, capture_output=True, text=True, check=False)
+            if completed.returncode != 0:
+                stderr_tail = completed.stderr.strip().splitlines()[-5:]
+                raise RuntimeError(
+                    f"ffmpeg could not decode {topic!r} (exit {completed.returncode}): "
+                    f"{stderr_tail}"
+                )
+            source_count = len(
+                self._channel_log_times(self._resolve_channel_info(topic).channel_id)
+            )
+            clean_indices = self._cleanly_decoded_indices(
+                topic, decoded_trace_path, frame_count=source_count
+            )
+        self._clean_message_indices[topic] = frozenset(clean_indices)
+        return self._clean_message_indices[topic]
 
     def frames(
         self,

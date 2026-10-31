@@ -49,7 +49,7 @@ from hflow._video_measurements._raw_frames import rgb_frames
 from hflow.asyncio_utils import run_blocking
 from hflow.episode import Episode
 from hflow.steps import CheckResult, Interval, MeasurementValue
-from hflow.video import source_log_times_for_sampled_frames
+from hflow.video import source_indices_for_sampled_frames
 
 logger = logging.getLogger(__name__)
 
@@ -479,6 +479,25 @@ def _measure_mediapipe_hands(
                 minimum_tracking_confidence=minimum_tracking_confidence,
             )
 
+        # The fps filter repeats the last decoded picture over messages the
+        # decoder dropped, and a concealed picture carries no error (#727).
+        # Neither shows its message, so neither is a sample of it.
+        source_indices = source_indices_for_sampled_frames(
+            len(stamps_ns),
+            source_fps=1.0 / median_interval_s,
+            sample_fps=sample_fps,
+            start_s=0.0,
+            frame_count=len(detections),
+        )
+        clean_indices = episode._cleanly_decoded_message_indices(topic)
+        kept_samples = [
+            (int(stamps_ns[source_index]), detection)
+            for source_index, detection in zip(source_indices, detections, strict=True)
+            if source_index in clean_indices
+        ]
+        log_times_ns = [log_time_ns for log_time_ns, _ in kept_samples]
+        detections = [detection for _, detection in kept_samples]
+
         summary = summarize_hand_detections(detections)
         measurements[f"{topic}/hand_detection_frame_count"] = summary.frame_count
         measurements[f"{topic}/hand_sample_fps"] = sample_fps
@@ -502,13 +521,6 @@ def _measure_mediapipe_hands(
                 f"{topic}/mediapipe_version": _import_mediapipe().__version__,
                 f"{topic}/hand_model_digest": _resolved_hand_model_digest(),
             }
-        )
-        log_times_ns = source_log_times_for_sampled_frames(
-            stamps_ns.tolist(),
-            source_fps=1.0 / median_interval_s,
-            sample_fps=sample_fps,
-            start_s=0.0,
-            frame_count=summary.frame_count,
         )
         intervals.extend(
             _no_detection_intervals(log_times_ns, detections, f"no_hand_detected:{topic}")
