@@ -31,12 +31,14 @@ from mcap.records import Attachment, Schema
 from hflow import video as video_module
 from hflow.ffmpeg import ffmpeg_path, ffprobe_path
 from hflow.ffmpeg._binary import _ffmpeg_filter_script_flag
+from hflow.ffmpeg._process import run_media_command
 from hflow.format import (
     CAMERA_SCHEMA_NAMES,
     CANONICAL_VIDEO_SCHEMA_NAME,
     METADATA_RECORD_EPISODE,
     METADATA_RECORD_PROVENANCE,
 )
+from hflow.media import VideoLimits
 from hflow.reader import (
     DEFAULT_BATCH_MAX_BYTES,
     DEFAULT_BATCH_MAX_MESSAGES,
@@ -863,7 +865,12 @@ class Episode:
             decoded_trace_path = Path(trace_dir) / "decoded.framecrc"
             command = [
                 str(ffmpeg_path()),
+                "-nostdin",
                 "-hide_banner",
+                # Damaged footage is the point of this pass, and its decoder
+                # warnings would otherwise count against the output cap.
+                "-loglevel",
+                "fatal",
                 "-y",
                 "-i",
                 str(mp4),
@@ -879,12 +886,10 @@ class Episode:
                 "framecrc",
                 str(decoded_trace_path),
             ]
-            completed = subprocess.run(command, capture_output=True, text=True, check=False)
+            completed = run_media_command(command, timeout_seconds=VideoLimits().timeout_seconds)
             if completed.returncode != 0:
-                stderr_tail = completed.stderr.strip().splitlines()[-5:]
                 raise RuntimeError(
-                    f"ffmpeg could not decode {topic!r} (exit {completed.returncode}): "
-                    f"{stderr_tail}"
+                    f"ffmpeg could not decode {topic!r} (exit {completed.returncode})"
                 )
             source_count = len(
                 self._channel_log_times(self._resolve_channel_info(topic).channel_id)

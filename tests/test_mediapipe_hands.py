@@ -235,25 +235,35 @@ def test_samples_after_a_lost_keyframe_are_not_attributed_to_other_pictures(
 
     The fps filter fills the dropped sample times with the last decoded picture, 99.
     Neither that repeat nor the concealed picture shows the message it would be
-    labelled with, so none may reach the counts or the absence intervals. The
-    stand-in detector reports the frame number drawn into each picture, so the
-    samples handed on can be checked against the messages they are labelled with.
+    labelled with, so none may reach the counts, and no absence interval may
+    span them. The stand-in detector reports the frame number drawn into each
+    picture, so the samples handed on can be checked against their labels.
     """
     from hflow import mediapipe_hands
 
+    shown_numbers: dict[int, int] = {}
+
     def numbers_shown(frames: Iterator[np.ndarray], **_: object) -> list[FrameHandCounts]:
-        return [_frame(number_in_luma(frame.mean(axis=2))) for frame in frames]
+        # A hand everywhere except on pictures 95..99, just before the lost keyframe.
+        detections = []
+        for frame in frames:
+            number = number_in_luma(frame.mean(axis=2))
+            detection = _frame(0 if 95 <= number <= 99 else 1)
+            shown_numbers[id(detection)] = number
+            detections.append(detection)
+        return detections
 
     labelled_samples: list[tuple[int, int]] = []
+    real_no_detection_intervals = mediapipe_hands._no_detection_intervals
 
     def capture_samples(
         log_times_ns: list[int], detections: list[FrameHandCounts], label: str
     ) -> list[hflow.Interval]:
         labelled_samples.extend(
-            (source_frame_number(log_time_ns), detection.hand_count)
+            (source_frame_number(log_time_ns), shown_numbers[id(detection)])
             for log_time_ns, detection in zip(log_times_ns, detections, strict=True)
         )
-        return []
+        return real_no_detection_intervals(log_times_ns, detections, label)
 
     monkeypatch.setattr(mediapipe_hands, "detect_hands_in_frames", numbers_shown)
     monkeypatch.setattr(mediapipe_hands, "_no_detection_intervals", capture_samples)
@@ -276,6 +286,13 @@ def test_samples_after_a_lost_keyframe_are_not_attributed_to_other_pictures(
     assert {99, 110 if sample_fps == 30.0 else 112} <= named_frames
     assert result.measurements[f"{NUMBERED_VIDEO_TOPIC}/hand_detection_frame_count"] == len(
         labelled_samples
+    )
+    # The absence before the gap closes at its last clean sample, 99, rather
+    # than spanning the discarded footage to the next sample that shows a hand.
+    (interval,) = result.intervals
+    assert (source_frame_number(interval.start_ns), source_frame_number(interval.end_ns)) == (
+        95 if sample_fps == 30.0 else 96,
+        99,
     )
 
 

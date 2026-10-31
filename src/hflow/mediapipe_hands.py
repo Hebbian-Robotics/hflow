@@ -490,15 +490,23 @@ def _measure_mediapipe_hands(
             frame_count=len(detections),
         )
         clean_indices = episode._cleanly_decoded_message_indices(topic)
-        kept_samples = [
-            (int(stamps_ns[source_index]), detection)
-            for source_index, detection in zip(source_indices, detections, strict=True)
-            if source_index in clean_indices
-        ]
-        log_times_ns = [log_time_ns for log_time_ns, _ in kept_samples]
-        detections = [detection for _, detection in kept_samples]
+        # Runs of consecutive kept samples. An absence interval may not span a
+        # discarded stretch: the check saw nothing there to call absent.
+        clean_runs: list[list[tuple[int, FrameHandCounts]]] = []
+        previous_sample_index: int | None = None
+        for sample_index, (source_index, detection) in enumerate(
+            zip(source_indices, detections, strict=True)
+        ):
+            if source_index not in clean_indices:
+                continue
+            if previous_sample_index is None or sample_index != previous_sample_index + 1:
+                clean_runs.append([])
+            clean_runs[-1].append((int(stamps_ns[source_index]), detection))
+            previous_sample_index = sample_index
 
-        summary = summarize_hand_detections(detections)
+        summary = summarize_hand_detections(
+            [detection for clean_run in clean_runs for _, detection in clean_run]
+        )
         measurements[f"{topic}/hand_detection_frame_count"] = summary.frame_count
         measurements[f"{topic}/hand_sample_fps"] = sample_fps
         if inference_long_edge_pixels is not None:
@@ -522,7 +530,12 @@ def _measure_mediapipe_hands(
                 f"{topic}/hand_model_digest": _resolved_hand_model_digest(),
             }
         )
-        intervals.extend(
-            _no_detection_intervals(log_times_ns, detections, f"no_hand_detected:{topic}")
-        )
+        for clean_run in clean_runs:
+            intervals.extend(
+                _no_detection_intervals(
+                    [log_time_ns for log_time_ns, _ in clean_run],
+                    [detection for _, detection in clean_run],
+                    f"no_hand_detected:{topic}",
+                )
+            )
     return CheckResult(measurements=measurements, intervals=intervals)
