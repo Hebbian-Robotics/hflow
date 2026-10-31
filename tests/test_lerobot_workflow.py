@@ -354,6 +354,41 @@ def test_workflow_end_to_end_on_small_fixture(tmp_path: Path, installed_fake_imp
     assert "OK" in proc.stdout
 
 
+def test_workflow_runs_the_corpus_in_a_given_source_manifest(
+    tmp_path: Path, installed_fake_import: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_import = workflow.hflow.import_lerobot_dataset
+    imported: list[int | None] = []
+
+    def _recording_import(
+        dataset_repo: str,
+        revision: str,
+        output_dir: Path,
+        episode_index: int | None = None,
+        camera_keys: tuple[str, ...] = (),
+    ) -> list[str]:
+        imported.append(episode_index)
+        return fake_import(
+            dataset_repo=dataset_repo,
+            revision=revision,
+            output_dir=output_dir,
+            episode_index=episode_index,
+            camera_keys=camera_keys,
+        )
+
+    monkeypatch.setattr(workflow.hflow, "import_lerobot_dataset", _recording_import)
+    source_manifest = tmp_path / "other-corpus.json"
+    source_manifest.write_text(json.dumps({**FIXTURE_MANIFEST, "episodes": [0, 2]}))
+
+    data_dir = tmp_path / "run"
+    assert (
+        workflow.main(["--data-dir", str(data_dir), "--source-manifest", str(source_manifest)]) == 0
+    )
+    # The import step runs first, one call per listed episode; the export step's own
+    # importer calls come after it.
+    assert imported[:2] == [0, 2]
+
+
 def test_verify_rejects_a_missing_reference(tmp_path: Path) -> None:
     """The clean-process verifier fails when an exported file goes missing."""
     v3 = tmp_path / "v3"

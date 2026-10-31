@@ -10,12 +10,14 @@ snapshot and a loadable LeRobot Dataset v3 repository, and verify the
 export in a clean process.
 
 The pinned corpus and the bounded episode subset live in
-``source-manifest.json`` next to this file; all downloaded media and
-generated artifacts stay under the gitignored data directory, so re-running
-without source or configuration changes is safe and reproduces the same
-selection.
+``source-manifest.json`` next to this file; pass ``--source-manifest`` to run
+the same steps on another corpus with a manifest of the same shape (its
+``revision`` must be a full commit SHA, not a branch or tag). All
+downloaded media and generated artifacts stay under the gitignored data
+directory, so re-running without source or configuration changes is safe and
+reproduces the same selection.
 
-    uv run python examples/lerobot/workflow.py [--data-dir DATA_DIR]
+    uv run python examples/lerobot/workflow.py [--data-dir DATA_DIR] [--source-manifest PATH]
 
 Prerequisites: network access to the Hugging Face Hub, enough disk for the
 pinned corpus and generated artifacts (~1 GB), and the repository's normal
@@ -216,11 +218,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=Path("./data/lerobot_workflow"),
         help="working directory for all downloads and generated artifacts",
     )
+    parser.add_argument(
+        "--source-manifest",
+        type=Path,
+        default=Path(__file__).with_name("source-manifest.json"),
+        help="corpus to run: repository, revision (a full commit SHA), cameras and "
+        "episodes (default: the pinned source-manifest.json next to this script)",
+    )
     args = parser.parse_args(argv)
 
     data_dir = args.data_dir
     data_dir.mkdir(parents=True, exist_ok=True)
-    source_manifest = json.loads(Path(__file__).with_name("source-manifest.json").read_text())
+    source_manifest = json.loads(args.source_manifest.read_text())
     cameras = tuple(source_manifest["cameras"])
     subset = [int(index) for index in source_manifest["episodes"]]
 

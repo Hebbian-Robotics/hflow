@@ -37,6 +37,11 @@ used different data/video filenames; those files may be downloaded again on
 the first import after upgrading. Existing landing episodes remain reusable.
 HFlow leaves the older source files in place.
 
+Dataset v3 packs many episodes into each data and video file, so importing one
+episode still downloads every file that holds part of it, other episodes
+included. For `lerobot/droid_100`, a single-episode import fetched about 443 MB.
+Later imports of episodes stored in the same files reuse the cache.
+
 The SDK manages download retries, timeouts, and Xet transfers. Its auxiliary
 Xet cache follows `HF_XET_CACHE` (default: `$HF_HOME/xet`), independently of the
 workspace source cache. See the
