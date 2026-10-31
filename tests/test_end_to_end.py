@@ -567,9 +567,15 @@ def test_frames_at_indices_pairs_pictures_by_time_when_a_keyframe_is_missing(
             kept_source_frames[index] for index in after_the_gap
         ]
 
-        inside_the_gap = [33, 34]
-        with pytest.raises(RuntimeError, match="extracted"):
-            episode.frames_at_indices(topic, frame_indices=inside_the_gap)
+        # Messages 30..38 hold source frames 31..39, which all depend on the lost
+        # keyframe 30; the decoder drops most of them and conceals the rest from
+        # an unrelated reference. None may come back as that message's picture.
+        next_keyframe_message = kept_source_frames.index(40)
+        for unclean_index in range(lost_source_frame, next_keyframe_message):
+            with pytest.raises(RuntimeError, match=rf"\[{unclean_index}\].*cannot be decoded"):
+                episode.frames_at_indices(topic, frame_indices=[29, unclean_index])
+        recovered = episode.frames_at_indices(topic, frame_indices=[next_keyframe_message])
+        assert [_read_frame_number(frame.path) for frame in recovered] == [40]
 
 
 @pytest.mark.requires_system_ffmpeg
