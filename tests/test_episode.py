@@ -166,15 +166,16 @@ def test_frames_omit_undecoded_ticks_without_shifting_later_samples(
         frames = episode.frames(_NUMBERED_VIDEO_TOPIC, fps=fps)
     assert frames
     sampled_ticks = {int(frame.path.stem.removeprefix("frame_")) - 1 for frame in frames}
-    # Original MP4 PTS 100..107 are absent after dropping IDR 100; filter
-    # duplication of frame 99 must not create samples at those tick positions.
-    for tick in range(100, 108):
+    # Original MP4 PTS 100..107 are absent after dropping IDR 100, and the decoder
+    # conceals 108 from an unrelated reference until the next keyframe at 109:
+    # neither filter duplication of frame 99 nor that concealed picture may
+    # become a sample at those tick positions.
+    for tick in range(100, 109):
         if tick % (30 / fps) == 0:
             assert int(tick * fps / 30) not in sampled_ticks
     assert max(sampled_ticks) >= int(120 * fps / 30)
     for frame in frames:
-        if _source_frame_number(frame.log_time_ns) >= 120:
-            assert abs(_number_in_frame(frame.path) - _source_frame_number(frame.log_time_ns)) <= 1
+        assert abs(_number_in_frame(frame.path) - _source_frame_number(frame.log_time_ns)) <= 1
 
 
 @pytest.mark.requires_system_ffmpeg
@@ -196,7 +197,7 @@ def test_frames_reextract_old_cache_and_reuse_new_cache(
     with Episode(numbered_h264_episodes[None], workdir=tmp_path) as episode:
         first = episode.frames(_NUMBERED_VIDEO_TOPIC, fps=1.0)
         assert len(first) == 5
-        assert first[0].path.parent.name.startswith("frames_v2_")
+        assert first[0].path.parent.name.startswith("frames_v3_")
         assert _number_in_frame(first[0].path) == 0
         assert {path.suffix for path in first[0].path.parent.iterdir()} == {".jpg"}
 
