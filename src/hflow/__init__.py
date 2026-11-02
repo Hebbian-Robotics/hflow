@@ -84,6 +84,7 @@ if TYPE_CHECKING:
         ManifestSplitReport,
         ManifestSplitSettings,
         split_manifest,
+        verify_manifest_split,
     )
     from hflow.reader import (
         EpisodeReader,
@@ -172,6 +173,7 @@ _ATTRIBUTE_NAMES_BY_MODULE: dict[str, tuple[str, ...]] = {
         "ManifestSplitReport",
         "ManifestSplitSettings",
         "split_manifest",
+        "verify_manifest_split",
     ),
     "hflow.app": (
         "App",
@@ -518,5 +520,6 @@ __all__ = [
     "to_grid",
     "verify_dataset_snapshot",
     "verify_lerobot_import",
+    "verify_manifest_split",
     "write_canonical_episode",
 ]

@@ -1,7 +1,8 @@
 """Command-line entry point.
 
 Subcommands: ``curate``, ``catalog ui``, ``dataset create``, ``import lerobot``,
-``export snapshot``, ``verify snapshot``, ``verify lerobot-import``, ``stale``,
+``export snapshot``, ``verify snapshot``, ``verify lerobot-import``,
+``verify manifest-split``, ``stale``,
 ``doctor``, ``manifest``, ``package``, the Compose runtime family
 ``up``/``down``/``ingest``/``status``, ``deploy`` for bring-your-own Airflow,
 and ``serve`` for the workspace HTTP server (a separate ``hflow-server``
@@ -862,6 +863,25 @@ def _command_export_snapshot(
     return 0
 
 
+def _command_verify_manifest_split(directory: str) -> int:
+    from hflow.manifest_splits import verify_manifest_split
+    from hflow.verification import exit_code_for
+
+    try:
+        report = verify_manifest_split(directory)
+    except (ValueError, OSError) as error:
+        print(f"verify manifest-split: {error}", file=sys.stderr)
+        return 2
+    if report.ok:
+        print("verified: every receipted Parquet file matches its sha256")
+    else:
+        print(f"not verified: {len(report.findings)} finding(s)")
+        for finding in report.findings:
+            print(f"  [{finding.reason}] {finding.uri}")
+            print(f"    {finding.detail}")
+    return exit_code_for(report)
+
+
 def _command_verify_snapshot(directory: str) -> int:
     from hflow.snapshot import verify_dataset_snapshot
     from hflow.verification import exit_code_for
@@ -1319,6 +1339,20 @@ def _register_verify_group(app: typer.Typer, result_holder: list[int]) -> None:
     @verify_app.callback()
     def _verify_root() -> None:
         pass
+
+    @verify_app.command(
+        "manifest-split",
+        help=(
+            "Check the split's output Parquet files against receipt.json. "
+            "Exit 0 clean, 1 damaged, 2 unreadable input."
+        ),
+    )
+    def verify_manifest_split_command(
+        directory: str = typer.Argument(..., help="frozen manifest split directory to verify"),
+    ) -> int:
+        code = _command_verify_manifest_split(directory)
+        result_holder.append(code)
+        return code
 
     @verify_app.command(
         "snapshot",
