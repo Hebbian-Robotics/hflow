@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -218,3 +220,165 @@ def test_case_colliding_source_columns_are_refused_not_renamed(tmp_path: Path) -
             settings=ManifestSplitSettings("sample_id", ("recording_id",)),
         )
     assert not (tmp_path / "split").exists()
+
+
+@pytest.fixture
+def frozen_split(tmp_path: Path) -> Path:
+    source = tmp_path / "source.parquet"
+    _write_manifest(source, [(str(i), f"r{i}", f"i{i}", i) for i in range(6)])
+    output = tmp_path / "split"
+    split_manifest(source, output, settings=ManifestSplitSettings("sample_id", ("recording_id",)))
+    source.unlink()
+    return output
+
+
+def _verify_cli(directory: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "hflow", "verify", "manifest-split", str(directory)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_verify_moved_split_and_report_multiple_file_damage(frozen_split: Path) -> None:
+    from hflow import VerificationReason, verify_manifest_split
+
+    moved = frozen_split.rename(frozen_split.with_name("moved"))
+    (moved / "extra.txt").write_text("ignored")
+    assert verify_manifest_split(moved).ok
+    assert _verify_cli(moved).returncode == 0
+    assignments = moved / "assignments.parquet"
+    data = assignments.read_bytes()
+    assignments.write_bytes(bytes([data[0] ^ 1]) + data[1:])
+    (moved / "train.parquet").unlink()
+    (moved / "test.parquet").write_bytes(b"changed")
+    report = verify_manifest_split(moved)
+    assert {(f.uri, f.reason) for f in report.findings} == {
+        ("assignments.parquet", VerificationReason.CONTENT_ID_MISMATCH),
+        ("train.parquet", VerificationReason.MISSING),
+        ("test.parquet", VerificationReason.CONTENT_ID_MISMATCH),
+    }
+    result = _verify_cli(moved)
+    assert result.returncode == 1
+    assert "assignments.parquet" in result.stdout
+    assert "train.parquet" in result.stdout
+    assert "test.parquet" in result.stdout
+
+
+def test_verify_missing_assignment_and_partition(frozen_split: Path) -> None:
+    from hflow import VerificationReason, verify_manifest_split
+
+    (frozen_split / "assignments.parquet").unlink()
+    (frozen_split / "development.parquet").unlink()
+    report = verify_manifest_split(frozen_split)
+    assert {(f.uri, f.reason) for f in report.findings} == {
+        ("assignments.parquet", VerificationReason.MISSING),
+        ("development.parquet", VerificationReason.MISSING),
+    }
+
+
+@pytest.mark.parametrize(
+    "change, message",
+    [
+        ("missing", "receipt.json"),
+        ("json", "receipt.json"),
+        ("object", "JSON object"),
+        ("version", "schema_version"),
+        ("bool_version", "schema_version"),
+        ("algorithm", "algorithm"),
+        ("path", "partition"),
+        ("reserved", "partition"),
+        ("duplicate", "partition"),
+        ("hash", "sha256"),
+        ("partition_hash", "sha256"),
+        ("partitions", "partitions"),
+    ],
+)
+def test_verify_rejects_invalid_receipt(frozen_split: Path, change: str, message: str) -> None:
+    from hflow import verify_manifest_split
+
+    marker = frozen_split / "receipt.json"
+    receipt = json.loads(marker.read_text())
+    if change == "missing":
+        marker.unlink()
+    elif change == "json":
+        marker.write_text("{")
+    elif change == "object":
+        marker.write_text("[]")
+    else:
+        if change == "version":
+            receipt["schema_version"] = 99
+        elif change == "bool_version":
+            receipt["schema_version"] = True
+        elif change == "algorithm":
+            receipt["algorithm"] = "unknown"
+        elif change == "path":
+            receipt["partitions"][0]["name"] = "../sibling"
+        elif change == "reserved":
+            receipt["partitions"][0]["name"] = "assignments"
+        elif change == "duplicate":
+            receipt["partitions"][1]["name"] = receipt["partitions"][0]["name"]
+        elif change == "hash":
+            receipt["assignments_sha256"] = "bad"
+        elif change == "partition_hash":
+            receipt["partitions"][0]["sha256"] = None
+        elif change == "partitions":
+            receipt["partitions"] = []
+        marker.write_text(json.dumps(receipt))
+    with pytest.raises((ValueError, OSError), match=message):
+        verify_manifest_split(frozen_split)
+    result = _verify_cli(frozen_split)
+    assert result.returncode == 2
+    assert message in result.stderr
+
+
+@pytest.mark.parametrize("name", ["receipt.json", "assignments.parquet", "train.parquet"])
+def test_verify_refuses_sibling_symlink(frozen_split: Path, name: str) -> None:
+    from hflow import verify_manifest_split
+
+    original = frozen_split / name
+    sibling = frozen_split.parent / name
+    original.rename(sibling)
+    original.symlink_to(sibling)
+    with pytest.raises((ValueError, OSError), match=r"receipt|symlink|link"):
+        verify_manifest_split(frozen_split)
+    assert _verify_cli(frozen_split).returncode == 2
+
+
+def test_verify_custom_partition_names(tmp_path: Path) -> None:
+    from hflow import VerificationReason, verify_manifest_split
+
+    source = tmp_path / "source.parquet"
+    _write_manifest(source, [(str(i), f"r{i}", f"i{i}", i) for i in range(6)])
+    output = tmp_path / "split"
+    split_manifest(
+        source,
+        output,
+        settings=ManifestSplitSettings(
+            "sample_id",
+            ("recording_id",),
+            (ManifestPartition("search", 0.7), ManifestPartition("confirmation", 0.3)),
+        ),
+    )
+    assert verify_manifest_split(output).ok
+    (output / "confirmation.parquet").write_bytes(b"changed")
+    report = verify_manifest_split(output)
+    assert [(f.uri, f.reason) for f in report.findings] == [
+        ("confirmation.parquet", VerificationReason.CONTENT_ID_MISMATCH)
+    ]
+    assert _verify_cli(output).returncode == 1
+
+
+@pytest.mark.parametrize("name", ["receipt.json", "train.parquet"])
+def test_verify_refuses_nonregular_file(frozen_split: Path, name: str) -> None:
+    from hflow import verify_manifest_split
+
+    path = frozen_split / name
+    path.unlink()
+    path.mkdir()
+    with pytest.raises(ValueError, match="regular file"):
+        verify_manifest_split(frozen_split)
+    result = _verify_cli(frozen_split)
+    assert result.returncode == 2
+    assert "regular file" in result.stderr

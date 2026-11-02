@@ -7,20 +7,28 @@ infer missing identities, stratify labels, or read the HFlow episode catalog.
 
 from __future__ import annotations
 
+import errno
 import hashlib
+import io
 import json
 import math
+import os
 import re
 import shutil
+import stat
 import tempfile
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import duckdb
 
 from hflow._manifest_parquet_schema import _reject_ambiguous_column_names
 from hflow._version import __version__
+
+if TYPE_CHECKING:
+    from hflow.verification import VerificationReport
 
 MANIFEST_SPLIT_VERSION = 1
 
@@ -350,3 +358,104 @@ def split_manifest(
             except Exception:
                 shutil.rmtree(output_directory)
                 raise
+
+
+def verify_manifest_split(output_directory: Path | str) -> VerificationReport:
+    """Compare a frozen split's output bytes with its local receipt.
+
+    The input manifest is not needed. Extra files are ignored. The receipt is
+    unsigned, so matching hashes do not prove authenticity or prevent leakage.
+    Missing or malformed receipts raise; missing or changed outputs are findings.
+    """
+    from hflow.verification import (
+        VerificationFinding,
+        VerificationReason,
+        VerificationReport,
+        VerificationStatus,
+    )
+
+    directory = Path(output_directory)
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+
+    def open_member(name: str) -> io.BufferedReader:
+        # Each member is a single validated filename; refuse symlinks and FIFOs.
+        try:
+            descriptor = os.open(
+                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd
+            )
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise ValueError(f"{name}: symlink is not allowed") from error
+            raise
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            raise ValueError(f"{name}: expected a regular file")
+        return os.fdopen(descriptor, "rb")
+
+    try:
+        try:
+            with open_member("receipt.json") as marker:
+                receipt = json.load(marker)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise ValueError(f"receipt.json is unreadable: {error}") from error
+        if not isinstance(receipt, dict):
+            raise ValueError("receipt.json must be a JSON object")
+        version = receipt.get("schema_version")
+        if type(version) is not int or version != MANIFEST_SPLIT_VERSION:
+            raise ValueError(f"receipt.json has unsupported schema_version: {version!r}")
+        algorithm = receipt.get("algorithm")
+        if algorithm != "connected-groups-sha256-largest-remainder-v1":
+            raise ValueError(f"receipt.json has unsupported algorithm: {algorithm!r}")
+
+        def digest(value: object, field: str) -> str:
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise ValueError(f"receipt.json {field} must be a lowercase SHA-256 digest")
+            return value
+
+        claims = [
+            ("assignments.parquet", digest(receipt.get("assignments_sha256"), "assignments_sha256"))
+        ]
+        partitions = receipt.get("partitions")
+        if not isinstance(partitions, list) or len(partitions) < 2:
+            raise ValueError("receipt.json partitions must contain at least two entries")
+        names: set[str] = set()
+        for partition in partitions:
+            if not isinstance(partition, dict):
+                raise ValueError("receipt.json partition must be an object")
+            name = partition.get("name")
+            if (
+                not isinstance(name, str)
+                or not re.fullmatch(r"[a-z][a-z0-9_-]*", name)
+                or name == "assignments"
+                or name in names
+            ):
+                raise ValueError(f"receipt.json has invalid or duplicate partition name: {name!r}")
+            names.add(name)
+            claims.append(
+                (f"{name}.parquet", digest(partition.get("sha256"), f"partition {name} sha256"))
+            )
+
+        findings: list[VerificationFinding] = []
+        for name, expected in claims:
+            try:
+                with open_member(name) as source:
+                    actual = hashlib.file_digest(source, "sha256").hexdigest()
+            except FileNotFoundError:
+                findings.append(
+                    VerificationFinding(
+                        name, VerificationReason.MISSING, "receipted file is missing"
+                    )
+                )
+                continue
+            if actual != expected:
+                findings.append(
+                    VerificationFinding(
+                        name,
+                        VerificationReason.CONTENT_ID_MISMATCH,
+                        f"sha256 {actual!r} != receipt sha256 {expected!r}",
+                    )
+                )
+        status = VerificationStatus.DAMAGED if findings else VerificationStatus.OK
+        return VerificationReport(status=status, findings=findings)
+    finally:
+        os.close(directory_fd)
