@@ -501,6 +501,82 @@ def test_dataset_snapshot_excludes_check_runs_without_a_committed_episode(tmp_pa
     ]
 
 
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit, OSError])
+@pytest.mark.parametrize("rename_phase", ["backup", "activation"])
+@pytest.mark.parametrize("after_rename", [False, True])
+def test_snapshot_overwrite_keeps_a_valid_delivery_when_activation_is_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[BaseException],
+    rename_phase: str,
+    after_rename: bool,
+) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    append_snapshot_episode(catalog, tmp_path, name="original", score=0.1, with_media=True)
+    destination = tmp_path / "snapshot"
+    hflow.export_dataset_snapshot(
+        catalog.root, destination, media_mode=hflow.SnapshotMediaMode.COPY
+    )
+    original_files = {
+        path.relative_to(destination): path.read_bytes()
+        for path in destination.rglob("*")
+        if path.is_file()
+    }
+    append_snapshot_episode(catalog, tmp_path, name="added", score=0.9, with_media=False)
+    real_replace = Path.replace
+    interrupted = False
+
+    def interrupt_rename(path: Path, target: Path) -> Path:
+        nonlocal interrupted
+        is_target_rename = (
+            path == destination
+            if rename_phase == "backup"
+            else path.name.startswith(".snapshot.staging-")
+        )
+        if is_target_rename and not interrupted:
+            interrupted = True
+            if after_rename:
+                real_replace(path, target)
+            raise error_type("interrupted snapshot activation")
+        return real_replace(path, target)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(Path, "replace", interrupt_rename)
+        with pytest.raises(error_type, match="interrupted snapshot activation"):
+            hflow.export_dataset_snapshot(
+                catalog.root,
+                destination,
+                media_mode=hflow.SnapshotMediaMode.COPY,
+                overwrite=True,
+            )
+
+    assert interrupted
+    assert hflow.verify_dataset_snapshot(destination).ok
+    backups = list(tmp_path.glob(".snapshot.previous-*"))
+    activated = rename_phase == "activation" and after_rename
+    if activated:
+        assert len(backups) == 1
+        previous = backups[0]
+        assert duckdb.read_parquet(str(destination / "samples.parquet")).count("*").fetchall() == [
+            (2,)
+        ]
+    else:
+        assert not backups
+        previous = destination
+    assert {
+        path.relative_to(previous): path.read_bytes()
+        for path in previous.rglob("*")
+        if path.is_file()
+    } == original_files
+    assert not list(tmp_path.glob(".snapshot.staging-*"))
+    # An interrupted overwrite must not prevent the next normal export.
+    report = hflow.export_dataset_snapshot(
+        catalog.root, destination, media_mode=hflow.SnapshotMediaMode.COPY, overwrite=True
+    )
+    assert report.episode_count == 2
+    assert hflow.verify_dataset_snapshot(destination).ok
+
+
 def test_dataset_snapshot_reports_retained_backup_when_cleanup_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

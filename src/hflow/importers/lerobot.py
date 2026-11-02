@@ -898,7 +898,7 @@ def import_lerobot_dataset(
     dataset_repo: str = DEFAULT_REPO,
     revision: str = DEFAULT_REVISION,
     output_dir: Path | str | StorageRoot = DEFAULT_OUTPUT_DIR,
-    episode_index: int | None = None,
+    episode_index: int | Sequence[int] | None = None,
     camera_keys: str | Sequence[str] = (DEFAULT_CAMERA_KEY,),
 ) -> list[str]:
     """Import selected LeRobot Dataset v3 episodes as canonical MCAP.
@@ -908,7 +908,8 @@ def import_lerobot_dataset(
     commit before downloading data and records that commit in episode
     metadata and the prepared manifest. ``camera_keys`` accepts a sequence of
     camera features; a comma-separated string is accepted for compatibility.
-    When ``episode_index`` is omitted, every episode is imported.
+    ``episode_index`` selects one zero-based episode or a sequence of them;
+    when it is omitted, every episode is imported.
 
     ``output_dir`` is any HFlow data root: a local directory or an object-store
     prefix (``s3://``, ``gs://``, ``az://``). Hugging Face downloads and MCAP
@@ -945,10 +946,25 @@ def import_lerobot_dataset(
         raise ValueError("dataset_repo must not be empty")
     if not normalized_revision:
         raise ValueError("revision must not be empty")
-    if episode_index is not None and (
-        isinstance(episode_index, bool) or not isinstance(episode_index, int) or episode_index < 0
-    ):
-        raise ValueError("episode_index must be zero or greater")
+    requested_episode_indexes: tuple[int, ...] | None = None
+    if episode_index is not None:
+        if isinstance(episode_index, int):
+            requested_episode_indexes = (episode_index,)
+        elif isinstance(episode_index, Sequence) and not isinstance(episode_index, str):
+            requested_episode_indexes = tuple(episode_index)
+        else:
+            raise ValueError("episode_index must be zero or greater")
+        if not requested_episode_indexes:
+            raise ValueError("episode_index must name at least one episode")
+        for requested_index in requested_episode_indexes:
+            if (
+                isinstance(requested_index, bool)
+                or not isinstance(requested_index, int)
+                or requested_index < 0
+            ):
+                raise ValueError("episode_index must be zero or greater")
+        if len(set(requested_episode_indexes)) != len(requested_episode_indexes):
+            raise ValueError("episode_index must not contain duplicates")
 
     camera_key_arguments = (camera_keys,) if isinstance(camera_keys, str) else camera_keys
     resolved_camera_keys = tuple(
@@ -974,6 +990,13 @@ def import_lerobot_dataset(
     )
 
     dataset_information = source_archive.dataset_information
+    if not source_archive.video_keys:
+        # -- an image-only dataset used to be refused by camera key, naming the default the user
+        # -- never passed; the missing capability is the video features, not that key --
+        raise ValueError(
+            f"dataset '{normalized_dataset_repo}' has no video features: image-only LeRobot "
+            "datasets are not supported (camera keys are the dataset's video features)"
+        )
     for camera_key in resolved_camera_keys:
         if camera_key not in source_archive.video_keys:
             raise ValueError(
@@ -1003,12 +1026,16 @@ def import_lerobot_dataset(
         )
 
     episode_rows = source_archive.episodes
-    if episode_index is not None and episode_index >= len(episode_rows):
-        raise ValueError(
-            f"episode_index {episode_index} is out of range for {len(episode_rows)} episode(s)"
-        )
+    for requested_index in requested_episode_indexes or ():
+        if requested_index >= len(episode_rows):
+            raise ValueError(
+                f"episode_index {requested_index} is out of range for "
+                f"{len(episode_rows)} episode(s)"
+            )
     selected_episode_indexes = (
-        [episode_index] if episode_index is not None else list(range(len(episode_rows)))
+        list(requested_episode_indexes)
+        if requested_episode_indexes is not None
+        else list(range(len(episode_rows)))
     )
     published_episodes: list[_PublishedEpisode] = []
     episodes_converted = 0

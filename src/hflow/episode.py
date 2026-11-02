@@ -29,7 +29,7 @@ import numpy as np
 from mcap.records import Attachment, Schema
 
 from hflow import video as video_module
-from hflow.ffmpeg import ffmpeg_path
+from hflow.ffmpeg import ffmpeg_path, ffprobe_path
 from hflow.ffmpeg._binary import _ffmpeg_filter_script_flag
 from hflow.format import (
     CAMERA_SCHEMA_NAMES,
@@ -92,8 +92,9 @@ def _sanitize_topic(topic: str) -> str:
 
 # The cache directory name is the cache key, so the layout tag retires every
 # directory written before the selection moved to timestamps (#727): those hold
-# the decoded-counter pictures, which are shifted after a lost keyframe.
-_FRAMES_AT_INDICES_CACHE_LAYOUT = "v2-time"
+# the decoded-counter pictures, which are shifted after a lost keyframe. "v3"
+# also retires caches that hold a concealed picture after a lost keyframe.
+_FRAMES_AT_INDICES_CACHE_LAYOUT = "v3-clean"
 
 
 def _frame_selection_expression(frame_indices: Sequence[int], *, fps: float) -> str:
@@ -161,6 +162,28 @@ def _decoded_frame_indices(framecrc_path: Path, *, source_fps: float) -> set[int
     if not timestamps:
         raise RuntimeError(f"No decoded frame timestamps in {framecrc_path}")
     return {round(timestamp * Fraction(str(source_fps))) for timestamp in timestamps}
+
+
+def _cleanly_decoded_frame_indices(
+    decoded_indices: set[int], *, keyframe_indices: frozenset[int], frame_count: int
+) -> set[int]:
+    """Keep the decoded positions whose whole reference chain was decoded.
+
+    Canonical video has no B-frames, so a picture depends on every picture since
+    its preceding keyframe. After a lost keyframe the decoder may still output a
+    dependent picture, concealed from an unrelated reference and carrying no
+    error flag (#727); it is trustworthy again only from the next keyframe.
+    """
+    clean_indices: set[int] = set()
+    reference_chain_intact = False
+    for frame_index in range(frame_count):
+        if frame_index in keyframe_indices:
+            reference_chain_intact = frame_index in decoded_indices
+        else:
+            reference_chain_intact = reference_chain_intact and frame_index in decoded_indices
+        if reference_chain_intact:
+            clean_indices.add(frame_index)
+    return clean_indices
 
 
 def _message_field_names(message: Any) -> list[str]:
@@ -477,6 +500,7 @@ class Episode:
         self._channel_log_times_by_id: dict[int, np.ndarray] = {}
         # Source frame rate per camera topic, recorded by video() for frames().
         self._video_fps: dict[str, float] = {}
+        self._keyframe_indices: dict[str, frozenset[int]] = {}
 
     @property
     def workdir(self) -> Path:
@@ -774,6 +798,54 @@ class Episode:
             output=output,
         )
 
+    def _keyframe_message_indices(self, topic: str) -> frozenset[int]:
+        """Message positions of the camera's keyframes.
+
+        Read from the remuxed MP4's packet flags rather than the recording, so
+        cached timestamps and a cached MP4 spare a second pass over the MCAP.
+        The remux copies one access unit per message, so packet *i* is message *i*.
+        """
+        cached = self._keyframe_indices.get(topic)
+        if cached is not None:
+            return cached
+        completed = subprocess.run(
+            [
+                str(ffprobe_path()),
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "packet=flags",
+                "-of",
+                "csv=p=0",
+                str(self.video(topic)),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"ffprobe could not read the packets of {topic!r}: {completed.stderr.strip()}"
+            )
+        self._keyframe_indices[topic] = frozenset(
+            packet_index
+            for packet_index, flags in enumerate(completed.stdout.split())
+            if flags.startswith("K")
+        )
+        return self._keyframe_indices[topic]
+
+    def _cleanly_decoded_indices(
+        self, topic: str, decoded_trace_path: Path, *, frame_count: int
+    ) -> set[int]:
+        """Source-frame positions the decoder reproduced from intact references."""
+        return _cleanly_decoded_frame_indices(
+            _decoded_frame_indices(decoded_trace_path, source_fps=self._video_fps[topic]),
+            keyframe_indices=self._keyframe_message_indices(topic),
+            frame_count=frame_count,
+        )
+
     def frames(
         self,
         camera: str | None = None,
@@ -790,7 +862,9 @@ class Episode:
         message it was extracted from, exact to within one source frame
         interval even across recording gaps. Samples whose source frames could
         not be decoded are omitted, so damaged recordings may return fewer
-        frames than the requested sampling ticks.
+        frames than the requested sampling ticks. So are samples of a picture
+        whose reference keyframe was lost: the decoder conceals those from an
+        unrelated picture.
         """
         topic = self._resolve_camera(camera)
         mp4 = self.video(topic)
@@ -800,7 +874,7 @@ class Episode:
         # requests would share one cache directory.
         end_label = f"{end_s:.6f}" if end_s is not None else "end"
         label = f"{_sanitize_topic(topic)}_f{fps:.6f}_s{window_start_s:.6f}_e{end_label}"
-        output_dir = self.workdir / f"frames_v2_{label}"
+        output_dir = self.workdir / f"frames_v3_{label}"
         if not output_dir.exists():
             # Extract into a unique temp dir and rename on success: a bare directory
             # is the cache key, so a failed run must never leave one behind.
@@ -846,11 +920,11 @@ class Episode:
                         f"ffmpeg frame extraction produced no frames for {topic!r} "
                         f"(exit {completed.returncode}): {stderr_tail}"
                     )
-                decoded_indices = _decoded_frame_indices(
-                    staging_dir / "decoded.framecrc", source_fps=self._video_fps[topic]
-                )
                 source_count = len(
                     self._channel_log_times(self._resolve_channel_info(topic).channel_id)
+                )
+                decoded_indices = self._cleanly_decoded_indices(
+                    topic, staging_dir / "decoded.framecrc", frame_count=source_count
                 )
                 sample_rate = Fraction(f"{fps:g}")
                 first_tick = math.ceil(Fraction(f"{window_start_s:.6f}") * sample_rate)
@@ -912,7 +986,10 @@ class Episode:
         This accessor is intended for labeled datasets whose annotations refer
         to source frame numbers rather than a sampling rate. Indices must be
         unique and ascending so returned paths and source log times have an
-        unambiguous one-to-one order.
+        unambiguous one-to-one order. A request that names a frame the camera
+        cannot decode cleanly (its reference keyframe is missing) raises
+        ``RuntimeError`` naming those indices, rather than returning a concealed
+        picture under the requested message's log time.
         """
 
         selected_frame_indices = [
@@ -982,6 +1059,19 @@ class Episode:
                     "-start_number",
                     "0",
                     str(staging_directory / "frame_%06d.jpg"),
+                    "-map",
+                    "0:v:0",
+                    "-c:v",
+                    "rawvideo",
+                    "-enc_time_base",
+                    "1:1000000",
+                    "-fps_mode",
+                    "passthrough",
+                    "-to",
+                    f"{(final_frame_index + 0.5) / self._video_fps[topic]:.17g}",
+                    "-f",
+                    "framecrc",
+                    str(staging_directory / "decoded.framecrc"),
                 ]
                 completed_process = subprocess.run(
                     command,
@@ -990,6 +1080,23 @@ class Episode:
                     check=False,
                 )
                 staged_frame_paths = sorted(staging_directory.glob("frame_*.jpg"))
+                decoded_trace_path = staging_directory / "decoded.framecrc"
+                if decoded_trace_path.exists():
+                    clean_indices = self._cleanly_decoded_indices(
+                        topic, decoded_trace_path, frame_count=len(camera_log_times)
+                    )
+                    unclean_indices = [
+                        frame_index
+                        for frame_index in selected_frame_indices
+                        if frame_index not in clean_indices
+                    ]
+                    if unclean_indices:
+                        raise RuntimeError(
+                            f"frame indices {unclean_indices} of {topic!r} cannot be decoded "
+                            "cleanly: the keyframe they depend on is missing from the "
+                            "recording, so the decoder drops or conceals them"
+                        )
+                    decoded_trace_path.unlink()
                 if completed_process.returncode != 0 or len(staged_frame_paths) != len(
                     selected_frame_indices
                 ):

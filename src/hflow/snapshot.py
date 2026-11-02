@@ -748,11 +748,18 @@ def _activate_staged_export(
             previous_directory = validated_output_directory.with_name(
                 f".{validated_output_directory.name}.previous-{uuid4().hex}"
             )
-            validated_output_directory.replace(previous_directory)
     try:
-        staging_directory.replace(validated_output_directory)
-    except Exception:
         if previous_directory is not None:
+            validated_output_directory.replace(previous_directory)
+        staging_directory.replace(validated_output_directory)
+    except BaseException:
+        # A signal can arrive after either rename succeeds. Restore the old
+        # export only while its destination is absent; a live replacement stays.
+        if (
+            previous_directory is not None
+            and previous_directory.exists()
+            and not validated_output_directory.exists()
+        ):
             previous_directory.replace(validated_output_directory)
         raise
     if previous_directory is not None:
@@ -794,7 +801,9 @@ def export_dataset_snapshot(
     The completed directory appears atomically. Existing destinations are
     refused unless ``overwrite=True`` and ``format.json`` identifies a
     supported HFlow dataset snapshot; even then, the prior export remains in
-    place until the replacement is fully staged.
+    place until the replacement is fully staged. An exception or cancellation
+    during activation restores the prior export if the replacement is not yet
+    live; once activated, the new export stays in place.
     """
     resolved_media_mode = SnapshotMediaMode(media_mode)
     resolved_output_directory = Path(output_directory)
@@ -968,6 +977,7 @@ def verify_dataset_snapshot(
 
     if not resolved_directory.is_dir():
         raise NotADirectoryError(f"snapshot directory does not exist: {resolved_directory}")
+    resolved_snapshot_root = resolved_directory.resolve()
     marker_path = resolved_directory / "format.json"
     if not marker_path.is_file():
         raise FileNotFoundError(f"no format.json in {resolved_directory}; not a dataset snapshot")
@@ -1065,6 +1075,18 @@ def verify_dataset_snapshot(
                 "no Windows drive letter); refused before any file read"
             ) from error
         delivered_path = resolved_directory / relative_path
+        try:
+            resolved_delivered_path = delivered_path.resolve()
+        except (OSError, RuntimeError) as error:
+            raise ValueError(
+                f"format.json integrity receipt path {relative_path!r} cannot be resolved "
+                "inside the handed snapshot directory"
+            ) from error
+        if not resolved_delivered_path.is_relative_to(resolved_snapshot_root):
+            raise ValueError(
+                f"format.json integrity receipt path {relative_path!r} must resolve "
+                "under the handed snapshot directory; refused before any file read"
+            )
         if not delivered_path.is_file():
             findings.append(
                 VerificationFinding(

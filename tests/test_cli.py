@@ -406,3 +406,33 @@ def test_cli_curate_file_output_scheme_is_case_insensitive(tmp_path: Path) -> No
         )
         assert result == 0
         assert manifest.is_file()
+
+
+def test_import_lerobot_cli_passes_every_repeated_episode_index(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    received: dict[str, object] = {}
+
+    def record(**kwargs: object) -> list[str]:
+        received.update(kwargs)
+        return []
+
+    monkeypatch.setattr("hflow.importers.lerobot.import_lerobot_dataset", record)
+
+    exit_code = main(
+        [
+            "import",
+            "lerobot",
+            "--repo",
+            "lerobot/pusht",
+            "--output-dir",
+            str(tmp_path),
+            "--episode-index",
+            "0",
+            "--episode-index",
+            "4",
+        ]
+    )
+
+    assert exit_code == 0
+    assert received["episode_index"] == [0, 4]

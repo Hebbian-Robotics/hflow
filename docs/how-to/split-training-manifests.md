@@ -99,8 +99,27 @@ The output directory must not exist. Files are written under an exclusively
 created directory, with the receipt written last. Ordinary failures remove
 that directory. Process termination can leave an incomplete directory: a
 directory without a receipt is not a completed split. Readers must wait for
-successful return; publication of the directory is not atomic and the receipt
-is not an independent verifier of later file changes.
+successful return; publication of the directory is not atomic.
+
+## Verify a frozen split
+
+Run the verifier after copying or moving the split:
+
+```bash
+hflow verify manifest-split frozen-splits
+```
+
+Or call `hflow.verify_manifest_split(Path("frozen-splits"))` and inspect its
+`VerificationReport`. The verifier compares the SHA-256 digest of
+`assignments.parquet` and every partition listed in the receipt. The original
+input is not required, and unrelated files are ignored. Symbolic links for
+the receipt or claimed files are refused. The command exits 0 for matching
+files, 1 for missing or changed files, and 2 for an unreadable or invalid
+receipt or directory.
+
+This checks bytes against the receipt, not whether the declared relationships
+prevent leakage. The receipt is unsigned and can be changed alongside the
+files, so matching hashes do not establish authenticity.
 
 HFlow still ends at curated data and manifests. Model-specific export,
 training, and autoresearch orchestration remain downstream; see
