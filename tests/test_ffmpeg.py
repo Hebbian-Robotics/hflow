@@ -51,6 +51,7 @@ from hflow._video_measurements._frame_statistics import (
 from hflow._video_measurements._raw_frames import (
     RawFrameError,
     _decoded_frame_hashes,
+    _first_sample_index,
     _scaled_frame_shape,
     luma_frames,
     rgb_frames,
@@ -125,6 +126,55 @@ def test_rgb_frame_hash_trace_waits_after_successful_eof(monkeypatch: pytest.Mon
     assert decoded_indices == [0]
     assert hashes == {0: {"digest"}}
     assert not process.terminated
+
+
+def test_rgb_frame_hash_trace_preserves_nonzero_source_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HashProcess:
+        def __init__(self) -> None:
+            self.stdout = io.StringIO(
+                "#tb 0: 1/1000000\n"
+                "0, 0, 1000000, 33333, 1, first\n"
+                "0, 1000000, 1033333, 33333, 1, second\n"
+            )
+
+        def poll(self) -> int:
+            return 0
+
+        def wait(self) -> int:
+            return 0
+
+    process = HashProcess()
+    monkeypatch.setattr(
+        "hflow._video_measurements._raw_frames.subprocess.Popen",
+        lambda *args, **kwargs: process,
+    )
+    toolchain = cast(VideoMeasurementToolchain, SimpleNamespace(ffmpeg_executable=Path("ffmpeg")))
+
+    decoded_indices, hashes = _decoded_frame_hashes(
+        Path("video.mp4"),
+        toolchain=toolchain,
+        filter_graph="format=pix_fmts=rgb24",
+        source_fps=30.0,
+        sample_fps=30.0,
+    )
+
+    assert decoded_indices == [30, 31]
+    assert hashes == {30: {"first"}, 31: {"second"}}
+
+
+@pytest.mark.parametrize(
+    ("first_source_index", "source_fps", "sample_fps", "expected_sample_index"),
+    [(10, 30.0, 30.0, 10), (11, 30.0, 3.0, 2), (10, 30.0, 40.0, 14)],
+)
+def test_first_sample_index_keeps_the_original_sampling_grid(
+    first_source_index: int,
+    source_fps: float,
+    sample_fps: float,
+    expected_sample_index: int,
+) -> None:
+    assert _first_sample_index(first_source_index, source_fps, sample_fps) == expected_sample_index
 
 
 def _measure_frame_statistics(

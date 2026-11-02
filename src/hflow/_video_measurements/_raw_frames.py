@@ -7,6 +7,7 @@ from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from fractions import Fraction
+from math import ceil
 from pathlib import Path
 
 import numpy as np
@@ -150,6 +151,13 @@ def _sample_source_frame_index(sample_index: int, source_fps: float, sample_fps:
     return int(sample_index * source_fps / sample_fps + 1e-6)
 
 
+def _first_sample_index(source_frame_index: int, source_fps: float, sample_fps: float) -> int:
+    """Map a stream's first decoded position to the first possible sampling tick."""
+    return ceil(
+        Fraction(source_frame_index) * Fraction(str(sample_fps)) / Fraction(str(source_fps))
+    )
+
+
 def _decoded_frame_hashes(
     video: Path,
     *,
@@ -188,7 +196,6 @@ def _decoded_frame_hashes(
         command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
     )
     time_base: Fraction | None = None
-    origin: Fraction | None = None
     decoded_indices: list[int] = []
     hashes: dict[int, set[str]] = {}
     reached_end_of_stream = False
@@ -203,9 +210,7 @@ def _decoded_frame_hashes(
                 if time_base is None or len(fields) < 6 or fields[0].strip() != "0":
                     raise ValueError("invalid frame hash record")
                 timestamp = int(fields[2].strip()) * time_base
-                if origin is None:
-                    origin = timestamp
-                source_index = round((timestamp - origin) * Fraction(str(source_fps)))
+                source_index = round(timestamp * Fraction(str(source_fps)))
                 decoded_indices.append(source_index)
                 digest = fields[5].strip()
                 if sample_fps is None:
@@ -234,7 +239,7 @@ def _decoded_frame_hashes(
 
     if return_code != 0:
         raise RawFrameError(f"ffmpeg failed to trace decoded frames for {video}")
-    if origin is None:
+    if not decoded_indices:
         raise RawFrameError(f"No decoded frame timestamps for {video}")
     return decoded_indices, hashes
 
@@ -420,7 +425,11 @@ def rgb_frames(
                     )
                 return
 
-            for sample_index, pixels in enumerate(candidate_frames):
+            first_sample_index = _first_sample_index(
+                decoded_indices[0], source_fps, effective_sample_fps
+            )
+            for sample_offset, pixels in enumerate(candidate_frames):
+                sample_index = first_sample_index + sample_offset
                 source_frame_index = _sample_source_frame_index(
                     sample_index, source_fps, effective_sample_fps
                 )
