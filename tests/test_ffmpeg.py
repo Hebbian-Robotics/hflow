@@ -122,7 +122,7 @@ def test_rgb_frame_hash_trace_waits_after_successful_eof(monkeypatch: pytest.Mon
         sample_fps=30.0,
     )
 
-    assert decoded_indices == []
+    assert decoded_indices == [0]
     assert hashes == {0: {"digest"}}
     assert not process.terminated
 

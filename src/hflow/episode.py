@@ -29,6 +29,7 @@ import numpy as np
 from mcap.records import Attachment, Schema
 
 from hflow import video as video_module
+from hflow._video_measurements._frame_integrity import cleanly_decoded_frame_indices
 from hflow.ffmpeg import ffmpeg_path, ffprobe_path
 from hflow.ffmpeg._binary import _ffmpeg_filter_script_flag
 from hflow.format import (
@@ -162,28 +163,6 @@ def _decoded_frame_indices(framecrc_path: Path, *, source_fps: float) -> set[int
     if not timestamps:
         raise RuntimeError(f"No decoded frame timestamps in {framecrc_path}")
     return {round(timestamp * Fraction(str(source_fps))) for timestamp in timestamps}
-
-
-def _cleanly_decoded_frame_indices(
-    decoded_indices: set[int], *, keyframe_indices: frozenset[int], frame_count: int
-) -> set[int]:
-    """Keep the decoded positions whose whole reference chain was decoded.
-
-    Canonical video has no B-frames, so a picture depends on every picture since
-    its preceding keyframe. After a lost keyframe the decoder may still output a
-    dependent picture, concealed from an unrelated reference and carrying no
-    error flag (#727); it is trustworthy again only from the next keyframe.
-    """
-    clean_indices: set[int] = set()
-    reference_chain_intact = False
-    for frame_index in range(frame_count):
-        if frame_index in keyframe_indices:
-            reference_chain_intact = frame_index in decoded_indices
-        else:
-            reference_chain_intact = reference_chain_intact and frame_index in decoded_indices
-        if reference_chain_intact:
-            clean_indices.add(frame_index)
-    return clean_indices
 
 
 def _message_field_names(message: Any) -> list[str]:
@@ -840,7 +819,7 @@ class Episode:
         self, topic: str, decoded_trace_path: Path, *, frame_count: int
     ) -> set[int]:
         """Source-frame positions the decoder reproduced from intact references."""
-        return _cleanly_decoded_frame_indices(
+        return cleanly_decoded_frame_indices(
             _decoded_frame_indices(decoded_trace_path, source_fps=self._video_fps[topic]),
             keyframe_indices=self._keyframe_message_indices(topic),
             frame_count=frame_count,

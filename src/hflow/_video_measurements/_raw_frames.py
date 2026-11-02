@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ._frame_integrity import cleanly_decoded_frame_indices
 from ._toolchain import VideoMeasurementToolchain
 
 
@@ -110,6 +111,40 @@ def _probe_frame_rate(video: Path, toolchain: VideoMeasurementToolchain) -> floa
     return float(rate)
 
 
+def _probe_keyframe_indices(video: Path, toolchain: VideoMeasurementToolchain) -> frozenset[int]:
+    """Return source packet positions marked as keyframes in the remuxed MP4."""
+    completed_process = subprocess.run(
+        [
+            str(toolchain.ffprobe_executable),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "packet=flags",
+            "-of",
+            "csv=p=0",
+            str(video),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed_process.returncode != 0:
+        raise RawFrameError(
+            f"ffprobe failed to read keyframes for {video}: {completed_process.stderr.strip()}"
+        )
+    keyframe_indices = frozenset(
+        packet_index
+        for packet_index, flags in enumerate(completed_process.stdout.split())
+        if flags.startswith("K")
+    )
+    if not keyframe_indices:
+        raise RawFrameError(f"ffprobe reported no keyframes for {video}")
+    return keyframe_indices
+
+
 def _sample_source_frame_index(sample_index: int, source_fps: float, sample_fps: float) -> int:
     """Map an output tick to the source frame visible at that tick."""
     return int(sample_index * source_fps / sample_fps + 1e-6)
@@ -171,10 +206,11 @@ def _decoded_frame_hashes(
                 if origin is None:
                     origin = timestamp
                 source_index = round((timestamp - origin) * Fraction(str(source_fps)))
+                decoded_indices.append(source_index)
                 digest = fields[5].strip()
                 if sample_fps is None:
-                    decoded_indices.append(source_index)
-                elif sample_fps >= source_fps:
+                    continue
+                if sample_fps >= source_fps:
                     hashes.setdefault(source_index, set()).add(digest)
                 else:
                     center = int(source_index * sample_fps / source_fps)
@@ -349,6 +385,11 @@ def rgb_frames(
         source_fps=source_fps,
         sample_fps=effective_sample_fps,
     )
+    clean_decoded_indices = cleanly_decoded_frame_indices(
+        set(decoded_indices),
+        keyframe_indices=_probe_keyframe_indices(video, toolchain),
+        frame_count=max(decoded_indices) + 1,
+    )
 
     with _raw_frame_stream(
         video,
@@ -359,19 +400,22 @@ def rgb_frames(
 
         def read_frames() -> Iterator[SampledRGBFrame]:
             if effective_sample_fps is None:
-                sample_count = 0
+                decoded_frame_count = 0
                 for sample_index, pixels in enumerate(candidate_frames):
                     if sample_index >= len(decoded_indices):
                         raise RawFrameError(f"ffmpeg produced extra RGB frames for {video}")
-                    sample_count += 1
+                    decoded_frame_count += 1
+                    source_frame_index = decoded_indices[sample_index]
+                    if source_frame_index not in clean_decoded_indices:
+                        continue
                     yield SampledRGBFrame(
-                        sample_index=sample_index,
-                        source_frame_index=decoded_indices[sample_index],
+                        sample_index=source_frame_index,
+                        source_frame_index=source_frame_index,
                         pixels=pixels,
                     )
-                if len(decoded_indices) != sample_count:
+                if len(decoded_indices) != decoded_frame_count:
                     raise RawFrameError(
-                        f"ffmpeg produced {sample_count} RGB frames but recorded "
+                        f"ffmpeg produced {decoded_frame_count} RGB frames but recorded "
                         f"{len(decoded_indices)} decoded frame timestamps for {video}"
                     )
                 return
@@ -380,6 +424,8 @@ def rgb_frames(
                 source_frame_index = _sample_source_frame_index(
                     sample_index, source_fps, effective_sample_fps
                 )
+                if source_frame_index not in clean_decoded_indices:
+                    continue
                 if hashlib.sha256(memoryview(pixels)).hexdigest() not in decoded_hashes.get(
                     source_frame_index, set()
                 ):

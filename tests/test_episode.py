@@ -209,22 +209,20 @@ def test_rgb_frames_omit_repeats_and_keep_sample_positions_after_lost_keyframe(
             samples = list(frames)
 
     by_sample_index = {sample.sample_index: sample for sample in samples}
-    # The missing IDR leaves these requested messages undecodable. FFmpeg's
-    # fps filter repeats the last good image there; do not return it as a new
-    # sample. The concealed picture at the next timestamp is a separate H.264
-    # validation problem tracked by #727.
-    assert set(range(100, 108)).isdisjoint(by_sample_index)
+    # The missing IDR leaves these requested messages undecodable, and the
+    # decoder also conceals the picture after them. Neither may be attributed
+    # to the wrong source time.
+    assert set(range(100, 109)).isdisjoint(by_sample_index)
     assert 120 in by_sample_index
     assert all(sample.source_frame_index == sample.sample_index for sample in samples)
     for sample in samples:
-        if sample.source_frame_index >= 120:
-            assert (
-                abs(
-                    _number_in_rgb_frame(sample)
-                    - _source_frame_number(source_times[sample.source_frame_index])
-                )
-                <= 1
+        assert (
+            abs(
+                _number_in_rgb_frame(sample)
+                - _source_frame_number(source_times[sample.source_frame_index])
             )
+            <= 1
+        ), sample
 
 
 @pytest.mark.requires_system_ffmpeg
