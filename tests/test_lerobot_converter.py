@@ -829,6 +829,59 @@ def test_window_times_are_count_anchored_not_boundary_filtered(
         )
 
 
+def test_window_start_rejects_the_previous_episodes_last_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A packet one frame period before the window start belongs to the
+    previous episode. A full-period tolerance admitted it whenever float
+    rounding landed it a hair above the boundary, so frame zero became the
+    previous episode's last frame and the timestamp check refused the
+    episode: 15 of the 100 droid_100 episodes failed that way at 15 fps.
+    Half a period admits only what quantization could have moved into the
+    window.
+    """
+    fps = 15.0
+    frame_period = 1.0 / fps
+    start_seconds = 100.0
+    frame_count = 90
+    # The previous episode's last packet, a full period before the window
+    # start and a hair inside a full-period tolerance.
+    previous_episode_last = start_seconds - 0.066666
+    assert previous_episode_last >= start_seconds - frame_period
+
+    packets = [previous_episode_last] + [
+        start_seconds + index / fps for index in range(frame_count)
+    ]
+    monkeypatch.setattr(prep, "_get_video_pts_times", lambda _path: packets)
+    rebased = prep._relative_video_pts_times(
+        Path("chunk.mp4"),
+        start_seconds,
+        start_seconds + frame_count / fps,
+        frame_count,
+        fps,
+    )
+    assert len(rebased) == frame_count
+    assert rebased[0] == 0.0
+    assert rebased[-1] == pytest.approx((frame_count - 1) / fps)
+
+    # Quantization that moves the episode's true first packet earlier by less
+    # than half a period is still frame zero.
+    quantized_start = start_seconds - frame_period / 4
+    packets = [previous_episode_last] + [
+        quantized_start + index / fps for index in range(frame_count)
+    ]
+    monkeypatch.setattr(prep, "_get_video_pts_times", lambda _path: packets)
+    rebased = prep._relative_video_pts_times(
+        Path("chunk.mp4"),
+        start_seconds,
+        start_seconds + frame_count / fps,
+        frame_count,
+        fps,
+    )
+    assert rebased[0] == pytest.approx(-frame_period / 4)
+    assert len(rebased) == frame_count
+
+
 @pytest.mark.parametrize(
     "bad_fps",
     [

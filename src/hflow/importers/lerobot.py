@@ -430,16 +430,25 @@ def _relative_video_pts_times(
     """Packet times of an episode window, rebased to the window start.
 
     The window anchors on the left: the first ``frame_count`` packets at or
-    within one frame period of ``start_seconds`` are the episode's frames.
-    Container timestamps are quantized while the metadata window is exact,
-    so a half-open ``[start, end)`` filter over the raw times drags the next
-    episode's first frame in or drops this episode's last frame by one; the
-    data row count is the window's true extent on both edges, and the
-    per-frame timestamp check downstream still validates the alignment.
+    after the window start, within half a frame period of it, are the
+    episode's frames. Container timestamps are quantized while the metadata
+    window is exact, so a half-open ``[start, end)`` filter over the raw times
+    drags the next episode's first frame in or drops this episode's last
+    frame by one; the data row count is the window's true extent on both
+    edges, and the per-frame timestamp check downstream still validates the
+    alignment.
+
+    The tolerance is half a period rather than a whole one. Quantization can
+    move a packet timestamp by up to half a period, so half is the widest
+    bound that still leaves the previous episode's last packet outside the
+    window: that packet sits a full period before the start, and a
+    full-period tolerance admits it whenever rounding lands it a hair above
+    the boundary, which shifts every frame of the episode by one.
     """
     frame_period = 1.0 / frames_per_second
     times = _get_video_pts_times(mp4_path)
-    windowed = [time for time in times if time >= start_seconds - frame_period]
+    earliest_packet_time = start_seconds - frame_period / 2
+    windowed = [time for time in times if time >= earliest_packet_time]
     if len(windowed) < frame_count:
         raise ValueError(
             f"video has {len(windowed)} packets at or after the window start "
@@ -1223,13 +1232,16 @@ def _convert_single_episode(
                 frame_count=frame_count,
                 seek_seconds=video_start_seconds,
             )
-            presentation_timestamps = _relative_video_pts_times(
-                local_video_path,
-                video_start_seconds,
-                video_end_seconds,
-                frame_count,
-                float(frames_per_second),
-            )
+            try:
+                presentation_timestamps = _relative_video_pts_times(
+                    local_video_path,
+                    video_start_seconds,
+                    video_end_seconds,
+                    frame_count,
+                    float(frames_per_second),
+                )
+            except ValueError as error:
+                raise ValueError(f"episode {episode_index}: {error}") from error
         else:
             access_units = _transcode_mp4_to_h264(
                 local_video_path, IMPORT_GOP_SECONDS, float(frames_per_second)
