@@ -141,7 +141,7 @@ line can read the object's bytes. Use it on hosts that do not run untrusted
 local users. Leaving the block waits for any read still in progress.
 
 What is read depends on the mode. `KEYFRAMES` reads the container header and
-the bytes from each bin start to its first keyframe. `UNIFORM`,
+the bytes from half a second before each bin start to its first keyframe. `UNIFORM`,
 `NEAREST_KEYFRAMES`, and a `KEYFRAMES_FIRST` fallback read the whole window.
 
 If your reader raises, the consuming call re-raises that exception, not

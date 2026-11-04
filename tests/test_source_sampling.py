@@ -89,6 +89,30 @@ def test_keyframes_preserve_timestamps_content_and_aspect_after_a_seek(
     assert hashlib.sha256(color_video.read_bytes()).digest() == original_digest
 
 
+@pytest.mark.parametrize("container", ["mp4", "ts"])
+def test_keyframes_at_bin_starts_are_found_when_decode_time_precedes_presentation(
+    color_video: Path, tmp_path: Path, container: str
+) -> None:
+    # With B-frames each keyframe decodes before it is presented. MPEG-TS has
+    # no index, so a probe that seeks to a bin start lands after a keyframe
+    # presented exactly there, and the sampler moved on to the next one.
+    source_path = tmp_path / f"colors.{container}"
+    subprocess.run(
+        [str(ffmpeg_path()), "-v", "error", "-i", str(color_video), "-c", "copy", str(source_path)],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    samples = sample_source_frames(
+        source_path,
+        tmp_path / "samples",
+        window=SourceWindow(0, 6000),
+        settings=SourceFrameSampling(mode=SourceSamplingMode.KEYFRAMES, maximum_frames=3),
+    )
+    assert [frame.timestamp_seconds for frame in samples.frames] == [0, 2, 4]
+    assert samples.actual_mode is SourceSamplingMode.KEYFRAMES
+
+
 @pytest.mark.parametrize("start_millis", [250, 251])
 def test_uniform_sampling_reports_actual_frames_instead_of_requested_ticks(
     color_video: Path, tmp_path: Path, start_millis: int

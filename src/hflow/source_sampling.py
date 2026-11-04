@@ -28,6 +28,12 @@ _TIME_BASE_PATTERN = re.compile(rb"\[Parsed_showinfo_[^\]]+\].*config in time_ba
 # The first keyframe probe after a bin start reads this much source time, and
 # doubles until it finds a keyframe or reaches the window end.
 _KEYFRAME_PROBE_SECONDS = Fraction(1, 2)
+# Each probe starts this much source time before its bin. Without an index
+# (MPEG-TS) ffprobe seeks by decode time, and with B-frames a keyframe decodes
+# before it is presented, so a seek to the bin start skips a keyframe presented
+# exactly there. FFmpeg's own -ss backs off for the same reason; half a second
+# covers reorder delays of a dozen frames at 25 fps.
+_KEYFRAME_PROBE_LEAD_IN_SECONDS = Fraction(1, 2)
 
 
 class SourceSamplingMode(StrEnum):
@@ -579,9 +585,9 @@ def _first_keyframe_in_each_bin(
 ) -> tuple[Fraction, ...]:
     """Select the first keyframe of each of ``maximum_frames`` equal bins, skipping empty bins.
 
-    Each bin is probed from its start, so ffprobe reads packets from the
-    keyframe before the bin start to the first keyframe inside it rather
-    than the whole window.
+    Each bin is probed from shortly before its start, so ffprobe reads packets
+    from the keyframe before the bin start to the first keyframe inside it
+    rather than the whole window.
     """
     start = Fraction(window.start_millis, 1000)
     end = Fraction(window.end_millis, 1000)
@@ -598,7 +604,7 @@ def _first_keyframe_in_each_bin(
                     source_input,
                     # An absolute end: an offset end would count from the keyframe the
                     # seek lands on, before the bin start, and stop short of the probe.
-                    f"{float(aligned_origin + bin_start):.9f}"
+                    f"{float(aligned_origin + bin_start - _KEYFRAME_PROBE_LEAD_IN_SECONDS):.9f}"
                     f"%{float(aligned_origin + bin_start + probe_seconds):.9f}",
                     executable=executable,
                     deadline=deadline,
