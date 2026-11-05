@@ -96,7 +96,7 @@ def test_keyframes_at_bin_starts_are_found_when_decode_time_precedes_presentatio
     # With B-frames each keyframe decodes before it is presented. MPEG-TS has
     # no index, so a probe that seeks to a bin start lands after a keyframe
     # presented exactly there, and the sampler moved on to the next one.
-    source_path = tmp_path / f"colors.{container}"
+    source_path = tmp_path / f"remuxed-colors.{container}"
     subprocess.run(
         [str(ffmpeg_path()), "-v", "error", "-i", str(color_video), "-c", "copy", str(source_path)],
         check=True,
