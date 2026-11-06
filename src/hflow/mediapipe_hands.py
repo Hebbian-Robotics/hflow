@@ -49,7 +49,7 @@ from hflow._video_measurements._raw_frames import rgb_frames
 from hflow.asyncio_utils import run_blocking
 from hflow.episode import Episode
 from hflow.steps import CheckResult, Interval, MeasurementValue
-from hflow.video import source_log_times_for_sampled_frames
+from hflow.video import source_indices_for_sampled_frames
 
 logger = logging.getLogger(__name__)
 
@@ -479,7 +479,34 @@ def _measure_mediapipe_hands(
                 minimum_tracking_confidence=minimum_tracking_confidence,
             )
 
-        summary = summarize_hand_detections(detections)
+        # The fps filter repeats the last decoded picture over messages the
+        # decoder dropped, and a concealed picture carries no error (#727).
+        # Neither shows its message, so neither is a sample of it.
+        source_indices = source_indices_for_sampled_frames(
+            len(stamps_ns),
+            source_fps=1.0 / median_interval_s,
+            sample_fps=sample_fps,
+            start_s=0.0,
+            frame_count=len(detections),
+        )
+        clean_indices = episode._cleanly_decoded_message_indices(topic)
+        # Runs of consecutive kept samples. An absence interval may not span a
+        # discarded stretch: the check saw nothing there to call absent.
+        clean_runs: list[list[tuple[int, FrameHandCounts]]] = []
+        previous_sample_index: int | None = None
+        for sample_index, (source_index, detection) in enumerate(
+            zip(source_indices, detections, strict=True)
+        ):
+            if source_index not in clean_indices:
+                continue
+            if previous_sample_index is None or sample_index != previous_sample_index + 1:
+                clean_runs.append([])
+            clean_runs[-1].append((int(stamps_ns[source_index]), detection))
+            previous_sample_index = sample_index
+
+        summary = summarize_hand_detections(
+            [detection for clean_run in clean_runs for _, detection in clean_run]
+        )
         measurements[f"{topic}/hand_detection_frame_count"] = summary.frame_count
         measurements[f"{topic}/hand_sample_fps"] = sample_fps
         if inference_long_edge_pixels is not None:
@@ -503,14 +530,12 @@ def _measure_mediapipe_hands(
                 f"{topic}/hand_model_digest": _resolved_hand_model_digest(),
             }
         )
-        log_times_ns = source_log_times_for_sampled_frames(
-            stamps_ns.tolist(),
-            source_fps=1.0 / median_interval_s,
-            sample_fps=sample_fps,
-            start_s=0.0,
-            frame_count=summary.frame_count,
-        )
-        intervals.extend(
-            _no_detection_intervals(log_times_ns, detections, f"no_hand_detected:{topic}")
-        )
+        for clean_run in clean_runs:
+            intervals.extend(
+                _no_detection_intervals(
+                    [log_time_ns for log_time_ns, _ in clean_run],
+                    [detection for _, detection in clean_run],
+                    f"no_hand_detected:{topic}",
+                )
+            )
     return CheckResult(measurements=measurements, intervals=intervals)

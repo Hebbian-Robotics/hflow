@@ -176,13 +176,40 @@ def source_log_times_for_sampled_frames(
         raise ValueError(
             f"source_fps and sample_fps must both be positive, got {source_fps} and {sample_fps}"
         )
-    last_source_index = len(source_timestamps_ns) - 1
-    log_times_ns: list[int] = []
-    for frame_index in range(frame_count):
-        output_time_s = start_s + frame_index / sample_fps
-        source_index = min(int(output_time_s * source_fps + 1e-6), last_source_index)
-        log_times_ns.append(int(source_timestamps_ns[source_index]))
-    return log_times_ns
+    source_indices = source_indices_for_sampled_frames(
+        len(source_timestamps_ns),
+        source_fps=source_fps,
+        sample_fps=sample_fps,
+        start_s=start_s,
+        frame_count=frame_count,
+    )
+    return [int(source_timestamps_ns[source_index]) for source_index in source_indices]
+
+
+def source_indices_for_sampled_frames(
+    source_count: int,
+    *,
+    source_fps: float,
+    sample_fps: float,
+    start_s: float,
+    frame_count: int,
+) -> list[int]:
+    """Positions of the source messages behind ``frame_count`` sampled frames.
+
+    The mapping :func:`source_log_times_for_sampled_frames` documents, as
+    message positions rather than log times.
+    """
+    if source_count == 0:
+        raise ValueError("cannot map sampled frames onto an empty source stream")
+    if source_fps <= 0 or sample_fps <= 0:
+        raise ValueError(
+            f"source_fps and sample_fps must both be positive, got {source_fps} and {sample_fps}"
+        )
+    last_source_index = source_count - 1
+    return [
+        min(int((start_s + frame_index / sample_fps) * source_fps + 1e-6), last_source_index)
+        for frame_index in range(frame_count)
+    ]
 
 
 def encode_images_to_h264(

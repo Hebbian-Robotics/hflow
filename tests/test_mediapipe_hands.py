@@ -19,8 +19,15 @@ import os
 from collections.abc import Iterator
 from pathlib import Path
 
+import numpy as np
 import pytest
-from episode_test_helpers import synthesize_canonical_episode
+from episode_test_helpers import (
+    NUMBERED_VIDEO_TOPIC,
+    number_in_luma,
+    source_frame_number,
+    synthesize_canonical_episode,
+    write_numbered_h264_episodes,
+)
 
 import hflow
 from hflow.mediapipe_hands import (
@@ -216,6 +223,77 @@ class TestRegistrationWithoutTheModel:
         )
         with hflow.Episode(canonical) as episode, pytest.raises(ValueError, match="sample_fps"):
             asyncio.run(mediapipe_hand_detection(episode, sample_fps=5000.0))
+
+
+@pytest.mark.requires_system_ffmpeg
+@pytest.mark.parametrize("sample_fps", [30.0, 10.0])
+def test_samples_after_a_lost_keyframe_are_not_attributed_to_other_pictures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sample_fps: float
+) -> None:
+    """Source IDR 100 is lost, so the decoder drops source frames 101..108 and
+    conceals 109 from an unrelated reference until the next keyframe, 110.
+
+    The fps filter fills the dropped sample times with the last decoded picture, 99.
+    Neither that repeat nor the concealed picture shows the message it would be
+    labelled with, so none may reach the counts, and no absence interval may
+    span them. The stand-in detector reports the frame number drawn into each
+    picture, so the samples handed on can be checked against their labels.
+    """
+    from hflow import mediapipe_hands
+
+    shown_numbers: dict[int, int] = {}
+
+    def numbers_shown(frames: Iterator[np.ndarray], **_: object) -> list[FrameHandCounts]:
+        # A hand everywhere except on pictures 95..99, just before the lost keyframe.
+        detections = []
+        for frame in frames:
+            number = number_in_luma(frame.mean(axis=2))
+            detection = _frame(0 if 95 <= number <= 99 else 1)
+            shown_numbers[id(detection)] = number
+            detections.append(detection)
+        return detections
+
+    labelled_samples: list[tuple[int, int]] = []
+    real_no_detection_intervals = mediapipe_hands._no_detection_intervals
+
+    def capture_samples(
+        log_times_ns: list[int], detections: list[FrameHandCounts], label: str
+    ) -> list[hflow.Interval]:
+        labelled_samples.extend(
+            (source_frame_number(log_time_ns), shown_numbers[id(detection)])
+            for log_time_ns, detection in zip(log_times_ns, detections, strict=True)
+        )
+        return real_no_detection_intervals(log_times_ns, detections, label)
+
+    monkeypatch.setattr(mediapipe_hands, "detect_hands_in_frames", numbers_shown)
+    monkeypatch.setattr(mediapipe_hands, "_no_detection_intervals", capture_samples)
+    monkeypatch.setattr(
+        mediapipe_hands, "_import_mediapipe", lambda: type("mp", (), {"__version__": "stub"})
+    )
+    monkeypatch.setattr(mediapipe_hands, "_resolved_hand_model_digest", lambda: "stub")
+
+    episodes = write_numbered_h264_episodes(tmp_path)
+    with hflow.Episode(episodes[100], workdir=tmp_path / "work") as episode:
+        result = asyncio.run(
+            mediapipe_hand_detection(episode, cameras=[NUMBERED_VIDEO_TOPIC], sample_fps=sample_fps)
+        )
+
+    assert labelled_samples
+    assert all(named == shown for named, shown in labelled_samples), labelled_samples
+    named_frames = {named for named, _ in labelled_samples}
+    assert named_frames.isdisjoint(range(100, 110))
+    # Sampling resumes at the first clean sample tick after the keyframe.
+    assert {99, 110 if sample_fps == 30.0 else 112} <= named_frames
+    assert result.measurements[f"{NUMBERED_VIDEO_TOPIC}/hand_detection_frame_count"] == len(
+        labelled_samples
+    )
+    # The absence before the gap closes at its last clean sample, 99, rather
+    # than spanning the discarded footage to the next sample that shows a hand.
+    (interval,) = result.intervals
+    assert (source_frame_number(interval.start_ns), source_frame_number(interval.end_ns)) == (
+        95 if sample_fps == 30.0 else 96,
+        99,
+    )
 
 
 @pytest.fixture(scope="module")

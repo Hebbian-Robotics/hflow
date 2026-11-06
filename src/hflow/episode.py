@@ -31,12 +31,14 @@ from mcap.records import Attachment, Schema
 from hflow import video as video_module
 from hflow.ffmpeg import ffmpeg_path, ffprobe_path
 from hflow.ffmpeg._binary import _ffmpeg_filter_script_flag
+from hflow.ffmpeg._process import run_media_command
 from hflow.format import (
     CAMERA_SCHEMA_NAMES,
     CANONICAL_VIDEO_SCHEMA_NAME,
     METADATA_RECORD_EPISODE,
     METADATA_RECORD_PROVENANCE,
 )
+from hflow.media import VideoLimits
 from hflow.reader import (
     DEFAULT_BATCH_MAX_BYTES,
     DEFAULT_BATCH_MAX_MESSAGES,
@@ -501,6 +503,7 @@ class Episode:
         # Source frame rate per camera topic, recorded by video() for frames().
         self._video_fps: dict[str, float] = {}
         self._keyframe_indices: dict[str, frozenset[int]] = {}
+        self._clean_message_indices: dict[str, frozenset[int]] = {}
 
     @property
     def workdir(self) -> Path:
@@ -845,6 +848,57 @@ class Episode:
             keyframe_indices=self._keyframe_message_indices(topic),
             frame_count=frame_count,
         )
+
+    def _cleanly_decoded_message_indices(self, topic: str) -> frozenset[int]:
+        """Message positions whose picture the camera's video decodes cleanly.
+
+        For consumers that sample the video themselves instead of through
+        :meth:`frames`: a picture outside this set is missing or concealed
+        (#727), and must not be attributed to its message.
+        """
+        cached = self._clean_message_indices.get(topic)
+        if cached is not None:
+            return cached
+        mp4 = self.video(topic)
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=self.workdir) as trace_dir:
+            decoded_trace_path = Path(trace_dir) / "decoded.framecrc"
+            command = [
+                str(ffmpeg_path()),
+                "-nostdin",
+                "-hide_banner",
+                # Damaged footage is the point of this pass, and its decoder
+                # warnings would otherwise count against the output cap.
+                "-loglevel",
+                "fatal",
+                "-y",
+                "-i",
+                str(mp4),
+                "-map",
+                "0:v:0",
+                "-c:v",
+                "rawvideo",
+                "-enc_time_base",
+                "1:1000000",
+                "-fps_mode",
+                "passthrough",
+                "-f",
+                "framecrc",
+                str(decoded_trace_path),
+            ]
+            completed = run_media_command(command, timeout_seconds=VideoLimits().timeout_seconds)
+            if completed.returncode != 0:
+                raise RuntimeError(
+                    f"ffmpeg could not decode {topic!r} (exit {completed.returncode})"
+                )
+            source_count = len(
+                self._channel_log_times(self._resolve_channel_info(topic).channel_id)
+            )
+            clean_indices = self._cleanly_decoded_indices(
+                topic, decoded_trace_path, frame_count=source_count
+            )
+        self._clean_message_indices[topic] = frozenset(clean_indices)
+        return self._clean_message_indices[topic]
 
     def frames(
         self,
