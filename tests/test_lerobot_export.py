@@ -90,6 +90,11 @@ def _install_fake_import(corpus: dict, tmp_path: Path, monkeypatch: pytest.Monke
         cache = Path(output_dir) / "_lerobot_cache" / str(revision)
         if not cache.exists():
             shutil.copytree(tmp_path, cache)
+        failed_indexes = corpus.get("_fail_import_indexes", set())
+        if episode_index is None and failed_indexes:
+            raise ValueError(f"synthetic conversion failure for episode {min(failed_indexes)}")
+        if episode_index in failed_indexes:
+            raise ValueError(f"synthetic conversion failure for episode {episode_index}")
         return []
 
     monkeypatch.setattr(hflow, "import_lerobot_dataset", _fake_import)
@@ -154,8 +159,12 @@ def test_export_noncontiguous_selection(
             {"metadata_json": _provenance_meta(2, task="task-2")},
         ],
     )
+    # Episode 1 stands in for a corrupt source episode outside this selection.
+    # Export must not invoke conversion for it.
+    fake_corpus["_fail_import_indexes"] = {1}
     dest = tmp_path / "out"
     export.export(dest, manifest=manifest, camera_keys=CAMS)
+    assert [call["episode_index"] for call in fake_corpus["_import_calls"]] == [0, 2]
 
     info = json.loads((dest / "meta" / "info.json").read_text())
     assert info["total_episodes"] == 2
@@ -309,10 +318,8 @@ def test_export_sql_selection(fake_corpus: dict, tmp_path: Path) -> None:
 def test_export_drives_public_importer(fake_corpus: dict, tmp_path: Path) -> None:
     """Materialization goes through hflow.import_lerobot_dataset.
 
-    Regression for the review finding that export imported private helpers
-    from examples/lerobot/prepare.py; the source archive must be
-    materialized through the exported entry point, all episodes, with the
-    camera keys the user asked to export.
+    Export materializes the selected source episode through the public entry
+    point and passes the camera keys the user asked to export.
     """
     manifest = _fake_manifest(tmp_path, [{"metadata_json": _provenance_meta(0)}])
     export.export(
@@ -321,11 +328,29 @@ def test_export_drives_public_importer(fake_corpus: dict, tmp_path: Path) -> Non
         camera_keys=("observation.images.up", "observation.images.side"),
     )
     assert fake_corpus["_import_calls"], "export must drive the public importer"
-    call = fake_corpus["_import_calls"][-1]
+    call = fake_corpus["_import_calls"][0]
     assert call["dataset_repo"] == "lerobot/fake"
     assert call["revision"] == "a" * 40
-    assert call["episode_index"] is None
+    assert call["episode_index"] == 0
     assert call["camera_keys"] == ("observation.images.up", "observation.images.side")
+
+
+def test_export_refuses_selected_broken_episode_without_replacing_destination(
+    fake_corpus: dict, tmp_path: Path
+) -> None:
+    """A selected episode failure leaves the previously published export intact."""
+    fake_corpus["_fail_import_indexes"] = {1}
+    manifest = _fake_manifest(tmp_path, [{"metadata_json": _provenance_meta(1)}])
+    dest = tmp_path / "out"
+    dest.mkdir()
+    marker = dest / "existing.txt"
+    marker.write_text("previous export")
+
+    with pytest.raises(ValueError, match="synthetic conversion failure for episode 1"):
+        export.export(dest, manifest=manifest, camera_keys=CAMS)
+
+    assert marker.read_text() == "previous export"
+    assert sorted(path.name for path in dest.iterdir()) == ["existing.txt"]
 
 
 def _exported_dataset(fake_corpus: dict, tmp_path: Path) -> Path:

@@ -35,6 +35,7 @@ import json
 import re
 import shutil
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -325,26 +326,29 @@ def _fetch_task_registry(src_ds: str, src_rev: str, cache_dir: Path) -> None:
 
 
 def _materialize_source_archive(
-    src_ds: str, src_rev: str, cache_dir: Path, camera_keys: tuple[str, ...]
+    src_ds: str,
+    src_rev: str,
+    cache_dir: Path,
+    camera_keys: tuple[str, ...],
+    episode_indexes: Sequence[int],
 ) -> dict:
-    """Materialize the source archive through the public importer.
+    """Materialize the selected episodes and shared source archive metadata.
 
     ``hflow.import_lerobot_dataset`` (exported from ``hflow/__init__.py``;
-    ``hflow import lerobot`` on the CLI) resolves the immutable revision,
-    validates the camera keys, and downloads the corpus metadata, data
-    chunks, and video chunks under
-    ``<output_dir>/_lerobot_cache/<resolved revision>`` (the cache is
-    namespaced by the resolved commit sha). Export consumes that archive;
-    the canonical landing MCAPs the importer also writes are a side effect
-    export does not use.
+    ``hflow import lerobot`` on the CLI) resolves the immutable revision and
+    downloads the corpus metadata and selected episodes' data/video chunks
+    under ``<output_dir>/_lerobot_cache/<resolved revision>``. Calls share the
+    same SHA-namespaced cache, including shared video chunks. The canonical
+    landing MCAPs are a side effect export does not use.
     """
-    hflow.import_lerobot_dataset(
-        dataset_repo=src_ds,
-        revision=src_rev,
-        output_dir=cache_dir.parent,
-        episode_index=None,
-        camera_keys=camera_keys,
-    )
+    for episode_index in episode_indexes:
+        hflow.import_lerobot_dataset(
+            dataset_repo=src_ds,
+            revision=src_rev,
+            output_dir=cache_dir.parent,
+            episode_index=episode_index,
+            camera_keys=camera_keys,
+        )
     # main namespaces the materialized archive under the resolved revision
     # sha (fix(lerobot) #328); resolve that single subdirectory loudly.
     namespaces = sorted(p for p in cache_dir.iterdir() if p.is_dir())
@@ -861,7 +865,7 @@ def export(
     with tempfile.TemporaryDirectory(prefix="lerobot-export-") as tmp:
         stage_root = Path(tmp)
         cache_dir = stage_root / "_lerobot_cache"
-        corpus = _materialize_source_archive(src_ds, src_rev, cache_dir, camera_keys)
+        corpus = _materialize_source_archive(src_ds, src_rev, cache_dir, camera_keys, want_indexes)
 
         exist = {e["episode_index"] for e in corpus["episodes"]}
         missing = [i for i in want_indexes if i not in exist]
