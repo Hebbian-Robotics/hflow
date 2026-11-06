@@ -1391,16 +1391,11 @@ class App:
         built-in had to also opt out of the default -- an opinion that fights
         the user is not worth holding.
 
-        So the default yields: it contributed nothing this pipeline did not
-        already measure, and it is recorded as ``superseded`` with the reason
-        rather than silently dropped, so the catalog never shows a check
-        version that claims measurements it did not supply.
-
-        A status of its own, not ``skipped``, because the two are opposite
-        answers to the question a planner asks. This supersession is permanent
-        -- the pipeline's step emits those keys on every episode -- while a
-        quarantine skip lifts the moment its critical check is retuned. See
-        :data:`hflow.steps.SETTLED_STATUSES`.
+        A default that has already run keeps its other measurements. The
+        overlapping keys are removed and recorded as ``superseded:<key>``
+        tags, so the catalog retains the remaining evidence without duplicate
+        measurements. Defaults skipped before execution keep their separate
+        ``superseded`` status.
 
         Only a DEFAULT ever yields. Two of the pipeline's own steps sharing a
         key is still refused, because there the engine has no basis to pick a
@@ -1423,7 +1418,17 @@ class App:
             superseded_keys = sorted(set(run.result.measurements) & pipeline_measurement_keys)
             if not superseded_keys:
                 continue
-            run.outcome = NotRun(SupersededByPipeline(superseded_keys=tuple(superseded_keys)))
+            # The default already ran and computed its measurements. Dropping
+            # the superseded keys avoids a duplicate-key collision with the
+            # pipeline step that already measured them, while keeping the
+            # check recorded as MEASURED so its remaining evidence survives.
+            superseded_set = set(superseded_keys)
+            run.result.measurements = {
+                key: value
+                for key, value in run.result.measurements.items()
+                if key not in superseded_set
+            }
+            run.result.tags.extend(f"superseded:{key}" for key in superseded_keys)
 
     def _canonical_integrity_verdict(self, canonical_path: Path) -> "tuple[bool, str | None]":
         """The check lane's front-door verdict for one canonical file.
