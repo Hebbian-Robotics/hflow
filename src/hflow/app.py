@@ -1391,16 +1391,11 @@ class App:
         built-in had to also opt out of the default -- an opinion that fights
         the user is not worth holding.
 
-        So the default yields: it contributed nothing this pipeline did not
-        already measure, and it is recorded as ``superseded`` with the reason
-        rather than silently dropped, so the catalog never shows a check
-        version that claims measurements it did not supply.
-
-        A status of its own, not ``skipped``, because the two are opposite
-        answers to the question a planner asks. This supersession is permanent
-        -- the pipeline's step emits those keys on every episode -- while a
-        quarantine skip lifts the moment its critical check is retuned. See
-        :data:`hflow.steps.SETTLED_STATUSES`.
+        A default that has already run keeps its other measurements. The
+        overlapping keys are removed and recorded as ``superseded:<key>``
+        tags, so the catalog retains the remaining evidence without duplicate
+        measurements. Defaults skipped before execution keep their separate
+        ``superseded`` status.
 
         Only a DEFAULT ever yields. Two of the pipeline's own steps sharing a
         key is still refused, because there the engine has no basis to pick a

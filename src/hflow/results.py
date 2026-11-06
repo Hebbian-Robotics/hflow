@@ -157,6 +157,11 @@ def project_results(
                     for name in selection.measurements.values()
                     if name not in result.measurements
                 ]
+                unknown_measurements = [
+                    name for name in missing if f"superseded:{name}" not in result.tags
+                ]
+                if unknown_measurements:
+                    raise KeyError(unknown_measurements[0])
                 if missing:
                     checks.append(UnavailableCheck(selection.public_name, "superseded"))
                 else:

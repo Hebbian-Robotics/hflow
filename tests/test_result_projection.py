@@ -70,14 +70,10 @@ def test_result_projection_preserves_verdicts_without_disclosing_internal_detail
         projection.to_json(maximum_bytes=len(encoded) - 1)
     with pytest.raises(KeyError):
         project_results(report, (CheckSelection("unknown", "quality", {}),))
-    projection = project_results(
-        report, (CheckSelection("private_measurement", "quality", {"score": "missing"}),)
-    )
-    match projection.checks[0]:
-        case MeasuredCheck():
-            raise AssertionError("expected superseded, got measured")
-        case UnavailableCheck(status="superseded"):
-            pass
+    with pytest.raises(KeyError, match="missing"):
+        project_results(
+            report, (CheckSelection("private_measurement", "quality", {"score": "missing"}),)
+        )
 
 
 def test_project_results_handles_superseded_default_without_keyerror(
@@ -114,11 +110,16 @@ def test_project_results_handles_superseded_default_without_keyerror(
         report,
         (CheckSelection("episode_duration", "duration", {"value": "duration_s"}),),
     )
-    match projection.checks[0]:
-        case MeasuredCheck():
-            raise AssertionError("expected superseded, got measured")
-        case UnavailableCheck(status="superseded"):
-            pass
+    assert projection.checks[0] == UnavailableCheck("duration", "superseded")
+    with pytest.raises(KeyError, match="missing"):
+        project_results(
+            report,
+            (
+                CheckSelection(
+                    "episode_duration", "duration", {"value": "duration_s", "bad": "missing"}
+                ),
+            ),
+        )
 
     # project_results reports measured for a surviving key.
     projection = project_results(
