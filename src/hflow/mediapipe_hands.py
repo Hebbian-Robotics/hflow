@@ -11,8 +11,11 @@ recommended gate;
 
 Mechanism: frames are sampled from a camera at a declared rate, decoded
 straight to RGB by the pinned ffmpeg, and passed to the Hand Landmarker in
-VIDEO mode. Per frame, how many hands it found and which; per camera, the
-share of sampled frames those add up to, plus the spans where it found none.
+VIDEO mode. A sampled image is omitted when it does not match the decoded
+source picture at that tick, and its original sample time is retained so later
+detections are not relabelled. Per frame, how many hands it found and which;
+per camera, the share of sampled frames those add up to, plus the spans where
+it found none.
 Landmark coordinates are deliberately not recorded: 21 image and 21 world
 landmarks per hand is a nested shape the flat catalog cannot hold, and the
 counts are what the shares need.
@@ -28,7 +31,7 @@ ffmpeg build.
 import importlib
 import logging
 import os
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import lru_cache
@@ -45,11 +48,10 @@ from hflow._pinned_asset import (
     user_cache_dir,
 )
 from hflow._video_measurement_toolchain import resolved_video_measurement_toolchain
-from hflow._video_measurements._raw_frames import rgb_frames
+from hflow._video_measurements._raw_frames import SampledRGBFrame, rgb_frames
 from hflow.asyncio_utils import run_blocking
 from hflow.episode import Episode
 from hflow.steps import CheckResult, Interval, MeasurementValue
-from hflow.video import source_log_times_for_sampled_frames
 
 logger = logging.getLogger(__name__)
 
@@ -183,8 +185,10 @@ def _no_detection_intervals(
     log_times_ns: Sequence[int],
     detections: Sequence[FrameHandCounts],
     label: str,
+    *,
+    sample_indices: Sequence[int] | None = None,
 ) -> list[Interval]:
-    """Spans of consecutive frames in which the model found no hand.
+    """Spans of consecutive sampled ticks in which the model found no hand.
 
     A run ends at the log time of the next frame that DID show a hand, so the
     interval covers the footage the absence actually spans. A run that reaches
@@ -192,10 +196,30 @@ def _no_detection_intervals(
     trailing absence is under-reported by up to one sample period -- stated
     rather than papered over, because the alternative is inventing an end
     time from a rate.
+
+    A skipped sample tick breaks a run: no-hand evidence on either side cannot
+    establish what happened during that unsampled time.
     """
+    if len(log_times_ns) != len(detections):
+        raise ValueError("log_times_ns and detections must have equal lengths")
+    if sample_indices is None:
+        sample_indices = range(len(detections))
+    if len(sample_indices) != len(detections):
+        raise ValueError("sample_indices and detections must have equal lengths")
+
     intervals: list[Interval] = []
     run_start_index: int | None = None
     for frame_index, frame in enumerate(detections):
+        if frame_index > 0 and sample_indices[frame_index] != sample_indices[frame_index - 1] + 1:
+            if run_start_index is not None and frame_index - 1 > run_start_index:
+                intervals.append(
+                    Interval(
+                        start_ns=log_times_ns[run_start_index],
+                        end_ns=log_times_ns[frame_index - 1],
+                        label=label,
+                    )
+                )
+            run_start_index = None
         if frame.hand_count == 0 and run_start_index is None:
             run_start_index = frame_index
         elif frame.hand_count > 0 and run_start_index is not None:
@@ -322,7 +346,7 @@ def _handedness_of(handedness_categories: Sequence[Any]) -> Handedness:
 
 
 def detect_hands_in_frames(
-    frames: Iterable[np.ndarray],
+    frames: Iterable[np.ndarray | SampledRGBFrame],
     *,
     sample_fps: float,
     minimum_hand_detection_confidence: float = DEFAULT_MINIMUM_CONFIDENCE,
@@ -349,13 +373,20 @@ def detect_hands_in_frames(
     )
     detections: list[FrameHandCounts] = []
     with mediapipe.tasks.vision.HandLandmarker.create_from_options(options) as landmarker:
-        for frame_index, frame in enumerate(frames):
+        for frame_index, sampled_frame in enumerate(frames):
+            if isinstance(sampled_frame, SampledRGBFrame):
+                frame = sampled_frame.pixels
+                timestamp_ms = int(
+                    sampled_frame.sample_index * _MILLISECONDS_PER_SECOND / sample_fps
+                )
+            else:
+                frame = sampled_frame
+                timestamp_ms = int(frame_index * _MILLISECONDS_PER_SECOND / sample_fps)
             # A copy because MediaPipe takes ownership of the buffer, and the
             # decoder's frames are read-only views over the pipe's bytes.
             image = mediapipe.Image(
                 image_format=mediapipe.ImageFormat.SRGB, data=np.array(frame, dtype=np.uint8)
             )
-            timestamp_ms = int(frame_index * _MILLISECONDS_PER_SECOND / sample_fps)
             detections.append(_frame_hand_counts(landmarker.detect_for_video(image, timestamp_ms)))
     return detections
 
@@ -415,6 +446,25 @@ async def mediapipe_hand_detection(
     )
 
 
+def _validated_sampled_frames(
+    frames: Iterable[SampledRGBFrame],
+    *,
+    source_frame_count: int,
+    topic: str,
+    collected_source_frame_indices: list[int],
+    collected_sample_indices: list[int],
+) -> Iterator[SampledRGBFrame]:
+    for sampled_frame in frames:
+        if not 0 <= sampled_frame.source_frame_index < source_frame_count:
+            raise RuntimeError(
+                f"decoded frame index {sampled_frame.source_frame_index} is outside "
+                f"camera {topic!r}'s {source_frame_count} source messages"
+            )
+        collected_source_frame_indices.append(sampled_frame.source_frame_index)
+        collected_sample_indices.append(sampled_frame.sample_index)
+        yield sampled_frame
+
+
 def _measure_mediapipe_hands(
     episode: Episode,
     *,
@@ -470,9 +520,18 @@ def _measure_mediapipe_hands(
             toolchain=resolved_video_measurement_toolchain(),
             frames_per_second=sample_fps,
             long_edge_pixels=inference_long_edge_pixels,
+            source_fps=1.0 / median_interval_s,
         ) as frames:
+            sampled_source_frame_indices: list[int] = []
+            sampled_sample_indices: list[int] = []
             detections = detect_hands_in_frames(
-                frames,
+                _validated_sampled_frames(
+                    frames,
+                    source_frame_count=len(stamps_ns),
+                    topic=topic,
+                    collected_source_frame_indices=sampled_source_frame_indices,
+                    collected_sample_indices=sampled_sample_indices,
+                ),
                 sample_fps=sample_fps,
                 minimum_hand_detection_confidence=minimum_hand_detection_confidence,
                 minimum_hand_presence_confidence=minimum_hand_presence_confidence,
@@ -503,14 +562,13 @@ def _measure_mediapipe_hands(
                 f"{topic}/hand_model_digest": _resolved_hand_model_digest(),
             }
         )
-        log_times_ns = source_log_times_for_sampled_frames(
-            stamps_ns.tolist(),
-            source_fps=1.0 / median_interval_s,
-            sample_fps=sample_fps,
-            start_s=0.0,
-            frame_count=summary.frame_count,
-        )
+        log_times_ns = [int(stamps_ns[index]) for index in sampled_source_frame_indices]
         intervals.extend(
-            _no_detection_intervals(log_times_ns, detections, f"no_hand_detected:{topic}")
+            _no_detection_intervals(
+                log_times_ns,
+                detections,
+                f"no_hand_detected:{topic}",
+                sample_indices=sampled_sample_indices,
+            )
         )
     return CheckResult(measurements=measurements, intervals=intervals)
