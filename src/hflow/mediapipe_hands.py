@@ -185,8 +185,10 @@ def _no_detection_intervals(
     log_times_ns: Sequence[int],
     detections: Sequence[FrameHandCounts],
     label: str,
+    *,
+    sample_indices: Sequence[int] | None = None,
 ) -> list[Interval]:
-    """Spans of consecutive frames in which the model found no hand.
+    """Spans of consecutive sampled ticks in which the model found no hand.
 
     A run ends at the log time of the next frame that DID show a hand, so the
     interval covers the footage the absence actually spans. A run that reaches
@@ -194,10 +196,30 @@ def _no_detection_intervals(
     trailing absence is under-reported by up to one sample period -- stated
     rather than papered over, because the alternative is inventing an end
     time from a rate.
+
+    A skipped sample tick breaks a run: no-hand evidence on either side cannot
+    establish what happened during that unsampled time.
     """
+    if len(log_times_ns) != len(detections):
+        raise ValueError("log_times_ns and detections must have equal lengths")
+    if sample_indices is None:
+        sample_indices = range(len(detections))
+    if len(sample_indices) != len(detections):
+        raise ValueError("sample_indices and detections must have equal lengths")
+
     intervals: list[Interval] = []
     run_start_index: int | None = None
     for frame_index, frame in enumerate(detections):
+        if frame_index > 0 and sample_indices[frame_index] != sample_indices[frame_index - 1] + 1:
+            if run_start_index is not None and frame_index - 1 > run_start_index:
+                intervals.append(
+                    Interval(
+                        start_ns=log_times_ns[run_start_index],
+                        end_ns=log_times_ns[frame_index - 1],
+                        label=label,
+                    )
+                )
+            run_start_index = None
         if frame.hand_count == 0 and run_start_index is None:
             run_start_index = frame_index
         elif frame.hand_count > 0 and run_start_index is not None:
@@ -430,6 +452,7 @@ def _validated_sampled_frames(
     source_frame_count: int,
     topic: str,
     collected_source_frame_indices: list[int],
+    collected_sample_indices: list[int],
 ) -> Iterator[SampledRGBFrame]:
     for sampled_frame in frames:
         if not 0 <= sampled_frame.source_frame_index < source_frame_count:
@@ -438,6 +461,7 @@ def _validated_sampled_frames(
                 f"camera {topic!r}'s {source_frame_count} source messages"
             )
         collected_source_frame_indices.append(sampled_frame.source_frame_index)
+        collected_sample_indices.append(sampled_frame.sample_index)
         yield sampled_frame
 
 
@@ -499,12 +523,14 @@ def _measure_mediapipe_hands(
             source_fps=1.0 / median_interval_s,
         ) as frames:
             sampled_source_frame_indices: list[int] = []
+            sampled_sample_indices: list[int] = []
             detections = detect_hands_in_frames(
                 _validated_sampled_frames(
                     frames,
                     source_frame_count=len(stamps_ns),
                     topic=topic,
                     collected_source_frame_indices=sampled_source_frame_indices,
+                    collected_sample_indices=sampled_sample_indices,
                 ),
                 sample_fps=sample_fps,
                 minimum_hand_detection_confidence=minimum_hand_detection_confidence,
@@ -538,6 +564,11 @@ def _measure_mediapipe_hands(
         )
         log_times_ns = [int(stamps_ns[index]) for index in sampled_source_frame_indices]
         intervals.extend(
-            _no_detection_intervals(log_times_ns, detections, f"no_hand_detected:{topic}")
+            _no_detection_intervals(
+                log_times_ns,
+                detections,
+                f"no_hand_detected:{topic}",
+                sample_indices=sampled_sample_indices,
+            )
         )
     return CheckResult(measurements=measurements, intervals=intervals)

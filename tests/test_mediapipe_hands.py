@@ -130,6 +130,19 @@ class TestAbsenceIntervals:
         assert [(interval.start_ns, interval.end_ns) for interval in intervals] == expected_spans
         assert all(interval.label == "no_hand_detected:/cam" for interval in intervals)
 
+    def test_a_skipped_sampling_tick_splits_absence_runs(self) -> None:
+        log_times_ns = [0, 2 * _SECOND_NS, 3 * _SECOND_NS]
+        intervals = _no_detection_intervals(
+            log_times_ns,
+            [_frame(0), _frame(0), _frame(1)],
+            "no_hand_detected:/cam",
+            sample_indices=[0, 2, 3],
+        )
+
+        assert [(interval.start_ns, interval.end_ns) for interval in intervals] == [
+            (2 * _SECOND_NS, 3 * _SECOND_NS)
+        ]
+
 
 class TestModelAcquisition:
     def test_the_environment_override_wins(
@@ -228,7 +241,7 @@ class TestMissingSampleTiming:
     def test_missing_sampling_tick_keeps_detector_and_absence_times(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A skipped sample must not renumber later MediaPipe timestamps or intervals."""
+        """A skipped sample keeps detector times and splits absence intervals."""
         topic = "/wrist_cam/compressed"
         source_timestamps_ns = np.arange(91, dtype=np.int64) * 33_333_333
         episode = cast(
@@ -251,7 +264,7 @@ class TestMissingSampleTiming:
             def detect_for_video(self, _image: object, timestamp_ms: int) -> SimpleNamespace:
                 detector_timestamps_ms.append(timestamp_ms)
                 # The first two sampled frames have no hand; the third does.
-                # Its presence closes the absence span at its original time.
+                # Tick 1 was skipped, so it breaks the first absence run.
                 has_hand = len(detector_timestamps_ms) == 3
                 return SimpleNamespace(
                     hand_landmarks=[object()] if has_hand else [],
@@ -300,7 +313,7 @@ class TestMissingSampleTiming:
         assert detector_timestamps_ms == [0, 2000, 3000]
         (interval,) = result.intervals
         assert (interval.start_ns, interval.end_ns) == (
-            int(source_timestamps_ns[0]),
+            int(source_timestamps_ns[60]),
             int(source_timestamps_ns[90]),
         )
 
