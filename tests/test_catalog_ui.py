@@ -270,13 +270,35 @@ def test_catalog_ui_waits_for_the_episodes_file_before_binding_an_append(
     staged_catalog_root = tmp_path / "staged"
     _append_local_demo_episode(tmp_path, staged_catalog_root)
     catalog_root = tmp_path / "catalog"
+
+    polls_completed = 0
+    poll_completed = Condition()
+    relations_have_landed_parquet = catalog_ui._empty_table_relations_have_landed_parquet
+
+    def record_poll(
+        catalog_connection: duckdb.DuckDBPyConnection, polled_catalog_root: Path | str
+    ) -> bool:
+        nonlocal polls_completed
+        landed = relations_have_landed_parquet(catalog_connection, polled_catalog_root)
+        with poll_completed:
+            polls_completed += 1
+            poll_completed.notify_all()
+        return landed
+
+    monkeypatch.setattr(catalog_ui, "_empty_table_relations_have_landed_parquet", record_poll)
     with _running_catalog_ui(catalog_root, monkeypatch) as session:
         catalog_connection = session.started_connection()
 
         for staged_table in staged_catalog_root.iterdir():
             if staged_table.is_dir() and staged_table.name != "episodes":
                 shutil.copytree(staged_table, catalog_root / staged_table.name, dirs_exist_ok=True)
-        time.sleep(0.2)
+        # The first poll to finish may have started before the copy did; the
+        # second one started after it, so it saw every dependent table.
+        with poll_completed:
+            polls_before_copy = polls_completed
+            assert poll_completed.wait_for(
+                lambda: polls_completed >= polls_before_copy + 2, timeout=2
+            )
         assert session.refresh_count == 0
 
         shutil.copytree(
