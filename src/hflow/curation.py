@@ -532,7 +532,14 @@ def _empty_table_relations_have_landed_parquet(
     """
     location = parse_storage_root(catalog_root)
     query_root = _local_query_root(location)
+    # An append stores its dependents before its episodes file, so dependent
+    # Parquet with no episodes Parquet is an append still in flight (or crash
+    # debris). Rebinding on it would show the empty episodes shell as final.
+    episodes_directory = query_root / _TABLE_DIRECTORIES["episodes_raw"]
+    append_committed = episodes_directory.is_dir() and any(episodes_directory.glob("*.parquet"))
     for relation_name in _LONG_TABLE_NAMES:
+        if not append_committed and _TABLE_DIRECTORIES[relation_name] in TABLE_COLUMN_DDL:
+            continue
         relation_type_row = connection.execute(
             """
             SELECT table_type

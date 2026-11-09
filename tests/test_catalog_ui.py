@@ -1,5 +1,6 @@
 """The local DuckDB catalog browser lifecycle."""
 
+import shutil
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -258,6 +259,34 @@ def test_catalog_ui_binds_failure_only_catalog_without_episodes(
         assert session.wait_for_refreshes(1)
         assert catalog_connection.execute("SELECT count(*) FROM ingest_failures").fetchone() == (1,)
         assert catalog_connection.execute("SELECT count(*) FROM episodes").fetchone() == (0,)
+
+
+def test_catalog_ui_waits_for_the_episodes_file_before_binding_an_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An append's dependent tables land before its episodes file, its commit
+    marker. Seeing only the dependents is an append still in flight, so the UI
+    must not spend its first refresh on it and report the views as ready."""
+    staged_catalog_root = tmp_path / "staged"
+    _append_local_demo_episode(tmp_path, staged_catalog_root)
+    catalog_root = tmp_path / "catalog"
+    with _running_catalog_ui(catalog_root, monkeypatch) as session:
+        catalog_connection = session.started_connection()
+
+        for staged_table in staged_catalog_root.iterdir():
+            if staged_table.is_dir() and staged_table.name != "episodes":
+                shutil.copytree(staged_table, catalog_root / staged_table.name, dirs_exist_ok=True)
+        time.sleep(0.2)
+        assert session.refresh_count == 0
+
+        shutil.copytree(
+            staged_catalog_root / "episodes", catalog_root / "episodes", dirs_exist_ok=True
+        )
+
+        assert session.wait_for_refreshes(1)
+        assert catalog_connection.execute(
+            "SELECT count(*), min(task) FROM episodes"
+        ).fetchone() == (1, "demo")
 
 
 @pytest.mark.parametrize("port", [0, 65536])
