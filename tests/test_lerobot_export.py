@@ -240,7 +240,11 @@ def test_export_preserves_source_data_schema(fake_corpus: dict, tmp_path: Path) 
             pa.field("episode_index", pa.int64()),
             pa.field("frame_index", pa.int64()),
             pa.field("timestamp", pa.float32()),
-            pa.field("observation.state", pa.list_(pa.float32(), 6)),
+            pa.field(
+                "observation.state",
+                pa.list_(pa.float32(), 6),
+                metadata={b"source": b"synthetic state feature"},
+            ),
             pa.field("action", pa.list_(pa.float32(), 6)),
         ],
         metadata={b"source": b"synthetic LeRobot float32 features"},
