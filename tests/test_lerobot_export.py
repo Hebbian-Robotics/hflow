@@ -228,6 +228,47 @@ def _provenance_json(**overrides: object) -> str:
     return json.dumps({**json.loads(_provenance_meta(0)), **overrides})
 
 
+def test_export_preserves_source_data_schema(fake_corpus: dict, tmp_path: Path) -> None:
+    """Renumbered rows retain source float widths, array shapes, and metadata."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    source_path = Path(fake_corpus["cache_dir"]) / "data/chunk-000/file-000.parquet"
+    source_schema = pa.schema(
+        [
+            pa.field("index", pa.int64()),
+            pa.field("episode_index", pa.int64()),
+            pa.field("frame_index", pa.int64()),
+            pa.field("timestamp", pa.float32()),
+            pa.field("observation.state", pa.list_(pa.float32(), 6)),
+            pa.field("action", pa.list_(pa.float32(), 6)),
+        ],
+        metadata={b"source": b"synthetic LeRobot float32 features"},
+    )
+    source = pq.read_table(source_path).cast(source_schema)
+    pq.write_table(source, source_path)
+    manifest = _fake_manifest(
+        tmp_path,
+        [
+            {
+                "metadata_json": _provenance_json(
+                    source_dataset=str(tmp_path), source_episode_index=2, task="task-2"
+                )
+            }
+        ],
+    )
+    destination = tmp_path / "out"
+
+    export.export(destination, manifest=manifest, camera_keys=CAMS)
+
+    exported = pq.read_table(destination / "data/chunk-000/file-000.parquet")
+    assert exported.schema.equals(pq.read_schema(source_path), check_metadata=True)
+    assert exported["episode_index"].to_pylist() == [0] * LENGTHS[2]
+    assert exported["index"].to_pylist() == list(range(LENGTHS[2]))
+    for feature in ("timestamp", "observation.state", "action"):
+        assert exported[feature] == source[feature].slice(OFFSETS[2], LENGTHS[2])
+
+
 @pytest.mark.parametrize(
     ("manifest_rows", "expected_message"),
     [
