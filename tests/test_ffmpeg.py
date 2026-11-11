@@ -7,12 +7,12 @@ mutation. Remote availability and real-download tests are opt-in via
 """
 
 import hashlib
-import io
 import logging
 import os
 import platform
 import shutil
 import subprocess
+import sys
 import tarfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -49,6 +49,8 @@ from hflow._video_measurements._frame_statistics import (
     _aggregate_frame_statistics_output,
 )
 from hflow._video_measurements._raw_frames import (
+    DECODED_FRAME_HASH_TIMEOUT_SECONDS,
+    MAXIMUM_DECODED_FRAME_HASH_OUTPUT_BYTES,
     RawFrameError,
     _decoded_frame_hashes,
     _first_sample_index,
@@ -60,8 +62,10 @@ from hflow.episode import ExtractedFrame
 from hflow.ffmpeg import (
     PINNED_LINUX_X86_64_FFMPEG,
     PINNED_LINUX_X86_64_FFPROBE,
+    MediaToolError,
     _binary,
     _contact_sheet,
+    run_media_command,
     verify_media_binary,
 )
 from hflow.ffmpeg._binary import (
@@ -89,29 +93,23 @@ from hflow.ffmpeg._contact_sheet import (
 )
 
 
-def test_rgb_frame_hash_trace_waits_after_successful_eof(monkeypatch: pytest.MonkeyPatch) -> None:
-    class FinishedAfterEofProcess:
-        def __init__(self) -> None:
-            self.stdout = io.StringIO("#tb 0: 1/1000000\n0, 1, 0, 1, 1, digest\n")
-            self.returncode: int | None = None
-            self.terminated = False
+def test_rgb_frame_hash_trace_uses_bounded_media_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: dict[str, object] = {}
 
-        def poll(self) -> int | None:
-            return self.returncode
+    def completed_hash_process(
+        _arguments: list[str], *, timeout_seconds: float, maximum_output_bytes: int
+    ) -> SimpleNamespace:
+        calls.update(
+            timeout_seconds=timeout_seconds,
+            maximum_output_bytes=maximum_output_bytes,
+        )
+        return SimpleNamespace(
+            returncode=0,
+            stdout=b"#tb 0: 1/1000000\n0, 1, 0, 1, 1, digest\n",
+        )
 
-        def terminate(self) -> None:
-            self.terminated = True
-            self.returncode = -15
-
-        def wait(self) -> int:
-            if self.returncode is None:
-                self.returncode = 0
-            return self.returncode
-
-    process = FinishedAfterEofProcess()
     monkeypatch.setattr(
-        "hflow._video_measurements._raw_frames.subprocess.Popen",
-        lambda *args, **kwargs: process,
+        "hflow._video_measurements._raw_frames.run_media_command", completed_hash_process
     )
     toolchain = cast(VideoMeasurementToolchain, SimpleNamespace(ffmpeg_executable=Path("ffmpeg")))
 
@@ -125,30 +123,25 @@ def test_rgb_frame_hash_trace_waits_after_successful_eof(monkeypatch: pytest.Mon
 
     assert decoded_indices == [0]
     assert hashes == {0: {"digest"}}
-    assert not process.terminated
+    assert calls == {
+        "timeout_seconds": DECODED_FRAME_HASH_TIMEOUT_SECONDS,
+        "maximum_output_bytes": MAXIMUM_DECODED_FRAME_HASH_OUTPUT_BYTES,
+    }
 
 
 def test_rgb_frame_hash_trace_preserves_nonzero_source_positions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class HashProcess:
-        def __init__(self) -> None:
-            self.stdout = io.StringIO(
-                "#tb 0: 1/1000000\n"
-                "0, 0, 1000000, 33333, 1, first\n"
-                "0, 1000000, 1033333, 33333, 1, second\n"
-            )
-
-        def poll(self) -> int:
-            return 0
-
-        def wait(self) -> int:
-            return 0
-
-    process = HashProcess()
     monkeypatch.setattr(
-        "hflow._video_measurements._raw_frames.subprocess.Popen",
-        lambda *args, **kwargs: process,
+        "hflow._video_measurements._raw_frames.run_media_command",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=(
+                b"#tb 0: 1/1000000\n"
+                b"0, 0, 1000000, 33333, 1, first\n"
+                b"0, 1000000, 1033333, 33333, 1, second\n"
+            ),
+        ),
     )
     toolchain = cast(VideoMeasurementToolchain, SimpleNamespace(ffmpeg_executable=Path("ffmpeg")))
 
@@ -162,6 +155,35 @@ def test_rgb_frame_hash_trace_preserves_nonzero_source_positions(
 
     assert decoded_indices == [30, 31]
     assert hashes == {30: {"first"}, 31: {"second"}}
+
+
+def test_rgb_frame_hash_trace_times_out_a_stalled_ffmpeg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "hflow._video_measurements._raw_frames.DECODED_FRAME_HASH_TIMEOUT_SECONDS", 0.1
+    )
+
+    def stalled_ffmpeg(
+        _arguments: list[str], *, timeout_seconds: float, maximum_output_bytes: int
+    ) -> object:
+        return run_media_command(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            timeout_seconds=timeout_seconds,
+            maximum_output_bytes=maximum_output_bytes,
+        )
+
+    monkeypatch.setattr("hflow._video_measurements._raw_frames.run_media_command", stalled_ffmpeg)
+    toolchain = cast(VideoMeasurementToolchain, SimpleNamespace(ffmpeg_executable=Path("ffmpeg")))
+
+    with pytest.raises(MediaToolError, match="timed out"):
+        _decoded_frame_hashes(
+            Path("video.mp4"),
+            toolchain=toolchain,
+            filter_graph="format=pix_fmts=rgb24",
+            source_fps=30.0,
+            sample_fps=30.0,
+        )
 
 
 @pytest.mark.parametrize(
