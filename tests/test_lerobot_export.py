@@ -228,6 +228,119 @@ def _provenance_json(**overrides: object) -> str:
     return json.dumps({**json.loads(_provenance_meta(0)), **overrides})
 
 
+def test_export_registry_matches_written_features(fake_corpus: dict, tmp_path: Path) -> None:
+    """All written non-video features retain their exact source declarations."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    source_path = Path(fake_corpus["cache_dir"]) / "data/chunk-000/file-000.parquet"
+    source = pq.read_table(source_path)
+    for name in ("index", "episode_index", "frame_index"):
+        source = source.set_column(
+            source.schema.get_field_index(name), name, source[name].cast(pa.int64())
+        )
+    source = source.append_column("task_index", pa.array([0] * source.num_rows, pa.int64()))
+    source = source.append_column(
+        "next.done", pa.array([i % 2 == 0 for i in range(source.num_rows)], pa.bool_())
+    )
+    pq.write_table(source, source_path)
+    features = fake_corpus["info"]["features"]
+    for name in ("index", "episode_index", "frame_index", "task_index", "next.done"):
+        features[name] = {
+            "dtype": "bool" if name == "next.done" else "int64",
+            "shape": [1],
+            "names": [name],
+        }
+    features["unwritten.float"] = {"dtype": "float32", "shape": [1], "names": None}
+    features["unwritten.integer"] = {"dtype": "int64", "shape": [1], "names": None}
+    (tmp_path / "meta/info.json").write_text(json.dumps(fake_corpus["info"]))
+    manifest = _fake_manifest(
+        tmp_path,
+        [{"metadata_json": _provenance_meta(0)}, {"metadata_json": _provenance_meta(2)}],
+    )
+    destination = tmp_path / "out"
+
+    export.export(destination, manifest=manifest, camera_keys=CAMS[:1])
+
+    registry = json.loads((destination / "meta/info.json").read_text())["features"]
+    assert {key for key, value in registry.items() if value["dtype"] == "video"} == {CAMS[0]}
+    data_features = {key: value for key, value in registry.items() if value["dtype"] != "video"}
+    for exported_file in sorted((destination / "data").rglob("*.parquet")):
+        exported = pq.read_table(exported_file)
+        assert data_features == {name: features[name] for name in exported.column_names}
+        assert set(registry) == set(exported.column_names) | {CAMS[0]}
+        for name in ("index", "episode_index", "frame_index", "task_index"):
+            assert exported.schema.field(name).type == pa.int64()
+        assert exported.schema.field("next.done").type == pa.bool_()
+
+
+@pytest.mark.parametrize(
+    ("mismatch", "differing_field"),
+    [
+        ("type", "index"),
+        ("nullability", "index"),
+        ("field_metadata", "index"),
+        ("schema_metadata", "schema metadata"),
+        ("missing_field", "action"),
+        ("extra_field", "extra"),
+        ("field_order", "index"),
+    ],
+)
+def test_export_refuses_written_schema_mismatch(
+    fake_corpus: dict,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mismatch: str,
+    differing_field: str,
+) -> None:
+    """A changed schema in the second data file aborts publication with a useful error."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    manifest = _fake_manifest(
+        tmp_path,
+        [{"metadata_json": _provenance_meta(0)}, {"metadata_json": _provenance_meta(2)}],
+    )
+    write_table = pq.write_table
+
+    def write_changed_schema(table: pa.Table, where: Path) -> None:
+        if where.parent.name == "chunk-000" and where.name == "file-001.parquet":
+            first_field = table.schema.field(0)
+            match mismatch:
+                case "type":
+                    table = table.set_column(
+                        0, first_field.name, table.column(0).cast(pa.float64())
+                    )
+                case "nullability":
+                    table = table.cast(table.schema.set(0, first_field.with_nullable(False)))
+                case "field_metadata":
+                    table = table.cast(
+                        table.schema.set(0, first_field.with_metadata({b"changed": b"true"}))
+                    )
+                case "schema_metadata":
+                    table = table.replace_schema_metadata({b"changed": b"true"})
+                case "missing_field":
+                    table = table.drop_columns(["action"])
+                case "extra_field":
+                    table = table.append_column("extra", pa.array([0] * table.num_rows))
+                case "field_order":
+                    table = table.select(list(reversed(table.column_names)))
+        write_table(table, where)
+
+    monkeypatch.setattr(pq, "write_table", write_changed_schema)
+    destination = tmp_path / "out"
+    destination.mkdir()
+    (destination / "sentinel.txt").write_text("previous export")
+    with pytest.raises(ValueError) as error:
+        export.export(destination, manifest=manifest, camera_keys=CAMS)
+    message = str(error.value)
+    assert "data/chunk-000/file-001.parquet" in message
+    assert "schema differs from source" in message
+    assert differing_field in message
+    assert (destination / "sentinel.txt").read_text() == "previous export"
+    assert sorted(path.name for path in destination.iterdir()) == ["sentinel.txt"]
+
+
 def test_export_preserves_source_data_schema(fake_corpus: dict, tmp_path: Path) -> None:
     """Renumbered rows retain source float widths, array shapes, and metadata."""
     import pyarrow as pa
