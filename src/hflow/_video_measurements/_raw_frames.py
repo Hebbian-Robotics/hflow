@@ -12,8 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
-from hflow.ffmpeg._process import run_media_command
-
+from ._bounded_process import BoundedProcessError, run_bounded_process
 from ._frame_integrity import cleanly_decoded_frame_indices
 from ._toolchain import VideoMeasurementToolchain
 
@@ -196,11 +195,16 @@ def _decoded_frame_hashes(
         "framemd5",
         "-",
     ]
-    completed = run_media_command(
-        command,
-        timeout_seconds=DECODED_FRAME_HASH_TIMEOUT_SECONDS,
-        maximum_output_bytes=MAXIMUM_DECODED_FRAME_HASH_OUTPUT_BYTES,
-    )
+    try:
+        completed = run_bounded_process(
+            command,
+            timeout_seconds=DECODED_FRAME_HASH_TIMEOUT_SECONDS,
+            maximum_output_bytes=MAXIMUM_DECODED_FRAME_HASH_OUTPUT_BYTES,
+        )
+    except BoundedProcessError as error:
+        raise RawFrameError(
+            f"ffmpeg failed or timed out while tracing decoded frames for {video}"
+        ) from error
     if completed.returncode != 0:
         raise RawFrameError(f"ffmpeg failed to trace decoded frames for {video}")
 

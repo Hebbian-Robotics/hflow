@@ -44,6 +44,7 @@ from hflow._video_measurements import (
     VideoMeasurementToolchain,
     measure_video_frame_statistics,
 )
+from hflow._video_measurements._bounded_process import run_bounded_process
 from hflow._video_measurements._frame_statistics import (
     _FILTER_LIST_ENTRY_PATTERN,
     _aggregate_frame_statistics_output,
@@ -62,10 +63,8 @@ from hflow.episode import ExtractedFrame
 from hflow.ffmpeg import (
     PINNED_LINUX_X86_64_FFMPEG,
     PINNED_LINUX_X86_64_FFPROBE,
-    MediaToolError,
     _binary,
     _contact_sheet,
-    run_media_command,
     verify_media_binary,
 )
 from hflow.ffmpeg._binary import (
@@ -109,7 +108,7 @@ def test_rgb_frame_hash_trace_uses_bounded_media_command(monkeypatch: pytest.Mon
         )
 
     monkeypatch.setattr(
-        "hflow._video_measurements._raw_frames.run_media_command", completed_hash_process
+        "hflow._video_measurements._raw_frames.run_bounded_process", completed_hash_process
     )
     toolchain = cast(VideoMeasurementToolchain, SimpleNamespace(ffmpeg_executable=Path("ffmpeg")))
 
@@ -133,7 +132,7 @@ def test_rgb_frame_hash_trace_preserves_nonzero_source_positions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "hflow._video_measurements._raw_frames.run_media_command",
+        "hflow._video_measurements._raw_frames.run_bounded_process",
         lambda *args, **kwargs: SimpleNamespace(
             returncode=0,
             stdout=(
@@ -167,16 +166,16 @@ def test_rgb_frame_hash_trace_times_out_a_stalled_ffmpeg(
     def stalled_ffmpeg(
         _arguments: list[str], *, timeout_seconds: float, maximum_output_bytes: int
     ) -> object:
-        return run_media_command(
+        return run_bounded_process(
             [sys.executable, "-c", "import time; time.sleep(10)"],
             timeout_seconds=timeout_seconds,
             maximum_output_bytes=maximum_output_bytes,
         )
 
-    monkeypatch.setattr("hflow._video_measurements._raw_frames.run_media_command", stalled_ffmpeg)
+    monkeypatch.setattr("hflow._video_measurements._raw_frames.run_bounded_process", stalled_ffmpeg)
     toolchain = cast(VideoMeasurementToolchain, SimpleNamespace(ffmpeg_executable=Path("ffmpeg")))
 
-    with pytest.raises(MediaToolError, match="timed out"):
+    with pytest.raises(RawFrameError, match="timed out"):
         _decoded_frame_hashes(
             Path("video.mp4"),
             toolchain=toolchain,
