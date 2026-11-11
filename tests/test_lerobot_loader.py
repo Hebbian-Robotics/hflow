@@ -25,16 +25,24 @@ def test_export_official_loader(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, task_ids: tuple[int, int]
 ) -> None:
     """Metadata, camera tensors and a whole episode load locally without Hub downloads."""
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    hub = pytest.importorskip("huggingface_hub")
+    hub_constants = pytest.importorskip("huggingface_hub.constants")
+    assert hub_constants.HF_HUB_OFFLINE
     loader = pytest.importorskip("lerobot.datasets.lerobot_dataset")
     torch = pytest.importorskip("torch")
     assert loader.CODEBASE_VERSION == "v3.0"
-    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
 
     def refuse_download(*args: object, **kwargs: object) -> None:
         pytest.fail("the local export must load without a Hub download")
 
-    monkeypatch.setattr(loader.LeRobotDatasetMetadata, "pull_from_repo", refuse_download)
-    monkeypatch.setattr(loader.LeRobotDataset, "download", refuse_download)
+    # Patch Hub calls where used, independent of LeRobot's download method names.
+    # The metadata class lives in a separate module in newer releases.
+    metadata_module = sys.modules[loader.LeRobotDatasetMetadata.__module__]
+    for module in {hub, loader, metadata_module}:
+        monkeypatch.setattr(module, "snapshot_download", refuse_download)
+        if hasattr(module, "hf_hub_download"):
+            monkeypatch.setattr(module, "hf_hub_download", refuse_download)
     subprocess.run(
         [
             os.environ.get("HFLOW_EXPORT_PYTHON", sys.executable),
