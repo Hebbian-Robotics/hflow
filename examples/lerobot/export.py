@@ -46,7 +46,7 @@ import pyarrow.parquet as pq
 
 import hflow
 
-EXPORT_VERSION = "lerobot-export-v3"
+EXPORT_VERSION = "lerobot-export-v4"
 
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
@@ -186,9 +186,16 @@ def _read_task_registry(meta_dir: Path) -> dict[int, str]:
     if tasks_parquet.exists():
         table = pq.read_table(str(tasks_parquet))
         cols = table.column_names
+        task_column = "task"
+        if task_column not in cols:
+            pandas_metadata = json.loads((table.schema.metadata or {}).get(b"pandas", b"{}"))
+            for column in pandas_metadata.get("index_columns", []):
+                if isinstance(column, str) and column in cols:
+                    task_column = column
+                    break
         if "task_index" in cols:
             indices = table["task_index"].to_pylist()
-            names = table["task"].to_pylist() if "task" in cols else [""] * len(indices)
+            names = table[task_column].to_pylist() if task_column in cols else [""] * len(indices)
             for idx, name in zip(indices, names, strict=False):
                 if idx is not None:
                     tasks[int(idx)] = str(name or "")
@@ -565,36 +572,44 @@ def _write_v3_repository(
     episodes_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    src_tasks_parquet = corpus["cache_dir"] / "meta" / "tasks.parquet"
-    if src_tasks_parquet.exists():
-        shutil.copy2(src_tasks_parquet, meta_dir / "tasks.parquet")
-    src_tasks_jsonl = corpus["cache_dir"] / "meta" / "tasks.jsonl"
+    task_map = registry_task_map or dict(enumerate(dataset_tasks))
+    # The official loader uses tasks.iloc[task_index].name. Keep source IDs,
+    # including sparse IDs, by leaving null rows at unpublished positions.
+    task_positions = range(max(task_map, default=-1) + 1)
+    task_table = pa.table(
+        {
+            "task_index": pa.array(
+                [i if i in task_map else None for i in task_positions], type=pa.int64()
+            ),
+            "task": pa.array([task_map.get(i) for i in task_positions], type=pa.string()),
+        }
+    )
+    # Arrow's pandas metadata makes task strings the DataFrame index without
+    # requiring pandas in the exporter environment.
+    pandas_metadata = {
+        "index_columns": ["task"],
+        "column_indexes": [],
+        "columns": [
+            {
+                "name": name,
+                "field_name": name,
+                "pandas_type": pandas_type,
+                "numpy_type": numpy_type,
+                "metadata": None,
+            }
+            for name, pandas_type, numpy_type in (
+                ("task_index", "int64", "int64"),
+                ("task", "unicode", "object"),
+            )
+        ],
+    }
+    task_table = task_table.replace_schema_metadata(
+        {b"pandas": json.dumps(pandas_metadata).encode()}
+    )
+    pq.write_table(task_table, meta_dir / "tasks.parquet")
+    src_tasks_jsonl = cache_dir / "meta" / "tasks.jsonl"
     if src_tasks_jsonl.exists():
         shutil.copy2(src_tasks_jsonl, meta_dir / "tasks.jsonl")
-
-    dest_tasks_parquet = meta_dir / "tasks.parquet"
-    dest_tasks_jsonl = meta_dir / "tasks.jsonl"
-    if not dest_tasks_parquet.exists() and not dest_tasks_jsonl.exists():
-        if registry_task_map:
-            t_indices = sorted(registry_task_map.keys())
-            t_names = [registry_task_map[k] for k in t_indices]
-            t_table = pa.Table.from_arrays(
-                [
-                    pa.array(t_indices, type=pa.int64()),
-                    pa.array(t_names, type=pa.string()),
-                ],
-                names=["task_index", "task"],
-            )
-            pq.write_table(t_table, dest_tasks_parquet)
-        elif dataset_tasks:
-            t_table = pa.Table.from_arrays(
-                [
-                    pa.array(range(len(dataset_tasks)), type=pa.int64()),
-                    pa.array(dataset_tasks, type=pa.string()),
-                ],
-                names=["task_index", "task"],
-            )
-            pq.write_table(t_table, dest_tasks_parquet)
 
     # one data parquet per selected episode: windowed rows, renumbered
     ep_rows_out: list[dict] = []
@@ -686,12 +701,14 @@ def _write_v3_repository(
     }
     out_info = {
         "code": "LeRobotDataset/v3",
+        "codebase_version": "v3.0",
+        "total_tasks": len(task_map),
         "total_episodes": len(selections),
         "total_frames": total_frames,
         "total_videos": len(video_paths),
         "robot_type": selections[0].embodiment or info.get("robot_type", "unknown"),
         "fps": info.get("fps", 30),
-        "splits": {"train": [f"episode_{i:06d}" for i in range(len(selections))]},
+        "splits": {"train": f"0:{len(selections)}"},
         "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
         "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
         "features": {**data_features, **video_features},
@@ -723,15 +740,12 @@ def _write_v3_repository(
 
 
 def _validate_v3(dataset_dir: Path) -> None:
-    """Validate the staged repository is a loadable LeRobot Dataset v3.
+    """Check staged v3 metadata, windows and file references before publication.
 
-    Structural checks are the validation: meta/info.json present and
-    coherent, episode and data parquets readable, per-episode windows equal
-    the row counts, and every episode's data and camera references resolve
-    through the dataset's ``data_path`` / ``video_path`` templates to files
-    that exist. Index fields must be values the templates can format (plain
-    integers), which is what makes the staged directory loadable by the
-    official ``lerobot`` package.
+    These are structural checks, not a frame-decoding test. The opt-in
+    official-loader integration test exercises metadata and camera reads
+    against real MP4s. Keep the exporter-specific ``code`` marker for the
+    standalone verifier; ``codebase_version`` is the official format version.
     """
     meta_path = dataset_dir / "meta" / "info.json"
     if not meta_path.exists():
@@ -739,6 +753,8 @@ def _validate_v3(dataset_dir: Path) -> None:
     info = json.loads(meta_path.read_text())
     if info.get("code") != "LeRobotDataset/v3":
         raise ValueError(f"staged dataset is not LeRobotDataset/v3: {info.get('code')}")
+    if info.get("codebase_version") != "v3.0":
+        raise ValueError("staged dataset codebase_version must be v3.0")
     if int(info.get("total_episodes", 0)) < 1:
         raise ValueError("staged dataset has no episodes")
 

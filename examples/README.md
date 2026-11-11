@@ -486,11 +486,32 @@ the video chunks byte-for-byte. A dataset-card draft (`README.md`) and
 exporter version, selection SQL/manifest, and selected source episode
 indexes.
 
-The v3 exporter completes the feature registry and preserves the source Parquet
-schemas introduced in exporter v2. Regenerate exports made with v1 to restore
-source dtypes and array shapes, and those made with v1 or v2 to restore missing
-integer and boolean feature declarations. This does not change HFlow's canonical
-episode format or transform behavior version.
+Exporter v4 writes the official `codebase_version: v3.0`, task count, range-form
+training split, and pandas-indexed `meta/tasks.parquet`. Task strings resolve
+through the official loader, including sources with sparse task IDs or a JSONL
+task registry. It retains the source schemas and complete feature registry from
+v3. Regenerate earlier exports for official loader compatibility. This does not
+change HFlow's canonical episode format or transform behavior version.
+
+The opt-in compatibility test exports real tiny MP4s and reads metadata, camera
+tensors, and a complete episode with LeRobot 0.4.4 (dataset format v3.0) using its
+PyAV video backend. Keep its older Hub SDK requirements in a separate environment; `HFLOW_EXPORT_PYTHON`
+selects the normal project interpreter that builds the export. System ffmpeg
+5.1+ must be on `PATH` (or set `HFLOW_FFMPEG` and `HFLOW_FFPROBE`). From the
+repository root after the normal development sync:
+
+```bash
+uv venv data/lerobot-loader --python 3.12
+uv --no-config pip install --python data/lerobot-loader/bin/python \
+  torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cpu
+uv --no-config pip install --python data/lerobot-loader/bin/python lerobot==0.4.4 pytest
+HFLOW_LEROBOT_TESTS=1 HF_HUB_OFFLINE=1 \
+  HFLOW_EXPORT_PYTHON="$PWD/.venv/bin/python" \
+  data/lerobot-loader/bin/python -m pytest -q tests/test_lerobot_loader.py
+```
+
+The test requires no dataset download and stays skipped in default CI. LeRobot
+and PyTorch are not project dependencies.
 
 From a curation manifest:
 

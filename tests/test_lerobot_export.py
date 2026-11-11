@@ -28,6 +28,7 @@ from lerobot_test_helpers import (
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import hflow
+import hflow.ffmpeg
 from examples.lerobot import export
 
 CAMS = TWO_CAMERA_KEYS
@@ -169,7 +170,7 @@ def test_export_noncontiguous_selection(
     info = json.loads((dest / "meta" / "info.json").read_text())
     assert info["total_episodes"] == 2
     assert info["total_frames"] == 60 + 70  # episodes 0 and 2
-    assert info["splits"]["train"] == ["episode_000000", "episode_000001"]
+    assert info["splits"]["train"] == "0:2"
     assert "observation.images.up" in info["features"]
     assert "observation.images.side" in info["features"]
     assert info["features"]["action"]["dtype"] == "float32"
@@ -1135,6 +1136,7 @@ def test_validate_v3_refuses_frame_task_index_missing_from_sparse_registry(
         json.dumps(
             {
                 "code": "LeRobotDataset/v3",
+                "codebase_version": "v3.0",
                 "total_episodes": 1,
                 "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
             }
@@ -1237,5 +1239,196 @@ def test_export_sparse_registry_preserves_valid_indices(
     dest_tasks = dest / "meta" / "tasks.parquet"
     assert dest_tasks.exists()
     t_table = pq.read_table(str(dest_tasks))
-    assert t_table.column("task_index").to_pylist() == [0, 10]
-    assert t_table.column("task").to_pylist() == ["task-0", "task-10"]
+    assert t_table.column("task_index").drop_null().to_pylist() == [0, 10]
+    assert t_table.column("task").drop_null().to_pylist() == ["task-0", "task-10"]
+    assert (
+        pq.read_table(dest / "data/chunk-000/file-000.parquet")["task_index"].to_pylist()
+        == task_indices
+    )
+
+
+def _export_real_video_fixture(tmp_path: Path, task_ids: tuple[int, int]) -> Path:
+    """Build in HFlow's interpreter; the optional loader test uses its own environment."""
+    import subprocess
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        source_root = tmp_path / "source"
+        info = two_camera_v3_info(camera_frame_shape=(48, 64, 3))
+        for name in ("index", "episode_index", "frame_index", "task_index"):
+            info["features"][name] = {"dtype": "int64", "shape": [1], "names": None}
+        write_v3_corpus(
+            source_root,
+            info=info,
+            episode_rows=[
+                CorpusEpisodeRow(0, 3, 0, 3 / info["fps"], ("task-0",)),
+                CorpusEpisodeRow(1, 4, 3, 7 / info["fps"], ("task-1",)),
+            ],
+        )
+        source_path = source_root / "data/chunk-000/file-000.parquet"
+        table = pq.read_table(source_path)
+        for name in (
+            "index",
+            "episode_index",
+            "frame_index",
+            "timestamp",
+            "observation.state",
+            "action",
+        ):
+            dtype = (
+                pa.int64() if name in ("index", "episode_index", "frame_index") else pa.float32()
+            )
+            if name in ("observation.state", "action"):
+                dtype = pa.list_(dtype, 6)
+            table = table.set_column(
+                table.schema.get_field_index(name), name, table[name].cast(dtype)
+            )
+        table = table.append_column(
+            "task_index", pa.array([task_ids[0]] * 3 + [task_ids[1]] * 4, pa.int64())
+        )
+        pq.write_table(
+            pa.table({"task_index": list(task_ids), "task": ["task-0", "task-1"]}),
+            source_root / "meta/tasks.parquet",
+        )
+        pq.write_table(table, source_path)
+        episode_path = source_root / "meta/episodes/chunk-000/file-000.parquet"
+        episodes = pq.read_table(episode_path).to_pylist()
+        for episode_row in episodes:
+            for camera in CAMS:
+                for bound in ("from_timestamp", "to_timestamp"):
+                    key = f"videos/{camera}/{bound}"
+                    episode_row[key] = float(episode_row[key])
+        for camera in CAMS:
+            episodes[1][f"videos/{camera}/from_timestamp"] = 3 / info["fps"]
+            video = source_root / f"videos/{camera}/chunk-000/file-000.mp4"
+            video.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                [
+                    hflow.ffmpeg.ffmpeg_path(),
+                    "-v",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    f"testsrc2=size=64x48:rate={info['fps']}",
+                    "-frames:v",
+                    "7",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-threads",
+                    "1",
+                    str(video),
+                ],
+                check=True,
+            )
+        pq.write_table(pa.Table.from_pylist(episodes), episode_path)
+        corpus = {"cache_dir": source_root, "info": info}
+        _install_fake_import(corpus, source_root, monkeypatch)
+        manifest = _fake_manifest(
+            tmp_path,
+            [
+                {"metadata_json": _provenance_meta(1, "task-1")},
+                {"metadata_json": _provenance_meta(0)},
+            ],
+        )
+        destination = tmp_path / "exported"
+        export.export(destination, manifest=manifest, camera_keys=CAMS)
+        return destination
+
+
+@pytest.fixture()
+def loader_corpus(fake_corpus: dict, monkeypatch: pytest.MonkeyPatch) -> dict:
+    # These metadata tests supply the whole source archive locally.
+    monkeypatch.setattr(export, "_fetch_task_registry", lambda *_args: None)
+    return fake_corpus
+
+
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    [
+        ("codebase_version", "v3.0"),
+        ("total_tasks", 2),
+        ("splits", {"train": "0:2"}),
+    ],
+)
+def test_export_loader_info_fields(
+    loader_corpus: dict, tmp_path: Path, field: str, expected: object
+) -> None:
+    """Metadata describes the selected repository in the official v3 format."""
+    manifest = _fake_manifest(
+        tmp_path,
+        [{"metadata_json": _provenance_meta(2, "task-2")}, {"metadata_json": _provenance_meta(0)}],
+    )
+    destination = tmp_path / "exported"
+    export.export(destination, manifest=manifest, camera_keys=CAMS)
+    info = json.loads((destination / "meta/info.json").read_text())
+    assert info[field] == expected
+    assert (
+        json.loads((destination / "export-provenance.json").read_text())["exporter_version"]
+        == "lerobot-export-v4"
+    )
+
+
+@pytest.mark.parametrize("registry", ["synthesized", "jsonl", "indexed_parquet", "sparse"])
+def test_export_loader_task_registry(loader_corpus: dict, tmp_path: Path, registry: str) -> None:
+    """Task strings are a pandas index, and frame IDs retain their positional meaning."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    task_ids = [0, 10] if registry == "sparse" else [0, 1]
+    names = ["task-0", "task-2"]
+    if registry == "jsonl":
+        (tmp_path / "meta/tasks.jsonl").write_text(
+            "\n".join(
+                json.dumps({"task_index": i, "task": t})
+                for i, t in zip(task_ids, names, strict=True)
+            )
+        )
+    elif registry == "indexed_parquet":
+        # The official writer uses an unnamed pandas string index.
+        table = pa.table({"task_index": task_ids, "__index_level_0__": names})
+        table = table.replace_schema_metadata(
+            {b"pandas": json.dumps({"index_columns": ["__index_level_0__"]}).encode()}
+        )
+        pq.write_table(table, tmp_path / "meta/tasks.parquet")
+    elif registry == "sparse":
+        pq.write_table(
+            pa.table({"task_index": task_ids, "task": names}), tmp_path / "meta/tasks.parquet"
+        )
+    manifest = _fake_manifest(
+        tmp_path,
+        [{"metadata_json": _provenance_meta(0)}, {"metadata_json": _provenance_meta(2, "task-2")}],
+    )
+    destination = tmp_path / "exported"
+    export.export(destination, manifest=manifest, camera_keys=CAMS)
+    tasks = pq.read_table(destination / "meta/tasks.parquet")
+    pandas_metadata = json.loads((tasks.schema.metadata or {})[b"pandas"])
+    index_column = pandas_metadata["index_columns"][0]
+    for task_id, task in zip(task_ids, names, strict=True):
+        assert tasks[index_column][task_id].as_py() == task
+        assert tasks["task_index"][task_id].as_py() == task_id
+    assert export._read_task_registry(destination / "meta") == dict(
+        zip(task_ids, names, strict=True)
+    )
+    assert json.loads((destination / "meta/info.json").read_text())["total_tasks"] == 2
+
+
+@pytest.mark.parametrize("codebase_version", [None, "v2.1"])
+def test_validate_v3_requires_official_version(
+    loader_corpus: dict, tmp_path: Path, codebase_version: str | None
+) -> None:
+    destination = _exported_dataset(loader_corpus, tmp_path)
+    path = destination / "meta/info.json"
+    info = json.loads(path.read_text())
+    if codebase_version is None:
+        info.pop("codebase_version", None)
+    else:
+        info["codebase_version"] = codebase_version
+    path.write_text(json.dumps(info))
+    with pytest.raises(ValueError, match=r"codebase_version must be v3\.0"):
+        export._validate_v3(destination)
