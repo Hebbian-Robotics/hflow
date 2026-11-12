@@ -472,14 +472,19 @@ Episode provenance stamped by the converter (`source_dataset`,
 resolved back to the source; the exporter copies the source video chunks
 byte-for-byte (each source (chunk, file) keeping its identity in the
 destination path) and slices the selected data rows from the source chunk
-parquets, so cameras, feature schema, dtypes, shapes, and frame timing
-match the source. Episode indexes are renumbered sequentially in selection
-order. The exporter drives the public `hflow import lerobot` entry point to
+parquets, so cameras, Parquet column types, array shapes, and frame timing
+match the source. Data files retain the source Arrow schema, including float32
+widths and field and schema metadata. Episode indexes are renumbered sequentially
+in selection order. The exporter drives the public `hflow import lerobot` entry point to
 materialize the source archive (meta, data chunks, video chunks) and copies
-those chunks byte-for-byte. A dataset-card draft (`README.md`) and
+the video chunks byte-for-byte. A dataset-card draft (`README.md`) and
 `export-provenance.json` record the source repository, source commit,
 exporter version, selection SQL/manifest, and selected source episode
 indexes.
+
+The v2 exporter preserves source Parquet schemas; regenerate v3 exports made
+with v1 to restore source dtypes and array shapes. This does not change HFlow's
+canonical episode format or transform behavior version.
 
 From a curation manifest:
 

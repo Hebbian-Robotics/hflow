@@ -45,7 +45,7 @@ import pyarrow.parquet as pq
 
 import hflow
 
-EXPORT_VERSION = "lerobot-export-v1"
+EXPORT_VERSION = "lerobot-export-v2"
 
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
@@ -523,7 +523,17 @@ def _write_v3_repository(
             _fetch_video(cam, vw)
 
         staged_episodes.append(
-            (new_idx, sel, src, length, cols, rows, index_col, ep_published_tasks)
+            (
+                new_idx,
+                sel,
+                src,
+                length,
+                cols,
+                rows,
+                index_col,
+                ep_published_tasks,
+                pq.read_schema(data_local),
+            )
         )
 
     meta_dir = destination / "meta"
@@ -579,6 +589,7 @@ def _write_v3_repository(
         rows,
         index_col,
         ep_published_tasks,
+        source_data_schema,
     ) in staged_episodes:
         frame_rows: list[dict] = []
         for local_frame, row in enumerate(rows):
@@ -589,7 +600,10 @@ def _write_v3_repository(
             data_frames.append(d)
             frame_rows.append(d)
         total_frames += length
-        pq.write_table(pa.Table.from_pylist(frame_rows), data_dir / f"file-{new_idx:03d}.parquet")
+        pq.write_table(
+            pa.Table.from_pylist(frame_rows, schema=source_data_schema),
+            data_dir / f"file-{new_idx:03d}.parquet",
+        )
 
         # keep the source (chunk, file) identity in the destination path
         ep_video_refs: dict[str, dict] = {}
