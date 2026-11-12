@@ -24,6 +24,8 @@ class RawFrameError(RuntimeError):
 LUMA_FRAME_FILTER_GRAPH = "format=pix_fmts=gray"
 DECODED_FRAME_HASH_TIMEOUT_SECONDS = 600.0
 MAXIMUM_DECODED_FRAME_HASH_OUTPUT_BYTES = 256 * 1024 * 1024
+FFPROBE_TIMEOUT_SECONDS = 600.0
+MAXIMUM_FFPROBE_OUTPUT_BYTES = 256 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -35,11 +37,29 @@ class SampledRGBFrame:
     pixels: np.ndarray
 
 
+def _run_ffprobe(video: Path, toolchain: VideoMeasurementToolchain, arguments: list[str]) -> bytes:
+    """Run one bounded ffprobe query and return its standard output."""
+    try:
+        completed_process = run_bounded_process(
+            [str(toolchain.ffprobe_executable), *arguments, str(video)],
+            timeout_seconds=FFPROBE_TIMEOUT_SECONDS,
+            maximum_output_bytes=MAXIMUM_FFPROBE_OUTPUT_BYTES,
+        )
+    except BoundedProcessError as error:
+        raise RawFrameError(
+            f"ffprobe failed or exceeded its bounds for {video}: {error}"
+        ) from error
+    if completed_process.returncode != 0:
+        raise RawFrameError(f"ffprobe failed for {video}")
+    return completed_process.stdout
+
+
 def _probe_frame_shape(video: Path, toolchain: VideoMeasurementToolchain) -> tuple[int, int]:
     """Return the coded ``(height, width)`` of the first video stream."""
-    completed_process = subprocess.run(
+    output = _run_ffprobe(
+        video,
+        toolchain,
         [
-            str(toolchain.ffprobe_executable),
             "-hide_banner",
             "-loglevel",
             "error",
@@ -49,18 +69,12 @@ def _probe_frame_shape(video: Path, toolchain: VideoMeasurementToolchain) -> tup
             "stream=width,height",
             "-of",
             "json",
-            str(video),
         ],
-        capture_output=True,
-        text=True,
-        check=False,
     )
-    if completed_process.returncode != 0:
-        raise RawFrameError(f"ffprobe failed for {video}: {completed_process.stderr.strip()}")
     # CSV also appends stream side data (for example display rotation). Read
     # named fields so that metadata cannot change the dimension record's shape.
     try:
-        stream = json.loads(completed_process.stdout)["streams"][0]
+        stream = json.loads(output)["streams"][0]
         frame_width, frame_height = stream["width"], stream["height"]
     except (json.JSONDecodeError, KeyError, IndexError, TypeError):
         raise RawFrameError(f"ffprobe reported no video dimensions for {video}") from None
@@ -76,9 +90,10 @@ def _probe_frame_shape(video: Path, toolchain: VideoMeasurementToolchain) -> tup
 
 def _probe_frame_rate(video: Path, toolchain: VideoMeasurementToolchain) -> float:
     """Return the stream's declared constant frame rate."""
-    completed_process = subprocess.run(
+    output = _run_ffprobe(
+        video,
+        toolchain,
         [
-            str(toolchain.ffprobe_executable),
             "-hide_banner",
             "-loglevel",
             "error",
@@ -88,16 +103,10 @@ def _probe_frame_rate(video: Path, toolchain: VideoMeasurementToolchain) -> floa
             "stream=avg_frame_rate,r_frame_rate",
             "-of",
             "json",
-            str(video),
         ],
-        capture_output=True,
-        text=True,
-        check=False,
     )
-    if completed_process.returncode != 0:
-        raise RawFrameError(f"ffprobe failed for {video}: {completed_process.stderr.strip()}")
     try:
-        stream = json.loads(completed_process.stdout)["streams"][0]
+        stream = json.loads(output)["streams"][0]
         rates = [Fraction(stream[key]) for key in ("avg_frame_rate", "r_frame_rate")]
         rate = next(candidate for candidate in rates if candidate > 0)
     except (
@@ -117,9 +126,10 @@ def _probe_frame_rate(video: Path, toolchain: VideoMeasurementToolchain) -> floa
 
 def _probe_keyframe_indices(video: Path, toolchain: VideoMeasurementToolchain) -> frozenset[int]:
     """Return source packet positions marked as keyframes in the remuxed MP4."""
-    completed_process = subprocess.run(
+    output = _run_ffprobe(
+        video,
+        toolchain,
         [
-            str(toolchain.ffprobe_executable),
             "-hide_banner",
             "-loglevel",
             "error",
@@ -129,19 +139,11 @@ def _probe_keyframe_indices(video: Path, toolchain: VideoMeasurementToolchain) -
             "packet=flags",
             "-of",
             "csv=p=0",
-            str(video),
         ],
-        capture_output=True,
-        text=True,
-        check=False,
     )
-    if completed_process.returncode != 0:
-        raise RawFrameError(
-            f"ffprobe failed to read keyframes for {video}: {completed_process.stderr.strip()}"
-        )
     keyframe_indices = frozenset(
         packet_index
-        for packet_index, flags in enumerate(completed_process.stdout.split())
+        for packet_index, flags in enumerate(output.decode("ascii").split())
         if flags.startswith("K")
     )
     if not keyframe_indices:

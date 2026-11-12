@@ -51,10 +51,14 @@ from hflow._video_measurements._frame_statistics import (
 )
 from hflow._video_measurements._raw_frames import (
     DECODED_FRAME_HASH_TIMEOUT_SECONDS,
+    FFPROBE_TIMEOUT_SECONDS,
     MAXIMUM_DECODED_FRAME_HASH_OUTPUT_BYTES,
+    MAXIMUM_FFPROBE_OUTPUT_BYTES,
     RawFrameError,
     _decoded_frame_hashes,
     _first_sample_index,
+    _probe_frame_rate,
+    _probe_keyframe_indices,
     _scaled_frame_shape,
     luma_frames,
     rgb_frames,
@@ -183,6 +187,70 @@ def test_rgb_frame_hash_trace_times_out_a_stalled_ffmpeg(
             source_fps=30.0,
             sample_fps=30.0,
         )
+
+
+@pytest.mark.parametrize(
+    ("probe", "stdout", "expected"),
+    [
+        (
+            _probe_frame_rate,
+            b'{"streams":[{"avg_frame_rate":"30/1","r_frame_rate":"30/1"}]}',
+            30.0,
+        ),
+        (_probe_keyframe_indices, b"K_\n_\n", frozenset({0})),
+    ],
+)
+def test_frame_probes_use_bounded_media_command(
+    monkeypatch: pytest.MonkeyPatch,
+    probe: Callable[[Path, VideoMeasurementToolchain], object],
+    stdout: bytes,
+    expected: object,
+) -> None:
+    calls: list[tuple[list[str], float, int]] = []
+
+    def completed_probe(
+        arguments: list[str], *, timeout_seconds: float, maximum_output_bytes: int
+    ) -> SimpleNamespace:
+        calls.append((arguments, timeout_seconds, maximum_output_bytes))
+        return SimpleNamespace(returncode=0, stdout=stdout)
+
+    monkeypatch.setattr(
+        "hflow._video_measurements._raw_frames.run_bounded_process", completed_probe
+    )
+    toolchain = cast(VideoMeasurementToolchain, SimpleNamespace(ffprobe_executable=Path("ffprobe")))
+
+    assert probe(Path("video.mp4"), toolchain) == expected
+    assert len(calls) == 1
+    arguments, timeout_seconds, maximum_output_bytes = calls[0]
+    assert arguments[0] == "ffprobe"
+    assert arguments[-1] == "video.mp4"
+    assert timeout_seconds == FFPROBE_TIMEOUT_SECONDS
+    assert maximum_output_bytes == MAXIMUM_FFPROBE_OUTPUT_BYTES
+
+
+@pytest.mark.parametrize("probe", [_probe_frame_rate, _probe_keyframe_indices])
+def test_frame_probes_time_out_a_stalled_ffprobe(
+    monkeypatch: pytest.MonkeyPatch,
+    probe: Callable[[Path, VideoMeasurementToolchain], object],
+) -> None:
+    monkeypatch.setattr("hflow._video_measurements._raw_frames.FFPROBE_TIMEOUT_SECONDS", 0.1)
+
+    def stalled_ffprobe(
+        _arguments: list[str], *, timeout_seconds: float, maximum_output_bytes: int
+    ) -> object:
+        return run_bounded_process(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            timeout_seconds=timeout_seconds,
+            maximum_output_bytes=maximum_output_bytes,
+        )
+
+    monkeypatch.setattr(
+        "hflow._video_measurements._raw_frames.run_bounded_process", stalled_ffprobe
+    )
+    toolchain = cast(VideoMeasurementToolchain, SimpleNamespace(ffprobe_executable=Path("ffprobe")))
+
+    with pytest.raises(RawFrameError, match="exceeded its bounds"):
+        probe(Path("video.mp4"), toolchain)
 
 
 @pytest.mark.parametrize(
