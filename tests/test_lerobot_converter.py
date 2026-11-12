@@ -651,6 +651,68 @@ def _episode_video_access_units(mcap: Path, camera_key: str) -> "list[bytes]":
 
 @_requires_system_ffmpeg
 @pytest.mark.requires_system_ffmpeg
+def test_video_pts_times_are_in_presentation_order_for_b_frame_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A source encoded with B-frames (libx264's default, and what an H.264
+    LeRobot dataset carries) stores packets in decode order. The packet times
+    are matched index-by-index against the parquet rows, so they must come
+    back in presentation order or frame 1 is compared with a later frame.
+    """
+    assert _FFMPEG is not None and _FFPROBE is not None
+    source = tmp_path / "source.mp4"
+    subprocess.run(
+        [
+            _FFMPEG,
+            "-hide_banner",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=30:duration=2,format=yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-bf",
+            "3",
+            str(source),
+        ],
+        capture_output=True,
+        check=True,
+    )
+    decode_order = subprocess.run(
+        [
+            _FFPROBE,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "packet=pts_time",
+            "-of",
+            "csv=p=0",
+            str(source),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    decode_order_times = [float(time) for time in decode_order]
+    assert decode_order_times != sorted(decode_order_times), "source has no B-frames"
+
+    system_ffprobe_path = Path(_FFPROBE)
+    monkeypatch.setattr(prep, "ffprobe_path", lambda: system_ffprobe_path)
+
+    times = prep._get_video_pts_times(source)
+    assert times == pytest.approx([index / 30 for index in range(60)], abs=1e-3)
+
+    rebased = prep._relative_video_pts_times(source, 1.0, 1.5, 15, 30.0)
+    assert rebased == pytest.approx([index / 30 for index in range(15)], abs=1e-3)
+
+
+@_requires_system_ffmpeg
+@pytest.mark.requires_system_ffmpeg
 def test_converter_slices_exactly_the_declared_frame_count(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

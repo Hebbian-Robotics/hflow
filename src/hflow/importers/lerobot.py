@@ -417,6 +417,10 @@ def _get_video_pts_times(mp4_path: Path) -> list[float]:
         line = line.strip()
         if line and line != "N/A":
             times.append(float(line))
+    # ffprobe lists packets in decode order, so a source with B-frames reports
+    # non-monotonic presentation times. Frames (and the parquet rows they are
+    # checked against) are in presentation order.
+    times.sort()
     return times
 
 
