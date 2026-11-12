@@ -672,6 +672,30 @@ def test_health_parses_body_not_status(stub_server: str) -> None:
     assert "scheduler=unhealthy" in unhealthy.summary()
 
 
+def test_health_allows_optional_components_to_be_absent() -> None:
+    health = AirflowHealth(
+        components={
+            "metadatabase": "healthy",
+            "scheduler": "healthy",
+            "triggerer": None,
+        }
+    )
+
+    assert health.healthy
+
+
+def test_health_rejects_an_unhealthy_optional_component() -> None:
+    health = AirflowHealth(
+        components={
+            "metadatabase": "healthy",
+            "scheduler": "healthy",
+            "dag_processor": "unhealthy",
+        }
+    )
+
+    assert not health.healthy
+
+
 def test_get_redirect_is_followed(stub_server: str) -> None:
     _StubAirflowHandler.health_redirect_location = "/api/v2/monitor/health-redirected"
     client = AirflowClient(stub_server, "airflow", "right-password")

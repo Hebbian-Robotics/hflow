@@ -76,8 +76,11 @@ class AirflowHealth:
     def healthy(self) -> bool:
         # metadatabase and scheduler must be healthy; triggerer/dag_processor
         # may legitimately be absent (null) in minimal deployments.
-        required = ("metadatabase", "scheduler", "dag_processor")
-        return all(self.components.get(name) == "healthy" for name in required)
+        required = ("metadatabase", "scheduler")
+        if not all(self.components.get(name) == "healthy" for name in required):
+            return False
+        optional = ("triggerer", "dag_processor")
+        return all(self.components.get(name) in (None, "healthy") for name in optional)
 
     def summary(self) -> str:
         parts = [f"{name}={status or 'absent'}" for name, status in sorted(self.components.items())]
