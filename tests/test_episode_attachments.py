@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from hflow._grouped_mcap_writer import GroupedMcapWriter
+from hebbian_mcap import GroupedMcapWriter
+
 from hflow.episode import Episode
 
 

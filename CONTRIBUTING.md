@@ -18,6 +18,7 @@ You need:
 
 - Git and [uv](https://docs.astral.sh/uv/)
 - Python 3.11 or newer
+- Rust 1.92+ for source builds of the shared `hebbian-mcap` dependency
 - A system C compiler/toolchain that provides `cc` for the native-overlay tests
 - ffmpeg and ffprobe on `PATH` for the test suite (ffmpeg 5.1 or newer; the suite uses `-fps_mode`, which is not in the 4.4.x builds Ubuntu 22.04 ships). Tests that invoke ffmpeg must carry `@pytest.mark.requires_system_ffmpeg` so older binaries skip them instead of failing the suite.
 - Docker with Compose v2 only when working on the Airflow runtime integration

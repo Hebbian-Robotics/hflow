@@ -45,16 +45,16 @@ from pathlib import Path
 from typing import IO
 
 from _real_input import discover_topics, plan_topic_groups
-from mcap.reader import make_reader
-from mcap.summary import Summary
-from mcap.writer import Writer as StockWriter
-
-from hflow._grouped_mcap_writer import (
+from hebbian_mcap import (
     NO_SCHEMA_ID,
     ChannelId,
     GroupedMcapWriter,
     SchemaId,
 )
+from mcap.reader import make_reader
+from mcap.summary import Summary
+from mcap.writer import Writer as StockWriter
+
 from hflow.format import DEFAULT_CHUNK_SIZE_BYTES, GopPreset
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import TransformConfig, write_canonical_episode

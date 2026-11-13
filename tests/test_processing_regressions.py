@@ -28,7 +28,6 @@ from mcap_test_helpers import (
 
 import hflow
 from hflow import transform
-from hflow._grouped_mcap_writer import NO_SCHEMA_ID, GroupedMcapWriter
 from hflow.catalog import content_episode_id
 from hflow.checks import required_topics
 from hflow.doctor import diagnose
@@ -567,26 +566,6 @@ def test_transform_preserves_decoder_owned_video_messages(
             assert decode(message.data).original == "source-recorder"
     report = diagnose(output)
     assert report.conforming, report.summary()
-
-
-def test_aborted_writer_does_not_publish_partial_file(tmp_path: Path) -> None:
-    path = tmp_path / "aborted.mcap"
-    with pytest.raises(RuntimeError, match="boom"):  # noqa: SIM117
-        with GroupedMcapWriter(path) as writer:
-            schema_id = writer.register_schema("s", "jsonschema", b"{}")
-            writer.register_channel("/t", "json", schema_id, group="state")
-            raise RuntimeError("boom")
-    assert not path.exists(), "an aborted write must not leave a partial file"
-
-
-def test_writer_abort_preserves_previously_published_file(tmp_path: Path) -> None:
-    path = tmp_path / "published.mcap"
-    path.write_bytes(b"previous valid bytes")
-    with pytest.raises(RuntimeError, match="boom"):  # noqa: SIM117
-        with GroupedMcapWriter(path) as writer:
-            writer.register_channel("/t", "json", NO_SCHEMA_ID, group="state")
-            raise RuntimeError("boom")
-    assert path.read_bytes() == b"previous valid bytes"
 
 
 def test_sources_with_the_same_basename_get_distinct_artifact_paths(tmp_path: Path) -> None:

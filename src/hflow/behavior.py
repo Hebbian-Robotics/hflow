@@ -103,4 +103,9 @@ across these changes.
 # canonical used to lose the declaration while provenance still named its
 # topic group, so required_topics reported the camera absent. Episodes with
 # no empty camera channel change bytes only because this constant moved.
-TRANSFORM_BEHAVIOR_VERSION: str = "11"
+#
+# "12": grouped MCAP serialization now uses the shared Rust core through
+# hebbian-mcap. Message semantics and group isolation are preserved, but the
+# library identifier, schema/channel placement, and compressed bytes can change.
+# Regenerate derived outputs rather than mixing both writers under one identity.
+TRANSFORM_BEHAVIOR_VERSION: str = "12"

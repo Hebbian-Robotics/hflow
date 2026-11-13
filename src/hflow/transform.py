@@ -63,17 +63,18 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Literal
 
+from hebbian_mcap import (
+    NO_SCHEMA_ID,
+    ChannelId,
+    GroupedMcapWriter,
+    SchemaId,
+)
+
 from hflow import video as video_module
 from hflow._field_guards import (
     require_int_in_range,
     require_positive_float,
     require_positive_int,
-)
-from hflow._grouped_mcap_writer import (
-    NO_SCHEMA_ID,
-    ChannelId,
-    GroupedMcapWriter,
-    SchemaId,
 )
 from hflow.behavior import TRANSFORM_BEHAVIOR_VERSION
 from hflow.ffmpeg import ffmpeg_version

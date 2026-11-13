@@ -97,8 +97,9 @@ conventions for efficient reads and reproducible processing:
    unrelated camera bytes. HFlow instead groups topics that share a read pattern and writes each
    group time-major: cameras interleaved in one chunk stream, proprioception + actions in another,
    never sharing a chunk. A sample then costs one read per *group*: an added camera costs no extra
-   fetch. The generic mechanism is isolated in the private
-   `hflow._grouped_mcap_writer` subpackage. Chunking changes write order, not the format, so
+   fetch. The generic mechanism lives in the shared
+   [`mcap-tools`](https://github.com/Hebbian-Robotics/mcap-tools) Rust core,
+   accessed through the `hebbian_mcap` Python bindings. Chunking changes write order, not the format, so
    **any conforming MCAP reader
    (Foxglove, Rerun, the stock `mcap` package) reads our files unmodified.**
 3. **Version stamps.** HFlow stamps every canonical episode with `schema_version`,
@@ -118,10 +119,14 @@ The remaining details are HFlow design decisions:
 
 On-disk identifiers (metadata record names, channel naming) are neutral and format-versioned: they never embed the project name, so stored data is independent of branding.
 
-`hflow._grouped_mcap_writer` is an incubation boundary, not a public API or a second distribution.
-It is included in the normal HFlow wheel, so releases remain a single build and publish. If its API
-proves useful independently, it can later move into a workspace package with its own tests and
-version; that package must be published before a HFlow release declares it as a dependency.
+The `hebbian-mcap` dependency owns generic grouping and MCAP serialization. HFlow
+owns group selection, derived targets, episode schemas, transformations and provenance.
+We maintain both repositories; coordinated changes to `mcap-tools` are welcome.
+Update the pinned Git revision in `pyproject.toml` and refresh `uv.lock` together.
+Source installs require Rust; published wheels do not. Before publishing a HFlow
+release, release a compatible `hebbian-mcap` package to PyPI: uv's Git source
+selection applies to development, while distribution metadata declares the versioned
+package dependency.
 
 **Acceptance test for every file the pipeline writes: it opens cleanly in Foxglove and Rerun.**
 

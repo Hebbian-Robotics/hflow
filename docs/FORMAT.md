@@ -19,7 +19,7 @@ The single overriding rule: **a canonical episode is spec-conforming MCAP.** Eve
 
 - MCAP magic, `Header`, data section, `DataEnd`, summary section, `Footer`, closing magic, per the [MCAP spec](https://mcap.dev/spec).
 - `Header.profile` is the empty string `""` (the file mixes protobuf video channels with pass-through channels of arbitrary encoding, so no single profile applies).
-- `Header.library` is informational only (currently `hflow._grouped_mcap_writer`). Its exact value is not part of the format contract, and no reader may key behavior off it (see [Identifier rules](#identifier-rules)).
+- `Header.library` is informational only (currently `hebbian-mcap/0.1.0`). Its exact value is not part of the format contract, and no reader may key behavior off it (see [Identifier rules](#identifier-rules)).
 - Chunks are compressed with **zstd** by default (`"none"` is permitted). Each `Chunk` record carries `uncompressed_crc`; the `Footer` carries a summary CRC.
 - The summary section repeats all `Schema` and `Channel` records and contains `Statistics`, all `ChunkIndex` records, `AttachmentIndex`/`MetadataIndex` records, and `SummaryOffset` records. A canonical episode always has a complete summary; unindexed files are not canonical.
 - Each topic names exactly one channel. MCAP allows several channels to share a topic; a canonical episode does not, because topic-keyed reads would be ambiguous.
@@ -41,12 +41,11 @@ time-major chunk streams, so a sample costs one read per *group*.
 | Derived chunk targets | Recorded per group in `provenance/v1` as `chunk-target/<group>`, and only when derived (a pinned target is already in the config) |
 | Camera schemas | `foxglove.CompressedVideo`, `foxglove.CompressedImage`, `foxglove.RawImage`, `foxglove_msgs/msg/CompressedVideo`, `sensor_msgs/msg/CompressedImage`, `sensor_msgs/msg/Image` |
 
-Writer mechanics (currently implemented by HFlow's private `hflow._grouped_mcap_writer`
-incubation package; equivalent layouts are conforming as long as the rule above holds):
+Writer mechanics (implemented by the shared `hebbian-mcap` package; equivalent layouts are conforming as long as the rule above holds):
 
 - One chunk buffer per group. A message routes to its channel's group buffer; when a group's uncompressed buffer exceeds the chunk-size target, that group's chunk is finalized. At `finish()`, every group flushes its remaining buffer.
 - Each `Chunk` record is followed immediately by its `MessageIndex` records (one per channel present in that chunk), and a `ChunkIndex` in the summary points at both. Consequence: the set of channel IDs in any chunk's `message_index_offsets` maps to exactly one group; this is the property conformance checks assert.
-- `Schema` and `Channel` records are written *unchunked* in the data section at registration time and repeated in the summary (spec-legal; readers that only consult the summary see them either way).
+- `Schema` and `Channel` records may be chunked with messages or written unchunked, and are repeated in the summary. Their physical placement is not part of the convention.
 
 Chunking changes write order, not the format.
 
