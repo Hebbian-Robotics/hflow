@@ -14,6 +14,9 @@ resolution-markers = [
 exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
 exclude-newer-span = "P5D"
 
+[options.exclude-newer-package]
+hebbian-mcap = false
+
 [manifest]
 members = [
     "hflow",
@@ -1220,7 +1223,15 @@ wheels = [
 [[package]]
 name = "hebbian-mcap"
 version = "0.1.0"
-source = { git = "https://github.com/Hebbian-Robotics/mcap-tools?rev=ec0553ba42299726a4eb19f5b25b714e1e71ed12#ec0553ba42299726a4eb19f5b25b714e1e71ed12" }
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/59/7e/e25ba9b4d74999bbf33dc0c989c4324c3b53d6b5393095cc21587fa68ade/hebbian_mcap-0.1.0.tar.gz", hash = "sha256:35845094f7d74ba428305c6eed7008cdc491c0f269494760edf0b6b18d561d16", size = 33623, upload-time = "2026-11-13T14:50:28.306Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f3/55/21c241ef1fecf9788676b525aeaafb905bcd665d690fc06059e0478be40c/hebbian_mcap-0.1.0-cp311-abi3-macosx_10_12_x86_64.whl", hash = "sha256:65b7cf112de4cf7c0446d912927ad4cfa95c8bfa13e20d69d3da852de7f2e678", size = 613164, upload-time = "2026-11-13T14:50:22.492Z" },
+    { url = "https://files.pythonhosted.org/packages/42/c7/3b49a463fe7a55dd5b9ba7ca7f7b23be6b20ae0e225e7f322e73fbd599c0/hebbian_mcap-0.1.0-cp311-abi3-macosx_11_0_arm64.whl", hash = "sha256:b823fa90d3a33b00e724af9d49a54870362fb3c52e6fcdc9658ae2be46f5f445", size = 560158, upload-time = "2026-11-13T14:50:24.145Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/24/3bdfae9592d0f4ad96bf8f127c831eda429f214a242890a73654717c1062/hebbian_mcap-0.1.0-cp311-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:1a9bc08328cdc063d22fa972e0930ecd8cb8c02d7c8da6c43c442d1d154af0a5", size = 691691, upload-time = "2026-11-13T14:50:25.079Z" },
+    { url = "https://files.pythonhosted.org/packages/ad/04/31861e259dc72c0326db37166cdfd65e46d08da26c5906cec89f45c6a903/hebbian_mcap-0.1.0-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:238ca2985779bd63bc6344e70dc8a18dcb97906d1bae22ab9f8c6fb2e3982dcd", size = 685952, upload-time = "2026-11-13T14:50:26.099Z" },
+    { url = "https://files.pythonhosted.org/packages/c8/ba/a573437df2b82a9d001252c2ea8a1e0ab2655a8014c097e9283c0b6ebea7/hebbian_mcap-0.1.0-cp311-abi3-win_amd64.whl", hash = "sha256:65f26d177478a95fe9abf50ec056d8d6d4df3e04c0279469ff50601a417191dd", size = 479322, upload-time = "2026-11-13T14:50:27.271Z" },
+]
 
 [package.optional-dependencies]
 video = [
@@ -1329,8 +1340,8 @@ requires-dist = [
     { name = "cython", marker = "extra == 'native-build'", specifier = ">=3.3.0" },
     { name = "duckdb", specifier = ">=2.0.0" },
     { name = "foxglove-schemas-protobuf", specifier = ">=0.4.0" },
-    { name = "hebbian-mcap", git = "https://github.com/Hebbian-Robotics/mcap-tools?rev=ec0553ba42299726a4eb19f5b25b714e1e71ed12" },
-    { name = "hebbian-mcap", extras = ["video"], marker = "extra == 'video'", git = "https://github.com/Hebbian-Robotics/mcap-tools?rev=ec0553ba42299726a4eb19f5b25b714e1e71ed12" },
+    { name = "hebbian-mcap", specifier = "==0.1.0" },
+    { name = "hebbian-mcap", extras = ["video"], marker = "extra == 'video'", specifier = "==0.1.0" },
     { name = "httpx", specifier = ">=0.28.1,<1" },
     { name = "httpx2", specifier = ">=2.12.0" },
     { name = "huggingface-hub", specifier = ">=1.31.0,<2" },

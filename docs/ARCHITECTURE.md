@@ -125,11 +125,11 @@ The shared package also owns H.264 inspection and optional camera-to-MP4 export;
 `hflow.mcap_video` adapts HFlow media limits to that exporter. Codec dependencies
 remain behind the `video` extra.
 We maintain both repositories; coordinated changes to `mcap-tools` are welcome.
-Update the pinned Git revision in `pyproject.toml` and refresh `uv.lock` together.
-Source installs require Rust; published wheels do not. Before publishing a HFlow
-release, release a compatible `hebbian-mcap` package to PyPI: uv's Git source
-selection applies to development, while distribution metadata declares the versioned
-package dependency.
+Update the pinned package version in `pyproject.toml` and refresh `uv.lock`
+together after publishing its wheels. Supported platforms install prebuilt wheels
+without a Rust toolchain. Rust is needed when developing the dependency's native
+implementation from source. The package is exempted from the development
+minimum-release-age delay because we maintain and validate its releases ourselves.
 
 **Acceptance test for every file the pipeline writes: it opens cleanly in Foxglove and Rerun.**
 

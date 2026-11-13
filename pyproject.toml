@@ -27,7 +27,7 @@ dependencies = [
     "httpx2>=2.12.0",
     "huggingface-hub>=1.31.0,<2",
     "mcap>=1.4.0",
-    "hebbian-mcap>=0.1.0",
+    "hebbian-mcap==0.1.0",
     "mcap-protobuf-support>=0.5.4",
     "mcap-ros2-support>=0.5.7",
     "numpy>=2.3.5",
@@ -57,7 +57,7 @@ mediapipe = ["mediapipe>=1.0.1"]
 # dependency is real, and confined to the one check that needs it. Headless
 # because a data pipeline runs where there is no display.
 motion = ["opencv-python-headless>=5.0.0.93"]
-video = ["av>=18.1.0", "hebbian-mcap[video]>=0.1.0"]
+video = ["av>=18.1.0", "hebbian-mcap[video]==0.1.0"]
 native-build = ["Cython>=3.3.0", "setuptools>=84.0.0"]
 openai = ["openai>=3.3.1"]
 
@@ -98,6 +98,8 @@ cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.py" }]
 # Override per-package via `exclude-newer-package = { foo = false }` for
 # trusted first-party packages.
 exclude-newer = "5 days"
+# First-party releases are verified by our wheel matrix before consumers update.
+exclude-newer-package = { hebbian-mcap = false }
 
 [tool.uv.workspace]
 members = [
@@ -108,7 +110,6 @@ members = [
 ]
 
 [tool.uv.sources]
-hebbian-mcap = { git = "https://github.com/Hebbian-Robotics/mcap-tools", rev = "ec0553ba42299726a4eb19f5b25b714e1e71ed12" }
 hflow-server = { workspace = true }
 
 [tool.pytest.ini_options]

@@ -18,7 +18,6 @@ You need:
 
 - Git and [uv](https://docs.astral.sh/uv/)
 - Python 3.11 or newer
-- Rust 1.92+ for source builds of the shared `hebbian-mcap` dependency
 - A system C compiler/toolchain that provides `cc` for the native-overlay tests
 - ffmpeg and ffprobe on `PATH` for the test suite (ffmpeg 5.1 or newer; the suite uses `-fps_mode`, which is not in the 4.4.x builds Ubuntu 22.04 ships). Tests that invoke ffmpeg must carry `@pytest.mark.requires_system_ffmpeg` so older binaries skip them instead of failing the suite.
 - Docker with Compose v2 only when working on the Airflow runtime integration
@@ -49,6 +48,12 @@ distribution instead, following the setup steps below from the WSL2 shell and
 keeping both the clone and your data root on the Linux filesystem. The
 [runtime prerequisites](./docs/RUNTIME.md#prerequisites) explain why the data
 root has to live there.
+
+The shared `hebbian-mcap` dependency installs from prebuilt wheels on supported
+platforms. Its source build needs Rust 1.92+; a normal HFlow installation does not
+need a Rust toolchain. When changing that dependency, coordinate work in our
+[mcap-tools repository](https://github.com/Hebbian-Robotics/mcap-tools), publish
+its wheels, then update the pinned package version and `uv.lock` here.
 
 Public package exports load their implementations on first access. Keep utility
 imports such as `hflow.statistics` and `hflow.batching` independent of pipeline,
