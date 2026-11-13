@@ -474,17 +474,23 @@ byte-for-byte (each source (chunk, file) keeping its identity in the
 destination path) and slices the selected data rows from the source chunk
 parquets, so cameras, Parquet column types, array shapes, and frame timing
 match the source. Data files retain the source Arrow schema, including float32
-widths and field and schema metadata. Episode indexes are renumbered sequentially
-in selection order. The exporter drives the public `hflow import lerobot` entry point to
+widths and field and schema metadata; each written data file's schema is checked
+against its source before publication. The feature registry retains the source
+declaration (dtype, shape, names) for every written non-video feature, including
+integer indexes and boolean flags, and omits declarations for unwritten columns.
+Episode indexes are renumbered sequentially in selection order. The exporter
+drives the public `hflow import lerobot` entry point to
 materialize the source archive (meta, data chunks, video chunks) and copies
 the video chunks byte-for-byte. A dataset-card draft (`README.md`) and
 `export-provenance.json` record the source repository, source commit,
 exporter version, selection SQL/manifest, and selected source episode
 indexes.
 
-The v2 exporter preserves source Parquet schemas; regenerate v3 exports made
-with v1 to restore source dtypes and array shapes. This does not change HFlow's
-canonical episode format or transform behavior version.
+The v3 exporter completes the feature registry and preserves the source Parquet
+schemas introduced in exporter v2. Regenerate exports made with v1 to restore
+source dtypes and array shapes, and those made with v1 or v2 to restore missing
+integer and boolean feature declarations. This does not change HFlow's canonical
+episode format or transform behavior version.
 
 From a curation manifest:
 
@@ -507,7 +513,7 @@ uv run python examples/lerobot/export.py \
 Failures abort before any output is published: mixed source repositories
 or revisions, non-immutable revisions, missing provenance, missing source
 episodes, duplicate selections, and a staged dataset that fails structural
-or (when `lerobot` is installed) official-API validation never replace a
+validation never replace a
 previously valid destination.
 
 Code: [`lerobot/export.py`](./lerobot/export.py)

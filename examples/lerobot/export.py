@@ -37,6 +37,7 @@ import shutil
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import zip_longest
 from pathlib import Path
 
 import duckdb
@@ -45,7 +46,7 @@ import pyarrow.parquet as pq
 
 import hflow
 
-EXPORT_VERSION = "lerobot-export-v2"
+EXPORT_VERSION = "lerobot-export-v3"
 
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
@@ -369,6 +370,28 @@ def _episode_rows(table: pa.Table) -> list[dict]:
     return out
 
 
+def _check_written_data_schema(path: Path, source_schema: pa.Schema) -> None:
+    """Check the written footer without reading any frame data."""
+    written_schema = pq.read_schema(path)
+    if written_schema.equals(source_schema, check_metadata=True):
+        return
+    difference = "schema metadata"
+    for source_field, written_field in zip_longest(source_schema, written_schema):
+        if source_field is None:
+            difference = f"unexpected field {written_field.name!r}"
+        elif written_field is None:
+            difference = f"missing field {source_field.name!r}"
+        elif source_field.equals(written_field, check_metadata=True):
+            continue
+        else:
+            difference = (
+                f"field {source_field.name!r} (type, nullability, or metadata): "
+                f"expected {source_field}, found {written_field}"
+            )
+        break
+    raise ValueError(f"exported data file {path}: schema differs from source at {difference}")
+
+
 def _write_v3_repository(
     *,
     corpus: dict,
@@ -579,6 +602,7 @@ def _write_v3_repository(
     total_frames = 0
     video_paths: list[Path] = []
     copied_videos: set[tuple[str, int, int]] = set()
+    written_data_columns: set[str] = set()
 
     for (
         new_idx,
@@ -600,10 +624,10 @@ def _write_v3_repository(
             data_frames.append(d)
             frame_rows.append(d)
         total_frames += length
-        pq.write_table(
-            pa.Table.from_pylist(frame_rows, schema=source_data_schema),
-            data_dir / f"file-{new_idx:03d}.parquet",
-        )
+        data_path = data_dir / f"file-{new_idx:03d}.parquet"
+        pq.write_table(pa.Table.from_pylist(frame_rows, schema=source_data_schema), data_path)
+        _check_written_data_schema(data_path, source_data_schema)
+        written_data_columns.update(source_data_schema.names)
 
         # keep the source (chunk, file) identity in the destination path
         ep_video_refs: dict[str, dict] = {}
@@ -655,10 +679,10 @@ def _write_v3_repository(
         cam: corpus["info"]["features"].get(cam, {"dtype": "video", "shape": [480, 640, 3]})
         for cam in camera_keys
     }
-    numeric_features = {
+    data_features = {
         k: v
         for k, v in corpus["info"].get("features", {}).items()
-        if isinstance(v, dict) and v.get("dtype") == "float32"
+        if isinstance(v, dict) and v.get("dtype") != "video" and k in written_data_columns
     }
     out_info = {
         "code": "LeRobotDataset/v3",
@@ -670,7 +694,7 @@ def _write_v3_repository(
         "splits": {"train": [f"episode_{i:06d}" for i in range(len(selections))]},
         "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
         "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
-        "features": {**numeric_features, **video_features},
+        "features": {**data_features, **video_features},
         "version": 1,
     }
     (destination / "meta" / "info.json").write_text(json.dumps(out_info, indent=2))
