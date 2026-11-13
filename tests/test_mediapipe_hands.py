@@ -7,27 +7,33 @@ resolution, and the promise that registering the check does not require the
 model to be installed. The end-to-end case is opt-in via
 ``HFLOW_MEDIAPIPE_TESTS=1``.
 
-That split is the same one the original implementation made -- its own tests
-covered selection and resize arithmetic, and the detector was exercised by a
-manual probe -- and it leaves one honest gap, recorded at the bottom of this
-file.
+The mocked detector test exercises the timestamp and interval plumbing without
+the optional model. The opt-in test below covers the real MediaPipe integration;
+synthetic footage still cannot prove that the model detects a real hand.
 """
 
 import asyncio
 import hashlib
 import os
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
+import numpy as np
 import pytest
 from episode_test_helpers import synthesize_canonical_episode
 
 import hflow
+from hflow._video_measurements._raw_frames import SampledRGBFrame
+from hflow.episode import Episode
 from hflow.mediapipe_hands import (
     HAND_LANDMARKER_MODEL_ENV_VAR,
     PINNED_HAND_MODEL_SHA256,
     FrameHandCounts,
     HandModelNotAvailableError,
+    _measure_mediapipe_hands,
     _no_detection_intervals,
     _resolved_hand_model_digest,
     hand_landmarker_model_path,
@@ -124,6 +130,19 @@ class TestAbsenceIntervals:
         assert [(interval.start_ns, interval.end_ns) for interval in intervals] == expected_spans
         assert all(interval.label == "no_hand_detected:/cam" for interval in intervals)
 
+    def test_a_skipped_sampling_tick_splits_absence_runs(self) -> None:
+        log_times_ns = [0, 2 * _SECOND_NS, 3 * _SECOND_NS]
+        intervals = _no_detection_intervals(
+            log_times_ns,
+            [_frame(0), _frame(0), _frame(1)],
+            "no_hand_detected:/cam",
+            sample_indices=[0, 2, 3],
+        )
+
+        assert [(interval.start_ns, interval.end_ns) for interval in intervals] == [
+            (2 * _SECOND_NS, 3 * _SECOND_NS)
+        ]
+
 
 class TestModelAcquisition:
     def test_the_environment_override_wins(
@@ -216,6 +235,87 @@ class TestRegistrationWithoutTheModel:
         )
         with hflow.Episode(canonical) as episode, pytest.raises(ValueError, match="sample_fps"):
             asyncio.run(mediapipe_hand_detection(episode, sample_fps=5000.0))
+
+
+class TestMissingSampleTiming:
+    def test_missing_sampling_tick_keeps_detector_and_absence_times(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A skipped sample keeps detector times and splits absence intervals."""
+        topic = "/wrist_cam/compressed"
+        source_timestamps_ns = np.arange(91, dtype=np.int64) * 33_333_333
+        episode = cast(
+            Episode,
+            SimpleNamespace(
+                cameras=[topic],
+                channel=lambda _topic: SimpleNamespace(timestamps=source_timestamps_ns),
+                video=lambda _topic: tmp_path / "synthetic.mp4",
+            ),
+        )
+        detector_timestamps_ms: list[int] = []
+
+        class FakeLandmarker:
+            def __enter__(self) -> "FakeLandmarker":
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                pass
+
+            def detect_for_video(self, _image: object, timestamp_ms: int) -> SimpleNamespace:
+                detector_timestamps_ms.append(timestamp_ms)
+                # The first two sampled frames have no hand; the third does.
+                # Tick 1 was skipped, so it breaks the first absence run.
+                has_hand = len(detector_timestamps_ms) == 3
+                return SimpleNamespace(
+                    hand_landmarks=[object()] if has_hand else [],
+                    handedness=[[]] if has_hand else [],
+                )
+
+        fake_mediapipe = SimpleNamespace(
+            __version__="test",
+            ImageFormat=SimpleNamespace(SRGB="SRGB"),
+            Image=lambda **kwargs: SimpleNamespace(**kwargs),
+            tasks=SimpleNamespace(
+                BaseOptions=lambda **kwargs: SimpleNamespace(**kwargs),
+                vision=SimpleNamespace(
+                    RunningMode=SimpleNamespace(VIDEO="VIDEO"),
+                    HandLandmarkerOptions=lambda **kwargs: SimpleNamespace(**kwargs),
+                    HandLandmarker=SimpleNamespace(
+                        create_from_options=lambda _options: FakeLandmarker()
+                    ),
+                ),
+            ),
+        )
+        pixels = np.zeros((2, 2, 3), dtype=np.uint8)
+        sampled_frames = [
+            SampledRGBFrame(sample_index=sample, source_frame_index=source, pixels=pixels)
+            for sample, source in ((0, 0), (2, 60), (3, 90))
+        ]
+
+        @contextmanager
+        def fake_rgb_frames(
+            *_args: object, **_kwargs: object
+        ) -> Generator[list[SampledRGBFrame], None, None]:
+            yield sampled_frames
+
+        monkeypatch.setattr("hflow.mediapipe_hands._import_mediapipe", lambda: fake_mediapipe)
+        monkeypatch.setattr("hflow.mediapipe_hands.hand_landmarker_model_path", lambda: tmp_path)
+        monkeypatch.setattr(
+            "hflow.mediapipe_hands._resolved_hand_model_digest", lambda: "test-digest"
+        )
+        monkeypatch.setattr("hflow.mediapipe_hands.rgb_frames", fake_rgb_frames)
+        monkeypatch.setattr(
+            "hflow.mediapipe_hands.resolved_video_measurement_toolchain", lambda: object()
+        )
+
+        result = _measure_mediapipe_hands(episode, sample_fps=1.0)
+
+        assert detector_timestamps_ms == [0, 2000, 3000]
+        (interval,) = result.intervals
+        assert (interval.start_ns, interval.end_ns) == (
+            int(source_timestamps_ns[60]),
+            int(source_timestamps_ns[90]),
+        )
 
 
 @pytest.fixture(scope="module")

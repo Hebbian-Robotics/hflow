@@ -12,10 +12,12 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 import tarfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import httpx2
 import numpy as np
@@ -42,12 +44,21 @@ from hflow._video_measurements import (
     VideoMeasurementToolchain,
     measure_video_frame_statistics,
 )
+from hflow._video_measurements._bounded_process import run_bounded_process
 from hflow._video_measurements._frame_statistics import (
     _FILTER_LIST_ENTRY_PATTERN,
     _aggregate_frame_statistics_output,
 )
 from hflow._video_measurements._raw_frames import (
+    DECODED_FRAME_HASH_TIMEOUT_SECONDS,
+    FFPROBE_TIMEOUT_SECONDS,
+    MAXIMUM_DECODED_FRAME_HASH_OUTPUT_BYTES,
+    MAXIMUM_FFPROBE_OUTPUT_BYTES,
     RawFrameError,
+    _decoded_frame_hashes,
+    _first_sample_index,
+    _probe_frame_rate,
+    _probe_keyframe_indices,
     _scaled_frame_shape,
     luma_frames,
     rgb_frames,
@@ -83,6 +94,176 @@ from hflow.ffmpeg._contact_sheet import (
     _find_usable_font_file,
     contact_sheet,
 )
+
+
+def test_rgb_frame_hash_trace_uses_bounded_media_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: dict[str, object] = {}
+
+    def completed_hash_process(
+        _arguments: list[str], *, timeout_seconds: float, maximum_output_bytes: int
+    ) -> SimpleNamespace:
+        calls.update(
+            timeout_seconds=timeout_seconds,
+            maximum_output_bytes=maximum_output_bytes,
+        )
+        return SimpleNamespace(
+            returncode=0,
+            stdout=b"#tb 0: 1/1000000\n0, 1, 0, 1, 1, digest\n",
+        )
+
+    monkeypatch.setattr(
+        "hflow._video_measurements._raw_frames.run_bounded_process", completed_hash_process
+    )
+    toolchain = cast(VideoMeasurementToolchain, SimpleNamespace(ffmpeg_executable=Path("ffmpeg")))
+
+    decoded_indices, hashes = _decoded_frame_hashes(
+        Path("video.mp4"),
+        toolchain=toolchain,
+        filter_graph="format=pix_fmts=rgb24",
+        source_fps=30.0,
+        sample_fps=30.0,
+    )
+
+    assert decoded_indices == [0]
+    assert hashes == {0: {"digest"}}
+    assert calls == {
+        "timeout_seconds": DECODED_FRAME_HASH_TIMEOUT_SECONDS,
+        "maximum_output_bytes": MAXIMUM_DECODED_FRAME_HASH_OUTPUT_BYTES,
+    }
+
+
+def test_rgb_frame_hash_trace_preserves_nonzero_source_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "hflow._video_measurements._raw_frames.run_bounded_process",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=(
+                b"#tb 0: 1/1000000\n"
+                b"0, 0, 1000000, 33333, 1, first\n"
+                b"0, 1000000, 1033333, 33333, 1, second\n"
+            ),
+        ),
+    )
+    toolchain = cast(VideoMeasurementToolchain, SimpleNamespace(ffmpeg_executable=Path("ffmpeg")))
+
+    decoded_indices, hashes = _decoded_frame_hashes(
+        Path("video.mp4"),
+        toolchain=toolchain,
+        filter_graph="format=pix_fmts=rgb24",
+        source_fps=30.0,
+        sample_fps=30.0,
+    )
+
+    assert decoded_indices == [30, 31]
+    assert hashes == {30: {"first"}, 31: {"second"}}
+
+
+def test_rgb_frame_hash_trace_times_out_a_stalled_ffmpeg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "hflow._video_measurements._raw_frames.DECODED_FRAME_HASH_TIMEOUT_SECONDS", 0.1
+    )
+
+    def stalled_ffmpeg(
+        _arguments: list[str], *, timeout_seconds: float, maximum_output_bytes: int
+    ) -> object:
+        return run_bounded_process(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            timeout_seconds=timeout_seconds,
+            maximum_output_bytes=maximum_output_bytes,
+        )
+
+    monkeypatch.setattr("hflow._video_measurements._raw_frames.run_bounded_process", stalled_ffmpeg)
+    toolchain = cast(VideoMeasurementToolchain, SimpleNamespace(ffmpeg_executable=Path("ffmpeg")))
+
+    with pytest.raises(RawFrameError, match="timed out"):
+        _decoded_frame_hashes(
+            Path("video.mp4"),
+            toolchain=toolchain,
+            filter_graph="format=pix_fmts=rgb24",
+            source_fps=30.0,
+            sample_fps=30.0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("probe", "stdout", "expected"),
+    [
+        (
+            _probe_frame_rate,
+            b'{"streams":[{"avg_frame_rate":"30/1","r_frame_rate":"30/1"}]}',
+            30.0,
+        ),
+        (_probe_keyframe_indices, b"K_\n_\n", frozenset({0})),
+    ],
+)
+def test_frame_probes_use_bounded_media_command(
+    monkeypatch: pytest.MonkeyPatch,
+    probe: Callable[[Path, VideoMeasurementToolchain], object],
+    stdout: bytes,
+    expected: object,
+) -> None:
+    calls: list[tuple[list[str], float, int]] = []
+
+    def completed_probe(
+        arguments: list[str], *, timeout_seconds: float, maximum_output_bytes: int
+    ) -> SimpleNamespace:
+        calls.append((arguments, timeout_seconds, maximum_output_bytes))
+        return SimpleNamespace(returncode=0, stdout=stdout)
+
+    monkeypatch.setattr(
+        "hflow._video_measurements._raw_frames.run_bounded_process", completed_probe
+    )
+    toolchain = cast(VideoMeasurementToolchain, SimpleNamespace(ffprobe_executable=Path("ffprobe")))
+
+    assert probe(Path("video.mp4"), toolchain) == expected
+    assert len(calls) == 1
+    arguments, timeout_seconds, maximum_output_bytes = calls[0]
+    assert arguments[0] == "ffprobe"
+    assert arguments[-1] == "video.mp4"
+    assert timeout_seconds == FFPROBE_TIMEOUT_SECONDS
+    assert maximum_output_bytes == MAXIMUM_FFPROBE_OUTPUT_BYTES
+
+
+@pytest.mark.parametrize("probe", [_probe_frame_rate, _probe_keyframe_indices])
+def test_frame_probes_time_out_a_stalled_ffprobe(
+    monkeypatch: pytest.MonkeyPatch,
+    probe: Callable[[Path, VideoMeasurementToolchain], object],
+) -> None:
+    monkeypatch.setattr("hflow._video_measurements._raw_frames.FFPROBE_TIMEOUT_SECONDS", 0.1)
+
+    def stalled_ffprobe(
+        _arguments: list[str], *, timeout_seconds: float, maximum_output_bytes: int
+    ) -> object:
+        return run_bounded_process(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            timeout_seconds=timeout_seconds,
+            maximum_output_bytes=maximum_output_bytes,
+        )
+
+    monkeypatch.setattr(
+        "hflow._video_measurements._raw_frames.run_bounded_process", stalled_ffprobe
+    )
+    toolchain = cast(VideoMeasurementToolchain, SimpleNamespace(ffprobe_executable=Path("ffprobe")))
+
+    with pytest.raises(RawFrameError, match="exceeded its bounds"):
+        probe(Path("video.mp4"), toolchain)
+
+
+@pytest.mark.parametrize(
+    ("first_source_index", "source_fps", "sample_fps", "expected_sample_index"),
+    [(10, 30.0, 30.0, 10), (11, 30.0, 3.0, 2), (10, 30.0, 40.0, 14)],
+)
+def test_first_sample_index_keeps_the_original_sampling_grid(
+    first_source_index: int,
+    source_fps: float,
+    sample_fps: float,
+    expected_sample_index: int,
+) -> None:
+    assert _first_sample_index(first_source_index, source_fps, sample_fps) == expected_sample_index
 
 
 def _measure_frame_statistics(
@@ -646,7 +827,7 @@ def test_raw_frames_stream_every_frame_at_the_coded_size(
     needs and what ``Episode.frames()`` deliberately does not give.
     """
     with frame_reader(black_tail_video, toolchain=resolved_video_measurement_toolchain()) as frames:
-        shapes = [frame.shape for frame in frames]
+        shapes = [getattr(frame, "pixels", frame).shape for frame in frames]
     assert len(shapes) == 60
     assert set(shapes) == {expected_shape}
 
@@ -765,7 +946,7 @@ def test_rgb_frames_resamples_and_resizes_in_one_decode(black_tail_video: Path) 
         frames_per_second=1.0,
         long_edge_pixels=80,
     ) as frames:
-        shapes = [frame.shape for frame in frames]
+        shapes = [frame.pixels.shape for frame in frames]
     # 6 seconds at 10 fps sampled to 1 fps, and 160x120 scaled to an 80 long edge.
     assert len(shapes) == 6
     assert set(shapes) == {(60, 80, 3)}
@@ -777,8 +958,8 @@ def test_rgb_frames_are_contiguous_uint8(black_tail_video: Path) -> None:
     """
     with rgb_frames(black_tail_video, toolchain=resolved_video_measurement_toolchain()) as frames:
         frame = next(iter(frames))
-    assert frame.dtype == np.uint8
-    assert frame.flags["C_CONTIGUOUS"]
+    assert frame.pixels.dtype == np.uint8
+    assert frame.pixels.flags["C_CONTIGUOUS"]
 
 
 def test_rgb_frames_reject_a_non_positive_rate(black_tail_video: Path) -> None:
@@ -837,7 +1018,7 @@ def numbered_30fps_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return video_path
 
 
-@pytest.mark.parametrize("sample_fps", [1.0, 3.0, 4.0, 10.0, 30.0])
+@pytest.mark.parametrize("sample_fps", [1.0, 3.0, 3.0000049, 4.0, 10.0, 30.0])
 def test_rgb_frames_sampling_aligns_with_output_ticks(
     numbered_30fps_video: Path, sample_fps: float
 ) -> None:
@@ -862,10 +1043,14 @@ def test_rgb_frames_sampling_aligns_with_output_ticks(
         toolchain=resolved_video_measurement_toolchain(),
         frames_per_second=sample_fps,
     ) as frames:
-        shown = [read_frame_index(f) for f in frames]
+        samples = list(frames)
+        shown = [read_frame_index(sample.pixels) for sample in samples]
 
-    expected = [int(i * 30 / sample_fps) for i in range(int(3 * sample_fps))]
+    effective_sample_fps = float(f"{sample_fps:g}")
+    expected = [int(i * 30 / effective_sample_fps) for i in range(int(3 * effective_sample_fps))]
     assert shown == expected
+    assert [sample.sample_index for sample in samples] == list(range(len(expected)))
+    assert [sample.source_frame_index for sample in samples] == expected
 
 
 @pytest.mark.parametrize(
