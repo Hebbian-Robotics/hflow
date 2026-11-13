@@ -50,7 +50,9 @@ NANOSECONDS_PER_SECOND = 1_000_000_000
 # artifact names, label keys, or the muxed file's timing model change.
 # "2": the per-camera MP4 cache name gained its collision-resistant topic
 # digest (#535), so the published artifact URIs change.
-CAMERA_VIDEO_VERSION = "2"
+# "3": single-frame cameras now record video_frame_count=1 and video_start_s
+# without fps or an MP4 artifact instead of failing (#774).
+CAMERA_VIDEO_VERSION = "3"
 
 VIDEO_ARTIFACT_PREFIX = "video:"
 
