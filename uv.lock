@@ -1220,7 +1220,18 @@ wheels = [
 [[package]]
 name = "hebbian-mcap"
 version = "0.1.0"
-source = { git = "https://github.com/Hebbian-Robotics/mcap-tools?rev=ec9f4262d5ec5681e0960f7a93f66347b64cb612#ec9f4262d5ec5681e0960f7a93f66347b64cb612" }
+source = { git = "https://github.com/Hebbian-Robotics/mcap-tools?rev=ec0553ba42299726a4eb19f5b25b714e1e71ed12#ec0553ba42299726a4eb19f5b25b714e1e71ed12" }
+
+[package.optional-dependencies]
+video = [
+    { name = "av", version = "18.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "av", version = "19.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "mcap" },
+    { name = "mcap-protobuf-support" },
+    { name = "mcap-ros2-support" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
 
 [[package]]
 name = "hf-xet"
@@ -1292,6 +1303,7 @@ openai = [
 video = [
     { name = "av", version = "18.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "av", version = "19.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "hebbian-mcap", extra = ["video"] },
 ]
 
 [package.dev-dependencies]
@@ -1317,7 +1329,8 @@ requires-dist = [
     { name = "cython", marker = "extra == 'native-build'", specifier = ">=3.3.0" },
     { name = "duckdb", specifier = ">=2.0.0" },
     { name = "foxglove-schemas-protobuf", specifier = ">=0.4.0" },
-    { name = "hebbian-mcap", git = "https://github.com/Hebbian-Robotics/mcap-tools?rev=ec9f4262d5ec5681e0960f7a93f66347b64cb612" },
+    { name = "hebbian-mcap", git = "https://github.com/Hebbian-Robotics/mcap-tools?rev=ec0553ba42299726a4eb19f5b25b714e1e71ed12" },
+    { name = "hebbian-mcap", extras = ["video"], marker = "extra == 'video'", git = "https://github.com/Hebbian-Robotics/mcap-tools?rev=ec0553ba42299726a4eb19f5b25b714e1e71ed12" },
     { name = "httpx", specifier = ">=0.28.1,<1" },
     { name = "httpx2", specifier = ">=2.12.0" },
     { name = "huggingface-hub", specifier = ">=1.31.0,<2" },

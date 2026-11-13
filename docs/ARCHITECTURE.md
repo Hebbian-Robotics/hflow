@@ -121,6 +121,9 @@ On-disk identifiers (metadata record names, channel naming) are neutral and form
 
 The `hebbian-mcap` dependency owns generic grouping and MCAP serialization. HFlow
 owns group selection, derived targets, episode schemas, transformations and provenance.
+The shared package also owns H.264 inspection and optional camera-to-MP4 export;
+`hflow.mcap_video` adapts HFlow media limits to that exporter. Codec dependencies
+remain behind the `video` extra.
 We maintain both repositories; coordinated changes to `mcap-tools` are welcome.
 Update the pinned Git revision in `pyproject.toml` and refresh `uv.lock` together.
 Source installs require Rust; published wheels do not. Before publishing a HFlow

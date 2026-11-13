@@ -57,7 +57,7 @@ mediapipe = ["mediapipe>=1.0.1"]
 # dependency is real, and confined to the one check that needs it. Headless
 # because a data pipeline runs where there is no display.
 motion = ["opencv-python-headless>=5.0.0.93"]
-video = ["av>=18.1.0"]
+video = ["av>=18.1.0", "hebbian-mcap[video]>=0.1.0"]
 native-build = ["Cython>=3.3.0", "setuptools>=84.0.0"]
 openai = ["openai>=3.3.1"]
 
@@ -108,7 +108,7 @@ members = [
 ]
 
 [tool.uv.sources]
-hebbian-mcap = { git = "https://github.com/Hebbian-Robotics/mcap-tools", rev = "ec9f4262d5ec5681e0960f7a93f66347b64cb612" }
+hebbian-mcap = { git = "https://github.com/Hebbian-Robotics/mcap-tools", rev = "ec0553ba42299726a4eb19f5b25b714e1e71ed12" }
 hflow-server = { workspace = true }
 
 [tool.pytest.ini_options]
