@@ -179,6 +179,7 @@ def contact_sheet(
             str(ffmpeg_binary),
             "-hide_banner",
             "-nostats",
+            "-nostdin",
             "-y",
             "-f",
             "concat",
