@@ -610,7 +610,7 @@ def _ingest_in_process(
     turns off the per-episode planning that would otherwise skip the ones the
     catalog already records as current.
     """
-    from hflow.stage_execution import run_stages_directly
+    from hflow.stage_execution import resolve_step_names_for_stage, run_stages_directly
     from hflow.stage_planning import StageSelection
     from hflow.steps import stages_for_profile
 
@@ -621,6 +621,17 @@ def _ingest_in_process(
         return 2
     stages = stages_for_profile(profile)
     selection = StageSelection.EVERY_STAGE if all_stages else StageSelection.OUTSTANDING
+    try:
+        # Only the selection is parsed inside this block. run_stages_directly
+        # parses it again, but catching ValueError around the run itself would
+        # report one raised while processing an episode as bad input. The
+        # resolver answers for one stage and validates the whole selection
+        # whichever stage is named, so its answer is not needed here.
+        enabled_stage_names = sorted(stage.value for stage in stages)
+        resolve_step_names_for_stage(app, step_names, enabled_stage_names, enabled_stage_names[0])
+    except (ValueError, TypeError) as error:
+        print(f"ingest: {error}", file=sys.stderr)
+        return 2
     print(
         f"ingest: no runtime addressed; processing {len(uris)} episode(s) "
         f"in this process against {app.data_root}",

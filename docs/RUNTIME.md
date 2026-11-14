@@ -76,7 +76,9 @@ hflow ingest --profile metadata_backfill \
   --step camera_integrity --step hand_activity episodes-in/*.mcap
 ```
 
-The profile must enable every selected step's owning stage. `sync` still runs
+The profile must enable every selected step's owning stage. In-process, a name
+no step is registered under, or one whose stage the profile disables, is
+refused with exit code 2 before any episode is read. `sync` still runs
 when the profile includes it; unselected steps write no catalog rows and
 remain available to a later run.
 
