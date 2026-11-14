@@ -747,6 +747,7 @@ def measure_video_frame_statistics(
             with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as standard_error_file:
                 instrument_process = subprocess.Popen(
                     command,
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=standard_error_file,
                     text=True,
