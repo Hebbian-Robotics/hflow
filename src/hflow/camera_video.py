@@ -28,7 +28,10 @@ Per camera topic it records:
 - label ``<topic>/video_frame_count``: how many access units were muxed.
 
 A declared camera with no messages gets only ``<topic>/video_frame_count`` of
-0: no MP4 artifact, no ``video_fps``, and no ``video_start_s``.
+0: no MP4 artifact, no ``video_fps``, and no ``video_start_s``. A camera with
+a single message gets ``<topic>/video_frame_count`` of 1: no MP4 artifact (no
+inter-frame interval to mux), no ``video_fps``, but ``video_start_s`` when the
+episode records time bounds.
 
 The MP4 plays at a constant rate, so a stream with irregular stamps drifts
 from log time by its jitter; the ``timestamp_regularity`` check measures that
@@ -47,7 +50,9 @@ NANOSECONDS_PER_SECOND = 1_000_000_000
 # artifact names, label keys, or the muxed file's timing model change.
 # "2": the per-camera MP4 cache name gained its collision-resistant topic
 # digest (#535), so the published artifact URIs change.
-CAMERA_VIDEO_VERSION = "2"
+# "3": single-frame cameras now record video_frame_count=1 and video_start_s
+# without fps or an MP4 artifact instead of failing (#774).
+CAMERA_VIDEO_VERSION = "3"
 
 VIDEO_ARTIFACT_PREFIX = "video:"
 
@@ -75,6 +80,17 @@ def camera_video(episode: Episode) -> EnrichmentResult:
             # record the zero count and publish no video for it.
             labels[f"{camera_topic}/video_frame_count"] = 0
             continue
+        if len(channel) == 1:
+            # A single-frame stream has no inter-frame interval, so fps cannot
+            # be estimated and no MP4 can be muxed. Record the count and, when
+            # the episode records time bounds, the offset of that one frame.
+            labels[f"{camera_topic}/video_frame_count"] = 1
+            if time_bounds is not None:
+                first_frame_offset_ns = int(channel.timestamps[0]) - time_bounds.start_ns
+                labels[f"{camera_topic}/video_start_s"] = (
+                    first_frame_offset_ns / NANOSECONDS_PER_SECOND
+                )
+            continue
         mp4_path = episode.video(camera_topic)
         artifacts[video_artifact_name(camera_topic)] = mp4_path
         # The same estimate Episode.video() muxed at, so the label is the
@@ -83,7 +99,7 @@ def camera_video(episode: Episode) -> EnrichmentResult:
             channel.timestamps.tolist(), topic=camera_topic
         )
         labels[f"{camera_topic}/video_frame_count"] = len(channel)
-        if time_bounds is not None and len(channel) > 0:
+        if time_bounds is not None:
             first_frame_offset_ns = int(channel.timestamps[0]) - time_bounds.start_ns
             labels[f"{camera_topic}/video_start_s"] = first_frame_offset_ns / NANOSECONDS_PER_SECOND
     return EnrichmentResult(labels=labels, artifacts=artifacts)
