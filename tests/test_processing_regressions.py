@@ -7,9 +7,8 @@ import logging
 import subprocess
 import sys
 import textwrap
-from collections.abc import Callable
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 import pytest
 from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
@@ -27,7 +26,6 @@ from mcap_test_helpers import (
 )
 
 import hflow
-from hflow import transform
 from hflow.catalog import content_episode_id
 from hflow.checks import required_topics
 from hflow.doctor import diagnose
@@ -37,7 +35,6 @@ from hflow.format import (
     METADATA_RECORD_PROVENANCE,
     PROVENANCE_KEY_TOPIC_GROUP_PREFIX,
 )
-from hflow.reader import TopicInfo
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import SourceNotConforming, write_canonical_episode
 from hflow.video import estimate_fps_from_log_times
@@ -519,10 +516,10 @@ def test_transform_inserts_missing_aud_into_ros2_video(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "data", [KEYFRAME_ACCESS_UNIT, KEYFRAME_WITHOUT_AUD], ids=["conforming", "repaired"]
 )
-def test_transform_preserves_decoder_owned_video_messages(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, encoding: str, data: bytes
+def test_transform_preserves_every_field_of_passthrough_video_messages(
+    tmp_path: Path, encoding: str, data: bytes
 ) -> None:
-    source = tmp_path / "decoder-owned-video.mcap"
+    source = tmp_path / "passthrough-video.mcap"
     if encoding == "protobuf":
         write_compressed_video_mcap(source, [("/cam", 1, data)])
     else:
@@ -536,34 +533,22 @@ def test_transform_preserves_decoder_owned_video_messages(
             original="source-recorder",
         )
 
-    resolve_decoder = transform._resolve_decoder
-    decoder_owned_messages: list[Any] = []
-
-    def retaining_decoder(topic: str, info: TopicInfo) -> Callable[[bytes], Any]:
-        decode = resolve_decoder(topic, info)
-
-        def decode_and_retain(payload: bytes) -> Any:
-            message = decode(payload)
-            decoder_owned_messages.append(message)
-            return message
-
-        return decode_and_retain
-
-    monkeypatch.setattr(transform, "_resolve_decoder", retaining_decoder)
     output = tmp_path / "out.mcap"
     write_canonical_episode(source, output)
 
-    (original,) = decoder_owned_messages
-    assert bytes(original.data) == data
-    assert original.format == "h264"
-    assert original.frame_id == "cam"
-    if encoding == "cdr":
-        with output.open("rb") as stream:
-            schema, channel, message = next(make_reader(stream).iter_messages())
-            assert schema is not None
-            decode = Ros2DecoderFactory().decoder_for(channel.message_encoding, schema)
-            assert decode is not None
-            assert decode(message.data).original == "source-recorder"
+    with output.open("rb") as stream:
+        schema, channel, message = next(make_reader(stream).iter_messages())
+        assert schema is not None
+    if encoding == "protobuf":
+        written = CompressedVideo.FromString(message.data)
+    else:
+        decode = Ros2DecoderFactory().decoder_for(channel.message_encoding, schema)
+        assert decode is not None
+        written = decode(message.data)
+        assert written.original == "source-recorder"
+    assert bytes(written.data).endswith(KEYFRAME_WITHOUT_AUD)
+    assert written.format == "h264"
+    assert written.frame_id == "cam"
     report = diagnose(output)
     assert report.conforming, report.summary()
 

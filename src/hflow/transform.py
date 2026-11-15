@@ -56,7 +56,6 @@ v1 behavior:
 import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
-from copy import copy
 from dataclasses import dataclass, field
 from itertools import pairwise
 from pathlib import Path
@@ -64,10 +63,14 @@ from statistics import median
 from typing import Any, Literal
 
 from hebbian_mcap import (
+    COMPRESSED_VIDEO_SCHEMA,
     NO_SCHEMA_ID,
     ChannelId,
+    CompressedVideo,
+    CompressedVideoCodec,
     GroupedMcapWriter,
     SchemaId,
+    encode_compressed_video,
 )
 
 from hflow import video as video_module
@@ -389,49 +392,17 @@ def _resolve_decoder(topic: str, info: TopicInfo) -> Callable[[bytes], Any]:
     )
 
 
-@dataclass(frozen=True)
-class _Ros2VideoMessageWithData:
-    """Override only the payload while forwarding every other field to its owner."""
-
-    _original: object
-    data: bytes
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._original, name)
-
-
-def _resolve_encoder(topic: str, info: TopicInfo) -> Callable[[Any, bytes], bytes]:
-    """An encoder matching a decoded pass-through video message."""
-    if info.message_encoding == "protobuf":
-
-        def encode_protobuf(message: Any, data: bytes) -> bytes:
-            repaired_message = copy(message)
-            repaired_message.data = data
-            serialize = getattr(repaired_message, "SerializeToString", None)
-            if not callable(serialize):
-                raise ValueError(
-                    f"camera topic {topic!r} decoded a protobuf message that cannot "
-                    "be serialized after inserting an AUD"
-                )
-            return bytes(serialize())
-
-        return encode_protobuf
-    if info.message_encoding == "cdr" and info.schema_encoding == "ros2msg":
-        from mcap_ros2.writer import serialize_dynamic
-
-        encoders = serialize_dynamic(info.schema_name, info.schema_data.decode())
-        encoder = encoders.get(info.schema_name)
-        if encoder is not None:
-
-            def encode_cdr(message: Any, data: bytes) -> bytes:
-                # mcap_ros2's slotted SimpleNamespace fields are lost by copy.copy.
-                return encoder(_Ros2VideoMessageWithData(_original=message, data=data))
-
-            return encode_cdr
-    raise ValueError(
-        f"camera topic {topic!r} has message encoding {info.message_encoding!r} "
-        "that cannot be serialized after inserting an AUD"
-    )
+def _resolve_passthrough_video_codec(topic: str, info: TopicInfo) -> CompressedVideoCodec:
+    """The codec for one pass-through video channel, or a loud error naming the topic."""
+    try:
+        return CompressedVideoCodec(
+            info.message_encoding, info.schema_encoding, info.schema_name, info.schema_data
+        )
+    except ValueError as error:
+        raise ValueError(
+            f"camera topic {topic!r} has message encoding {info.message_encoding!r} "
+            f"that no available decoder handles ({error})"
+        ) from error
 
 
 @dataclass(frozen=True)
@@ -442,14 +413,16 @@ class _PassthroughVideoMessage:
     data: bytes
 
 
-def _parse_passthrough_video_message(topic: str, decoded_message: Any) -> _PassthroughVideoMessage:
+def _parse_passthrough_video_message(
+    topic: str, decoded_message: CompressedVideo
+) -> _PassthroughVideoMessage:
     if decoded_message.format != "h264":
         raise SourceNotConforming(
             f"pass-through video topic {topic!r} carries format "
             f"{decoded_message.format!r}; the canonical convention requires 'h264' "
             "(re-encode upstream -- v1 does not transcode CompressedVideo)"
         )
-    return _PassthroughVideoMessage(format="h264", data=bytes(decoded_message.data))
+    return _PassthroughVideoMessage(format="h264", data=decoded_message.data)
 
 
 def _insert_missing_passthrough_video_aud(
@@ -686,8 +659,7 @@ def write_canonical_episode(
             for channel_id, info in infos.items()
             if info.schema_name in PASSTHROUGH_VIDEO_SCHEMA_NAMES
         }
-        passthrough_video_decoders: dict[int, Callable[[bytes], Any]] = {}
-        passthrough_video_encoders: dict[int, Callable[[Any, bytes], bytes]] = {}
+        passthrough_video_codecs: dict[int, CompressedVideoCodec] = {}
         passthrough_video_channels_with_messages: set[int] = set()
         # Log time of every keyframe on each pass-through channel, so the
         # cadence stamped into provenance is measured off the bytes being
@@ -700,19 +672,18 @@ def write_canonical_episode(
                 camera_payloads[batch.channel_id].extend(batch.data)
             else:
                 if batch.channel_id in passthrough_video_channel_ids:
-                    if batch.channel_id not in passthrough_video_decoders:
-                        passthrough_video_decoders[batch.channel_id] = _resolve_decoder(
-                            batch.topic, infos[batch.channel_id]
+                    if batch.channel_id not in passthrough_video_codecs:
+                        passthrough_video_codecs[batch.channel_id] = (
+                            _resolve_passthrough_video_codec(batch.topic, infos[batch.channel_id])
                         )
-                    decode = passthrough_video_decoders[batch.channel_id]
+                    codec = passthrough_video_codecs[batch.channel_id]
                     canonical_payloads: list[bytes] = []
                     for message_index, payload in enumerate(batch.data):
                         is_first_message = (
                             batch.channel_id not in passthrough_video_channels_with_messages
                         )
-                        decoded_message = decode(payload)
                         video_message = _parse_passthrough_video_message(
-                            batch.topic, decoded_message
+                            batch.topic, codec.decode(payload)
                         )
                         repaired_video_message = _insert_missing_passthrough_video_aud(
                             batch.topic, video_message
@@ -727,13 +698,7 @@ def write_canonical_episode(
                                 int(batch.log_times[message_index])
                             )
                         if repaired_video_message.data != video_message.data:
-                            if batch.channel_id not in passthrough_video_encoders:
-                                passthrough_video_encoders[batch.channel_id] = _resolve_encoder(
-                                    batch.topic, infos[batch.channel_id]
-                                )
-                            payload = passthrough_video_encoders[batch.channel_id](
-                                decoded_message, repaired_video_message.data
-                            )
+                            payload = codec.replace_data(payload, repaired_video_message.data)
                         canonical_payloads.append(payload)
                         passthrough_video_channels_with_messages.add(batch.channel_id)
                 else:
@@ -747,8 +712,6 @@ def write_canonical_episode(
                     )
                     for index, payload in enumerate(canonical_payloads)
                 )
-
-        from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
 
         for channel_id in transcode_channel_ids:
             payloads = camera_payloads[channel_id]
@@ -775,17 +738,17 @@ def write_canonical_episode(
                 input_codec=input_codec,
             )
             for index, access_unit in enumerate(access_units):
-                message = CompressedVideo()
-                message.timestamp.FromNanoseconds(log_times[index])
-                message.frame_id = frame_ids[index] or topic.strip("/")
-                message.data = access_unit.data
-                message.format = "h264"
                 outgoing.append(
                     _OutgoingMessage(
                         log_time=log_times[index],
                         publish_time=camera_publish_times[channel_id][index],
                         source_channel_id=channel_id,
-                        data=message.SerializeToString(),
+                        data=encode_compressed_video(
+                            log_times[index],
+                            frame_ids[index] or topic.strip("/"),
+                            access_unit.data,
+                            "h264",
+                        ),
                     )
                 )
 
@@ -853,8 +816,6 @@ def write_canonical_episode(
                 derived_topic, DEFAULT_STATE_GROUP
             )
 
-        from mcap_protobuf.schema import build_file_descriptor_set
-
         source_metadata = reader.metadata()
         episode_record_present = METADATA_RECORD_EPISODE in source_metadata
         episode_record = dict(source_metadata.get(METADATA_RECORD_EPISODE, {}))
@@ -898,7 +859,7 @@ def write_canonical_episode(
                         video_schema_id = writer.register_schema(
                             name=CANONICAL_VIDEO_SCHEMA_NAME,
                             encoding="protobuf",
-                            data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
+                            data=COMPRESSED_VIDEO_SCHEMA,
                         )
                     output_channel_ids[source_channel_id] = writer.register_channel(
                         info.topic,
