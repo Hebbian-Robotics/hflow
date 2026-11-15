@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 from mcap.writer import Writer
+from mcap_ros2.writer import serialize_dynamic
 
 from hflow import Episode
 from hflow.checks import (
@@ -34,7 +35,6 @@ from hflow.steps import CheckResult
 from hflow.testing import (
     _JOINT_STATE_SCHEMA_TEXT,
     JOINT_STATE_SCHEMA_NAME,
-    _encode_joint_state,
 )
 
 TOPIC = "/joint_states"
@@ -48,6 +48,9 @@ def _joint_states_episode(
     *,
     omit_positions: bool = False,
 ) -> Episode:
+    encode_joint_state = serialize_dynamic(JOINT_STATE_SCHEMA_NAME, _JOINT_STATE_SCHEMA_TEXT)[
+        JOINT_STATE_SCHEMA_NAME
+    ]
     with path.open("wb") as stream:
         writer = Writer(stream)
         writer.start(profile="ros2", library="test-546")
@@ -63,13 +66,19 @@ def _joint_states_episode(
             METADATA_RECORD_EPISODE, {"task": "nan-failopen", "embodiment": "probe"}
         )
         for sequence, (stamp_ns, position) in enumerate(zip(stamps_ns, positions, strict=True)):
-            payload = _encode_joint_state(
-                stamp_ns,
-                "probe",
-                ["j0"],
-                [] if omit_positions else [position],
-                [],
-                [],
+            # A message naming a joint without a position is malformed on purpose,
+            # so it is built with the schema-driven encoder, which does not check it.
+            payload = encode_joint_state(
+                {
+                    "header": {
+                        "stamp": {"sec": stamp_ns // NS_PER_S, "nanosec": stamp_ns % NS_PER_S},
+                        "frame_id": "probe",
+                    },
+                    "name": ["j0"],
+                    "position": [] if omit_positions else [position],
+                    "velocity": [],
+                    "effort": [],
+                }
             )
             writer.add_message(
                 channel_id=channel_id,
