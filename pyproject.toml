@@ -26,7 +26,7 @@ dependencies = [
     "httpx2>=2.12.0",
     "huggingface-hub>=1.31.0,<2",
     "mcap>=1.4.0",
-    "hebbian-mcap==0.1.1",
+    "hebbian-mcap==0.1.2",
     "mcap-protobuf-support>=0.5.4",
     "mcap-ros2-support>=0.5.7",
     "numpy>=2.3.5",
@@ -56,7 +56,7 @@ mediapipe = ["mediapipe>=1.0.1"]
 # dependency is real, and confined to the one check that needs it. Headless
 # because a data pipeline runs where there is no display.
 motion = ["opencv-python-headless>=5.0.0.93"]
-video = ["av>=18.1.0", "hebbian-mcap[video]==0.1.1"]
+video = ["av>=18.1.0", "hebbian-mcap[video]==0.1.2"]
 native-build = ["Cython>=3.3.0", "setuptools>=84.0.0"]
 openai = ["openai>=3.3.1"]
 

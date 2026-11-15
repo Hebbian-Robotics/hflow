@@ -109,7 +109,7 @@ across these changes.
 # library identifier, schema/channel placement, and compressed bytes can change.
 # Regenerate derived outputs rather than mixing both writers under one identity.
 #
-# "13": video messages are encoded and rewritten by hebbian-mcap 0.1.1. The
+# "13": video messages are encoded and rewritten by hebbian-mcap (0.1.2). The
 # CompressedVideo schema record now carries protobuf ``json_name`` entries, the
 # library identifier names the new release, and a pass-through protobuf message
 # that gains an access unit delimiter keeps its original field order. Decoded

@@ -44,6 +44,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from hebbian_mcap import encode_joint_state
 from mcap.writer import Writer
 
 from hflow._field_guards import require_float, require_int
@@ -180,10 +181,6 @@ class _CdrEncoder:
         self.align(4)
         self._body += struct.pack("<i", value)
 
-    def write_f64(self, value: float) -> None:
-        self.align(8)
-        self._body += struct.pack("<d", value)
-
     def write_string(self, value: str) -> None:
         encoded_value = value.encode("utf-8")
         # The uint32 length prefix includes the trailing NUL terminator.
@@ -201,26 +198,6 @@ def _write_header(encoder: _CdrEncoder, stamp_ns: int, frame_id: str) -> None:
     encoder.write_i32(stamp_ns // NANOSECONDS_PER_SECOND)
     encoder.write_u32(stamp_ns % NANOSECONDS_PER_SECOND)
     encoder.write_string(frame_id)
-
-
-def _encode_joint_state(
-    stamp_ns: int,
-    frame_id: str,
-    joint_names: list[str],
-    positions: list[float],
-    velocities: list[float],
-    efforts: list[float],
-) -> bytes:
-    encoder = _CdrEncoder()
-    _write_header(encoder, stamp_ns, frame_id)
-    encoder.write_u32(len(joint_names))
-    for joint_name in joint_names:
-        encoder.write_string(joint_name)
-    for float_sequence in (positions, velocities, efforts):
-        encoder.write_u32(len(float_sequence))
-        for element in float_sequence:
-            encoder.write_f64(element)
-    return encoder.payload()
 
 
 def _encode_compressed_image(stamp_ns: int, frame_id: str, jpeg_bytes: bytes) -> bytes:
@@ -690,11 +667,11 @@ def _build_joint_messages(spec: SyntheticEpisodeSpec) -> list[tuple[int, bytes]]
                 JOINT_SINE_AMPLITUDE_RAD * 2.0 * math.pi * frequency_hz * math.cos(angle_rad)
             )
         log_time_ns = _message_log_time_ns(spec, message_index, spec.joint_hz)
-        payload = _encode_joint_state(
-            stamp_ns=log_time_ns,
-            frame_id="base",
-            joint_names=joint_names,
-            positions=positions,
+        payload = encode_joint_state(
+            log_time_ns,
+            "base",
+            joint_names,
+            positions,
             velocities=velocities,
             efforts=[0.0] * spec.joint_count,
         )
