@@ -1276,10 +1276,8 @@ def _convert_single_episode(
     landing_relative_key = _landing_relative_key(episode_index)
     output_file_name = Path(landing_relative_key).name
 
-    from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
-    from mcap_protobuf.schema import build_file_descriptor_set
+    from hebbian_mcap import COMPRESSED_VIDEO_SCHEMA, encode_compressed_video
 
-    video_schema_data = build_file_descriptor_set(CompressedVideo).SerializeToString()
     state_schema_name = "lerobot_msgs/msg/State"
     action_schema_name = "lerobot_msgs/msg/Action"
     state_schema_text = f"float32[{numeric_schemas['observation.state'].dim}] position"
@@ -1296,7 +1294,7 @@ def _convert_single_episode(
             mcap_writer.start(profile="", library="hflow LeRobot source adapter")
 
             video_schema_id = mcap_writer.register_schema(
-                "foxglove.CompressedVideo", "protobuf", video_schema_data
+                "foxglove.CompressedVideo", "protobuf", COMPRESSED_VIDEO_SCHEMA
             )
             state_schema_id = mcap_writer.register_schema(
                 state_schema_name, "ros2msg", state_schema_data
@@ -1328,16 +1326,12 @@ def _convert_single_episode(
                 )
                 for camera_key in camera_keys:
                     access_units, _presentation_timestamps = video_data_by_camera[camera_key]
-                    video_message = CompressedVideo()
-                    video_message.timestamp.seconds = log_time_ns // NANOSECONDS_PER_SECOND
-                    video_message.timestamp.nanos = log_time_ns % NANOSECONDS_PER_SECOND
-                    video_message.frame_id = camera_key
-                    video_message.data = access_units[frame_index]
-                    video_message.format = "h264"
                     mcap_writer.add_message(
                         channel_id=video_channel_ids[camera_key],
                         log_time=log_time_ns,
-                        data=video_message.SerializeToString(),
+                        data=encode_compressed_video(
+                            log_time_ns, camera_key, access_units[frame_index], "h264"
+                        ),
                         publish_time=log_time_ns,
                         sequence=frame_index,
                     )

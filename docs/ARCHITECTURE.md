@@ -121,7 +121,9 @@ On-disk identifiers (metadata record names, channel naming) are neutral and form
 
 The `hebbian-mcap` dependency owns generic grouping and MCAP serialization. HFlow
 owns group selection, derived targets, episode schemas, transformations and provenance.
-The shared package also owns H.264 inspection and optional camera-to-MP4 export;
+The shared package also owns `CompressedVideo` encoding, reading and payload
+replacement for protobuf and ROS 2 CDR channels, H.264 inspection and optional
+camera-to-MP4 export;
 `hflow.mcap_video` adapts HFlow media limits to that exporter. Codec dependencies
 remain behind the `video` extra.
 We maintain both repositories; coordinated changes to `mcap-tools` are welcome.

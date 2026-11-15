@@ -19,7 +19,7 @@ The single overriding rule: **a canonical episode is spec-conforming MCAP.** Eve
 
 - MCAP magic, `Header`, data section, `DataEnd`, summary section, `Footer`, closing magic, per the [MCAP spec](https://mcap.dev/spec).
 - `Header.profile` is the empty string `""` (the file mixes protobuf video channels with pass-through channels of arbitrary encoding, so no single profile applies).
-- `Header.library` is informational only (currently `hebbian-mcap/0.1.0`). Its exact value is not part of the format contract, and no reader may key behavior off it (see [Identifier rules](#identifier-rules)).
+- `Header.library` is informational only (currently `hebbian-mcap/0.1.1`). Its exact value is not part of the format contract, and no reader may key behavior off it (see [Identifier rules](#identifier-rules)).
 - Chunks are compressed with **zstd** by default (`"none"` is permitted). Each `Chunk` record carries `uncompressed_crc`; the `Footer` carries a summary CRC.
 - The summary section repeats all `Schema` and `Channel` records and contains `Statistics`, all `ChunkIndex` records, `AttachmentIndex`/`MetadataIndex` records, and `SummaryOffset` records. A canonical episode always has a complete summary; unindexed files are not canonical.
 - Each topic names exactly one channel. MCAP allows several channels to share a topic; a canonical episode does not, because topic-keyed reads would be ambiguous.

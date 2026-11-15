@@ -17,12 +17,13 @@ file alone).
 """
 
 import math
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from hebbian_mcap import CompressedVideoCodec
 from mcap.reader import make_reader
 from mcap.records import Channel, Schema
 
@@ -190,7 +191,7 @@ def _check_video_payload(
 
 
 class VideoEncodingUnsupported(ValueError):
-    """No decoder factory in the supported set handles this message encoding.
+    """The channel's message encoding or schema is outside the supported set.
 
     A subclass of ``ValueError`` because every existing caller treats
     resolution failure as a ``ValueError``; the distinct type lets the video
@@ -200,19 +201,17 @@ class VideoEncodingUnsupported(ValueError):
     """
 
 
-def _resolve_video_decoder(topic: str, channel: Channel, schema: Schema) -> Callable[[bytes], Any]:
+def _resolve_video_codec(topic: str, channel: Channel, schema: Schema) -> CompressedVideoCodec:
     """Resolve either supported encoded-video payload representation."""
-    from mcap_protobuf.decoder import DecoderFactory as ProtobufDecoderFactory
-    from mcap_ros2.decoder import DecoderFactory as Ros2DecoderFactory
-
-    for factory in (Ros2DecoderFactory(), ProtobufDecoderFactory()):
-        decoder = factory.decoder_for(channel.message_encoding, schema)
-        if decoder is not None:
-            return decoder
-    raise VideoEncodingUnsupported(
-        f"video topic {topic!r} has message encoding {channel.message_encoding!r} "
-        "that no available decoder handles"
-    )
+    try:
+        return CompressedVideoCodec(
+            channel.message_encoding, schema.encoding, schema.name, schema.data
+        )
+    except ValueError as error:
+        raise VideoEncodingUnsupported(
+            f"video topic {topic!r} has message encoding {channel.message_encoding!r} "
+            f"that no available decoder handles ({error})"
+        ) from error
 
 
 def _unreadable_message(stream: Any, error: Exception) -> str:
@@ -503,7 +502,7 @@ def diagnose(path: Path | str) -> DoctorReport:
         video_log_times: dict[int, list[int]] = {}
         video_keyframes: dict[int, list[bool | None]] = {}
         try:
-            video_decoders: dict[int, Callable[[bytes], Any]] = {}
+            video_codecs: dict[int, CompressedVideoCodec] = {}
 
             for channel_id, log_time, payload in iter_all_messages():
                 previous = last_log_time_by_channel.get(channel_id)
@@ -523,12 +522,12 @@ def diagnose(path: Path | str) -> DoctorReport:
                         continue
                     message_index = video_message_counts.get(channel_id, 0)
                     video_message_counts[channel_id] = message_index + 1
-                    decoder = video_decoders.get(channel_id)
-                    if decoder is None:
+                    codec = video_codecs.get(channel_id)
+                    if codec is None:
                         channel = summary.channels[channel_id]
                         schema = summary.schemas[channel.schema_id]
                         try:
-                            decoder = _resolve_video_decoder(channel.topic, channel, schema)
+                            codec = _resolve_video_codec(channel.topic, channel, schema)
                         except VideoEncodingUnsupported as error:
                             video_check_skipped_topics.add(topics_by_channel_id[channel_id])
                             collector.add(
@@ -538,14 +537,14 @@ def diagnose(path: Path | str) -> DoctorReport:
                                 "cannot run on this topic (the file bytes are not implicated)",
                             )
                             continue
-                        video_decoders[channel_id] = decoder
-                    decoded = decoder(payload)
+                        video_codecs[channel_id] = codec
+                    decoded = codec.decode(payload)
                     is_keyframe = _check_video_payload(
                         collector,
                         topics_by_channel_id[channel_id],
                         message_index,
                         decoded.format,
-                        bytes(decoded.data),
+                        decoded.data,
                         is_first_message=message_index == 0,
                     )
                     video_log_times.setdefault(channel_id, []).append(log_time)

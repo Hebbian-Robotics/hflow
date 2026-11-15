@@ -1222,15 +1222,15 @@ wheels = [
 
 [[package]]
 name = "hebbian-mcap"
-version = "0.1.0"
+version = "0.1.1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/59/7e/e25ba9b4d74999bbf33dc0c989c4324c3b53d6b5393095cc21587fa68ade/hebbian_mcap-0.1.0.tar.gz", hash = "sha256:35845094f7d74ba428305c6eed7008cdc491c0f269494760edf0b6b18d561d16", size = 33623, upload-time = "2026-11-13T14:50:28.306Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/36/00/93440d933a7b0f6238cfbfc15ecaa63687bb93a735de1f5c68961a779b19/hebbian_mcap-0.1.1.tar.gz", hash = "sha256:89c41bfaedea4dc78f5c21015538b5ae19ee6ed764443b2fd3b5bcc636976b17", size = 45064, upload-time = "2026-11-15T10:28:14.103Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f3/55/21c241ef1fecf9788676b525aeaafb905bcd665d690fc06059e0478be40c/hebbian_mcap-0.1.0-cp311-abi3-macosx_10_12_x86_64.whl", hash = "sha256:65b7cf112de4cf7c0446d912927ad4cfa95c8bfa13e20d69d3da852de7f2e678", size = 613164, upload-time = "2026-11-13T14:50:22.492Z" },
-    { url = "https://files.pythonhosted.org/packages/42/c7/3b49a463fe7a55dd5b9ba7ca7f7b23be6b20ae0e225e7f322e73fbd599c0/hebbian_mcap-0.1.0-cp311-abi3-macosx_11_0_arm64.whl", hash = "sha256:b823fa90d3a33b00e724af9d49a54870362fb3c52e6fcdc9658ae2be46f5f445", size = 560158, upload-time = "2026-11-13T14:50:24.145Z" },
-    { url = "https://files.pythonhosted.org/packages/6e/24/3bdfae9592d0f4ad96bf8f127c831eda429f214a242890a73654717c1062/hebbian_mcap-0.1.0-cp311-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:1a9bc08328cdc063d22fa972e0930ecd8cb8c02d7c8da6c43c442d1d154af0a5", size = 691691, upload-time = "2026-11-13T14:50:25.079Z" },
-    { url = "https://files.pythonhosted.org/packages/ad/04/31861e259dc72c0326db37166cdfd65e46d08da26c5906cec89f45c6a903/hebbian_mcap-0.1.0-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:238ca2985779bd63bc6344e70dc8a18dcb97906d1bae22ab9f8c6fb2e3982dcd", size = 685952, upload-time = "2026-11-13T14:50:26.099Z" },
-    { url = "https://files.pythonhosted.org/packages/c8/ba/a573437df2b82a9d001252c2ea8a1e0ab2655a8014c097e9283c0b6ebea7/hebbian_mcap-0.1.0-cp311-abi3-win_amd64.whl", hash = "sha256:65f26d177478a95fe9abf50ec056d8d6d4df3e04c0279469ff50601a417191dd", size = 479322, upload-time = "2026-11-13T14:50:27.271Z" },
+    { url = "https://files.pythonhosted.org/packages/bd/a3/6d9e987cc4c6f6b5c61ac1beed8df46db31c03b1b935591244dbd80ee22b/hebbian_mcap-0.1.1-cp311-abi3-macosx_10_12_x86_64.whl", hash = "sha256:9ab2dd5c1ff0b665968ffa08dbc122a49778a5d303e2bc40c12a1953432e737f", size = 634284, upload-time = "2026-11-15T10:28:04.531Z" },
+    { url = "https://files.pythonhosted.org/packages/48/c8/212378fe1cd2fb9030a50032e0f3a43131965b20cd84d615187776d7b812/hebbian_mcap-0.1.1-cp311-abi3-macosx_11_0_arm64.whl", hash = "sha256:cc319552d6514b5210a14ce3099cb07b6804e7bf5e20d99fef88664439bca213", size = 578239, upload-time = "2026-11-15T10:28:07.776Z" },
+    { url = "https://files.pythonhosted.org/packages/21/63/1bb0a63aac128c9eb627cd255ad2a9dac9100efb3ed8450aec5d35344634/hebbian_mcap-0.1.1-cp311-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:8c4289507648799032a84804a4b13c47ea5c5ff606cb78aa4ef3a2664a5df342", size = 709197, upload-time = "2026-11-15T10:28:09.51Z" },
+    { url = "https://files.pythonhosted.org/packages/18/cc/0ea8816b7c8c97f661d5af6016cb4f9878dc31014fe6129ab1cc70c97332/hebbian_mcap-0.1.1-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:b596562a8be241de0ab4e404f9859e43640ade2ff270558fad7ebef78540d1f0", size = 708167, upload-time = "2026-11-15T10:28:11.573Z" },
+    { url = "https://files.pythonhosted.org/packages/64/17/ec82211116102e6a1fd35daa07ca01f16c004dee3976d0a1d6d947fe22f1/hebbian_mcap-0.1.1-cp311-abi3-win_amd64.whl", hash = "sha256:a7704c336cd77ebcc51c3b30ef4dc7b97e9b0c767a60b56d951f39c980833fe7", size = 507248, upload-time = "2026-11-15T10:28:12.98Z" },
 ]
 
 [package.optional-dependencies]
@@ -1274,7 +1274,6 @@ version = "0.2.21"
 source = { editable = "." }
 dependencies = [
     { name = "duckdb" },
-    { name = "foxglove-schemas-protobuf" },
     { name = "hebbian-mcap" },
     { name = "httpx" },
     { name = "httpx2" },
@@ -1322,6 +1321,7 @@ dev = [
     { name = "av", version = "18.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "av", version = "19.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "cython" },
+    { name = "foxglove-schemas-protobuf" },
     { name = "hflow-server" },
     { name = "obstore" },
     { name = "opencv-python-headless" },
@@ -1339,9 +1339,8 @@ requires-dist = [
     { name = "av", marker = "extra == 'video'", specifier = ">=18.1.0" },
     { name = "cython", marker = "extra == 'native-build'", specifier = ">=3.3.0" },
     { name = "duckdb", specifier = ">=2.0.0" },
-    { name = "foxglove-schemas-protobuf", specifier = ">=0.4.0" },
-    { name = "hebbian-mcap", specifier = "==0.1.0" },
-    { name = "hebbian-mcap", extras = ["video"], marker = "extra == 'video'", specifier = "==0.1.0" },
+    { name = "hebbian-mcap", specifier = "==0.1.1" },
+    { name = "hebbian-mcap", extras = ["video"], marker = "extra == 'video'", specifier = "==0.1.1" },
     { name = "httpx", specifier = ">=0.28.1,<1" },
     { name = "httpx2", specifier = ">=2.12.0" },
     { name = "huggingface-hub", specifier = ">=1.31.0,<2" },
@@ -1367,6 +1366,7 @@ provides-extras = ["arrow", "bucket", "mediapipe", "motion", "video", "native-bu
 dev = [
     { name = "av", specifier = ">=18.1.0" },
     { name = "cython", specifier = ">=3.3.0" },
+    { name = "foxglove-schemas-protobuf", specifier = ">=0.4.0" },
     { name = "hflow-server", editable = "packages/hflow-server" },
     { name = "obstore", specifier = ">=0.11.1" },
     { name = "opencv-python-headless", specifier = ">=5.0.0.93" },

@@ -8,9 +8,8 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
+from hebbian_mcap import COMPRESSED_VIDEO_SCHEMA, encode_compressed_video
 from mcap.writer import Writer
-from mcap_protobuf.schema import build_file_descriptor_set
 
 from hflow._field_guards import (
     require_finite_float,
@@ -374,7 +373,7 @@ def _import_inspected_video(
             schema_id = writer.register_schema(
                 name=CANONICAL_VIDEO_SCHEMA_NAME,
                 encoding="protobuf",
-                data=build_file_descriptor_set(CompressedVideo).SerializeToString(),
+                data=COMPRESSED_VIDEO_SCHEMA,
             )
             channel_id = writer.register_channel(
                 topic=f"/{config.camera_name}/compressed",
@@ -408,19 +407,14 @@ def _import_inspected_video(
             )
             for frame_index, access_unit in enumerate(access_units):
                 timestamp_ns = _sample_timestamp_ns(config, frame_index)
-                message = CompressedVideo()
-                message.timestamp.seconds, message.timestamp.nanos = divmod(
-                    timestamp_ns, NANOSECONDS_PER_SECOND
-                )
-                message.frame_id = config.camera_name
-                message.format = "h264"
-                message.data = access_unit.data
                 writer.add_message(
                     channel_id=channel_id,
                     log_time=timestamp_ns,
                     publish_time=timestamp_ns,
                     sequence=frame_index,
-                    data=message.SerializeToString(),
+                    data=encode_compressed_video(
+                        timestamp_ns, config.camera_name, access_unit.data, "h264"
+                    ),
                 )
             writer.finish()
         # A hard link is an atomic create-if-absent on the same filesystem;
