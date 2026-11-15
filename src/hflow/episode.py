@@ -891,7 +891,9 @@ class Episode:
                 if end_s is not None:
                     command += ["-to", f"{end_s:.6f}"]
                 command.append(str(staging_dir / "decoded.framecrc"))
-                completed = subprocess.run(command, capture_output=True, text=True, check=False)
+                completed = subprocess.run(
+                    command, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False
+                )
                 staged_frames = sorted(staging_dir.glob("frame_*.jpg"))
                 if completed.returncode != 0 or not staged_frames:
                     stderr_tail = completed.stderr.strip().splitlines()[-5:]
@@ -1054,6 +1056,7 @@ class Episode:
                 ]
                 completed_process = subprocess.run(
                     command,
+                    stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
                     check=False,

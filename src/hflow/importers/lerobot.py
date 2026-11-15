@@ -384,7 +384,9 @@ def _transcode_mp4_to_h264(
         "h264",
         "pipe:1",
     ]
-    completed_process = subprocess.run(ffmpeg_command, capture_output=True, timeout=600)
+    completed_process = subprocess.run(
+        ffmpeg_command, stdin=subprocess.DEVNULL, capture_output=True, timeout=600
+    )
     if completed_process.returncode != 0:
         raise RuntimeError(
             "ffmpeg transcode failed: " + completed_process.stderr.decode(errors="ignore")

@@ -256,7 +256,7 @@ def _time_is_in_segment(time_s: float, segment: tuple[float, float] | None) -> b
 
 def _run_ffmpeg(arguments: list[str]) -> None:
     command = [str(ffmpeg_path()), "-hide_banner", "-loglevel", "error", "-y", *arguments]
-    completed = subprocess.run(command, capture_output=True, check=False)
+    completed = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, check=False)
     if completed.returncode != 0:
         raise RuntimeError(
             f"ffmpeg failed ({' '.join(command)}): {completed.stderr.decode(errors='replace')}"
