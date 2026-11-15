@@ -131,6 +131,11 @@ CAMERA_SCHEMA_NAMES = frozenset(
     }
 )
 
+# Written to the MCAP header of every canonical episode. It carries no version,
+# so a dependency or HFlow release that serializes the same way writes the same
+# bytes and leaves episode identities alone.
+CANONICAL_LIBRARY_IDENTIFIER = "hflow"
+
 CANONICAL_VIDEO_SCHEMA_NAME = "foxglove.CompressedVideo"
 
 # Already-encoded video schemas whose payload contract the built-in transform
