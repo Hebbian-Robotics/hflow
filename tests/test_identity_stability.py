@@ -8,6 +8,7 @@ from episode_test_helpers import synthesize_canonical_episode
 from mcap.reader import make_reader
 
 import hflow
+from hflow.format import CANONICAL_LIBRARY_IDENTIFIER
 from hflow.testing import SyntheticEpisodeSpec
 from hflow.transform import (
     TransformConfig,
@@ -124,3 +125,14 @@ def test_canonical_write_order_is_total_so_identity_cannot_ride_on_append_order(
         f"{tied_messages} of {len(written)} share a timestamp, and without a "
         "total order their arrangement is decided by append order"
     )
+
+
+def test_canonical_header_does_not_name_a_library_release(tmp_path: Path) -> None:
+    """A dependency release that serializes the same way must write the same header."""
+    canonical = synthesize_canonical_episode(
+        tmp_path, SyntheticEpisodeSpec(duration_s=1.0, cameras=())
+    )
+    with canonical.open("rb") as stream:
+        header = make_reader(stream).get_header()
+    assert header.library == CANONICAL_LIBRARY_IDENTIFIER
+    assert not any(character.isdigit() for character in header.library)

@@ -84,6 +84,7 @@ from hflow.ffmpeg import ffmpeg_version
 from hflow.format import (
     BULK_MESSAGE_BYTES,
     CAMERA_SCHEMA_NAMES,
+    CANONICAL_LIBRARY_IDENTIFIER,
     CANONICAL_VIDEO_SCHEMA_NAME,
     DEFAULT_BULK_GROUP,
     DEFAULT_CAMERA_GROUP,
@@ -846,6 +847,7 @@ def write_canonical_episode(
                 else transform_config.chunk_size_bytes
             ),
             compression=transform_config.compression,
+            library=CANONICAL_LIBRARY_IDENTIFIER,
         ) as writer:
             video_schema_id: SchemaId | None = None
             # Source channel id (or derived topic) -> output writer channel
