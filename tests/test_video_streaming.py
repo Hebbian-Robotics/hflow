@@ -118,7 +118,8 @@ def test_streaming_failure_reaps_process_and_preserves_atomic_output(
         video.write_access_units_to_mp4(units(), fps=30, output=output)
     assert len(processes) == 1
     assert processes[0].poll() is not None
-    assert processes[0].stdin is not None and processes[0].stdin.closed
+    assert processes[0].stdin is not None
+    assert processes[0].stdin.closed
     assert not list(tmp_path.glob(".video.mp4.*.tmp"))
     if existing_output:
         assert output.read_bytes() == b"previous completed MP4"

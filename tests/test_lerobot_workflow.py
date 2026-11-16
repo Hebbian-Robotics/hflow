@@ -323,7 +323,8 @@ def test_workflow_end_to_end_on_small_fixture(tmp_path: Path, installed_fake_imp
     snapshot = data_dir / "snapshot"
     assert list(snapshot.glob("*.parquet"))
     assets = snapshot / "assets"
-    assert assets.is_dir() and any(assets.rglob("*"))
+    assert assets.is_dir()
+    assert any(assets.rglob("*"))
 
     # v3 export contains exactly the selected episodes.
     info = json.loads((data_dir / "v3" / "meta" / "info.json").read_text())

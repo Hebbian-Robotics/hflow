@@ -34,7 +34,8 @@ def test_config_reports_local_mode_and_capabilities(
     payload = api.get("/api/v1/config").json()
     assert payload["mode"] == "local"
     assert payload["read_only"] is False  # the default server accepts writes
-    assert isinstance(payload["hflow_version"], str) and payload["hflow_version"]
+    assert isinstance(payload["hflow_version"], str)
+    assert payload["hflow_version"]
     assert payload["hflow_server_version"] == "0.1.0"
     assert payload["data_root"] == str(populated_workspace.data_root)
     assert payload["capabilities"] == {

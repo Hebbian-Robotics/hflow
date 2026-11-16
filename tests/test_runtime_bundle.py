@@ -1167,7 +1167,8 @@ def test_awkward_paths_render_parseable_compose(config: RuntimeConfig, tmp_path:
     volumes = parsed["services"]["airflow-scheduler"]["volumes"]
     data_mounts = [volume for volume in volumes if volume.endswith(":/opt/airflow/data")]
     # YAML sees the doubled '' as one quote; $ stays doubled for compose to undo.
-    assert data_mounts and "$$JWT_SECRET" in data_mounts[0]
+    assert data_mounts
+    assert "$$JWT_SECRET" in data_mounts[0]
 
 
 @pytest.mark.parametrize(

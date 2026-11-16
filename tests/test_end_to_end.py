@@ -435,7 +435,8 @@ def test_canonical_episode_accessors(
         assert joints.shape[1] == 7
 
         mp4 = episode.video("overhead_cam")
-        assert mp4.is_file() and mp4.stat().st_size > 0
+        assert mp4.is_file()
+        assert mp4.stat().st_size > 0
 
         cached_channels = dict(episode._channel_data_by_id)
         frames = episode.frames("overhead_cam", fps=2.0)
@@ -885,7 +886,8 @@ def test_crashing_check_is_infrastructure_not_data(
     assert not report.quarantined
     by_name = {run.check.name: run for run in report.checks}
     assert by_name["exploding"].status == "error"
-    assert by_name["exploding"].error is not None and "boom" in by_name["exploding"].error
+    assert by_name["exploding"].error is not None
+    assert "boom" in by_name["exploding"].error
     assert by_name["still_runs"].status == "measured"
     (record,) = caplog.records
     assert record.name == "hflow.app"

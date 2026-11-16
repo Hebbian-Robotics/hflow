@@ -7,7 +7,8 @@ BENCHMARK_PATH = Path(__file__).resolve().parents[1] / "benchmarks/camera_frame_
 
 def _load_benchmark() -> ModuleType:
     spec = importlib.util.spec_from_file_location("camera_frame_stats_benchmark", BENCHMARK_PATH)
-    assert spec is not None and spec.loader is not None
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

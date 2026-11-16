@@ -1443,7 +1443,8 @@ def test_cached_output_reaggregates_without_decoding_again(
     first = measure_video_frame_statistics_for_hflow(cached_video, settings=default_settings)
     toolchain = resolved_video_measurement_toolchain()
     cache_path = _frame_statistics_cache_path(cached_video, default_settings, toolchain)
-    assert cache_path is not None and cache_path.is_file()
+    assert cache_path is not None
+    assert cache_path.is_file()
 
     # A cache hit must remain usable even when another decode is impossible.
     cached_video.write_bytes(b"not a video anymore")

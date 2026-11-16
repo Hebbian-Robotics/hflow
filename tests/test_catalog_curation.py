@@ -61,7 +61,8 @@ def test_append_is_idempotent_for_the_same_content_versions_and_outcome(tmp_path
         episode_metadata={"task": "fold_napkin"},
         check_rows=[example_check_row()],
     )
-    assert first.written and not second.written
+    assert first.written
+    assert not second.written
     assert first.episode_id == second.episode_id == content_episode_id(canonical)
     parquet_files = list((tmp_path / "catalog" / "measurements").glob("*.parquet"))
     assert len(parquet_files) == 1
@@ -339,7 +340,8 @@ def test_the_orchestrator_run_id_is_recorded_without_entering_the_fingerprint(
         orchestrator_run_id="scheduled__2026-08-24T00:00:00+00:00",
     )
 
-    assert first.written and not replayed_under_another_run.written
+    assert first.written
+    assert not replayed_under_another_run.written
     assert first.run_fingerprint == replayed_under_another_run.run_fingerprint
     assert len(list((tmp_path / "catalog" / "episodes").glob("*.parquet"))) == 1
 
@@ -381,7 +383,8 @@ def test_episode_time_bounds_are_recorded_as_the_episode_axis(tmp_path: Path) ->
         episode_metadata={},
         check_rows=[example_check_row()],
     )
-    assert with_bounds.written and not replayed_without_bounds.written
+    assert with_bounds.written
+    assert not replayed_without_bounds.written
     assert with_bounds.run_fingerprint == replayed_without_bounds.run_fingerprint
 
     with open_catalog_connection(tmp_path / "catalog") as connection:
@@ -736,7 +739,8 @@ def test_successful_retry_after_error_appends_repaired_outcome(tmp_path: Path) -
         check_rows=[successful_row],
     )
 
-    assert first.written and second.written
+    assert first.written
+    assert second.written
     assert first.run_fingerprint != second.run_fingerprint
     with open_catalog_connection(tmp_path / "catalog") as connection:
         assert connection.execute(
@@ -830,7 +834,8 @@ def recorded_data_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
     for task_name, spec in episode_specs.items():
         source = synthesize_episode(sources_dir / f"{task_name}.mcap", spec)
         report = asyncio.run(app.test(source, verbose=False, record=True))
-        assert report.catalog_entry is not None and report.catalog_entry.written
+        assert report.catalog_entry is not None
+        assert report.catalog_entry.written
 
     rerun_report = asyncio.run(
         app.test(sources_dir / "fold_napkin.mcap", verbose=False, record=True)
@@ -2261,10 +2266,11 @@ def test_episodes_view_reserved_columns_match_queryable_episode_columns(
         for key in view_columns_by_lookup_key.keys() - reserved_columns_by_lookup_key.keys()
     )
 
-    assert not reserved_not_in_view and not view_not_reserved, (
-        "episodes view reserved-column drift: "
-        f"reserved_not_in_view={reserved_not_in_view}, "
-        f"view_not_reserved={view_not_reserved}"
+    assert not reserved_not_in_view, (
+        f"episodes view reserved-column drift: reserved_not_in_view={reserved_not_in_view}"
+    )
+    assert not view_not_reserved, (
+        f"episodes view reserved-column drift: view_not_reserved={view_not_reserved}"
     )
 
 
@@ -2660,7 +2666,8 @@ def test_measurements_latest_ranks_by_the_owning_episodes_recorded_at(tmp_path: 
         episode_metadata={},
         check_rows=[example_check_row(version="v2", value=2.0)],
     )
-    assert older.written and newer.written
+    assert older.written
+    assert newer.written
     assert older.run_fingerprint != newer.run_fingerprint
 
     # Simulate a repair pass that won `episodes` for the NEWER run but

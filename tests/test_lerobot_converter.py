@@ -516,7 +516,8 @@ def test_converter_output_remuxes_without_tail_loss(
     every source frame.
     """
 
-    assert _FFMPEG is not None and _FFPROBE is not None
+    assert _FFMPEG is not None
+    assert _FFPROBE is not None
     system_ffmpeg_path = Path(_FFMPEG)
     system_ffprobe_path = Path(_FFPROBE)
     monkeypatch.setattr(prep, "ffmpeg_path", lambda: system_ffmpeg_path)
@@ -628,7 +629,8 @@ def _source_gray_frame(video: Path, index: int) -> bytes:
 
 
 def _mean_absolute_difference(left: bytes, right: bytes) -> float:
-    assert left and len(left) == len(right)
+    assert left
+    assert len(left) == len(right)
     return sum(abs(a - b) for a, b in zip(left, right, strict=True)) / len(left)
 
 
@@ -659,7 +661,8 @@ def test_video_pts_times_are_in_presentation_order_for_b_frame_sources(
     are matched index-by-index against the parquet rows, so they must come
     back in presentation order or frame 1 is compared with a later frame.
     """
-    assert _FFMPEG is not None and _FFPROBE is not None
+    assert _FFMPEG is not None
+    assert _FFPROBE is not None
     source = tmp_path / "source.mp4"
     subprocess.run(
         [
@@ -727,7 +730,8 @@ def test_converter_slices_exactly_the_declared_frame_count(
     disagree by one. The first episode of the pinned svla corpus reproduces
     this on real recordings (length 226 vs 227 access units).
     """
-    assert _FFMPEG is not None and _FFPROBE is not None
+    assert _FFMPEG is not None
+    assert _FFPROBE is not None
     source = tmp_path / "source.mp4"
     subprocess.run(
         [

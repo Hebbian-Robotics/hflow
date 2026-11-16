@@ -109,7 +109,8 @@ def test_cancellation_drains_blocking_media_before_closing_the_episode(tmp_path:
                 release_media.set()
             with pytest.raises(asyncio.CancelledError):
                 await processing_task
-        assert media_finished.is_set() and check_finished.is_set()
+        assert media_finished.is_set()
+        assert check_finished.is_set()
 
     asyncio.run(scenario())
 
