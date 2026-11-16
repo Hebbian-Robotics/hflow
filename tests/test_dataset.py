@@ -58,6 +58,7 @@ def _ingest(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert cli_main(["ingest", "episodes-in/episode_0001.mcap"]) == 0
 
 
+@pytest.mark.usefixtures("advancing_catalog_clock")
 class TestDefaultPolicy:
     def test_a_check_that_errors_on_replay_excludes_its_episode(
         self, tmp_path: Path, one_second_camera_less_episode: Path

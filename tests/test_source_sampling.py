@@ -28,9 +28,9 @@ from hflow.ffmpeg import ffmpeg_path, ffprobe_path
 pytestmark = pytest.mark.requires_system_ffmpeg
 
 
-@pytest.fixture
-def color_video(tmp_path: Path) -> Path:
-    source_path = tmp_path / "colors.mp4"
+@pytest.fixture(scope="module")
+def color_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    source_path = tmp_path_factory.mktemp("sampling-colors") / "colors.mp4"
     arguments = [str(ffmpeg_path()), "-hide_banner", "-loglevel", "error", "-nostdin"]
     for color in ("red", "green", "blue"):
         arguments.extend(("-f", "lavfi", "-i", f"color=c={color}:s=96x64:r=10:d=2"))
