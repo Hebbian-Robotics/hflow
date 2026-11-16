@@ -394,7 +394,7 @@ def test_saved_label_report_rejects_unsupported_envelope_before_frames(
     report_path = tmp_path / "labels.json"
     report_path.write_text(json.dumps({**envelope, "frames": [None]}))
 
-    with pytest.raises(ValueError) as error:
+    with pytest.raises(ValueError, match=rf"field '{field_name}' has value") as error:
         load_projected_hand_label_report(report_path)
 
     message = str(error.value)
@@ -1016,7 +1016,7 @@ def test_run_metadata_names_the_file_and_the_bad_field(
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path.write_text(run_json_text)
 
-    with pytest.raises(ValueError) as error:
+    with pytest.raises(ValueError, match=r"run\.json") as error:
         _prepare_output_directory(configuration)
 
     message = str(error.value)
