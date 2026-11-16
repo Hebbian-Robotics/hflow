@@ -174,7 +174,9 @@ def test_streaming_fps_preserves_exact_median_and_errors(timestamps: list[int]) 
     try:
         expected = video.estimate_fps_from_log_times(timestamps, topic="/camera")
     except ValueError as error:
-        with pytest.raises(ValueError) as streaming_error:
+        with pytest.raises(
+            ValueError, match=r"camera topic '/camera'.*frame rate"
+        ) as streaming_error:
             video.estimate_fps_from_streaming_log_times(iter(timestamps), topic="/camera")
         assert str(streaming_error.value) == str(error)
     else:

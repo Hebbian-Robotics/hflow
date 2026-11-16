@@ -690,7 +690,7 @@ def test_model_answers_reject_ambiguous_or_out_of_contract_json(
     task: str, response_text: str
 ) -> None:
     checks = hflow.build_ai_vlm_checks
-    with pytest.raises(ValueError) as captured_error:
+    with pytest.raises(ValueError, match=task.replace("-", " ")) as captured_error:
         checks.parse_task_response(checks.EvaluationTask(task), response_text)
     assert captured_error.value.__cause__ is None
     assert captured_error.value.__suppress_context__

@@ -331,7 +331,7 @@ def test_export_refuses_written_schema_mismatch(
     destination = tmp_path / "out"
     destination.mkdir()
     (destination / "sentinel.txt").write_text("previous export")
-    with pytest.raises(ValueError) as error:
+    with pytest.raises(ValueError, match="schema differs from source") as error:
         export.export(destination, manifest=manifest, camera_keys=CAMS)
     message = str(error.value)
     assert "data/chunk-000/file-001.parquet" in message

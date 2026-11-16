@@ -170,12 +170,16 @@ def test_preparation_failure_surfaces_at_its_item_after_earlier_items(tmp_path: 
 
     async def scenario() -> list[int]:
         received: list[int] = []
-        with pytest.raises(ValueError, match="window 2 is unreadable"):
+
+        async def consume() -> None:
             async with prefetch(
                 range(5), prepare, working_directory=tmp_path, lookahead=2
             ) as prepared_items:
                 async for prepared in prepared_items:
                     received.append(prepared.item)
+
+        with pytest.raises(ValueError, match="window 2 is unreadable"):
+            await consume()
         return received
 
     assert asyncio.run(scenario()) == [0, 1]

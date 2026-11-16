@@ -49,11 +49,21 @@ def test_plans_refuse_partial_coverage_when_limits_cannot_be_satisfied() -> None
 
 @pytest.mark.parametrize("duration_millis", [True, 1.5, "100", 0, -1])
 def test_invalid_durations_are_not_silently_coerced(duration_millis: object) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="duration_millis must be"):
         plan_source_windows(duration_millis, maximum_window_millis=100)  # ty: ignore[invalid-argument-type]
 
 
-@pytest.mark.parametrize("bounds", [(-1, 1), (0, 0), (2, 1), (False, 1)])
-def test_source_windows_require_a_nonempty_forward_interval(bounds: tuple[int, int]) -> None:
-    with pytest.raises(ValueError):
+@pytest.mark.parametrize(
+    ("bounds", "expected_error"),
+    [
+        ((-1, 1), "start_millis must be >= 0"),
+        ((0, 0), "end_millis must be > 0"),
+        ((2, 1), "end_millis must be greater than start_millis"),
+        ((False, 1), "start_millis must be an int"),
+    ],
+)
+def test_source_windows_require_a_nonempty_forward_interval(
+    bounds: tuple[int, int], expected_error: str
+) -> None:
+    with pytest.raises(ValueError, match=expected_error):
         SourceWindow(*bounds)

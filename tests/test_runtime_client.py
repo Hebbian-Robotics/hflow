@@ -599,7 +599,7 @@ def test_ingest_refuses_a_batch_count_the_run_could_not_honour(stub_server: str)
 def test_ingest_rejects_invalid_uri_before_making_http_requests(stub_server: str, uri: str) -> None:
     client = AirflowClient(stub_server, "airflow", "right-password")
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"non-empty string|separator|relative to the data root"):
         client.ingest("pipeline_ingest", [uri])
 
     assert _StubAirflowHandler.requests_seen == []
@@ -1020,12 +1020,10 @@ def test_wait_until_healthy_times_out_with_last_status(stub_server: str) -> None
     _StubAirflowHandler.healthy = False
     client = AirflowClient(stub_server, "airflow", "right-password")
     instantly_advancing_clock = InstantlyAdvancingClock()
-    with (
-        pytest.MonkeyPatch.context() as monkeypatch,
-        pytest.raises(TimeoutError, match="scheduler=unhealthy"),
-    ):
+    with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr("hflow.runtime._client.time", instantly_advancing_clock)
-        client.wait_until_healthy(timeout_s=0.3, poll_interval_s=10.0)
+        with pytest.raises(TimeoutError, match="scheduler=unhealthy"):
+            client.wait_until_healthy(timeout_s=0.3, poll_interval_s=10.0)
     assert instantly_advancing_clock.current_time_s == pytest.approx(0.3)
 
 

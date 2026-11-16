@@ -500,14 +500,13 @@ def test_rename_failure_propagates_and_cleans_up(
 
     monkeypatch.setattr(Path, "rename", fail_rename)
 
-    with (
-        Episode(canonical_mcap, workdir=workdir) as ep,
-        pytest.raises(PermissionError, match="simulated permission denied"),
-    ):
+    with Episode(canonical_mcap, workdir=workdir) as ep:
         if method == "frames":
-            ep.frames(fps=2.0)
+            with pytest.raises(PermissionError, match="simulated permission denied"):
+                ep.frames(fps=2.0)
         else:
-            ep.frames_at_indices(frame_indices=[0, 2])
+            with pytest.raises(PermissionError, match="simulated permission denied"):
+                ep.frames_at_indices(frame_indices=[0, 2])
 
     assert not [d for d in workdir.iterdir() if d.is_dir() and d.name.endswith(".tmp")]
 
@@ -543,14 +542,13 @@ def test_failed_ffmpeg_extraction_cleans_up_and_allows_retry(
         else "ffmpeg extracted 0 of 2 selected frames"
     )
 
-    with (
-        Episode(canonical_mcap, workdir=workdir) as ep,
-        pytest.raises(RuntimeError, match=expected_error),
-    ):
+    with Episode(canonical_mcap, workdir=workdir) as ep:
         if method == "frames":
-            ep.frames(fps=2.0)
+            with pytest.raises(RuntimeError, match=expected_error):
+                ep.frames(fps=2.0)
         else:
-            ep.frames_at_indices(frame_indices=[0, 2])
+            with pytest.raises(RuntimeError, match=expected_error):
+                ep.frames_at_indices(frame_indices=[0, 2])
 
     assert not [d for d in workdir.iterdir() if d.is_dir()]
 
