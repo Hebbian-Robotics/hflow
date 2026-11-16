@@ -143,6 +143,43 @@ def test_an_absolute_uri_is_refused_before_anything_runs(
     assert "not relative to the data root" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    ("step_arguments", "expected_message"),
+    [
+        (
+            ["--step", "not_registered"],
+            "ingest: unknown step names ['not_registered']; registered steps: ",
+        ),
+        (
+            ["--profile", "relabel", "--step", "episode_duration"],
+            "ingest: selected steps belong to stages that are not enabled: "
+            "['episode_duration (meta)']; enabled stages: ['labels']",
+        ),
+    ],
+    ids=["unknown-step-name", "step-in-a-stage-the-profile-disables"],
+)
+def test_a_step_selection_the_run_cannot_honour_is_refused_before_anything_runs(
+    project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    step_arguments: list[str],
+    expected_message: str,
+) -> None:
+    """A mistyped --step is bad input (exit 2), not a crash or a failed run."""
+    monkeypatch.delenv("HFLOW_DATA_ROOT", raising=False)
+    monkeypatch.delenv("HFLOW_AIRFLOW_URL", raising=False)
+    monkeypatch.chdir(project)
+
+    assert cli_main(["ingest", "episodes-in/episode_0001.mcap", *step_arguments]) == 2
+
+    printed = capsys.readouterr()
+    assert expected_message in printed.err
+    assert "Traceback" not in printed.err
+    assert "processing 1 episode(s)" not in printed.err
+    assert printed.out == ""
+    assert not (project / "data" / "catalog").exists()
+
+
 def test_stages_run_in_graph_order_whatever_order_they_are_asked_for(project: Path) -> None:
     """Order is the stage graph's, not the caller's.
 

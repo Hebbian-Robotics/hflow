@@ -142,6 +142,18 @@ def resolve_episode_reference(data_root: str, uri: DataRootRelativeUri) -> "Path
     return Path(data_root) / uri
 
 
+def resolve_step_selection(
+    application: "App",
+    step_names: Iterable[str] | None,
+    enabled_stages: Iterable[Stage],
+) -> RegisteredStepSelection:
+    """Parse a run's step selection against the enabled stages, before any I/O.
+
+    Raises ``ValueError`` for an unknown step or one whose stage is disabled.
+    """
+    return application._resolve_registered_step_selection(step_names, enabled_stages)
+
+
 def resolve_step_names_for_stage(
     application: "App",
     step_names: Iterable[str] | None,
@@ -161,9 +173,7 @@ def resolve_step_names_for_stage(
             f"stage {stage.value!r} is not enabled for this run; enabled stages: "
             f"{sorted(enabled.value for enabled in enabled_stages)}"
         )
-    registered_step_selection = application._resolve_registered_step_selection(
-        step_names, enabled_stages
-    )
+    registered_step_selection = resolve_step_selection(application, step_names, enabled_stages)
     return selected_step_names_for_stage(
         registered_step_selection,
         stage,
@@ -325,9 +335,7 @@ async def process_stage_batch(
     elif step_names is None:
         registered_step_selection = ALL_REGISTERED_STEPS
     else:
-        registered_step_selection = application._resolve_registered_step_selection(
-            step_names, {stage}
-        )
+        registered_step_selection = resolve_step_selection(application, step_names, {stage})
     data_root = str(application.data_root)
     counts: StageBatchCounts = {"processed": 0, "quarantined": 0, "errors": 0}
     # The labels and media gates read the episode's cataloged quarantine
@@ -463,9 +471,7 @@ async def run_stages_directly(
     """
     enabled_stages = set(stages)
     ordered_stages = [stage for stage in Stage if stage in enabled_stages]
-    registered_step_selection = application._resolve_registered_step_selection(
-        step_names, enabled_stages
-    )
+    registered_step_selection = resolve_step_selection(application, step_names, enabled_stages)
     stage_by_step_name = application._registered_step_stages()
 
     def selected_names_for_stage(stage: Stage) -> frozenset[str] | None:
