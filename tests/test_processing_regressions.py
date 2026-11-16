@@ -1087,7 +1087,8 @@ def test_missing_artifact_is_the_steps_error_not_the_runs(
     (enrichment_run,) = report.enrichments
     assert enrichment_run.status is hflow.CheckStatus.ERROR
     assert "never-written.png" in (enrichment_run.error or "")
-    assert report.catalog_entry is not None and report.catalog_entry.written
+    assert report.catalog_entry is not None
+    assert report.catalog_entry.written
     assert report.has_errors
     assert not report.quarantined
     (record,) = caplog.records

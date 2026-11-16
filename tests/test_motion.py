@@ -232,8 +232,10 @@ def test_the_check_reports_stability_with_its_coverage(stability_episode: Path) 
 
     unstable_share = result.measurements[f"{camera_topic}/unstable_share"]
     coverage_share = result.measurements[f"{camera_topic}/coverage_share"]
-    assert isinstance(unstable_share, float) and unstable_share > 0.5
-    assert isinstance(coverage_share, float) and coverage_share > 0.9
+    assert isinstance(unstable_share, float)
+    assert unstable_share > 0.5
+    assert isinstance(coverage_share, float)
+    assert coverage_share > 0.9
     assert result.measurements[f"{camera_topic}/horizontal_fov_degrees"] == 90.0
     assert [i.label for i in result.intervals] == [f"unstable:{camera_topic}"] * len(
         result.intervals

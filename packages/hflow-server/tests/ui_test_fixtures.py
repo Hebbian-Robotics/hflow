@@ -136,7 +136,8 @@ def build_populated_workspace(tmp_path_factory: pytest.TempPathFactory) -> Popul
             check_rows=[joint_check_row(2.0), contact_sheet_row],
             orchestrator_run_id=LATEST_ORCHESTRATOR_RUN_ID,
         )
-    assert first_append.written and second_append.written
+    assert first_append.written
+    assert second_append.written
     assert first_append.episode_id == second_append.episode_id
     time.sleep(0.01)
 

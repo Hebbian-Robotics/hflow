@@ -350,7 +350,8 @@ def test_copied_asset_damage_is_reported(
 
     assert not report.ok
     damaged = [f for f in report.findings if f.uri == asset_uri]
-    assert damaged and damaged[0].reason == "content-id-mismatch"
+    assert damaged
+    assert damaged[0].reason == "content-id-mismatch"
 
 
 def test_pre_401_format_json_is_unverifiable_not_corrupt(

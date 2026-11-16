@@ -329,7 +329,8 @@ def test_trigger_fetches_token_once_and_sends_bearer(stub_server: str) -> None:
     client = AirflowClient(stub_server, "airflow", "right-password")
     first = client.trigger_dag_run("pipeline_ingest", conf={"uris": ["a.mcap"]})
     second = client.ingest("pipeline_ingest", ["b.mcap"])
-    assert first.state == "queued" and second.state == "queued"
+    assert first.state == "queued"
+    assert second.state == "queued"
     assert len(_StubAirflowHandler.issued_tokens) == 1  # token cached across calls
 
     trigger_index = next(

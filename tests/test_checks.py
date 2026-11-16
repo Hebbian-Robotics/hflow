@@ -350,12 +350,12 @@ def test_idle_fraction_is_time_weighted_and_bounded(jittery_episode: hflow.Episo
     idle = asyncio.run(idle_fraction(jittery_episode, velocity_epsilon=1e9, min_interval_s=0.5))
     moving_fraction = moving.measurements["/joint_states/idle_fraction"]
     idle_fraction_value = idle.measurements["/joint_states/idle_fraction"]
-    assert isinstance(moving_fraction, float) and isinstance(idle_fraction_value, float)
+    assert isinstance(moving_fraction, float)
+    assert isinstance(idle_fraction_value, float)
     assert moving_fraction < 0.05
     assert idle_fraction_value == pytest.approx(1.0)
-    assert idle.intervals and all(
-        interval.label == "idle:/joint_states" for interval in idle.intervals
-    )
+    assert idle.intervals
+    assert all(interval.label == "idle:/joint_states" for interval in idle.intervals)
     assert moving.verdict is None  # evidence, not verdicts
 
 
@@ -366,7 +366,8 @@ def test_episode_duration_matches_the_synthesized_span(jittery_episode: hflow.Ep
     # The 4 s spec spans ~4 s of log time (one sample period short per stream).
     assert duration_s == pytest.approx(4.0, abs=0.1)
     message_count_total = result.measurements["message_count_total"]
-    assert isinstance(message_count_total, int) and message_count_total > 0
+    assert isinstance(message_count_total, int)
+    assert message_count_total > 0
 
 
 @pytest.fixture
@@ -756,7 +757,8 @@ def test_camera_frame_stats_sees_the_injected_black_segment(tmp_path: Path) -> N
     # Which binary measured this: a pinned-build bump moves readings without
     # moving the check's version, so the instrument names itself in the row.
     instrument = result.measurements["camera_instrument"]
-    assert isinstance(instrument, str) and "ffmpeg version" in instrument
+    assert isinstance(instrument, str)
+    assert "ffmpeg version" in instrument
 
 
 def test_camera_frame_stats_handles_duplicate_and_stationary_timestamps_without_zero_division(
@@ -864,7 +866,8 @@ def test_media_digest_matches_the_same_footage_under_different_telemetry(
 
     assert first_media == second_media, "same footage must digest the same"
     assert first_content != second_content, "differing telemetry must change content_digest"
-    assert isinstance(media_bytes, int) and media_bytes > 0
+    assert isinstance(media_bytes, int)
+    assert media_bytes > 0
 
 
 def test_media_digest_separates_different_footage(tmp_path: Path) -> None:
@@ -899,7 +902,8 @@ def test_keyframe_interval_reports_the_encoders_gop(tmp_path: Path) -> None:
         result = asyncio.run(keyframe_interval(episode))
 
     keyframe_count = result.measurements[f"{camera_topic}/keyframe_count"]
-    assert isinstance(keyframe_count, int) and keyframe_count >= 2
+    assert isinstance(keyframe_count, int)
+    assert keyframe_count >= 2
     assert result.measurements[f"{camera_topic}/first_frame_is_keyframe"] == 1
     max_gap_s = result.measurements[f"{camera_topic}/max_keyframe_gap_s"]
     assert isinstance(max_gap_s, float)
@@ -1151,14 +1155,16 @@ def test_camera_signal_quality_measures_range_exposure_and_stillness(tmp_path: P
     luma_min = result.measurements[f"{camera_topic}/luma_min"]
     luma_max = result.measurements[f"{camera_topic}/luma_max"]
     assert full_range in (0, 1)
-    assert isinstance(luma_min, float) and isinstance(luma_max, float)
+    assert isinstance(luma_min, float)
+    assert isinstance(luma_max, float)
     assert 0.0 <= luma_min <= luma_max <= 255.0
     # The verdict must be consistent with its own evidence.
     assert bool(full_range) == (luma_min < 16.0 or luma_max > 235.0)
 
     # The test pattern moves, so stillness is well above zero.
     frame_difference_mean = result.measurements[f"{camera_topic}/frame_difference_mean"]
-    assert isinstance(frame_difference_mean, float) and frame_difference_mean > 0.0
+    assert isinstance(frame_difference_mean, float)
+    assert frame_difference_mean > 0.0
 
     # A clean synthetic encode carries no impulse noise.
     assert result.measurements[f"{camera_topic}/temporal_outlier_max"] == pytest.approx(
@@ -1190,15 +1196,18 @@ def test_camera_signal_quality_sees_a_blacked_out_segment(tmp_path: Path) -> Non
     # builds' black frames sit under, so the share is stable across them.
     black_share_max = result.measurements[f"{camera_topic}/black_pixel_share_max"]
     black_share_mean = result.measurements[f"{camera_topic}/black_pixel_share_mean"]
-    assert isinstance(black_share_max, float) and black_share_max > 90.0
+    assert isinstance(black_share_max, float)
+    assert black_share_max > 90.0
     # 2 s of 4 s blacked out; decode boundaries make the exact count fuzzy.
-    assert isinstance(black_share_mean, float) and 25.0 < black_share_mean < 75.0
+    assert isinstance(black_share_mean, float)
+    assert 25.0 < black_share_mean < 75.0
 
     # Half the clip near-black must drag the low percentile far below the high
     # one, whatever scale the decoder put them on.
     luma_p10_mean = result.measurements[f"{camera_topic}/luma_p10_mean"]
     luma_p90_mean = result.measurements[f"{camera_topic}/luma_p90_mean"]
-    assert isinstance(luma_p10_mean, float) and isinstance(luma_p90_mean, float)
+    assert isinstance(luma_p10_mean, float)
+    assert isinstance(luma_p90_mean, float)
     assert luma_p10_mean < luma_p90_mean / 2.0
 
 
@@ -1251,7 +1260,9 @@ def test_trajectory_metrics_finds_the_injected_hold(held_joints_episode: Path) -
     assert result.measurements["/joint_states/scale_source"] == "raw"
     peak = result.measurements["/joint_states/peak_velocity"]
     mean = result.measurements["/joint_states/mean_velocity"]
-    assert isinstance(peak, float) and isinstance(mean, float) and peak >= mean > 0.0
+    assert isinstance(peak, float)
+    assert isinstance(mean, float)
+    assert peak >= mean > 0.0
     assert result.verdict is None
 
 
@@ -1276,7 +1287,8 @@ def test_trajectory_metrics_dimension_scales_are_recorded_and_validated(
     assert scaled.measurements["/joint_states/scale_source"] == "user"
     raw_peak = raw.measurements["/joint_states/peak_velocity"]
     scaled_peak = scaled.measurements["/joint_states/peak_velocity"]
-    assert isinstance(raw_peak, float) and isinstance(scaled_peak, float)
+    assert isinstance(raw_peak, float)
+    assert isinstance(scaled_peak, float)
     # Halving every dimension halves the magnitude over all of them.
     assert scaled_peak == pytest.approx(raw_peak / 2.0)
 
@@ -1319,7 +1331,8 @@ def test_trajectory_segments_flags_the_injected_jump_as_a_change(tmp_path: Path)
         max_change = asyncio.run(trajectory_metrics(episode)).measurements[
             "/joint_states/max_trajectory_change"
         ]
-    assert isinstance(threshold, float) and isinstance(max_change, float)
+    assert isinstance(threshold, float)
+    assert isinstance(max_change, float)
     assert max_change > threshold
 
 
@@ -1484,9 +1497,11 @@ def test_trajectory_metrics_emits_final_pose_speed_for_low_frequency_stream(
         result = asyncio.run(trajectory_metrics(episode))
 
     speed = result.measurements.get("/joint_states/final_pose_speed")
-    assert isinstance(speed, float) and speed > 0
+    assert isinstance(speed, float)
+    assert speed > 0
     ratio = result.measurements.get("/joint_states/final_pose_unsettled_ratio")
-    assert isinstance(ratio, float) and ratio > 0
+    assert isinstance(ratio, float)
+    assert ratio > 0
 
 
 def test_trajectory_metrics_time_weights_final_pose_speed_identically_to_mean_velocity(
@@ -1571,7 +1586,8 @@ def test_trajectory_metrics_omits_final_pose_speed_when_final_window_is_unmeasur
     assert "/joint_states/final_pose_speed" not in result.measurements
     assert "/joint_states/final_pose_unsettled_ratio" not in result.measurements
     mean = result.measurements.get("/joint_states/mean_velocity")
-    assert isinstance(mean, float) and mean > 0
+    assert isinstance(mean, float)
+    assert mean > 0
 
 
 @pytest.fixture(scope="module")

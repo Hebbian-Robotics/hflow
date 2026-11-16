@@ -189,7 +189,8 @@ def test_subframe_excerpts_sample_the_frame_covering_their_start(
     assert len(messages) == 1
     _schema, _channel, message, decoded = messages[0]
     assert message.log_time == 0
-    assert _schema is not None and _schema.name == "foxglove.CompressedVideo"
+    assert _schema is not None
+    assert _schema.name == "foxglove.CompressedVideo"
     assert decoded.format == "h264"
     decoder = av.CodecContext.create("h264", "r")
     pixels = _bgr_frame_from_h264(decoded.data, decoder)
@@ -581,7 +582,8 @@ def test_custom_encoding_matches_independent_moving_video_reference(
     assert isinstance(decoder, av.VideoCodecContext)
     assert decoder.decode(None) == []  # No delayed picture/reorder tail.
     scan = scan_picture_coding_types(b"".join(payloads))
-    assert scan.picture_count == 30 and scan.b_picture_count == 0
+    assert scan.picture_count == 30
+    assert scan.b_picture_count == 0
     exported = write_access_units_to_mp4(payloads, fps=10, output=tmp_path / "canonical.mp4")
     direct = tmp_path / "direct.mp4"
     assert prepare_model_video(moving_video, direct, config, transform_config=settings) == direct

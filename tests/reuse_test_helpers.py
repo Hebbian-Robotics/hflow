@@ -86,7 +86,8 @@ def corrupt_zstd_chunk_payload(episode_path: Path) -> None:
 
     data = bytearray(episode_path.read_bytes())
     summary = make_reader(io.BytesIO(bytes(data))).get_summary()
-    assert summary is not None and summary.chunk_indexes
+    assert summary is not None
+    assert summary.chunk_indexes
     chunk_start = summary.chunk_indexes[0].chunk_start_offset
     compression_length = struct.unpack_from("<I", data, chunk_start + 37)[0]
     compression_start = chunk_start + 41
@@ -108,7 +109,8 @@ def corrupt_first_chunk_crc(episode_path: Path) -> None:
 
     data = bytearray(episode_path.read_bytes())
     summary = make_reader(io.BytesIO(bytes(data))).get_summary()
-    assert summary is not None and summary.chunk_indexes
+    assert summary is not None
+    assert summary.chunk_indexes
     crc_offset = summary.chunk_indexes[0].chunk_start_offset + 33
     data[crc_offset] ^= 0x01
     episode_path.write_bytes(bytes(data))

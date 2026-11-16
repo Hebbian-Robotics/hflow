@@ -133,6 +133,7 @@ select = [
     "UP",
     "ANN",
     "PTH",
+    "PT018",
     "RET",
     "SIM",
     "TID",

@@ -80,7 +80,8 @@ def test_sampled_hand_visibility_folds_no_hand_frames_into_intervals(
     assert run.result is not None
     assert len(served) == 4
     stamps = [observation.timestamp_ns for observation in run.result.observations]
-    assert len(stamps) == 4 and stamps == sorted(stamps)
+    assert len(stamps) == 4
+    assert stamps == sorted(stamps)
     assert [observation.values["prediction"] for observation in run.result.observations] == [
         2,
         0,
@@ -235,7 +236,8 @@ def test_hosted_retries_are_bounded_and_the_last_status_is_reported(
 
     run = report.check("build_ai_hand_visibility")
     assert run.status is hflow.CheckStatus.ERROR
-    assert run.error is not None and "HTTP 429" in run.error
+    assert run.error is not None
+    assert "HTTP 429" in run.error
     assert attempts == 3
     # No Retry-After: exponential from one second.
     assert sleeps == [1.0, 2.0]
