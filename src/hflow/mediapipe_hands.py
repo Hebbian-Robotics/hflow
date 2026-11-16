@@ -23,7 +23,7 @@ counts are what the shares need.
 Counts are over FRAMES, never an average of per-episode shares, so a
 measurement here is comparable to a frame-labelled reference set.
 
-Requires the ``mediapipe`` extra (``pip install 'hflow[mediapipe]'``) and a
+Requires the ``mediapipe`` extra (``uv add 'hflow[mediapipe]'``) and a
 model asset, which is downloaded once and digest-verified like the pinned
 ffmpeg build.
 """

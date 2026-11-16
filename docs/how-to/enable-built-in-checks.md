@@ -177,7 +177,7 @@ streams (human egocentric video, for instance -- see
 
 One check needs a dependency the core install does not carry:
 `camera_stability` uses optical flow and so needs OpenCV, which ships in the
-optional `motion` extra (`pip install 'hflow[motion]'`). Everything else here
+optional `motion` extra (`uv add 'hflow[motion]'`). Everything else here
 runs on the core install. Enabling it without the extra raises at the first
 episode with the install command in the message, rather than failing obscurely.
 

@@ -76,14 +76,14 @@ ln -s /mnt/c/Users/you/hflow ~/hflow
 uv sync --locked
 ```
 
-## 5. Verify the install
+## 6. Verify the install
 
 ```bash
 uv run python -c "import hflow; print(hflow.__version__)"
 uv run hflow --help
 ```
 
-## 6. Run the quality gates
+## 7. Run the quality gates
 
 ```bash
 uv run ruff check
@@ -92,14 +92,16 @@ uv run ty check
 uv run pytest -q
 ```
 
-Two integration tests are opt-in (require network or Docker):
+Four integration test suites are opt-in (require network, Docker, an object store, or optional extras; see [CONTRIBUTING.md](../../CONTRIBUTING.md#tests)):
 
 ```bash
 HFLOW_NETWORK_TESTS=1 uv run pytest tests/test_ffmpeg.py -q
 HFLOW_DOCKER_TESTS=1 uv run pytest tests/test_runtime_integration.py -q
+HFLOW_TEST_BUCKET_URL=gs://your-bucket/tmp-prefix uv run pytest tests/test_storage.py -q
+HFLOW_MEDIAPIPE_TESTS=1 uv run --extra mediapipe pytest tests/test_mediapipe_hands.py -q
 ```
 
-## 6. Run the quickstart
+## 8. Run the quickstart
 
 ```bash
 uv run python examples/quickstart.py
@@ -109,7 +111,7 @@ Output: `data/sample/episode_0001.mcap` and a canonical episode under
 `data/test-runs/episode_0001-<hash>/episode_0001.canonical.mcap`
 with measurements printed to the terminal.
 
-## 7. Run hflow doctor on an episode
+## 9. Run hflow doctor on an episode
 
 ```bash
 uv run hflow doctor data/test-runs/episode_0001-*/episode_0001.canonical.mcap
@@ -123,7 +125,7 @@ doctor: data/test-runs/episode_0001-*/episode_0001.canonical.mcap
   verdict: CONFORMING
 ```
 
-## 7. Troubleshooting
+## 10. Troubleshooting
 
 ### `ffmpeg not found`
 

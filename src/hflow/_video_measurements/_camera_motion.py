@@ -31,8 +31,8 @@ def _import_cv2() -> ModuleType:
     except ModuleNotFoundError as error:  # pragma: no cover - exercised by hand
         raise MotionExtraNotInstalledError(
             "camera-motion measurement needs OpenCV, which ships in HFlow's "
-            "optional 'motion' extra: pip install 'hflow[motion]' (or uv add "
-            "'hflow[motion]'). Pyramidal Lucas-Kanade optical flow and the "
+            "optional 'motion' extra: uv add 'hflow[motion]'. "
+            "Pyramidal Lucas-Kanade optical flow and the "
             "RANSAC similarity fit have no numpy-only equivalent that would "
             "measure the same thing."
         ) from error

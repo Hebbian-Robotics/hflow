@@ -80,9 +80,9 @@ FROM python:3.12-slim AS runtime
 COPY --from=builder /usr/local /usr/local
 ```
 
-Set `HFLOW_VERSION` to a release that includes the `hflow package` command;
-HFlow 0.2.4 predates it. The unreleased-checkout flow below is the path until
-that release exists.
+Set `HFLOW_VERSION` to a release that includes the `hflow package` command
+(HFlow 0.2.5 and newer; HFlow 0.2.4 predated it). The unreleased-checkout flow
+below is the path when building from a local unreleased checkout.
 
 Pin production base images by digest rather than using `latest`; it is shown
 above only to keep the mechanics readable. Build and run stages must use the

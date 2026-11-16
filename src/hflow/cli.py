@@ -1402,7 +1402,8 @@ def _register_verify_group(app: typer.Typer, result_holder: list[int]) -> None:
             "Group commands for verifying deliveries against their recorded "
             "receipts. Use `snapshot` to re-check a delivered dataset snapshot "
             "directory against the integrity receipt inside its format.json. "
-            "Use `lerobot-import` to re-check a LeRobot prepared-manifest delivery."
+            "Use `lerobot-import` to re-check a LeRobot prepared-manifest delivery. "
+            "Use `manifest-split` to re-check a frozen manifest split directory."
         ),
     )
 

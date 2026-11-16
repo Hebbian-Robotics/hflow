@@ -1230,7 +1230,7 @@ async def camera_stability(
     share and seconds, since they count the same pairs; the duration filter
     shapes the intervals only.
 
-    Requires the ``motion`` extra (``pip install 'hflow[motion]'``). This is the
+    Requires the ``motion`` extra (``uv add 'hflow[motion]'``). This is the
     one built-in with a dependency outside the core install, because optical flow
     and a RANSAC similarity fit have no numpy-only equivalent that measures the
     same thing.

@@ -172,4 +172,7 @@ The return value is the list of published episode URIs under
 `gs://` / `az://` object URIs for a bucket root.
 
 This command imports source data into HFlow. It does not upload data, train a
-policy, or export a curated HFlow manifest back to LeRobot Dataset v3.
+policy, or directly export a curated HFlow manifest back to LeRobot Dataset v3.
+To export a curated selection back into a loadable LeRobot Dataset v3 repository,
+see the [LeRobot export example](../../examples/README.md#exporting-a-curated-selection-back-to-lerobot-dataset-v3)
+([`examples/lerobot/export.py`](../../examples/lerobot/export.py)).

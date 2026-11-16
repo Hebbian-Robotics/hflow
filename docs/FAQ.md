@@ -148,9 +148,11 @@ curated manifest. Training loops, policy implementations, and model-specific
 dataloaders are outside this repository.
 
 HFlow can import a supported subset of LeRobot Dataset v3 into canonical MCAP
-with `hflow import lerobot`. It does not export a curated HFlow selection back
-to LeRobot or run LeRobot training; HFlow's processing and curation boundaries
-remain MCAP and Parquet.
+with `hflow import lerobot`. The core pipeline does not run LeRobot training;
+HFlow's processing and curation boundaries remain MCAP and Parquet. A companion
+workflow ([`examples/lerobot/export.py`](../examples/README.md#exporting-a-curated-selection-back-to-lerobot-dataset-v3))
+can export curated catalog selections back into a loadable LeRobot Dataset v3
+repository.
 
 ## Where can HFlow store data?
 
