@@ -48,7 +48,7 @@ def test_to_arrow_rejects_payload_field_that_shadows_log_time() -> None:
         log_times=[1_000_000_000, 2_000_000_000],
     )
 
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(ValueError, match="reserved Arrow column") as excinfo:
         channel.to_arrow()
     message = str(excinfo.value)
     assert "log_time_ns" in message

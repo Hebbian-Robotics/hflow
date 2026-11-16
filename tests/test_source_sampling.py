@@ -432,7 +432,7 @@ def test_oversized_windows_are_rejected_before_output_creation(
     ],
 )
 def test_sampling_settings_refuse_invalid_limits(field_name: str, value: object) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=field_name):
         replace(SourceFrameSampling(), **{field_name: value})
 
 

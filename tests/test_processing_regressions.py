@@ -941,7 +941,7 @@ def test_wrapper_example_binds_every_missing_parameter() -> None:
     ) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={"n": len(topics) + threshold})
 
-    with pytest.raises(ValueError) as raised:
+    with pytest.raises(ValueError, match="required parameter") as raised:
         app.check(version="1")(cast(hflow.steps.CheckFunction, two_missing))
     message = str(raised.value)
     assert "threshold=..." in message

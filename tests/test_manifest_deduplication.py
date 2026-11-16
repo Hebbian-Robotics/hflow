@@ -177,18 +177,18 @@ def test_reserved_metadata_names_cannot_overwrite_source_provenance(tmp_path: Pa
 
 
 @pytest.mark.parametrize(
-    "identities, conflicts",
+    "identities, conflicts, expected_error",
     [
-        ((), ()),
-        (("digest", "DIGEST"), ()),
-        (("digest",), ("label", "LABEL")),
-        (("retained_sample_id",), ()),
+        ((), (), "identity_columns must be nonempty"),
+        (("digest", "DIGEST"), (), "identity_columns must contain distinct"),
+        (("digest",), ("label", "LABEL"), "conflict_columns must contain distinct"),
+        (("retained_sample_id",), (), "column names are reserved"),
     ],
 )
 def test_invalid_settings_reject_ambiguous_or_reserved_columns(
-    identities: tuple[str, ...], conflicts: tuple[str, ...]
+    identities: tuple[str, ...], conflicts: tuple[str, ...], expected_error: str
 ) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=expected_error):
         ManifestDeduplicationSettings("sample_id", identities, conflicts)
 
 

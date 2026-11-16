@@ -217,25 +217,27 @@ def test_invalid_sources_and_incomplete_excerpts_publish_nothing(
 
 
 @pytest.mark.parametrize(
-    "config",
+    "config, expected_error",
     [
-        {"duration_s": 0},
-        {"source_start_s": -1},
-        {"image_hz": 0},
-        {"image_height": True},
-        {"start_time_ns": -1},
-        {"start_time_ns": True},
+        ({"duration_s": 0}, "duration_s must be positive"),
+        ({"source_start_s": -1}, "source_start_s nonnegative"),
+        ({"image_hz": 0}, "image_hz must be positive"),
+        ({"image_height": True}, "image_height must be an int"),
+        ({"start_time_ns": -1}, "start_time_ns must be in"),
+        ({"start_time_ns": True}, "start_time_ns must be an int"),
         # Inside the field's range but the final frame's timestamp overflows.
-        {"start_time_ns": (1 << 64) - 1},
-        {"camera_name": ""},
-        {"metadata": (("task", "one"), ("task", "two"))},
-        {"maximum_encoded_bytes": 0},
-        {"maximum_encoded_bytes": True},
-        {"maximum_encoded_bytes": 1.5},
+        ({"start_time_ns": (1 << 64) - 1}, "excerpt exceeds the MCAP timestamp range"),
+        ({"camera_name": ""}, "camera_name must be nonempty"),
+        ({"metadata": (("task", "one"), ("task", "two"))}, "metadata contains duplicate key"),
+        ({"maximum_encoded_bytes": 0}, "maximum_encoded_bytes must be > 0"),
+        ({"maximum_encoded_bytes": True}, "maximum_encoded_bytes must be an int"),
+        ({"maximum_encoded_bytes": 1.5}, "maximum_encoded_bytes must be an int"),
     ],
 )
-def test_invalid_import_configuration_is_rejected(config: dict[str, object]) -> None:
-    with pytest.raises(ValueError):
+def test_invalid_import_configuration_is_rejected(
+    config: dict[str, object], expected_error: str
+) -> None:
+    with pytest.raises(ValueError, match=expected_error):
         replace(VideoImportConfig(duration_s=1), **config)
 
 

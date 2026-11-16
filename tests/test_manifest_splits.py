@@ -165,19 +165,19 @@ def test_invalid_identities_never_publish_a_split(
 
 
 @pytest.mark.parametrize(
-    "name, fraction",
+    "name, fraction, expected_error",
     [
-        ("../escape", 0.5),
-        ("assignments", 0.5),
-        ("train", float("nan")),
-        ("train", True),
-        ("train", 0),
+        ("../escape", 0.5, "partition name must match"),
+        ("assignments", 0.5, "partition name 'assignments' is reserved"),
+        ("train", float("nan"), "partition fraction must be finite"),
+        ("train", True, "partition fraction must be finite"),
+        ("train", 0, "partition fraction must be finite"),
     ],
 )
 def test_partition_values_reject_unsafe_names_and_invalid_fractions(
-    name: str, fraction: float
+    name: str, fraction: float, expected_error: str
 ) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=expected_error):
         ManifestPartition(name, fraction)
 
 
