@@ -133,7 +133,10 @@ def test_task_schemas_and_parsers_enforce_the_answer_contract() -> None:
                 f"{task.value}: the schema permits {value!r} but the parser does not accept it"
             )
         for value in rejected_values:
-            with pytest.raises(ValueError):
+            expected_error = (
+                "hand count" if task is EvaluationTask.HAND_COUNT else "active manipulation"
+            )
+            with pytest.raises(ValueError, match=expected_error):
                 parser(json.dumps({property_name: value}))
 
 
@@ -581,7 +584,7 @@ def test_run_metadata_names_the_file_and_the_bad_field(
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path.write_text(run_json_text)
 
-    with pytest.raises(ValueError) as error:
+    with pytest.raises(ValueError, match=r"run\.json") as error:
         _prepare_output_directory(configuration)
 
     message = str(error.value)
