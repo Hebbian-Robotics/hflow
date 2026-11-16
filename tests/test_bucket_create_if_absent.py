@@ -70,6 +70,7 @@ def _append_outcome(catalog: Catalog, canonical_path: Path, value: float = 1.0) 
     )
 
 
+@pytest.mark.usefixtures("advancing_catalog_clock")
 @pytest.mark.parametrize("recurring", [False, True])
 def test_concurrent_bucket_catalog_appends_publish_one_complete_outcome(
     tmp_path: Path,

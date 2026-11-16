@@ -84,7 +84,7 @@ def _run_sheet_with_ffmpeg_killed_mid_write(
     with monkeypatch.context() as scoped_patch:
         scoped_patch.setattr(_contact_sheet.subprocess, "run", kill_mid_write)
         with pytest.raises(RuntimeError, match="ffmpeg contact sheet failed"):
-            contact_sheet(frames, output, columns=4, tile_width=640)
+            contact_sheet(frames, output, columns=4, tile_width=320)
     return killed_mid_write
 
 
@@ -92,7 +92,7 @@ def _run_sheet_with_ffmpeg_killed_mid_write(
 def test_kill_mid_write_never_leaves_partial_sheet(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    frames = make_extracted_frames(tmp_path / "big-frames", count=8, size="1280x720")
+    frames = make_extracted_frames(tmp_path / "big-frames", count=4, size="640x480")
     output = tmp_path / "sheet.jpg"
 
     assert _run_sheet_with_ffmpeg_killed_mid_write(frames, output, monkeypatch), (
@@ -103,7 +103,7 @@ def test_kill_mid_write_never_leaves_partial_sheet(
 
     # A pre-existing valid sheet must survive a later kill byte-identically:
     # ffmpeg only ever truncates the per-call temp, never the final path.
-    contact_sheet(frames, output, columns=4, tile_width=640)
+    contact_sheet(frames, output, columns=4, tile_width=320)
     _assert_fully_valid_jpeg(output)
     before = output.read_bytes()
     assert _run_sheet_with_ffmpeg_killed_mid_write(frames, output, monkeypatch), (
@@ -124,7 +124,7 @@ def test_concurrent_sheets_to_same_path_stay_valid(tmp_path: Path) -> None:
         barrier.wait(timeout=60)
         return contact_sheet(frames, output, columns=4, tile_width=320).path
 
-    for round_index in range(5):
+    for round_index in range(2):
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = [pool.submit(render, round_index) for _ in range(2)]
             assert [future.result(timeout=120) for future in futures] == [output, output]

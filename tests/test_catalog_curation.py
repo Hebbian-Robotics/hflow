@@ -43,6 +43,8 @@ from hflow.stage_execution import run_stages_directly
 from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 from hflow.transform import EpisodeStamps
 
+pytestmark = pytest.mark.usefixtures("advancing_catalog_clock")
+
 
 def test_append_is_idempotent_for_the_same_content_versions_and_outcome(tmp_path: Path) -> None:
     catalog = Catalog(tmp_path / "catalog")

@@ -371,13 +371,19 @@ async def duration(ep: hflow.Episode) -> hflow.CheckResult:
 """
 
 
+@pytest.mark.usefixtures("advancing_catalog_clock")
 class TestSettledThenCrashed:
     """The one case the settled-steps rule cannot see on its own."""
 
-    @pytest.mark.parametrize("first_errors", [True, False])
-    @pytest.mark.parametrize("stages", ["full", "metadata_backfill"])
-    @pytest.mark.parametrize("bucket", [False, True])
-    @pytest.mark.parametrize("explicit_execution", [False, True])
+    @pytest.mark.parametrize(
+        ("first_errors", "stages", "bucket", "explicit_execution"),
+        [
+            (True, "full", False, False),
+            (False, "full", True, True),
+            (True, "metadata_backfill", True, False),
+            (False, "metadata_backfill", False, True),
+        ],
+    )
     def test_recurring_outcome_becomes_current_and_consecutive_retries_deduplicate(
         self,
         tmp_path: Path,

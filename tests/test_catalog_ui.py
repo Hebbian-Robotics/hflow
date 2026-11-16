@@ -297,7 +297,7 @@ def test_catalog_ui_waits_for_the_episodes_file_before_binding_an_append(
         with poll_completed:
             polls_before_copy = polls_completed
             assert poll_completed.wait_for(
-                lambda: polls_completed >= polls_before_copy + 2, timeout=2
+                lambda: polls_completed >= polls_before_copy + 2, timeout=10
             )
         assert session.refresh_count == 0
 

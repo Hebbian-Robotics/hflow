@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -80,6 +81,22 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         if item.get_closest_marker("requires_system_ffmpeg"):
             item.add_marker(skip)
+
+
+@pytest.fixture
+def advancing_catalog_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give sequential catalog appends deterministic, increasing timestamps."""
+    import hflow.catalog as catalog
+
+    class AdvancingClock:
+        current = datetime(2020, 1, 1, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, timezone: object) -> datetime:
+            cls.current += timedelta(seconds=1)
+            return cls.current
+
+    monkeypatch.setattr(catalog, "datetime", AdvancingClock)
 
 
 @pytest.fixture
