@@ -3,7 +3,9 @@
 import asyncio
 import json
 from pathlib import Path
+from typing import cast
 
+import numpy as np
 import pytest
 
 import hflow
@@ -137,6 +139,49 @@ def test_project_results_handles_superseded_default_without_keyerror(
             assert measurements == {"count": default.result.measurements["message_count_total"]}
         case UnavailableCheck():
             raise AssertionError("expected measured, got superseded")
+
+
+def test_result_projection_accepts_numpy_scalar_measurements(tmp_path: Path) -> None:
+    """Check code often measures with NumPy; the catalog stores those values, so
+    the projection must carry them too, as plain JSON numbers.
+    """
+    source = synthesize_episode(
+        tmp_path / "source.mcap", SyntheticEpisodeSpec(duration_s=0.2, cameras=())
+    )
+    application = hflow.App("numpy-results", data_root=tmp_path / "workspace", default_checks=())
+
+    @application.check(version="1")
+    async def numpy_measurement(_episode: hflow.Episode) -> hflow.CheckResult:
+        # cast: deliberately passing NumPy scalars past the declared
+        # MeasurementValue type, exactly what real check code does.
+        return hflow.CheckResult(
+            measurements=cast(
+                dict,
+                {"ratio": np.float64(0.5), "frames": np.int64(3), "flag": np.bool_(True)},
+            )
+        )
+
+    report = asyncio.run(application.process(source, record=False))
+    projection = project_results(
+        report,
+        (
+            CheckSelection(
+                "numpy_measurement",
+                "quality",
+                {"ratio": "ratio", "frames": "frames", "flag": "flag"},
+            ),
+        ),
+    )
+    assert json.loads(projection.to_json(maximum_bytes=1024))["checks"] == [
+        {
+            "name": "quality",
+            "status": "measured",
+            "measurements": {"ratio": 0.5, "frames": 3, "flag": True},
+            "verdict": None,
+        }
+    ]
+    with pytest.raises(ValueError, match="finite"):
+        MeasuredCheck("quality", cast(dict, {"score": np.float32("nan")}), None)
 
 
 def test_result_domain_refuses_nonfinite_measurements_and_duplicate_names() -> None:

@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, TypedDict, assert_never
 
+import numpy as np
+
 from hflow.app import Errored, Measured, NotRun, SkippedByQuarantine, SupersededByPipeline
 from hflow.steps import MeasurementValue
 
@@ -43,7 +45,12 @@ class MeasuredCheck:
     verdict: bool | None
 
     def __post_init__(self) -> None:
-        selected = dict(self.measurements)
+        # A check computing with NumPy returns np.float64 or np.int64; store
+        # the Python value, as the catalog does, so the payload stays plain JSON.
+        selected = {
+            name: value.item() if isinstance(value, np.generic) else value
+            for name, value in self.measurements.items()
+        }
         if (
             not isinstance(self.name, str)
             or not self.name
