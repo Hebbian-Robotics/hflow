@@ -9,6 +9,7 @@ episode (a tag, never a deletion) and skips its downstream steps.
 """
 
 import math
+import sys
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -354,9 +355,14 @@ def evaluate_gate(gate: Gate, measurements: Mapping[str, MeasurementValue]) -> G
     """
     unevaluated: list[str] = []
     verdict = True
+    # A check computing from ``to_numpy()`` often returns np.int64 or
+    # np.float32, which are not int/float subclasses. The catalog stores them
+    # as their Python values, so read them the same way here rather than
+    # abstaining. Looked up, not imported, to keep this module NumPy-free.
+    numpy = sys.modules.get("numpy")
     for threshold in gate.accept_when:
         matched = [
-            value
+            value.item() if numpy is not None and isinstance(value, numpy.generic) else value
             for key, value in sorted(measurements.items())
             if fnmatchcase(key, threshold.key_pattern)
         ]

@@ -7,6 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
+import numpy as np
 import pytest
 
 import hflow
@@ -157,6 +158,32 @@ def test_non_numeric_and_nan_measurements_abstain_but_infinity_compares() -> Non
         decision = evaluate_gate(_gate(threshold), {"value": unusable})
         assert isinstance(decision, hflow.GateAbstained), f"{unusable!r} should not be compared"
     assert evaluate_gate(_gate(threshold), {"value": math.inf}) == hflow.GateDecided(verdict=False)
+
+
+def test_numpy_scalar_measurements_compare_like_python_numbers(
+    tmp_path: Path, state_only_episode: Path
+) -> None:
+    """The catalog stores a NumPy scalar as its Python value, so the gate must
+    read it as one too, or a count from ``np.count_nonzero`` never quarantines.
+    """
+    threshold = hflow.Threshold("value", hflow.Comparison.AT_MOST, 50.0)
+    # cast: deliberately passing NumPy scalars past the declared
+    # MeasurementValue type, exactly what real check code does.
+    for numpy_value in (np.int64(99), np.float32(99.0)):
+        decision = evaluate_gate(_gate(threshold), cast(dict, {"value": numpy_value}))
+        assert decision == hflow.GateDecided(verdict=False), f"{numpy_value!r} was not compared"
+    boolean = evaluate_gate(_gate(threshold), cast(dict, {"value": np.bool_(True)}))
+    assert isinstance(boolean, hflow.GateAbstained)
+
+    app = hflow.App("numpy-gate", data_root=tmp_path / "data", default_checks=())
+
+    @app.check(version="1", critical=True, gate=_gate(threshold))
+    async def counts_frames(ep: hflow.Episode) -> hflow.CheckResult:
+        return hflow.CheckResult(measurements=cast(dict, {"value": np.int64(99)}))
+
+    report = asyncio.run(app.test(state_only_episode, verbose=False))
+    assert report.checks[0].status is hflow.CheckStatus.FAILED
+    assert report.quarantine_tags == ["quarantined:counts_frames"]
 
 
 def test_every_key_and_any_key_aggregate_over_topic_prefixed_keys() -> None:
