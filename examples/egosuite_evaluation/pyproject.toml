@@ -30,6 +30,8 @@ testpaths = ["tests"]
 extend = "../../pyproject.toml"
 
 [tool.ty.rules]
+invalid-ignore-comment = "error"
+ignore-comment-unknown-rule = "error"
 division-by-zero = "error"
 deprecated = "error"
 unused-ignore-comment = "error"
