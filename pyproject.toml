@@ -133,6 +133,19 @@ select = [
     "UP",
     "ANN",
     "PTH",
+    "PLE",
+    "LOG",
+    "PGH003",
+    "PGH004",
+    "PLW0108",
+    "PLC3002",
+    "ASYNC210",
+    "ASYNC220",
+    "ASYNC221",
+    "ASYNC222",
+    "ASYNC230",
+    "ASYNC250",
+    "ASYNC251",
     "PT018",
     "PT010",
     "PT011",
@@ -154,6 +167,8 @@ quote-style = "double"
 indent-style = "space"
 
 [tool.ty.rules]
+invalid-ignore-comment = "error"
+ignore-comment-unknown-rule = "error"
 division-by-zero = "error"
 deprecated = "error"
 unused-ignore-comment = "error"

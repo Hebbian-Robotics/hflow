@@ -49,6 +49,8 @@ extend = "../../pyproject.toml"
 extra-paths = ["../.."]
 
 [tool.ty.rules]
+invalid-ignore-comment = "error"
+ignore-comment-unknown-rule = "error"
 division-by-zero = "error"
 deprecated = "error"
 unused-ignore-comment = "error"
