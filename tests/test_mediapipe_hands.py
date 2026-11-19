@@ -274,12 +274,12 @@ class TestMissingSampleTiming:
         fake_mediapipe = SimpleNamespace(
             __version__="test",
             ImageFormat=SimpleNamespace(SRGB="SRGB"),
-            Image=lambda **kwargs: SimpleNamespace(**kwargs),
+            Image=SimpleNamespace,
             tasks=SimpleNamespace(
-                BaseOptions=lambda **kwargs: SimpleNamespace(**kwargs),
+                BaseOptions=SimpleNamespace,
                 vision=SimpleNamespace(
                     RunningMode=SimpleNamespace(VIDEO="VIDEO"),
-                    HandLandmarkerOptions=lambda **kwargs: SimpleNamespace(**kwargs),
+                    HandLandmarkerOptions=SimpleNamespace,
                     HandLandmarker=SimpleNamespace(
                         create_from_options=lambda _options: FakeLandmarker()
                     ),
@@ -304,9 +304,7 @@ class TestMissingSampleTiming:
             "hflow.mediapipe_hands._resolved_hand_model_digest", lambda: "test-digest"
         )
         monkeypatch.setattr("hflow.mediapipe_hands.rgb_frames", fake_rgb_frames)
-        monkeypatch.setattr(
-            "hflow.mediapipe_hands.resolved_video_measurement_toolchain", lambda: object()
-        )
+        monkeypatch.setattr("hflow.mediapipe_hands.resolved_video_measurement_toolchain", object)
 
         result = _measure_mediapipe_hands(episode, sample_fps=1.0)
 
