@@ -813,6 +813,10 @@ def stale_episodes(
     comparison. Feed each result's ``source_uri`` back into ingestion
     (``hflow ingest`` / ``app.process``) to reprocess it.
     """
+    if not pipeline_version.strip():
+        # A blank version differs from every cataloged one, so it would
+        # report the whole corpus as stale and queue all of it for re-ingest.
+        raise ValueError("pipeline_version must not be blank")
     connection = open_catalog_connection(catalog_root)
     try:
         predicate = "pipeline_version IS DISTINCT FROM ?"

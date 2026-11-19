@@ -1141,6 +1141,44 @@ def test_cli_stale_prints_source_uris_for_ingest(
     assert "1 episode(s)" in captured.err
 
 
+@pytest.mark.parametrize("blank_version", ["", "   "])
+def test_cli_stale_rejects_a_blank_pipeline_version(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], blank_version: str
+) -> None:
+    catalog = Catalog(tmp_path / "catalog")
+    catalog.append_episode(
+        canonical_path=write_fake_canonical(tmp_path),
+        stamps=FAKE_STAMPS,
+        episode_metadata={},
+        check_rows=[],
+        source_uri="episodes-in/run_0001.mcap",
+    )
+    exit_code = cli_main(
+        [
+            "stale",
+            "--catalog",
+            str(tmp_path / "catalog"),
+            "--pipeline-version",
+            blank_version,
+        ]
+    )
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    # A blank version differs from every cataloged one, so it would list the
+    # whole corpus for re-ingest. Nothing pipeable may reach stdout.
+    assert captured.out == ""
+    assert "pipeline_version must not be blank" in captured.err
+
+
+@pytest.mark.parametrize("blank_version", ["", "   "])
+def test_stale_episodes_rejects_a_blank_pipeline_version(
+    tmp_path: Path, blank_version: str
+) -> None:
+    Catalog(tmp_path / "catalog")
+    with pytest.raises(ValueError, match="pipeline_version must not be blank"):
+        hflow.stale_episodes(tmp_path / "catalog", pipeline_version=blank_version)
+
+
 def test_cli_stale_rejects_pipeline_and_pipeline_version_together(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
