@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 import duckdb
 
+from hflow._field_guards import require_finite_float
 from hflow._manifest_parquet_schema import _reject_ambiguous_column_names
 from hflow._version import __version__
 
@@ -45,12 +46,8 @@ class ManifestPartition:
             raise ValueError("partition name must match [a-z][a-z0-9_-]*")
         if self.name == "assignments":
             raise ValueError("partition name 'assignments' is reserved")
-        if (
-            isinstance(self.fraction, bool)
-            or not isinstance(self.fraction, (int, float))
-            or not math.isfinite(self.fraction)
-            or not 0 < self.fraction <= 1
-        ):
+        fraction = require_finite_float(self.fraction, "partition fraction")
+        if not 0 < fraction <= 1:
             raise ValueError("partition fraction must be finite and in (0, 1]")
 
 
