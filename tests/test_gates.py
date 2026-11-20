@@ -172,8 +172,9 @@ def test_numpy_scalar_measurements_compare_like_python_numbers(
     for numpy_value in (np.int64(99), np.float32(99.0)):
         decision = evaluate_gate(_gate(threshold), cast(dict, {"value": numpy_value}))
         assert decision == hflow.GateDecided(verdict=False), f"{numpy_value!r} was not compared"
-    boolean = evaluate_gate(_gate(threshold), cast(dict, {"value": np.bool_(True)}))
-    assert isinstance(boolean, hflow.GateAbstained)
+    for not_a_number in (np.bool_(True), np.datetime64(99, "ns"), np.timedelta64(99, "ns")):
+        decision = evaluate_gate(_gate(threshold), cast(dict, {"value": not_a_number}))
+        assert isinstance(decision, hflow.GateAbstained), f"{not_a_number!r} was compared"
 
     app = hflow.App("numpy-gate", data_root=tmp_path / "data", default_checks=())
 
