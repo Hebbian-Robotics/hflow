@@ -328,6 +328,26 @@ def _encode_cdr_float32_array(values: list[float] | tuple[float, ...]) -> bytes:
     return encapsulation + payload
 
 
+#: The dataset publisher controls both the camera file name and its bytes.
+#: Playlist and script demuxers (HLS, concat, ...) open further inputs named
+#: inside those bytes, including other local files, so a protocol whitelist
+#: alone cannot keep FFmpeg on the downloaded object. FFmpeg refuses any other
+#: probed demuxer before it reads the header.
+_DATASET_VIDEO_DEMUXER = "mov,mp4,m4a,3gp,3g2,mj2"
+
+
+def _dataset_video_input_arguments(video_path: Path) -> list[str]:
+    """FFmpeg/ffprobe input options that open only the downloaded MP4 file."""
+    return [
+        "-protocol_whitelist",
+        "file",
+        "-format_whitelist",
+        _DATASET_VIDEO_DEMUXER,
+        "-i",
+        f"file:{video_path.resolve(strict=True)}",
+    ]
+
+
 def _transcode_mp4_to_h264(
     mp4_path: Path,
     gop_seconds: float,
@@ -358,8 +378,7 @@ def _transcode_mp4_to_h264(
     if seek_seconds is not None:
         ffmpeg_command += ["-ss", f"{seek_seconds:.6f}"]
     ffmpeg_command += [
-        "-i",
-        str(mp4_path),
+        *_dataset_video_input_arguments(mp4_path),
         "-c:v",
         "libx264",
         "-preset",
@@ -406,7 +425,7 @@ def _get_video_pts_times(mp4_path: Path) -> list[float]:
             "packet=pts_time",
             "-of",
             "csv=p=0",
-            str(mp4_path),
+            *_dataset_video_input_arguments(mp4_path),
         ],
         capture_output=True,
         text=True,
