@@ -170,8 +170,9 @@ def test_invalid_identities_never_publish_a_split(
         ("../escape", 0.5, "partition name must match"),
         ("assignments", 0.5, "partition name 'assignments' is reserved"),
         ("train", float("nan"), "partition fraction must be finite"),
-        ("train", True, "partition fraction must be finite"),
+        ("train", True, "partition fraction must be an int or float"),
         ("train", 0, "partition fraction must be finite"),
+        ("train", 10**400, "partition fraction value is too large"),
     ],
 )
 def test_partition_values_reject_unsafe_names_and_invalid_fractions(
