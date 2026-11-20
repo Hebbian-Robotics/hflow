@@ -22,6 +22,12 @@
   </a>
 </p>
 
+<p align="center">
+  <a href="https://namespace.so/github-actions?utm_source=oss&amp;utm_campaign=hflow">
+    <img src="https://namespace.so/oss/badge.svg" alt="CI powered by Namespace, HFlow's CI sponsor">
+  </a>
+</p>
+
 Hebbian Robotics (YC S26) is building HFlow, an open source SDK for scalable
 multimodal data pipelines in robotics and physical AI. It makes data tooling and
 practices typically developed inside large robotics teams accessible to teams of

@@ -37,10 +37,15 @@ macOS, install the Xcode Command Line Tools with `xcode-select --install`.
 
 ## Platform support
 
-Linux and macOS both work for native development. CI runs on Linux only, so
-run the quality checks yourself before opening a pull request on macOS.
-Native overlay builds require CPython on Linux, so the packaging tests that
-compile one are skipped on macOS.
+Linux and macOS both work for native development. CI covers Linux x86-64 and
+Apple Silicon. Native overlay builds require CPython on Linux, so the packaging
+tests that compile one are skipped on macOS.
+
+Upstream builds and checks use Namespace runners, including pull requests from
+forks opened against HFlow. CI keeps a separate uv Cache Volume per platform and
+Python version, and only runs on `main` can update those volumes. Running
+workflows in a standalone fork requires its own Namespace setup. The PyPI
+publishing job uses GitHub-hosted Ubuntu.
 
 Native Windows is not supported: pipeline and storage operations use `fcntl`
 for file locking (`src/hflow/storage.py`), which does not exist on Windows. Work inside WSL2 with an Ubuntu
@@ -116,8 +121,9 @@ uv run --locked --project examples/path_to_example \
   pytest -q examples/path_to_example/tests
 ```
 
-CI runs the suite on Python 3.11 and 3.14. When changing compatibility-sensitive
-code, exercise both ends locally:
+CI runs the suite on Python 3.11 and 3.14 on Linux, and on Python 3.14 on macOS.
+Static analysis runs once, on Linux with Python 3.14. When changing
+compatibility-sensitive code, exercise both Python versions locally:
 
 ```bash
 uv run --python 3.11 --locked pytest -q
@@ -127,9 +133,9 @@ uv run --python 3.14 --locked pytest -q
 CI uses four pytest workers for the default suite. To match its test execution
 locally, run `uv run pytest -q -n 4`.
 
-After the normal suite, CI runs targeted resampling, Arrow conversion, and video
-import tests with the minimum supported NumPy on Python 3.14. To reproduce that
-compatibility check after syncing a Python 3.14 environment:
+After the normal suite on Linux with Python 3.14, CI runs targeted resampling,
+Arrow conversion, and video import tests with the minimum supported NumPy.
+To reproduce that compatibility check after syncing a Python 3.14 environment:
 
 ```bash
 uv pip install "numpy==2.3.5"

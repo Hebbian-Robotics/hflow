@@ -14,40 +14,64 @@ on:
 
 jobs:
   checks:
-    runs-on: ubuntu-latest
+    name: checks (${{ matrix.platform }}, ${{ matrix.python-version }})
+    runs-on:
+      - ${{ matrix.namespace-runner }}-with-cache
+      - nscloud-cache-tag-${{ matrix.cache-tag-prefix }}-${{ matrix.python-version }}
+      - nscloud-cache-allow-commit-from-main
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        # Test the supported floor and current runtime. Static analysis runs once below.
-        python-version: ["3.11", "3.14"]
+        include:
+          - platform: Linux
+            python-version: "3.11"
+            namespace-runner: nscloud-ubuntu-24.04-amd64-4x16
+            cache-tag-prefix: hflow-ci-uv
+          - platform: Linux
+            python-version: "3.14"
+            namespace-runner: nscloud-ubuntu-24.04-amd64-4x16
+            cache-tag-prefix: hflow-ci-uv
+          - platform: macOS
+            python-version: "3.14"
+            namespace-runner: nscloud-macos-sequoia-arm64-6x14
+            cache-tag-prefix: hflow-ci-macos-arm64-uv
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install ffmpeg (the test suite pins to the system binary)
+      - name: Install FFmpeg on Linux
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Install FFmpeg on macOS
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: ${{ matrix.python-version }}
+          enable-cache: false
+      - name: Attach the uv cache volume
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
+        with:
+          cache: uv
       - name: Sync environment
         # Not --all-extras: the mediapipe extra is a model, deliberately not
         # exercised here (see pyproject.toml).
         run: uv sync --locked
       - name: Lint
-        if: matrix.python-version == '3.14'
+        if: matrix.platform == 'Linux' && matrix.python-version == '3.14'
         run: uv run ruff check
       - name: Format check
-        if: matrix.python-version == '3.14'
+        if: matrix.platform == 'Linux' && matrix.python-version == '3.14'
         run: uv run ruff format --check
       - name: Typecheck
-        if: matrix.python-version == '3.14'
+        if: matrix.platform == 'Linux' && matrix.python-version == '3.14'
         run: uv run ty check
       - name: Tests
-        # Public ubuntu-latest runners have four CPUs; keep media-heavy tests within that limit.
         run: uv run pytest -q -n 4
       - name: Install minimum supported NumPy
-        if: matrix.python-version == '3.14'
+        if: matrix.platform == 'Linux' && matrix.python-version == '3.14'
         run: uv pip install "numpy==2.3.5"
       - name: Test minimum NumPy compatibility
-        if: matrix.python-version == '3.14'
+        if: matrix.platform == 'Linux' && matrix.python-version == '3.14'
         run: >-
           uv run --no-sync pytest -q -n 4
           tests/test_resample_derive.py tests/test_episode_to_arrow.py tests/test_video_import.py

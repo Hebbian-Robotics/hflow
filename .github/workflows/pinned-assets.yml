@@ -10,7 +10,10 @@ permissions:
 
 jobs:
   availability:
-    runs-on: ubuntu-latest
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-2x4-with-cache
+      - nscloud-cache-tag-hflow-ci-uv-3.11
+      - nscloud-cache-allow-commit-from-main
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -19,6 +22,11 @@ jobs:
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: "3.11"
+          enable-cache: false
+      - name: Attach the uv cache volume
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
+        with:
+          cache: uv
       - name: Check both pinned Linux FFmpeg assets are available
         env:
           HFLOW_NETWORK_TESTS: "1"

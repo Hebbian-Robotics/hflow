@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   enforce_open_pr_cap:
-    runs-on: ubuntu-latest
+    runs-on: nscloud-ubuntu-24.04-amd64-2x4
     if: github.event.pull_request.user.type != 'Bot'
     steps:
       - name: Close pull requests over the per-author cap

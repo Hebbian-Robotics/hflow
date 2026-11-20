@@ -1,0 +1,7 @@
+self-hosted-runner:
+  labels:
+    - nscloud-ubuntu-24.04-amd64-2x4
+    - nscloud-ubuntu-24.04-amd64-2x4-with-cache
+    - nscloud-ubuntu-24.04-amd64-4x16
+    - nscloud-cache-tag-hflow-ci-uv-3.11
+    - nscloud-cache-allow-commit-from-main
