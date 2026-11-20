@@ -1,5 +1,6 @@
 """Bounded remux consumption and cleanup at the subprocess boundary."""
 
+import re
 import subprocess
 import sys
 import time
@@ -168,19 +169,34 @@ def test_process_start_failure_removes_temporary_output(
 
 
 @pytest.mark.parametrize(
-    "timestamps", [[], [1], [1, 1], [3, 2, 1], [0, 10], [0, 10, 30], [0, 10, 10, 90, 95]]
+    ("timestamps", "expected_fps"),
+    [
+        pytest.param([0, 10], 100_000_000.0, id="single-interval"),
+        pytest.param([0, 10, 30], 1e9 / 15, id="even-interval-count"),
+        pytest.param([0, 10, 30, 60], 50_000_000.0, id="odd-interval-count"),
+        pytest.param([0, 10, 10, 90, 95], 1e9 / 7.5, id="duplicate-with-positive-median"),
+    ],
 )
-def test_streaming_fps_preserves_exact_median_and_errors(timestamps: list[int]) -> None:
-    try:
-        expected = video.estimate_fps_from_log_times(timestamps, topic="/camera")
-    except ValueError as error:
-        with pytest.raises(
-            ValueError, match=r"camera topic '/camera'.*frame rate"
-        ) as streaming_error:
-            video.estimate_fps_from_streaming_log_times(iter(timestamps), topic="/camera")
-        assert str(streaming_error.value) == str(error)
-    else:
-        assert (
-            video.estimate_fps_from_streaming_log_times(iter(timestamps), topic="/camera")
-            == expected
-        )
+def test_streaming_fps_preserves_exact_median(timestamps: list[int], expected_fps: float) -> None:
+    assert video.estimate_fps_from_log_times(timestamps, topic="/camera") == expected_fps
+    assert (
+        video.estimate_fps_from_streaming_log_times(iter(timestamps), topic="/camera")
+        == expected_fps
+    )
+
+
+@pytest.mark.parametrize(
+    ("timestamps", "message"),
+    [
+        pytest.param([], "has 0 timestamps; at least 2 are needed", id="empty"),
+        pytest.param([1], "has 1 timestamps; at least 2 are needed", id="single-timestamp"),
+        pytest.param([1, 1], "has a non-positive median inter-frame interval", id="repeated"),
+        pytest.param([3, 2, 1], "has a non-positive median inter-frame interval", id="decreasing"),
+    ],
+)
+def test_streaming_fps_rejects_invalid_timestamps(timestamps: list[int], message: str) -> None:
+    match = re.escape(f"camera topic '/camera' {message}")
+    with pytest.raises(ValueError, match=match):
+        video.estimate_fps_from_log_times(timestamps, topic="/camera")
+    with pytest.raises(ValueError, match=match):
+        video.estimate_fps_from_streaming_log_times(iter(timestamps), topic="/camera")
