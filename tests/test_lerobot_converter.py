@@ -855,6 +855,108 @@ def test_converter_slices_exactly_the_declared_frame_count(
     )
 
 
+@_requires_system_ffmpeg
+@pytest.mark.requires_system_ffmpeg
+@pytest.mark.parametrize("video_file_suffix", [".mkv", ".mp4"])
+@pytest.mark.parametrize("windowed", [False, True])
+def test_import_refuses_a_non_mp4_camera_file_without_publishing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    video_file_suffix: str,
+    windowed: bool,
+) -> None:
+    """A decodable camera video in another container is refused, not converted.
+
+    LeRobot stores camera video as MP4, and the importer opens dataset media
+    only through the MP4 demuxer: other demuxers include playlists and scripts
+    that open further files named inside the publisher's bytes. The fixture is
+    a benign Matroska video that would otherwise convert cleanly, served under
+    an ``.mkv`` name and under the default ``.mp4`` template, because the
+    refusal follows the bytes rather than the name. ``windowed`` covers the
+    seeking command as well as the whole-file one.
+    """
+    assert _FFMPEG is not None
+    assert _FFPROBE is not None
+    system_ffmpeg_path = Path(_FFMPEG)
+    system_ffprobe_path = Path(_FFPROBE)
+    monkeypatch.setattr(prep, "ffmpeg_path", lambda: system_ffmpeg_path)
+    monkeypatch.setattr(prep, "ffprobe_path", lambda: system_ffprobe_path)
+    monkeypatch.setattr(prep, "ffmpeg_version", lambda: "test-ffmpeg")
+
+    frames_per_second = 10
+    frame_count = 3
+    camera_key = "observation.images.up"
+    matroska_video = tmp_path / "camera.mkv"
+    subprocess.run(
+        [
+            _FFMPEG,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc2=size=32x32:rate={frames_per_second},format=yuv420p",
+            "-frames:v",
+            str(frame_count),
+            "-c:v",
+            "libx264",
+            "-bf",
+            "0",
+            "-f",
+            "matroska",
+            str(matroska_video),
+        ],
+        capture_output=True,
+        check=True,
+    )
+
+    corpus_root = tmp_path / "corpus"
+    info = two_camera_v3_info(frames_per_second=frames_per_second, camera_frame_shape=(32, 32, 3))
+    info["video_path"] = info["video_path"].removesuffix(".mp4") + video_file_suffix
+    write_v3_corpus(
+        corpus_root,
+        info=info,
+        episode_rows=[
+            CorpusEpisodeRow(
+                episode_index=0,
+                length=frame_count,
+                dataset_from_index=0,
+                video_to_timestamp=frame_count / frames_per_second if windowed else 0.0,
+                tasks=("push",),
+            )
+        ],
+        timestamps_as_double=True,
+    )
+    stub_hub_repo_info(monkeypatch, resolved_sha="abc")
+    stub_single_shard_hub_corpus(monkeypatch, corpus_root, info)
+
+    def supply_corpus_file(filename: str, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if filename.startswith("videos/"):
+            shutil.copy(matroska_video, destination)
+        elif filename.startswith("meta/episodes/"):
+            shutil.copy(corpus_root / filename, destination)
+        else:
+            shutil.copy(corpus_root / "data" / "chunk-000" / "file-000.parquet", destination)
+
+    stub_hub_download(monkeypatch, supply_corpus_file)
+    output_dir = tmp_path / "out"
+
+    with pytest.raises(RuntimeError, match="ffmpeg transcode failed"):
+        prep.import_lerobot_dataset(
+            dataset_repo="fake/repo",
+            revision="main",
+            output_dir=output_dir,
+            episode_index=0,
+            camera_keys=(camera_key,),
+        )
+
+    assert not (output_dir / "landing").exists()
+    assert not (output_dir / "prepared-manifest.json").exists()
+
+
 def test_window_times_are_count_anchored_not_boundary_filtered(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
