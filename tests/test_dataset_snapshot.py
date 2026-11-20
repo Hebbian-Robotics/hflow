@@ -222,8 +222,9 @@ def test_dataset_snapshot_is_tool_neutral_and_selected_by_manifest(tmp_path: Pat
     ).fetchall() == [("inspect", 10, 20)]
 
 
+@pytest.mark.parametrize("use_catalog_symlink", [False, True])
 def test_cli_snapshot_copy_mode_materializes_media_and_refuses_implicit_overwrite(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], use_catalog_symlink: bool
 ) -> None:
     catalog = Catalog(tmp_path / "catalog")
     selected_episode_id, preview_file = append_snapshot_episode(
@@ -235,13 +236,19 @@ def test_cli_snapshot_copy_mode_materializes_media_and_refuses_implicit_overwrit
     )
     assert preview_file is not None
     output_directory = tmp_path / "portable-snapshot"
+    catalog_path = catalog.root
+    if use_catalog_symlink:
+        alias_directory = tmp_path / "aliases"
+        alias_directory.mkdir()
+        catalog_path = alias_directory / "catalog"
+        catalog_path.symlink_to(catalog.root, target_is_directory=True)
 
     exit_code = cli_main(
         [
             "export",
             "snapshot",
             "--catalog",
-            str(catalog.location),
+            str(catalog_path),
             "--output",
             str(output_directory),
             "--media",

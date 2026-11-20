@@ -9,9 +9,13 @@ other tools can consume the same directory.
 import hashlib
 import json
 import mimetypes
+import os
 import re
 import shutil
+import stat
 import tempfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
@@ -23,7 +27,16 @@ import duckdb
 from hflow.app import ARTIFACT_MEASUREMENT_KEY_PREFIX, MEDIA_CONTACT_SHEET_STEP_NAME
 from hflow.catalog import episode_status_case_sql
 from hflow.curation import open_catalog_connection
-from hflow.storage import StorageRoot, _validated_relative_key, fetch_uri
+from hflow.storage import (
+    BucketStorageRoot,
+    LocalStorageRoot,
+    StorageRoot,
+    _refuse_unusable_file_path,
+    _validated_relative_key,
+    fetch_uri,
+    is_bucket_url,
+    parse_storage_root,
+)
 
 if TYPE_CHECKING:
     from hflow.verification import VerificationReport
@@ -545,10 +558,160 @@ def _copied_media_relative_path(*, episode_id: str, artifact_name: str, artifact
     )
 
 
+@dataclass(frozen=True)
+class _LocalArtifactWorkspace:
+    """A local workspace, bound to one open directory for the whole export."""
+
+    root: Path
+    root_descriptor: int
+
+
+@dataclass(frozen=True)
+class _BucketArtifactWorkspace:
+    root: BucketStorageRoot
+
+
+_ArtifactWorkspace = _LocalArtifactWorkspace | _BucketArtifactWorkspace
+
+_BENEATH_DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+# O_NONBLOCK keeps a FIFO swapped in for the file from stalling the export;
+# the descriptor is refused below unless it is a regular file.
+_BENEATH_FILE_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+
+
+def _bucket_workspace_url(catalog_url: str) -> str:
+    _scheme, _separator, remainder = catalog_url.partition("://")
+    if "/" not in remainder:
+        return catalog_url
+    return catalog_url.rpartition("/")[0]
+
+
+@contextmanager
+def _artifact_workspace(catalog_location: StorageRoot) -> Generator[_ArtifactWorkspace, None, None]:
+    """The workspace copy mode may read artifacts from: the catalog's parent.
+
+    A local catalog opened through a symlink belongs to the data root that
+    really contains it, which is where the framework records its artifacts.
+
+    Artifact URIs are catalog data, so whoever supplied the catalog chose them;
+    copy mode only materializes files that already belong to this workspace.
+    """
+    match catalog_location:
+        case LocalStorageRoot(path=catalog_path):
+            workspace_root = catalog_path.parent
+            root_descriptor = os.open(workspace_root, _BENEATH_DIRECTORY_OPEN_FLAGS)
+            try:
+                yield _LocalArtifactWorkspace(root=workspace_root, root_descriptor=root_descriptor)
+            finally:
+                os.close(root_descriptor)
+        case BucketStorageRoot():
+            yield _BucketArtifactWorkspace(
+                root=BucketStorageRoot(
+                    _bucket_workspace_url(catalog_location.url),
+                    store_options=catalog_location.store_options or None,
+                )
+            )
+
+
+def _outside_workspace_error(artifact_uri: str, workspace: object) -> ValueError:
+    return ValueError(
+        f"snapshot copy mode refuses artifact URI {artifact_uri!r}: it resolves outside "
+        f"the workspace {workspace} the catalog belongs to"
+    )
+
+
+def _open_regular_file_beneath(root_descriptor: int, relative_parts: tuple[str, ...]) -> int:
+    """Open ``relative_parts`` under ``root_descriptor`` without following any symlink.
+
+    Every component is opened relative to the descriptor of its parent, so the
+    file reached is the one beneath the workspace directory that was opened at
+    the start of the export, whatever the names point at by now.
+    """
+    opened_directory_descriptors: list[int] = []
+    parent_descriptor = root_descriptor
+    try:
+        for directory_name in relative_parts[:-1]:
+            parent_descriptor = os.open(
+                directory_name, _BENEATH_DIRECTORY_OPEN_FLAGS, dir_fd=parent_descriptor
+            )
+            opened_directory_descriptors.append(parent_descriptor)
+        file_descriptor = os.open(
+            relative_parts[-1], _BENEATH_FILE_OPEN_FLAGS, dir_fd=parent_descriptor
+        )
+    finally:
+        for directory_descriptor in opened_directory_descriptors:
+            os.close(directory_descriptor)
+    if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
+        os.close(file_descriptor)
+        raise OSError(f"{'/'.join(relative_parts)} is not a regular file")
+    return file_descriptor
+
+
+def _copy_local_workspace_artifact(
+    workspace: _LocalArtifactWorkspace, artifact_uri: str, destination: Path
+) -> None:
+    if is_bucket_url(artifact_uri):
+        raise _outside_workspace_error(artifact_uri, workspace.root)
+    artifact_path = Path(artifact_uri)
+    try:
+        resolved_artifact_path = artifact_path.resolve()
+    except (OSError, RuntimeError) as error:
+        raise ValueError(
+            f"snapshot copy mode cannot resolve artifact URI {artifact_uri!r} "
+            f"inside the workspace {workspace.root}: {error}"
+        ) from error
+    if (
+        not resolved_artifact_path.is_relative_to(workspace.root)
+        or resolved_artifact_path == workspace.root
+    ):
+        raise _outside_workspace_error(artifact_uri, workspace.root)
+    _refuse_unusable_file_path(artifact_path)
+    try:
+        source_descriptor = _open_regular_file_beneath(
+            workspace.root_descriptor,
+            resolved_artifact_path.relative_to(workspace.root).parts,
+        )
+    except OSError as error:
+        raise ValueError(
+            f"snapshot copy mode refuses artifact URI {artifact_uri!r}: it changed after its "
+            f"containment check and may now point outside the workspace {workspace.root} "
+            f"({error})"
+        ) from error
+    with os.fdopen(source_descriptor, "rb") as source_stream:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("wb") as destination_stream:
+            shutil.copyfileobj(source_stream, destination_stream)
+
+
+def _copy_bucket_workspace_artifact(
+    workspace: _BucketArtifactWorkspace, artifact_uri: str, destination: Path
+) -> None:
+    workspace_prefix = f"{workspace.root.url}/"
+    if not artifact_uri.startswith(workspace_prefix):
+        raise _outside_workspace_error(artifact_uri, workspace.root)
+    try:
+        artifact_key = _validated_relative_key(artifact_uri.removeprefix(workspace_prefix))
+    except ValueError as error:
+        raise _outside_workspace_error(artifact_uri, workspace.root) from error
+    source_file = workspace.root.fetch(artifact_key)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source_file, destination)
+
+
+def _copy_workspace_artifact(
+    workspace: _ArtifactWorkspace, artifact_uri: str, destination: Path
+) -> None:
+    match workspace:
+        case _LocalArtifactWorkspace():
+            _copy_local_workspace_artifact(workspace, artifact_uri, destination)
+        case _BucketArtifactWorkspace():
+            _copy_bucket_workspace_artifact(workspace, artifact_uri, destination)
+
+
 def _write_media_table(
     connection: duckdb.DuckDBPyConnection,
     staging_directory: Path,
-    media_mode: SnapshotMediaMode,
+    artifact_workspace: _ArtifactWorkspace | None,
 ) -> tuple[int, int]:
     artifact_rows = connection.execute(
         """
@@ -611,16 +774,15 @@ def _write_media_table(
             else _SnapshotMediaRole.ARTIFACT
         )
         exported_uri = artifact_uri
-        if media_mode is SnapshotMediaMode.COPY:
-            source_file = fetch_uri(artifact_uri)
+        if artifact_workspace is not None:
             copied_relative_path = _copied_media_relative_path(
                 episode_id=episode_id,
                 artifact_name=artifact_name,
                 artifact_uri=artifact_uri,
             )
-            copied_file = staging_directory / copied_relative_path
-            copied_file.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source_file, copied_file)
+            _copy_workspace_artifact(
+                artifact_workspace, artifact_uri, staging_directory / copied_relative_path
+            )
             exported_uri = copied_relative_path.as_posix()
             copied_media_count += 1
         exported_media_rows.append(
@@ -786,9 +948,15 @@ def export_dataset_snapshot(
     The destination is a local directory containing ordinary Parquet tables
     and ``format.json``. ``manifest`` may be a local file or object-store URL
     and must contain ``episode_id``; without it, every latest catalog episode
-    is exported. In ``references`` mode media URIs are preserved. In ``copy``
-    mode every recorded artifact is materialized below ``assets/`` and the
-    media table stores a path relative to the export directory.
+    is exported. In ``references`` mode media URIs are preserved and never
+    read. In ``copy`` mode every recorded artifact is materialized below
+    ``assets/`` and the media table stores a path relative to the export
+    directory. Copy mode only reads artifacts inside the catalog's workspace
+    (the resolved catalog root's parent, i.e. the data root, also when the
+    catalog path is a symlink): a local URI must resolve
+    under it without a symlink leaving it, and for a bucket catalog a URI must
+    name an object under the same prefix. Any other URI aborts the export with
+    ``ValueError`` before its bytes are read.
 
     ``format.json`` stays format version ``1``. The published ``tables`` map
     remains a name-to-filename contract. An additive ``integrity`` block
@@ -819,7 +987,12 @@ def export_dataset_snapshot(
         )
     )
     try:
-        connection = open_catalog_connection(catalog_root)
+        catalog_location = parse_storage_root(catalog_root)
+        if resolved_media_mode is SnapshotMediaMode.COPY and isinstance(
+            catalog_location, LocalStorageRoot
+        ):
+            catalog_location = LocalStorageRoot(catalog_location.path.resolve(strict=True))
+        connection = open_catalog_connection(catalog_location)
         try:
             episode_count = _register_selected_episode_ids(connection, manifest)
             _register_latest_check_runs(connection)
@@ -845,9 +1018,16 @@ def export_dataset_snapshot(
                 """,
                 staging_directory / _OBSERVATIONS_TABLE_FILE_NAME,
             )
-            media_count, copied_media_count = _write_media_table(
-                connection, staging_directory, resolved_media_mode
-            )
+            match resolved_media_mode:
+                case SnapshotMediaMode.REFERENCES:
+                    media_count, copied_media_count = _write_media_table(
+                        connection, staging_directory, None
+                    )
+                case SnapshotMediaMode.COPY:
+                    with _artifact_workspace(catalog_location) as artifact_workspace:
+                        media_count, copied_media_count = _write_media_table(
+                            connection, staging_directory, artifact_workspace
+                        )
             _copy_query_to_parquet(
                 connection,
                 _samples_snapshot_query(connection),
