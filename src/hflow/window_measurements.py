@@ -26,6 +26,7 @@ from typing import IO
 
 import numpy as np
 
+from hflow._frame_budget import ffmpeg_decoder_maximum_pixels
 from hflow._video_measurement_toolchain import resolved_video_measurement_toolchain
 from hflow._video_measurements._frame_statistics import (
     FRAME_STATISTICS_DEFINITION_VERSION,
@@ -72,7 +73,6 @@ _MAXIMUM_DIAGNOSTIC_BYTES = 65536
 # temporary path avoids filter-graph escaping rules for ':', ',', ';', '[' and quotes.
 _FILTER_SAFE_PATH = re.compile(r"^[A-Za-z0-9/._-]+$")
 _Y4M_DIMENSIONS = re.compile(rb"\bW(?P<width>\d+) H(?P<height>\d+)\b")
-_FFMPEG_MAXIMUM_PIXELS_OPTION = 2**31 - 1
 
 
 @dataclass(frozen=True)
@@ -245,11 +245,9 @@ def _measure_video_window(
             f"{measured_window.start_seconds:.3f}",
             "-t",
             f"{measured_window.duration_seconds:.3f}",
-            # The probe and this decode open the source separately. Bound the
-            # decoder too; FFmpeg compares the stride-aligned width, so allow
-            # padding headroom over the frame budget.
+            # The probe and this decode open the source separately.
             "-max_pixels",
-            str(min(2 * limits.maximum_frame_pixels, _FFMPEG_MAXIMUM_PIXELS_OPTION)),
+            str(ffmpeg_decoder_maximum_pixels(limits.maximum_frame_pixels)),
             "-i",
             str(source.resolve()),
             "-filter_complex",

@@ -12,6 +12,9 @@ from pathlib import Path
 
 import numpy as np
 
+from hflow._field_guards import require_positive_int
+from hflow._frame_budget import DEFAULT_MAXIMUM_FRAME_PIXELS, ffmpeg_decoder_maximum_pixels
+
 from ._bounded_process import BoundedProcessError, run_bounded_process
 from ._frame_integrity import cleanly_decoded_frame_indices
 from ._toolchain import VideoMeasurementToolchain
@@ -26,16 +29,8 @@ DECODED_FRAME_HASH_TIMEOUT_SECONDS = 600.0
 MAXIMUM_DECODED_FRAME_HASH_OUTPUT_BYTES = 256 * 1024 * 1024
 FFPROBE_TIMEOUT_SECONDS = 600.0
 MAXIMUM_FFPROBE_OUTPUT_BYTES = 256 * 1024 * 1024
-# Matches ``hflow.media.VideoLimits.maximum_frame_pixels``, which this
-# package cannot import.
-MAXIMUM_FRAME_PIXELS = 33554432
 # rgb24 is the widest pixel format these readers request.
 _MAXIMUM_BYTES_PER_PIXEL = 3
-# FFmpeg checks ``-max_pixels`` against the stride-aligned width (up to 64
-# padding columns), so the decoder needs headroom to accept every frame
-# that fits the budget. The cap still bounds what a lying stream can make
-# the decoder allocate after the probe.
-_DECODER_MAXIMUM_PIXELS = 2 * MAXIMUM_FRAME_PIXELS
 
 
 @dataclass(frozen=True)
@@ -64,7 +59,9 @@ def _run_ffprobe(video: Path, toolchain: VideoMeasurementToolchain, arguments: l
     return completed_process.stdout
 
 
-def _probe_frame_shape(video: Path, toolchain: VideoMeasurementToolchain) -> tuple[int, int]:
+def _probe_frame_shape(
+    video: Path, toolchain: VideoMeasurementToolchain, *, maximum_frame_pixels: int
+) -> tuple[int, int]:
     """Return the coded ``(height, width)`` of the first video stream."""
     output = _run_ffprobe(
         video,
@@ -95,17 +92,20 @@ def _probe_frame_shape(video: Path, toolchain: VideoMeasurementToolchain) -> tup
         or frame_height <= 0
     ):
         raise RawFrameError(f"ffprobe reported invalid video dimensions for {video}")
-    _require_frame_within_pixel_budget(video, (frame_height, frame_width))
+    _require_frame_within_pixel_budget(video, (frame_height, frame_width), maximum_frame_pixels)
     return frame_height, frame_width
 
 
-def _require_frame_within_pixel_budget(video: Path, frame_shape: tuple[int, ...]) -> None:
+def _require_frame_within_pixel_budget(
+    video: Path, frame_shape: tuple[int, ...], maximum_frame_pixels: int
+) -> None:
     """Refuse a ``(height, width[, channels])`` frame larger than the pixel budget."""
+    require_positive_int(maximum_frame_pixels, "maximum_frame_pixels")
     frame_height, frame_width, *channel_dimensions = frame_shape
-    if frame_height * frame_width > MAXIMUM_FRAME_PIXELS:
+    if frame_height * frame_width > maximum_frame_pixels:
         raise RawFrameError(
             f"{video} has {frame_width}x{frame_height} frames, which exceed the "
-            f"{MAXIMUM_FRAME_PIXELS}-pixel frame budget"
+            f"{maximum_frame_pixels}-pixel frame budget"
         )
     if prod(channel_dimensions) > _MAXIMUM_BYTES_PER_PIXEL:
         raise RawFrameError(
@@ -195,6 +195,7 @@ def _decoded_frame_hashes(
     filter_graph: str,
     source_fps: float,
     sample_fps: float | None,
+    maximum_frame_pixels: int = DEFAULT_MAXIMUM_FRAME_PIXELS,
 ) -> tuple[list[int], dict[int, set[str]]]:
     """Trace decoded RGB digests without writing frame data or a sidecar file."""
     command = [
@@ -205,7 +206,7 @@ def _decoded_frame_hashes(
         "error",
         "-noautorotate",
         "-max_pixels",
-        str(_DECODER_MAXIMUM_PIXELS),
+        str(ffmpeg_decoder_maximum_pixels(maximum_frame_pixels)),
         "-i",
         str(video),
         "-map",
@@ -296,9 +297,10 @@ def _raw_frame_stream(
     toolchain: VideoMeasurementToolchain,
     filter_graph: str,
     frame_shape: tuple[int, ...],
+    maximum_frame_pixels: int = DEFAULT_MAXIMUM_FRAME_PIXELS,
 ) -> Generator[Iterator[np.ndarray], None, None]:
     """Yield complete ``uint8`` frames from one owned FFmpeg process."""
-    _require_frame_within_pixel_budget(video, frame_shape)
+    _require_frame_within_pixel_budget(video, frame_shape, maximum_frame_pixels)
     frame_byte_count = prod(frame_shape)
     command = [
         str(toolchain.ffmpeg_executable),
@@ -308,7 +310,7 @@ def _raw_frame_stream(
         "error",
         "-noautorotate",
         "-max_pixels",
-        str(_DECODER_MAXIMUM_PIXELS),
+        str(ffmpeg_decoder_maximum_pixels(maximum_frame_pixels)),
         "-i",
         str(video),
         "-map",
@@ -360,15 +362,22 @@ def _raw_frame_stream(
 
 @contextmanager
 def luma_frames(
-    video: Path, *, toolchain: VideoMeasurementToolchain
+    video: Path,
+    *,
+    toolchain: VideoMeasurementToolchain,
+    maximum_frame_pixels: int = DEFAULT_MAXIMUM_FRAME_PIXELS,
 ) -> Generator[Iterator[np.ndarray], None, None]:
-    """Yield coded-size ``(height, width)`` 8-bit luma frames in order."""
-    frame_shape = _probe_frame_shape(video, toolchain)
+    """Yield coded-size ``(height, width)`` 8-bit luma frames in order.
+
+    A video whose frames exceed ``maximum_frame_pixels`` raises before decoding.
+    """
+    frame_shape = _probe_frame_shape(video, toolchain, maximum_frame_pixels=maximum_frame_pixels)
     with _raw_frame_stream(
         video,
         toolchain=toolchain,
         filter_graph=LUMA_FRAME_FILTER_GRAPH,
         frame_shape=frame_shape,
+        maximum_frame_pixels=maximum_frame_pixels,
     ) as frames:
         yield frames
 
@@ -381,6 +390,7 @@ def rgb_frames(
     frames_per_second: float | None = None,
     long_edge_pixels: int | None = None,
     source_fps: float | None = None,
+    maximum_frame_pixels: int = DEFAULT_MAXIMUM_FRAME_PIXELS,
 ) -> Generator[Iterator[SampledRGBFrame], None, None]:
     """Yield sampled RGB frames with their original sample and source positions.
 
@@ -389,11 +399,14 @@ def rgb_frames(
     comparing their digests filters out frames the ``fps`` filter repeated to
     fill decoder gaps. No full-video pixel buffer or temporary file is needed.
     ``sample_index`` preserves the original tick so callers can keep labels
-    aligned when a tick is omitted.
+    aligned when a tick is omitted. A source or sample frame that exceeds
+    ``maximum_frame_pixels`` raises before decoding.
     """
     if frames_per_second is not None and frames_per_second <= 0:
         raise ValueError(f"frames_per_second must be positive, got {frames_per_second}")
-    source_height, source_width = _probe_frame_shape(video, toolchain)
+    source_height, source_width = _probe_frame_shape(
+        video, toolchain, maximum_frame_pixels=maximum_frame_pixels
+    )
     frame_height, frame_width = _scaled_frame_shape((source_height, source_width), long_edge_pixels)
     if source_fps is None:
         source_fps = _probe_frame_rate(video, toolchain)
@@ -417,13 +430,14 @@ def rgb_frames(
     frame_shape = (frame_height, frame_width, 3)
     # An upscaling ``long_edge_pixels`` would otherwise make FFmpeg build
     # oversized frames for the digest trace before the raw reader refuses them.
-    _require_frame_within_pixel_budget(video, frame_shape)
+    _require_frame_within_pixel_budget(video, frame_shape, maximum_frame_pixels)
     decoded_indices, decoded_hashes = _decoded_frame_hashes(
         video,
         toolchain=toolchain,
         filter_graph=decoded_filter_graph,
         source_fps=source_fps,
         sample_fps=effective_sample_fps,
+        maximum_frame_pixels=maximum_frame_pixels,
     )
     clean_decoded_indices = cleanly_decoded_frame_indices(
         set(decoded_indices),
@@ -436,6 +450,7 @@ def rgb_frames(
         toolchain=toolchain,
         filter_graph=sampled_filter_graph,
         frame_shape=frame_shape,
+        maximum_frame_pixels=maximum_frame_pixels,
     ) as candidate_frames:
 
         def read_frames() -> Iterator[SampledRGBFrame]:

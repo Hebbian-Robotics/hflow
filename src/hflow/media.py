@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from pathlib import Path
 
+from hflow._frame_budget import DEFAULT_MAXIMUM_FRAME_PIXELS
 from hflow.byte_range_source import LoopbackVideoSource, media_input
 from hflow.ffmpeg import ffmpeg_path, ffprobe_path
 from hflow.ffmpeg._process import MediaToolError, media_input_was_rejected, run_media_command
@@ -23,7 +24,7 @@ from hflow.ffmpeg._process import MediaToolError, media_input_was_rejected, run_
 
 @dataclass(frozen=True)
 class VideoLimits:
-    maximum_frame_pixels: int = 33554432
+    maximum_frame_pixels: int = DEFAULT_MAXIMUM_FRAME_PIXELS
     maximum_frames_per_second: float = 240.0
     minimum_duration_seconds: float = 0.001
     maximum_duration_seconds: float = 86400.0

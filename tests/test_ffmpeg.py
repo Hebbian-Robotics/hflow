@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -830,6 +831,30 @@ def test_raw_frames_stream_every_frame_at_the_coded_size(
         shapes = [getattr(frame, "pixels", frame).shape for frame in frames]
     assert len(shapes) == 60
     assert set(shapes) == {expected_shape}
+
+
+@pytest.mark.parametrize(
+    "frame_reader",
+    [pytest.param(luma_frames, id="luma"), pytest.param(rgb_frames, id="rgb")],
+)
+def test_raw_frames_refuse_frames_over_the_pixel_limit_before_decoding(
+    black_tail_video: Path, tmp_path: Path, frame_reader: Callable[..., Any]
+) -> None:
+    """The real FFprobe reports 160x120; a stand-in FFmpeg records any decode attempt."""
+    decode_attempt_marker = tmp_path / "ffmpeg-was-started"
+    recording_ffmpeg = tmp_path / "ffmpeg"
+    recording_ffmpeg.write_text(f'#!/bin/sh\ntouch "{decode_attempt_marker}"\nexit 1\n')
+    recording_ffmpeg.chmod(0o755)
+    toolchain = replace(resolved_video_measurement_toolchain(), ffmpeg_executable=recording_ffmpeg)
+
+    with (
+        pytest.raises(RawFrameError, match="160x120 frames, which exceed the 19199-pixel"),
+        frame_reader(
+            black_tail_video, toolchain=toolchain, maximum_frame_pixels=160 * 120 - 1
+        ) as frames,
+    ):
+        list(frames)
+    assert not decode_attempt_marker.exists()
 
 
 def test_luma_frames_reaps_ffmpeg_when_the_caller_stops_early(
