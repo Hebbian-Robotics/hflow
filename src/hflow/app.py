@@ -101,6 +101,7 @@ from hflow.transform import (
     stamps_from_provenance,
     write_canonical_episode,
 )
+from hflow.uri import resolve_local_data_root_path
 from hflow.workspace import RUNTIME_BUNDLE_DIRECTORY_NAME, Workspace
 
 logger = logging.getLogger(__name__)
@@ -122,13 +123,21 @@ class SourceNotFound(FileNotFoundError):
 
 def _local_source_candidate_paths(
     source_reference: Path | str, root_path: Path
-) -> tuple[Path, Path]:
-    """The cwd and data-root interpretations of one local reference."""
+) -> tuple[Path, Path | None]:
+    """The cwd and data-root interpretations of one local reference.
+
+    The data-root interpretation is ``None`` when resolving it leaves the
+    real data root: a data-root key never names a file outside the root.
+    """
     source_path = Path(source_reference)
     if source_path.is_absolute():
         resolved_path = source_path.resolve()
         return resolved_path, resolved_path
-    return source_path.resolve(), (root_path / source_path).resolve()
+    try:
+        root_candidate: Path | None = resolve_local_data_root_path(root_path, source_path)
+    except ValueError:
+        root_candidate = None
+    return source_path.resolve(), root_candidate
 
 
 def _resolve_local_source_reference(source_reference: Path | str, root_path: Path) -> Path:
@@ -143,6 +152,13 @@ def _resolve_local_source_reference(source_reference: Path | str, root_path: Pat
     if cwd_candidate == root_candidate:
         return cwd_candidate
     cwd_candidate_exists = cwd_candidate.is_file()
+    if root_candidate is None:
+        if cwd_candidate_exists:
+            return cwd_candidate
+        raise ValueError(
+            f"relative source reference {str(source_reference)!r} resolves outside "
+            f"the data root {root_path.resolve()}"
+        )
     root_candidate_exists = root_candidate.is_file()
 
     if cwd_candidate_exists and root_candidate_exists and cwd_candidate != root_candidate:
@@ -1679,7 +1695,7 @@ class App:
         cwd_candidate, root_candidate = _local_source_candidate_paths(
             episode, self.storage_root.path
         )
-        if cwd_candidate.is_file() or root_candidate.is_file():
+        if root_candidate is None or cwd_candidate.is_file() or root_candidate.is_file():
             return resolved_identity
 
         root_identity = _local_source_identity(root_candidate, self.storage_root.path)

@@ -1,6 +1,6 @@
 """Validation for episode URIs relative to a runtime data root."""
 
-from pathlib import PureWindowsPath
+from pathlib import Path, PurePath, PureWindowsPath
 from posixpath import normpath
 from typing import NewType
 
@@ -35,3 +35,21 @@ def parse_data_root_relative_uri(uri: str) -> DataRootRelativeUri:
         raise ValueError(f"{candidate!r} is not relative to the data root")
 
     return DataRootRelativeUri(candidate)
+
+
+def resolve_local_data_root_path(data_root: Path, relative_reference: str | PurePath) -> Path:
+    """The real file a data-root-relative reference names on a local root.
+
+    ``parse_data_root_relative_uri`` can only judge a spelling. Resolution
+    follows symlinks, so ``link/../x`` or a file symlink can leave the root
+    even though the spelling never does. The returned real path is the one
+    object callers may open: re-joining the original spelling later would
+    resolve it again.
+    """
+    real_data_root = data_root.resolve()
+    real_path = (real_data_root / relative_reference).resolve()
+    if not real_path.is_relative_to(real_data_root):
+        raise ValueError(
+            f"{str(relative_reference)!r} resolves outside the data root {real_data_root}"
+        )
+    return real_path
