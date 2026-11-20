@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   welcome:
-    runs-on: ${{ github.repository == 'Hebbian-Robotics/hflow' && 'nscloud-ubuntu-24.04-amd64-2x4' || 'ubuntu-latest' }}
+    runs-on: nscloud-ubuntu-24.04-amd64-2x4
     if: (github.event.pull_request.user.type || github.event.issue.user.type) != 'Bot'
     steps:
       - name: Welcome first-time contributors

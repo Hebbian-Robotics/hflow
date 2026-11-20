@@ -15,12 +15,10 @@ on:
 jobs:
   checks:
     name: checks (${{ matrix.platform }}, ${{ matrix.python-version }})
-    # PRs into HFlow use its runners. Workflows run in a standalone fork use GitHub's.
-    runs-on: >-
-      ${{ github.repository == 'Hebbian-Robotics/hflow'
-          && fromJSON(format('["{0}-with-cache","nscloud-cache-tag-{1}-{2}","nscloud-cache-allow-commit-from-main"]',
-            matrix.namespace-runner, matrix.cache-tag-prefix, matrix.python-version))
-          || matrix.github-runner }}
+    runs-on:
+      - ${{ matrix.namespace-runner }}-with-cache
+      - nscloud-cache-tag-${{ matrix.cache-tag-prefix }}-${{ matrix.python-version }}
+      - nscloud-cache-allow-commit-from-main
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -29,17 +27,14 @@ jobs:
           - platform: Linux
             python-version: "3.11"
             namespace-runner: nscloud-ubuntu-24.04-amd64-4x16
-            github-runner: ubuntu-latest
             cache-tag-prefix: hflow-ci-uv
           - platform: Linux
             python-version: "3.14"
             namespace-runner: nscloud-ubuntu-24.04-amd64-4x16
-            github-runner: ubuntu-latest
             cache-tag-prefix: hflow-ci-uv
           - platform: macOS
             python-version: "3.14"
             namespace-runner: nscloud-macos-sequoia-arm64-6x14
-            github-runner: macos-15
             cache-tag-prefix: hflow-ci-macos-arm64-uv
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -52,9 +47,8 @@ jobs:
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: ${{ matrix.python-version }}
-          enable-cache: ${{ runner.environment == 'github-hosted' }}
+          enable-cache: false
       - name: Attach the uv cache volume
-        if: runner.environment == 'self-hosted'
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
         with:
           cache: uv
