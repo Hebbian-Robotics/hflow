@@ -7,7 +7,7 @@ from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from fractions import Fraction
-from math import ceil
+from math import ceil, prod
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +26,16 @@ DECODED_FRAME_HASH_TIMEOUT_SECONDS = 600.0
 MAXIMUM_DECODED_FRAME_HASH_OUTPUT_BYTES = 256 * 1024 * 1024
 FFPROBE_TIMEOUT_SECONDS = 600.0
 MAXIMUM_FFPROBE_OUTPUT_BYTES = 256 * 1024 * 1024
+# Matches ``hflow.media.VideoLimits.maximum_frame_pixels``, which this
+# package cannot import.
+MAXIMUM_FRAME_PIXELS = 33554432
+# rgb24 is the widest pixel format these readers request.
+_MAXIMUM_BYTES_PER_PIXEL = 3
+# FFmpeg checks ``-max_pixels`` against the stride-aligned width (up to 64
+# padding columns), so the decoder needs headroom to accept every frame
+# that fits the budget. The cap still bounds what a lying stream can make
+# the decoder allocate after the probe.
+_DECODER_MAXIMUM_PIXELS = 2 * MAXIMUM_FRAME_PIXELS
 
 
 @dataclass(frozen=True)
@@ -85,7 +95,22 @@ def _probe_frame_shape(video: Path, toolchain: VideoMeasurementToolchain) -> tup
         or frame_height <= 0
     ):
         raise RawFrameError(f"ffprobe reported invalid video dimensions for {video}")
+    _require_frame_within_pixel_budget(video, (frame_height, frame_width))
     return frame_height, frame_width
+
+
+def _require_frame_within_pixel_budget(video: Path, frame_shape: tuple[int, ...]) -> None:
+    """Refuse a ``(height, width[, channels])`` frame larger than the pixel budget."""
+    frame_height, frame_width, *channel_dimensions = frame_shape
+    if frame_height * frame_width > MAXIMUM_FRAME_PIXELS:
+        raise RawFrameError(
+            f"{video} has {frame_width}x{frame_height} frames, which exceed the "
+            f"{MAXIMUM_FRAME_PIXELS}-pixel frame budget"
+        )
+    if prod(channel_dimensions) > _MAXIMUM_BYTES_PER_PIXEL:
+        raise RawFrameError(
+            f"raw frames for {video} cannot exceed {_MAXIMUM_BYTES_PER_PIXEL} bytes per pixel"
+        )
 
 
 def _probe_frame_rate(video: Path, toolchain: VideoMeasurementToolchain) -> float:
@@ -179,6 +204,8 @@ def _decoded_frame_hashes(
         "-loglevel",
         "error",
         "-noautorotate",
+        "-max_pixels",
+        str(_DECODER_MAXIMUM_PIXELS),
         "-i",
         str(video),
         "-map",
@@ -271,7 +298,8 @@ def _raw_frame_stream(
     frame_shape: tuple[int, ...],
 ) -> Generator[Iterator[np.ndarray], None, None]:
     """Yield complete ``uint8`` frames from one owned FFmpeg process."""
-    frame_byte_count = int(np.prod(frame_shape))
+    _require_frame_within_pixel_budget(video, frame_shape)
+    frame_byte_count = prod(frame_shape)
     command = [
         str(toolchain.ffmpeg_executable),
         "-nostdin",
@@ -279,6 +307,8 @@ def _raw_frame_stream(
         "-loglevel",
         "error",
         "-noautorotate",
+        "-max_pixels",
+        str(_DECODER_MAXIMUM_PIXELS),
         "-i",
         str(video),
         "-map",
@@ -385,6 +415,9 @@ def rgb_frames(
     decoded_filter_graph = ",".join(decoded_filters)
     sampled_filter_graph = ",".join(sampled_filters)
     frame_shape = (frame_height, frame_width, 3)
+    # An upscaling ``long_edge_pixels`` would otherwise make FFmpeg build
+    # oversized frames for the digest trace before the raw reader refuses them.
+    _require_frame_within_pixel_budget(video, frame_shape)
     decoded_indices, decoded_hashes = _decoded_frame_hashes(
         video,
         toolchain=toolchain,

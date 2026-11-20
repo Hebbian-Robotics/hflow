@@ -72,6 +72,7 @@ _MAXIMUM_DIAGNOSTIC_BYTES = 65536
 # temporary path avoids filter-graph escaping rules for ':', ',', ';', '[' and quotes.
 _FILTER_SAFE_PATH = re.compile(r"^[A-Za-z0-9/._-]+$")
 _Y4M_DIMENSIONS = re.compile(rb"\bW(?P<width>\d+) H(?P<height>\d+)\b")
+_FFMPEG_MAXIMUM_PIXELS_OPTION = 2**31 - 1
 
 
 @dataclass(frozen=True)
@@ -244,6 +245,11 @@ def _measure_video_window(
             f"{measured_window.start_seconds:.3f}",
             "-t",
             f"{measured_window.duration_seconds:.3f}",
+            # The probe and this decode open the source separately. Bound the
+            # decoder too; FFmpeg compares the stride-aligned width, so allow
+            # padding headroom over the frame budget.
+            "-max_pixels",
+            str(min(2 * limits.maximum_frame_pixels, _FFMPEG_MAXIMUM_PIXELS_OPTION)),
             "-i",
             str(source.resolve()),
             "-filter_complex",
@@ -272,7 +278,10 @@ def _measure_video_window(
             try:
                 if selection.camera_shake is not None:
                     assert decoding_process.stdout is not None
-                    luma_frames = _Y4mLumaFrames(decoding_process.stdout)
+                    luma_frames = _Y4mLumaFrames(
+                        decoding_process.stdout,
+                        maximum_frame_pixels=limits.maximum_frame_pixels,
+                    )
                     try:
                         camera_shake = summarize_camera_shake(
                             filter_camera_shake(
@@ -439,8 +448,9 @@ def _shared_decode_graph(
 class _Y4mLumaFrames(Iterator[np.ndarray]):
     """Read grey YUV4MPEG2 frames; the header carries the rotated output size."""
 
-    def __init__(self, stream: IO[bytes]) -> None:
+    def __init__(self, stream: IO[bytes], *, maximum_frame_pixels: int) -> None:
         self._stream = stream
+        self._maximum_frame_pixels = maximum_frame_pixels
         self._frame_shape: tuple[int, int] | None = None
         self.frame_count = 0
 
@@ -452,7 +462,13 @@ class _Y4mLumaFrames(Iterator[np.ndarray]):
             dimensions = _Y4M_DIMENSIONS.search(header)
             if not header.startswith(b"YUV4MPEG2 ") or dimensions is None:
                 raise MediaToolError("window decode produced an invalid luma stream header")
-            self._frame_shape = (int(dimensions["height"]), int(dimensions["width"]))
+            frame_height, frame_width = int(dimensions["height"]), int(dimensions["width"])
+            if frame_height * frame_width > self._maximum_frame_pixels:
+                raise MediaToolError(
+                    f"window decode produced {frame_width}x{frame_height} luma frames, which "
+                    f"exceed the {self._maximum_frame_pixels}-pixel frame budget"
+                )
+            self._frame_shape = (frame_height, frame_width)
         frame_header = self._stream.readline()
         if not frame_header:
             raise StopIteration
