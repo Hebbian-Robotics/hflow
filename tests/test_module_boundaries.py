@@ -29,12 +29,23 @@ _DOCUMENTED_HFLOW_IMPORT_BOUNDARIES = (
     _ImportBoundary(
         source_paths=tuple(sorted(Path(video_measurements.__file__).parent.rglob("*.py"))),
         restricted_module_prefix="hflow",
-        allowed_modules=frozenset({"hflow._field_guards"}),
+        allowed_modules=frozenset({"hflow._field_guards", "hflow._frame_budget"}),
         scope=_ImportScope.ALL,
         rule=(
             "the video-measurements package must not import hflow or any hflow.* module "
-            "other than the dependency-free hflow._field_guards type guards, because it is "
-            "designed to be extracted into a standalone package"
+            "other than the dependency-free hflow._field_guards type guards and "
+            "hflow._frame_budget default, because it is designed to be extracted into a "
+            "standalone package"
+        ),
+    ),
+    _ImportBoundary(
+        source_paths=(_HFLOW_PACKAGE_DIRECTORY / "_frame_budget.py",),
+        restricted_module_prefix="hflow",
+        allowed_modules=frozenset(),
+        scope=_ImportScope.ALL,
+        rule=(
+            "hflow._frame_budget must stay dependency-free so the video-measurements "
+            "package can share it with hflow.media"
         ),
     ),
     _ImportBoundary(

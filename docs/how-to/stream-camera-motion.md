@@ -73,7 +73,9 @@ An input with N frames yields max(0, N−1) observations. Empty or single-frame
 inputs have no adjacent pairs. A pair's interval runs from its earlier frame to
 its later frame; the final frame's display duration is not an extra measured
 interval. Invalid frame shapes and decoding errors raise rather than being
-reported as camera stability evidence.
+reported as camera stability evidence. A video whose frames exceed 33,554,432
+pixels, the default `VideoLimits.maximum_frame_pixels` that `probe_video` and
+video import enforce, raises before any frame is decoded.
 
 ## Interpret motion and fit evidence
 

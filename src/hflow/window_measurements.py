@@ -26,6 +26,7 @@ from typing import IO
 
 import numpy as np
 
+from hflow._frame_budget import ffmpeg_decoder_maximum_pixels
 from hflow._video_measurement_toolchain import resolved_video_measurement_toolchain
 from hflow._video_measurements._frame_statistics import (
     FRAME_STATISTICS_DEFINITION_VERSION,
@@ -244,6 +245,9 @@ def _measure_video_window(
             f"{measured_window.start_seconds:.3f}",
             "-t",
             f"{measured_window.duration_seconds:.3f}",
+            # The probe and this decode open the source separately.
+            "-max_pixels",
+            str(ffmpeg_decoder_maximum_pixels(limits.maximum_frame_pixels)),
             "-i",
             str(source.resolve()),
             "-filter_complex",
@@ -272,7 +276,10 @@ def _measure_video_window(
             try:
                 if selection.camera_shake is not None:
                     assert decoding_process.stdout is not None
-                    luma_frames = _Y4mLumaFrames(decoding_process.stdout)
+                    luma_frames = _Y4mLumaFrames(
+                        decoding_process.stdout,
+                        maximum_frame_pixels=limits.maximum_frame_pixels,
+                    )
                     try:
                         camera_shake = summarize_camera_shake(
                             filter_camera_shake(
@@ -439,8 +446,9 @@ def _shared_decode_graph(
 class _Y4mLumaFrames(Iterator[np.ndarray]):
     """Read grey YUV4MPEG2 frames; the header carries the rotated output size."""
 
-    def __init__(self, stream: IO[bytes]) -> None:
+    def __init__(self, stream: IO[bytes], *, maximum_frame_pixels: int) -> None:
         self._stream = stream
+        self._maximum_frame_pixels = maximum_frame_pixels
         self._frame_shape: tuple[int, int] | None = None
         self.frame_count = 0
 
@@ -452,7 +460,13 @@ class _Y4mLumaFrames(Iterator[np.ndarray]):
             dimensions = _Y4M_DIMENSIONS.search(header)
             if not header.startswith(b"YUV4MPEG2 ") or dimensions is None:
                 raise MediaToolError("window decode produced an invalid luma stream header")
-            self._frame_shape = (int(dimensions["height"]), int(dimensions["width"]))
+            frame_height, frame_width = int(dimensions["height"]), int(dimensions["width"])
+            if frame_height * frame_width > self._maximum_frame_pixels:
+                raise MediaToolError(
+                    f"window decode produced {frame_width}x{frame_height} luma frames, which "
+                    f"exceed the {self._maximum_frame_pixels}-pixel frame budget"
+                )
+            self._frame_shape = (frame_height, frame_width)
         frame_header = self._stream.readline()
         if not frame_header:
             raise StopIteration
