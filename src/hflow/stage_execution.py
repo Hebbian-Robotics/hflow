@@ -269,7 +269,13 @@ def plan_stage_batches(
         # key is validated for containment and would refuse the literal
         # segments, so it is sized normalized.
         if isinstance(data_root_storage, LocalStorageRoot):
-            real_path = resolve_local_data_root_path(data_root_storage.path, uri)
+            try:
+                real_path = resolve_local_data_root_path(data_root_storage.path, uri)
+            except ValueError:
+                # Planned at zero bytes, never stat'ed: process_stage_batch
+                # refuses it again and counts it as that recording's error,
+                # so one refusal cannot fail the plan for its siblings.
+                return str(uri), 0
             return str(uri), real_path.stat().st_size
         return str(uri), data_root_storage.file_size(normpath(str(uri)))
 

@@ -26,6 +26,7 @@ from hflow.stage_execution import (
     summarize_error_budget,
     summarize_quarantine_budget,
 )
+from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
 
 class TestBudgets:
@@ -119,6 +120,32 @@ class TestLanePlanning:
         )
 
         assert batches == [{"items": ["a/../b.mcap"], "start_delay_s": 0.0}]
+
+    def test_batch_lane_leaves_a_refused_uri_to_processing_and_runs_its_sibling(
+        self, tmp_path: Path
+    ) -> None:
+        data_root = tmp_path / "data"
+        (data_root / "episodes-in").mkdir(parents=True)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        spec = SyntheticEpisodeSpec(duration_s=1.0, cameras=())
+        synthesize_episode(data_root / "episodes-in" / "sibling.mcap", spec)
+        synthesize_episode(outside / "elsewhere.mcap", spec)
+        (data_root / "episodes-in" / "linked.mcap").symlink_to(outside / "elsewhere.mcap")
+        uris = ["episodes-in/sibling.mcap", "episodes-in/linked.mcap"]
+
+        batches = plan_stage_batches(uris, mode="batch", batch_count=None, data_root=str(data_root))
+
+        assert sorted(item for batch in batches for item in batch["items"]) == sorted(uris)
+        app = hflow.App("planning", data_root=data_root, default_checks=())
+        batch_counts = [
+            asyncio.run(process_stage_batch(app, batch["items"], "sync")) for batch in batches
+        ]
+        assert sum(counts["processed"] for counts in batch_counts) == 1
+        assert sum(counts["quarantined"] for counts in batch_counts) == 0
+        assert sum(counts["errors"] for counts in batch_counts) == 1
+        assert list((data_root / "episodes").glob("sibling-*/sibling.canonical.mcap"))
+        assert not list((data_root / "episodes").glob("*/elsewhere.canonical.mcap"))
 
     def test_empty_uris_plan_nothing(self, tmp_path: Path) -> None:
         assert plan_stage_batches([], mode="batch", batch_count=None, data_root=str(tmp_path)) == []
