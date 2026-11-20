@@ -590,12 +590,15 @@ def _bucket_workspace_url(catalog_url: str) -> str:
 def _artifact_workspace(catalog_location: StorageRoot) -> Generator[_ArtifactWorkspace, None, None]:
     """The workspace copy mode may read artifacts from: the catalog's parent.
 
+    A local catalog opened through a symlink belongs to the data root that
+    really contains it, which is where the framework records its artifacts.
+
     Artifact URIs are catalog data, so whoever supplied the catalog chose them;
     copy mode only materializes files that already belong to this workspace.
     """
     match catalog_location:
         case LocalStorageRoot(path=catalog_path):
-            workspace_root = catalog_path.absolute().parent.resolve(strict=True)
+            workspace_root = catalog_path.resolve(strict=True).parent
             root_descriptor = os.open(workspace_root, _BENEATH_DIRECTORY_OPEN_FLAGS)
             try:
                 yield _LocalArtifactWorkspace(root=workspace_root, root_descriptor=root_descriptor)
@@ -949,7 +952,8 @@ def export_dataset_snapshot(
     read. In ``copy`` mode every recorded artifact is materialized below
     ``assets/`` and the media table stores a path relative to the export
     directory. Copy mode only reads artifacts inside the catalog's workspace
-    (the catalog root's parent, i.e. the data root): a local URI must resolve
+    (the resolved catalog root's parent, i.e. the data root, also when the
+    catalog path is a symlink): a local URI must resolve
     under it without a symlink leaving it, and for a bucket catalog a URI must
     name an object under the same prefix. Any other URI aborts the export with
     ``ValueError`` before its bytes are read.

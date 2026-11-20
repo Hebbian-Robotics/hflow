@@ -119,6 +119,51 @@ def test_copy_mode_still_materializes_artifact_inside_workspace(tmp_path: Path) 
     assert not _tree_contains(output, OUTSIDE_MARKER)
 
 
+def _catalog_opened_through_symlink(tmp_path: Path) -> tuple[Path, Path]:
+    """A real data root, and a catalog path that is a symlink into it."""
+    workspace = _workspace(tmp_path)
+    catalog = Catalog(workspace / "catalog")
+    preview = workspace / "episodes" / "preview.jpg"
+    preview.parent.mkdir()
+    preview.write_bytes(INSIDE_MARKER)
+    _append_artifact(catalog, workspace, str(preview.resolve()))
+    opened_from = tmp_path / "opened-from"
+    opened_from.mkdir()
+    catalog_link = opened_from / "catalog"
+    catalog_link.symlink_to(catalog.root, target_is_directory=True)
+    return catalog_link, opened_from
+
+
+def test_copy_mode_accepts_catalog_opened_through_symlink(tmp_path: Path) -> None:
+    catalog_link, _opened_from = _catalog_opened_through_symlink(tmp_path)
+    output = tmp_path / "snapshot"
+
+    report = hflow.export_dataset_snapshot(
+        catalog_link, output, media_mode=hflow.SnapshotMediaMode.COPY
+    )
+
+    assert report.copied_media_count == 1
+    assert _tree_contains(output, INSIDE_MARKER)
+
+
+def test_copy_mode_through_catalog_symlink_refuses_files_beside_the_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The workspace is the catalog's real data root, not the symlink's directory."""
+    catalog_link, opened_from = _catalog_opened_through_symlink(tmp_path)
+    beside_link = opened_from / "beside.bin"
+    beside_link.write_bytes(OUTSIDE_MARKER)
+    catalog = Catalog(catalog_link.resolve())
+    _append_artifact(catalog, catalog.root.parent, str(beside_link.resolve()))
+    output = tmp_path / "snapshot"
+    hits = _record_marker_writes(monkeypatch, OUTSIDE_MARKER)
+
+    with pytest.raises(ValueError, match="outside the workspace"):
+        hflow.export_dataset_snapshot(catalog_link, output, media_mode=hflow.SnapshotMediaMode.COPY)
+
+    _assert_marker_absent(output, hits=hits)
+
+
 def test_copy_mode_refuses_artifact_uri_outside_workspace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

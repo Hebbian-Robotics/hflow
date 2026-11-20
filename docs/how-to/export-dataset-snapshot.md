@@ -135,7 +135,9 @@ materialized.
 
 Copy mode only reads artifacts that belong to the catalog's workspace, the
 directory or bucket prefix that contains the catalog (the data root in the
-standard `<data_root>/catalog` layout). A local URI must resolve inside that
+standard `<data_root>/catalog` layout). When `--catalog` is a symlink, the
+workspace is the directory that contains the real catalog directory, not the
+directory holding the link. A local URI must resolve inside that
 directory, so an absolute path, `..` segments, or a symlink that leads out of
 it are refused. For a bucket catalog the URI must name an object under the
 same prefix. An object-store URL in a local catalog is refused too. A refused
