@@ -133,6 +133,15 @@ export directory. Copy mode downloads bucket-backed artifacts through HFlow's
 normal storage cache and aborts the export if any selected artifact cannot be
 materialized.
 
+Copy mode only reads artifacts that belong to the catalog's workspace, the
+directory or bucket prefix that contains the catalog (the data root in the
+standard `<data_root>/catalog` layout). A local URI must resolve inside that
+directory, so an absolute path, `..` segments, or a symlink that leads out of
+it are refused. For a bucket catalog the URI must name an object under the
+same prefix. An object-store URL in a local catalog is refused too. A refused
+URI aborts the export with exit code `2` before its bytes are read. Reference
+mode never reads artifact URIs, so it exports them unchanged.
+
 The library entry point exposes the same behavior:
 
 ```python
