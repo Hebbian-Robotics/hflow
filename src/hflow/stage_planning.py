@@ -46,7 +46,7 @@ from hflow.step_selection import (
     registered_step_is_selected,
 )
 from hflow.steps import RAN_STATUSES, SETTLED_STATUSES, Stage
-from hflow.uri import parse_data_root_relative_uri
+from hflow.uri import DataRootRelativeUri, parse_data_root_relative_uri
 
 if TYPE_CHECKING:
     import duckdb
@@ -458,20 +458,27 @@ def outstanding_stage_uris(
     from hflow.stage_execution import resolve_episode_reference
 
     validated_uris = [parse_data_root_relative_uri(str(uri)) for uri in uris]
-    identity_by_uri = {
-        uri: application.source_identity(resolve_episode_reference(data_root, uri))
-        for uri in validated_uris
-    }
+    identity_by_uri: dict[DataRootRelativeUri, str | None] = {}
+    for uri in validated_uris:
+        try:
+            identity_by_uri[uri] = application.source_identity(
+                resolve_episode_reference(data_root, uri)
+            )
+        except ValueError:
+            # A reference that resolves outside the data root has no catalog
+            # row either; it is handed on and refused again by processing.
+            identity_by_uri[uri] = None
     plans = plan_outstanding_stages(
         application,
-        list(identity_by_uri.values()),
+        [identity for identity in identity_by_uri.values() if identity is not None],
         (stage,),
         step_names=step_names,
     )
     stage_by_step_name = application._registered_step_stages()
     outstanding: list[str] = []
     for uri in validated_uris:
-        plan = plans.get(identity_by_uri[uri])
+        identity = identity_by_uri[uri]
+        plan = None if identity is None else plans.get(identity)
         if not isinstance(plan, OutstandingStages):
             outstanding.append(str(uri))
             if _stage_steps_by_uri is not None:

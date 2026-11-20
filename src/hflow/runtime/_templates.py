@@ -721,9 +721,17 @@ MEDIA_PLAN_FILTER_TEMPLATE = Template(
 
         from hflow.format import CAMERA_SCHEMA_NAMES
         from hflow.reader import open_reader
+        from hflow.uri import parse_data_root_relative_uri, resolve_local_data_root_path
 
         def has_camera(uri):
-            reader = open_reader(Path($data_root) / str(uri))
+            try:
+                source = resolve_local_data_root_path(
+                    Path($data_root), parse_data_root_relative_uri(str(uri))
+                )
+                reader = open_reader(source)
+            except (OSError, ValueError):
+                # Kept, so process_batch refuses it as a counted error.
+                return True
             try:
                 return any(
                     info.schema_name in CAMERA_SCHEMA_NAMES

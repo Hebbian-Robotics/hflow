@@ -45,8 +45,12 @@ from hflow.step_selection import (
     selected_step_names_for_stage,
 )
 from hflow.steps import IngestMode, Stage
-from hflow.storage import is_bucket_url, parse_storage_root
-from hflow.uri import DataRootRelativeUri, parse_data_root_relative_uri
+from hflow.storage import LocalStorageRoot, is_bucket_url, parse_storage_root
+from hflow.uri import (
+    DataRootRelativeUri,
+    parse_data_root_relative_uri,
+    resolve_local_data_root_path,
+)
 
 if TYPE_CHECKING:
     from hflow.app import App
@@ -136,10 +140,14 @@ def require_application_data_root(application: "App", expected_data_root: str) -
 
 
 def resolve_episode_reference(data_root: str, uri: DataRootRelativeUri) -> "Path | str":
-    """A conf URI (relative to the data root) as a processable reference."""
+    """A conf URI (relative to the data root) as a processable reference.
+
+    A local reference is the resolved real path, refused when it leaves the
+    real data root, so processing opens exactly the file accepted here.
+    """
     if is_bucket_url(data_root):
         return data_root.rstrip("/") + "/" + uri
-    return Path(data_root) / uri
+    return resolve_local_data_root_path(Path(data_root), uri)
 
 
 def resolve_step_selection(
@@ -254,17 +262,25 @@ def plan_stage_batches(
         ]
 
     data_root_storage = parse_storage_root(data_root)
-    # The conf keeps the URI's own spelling, so `a/../b.mcap` stays the
-    # identity; only the size lookup normalizes, because a storage key is
-    # validated for containment and would refuse the literal segments.
+
+    def planned_item_size(uri: DataRootRelativeUri) -> tuple[str, int]:
+        # The conf keeps the URI's own spelling, so `a/../b.mcap` stays the
+        # identity. A local root sizes the file processing will open; a bucket
+        # key is validated for containment and would refuse the literal
+        # segments, so it is sized normalized.
+        if isinstance(data_root_storage, LocalStorageRoot):
+            try:
+                real_path = resolve_local_data_root_path(data_root_storage.path, uri)
+                return str(uri), real_path.stat().st_size
+            except (OSError, ValueError):
+                # Leave unusable references for processing, where each counts
+                # as one error and the other recordings can still run.
+                return str(uri), 0
+        return str(uri), data_root_storage.file_size(normpath(str(uri)))
+
     workers = min(STAGE_PLAN_FILE_SIZE_WORKERS, len(validated_uris))
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        item_sizes = dict(
-            executor.map(
-                lambda uri: (str(uri), data_root_storage.file_size(normpath(str(uri)))),
-                validated_uris,
-            )
-        )
+        item_sizes = dict(executor.map(planned_item_size, validated_uris))
 
     all_planned: list[PlannedStageBatch] = []
     current_delay_s = 0.0
@@ -597,12 +613,20 @@ def _plan_after_sync(
 
     failed_sync_uri_set = {str(uri) for uri in failed_sync_uris}
     data_root = str(application.data_root)
-    identity_by_uri = {
-        str(uri): application.source_identity(
-            resolve_episode_reference(data_root, parse_data_root_relative_uri(str(uri)))
-        )
-        for uri in uris
-    }
+
+    def source_identity_for(uri: str) -> str:
+        try:
+            return application.source_identity(
+                resolve_episode_reference(data_root, parse_data_root_relative_uri(uri))
+            )
+        except ValueError:
+            # Sync already refused this reference and counted it; only its plan
+            # is needed, and that is NoCanonicalEpisode whatever it is called.
+            if uri in failed_sync_uri_set:
+                return uri
+            raise
+
+    identity_by_uri = {str(uri): source_identity_for(str(uri)) for uri in uris}
     successful_identities = sorted(
         {identity for uri, identity in identity_by_uri.items() if uri not in failed_sync_uri_set}
     )

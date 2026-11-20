@@ -26,6 +26,7 @@ from hflow.stage_execution import (
     summarize_error_budget,
     summarize_quarantine_budget,
 )
+from hflow.testing import SyntheticEpisodeSpec, synthesize_episode
 
 
 class TestBudgets:
@@ -119,6 +120,30 @@ class TestLanePlanning:
         )
 
         assert batches == [{"items": ["a/../b.mcap"], "start_delay_s": 0.0}]
+
+    @pytest.mark.parametrize("unavailable_reference", ["missing", "symlink-loop"])
+    def test_batch_counts_unavailable_recording_without_blocking_its_sibling(
+        self, tmp_path: Path, unavailable_reference: str
+    ) -> None:
+        recordings = tmp_path / "episodes-in"
+        recordings.mkdir()
+        synthesize_episode(
+            recordings / "sibling.mcap", SyntheticEpisodeSpec(duration_s=1.0, cameras=())
+        )
+        unavailable = recordings / f"{unavailable_reference}.mcap"
+        if unavailable_reference == "symlink-loop":
+            unavailable.symlink_to(unavailable.name)
+        uris = ["episodes-in/sibling.mcap", f"episodes-in/{unavailable.name}"]
+        batches = plan_stage_batches(uris, mode="batch", batch_count=1, data_root=str(tmp_path))
+        application = hflow.App("planning", data_root=tmp_path, default_checks=())
+
+        assert len(batches) == 1
+        assert asyncio.run(process_stage_batch(application, batches[0]["items"], "sync")) == {
+            "processed": 1,
+            "quarantined": 0,
+            "errors": 1,
+        }
+        assert list((tmp_path / "episodes").glob("sibling-*/sibling.canonical.mcap"))
 
     def test_empty_uris_plan_nothing(self, tmp_path: Path) -> None:
         assert plan_stage_batches([], mode="batch", batch_count=None, data_root=str(tmp_path)) == []

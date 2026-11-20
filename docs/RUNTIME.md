@@ -195,6 +195,12 @@ anything is triggered):
 hflow ingest episodes-in/run_0001.mcap episodes-in/run_0002.mcap
 ```
 
+On a local data root, a URI must also land inside the data root after
+symlinks are followed: a file or directory symlink that leads outside it is
+refused when the episode is processed and counted as that episode's error. To
+keep recordings on another disk, mount that disk inside the data root or point
+the data root itself at it.
+
 Three flags select what runs and how:
 
 - **`--profile`** picks the run profile: which stage sub-DAGs the master
