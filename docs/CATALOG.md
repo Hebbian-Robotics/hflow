@@ -632,8 +632,9 @@ so a CI job or a pre-training checklist can fail on drift the way
 hflow stale --catalog data/catalog --pipeline pipeline.py --exit-code
 ```
 
-Without the flag the command always exits 0, so existing pipes into
-`xargs hflow ingest` keep working.
+Without the flag the command exits 0 when the input is valid, so existing
+pipes into `xargs hflow ingest` keep working. A blank `--pipeline-version`
+value is invalid and exits 2.
 
 ### Coverage denominators
 
