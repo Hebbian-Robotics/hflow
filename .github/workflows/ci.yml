@@ -15,10 +15,9 @@ on:
 jobs:
   checks:
     name: checks (${{ matrix.platform }}, ${{ matrix.python-version }})
-    # Keep fork PRs and standalone forks outside the Namespace workspace.
+    # PRs into HFlow use its runners. Workflows run in a standalone fork use GitHub's.
     runs-on: >-
       ${{ github.repository == 'Hebbian-Robotics/hflow'
-          && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
           && fromJSON(format('["{0}-with-cache","nscloud-cache-tag-{1}-{2}","nscloud-cache-allow-commit-from-main"]',
             matrix.namespace-runner, matrix.cache-tag-prefix, matrix.python-version))
           || matrix.github-runner }}

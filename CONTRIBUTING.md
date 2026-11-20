@@ -41,10 +41,11 @@ Linux and macOS both work for native development. CI covers Linux x86-64 and
 Apple Silicon. Native overlay builds require CPython on Linux, so the packaging
 tests that compile one are skipped on macOS.
 
-Upstream builds and checks use Namespace runners. CI keeps a separate uv Cache
-Volume per platform and Python version, and only runs on `main` can update those
-volumes. CI for pull requests from forks uses GitHub-hosted runners on the
-same platforms. The PyPI publishing job uses GitHub-hosted Ubuntu.
+Upstream builds and checks use Namespace runners, including pull requests from
+forks opened against HFlow. CI keeps a separate uv Cache Volume per platform and
+Python version, and only runs on `main` can update those volumes. Workflows run
+inside standalone forks use GitHub-hosted runners on the same platforms. The
+PyPI publishing job uses GitHub-hosted Ubuntu.
 
 Native Windows is not supported: pipeline and storage operations use `fcntl`
 for file locking (`src/hflow/storage.py`), which does not exist on Windows. Work inside WSL2 with an Ubuntu
