@@ -165,6 +165,19 @@ def fixture_archive(tmp_path_factory: pytest.TempPathFactory) -> Path:
         video_directory = root / "videos" / camera_key / "chunk-000"
         video_directory.mkdir(parents=True)
         (video_directory / "file-000.mp4").write_bytes(b"fake-mp4-content")
+
+    # Keep the synthetic corpus self-contained: ship a local task registry so
+    # ``_fetch_task_registry`` resolves from the cache instead of reaching
+    # out to the Hub (which times out when networking is disabled).
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    tasks_table = pa.Table.from_arrays(
+        [pa.array([0], type=pa.int64()), pa.array(["fixture_task"], type=pa.string())],
+        names=["task_index", "task"],
+    )
+    (root / "meta" / "tasks.parquet").parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(tasks_table, str(root / "meta" / "tasks.parquet"))
     return root
 
 
