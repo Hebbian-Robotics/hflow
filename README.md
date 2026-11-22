@@ -115,9 +115,8 @@ addition rather than a rearchitecture: the workspace unit, the seams a
 service drives (manifests, remote runtime addressing, credential injection),
 the trust model, and the current limits.
 
-## Community and hosted interest
+## Community
 
-- **Hosted platform waitlist:** [tell us about your workflow](https://forms.gle/EZpQpGGF3eJomx498).
 - **Community Discord:** [join us](https://discord.gg/vacepQvjmg) for questions, feedback, and contribution discussion.
 - **Code of conduct:** review our [community standards](./CODE_OF_CONDUCT.md) and report concerns privately.
 
