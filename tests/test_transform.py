@@ -137,6 +137,69 @@ def test_camera_channels_became_compressed_video(
     assert joint_channel.message_encoding == "cdr"
 
 
+def _canonical_video_frame_ids(path: Path, topic: str) -> set[str]:
+    from foxglove_schemas_protobuf.CompressedVideo_pb2 import CompressedVideo
+
+    frame_ids: set[str] = set()
+    with path.open("rb") as stream:
+        for _schema, _channel, message in make_reader(stream).iter_messages(topics=[topic]):
+            video_message = CompressedVideo()
+            video_message.ParseFromString(message.data)
+            frame_ids.add(video_message.frame_id)
+    return frame_ids
+
+
+def test_transcoded_cameras_keep_the_source_image_frame_id(
+    source_episode: Path, canonical_episode: Path, tmp_path: Path
+) -> None:
+    """Both CompressedImage schemas carry a frame id; neither may become the topic.
+
+    ``sensor_msgs/msg/CompressedImage`` keeps it at ``header.frame_id``, while
+    ``foxglove.CompressedImage`` has no header and keeps it at ``frame_id``.
+    """
+    from foxglove_schemas_protobuf.CompressedImage_pb2 import CompressedImage
+    from mcap.writer import Writer as StockWriter
+    from mcap_protobuf.schema import build_file_descriptor_set
+    from mcap_ros2.decoder import DecoderFactory as Ros2DecoderFactory
+
+    ros_topic = f"/{SMALL_SPEC.cameras[0]}/compressed"
+    assert _canonical_video_frame_ids(canonical_episode, ros_topic) == {SMALL_SPEC.cameras[0]}
+
+    foxglove_topic = "/wrist/image"
+    foxglove_source = tmp_path / "foxglove-images.mcap"
+    with source_episode.open("rb") as source_stream, foxglove_source.open("wb") as stream:
+        writer = StockWriter(stream)
+        writer.start(profile="", library="test")
+        schema_id = writer.register_schema(
+            name="foxglove.CompressedImage",
+            encoding="protobuf",
+            data=build_file_descriptor_set(CompressedImage).SerializeToString(),
+        )
+        channel_id = writer.register_channel(
+            topic=foxglove_topic, message_encoding="protobuf", schema_id=schema_id
+        )
+        source_reader = make_reader(source_stream, decoder_factories=[Ros2DecoderFactory()])
+        for _schema, _channel, message, ros_image in source_reader.iter_decoded_messages(
+            topics=[ros_topic]
+        ):
+            foxglove_image = CompressedImage(
+                frame_id="wrist_optical_frame", format=ros_image.format, data=ros_image.data
+            )
+            foxglove_image.timestamp.FromNanoseconds(message.log_time)
+            writer.add_message(
+                channel_id,
+                log_time=message.log_time,
+                data=foxglove_image.SerializeToString(),
+                publish_time=message.publish_time,
+            )
+        writer.finish()
+
+    output = tmp_path / "foxglove-images.canonical.mcap"
+    write_canonical_episode(foxglove_source, output)
+
+    assert _canonical_video_frame_ids(output, foxglove_topic) == {"wrist_optical_frame"}
+
+
 def test_state_messages_pass_through_byte_for_byte(
     source_episode: Path, canonical_episode: Path
 ) -> None:
