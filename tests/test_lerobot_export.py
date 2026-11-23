@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -169,10 +170,24 @@ def test_export_noncontiguous_selection(
     info = json.loads((dest / "meta" / "info.json").read_text())
     assert info["total_episodes"] == 2
     assert info["total_frames"] == 60 + 70  # episodes 0 and 2
-    assert info["splits"]["train"] == ["episode_000000", "episode_000001"]
+    assert info["codebase_version"] == "v3.0"
+    assert info["total_tasks"] == 2
+    assert info["splits"]["train"] == "0:2"
+    assert info["chunks_size"] > 0
+    assert info["data_files_size_in_mb"] > 0
+    assert info["video_files_size_in_mb"] > 0
     assert "observation.images.up" in info["features"]
     assert "observation.images.side" in info["features"]
     assert info["features"]["action"]["dtype"] == "float32"
+
+    # This is the shape used by LeRobotDatasetMetadata.load_metadata:
+    # task strings are the pandas index and task_index is a data column.
+    import pandas as pd
+
+    tasks = pd.read_parquet(dest / "meta" / "tasks.parquet")
+    assert list(tasks.index) == ["task-0", "task-2"]
+    assert tasks.index.name == "task"
+    assert tasks["task_index"].tolist() == [0, 1]
 
     conn = duckdb.connect()
     rows = conn.execute(
@@ -222,6 +237,33 @@ def test_export_noncontiguous_selection(
     prov = json.loads((dest / "export-provenance.json").read_text())
     assert prov["source_episode_indexes"] == [0, 2]
     assert prov["source_commit"] == "a" * 40
+
+
+@pytest.mark.skipif(
+    os.environ.get("HFLOW_LEROBOT_TESTS") != "1",
+    reason="set HFLOW_LEROBOT_TESTS=1 with lerobot==0.4.4 installed",
+)
+def test_export_metadata_loads_with_official_lerobot(fake_corpus: dict, tmp_path: Path) -> None:
+    """LeRobot 0.4.4 can load the exported metadata through its public API."""
+    pytest.importorskip("lerobot.datasets.lerobot_dataset")
+    from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+
+    manifest = _fake_manifest(
+        tmp_path,
+        [
+            {"metadata_json": _provenance_meta(0)},
+            {"metadata_json": _provenance_meta(2, task="task-2")},
+        ],
+    )
+    destination = tmp_path / "official-loader"
+    export.export(destination, manifest=manifest, camera_keys=CAMS)
+
+    metadata = LeRobotDatasetMetadata("local/test", root=destination)
+    assert metadata.total_episodes == 2
+    assert metadata.total_frames == LENGTHS[0] + LENGTHS[2]
+    assert metadata.total_tasks == 2
+    assert metadata.tasks.index.tolist() == ["task-0", "task-2"]
+    assert metadata.get_task_index("task-2") == 1
 
 
 def _provenance_json(**overrides: object) -> str:
@@ -1239,3 +1281,9 @@ def test_export_sparse_registry_preserves_valid_indices(
     t_table = pq.read_table(str(dest_tasks))
     assert t_table.column("task_index").to_pylist() == [0, 10]
     assert t_table.column("task").to_pylist() == ["task-0", "task-10"]
+    import pandas as pd
+
+    tasks = pd.read_parquet(dest_tasks)
+    assert tasks.index.name == "task"
+    assert tasks.index.tolist() == ["task-0", "task-10"]
+    assert tasks["task_index"].tolist() == [0, 10]

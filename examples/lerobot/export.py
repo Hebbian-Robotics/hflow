@@ -46,7 +46,8 @@ import pyarrow.parquet as pq
 
 import hflow
 
-EXPORT_VERSION = "lerobot-export-v3"
+EXPORT_VERSION = "lerobot-export-v4"
+LEROBOT_CODEBASE_VERSION = "v3.0"
 
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
@@ -565,36 +566,23 @@ def _write_v3_repository(
     episodes_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    src_tasks_parquet = corpus["cache_dir"] / "meta" / "tasks.parquet"
-    if src_tasks_parquet.exists():
-        shutil.copy2(src_tasks_parquet, meta_dir / "tasks.parquet")
-    src_tasks_jsonl = corpus["cache_dir"] / "meta" / "tasks.jsonl"
-    if src_tasks_jsonl.exists():
-        shutil.copy2(src_tasks_jsonl, meta_dir / "tasks.jsonl")
-
     dest_tasks_parquet = meta_dir / "tasks.parquet"
-    dest_tasks_jsonl = meta_dir / "tasks.jsonl"
-    if not dest_tasks_parquet.exists() and not dest_tasks_jsonl.exists():
-        if registry_task_map:
-            t_indices = sorted(registry_task_map.keys())
-            t_names = [registry_task_map[k] for k in t_indices]
-            t_table = pa.Table.from_arrays(
-                [
-                    pa.array(t_indices, type=pa.int64()),
-                    pa.array(t_names, type=pa.string()),
-                ],
-                names=["task_index", "task"],
-            )
-            pq.write_table(t_table, dest_tasks_parquet)
-        elif dataset_tasks:
-            t_table = pa.Table.from_arrays(
-                [
-                    pa.array(range(len(dataset_tasks)), type=pa.int64()),
-                    pa.array(dataset_tasks, type=pa.string()),
-                ],
-                names=["task_index", "task"],
-            )
-            pq.write_table(t_table, dest_tasks_parquet)
+    if registry_task_map:
+        task_indices = sorted(registry_task_map)
+        task_names = [registry_task_map[index] for index in task_indices]
+    else:
+        task_indices = list(range(len(dataset_tasks)))
+        task_names = dataset_tasks
+    if not task_names:
+        raise ValueError("source dataset has no task registry entries")
+
+    # LeRobot reads this as a pandas DataFrame: task text is the index and
+    # task_index is a column. Rebuild both supported source encodings into the
+    # canonical v3 parquet while retaining sparse source task indexes.
+    import pandas as pd
+
+    tasks = pd.DataFrame({"task_index": task_indices}, index=pd.Index(task_names, name="task"))
+    tasks.to_parquet(dest_tasks_parquet)
 
     # one data parquet per selected episode: windowed rows, renumbered
     ep_rows_out: list[dict] = []
@@ -686,16 +674,20 @@ def _write_v3_repository(
     }
     out_info = {
         "code": "LeRobotDataset/v3",
+        "codebase_version": LEROBOT_CODEBASE_VERSION,
         "total_episodes": len(selections),
         "total_frames": total_frames,
+        "total_tasks": len(task_indices),
         "total_videos": len(video_paths),
         "robot_type": selections[0].embodiment or info.get("robot_type", "unknown"),
         "fps": info.get("fps", 30),
-        "splits": {"train": [f"episode_{i:06d}" for i in range(len(selections))]},
+        "splits": {"train": f"0:{len(selections)}"},
+        "chunks_size": info.get("chunks_size", 1000),
+        "data_files_size_in_mb": info.get("data_files_size_in_mb", 100),
+        "video_files_size_in_mb": info.get("video_files_size_in_mb", 200),
         "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
         "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
         "features": {**data_features, **video_features},
-        "version": 1,
     }
     (destination / "meta" / "info.json").write_text(json.dumps(out_info, indent=2))
 
