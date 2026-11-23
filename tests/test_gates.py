@@ -169,7 +169,7 @@ def test_numpy_scalar_measurements_compare_like_python_numbers(
     threshold = hflow.Threshold("value", hflow.Comparison.AT_MOST, 50.0)
     # cast: deliberately passing NumPy scalars past the declared
     # MeasurementValue type, exactly what real check code does.
-    for numpy_value in (np.int64(99), np.float32(99.0)):
+    for numpy_value in (np.int64(99), np.float32(99.0), np.longdouble(99)):
         decision = evaluate_gate(_gate(threshold), cast(dict, {"value": numpy_value}))
         assert decision == hflow.GateDecided(verdict=False), f"{numpy_value!r} was not compared"
     for not_a_number in (np.bool_(True), np.datetime64(99, "ns"), np.timedelta64(99, "ns")):

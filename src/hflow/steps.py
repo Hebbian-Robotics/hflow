@@ -370,7 +370,9 @@ def evaluate_gate(gate: Gate, measurements: Mapping[str, MeasurementValue]) -> G
             and isinstance(value, (numpy.integer, numpy.floating))
             and not isinstance(value, numpy.timedelta64)
         ):
-            return value.item()
+            # int()/float(), not .item(): np.longdouble.item() stays a NumPy
+            # scalar where long double is wider than a C double (Linux x86-64).
+            return int(value) if isinstance(value, numpy.integer) else float(value)
         return value
 
     for threshold in gate.accept_when:
