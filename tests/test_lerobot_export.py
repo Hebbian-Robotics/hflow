@@ -144,6 +144,8 @@ def test_export_noncontiguous_selection(
     fake_corpus: dict, tmp_path: Path, explicit_video_path: bool
 ) -> None:
     """Outcome: exactly episodes 0 and 2, in selection order, loadable layout."""
+    import pyarrow.parquet as pq
+
     if not explicit_video_path:
         source_root = Path(fake_corpus["cache_dir"])
         for camera_key in CAMS:
@@ -180,14 +182,13 @@ def test_export_noncontiguous_selection(
     assert "observation.images.side" in info["features"]
     assert info["features"]["action"]["dtype"] == "float32"
 
-    # This is the shape used by LeRobotDatasetMetadata.load_metadata:
-    # task strings are the pandas index and task_index is a data column.
-    import pandas as pd
-
-    tasks = pd.read_parquet(dest / "meta" / "tasks.parquet")
-    assert list(tasks.index) == ["task-0", "task-2"]
-    assert tasks.index.name == "task"
-    assert tasks["task_index"].tolist() == [0, 1]
+    # The pandas metadata restores task strings as the index without making
+    # pandas a runtime dependency of the exporter.
+    task_table = pq.read_table(dest / "meta" / "tasks.parquet")
+    pandas_metadata = json.loads(task_table.schema.metadata[b"pandas"])
+    assert pandas_metadata["index_columns"] == ["task"]
+    assert task_table.column("task").to_pylist() == ["task-0", "task-2"]
+    assert task_table.column("task_index").to_pylist() == [0, 1]
 
     conn = duckdb.connect()
     rows = conn.execute(
@@ -742,6 +743,19 @@ def test_validate_v3_rejects_incoherent_info(fake_corpus: dict, tmp_path: Path) 
         export._validate_v3(dest)
 
 
+def test_validate_v3_rejects_missing_official_loader_metadata(
+    fake_corpus: dict, tmp_path: Path
+) -> None:
+    """The structural validator refuses exports missing LeRobot v3 fields."""
+    dest = _exported_dataset(fake_corpus, tmp_path)
+    meta_path = dest / "meta" / "info.json"
+    info = json.loads(meta_path.read_text())
+    del info["codebase_version"]
+    meta_path.write_text(json.dumps(info))
+    with pytest.raises(ValueError, match="codebase_version"):
+        export._validate_v3(dest)
+
+
 def test_validate_v3_rejects_window_length_mismatch(fake_corpus: dict, tmp_path: Path) -> None:
     """Per-episode window must equal length: corrupt length => refusal."""
     import pyarrow as pa
@@ -1092,12 +1106,33 @@ def test_read_task_registry_helper(tmp_path: Path) -> None:
     pq.write_table(pq_table, meta_pq / "tasks.parquet")
     assert export._read_task_registry(meta_pq) == {0: "task-0", 10: "task-10"}
 
+    # Some source datasets persist task names in an unnamed pandas index.
+    meta_unnamed = tmp_path / "unnamed"
+    meta_unnamed.mkdir()
+    unnamed_table = pa.Table.from_arrays(
+        [
+            pa.array([0, 10], type=pa.int64()),
+            pa.array(["task-0", "task-10"], type=pa.string()),
+        ],
+        names=["task_index", "__index_level_0__"],
+    ).replace_schema_metadata(
+        {"pandas": json.dumps({"index_columns": ["__index_level_0__"]}).encode()}
+    )
+    pq.write_table(unnamed_table, meta_unnamed / "tasks.parquet")
+    assert export._read_task_registry(meta_unnamed) == {0: "task-0", 10: "task-10"}
+
     # JSONL registry
     meta_jl = tmp_path / "jl"
     meta_jl.mkdir()
     jl_lines = '{"task_index": 1, "task": "task-1"}\n{"task_index": 5, "task": "task-5"}\n'
     (meta_jl / "tasks.jsonl").write_text(jl_lines)
     assert export._read_task_registry(meta_jl) == {1: "task-1", 5: "task-5"}
+
+
+def test_official_tasks_table_rejects_extreme_sparse_indices() -> None:
+    """Do not allocate a positional task table for unreasonable sparse IDs."""
+    with pytest.raises(ValueError, match="exceeds the supported maximum"):
+        export._official_tasks_table({0: "task-0", export.MAX_TASK_INDEX + 1: "other"})
 
 
 def test_export_refuses_frame_task_index_missing_from_sparse_registry(
@@ -1279,11 +1314,14 @@ def test_export_sparse_registry_preserves_valid_indices(
     dest_tasks = dest / "meta" / "tasks.parquet"
     assert dest_tasks.exists()
     t_table = pq.read_table(str(dest_tasks))
-    assert t_table.column("task_index").to_pylist() == [0, 10]
-    assert t_table.column("task").to_pylist() == ["task-0", "task-10"]
-    import pandas as pd
+    assert t_table.column("task_index").to_pylist() == list(range(11))
+    task_names = t_table.column("task").to_pylist()
+    assert task_names[0] == "task-0"
+    assert task_names[10] == "task-10"
+    assert task_names[1:10] == [""] * 9
+    pandas_metadata = json.loads(t_table.schema.metadata[b"pandas"])
+    assert pandas_metadata["index_columns"] == ["task"]
+    assert json.loads((dest / "meta" / "info.json").read_text())["total_tasks"] == 2
 
-    tasks = pd.read_parquet(dest_tasks)
-    assert tasks.index.name == "task"
-    assert tasks.index.tolist() == ["task-0", "task-10"]
-    assert tasks["task_index"].tolist() == [0, 10]
+    out_data = pq.read_table(dest / "data" / "chunk-000" / "file-000.parquet")
+    assert out_data.column("task_index").to_pylist() == task_indices
