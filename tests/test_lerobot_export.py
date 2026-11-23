@@ -247,7 +247,8 @@ def test_export_noncontiguous_selection(
 def test_export_metadata_loads_with_official_lerobot(fake_corpus: dict, tmp_path: Path) -> None:
     """LeRobot 0.4.4 can load the exported metadata through its public API."""
     pytest.importorskip("lerobot.datasets.lerobot_dataset")
-    from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+    from importlib import import_module
+    from typing import Any, cast
 
     manifest = _fake_manifest(
         tmp_path,
@@ -259,7 +260,8 @@ def test_export_metadata_loads_with_official_lerobot(fake_corpus: dict, tmp_path
     destination = tmp_path / "official-loader"
     export.export(destination, manifest=manifest, camera_keys=CAMS)
 
-    metadata = LeRobotDatasetMetadata("local/test", root=destination)
+    metadata_module = cast(Any, import_module("lerobot.datasets.lerobot_dataset"))
+    metadata = metadata_module.LeRobotDatasetMetadata("local/test", root=destination)
     assert metadata.total_episodes == 2
     assert metadata.total_frames == LENGTHS[0] + LENGTHS[2]
     assert metadata.total_tasks == 2
@@ -1212,7 +1214,10 @@ def test_validate_v3_refuses_frame_task_index_missing_from_sparse_registry(
         json.dumps(
             {
                 "code": "LeRobotDataset/v3",
+                "codebase_version": "v3.0",
                 "total_episodes": 1,
+                "total_tasks": 2,
+                "splits": {"train": "0:1"},
                 "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
             }
         )
