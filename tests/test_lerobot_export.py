@@ -1121,6 +1121,51 @@ def test_export_refuses_frame_task_index_missing_from_sparse_registry(
     assert not dest.exists()
 
 
+def test_export_refuses_task_ids_too_sparse_for_the_task_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A registry whose largest ID would need an enormous positional table is refused.
+
+    meta/tasks.parquet holds one row per ID up to the largest, so two tasks with IDs
+    0 and MAX_TASK_ID + 1 must fail before anything is built or written.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    far_id = export.MAX_TASK_ID + 1
+    corpus_root = tmp_path / "corpus_far_task_id"
+    write_v3_corpus(
+        corpus_root,
+        info=two_camera_v3_info(),
+        episode_rows=[
+            CorpusEpisodeRow(
+                episode_index=0,
+                length=60,
+                dataset_from_index=0,
+                video_to_timestamp=2.0,
+                tasks=("task-0", "task-far"),
+            )
+        ],
+    )
+    for cam in CAMS:
+        vdir = corpus_root / "videos" / cam / "chunk-000"
+        vdir.mkdir(parents=True, exist_ok=True)
+        (vdir / "file-000.mp4").write_bytes(f"fake-mp4-{cam}".encode())
+    tasks_table = pa.Table.from_arrays(
+        [pa.array([0, far_id], type=pa.int64()), pa.array(["task-0", "task-far"])],
+        names=["task_index", "task"],
+    )
+    pq.write_table(tasks_table, corpus_root / "meta" / "tasks.parquet")
+
+    corpus = export._read_corpus_from_cache(corpus_root)
+    _install_fake_import(corpus, corpus_root, monkeypatch)
+    manifest = _fake_manifest(tmp_path, [{"metadata_json": _provenance_meta(0, task="task-0")}])
+    dest = tmp_path / "out_far_task_id"
+    with pytest.raises(ValueError, match=rf"source task_index {far_id} is above"):
+        export.export(dest, manifest=manifest, camera_keys=CAMS)
+    assert not dest.exists()
+
+
 def test_validate_v3_refuses_frame_task_index_missing_from_sparse_registry(
     tmp_path: Path,
 ) -> None:

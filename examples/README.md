@@ -489,8 +489,9 @@ indexes.
 Exporter v4 writes the official `codebase_version: v3.0`, task count, range-form
 training split, and pandas-indexed `meta/tasks.parquet`. Task strings resolve
 through the official loader, including sources with sparse task IDs or a JSONL
-task registry. It retains the source schemas and complete feature registry from
-v3. Regenerate earlier exports for official loader compatibility. This does not
+task registry. `meta/tasks.parquet` is positional, so source task IDs above
+1,000,000 are refused. It retains the source schemas and complete feature
+registry from v3. Regenerate earlier exports for official loader compatibility. This does not
 change HFlow's canonical episode format or transform behavior version.
 
 The opt-in compatibility test exports real tiny MP4s and reads metadata, camera

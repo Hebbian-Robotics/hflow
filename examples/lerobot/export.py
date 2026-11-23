@@ -47,6 +47,9 @@ import pyarrow.parquet as pq
 import hflow
 
 EXPORT_VERSION = "lerobot-export-v4"
+# meta/tasks.parquet is positional (the official loader reads
+# tasks.iloc[task_index]), so it holds one row per ID up to the largest one.
+MAX_TASK_ID = 1_000_000
 
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
@@ -441,6 +444,13 @@ def _write_v3_repository(
     registry_task_map = corpus["tasks"] if isinstance(corpus.get("tasks"), dict) else {}
     if not registry_task_map and corpus.get("cache_dir"):
         registry_task_map = _read_task_registry(Path(corpus["cache_dir"]) / "meta")
+    largest_task_id = max(registry_task_map, default=-1)
+    if largest_task_id > MAX_TASK_ID:
+        raise ValueError(
+            f"source task_index {largest_task_id} is above the supported maximum "
+            f"{MAX_TASK_ID}: meta/tasks.parquet is positional, so it would need "
+            f"{largest_task_id + 1} rows; renumber the source tasks"
+        )
 
     has_registry = bool(registry_task_map) or (
         bool(corpus.get("cache_dir"))
