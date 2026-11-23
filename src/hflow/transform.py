@@ -522,8 +522,11 @@ def _decode_compressed_images(
         decoded = decoder(payload)
         images.append(bytes(decoded.data))
         formats.add(str(decoded.format))
+        # sensor_msgs/msg/CompressedImage nests the frame in its header;
+        # foxglove.CompressedImage has no header and carries it at top level.
         header = getattr(decoded, "header", None)
-        frame_ids.append(str(header.frame_id) if header is not None else "")
+        frame_id = header.frame_id if header is not None else getattr(decoded, "frame_id", "")
+        frame_ids.append(str(frame_id))
     if len(formats) != 1:
         raise SourceNotConforming(f"camera topic {topic!r} mixes image formats {sorted(formats)}")
     return images, frame_ids, _input_codec_for_image_format(formats.pop(), topic)

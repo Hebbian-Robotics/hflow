@@ -63,7 +63,7 @@ Camera streams are messages of [`foxglove.CompressedVideo`](https://docs.foxglov
 | Field | Contents |
 |---|---|
 | `timestamp` | The frame's capture time; equals the MCAP message `log_time` |
-| `frame_id` | The source image's `header.frame_id`; if absent, the topic name without its leading `/` |
+| `frame_id` | The source image's frame id (`header.frame_id` for `sensor_msgs/msg/CompressedImage`, `frame_id` for `foxglove.CompressedImage`); if empty, the topic name without its leading `/` |
 | `data` | Exactly one H.264 access unit (one decodable frame), Annex B format |
 | `format` | `"h264"` |
 

@@ -115,4 +115,10 @@ across these changes.
 # original field order. Decoded message content is unchanged. The header's
 # library identifier becomes the fixed string ``hflow``: it used to name the
 # hebbian-mcap release, so every dependency bump changed canonical bytes.
-TRANSFORM_BEHAVIOR_VERSION: str = "13"
+#
+# "14": transcoded ``foxglove.CompressedImage`` cameras keep the source
+# image's top-level ``frame_id`` in their canonical CompressedVideo messages.
+# It used to be replaced by the topic name, because only the ROS header
+# location was read. ROS-sourced cameras and episodes without a Foxglove
+# image camera change bytes only because this constant moved.
+TRANSFORM_BEHAVIOR_VERSION: str = "14"
