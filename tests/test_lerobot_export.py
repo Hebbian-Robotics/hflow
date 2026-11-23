@@ -1304,6 +1304,7 @@ def test_validate_v3_rejects_list_form_splits(fake_corpus: dict, tmp_path: Path)
         export._validate_v3(dest)
 
 
+@pytest.mark.requires_system_ffmpeg
 def test_official_lerobot_loader_opens_typed_export(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1352,7 +1353,7 @@ def test_official_lerobot_loader_opens_typed_export(
                 length=length,
                 dataset_from_index=0,
                 video_to_timestamp=length / fps,
-                tasks=("task-0",),
+                tasks=("task-0", "task-10"),
             )
         ],
     )
@@ -1365,12 +1366,16 @@ def test_official_lerobot_loader_opens_typed_export(
             "episode_index": pa.array([0] * length, type=pa.int64()),
             "frame_index": pa.array(range(length), type=pa.int64()),
             "timestamp": pa.array([i / fps for i in range(length)], type=pa.float32()),
-            "task_index": pa.array([0] * length, type=pa.int64()),
+            "task_index": pa.array([0, 10] * (length // 2), type=pa.int64()),
             "observation.state": pa.array(state, type=pa.list_(pa.float32(), 6)),
             "action": pa.array(action, type=pa.list_(pa.float32(), 6)),
         }
     )
     pq.write_table(data, corpus_root / "data" / "chunk-000" / "file-000.parquet")
+    pq.write_table(
+        pa.table({"task_index": [0, 10], "task": ["task-0", "task-10"]}),
+        corpus_root / "meta" / "tasks.parquet",
+    )
     (corpus_root / "meta" / "info.json").write_text(json.dumps(info))
 
     ffmpeg = shutil.which("ffmpeg")
@@ -1411,21 +1416,28 @@ def test_official_lerobot_loader_opens_typed_export(
             [
                 "import json",
                 "import sys",
+                "from importlib.metadata import version",
                 "from pathlib import Path",
                 "from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata",
+                'assert version("lerobot") == "0.4.4"',
                 "root = Path(sys.argv[1])",
                 'meta = LeRobotDatasetMetadata("local/export", root=root)',
                 'assert meta.info["codebase_version"] == "v3.0"',
-                "assert meta.total_tasks == 1",
+                "assert meta.total_tasks == 2",
                 'assert meta.info["splits"]["train"] == "0:1"',
                 'assert meta.tasks.iloc[0].name == "task-0"',
+                'assert meta.tasks.iloc[10].name == "task-10"',
                 'ds = LeRobotDataset("local/export", root=root, video_backend="pyav")',
-                "item = ds[0]",
-                'assert item["task"] == "task-0"',
-                'for cam in ("observation.images.up", "observation.images.side"):',
-                "    tensor = item[cam]",
-                "    shape = tuple(tensor.shape[-3:])",
-                "    assert shape in {(3, 48, 64), (48, 64, 3)}",
+                "assert len(ds) == 8",
+                "for i in range(len(ds)):",
+                "    item = ds[i]",
+                "    task_index = (0, 10)[i % 2]",
+                '    assert int(item["task_index"]) == task_index',
+                '    assert item["task"] == f"task-{task_index}"',
+                '    for cam in ("observation.images.up", "observation.images.side"):',
+                "        tensor = item[cam]",
+                "        shape = tuple(tensor.shape[-3:])",
+                "        assert shape in {(3, 48, 64), (48, 64, 3)}",
                 'print("OFFICIAL_LOADER_OK", len(ds), json.dumps({"task": item["task"]}))',
                 "",
             ]
