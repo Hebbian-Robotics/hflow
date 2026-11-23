@@ -76,6 +76,27 @@ def test_camera_video_on_a_camera_less_episode_records_nothing(tmp_path: Path) -
 
     report = asyncio.run(app.test(source, verbose=False))
 
-    (video_run,) = report.enrichments
+    (video_run,) = [run for run in report.enrichments if run.enrichment.name == "camera_video"]
     assert video_run.status is hflow.CheckStatus.MEASURED, video_run.error
     assert video_run.result == hflow.EnrichmentResult()
+
+
+def test_camera_video_on_a_single_frame_camera_records_count_without_fps_or_mp4(
+    tmp_path: Path,
+) -> None:
+    app = hflow.App("camera-video-single-frame", data_root=tmp_path / "data")
+    app.enrich(version=CAMERA_VIDEO_VERSION)(camera_video)
+    source = synthesize_episode(
+        tmp_path / "episode.mcap",
+        SyntheticEpisodeSpec(duration_s=1.0, cameras=("wrist_cam",), image_hz=1.0),
+    )
+
+    report = asyncio.run(app.test(source, verbose=False))
+
+    (video_run,) = [run for run in report.enrichments if run.enrichment.name == "camera_video"]
+    assert video_run.status is hflow.CheckStatus.MEASURED, video_run.error
+    assert video_run.result is not None
+    assert video_run.result.labels["/wrist_cam/compressed/video_frame_count"] == 1
+    assert "/wrist_cam/compressed/video_fps" not in video_run.result.labels
+    assert "/wrist_cam/compressed/video_start_s" in video_run.result.labels
+    assert not video_run.result.artifacts
