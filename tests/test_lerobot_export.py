@@ -169,7 +169,7 @@ def test_export_noncontiguous_selection(
     info = json.loads((dest / "meta" / "info.json").read_text())
     assert info["total_episodes"] == 2
     assert info["total_frames"] == 60 + 70  # episodes 0 and 2
-    assert info["splits"]["train"] == ["episode_000000", "episode_000001"]
+    assert info["splits"]["train"] == "0:2"
     assert "observation.images.up" in info["features"]
     assert "observation.images.side" in info["features"]
     assert info["features"]["action"]["dtype"] == "float32"
@@ -1135,7 +1135,10 @@ def test_validate_v3_refuses_frame_task_index_missing_from_sparse_registry(
         json.dumps(
             {
                 "code": "LeRobotDataset/v3",
+                "codebase_version": "v3.0",
                 "total_episodes": 1,
+                "total_tasks": 2,
+                "splits": {"train": "0:1"},
                 "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
             }
         )
@@ -1237,5 +1240,205 @@ def test_export_sparse_registry_preserves_valid_indices(
     dest_tasks = dest / "meta" / "tasks.parquet"
     assert dest_tasks.exists()
     t_table = pq.read_table(str(dest_tasks))
-    assert t_table.column("task_index").to_pylist() == [0, 10]
-    assert t_table.column("task").to_pylist() == ["task-0", "task-10"]
+    # Official loader uses iloc[task_index], so unused slots are padded; source
+    # IDs 0 and 10 are unchanged in both the registry and the data file.
+    assert t_table.column("task_index").to_pylist() == list(range(11))
+    names = t_table.column("task").to_pylist()
+    assert names[0] == "task-0"
+    assert names[10] == "task-10"
+    assert names[1:10] == [""] * 9
+    pandas_meta = json.loads(t_table.schema.metadata[b"pandas"])
+    assert pandas_meta["index_columns"] == ["task"]
+    out_data = pq.read_table(str(dest / "data" / "chunk-000" / "file-000.parquet"))
+    assert out_data.column("task_index").to_pylist() == task_indices
+
+
+def test_export_info_json_matches_official_lerobot_v3_fields(
+    fake_corpus: dict, tmp_path: Path
+) -> None:
+    """#778: exported info.json carries the fields the official loader reads first."""
+    dest = _exported_dataset(fake_corpus, tmp_path)
+    info = json.loads((dest / "meta" / "info.json").read_text())
+    assert info["code"] == "LeRobotDataset/v3"
+    assert info["codebase_version"] == "v3.0"
+    assert info["total_episodes"] == 1
+    assert info["total_frames"] == LENGTHS[0]
+    assert info["total_tasks"] == 1
+    assert info["splits"] == {"train": "0:1"}
+    assert info["version"] == 1
+
+
+def test_export_tasks_parquet_uses_official_positional_index(
+    fake_corpus: dict, tmp_path: Path
+) -> None:
+    """#778: official loader takes the task string from the DataFrame index at iloc[task_index]."""
+    import pyarrow.parquet as pq
+
+    dest = _exported_dataset(fake_corpus, tmp_path)
+    table = pq.read_table(str(dest / "meta" / "tasks.parquet"))
+    pandas_meta = json.loads(table.schema.metadata[b"pandas"])
+    assert pandas_meta["index_columns"] == ["task"]
+    assert table.column("task").to_pylist()[0] == "task-0"
+    assert table.column("task_index").to_pylist()[0] == 0
+
+
+def test_validate_v3_rejects_missing_codebase_version(fake_corpus: dict, tmp_path: Path) -> None:
+    """#778: a staged export without codebase_version is not official-loader compatible."""
+    dest = _exported_dataset(fake_corpus, tmp_path)
+    meta = dest / "meta" / "info.json"
+    info = json.loads(meta.read_text())
+    del info["codebase_version"]
+    meta.write_text(json.dumps(info))
+    with pytest.raises(ValueError, match=r"codebase_version is None, expected 'v3\.0'"):
+        export._validate_v3(dest)
+
+
+def test_validate_v3_rejects_list_form_splits(fake_corpus: dict, tmp_path: Path) -> None:
+    """#778: official splits are a range string, not a list of episode names."""
+    dest = _exported_dataset(fake_corpus, tmp_path)
+    meta = dest / "meta" / "info.json"
+    info = json.loads(meta.read_text())
+    info["splits"] = {"train": ["episode_000000"]}
+    meta.write_text(json.dumps(info))
+    with pytest.raises(ValueError, match=r"splits.train is \['episode_000000'\], expected '0:1'"):
+        export._validate_v3(dest)
+
+
+def test_official_lerobot_loader_opens_typed_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#778 opt-in: export real MP4s and open them with the official loader.
+
+    Skipped unless HFLOW_LEROBOT_LOADER_PYTHON points at an interpreter with
+    ``lerobot`` installed (kept out of default CI so the lockfile is untouched).
+    Without the official-field fix the subprocess fails with KeyError:
+    'codebase_version'.
+    """
+    import os
+    import subprocess
+
+    loader = os.environ.get("HFLOW_LEROBOT_LOADER_PYTHON")
+    if not loader:
+        pytest.skip("set HFLOW_LEROBOT_LOADER_PYTHON to run the official-loader round-trip")
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    width, height, fps, length = 64, 48, 30, 8
+    corpus_root = tmp_path / "typed-corpus"
+    info = {
+        "fps": fps,
+        "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+        "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+        "robot_type": "so101",
+        "features": {
+            "action": {"dtype": "float32", "shape": [6], "names": None},
+            "observation.state": {"dtype": "float32", "shape": [6], "names": None},
+            "timestamp": {"dtype": "float32", "shape": [1], "names": None},
+            "index": {"dtype": "int64", "shape": [1], "names": None},
+            "episode_index": {"dtype": "int64", "shape": [1], "names": None},
+            "frame_index": {"dtype": "int64", "shape": [1], "names": None},
+            "task_index": {"dtype": "int64", "shape": [1], "names": None},
+            CAMS[0]: {"dtype": "video", "shape": [height, width, 3], "names": None},
+            CAMS[1]: {"dtype": "video", "shape": [height, width, 3], "names": None},
+        },
+    }
+    write_v3_corpus(
+        corpus_root,
+        info=info,
+        episode_rows=[
+            CorpusEpisodeRow(
+                episode_index=0,
+                length=length,
+                dataset_from_index=0,
+                video_to_timestamp=length / fps,
+                tasks=("task-0",),
+            )
+        ],
+    )
+    # Replace DuckDB-inferred decimals with the official v3 dtypes.
+    state = [[float(i)] * 6 for i in range(length)]
+    action = [[float(i) + 0.5] * 6 for i in range(length)]
+    data = pa.table(
+        {
+            "index": pa.array(range(length), type=pa.int64()),
+            "episode_index": pa.array([0] * length, type=pa.int64()),
+            "frame_index": pa.array(range(length), type=pa.int64()),
+            "timestamp": pa.array([i / fps for i in range(length)], type=pa.float32()),
+            "task_index": pa.array([0] * length, type=pa.int64()),
+            "observation.state": pa.array(state, type=pa.list_(pa.float32(), 6)),
+            "action": pa.array(action, type=pa.list_(pa.float32(), 6)),
+        }
+    )
+    pq.write_table(data, corpus_root / "data" / "chunk-000" / "file-000.parquet")
+    (corpus_root / "meta" / "info.json").write_text(json.dumps(info))
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("system ffmpeg is required to encode decodable camera videos")
+    for cam, color in zip(CAMS, ("red", "blue"), strict=True):
+        vdir = corpus_root / "videos" / cam / "chunk-000"
+        vdir.mkdir(parents=True, exist_ok=True)
+        encoded = vdir / "file-000.mp4"
+        subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                f"color=c={color}:s={width}x{height}:r={fps}:d={length / fps}",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-an",
+                str(encoded),
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+    corpus = export._read_corpus_from_cache(corpus_root)
+    _install_fake_import(corpus, corpus_root, monkeypatch)
+    dest = tmp_path / "typed-export"
+    manifest = _fake_manifest(tmp_path, [{"metadata_json": _provenance_meta(0)}])
+    export.export(dest, manifest=manifest, camera_keys=CAMS)
+
+    loader_script = tmp_path / "load_official.py"
+    loader_script.write_text(
+        "\n".join(
+            [
+                "import json",
+                "import sys",
+                "from pathlib import Path",
+                "from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata",
+                "root = Path(sys.argv[1])",
+                'meta = LeRobotDatasetMetadata("local/export", root=root)',
+                'assert meta.info["codebase_version"] == "v3.0"',
+                "assert meta.total_tasks == 1",
+                'assert meta.info["splits"]["train"] == "0:1"',
+                'assert meta.tasks.iloc[0].name == "task-0"',
+                'ds = LeRobotDataset("local/export", root=root, video_backend="pyav")',
+                "item = ds[0]",
+                'assert item["task"] == "task-0"',
+                'for cam in ("observation.images.up", "observation.images.side"):',
+                "    tensor = item[cam]",
+                "    shape = tuple(tensor.shape[-3:])",
+                "    assert shape in {(3, 48, 64), (48, 64, 3)}",
+                'print("OFFICIAL_LOADER_OK", len(ds), json.dumps({"task": item["task"]}))',
+                "",
+            ]
+        )
+    )
+    env = {**os.environ, "HF_HUB_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1"}
+    result = subprocess.run(
+        [loader, str(loader_script), str(dest)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if result.returncode != 0:
+        raise AssertionError("official loader failed:\n" + result.stdout + "\n" + result.stderr)
+    assert "OFFICIAL_LOADER_OK" in result.stdout

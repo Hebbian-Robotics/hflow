@@ -46,7 +46,8 @@ import pyarrow.parquet as pq
 
 import hflow
 
-EXPORT_VERSION = "lerobot-export-v3"
+EXPORT_VERSION = "lerobot-export-v4"
+OFFICIAL_CODEBASE_VERSION = "v3.0"
 
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
@@ -190,22 +191,89 @@ def _read_task_registry(meta_dir: Path) -> dict[int, str]:
             indices = table["task_index"].to_pylist()
             names = table["task"].to_pylist() if "task" in cols else [""] * len(indices)
             for idx, name in zip(indices, names, strict=False):
-                if idx is not None:
-                    tasks[int(idx)] = str(name or "")
+                text_name = str(name or "")
+                if idx is not None and text_name:
+                    tasks[int(idx)] = text_name
         elif "task" in cols:
             for idx, name in enumerate(table["task"].to_pylist()):
-                tasks[idx] = str(name or "")
+                text_name = str(name or "")
+                if text_name:
+                    tasks[idx] = text_name
     elif tasks_jsonl.exists():
         for line_idx, line in enumerate(tasks_jsonl.read_text().splitlines()):
             if line.strip():
                 item = json.loads(line)
                 idx = item.get("task_index")
-                name = item.get("task", "")
+                text_name = str(item.get("task", "") or "")
+                if not text_name:
+                    continue
                 if idx is not None:
-                    tasks[int(idx)] = str(name)
+                    tasks[int(idx)] = text_name
                 else:
-                    tasks[line_idx] = str(name)
+                    tasks[line_idx] = text_name
     return tasks
+
+
+def _tasks_pandas_metadata() -> str:
+    """Pandas index metadata so official ``load_tasks`` restores task strings."""
+    return json.dumps(
+        {
+            "index_columns": ["task"],
+            "column_indexes": [
+                {
+                    "name": None,
+                    "field_name": None,
+                    "pandas_type": "unicode",
+                    "numpy_type": "str",
+                    "metadata": {"encoding": "UTF-8"},
+                }
+            ],
+            "columns": [
+                {
+                    "name": "task_index",
+                    "field_name": "task_index",
+                    "pandas_type": "int64",
+                    "numpy_type": "int64",
+                    "metadata": None,
+                },
+                {
+                    "name": "task",
+                    "field_name": "task",
+                    "pandas_type": "unicode",
+                    "numpy_type": "str",
+                    "metadata": None,
+                },
+            ],
+            "creator": {"library": "pyarrow", "version": pa.__version__},
+        }
+    )
+
+
+def _official_tasks_table(registry: dict[int, str]) -> pa.Table:
+    """Build a tasks table the official loader can index by position.
+
+    Official ``LeRobotDataset`` does ``self.meta.tasks.iloc[task_idx].name``
+    and expects the DataFrame index to be the task string. Pandas metadata
+    marks the ``task`` column as that index. Sparse source IDs are kept:
+    rows are padded up to ``max(task_index)`` so ``iloc[10]`` resolves, and
+    unused slots are empty strings that ``_read_task_registry`` does not
+    treat as published tasks.
+    """
+    max_index = max(registry)
+    indices = list(range(max_index + 1))
+    names = [registry.get(i, "") for i in indices]
+    table = pa.Table.from_arrays(
+        [
+            pa.array(indices, type=pa.int64()),
+            pa.array(names, type=pa.string()),
+        ],
+        names=["task_index", "task"],
+    )
+    return table.replace_schema_metadata({"pandas": _tasks_pandas_metadata()})
+
+
+def _write_official_tasks_parquet(path: Path, registry: dict[int, str]) -> None:
+    pq.write_table(_official_tasks_table(registry), path)
 
 
 def _read_corpus_from_cache(cache_dir: Path) -> dict:
@@ -572,29 +640,13 @@ def _write_v3_repository(
     if src_tasks_jsonl.exists():
         shutil.copy2(src_tasks_jsonl, meta_dir / "tasks.jsonl")
 
-    dest_tasks_parquet = meta_dir / "tasks.parquet"
-    dest_tasks_jsonl = meta_dir / "tasks.jsonl"
-    if not dest_tasks_parquet.exists() and not dest_tasks_jsonl.exists():
-        if registry_task_map:
-            t_indices = sorted(registry_task_map.keys())
-            t_names = [registry_task_map[k] for k in t_indices]
-            t_table = pa.Table.from_arrays(
-                [
-                    pa.array(t_indices, type=pa.int64()),
-                    pa.array(t_names, type=pa.string()),
-                ],
-                names=["task_index", "task"],
-            )
-            pq.write_table(t_table, dest_tasks_parquet)
-        elif dataset_tasks:
-            t_table = pa.Table.from_arrays(
-                [
-                    pa.array(range(len(dataset_tasks)), type=pa.int64()),
-                    pa.array(dataset_tasks, type=pa.string()),
-                ],
-                names=["task_index", "task"],
-            )
-            pq.write_table(t_table, dest_tasks_parquet)
+    dest_task_registry = _read_task_registry(meta_dir)
+    if not dest_task_registry and registry_task_map:
+        dest_task_registry = dict(registry_task_map)
+    elif not dest_task_registry and dataset_tasks:
+        dest_task_registry = {i: name for i, name in enumerate(dataset_tasks) if name}
+    if dest_task_registry:
+        _write_official_tasks_parquet(meta_dir / "tasks.parquet", dest_task_registry)
 
     # one data parquet per selected episode: windowed rows, renumbered
     ep_rows_out: list[dict] = []
@@ -684,14 +736,17 @@ def _write_v3_repository(
         for k, v in corpus["info"].get("features", {}).items()
         if isinstance(v, dict) and v.get("dtype") != "video" and k in written_data_columns
     }
+    dest_task_registry = _read_task_registry(meta_dir)
     out_info = {
         "code": "LeRobotDataset/v3",
+        "codebase_version": OFFICIAL_CODEBASE_VERSION,
         "total_episodes": len(selections),
         "total_frames": total_frames,
         "total_videos": len(video_paths),
+        "total_tasks": len(dest_task_registry),
         "robot_type": selections[0].embodiment or info.get("robot_type", "unknown"),
         "fps": info.get("fps", 30),
-        "splits": {"train": [f"episode_{i:06d}" for i in range(len(selections))]},
+        "splits": {"train": f"0:{len(selections)}"},
         "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
         "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
         "features": {**data_features, **video_features},
@@ -739,8 +794,22 @@ def _validate_v3(dataset_dir: Path) -> None:
     info = json.loads(meta_path.read_text())
     if info.get("code") != "LeRobotDataset/v3":
         raise ValueError(f"staged dataset is not LeRobotDataset/v3: {info.get('code')}")
-    if int(info.get("total_episodes", 0)) < 1:
+    if info.get("codebase_version") != OFFICIAL_CODEBASE_VERSION:
+        raise ValueError(
+            f"staged dataset codebase_version is {info.get('codebase_version')!r}, "
+            f"expected {OFFICIAL_CODEBASE_VERSION!r}"
+        )
+    total_episodes = int(info.get("total_episodes", 0))
+    if total_episodes < 1:
         raise ValueError("staged dataset has no episodes")
+    train_split = (
+        (info.get("splits") or {}).get("train") if isinstance(info.get("splits"), dict) else None
+    )
+    expected_split = f"0:{total_episodes}"
+    if train_split != expected_split:
+        raise ValueError(
+            f"staged dataset splits.train is {train_split!r}, expected {expected_split!r}"
+        )
 
     episodes_parquets = sorted((dataset_dir / "meta" / "episodes").rglob("*.parquet"))
     if not episodes_parquets:
@@ -749,6 +818,14 @@ def _validate_v3(dataset_dir: Path) -> None:
     try:
         registry_tasks = _read_task_registry(dataset_dir / "meta")
         valid_registry_indices = set(registry_tasks.keys())
+        declared_total_tasks = info.get("total_tasks")
+        if declared_total_tasks is None:
+            raise ValueError("staged dataset has no total_tasks")
+        if int(declared_total_tasks) != len(registry_tasks):
+            raise ValueError(
+                f"staged dataset total_tasks is {declared_total_tasks!r}, "
+                f"expected {len(registry_tasks)}"
+            )
         has_registry = bool(valid_registry_indices) or (
             (dataset_dir / "meta" / "tasks.parquet").exists()
             or (dataset_dir / "meta" / "tasks.jsonl").exists()
