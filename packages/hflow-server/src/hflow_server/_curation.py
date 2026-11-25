@@ -155,21 +155,33 @@ def _stripped_sql_or_refuse(raw_sql: str) -> str:
 
 
 def _subquery_body(user_sql: str) -> str:
-    """The SQL as the body of ``(...)``: no statement terminator, and a
-    trailing comment ends on its own line, so a line comment cannot swallow
-    the wrapper's closing parenthesis. SQL without either is unchanged.
+    """The SQL as the body of ``(...)``: no statement terminator, no empty
+    statement ahead of the query, and a trailing comment ends on its own
+    line, so a line comment cannot swallow the wrapper's closing
+    parenthesis. SQL without any of these is unchanged.
 
     The terminator is found the way the SDK finds it (``hflow.curation``):
     the last token DuckDB does not classify as a comment, so ``; -- end``
     and ``; /* end */`` lose their semicolon too, while semicolons and
-    comment markers inside string literals are left alone. Positions are
-    UTF-8 byte offsets, hence the encode/decode.
+    comment markers inside string literals are left alone. Leading
+    semicolons (``; SELECT 1``) are empty statements that the gate's parser
+    and pin skip but a subquery cannot, so they are dropped the same way,
+    along with a leading byte-order mark the parser ignores as well.
+    Positions are UTF-8 byte offsets, hence the encode/decode.
     """
+    user_sql = user_sql.removeprefix("\ufeff")
     sql_bytes = user_sql.encode("utf-8")
     tokens = duckdb.tokenize(user_sql)
     code_tokens = [position for position, kind in tokens if kind != duckdb.token_type.comment]
+    semicolon_positions: set[int] = set()
+    for position in code_tokens:
+        if sql_bytes[position : position + 1] != b";":
+            break
+        semicolon_positions.add(position)
     if code_tokens and sql_bytes[code_tokens[-1] : code_tokens[-1] + 1] == b";":
-        sql_bytes = sql_bytes[: code_tokens[-1]] + sql_bytes[code_tokens[-1] + 1 :]
+        semicolon_positions.add(code_tokens[-1])
+    for position in sorted(semicolon_positions, reverse=True):
+        sql_bytes = sql_bytes[:position] + sql_bytes[position + 1 :]
     ends_in_comment = bool(tokens) and tokens[-1][1] == duckdb.token_type.comment
     return sql_bytes.decode("utf-8") + ("\n" if ends_in_comment else "")
 

@@ -293,6 +293,7 @@ def test_pin_rejects_pragma_and_describe_consistently(
         "DESCRIBE SELECT 1",
         "SHOW TABLES",
         "SUMMARIZE SELECT 1",
+        "; SHOW TABLES",
     ):
         pin_response = writable_api.post("/api/v1/curation/pin", json={"sql": sql, "name": "test"})
         preview_response = api.post("/api/v1/curation/preview", json={"sql": sql})
@@ -302,6 +303,27 @@ def test_pin_rejects_pragma_and_describe_consistently(
         assert preview_response.json()["detail"] == pin_response.json()["detail"]
         assert "DESCRIBE SELECT * FROM" not in pin_response.json()["detail"]
         assert "syntax error at or near" not in pin_response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "; SELECT episode_id FROM episodes",
+        ";;SELECT episode_id FROM episodes;",
+        "/* lead */ ; -- line\nSELECT episode_id FROM episodes",
+        "\ufeff; SELECT episode_id FROM episodes",
+    ],
+)
+def test_pin_and_preview_agree_on_empty_statements_before_the_query(
+    writable_api: TestClient, api: TestClient, sql: str
+) -> None:
+    # The gate's parser skips an empty statement ahead of the query and so
+    # does pin; preview's subquery wrapper must skip it too, not fail to parse.
+    pin_response = writable_api.post("/api/v1/curation/pin", json={"sql": sql, "name": "leading"})
+    preview_response = api.post("/api/v1/curation/preview", json={"sql": sql})
+    assert pin_response.status_code == 200, pin_response.text
+    assert preview_response.status_code == 200, preview_response.text
+    assert pin_response.json()["row_count"] == preview_response.json()["row_count"] == 4
 
 
 def test_pin_accepts_from_first_and_parenthesized_selects(

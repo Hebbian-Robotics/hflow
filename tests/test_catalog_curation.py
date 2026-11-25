@@ -1397,6 +1397,7 @@ _SQL_SURFACE_PAYLOADS = [
     pytest.param("SUMMARIZE SELECT episode_id FROM episodes", True, 0, id="summarize"),
     pytest.param("PRAGMA database_list", True, 0, id="pragma"),
     pytest.param("SHOW TABLES", True, 0, id="show"),
+    pytest.param("; SHOW TABLES", True, 0, id="empty-statement-then-show"),
     # Accepted. The catalog holds exactly one episode, so a query selecting
     # from it yields one row.
     pytest.param("SELECT episode_id FROM episodes", False, 1, id="legitimate-single-select"),
@@ -1624,6 +1625,15 @@ _SQL_REFUSED_AS_NOT_ONE_SELECT = [
     pytest.param("pragma database_list", id="lowercase-pragma"),
     pytest.param("-- comment\nPRAGMA database_list", id="line-comment-then-pragma"),
     pytest.param("/* block */ DESCRIBE SELECT 1", id="block-comment-then-describe"),
+    # The keyword is read off the parsed statement, so nothing the parser
+    # drops ahead of it may hide it: empty statements, a byte-order mark, or a
+    # nested block comment that a first-``*/`` scan of the raw text would end early.
+    pytest.param(";DESCRIBE SELECT 1", id="empty-statement-then-describe"),
+    pytest.param("; SHOW TABLES", id="empty-statement-then-show"),
+    pytest.param(";;SUMMARIZE SELECT 1", id="empty-statements-then-summarize"),
+    pytest.param("/* block */ ; -- line\nSHOW TABLES", id="comments-and-empty-statement-then-show"),
+    pytest.param("\ufeffSHOW TABLES", id="byte-order-mark-then-show"),
+    pytest.param("/* outer /* inner */ still outer */ SHOW TABLES", id="nested-comment-then-show"),
 ]
 
 _SQL_ACCEPTED_AS_ONE_SELECT = [
