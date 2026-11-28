@@ -641,7 +641,7 @@ def _leading_keyword(sql: str) -> str:
     inside ``FROM (<sql>)`` (the preview wrapper's shape), so a parse-based
     subquery check alone would let them through. The curation endpoints
     advertise exactly one read-only SELECT, so the gate also refuses these
-    keywords when they head the original text.
+    keywords when they head the parsed statement.
 
     This is a rule about the shape callers write, not a containment boundary.
     ``(DESCRIBE SELECT 1)`` is not headed by the keyword and is accepted, and
@@ -694,8 +694,12 @@ def reject_non_single_select(sql: str) -> None:
         # Refuse PRAGMA/DESCRIBE/SHOW/SUMMARIZE by leading keyword. DuckDB
         # labels them SELECT, and DESCRIBE/SHOW/SUMMARIZE even parse cleanly
         # as subqueries. This leading-keyword refusal is what keeps the gate in
-        # step with what the endpoints advertise.
-        if _leading_keyword(sql) in _SUBQUERY_FORBIDDEN_LEADING_KEYWORDS:
+        # step with what the endpoints advertise. Read the keyword off the
+        # parsed statement, not the raw input: the parser drops empty
+        # statements, a byte-order mark and nested block comments, so
+        # ``; SHOW TABLES`` or ``/* a /* b */ c */ SHOW TABLES`` would
+        # otherwise hide it.
+        if _leading_keyword(statements[0].query) in _SUBQUERY_FORBIDDEN_LEADING_KEYWORDS:
             raise NonSingleSelectQueryError("sql must be exactly one read-only SELECT statement")
     finally:
         parser_connection.close()
