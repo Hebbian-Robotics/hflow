@@ -9,6 +9,7 @@ episode (a tag, never a deletion) and skips its downstream steps.
 """
 
 import math
+import sys
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -354,9 +355,29 @@ def evaluate_gate(gate: Gate, measurements: Mapping[str, MeasurementValue]) -> G
     """
     unevaluated: list[str] = []
     verdict = True
+    # A check computing from ``to_numpy()`` often returns np.int64 or
+    # np.float32, which are not int/float subclasses. The catalog stores them
+    # as their Python values, so read numeric ones the same way here rather
+    # than abstaining. Only integers and floats: a datetime64 or timedelta64
+    # would become an int too (timedelta64 even subclasses np.integer), and
+    # comparing that against a threshold is meaningless. Looked up, not
+    # imported, to keep this module NumPy-free.
+    numpy = sys.modules.get("numpy")
+
+    def as_python_number(value: MeasurementValue) -> MeasurementValue:
+        if (
+            numpy is not None
+            and isinstance(value, (numpy.integer, numpy.floating))
+            and not isinstance(value, numpy.timedelta64)
+        ):
+            # int()/float(), not .item(): np.longdouble.item() stays a NumPy
+            # scalar where long double is wider than a C double (Linux x86-64).
+            return int(value) if isinstance(value, numpy.integer) else float(value)
+        return value
+
     for threshold in gate.accept_when:
         matched = [
-            value
+            as_python_number(value)
             for key, value in sorted(measurements.items())
             if fnmatchcase(key, threshold.key_pattern)
         ]
