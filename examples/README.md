@@ -486,11 +486,15 @@ the video chunks byte-for-byte. A dataset-card draft (`README.md`) and
 exporter version, selection SQL/manifest, and selected source episode
 indexes.
 
-The v3 exporter completes the feature registry and preserves the source Parquet
-schemas introduced in exporter v2. Regenerate exports made with v1 to restore
-source dtypes and array shapes, and those made with v1 or v2 to restore missing
-integer and boolean feature declarations. This does not change HFlow's canonical
-episode format or transform behavior version.
+The v4 exporter writes the metadata and positional task index required by the
+official LeRobot v3 loader, while preserving sparse source task IDs. It also
+completes the feature registry and preserves the source Parquet schemas
+introduced in exporter v2 and v3. Regenerate exports made with v1 to restore
+source dtypes and array shapes, those made with v1 or v2 to restore missing
+integer and boolean feature declarations, and those made with v1–v3 so the
+official `lerobot` loader can open them. Sparse task IDs above 100,000 are
+rejected to avoid allocating an oversized positional task table. These changes
+do not affect HFlow's canonical episode format or transform behavior version.
 
 From a curation manifest:
 
