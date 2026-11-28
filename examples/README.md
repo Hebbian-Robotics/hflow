@@ -486,11 +486,17 @@ the video chunks byte-for-byte. A dataset-card draft (`README.md`) and
 exporter version, selection SQL/manifest, and selected source episode
 indexes.
 
-The v3 exporter completes the feature registry and preserves the source Parquet
-schemas introduced in exporter v2. Regenerate exports made with v1 to restore
-source dtypes and array shapes, and those made with v1 or v2 to restore missing
-integer and boolean feature declarations. This does not change HFlow's canonical
-episode format or transform behavior version.
+The v4 exporter writes the official LeRobot v3 loader fields in ``meta/info.json``
+(``codebase_version``, ``total_tasks``, and ``splits`` in ``"0:N"`` form) and
+writes ``meta/tasks.parquet`` so the official package can look tasks up by
+position, while keeping the ``code`` marker the existing verifier checks and
+preserving sparse source task IDs. It also completes the feature registry and
+preserves the source Parquet schemas introduced in exporter v2 and v3.
+Regenerate exports made with v1 to restore source dtypes and array shapes,
+those made with v1 or v2 to restore missing integer and boolean feature
+declarations, and those made with v1–v3 so the official ``lerobot`` loader can
+open them. This does not change HFlow's canonical episode format or transform
+behavior version.
 
 From a curation manifest:
 
